@@ -66,4 +66,27 @@ export class PlatformAuthzClient {
     const r = await this.post<{ ids: string[] }>('/authz/lookup-resources', { subject, permission, resourceType });
     return r?.ids ?? [];
   }
+
+  /**
+   * The subject-side filter: of these Docmost user ids, which hold `permission` on the resource?
+   * Backs the reverse-index recipient filters (`getUserIdsWith*Access`). The platform echoes the
+   * passing subject refs back, so we recover Docmost user ids directly. FAIL-CLOSED → empty on error.
+   */
+  async filterSubjects(
+    permission: string,
+    resourceType: string,
+    resourceId: string,
+    candidateUserIds: string[],
+  ): Promise<string[]> {
+    if (candidateUserIds.length === 0) return [];
+    const candidates = candidateUserIds.map((externalId) => ({ provider: 'docmost', externalId }));
+    const r = await this.post<{ subjects: Array<{ externalId?: string }> }>('/authz/filter-subjects', {
+      permission,
+      resourceType,
+      resourceId,
+      candidates,
+    });
+    if (!r) return [];
+    return r.subjects.map((s) => s.externalId).filter((id): id is string => !!id);
+  }
 }

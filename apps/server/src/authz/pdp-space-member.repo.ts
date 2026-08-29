@@ -50,4 +50,13 @@ export class PdpSpaceMemberRepo extends SpaceMemberRepo {
   override async getUserSpaceIds(userId: string): Promise<string[]> {
     return this.authz.lookupResources(this.subject(userId), 'view', 'space');
   }
+
+  /**
+   * Reverse index (recipient filter): of `userIds`, which may VIEW the space — from the PDP, not the
+   * local mirror. Powers notification/digest fan-out. Bounded candidate list → subject-side filter.
+   */
+  override async getUserIdsWithSpaceAccess(userIds: string[], spaceId: string): Promise<Set<string>> {
+    if (userIds.length === 0) return new Set();
+    return new Set(await this.authz.filterSubjects('view', 'space', spaceId, userIds));
+  }
 }

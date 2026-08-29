@@ -53,4 +53,40 @@ export class PdpPagePermissionRepo extends PagePermissionRepo {
     if (opts.pageIds.length === 0) return [];
     return this.authz.filterResources(this.subject(opts.userId), 'view', 'page', opts.pageIds);
   }
+
+  /**
+   * Sidebar / tree listing: the viewable subset of `pageIds` WITH their edit capability — from the
+   * PDP, not the local mirror (closes the sidebar leakage vector). Two checks per page (view, edit),
+   * chunked under the platform's 256-check bulk cap; a page is included only if view passes.
+   */
+  override async filterAccessiblePageIdsWithPermissions(
+    pageIds: string[],
+    userId: string,
+  ): Promise<Array<{ id: string; canEdit: boolean }>> {
+    if (pageIds.length === 0) return [];
+    const subject = this.subject(userId);
+    const out: Array<{ id: string; canEdit: boolean }> = [];
+    const CHUNK = 128; // 2 checks/page ≤ the platform's 256-item bulk cap
+    for (let i = 0; i < pageIds.length; i += CHUNK) {
+      const batch = pageIds.slice(i, i + CHUNK);
+      const checks = batch.flatMap((id) => [
+        { permission: 'view', resourceType: 'page', resourceId: id },
+        { permission: 'edit', resourceType: 'page', resourceId: id },
+      ]);
+      const results = await this.authz.checkBulk(subject, checks);
+      batch.forEach((id, j) => {
+        if (results[j * 2]) out.push({ id, canEdit: !!results[j * 2 + 1] });
+      });
+    }
+    return out;
+  }
+
+  /**
+   * Reverse index (recipient filter): of `userIds`, which may VIEW the page — from the PDP, not the
+   * local mirror. Powers comment/mention/update/verification notification fan-out.
+   */
+  override async getUserIdsWithPageAccess(pageId: string, userIds: string[]): Promise<string[]> {
+    if (userIds.length === 0) return [];
+    return this.authz.filterSubjects('view', 'page', pageId, userIds);
+  }
 }

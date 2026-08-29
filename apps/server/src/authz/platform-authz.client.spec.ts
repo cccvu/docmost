@@ -52,4 +52,32 @@ describe('PlatformAuthzClient', () => {
     fetchMock.mockResolvedValueOnce(ok({ ids: ['a', 'c'] }));
     expect(await client.filterResources({ principalId: 'p1' }, 'view', 'page', ['a', 'b', 'c'])).toEqual(['a', 'c']);
   });
+
+  it('filterSubjects wraps candidate ids, echoes the passing externalIds, and skips the call when empty', async () => {
+    expect(await client.filterSubjects('view', 'page', 'pg1', [])).toEqual([]);
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    fetchMock.mockResolvedValueOnce(
+      ok({ subjects: [{ provider: 'docmost', externalId: 'u1' }, { provider: 'docmost', externalId: 'u3' }] }),
+    );
+    const allowed = await client.filterSubjects('view', 'page', 'pg1', ['u1', 'u2', 'u3']);
+    expect(allowed).toEqual(['u1', 'u3']);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('http://platform.test/authz/filter-subjects');
+    expect(JSON.parse(init.body)).toMatchObject({
+      permission: 'view',
+      resourceType: 'page',
+      resourceId: 'pg1',
+      candidates: [
+        { provider: 'docmost', externalId: 'u1' },
+        { provider: 'docmost', externalId: 'u2' },
+        { provider: 'docmost', externalId: 'u3' },
+      ],
+    });
+  });
+
+  it('filterSubjects is FAIL-CLOSED on error (denies all)', async () => {
+    fetchMock.mockRejectedValueOnce(new Error('down'));
+    expect(await client.filterSubjects('view', 'space', 's1', ['u1', 'u2'])).toEqual([]);
+  });
 });
