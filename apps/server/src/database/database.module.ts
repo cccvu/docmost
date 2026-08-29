@@ -31,6 +31,11 @@ import { PageListener } from '@docmost/db/listeners/page.listener';
 import { PostgresJSDialect } from 'kysely-postgres-js';
 import * as postgres from 'postgres';
 import { normalizePostgresUrl } from '../common/helpers';
+// --- CCC authorization integration seam (the ONLY upstream edit; see /UPSTREAM_MODIFICATIONS.md).
+// Rebinds the two authorization repos to PDP-backed subclasses that defer decisions to the platform.
+import { AuthzModule } from '../authz/authz.module';
+import { PdpSpaceMemberRepo } from '../authz/pdp-space-member.repo';
+import { PdpPagePermissionRepo } from '../authz/pdp-page-permission.repo';
 
 @Global()
 @Module({
@@ -67,6 +72,7 @@ import { normalizePostgresUrl } from '../common/helpers';
         },
       }),
     }),
+    AuthzModule,
   ],
   providers: [
     MigrationService,
@@ -75,9 +81,10 @@ import { normalizePostgresUrl } from '../common/helpers';
     GroupRepo,
     GroupUserRepo,
     SpaceRepo,
-    SpaceMemberRepo,
+    // CCC rebind: authorization decisions come from the platform PDP, not local tables.
+    { provide: SpaceMemberRepo, useClass: PdpSpaceMemberRepo },
     PageRepo,
-    PagePermissionRepo,
+    { provide: PagePermissionRepo, useClass: PdpPagePermissionRepo },
     PageTransclusionsRepo,
     PageTransclusionReferencesRepo,
     PageHistoryRepo,
