@@ -145,6 +145,15 @@ export class CollaborationGateway {
     return this.redisSync?.handleEvent(eventName, documentName, payload);
   }
 
+  /**
+   * CCC integration seam (UPSTREAM_MODIFICATIONS.md): force-disconnect a user's live sessions on a
+   * page, routed to the doc-owning node via RedisSync. Thin pass-through — the caller (authz/) owns
+   * the authorization decision (a PDP re-check) before invoking this.
+   */
+  forceDisconnectUserFromPage(pageId: string, userId: string) {
+    return this.handleYjsEvent('forceDisconnect', `page.${pageId}`, { userId });
+  }
+
   openDirectConnection(documentName: string, context?: any) {
     return this.hocuspocus.openDirectConnection(documentName, context);
   }

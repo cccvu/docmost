@@ -21,6 +21,18 @@ export class CollaborationHandler {
 
   getHandlers(hocuspocus: Hocuspocus) {
     return {
+      // CCC integration seam (UPSTREAM_MODIFICATIONS.md): force-disconnect a user's live sessions on a
+      // document when their access is revoked mid-session. Runs on the doc-owning node (RedisSync
+      // routes here); pure connection logic — the authorization decision is made in apps/server/src/authz/.
+      forceDisconnect: async (documentName: string, payload: { userId: string }) => {
+        const doc = hocuspocus.documents.get(documentName);
+        if (!doc) return;
+        for (const connection of doc.getConnections()) {
+          if (connection.context?.user?.id === payload.userId) {
+            connection.close();
+          }
+        }
+      },
       alterState: async (documentName: string, payload: { pageId: string }) => {
         // dummy
         // this.logger.log('Processing', documentName, payload);
