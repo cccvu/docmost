@@ -11,9 +11,9 @@ import { PlatformAuthzClient } from './platform-authz.client';
  * CCC authorization integration — NOT upstream Docmost code.
  *
  * PDP-backed PagePermissionRepo: page view/edit DECISIONS come from the platform (SpiceDB). Page
- * restrictions are not yet mirrored (creating them is EE-gated / a future feature), so
- * `hasAnyRestriction` is false and access derives from the space role via the PDP `page` permissions.
- * Non-overridden methods delegate to upstream.
+ * restrictions ARE mirrored now (platform projects page_access → `page:#restricted` and
+ * page_permissions → `#viewer`/`#editor`), so `hasAnyRestriction` reflects the schema's `locked`
+ * permission (page or an ancestor is restricted). Non-overridden methods delegate to upstream.
  */
 @Injectable()
 export class PdpPagePermissionRepo extends PagePermissionRepo {
@@ -38,11 +38,15 @@ export class PdpPagePermissionRepo extends PagePermissionRepo {
     userId: string,
     pageId: string,
   ): Promise<{ hasAnyRestriction: boolean; canAccess: boolean; canEdit: boolean }> {
-    const [canAccess, canEdit] = await this.authz.checkBulk(this.subject(userId), [
+    // `locked` (schema: restricted + parent->locked) tells upstream whether to trust the PDP's page
+    // decision (restricted page) or fall back to space CASL (unrestricted). The PDP's view/edit
+    // already fold restriction in, so canAccess/canEdit are correct either way.
+    const [canAccess, canEdit, locked] = await this.authz.checkBulk(this.subject(userId), [
       { permission: 'view', resourceType: 'page', resourceId: pageId },
       { permission: 'edit', resourceType: 'page', resourceId: pageId },
+      { permission: 'locked', resourceType: 'page', resourceId: pageId },
     ]);
-    return { hasAnyRestriction: false, canAccess, canEdit };
+    return { hasAnyRestriction: locked, canAccess, canEdit };
   }
 
   override async filterAccessiblePageIds(opts: {

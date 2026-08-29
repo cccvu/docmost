@@ -14,10 +14,12 @@ describe('PDP repo primitives — deny propagation (leakage backbone)', () => {
   const CONF_PAGE = 'conf-page';
   const CONF_SPACE = 'conf-space';
   const READONLY_PAGE = 'read-only-page';
+  const LOCKED_PAGE = 'locked-page';
   const BANNED_USER = 'banned-user';
 
   // A stub platform client modelling: the confidential page/space is denied to everyone; a
-  // read-only page grants view but not edit; the banned user is not a recipient anywhere.
+  // read-only page grants view but not edit; LOCKED_PAGE is restricted (locked=true) but viewable;
+  // the banned user is not a recipient anywhere.
   const denies = (rt: string, rid: string) =>
     (rt === 'page' && rid === CONF_PAGE) || (rt === 'space' && rid === CONF_SPACE);
 
@@ -25,6 +27,7 @@ describe('PDP repo primitives — deny propagation (leakage backbone)', () => {
     check: jest.fn(async (_s: any, _p: string, rt: string, rid: string) => !denies(rt, rid)),
     checkBulk: jest.fn(async (_s: any, checks: Array<{ permission: string; resourceType: string; resourceId: string }>) =>
       checks.map((c) => {
+        if (c.permission === 'locked') return c.resourceId === LOCKED_PAGE; // only LOCKED_PAGE is restricted
         if (denies(c.resourceType, c.resourceId)) return false;
         if (c.permission === 'edit' && c.resourceId === READONLY_PAGE) return false;
         return true;
@@ -88,6 +91,16 @@ describe('PDP repo primitives — deny propagation (leakage backbone)', () => {
       hasAnyRestriction: false,
       canAccess: false,
       canEdit: false,
+    });
+  });
+
+  it('canUserEditPage reports hasAnyRestriction=true for a restricted (locked) page', async () => {
+    // A restricted page the user CAN view+edit via a local grant: upstream then trusts the PDP
+    // decision instead of falling back to space CASL (closes the restricted-page edit fail-open).
+    expect(await pageRepo.canUserEditPage('u1', LOCKED_PAGE)).toEqual({
+      hasAnyRestriction: true,
+      canAccess: true,
+      canEdit: true,
     });
   });
 
