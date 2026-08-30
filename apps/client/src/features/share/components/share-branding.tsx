@@ -15,6 +15,9 @@ export default function ShareBranding() {
         component={Link}
         to="/"
         aria-label={`${getAppName()} home`}
+        // Paper doesn't carry Mantine's focus ring by default; opt in so keyboard
+        // focus on this link matches the app's ring, not just the UA outline.
+        className="mantine-focus-auto"
         withBorder
         shadow="xs"
         radius="xl"

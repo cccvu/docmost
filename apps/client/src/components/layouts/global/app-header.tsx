@@ -89,10 +89,13 @@ export function AppHeader() {
             className={classes.brand}
             aria-label={`${getAppName()} home`}
           >
-            <Box hiddenFrom="sm" className={classes.brandIcon}>
+            {/* Compact V icon up to md; the full lockup + wordmark only on
+                desktop (≥992px) where the header has room — avoids crowding the
+                search/actions at the sm breakpoint. */}
+            <Box hiddenFrom="md" className={classes.brandIcon}>
               <Brand variant="icon" iconHeight={24} />
             </Box>
-            <Box visibleFrom="sm" className={classes.brandIcon}>
+            <Box visibleFrom="md" className={classes.brandIcon}>
               <Brand variant="lockup" appName={getAppName()} lockupHeight={22} />
             </Box>
           </Link>

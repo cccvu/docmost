@@ -1,4 +1,5 @@
 import { Group, Text, useComputedColorScheme } from "@mantine/core";
+import clsx from "clsx";
 import classes from "./brand-logo.module.css";
 import vuCccBlack from "./assets/vu-ccc-black.png";
 import vuCccWhite from "./assets/vu-ccc-white.png";
@@ -36,10 +37,6 @@ interface BrandProps {
   className?: string;
 }
 
-function cx(...values: Array<string | false | undefined>) {
-  return values.filter(Boolean).join(" ");
-}
-
 export function Brand({
   variant = "lockup",
   appName,
@@ -56,7 +53,7 @@ export function Brand({
       <img
         src={vIcon}
         alt={alt}
-        className={cx(classes.vIcon, className)}
+        className={clsx(classes.vIcon, className)}
         style={{ height: iconHeight }}
       />
     );
@@ -64,7 +61,7 @@ export function Brand({
 
   if (variant === "compact") {
     return (
-      <Group gap={8} wrap="nowrap" className={cx(classes.root, className)}>
+      <Group gap={8} wrap="nowrap" className={clsx(classes.root, className)}>
         <img
           src={vIcon}
           alt={alt}
@@ -82,7 +79,7 @@ export function Brand({
 
   // lockup
   return (
-    <Group gap="sm" wrap="nowrap" className={cx(classes.root, className)}>
+    <Group gap="sm" wrap="nowrap" className={clsx(classes.root, className)}>
       <img
         src={lockupSrc}
         alt={alt}

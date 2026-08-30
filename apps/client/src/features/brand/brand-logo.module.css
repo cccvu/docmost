@@ -2,11 +2,19 @@
   align-items: center;
 }
 
-.lockup,
-.vIcon {
-  width: auto;
+/* Preserve the gold Dimensional V — never invert or recolor the artwork.
+   aspect-ratio reserves the box from the set height so the mark doesn't reflow
+   when the (non-inlined) PNG decodes. */
+.lockup {
   display: block;
-  /* Preserve the gold Dimensional V — never invert or recolor the artwork. */
+  width: auto;
+  aspect-ratio: 720 / 109;
+}
+
+.vIcon {
+  display: block;
+  width: auto;
+  aspect-ratio: 178 / 128;
 }
 
 .divider {
