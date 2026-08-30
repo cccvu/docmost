@@ -1,6 +1,7 @@
 import {
   Anchor,
   Badge,
+  Button,
   createTheme,
   CSSVariablesResolver,
   defaultVariantColorsResolver,
@@ -99,9 +100,9 @@ const red: MantineColorsTuple = [
   "#93151b",
 ];
 
-// Info blue — retained (Zinc-neutral cool blue) so the shipped components that
-// hard-code color="blue" (invites table, comment tabs, search filters) stay
-// brand-controlled instead of falling back to stock Mantine blue.
+// Info blue — the original Docmost blue tuple, retained so the shipped
+// components that hard-code color="blue" (invites table, comment tabs, search
+// filters) stay brand-controlled instead of falling back to stock Mantine blue.
 const blue: MantineColorsTuple = [
   "#e7f3ff",
   "#d0e4ff",
@@ -159,6 +160,15 @@ export const theme = createTheme({
       defaultProps: {
         events: { hover: true, focus: true, touch: false },
       },
+    }),
+    // A bare <Button> (no variant/color) renders filled by default, but Mantine
+    // only emits `--button-bg` when `color || variant` is truthy — so a bare
+    // button's background falls back to `--mantine-primary-color-filled` and
+    // never reaches the variantColorResolver's inverted `--brand-primary-bg`.
+    // Making the default variant explicit fixes that: `--button-bg` is emitted,
+    // so bare primary buttons (auth "Sign In", etc.) invert correctly in dark.
+    Button: Button.extend({
+      defaultProps: { variant: "filled" },
     }),
     // Links always underline: with the near-black primary, the derived anchor
     // color is close to body text, so color alone is not a sufficient link cue
