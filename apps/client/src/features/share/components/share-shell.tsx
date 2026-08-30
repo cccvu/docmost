@@ -43,6 +43,8 @@ import { ShareSearchSpotlight } from "@/features/search/components/share-search-
 import { shareSearchSpotlight } from "@/features/search/constants";
 import ShareBranding from '@/features/share/components/share-branding.tsx';
 import { MAIN_CONTENT_ID, SkipToMain } from "@/components/ui/skip-to-main.tsx";
+import { currentUserAtom } from "@/features/user/atoms/current-user-atom.ts";
+import { PublicAuthButtons } from "@/features/public/components/public-auth-buttons.tsx";
 
 const MemoizedSharedTree = React.memo(SharedTree);
 
@@ -52,6 +54,7 @@ export default function ShareShell({
   children: React.ReactNode;
 }) {
   const { t } = useTranslation();
+  const currentUser = useAtomValue(currentUserAtom);
   const [mobileOpened] = useAtom(mobileSidebarAtom);
   const [desktopOpened] = useAtom(desktopSidebarAtom);
   const toggleMobile = useToggleSidebar(mobileSidebarAtom);
@@ -231,6 +234,10 @@ export default function ShareShell({
             </>
 
             <ThemeToggle />
+
+            {/* Anonymous readers get a Log in / Sign up entry; hidden for a signed-in reader
+                (best-effort — the share shell renders outside UserProvider). */}
+            {!currentUser?.user && <PublicAuthButtons />}
           </Group>
         </Group>
       </AppShell.Header>

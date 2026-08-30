@@ -16,6 +16,7 @@ export default defineConfig(({ mode }) => {
     BILLING_TRIAL_DAYS,
     POSTHOG_HOST,
     POSTHOG_KEY,
+    PLATFORM_URL,
   } = loadEnv(mode, envPath, "");
 
   return {
@@ -59,6 +60,12 @@ export default defineConfig(({ mode }) => {
         "/api": {
           target: APP_URL,
           changeOrigin: false,
+        },
+        // Gated registration (request-access) lives on the platform service. In dev, forward /auth
+        // to it so the isolated platformApi call reaches it same-origin.
+        "/auth": {
+          target: PLATFORM_URL || "http://localhost:4000",
+          changeOrigin: true,
         },
         "/socket.io": {
           target: APP_URL,

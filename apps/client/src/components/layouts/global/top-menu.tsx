@@ -33,6 +33,7 @@ import useAuth from "@/features/auth/hooks/use-auth.ts";
 import { CustomAvatar } from "@/components/ui/custom-avatar.tsx";
 import { useTranslation } from "react-i18next";
 import { AvatarIconType } from "@/features/attachments/types/attachment.types.ts";
+import { PublicAuthButtons } from "@/features/public/components/public-auth-buttons.tsx";
 
 export default function TopMenu() {
   const { t } = useTranslation();
@@ -52,7 +53,9 @@ export default function TopMenu() {
   ] = useDisclosure(false);
 
   if (!user || !workspace) {
-    return <></>;
+    // Signed-out (e.g. an anonymous visitor who reached an app route): offer Log in / Sign up
+    // instead of a blank user menu.
+    return <PublicAuthButtons />;
   }
 
   return (

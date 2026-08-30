@@ -6,6 +6,7 @@ const APP_ROUTE = {
   AUTH: {
     LOGIN: "/login",
     SIGNUP: "/signup",
+    REQUEST_ACCESS: "/request-access",
     SETUP: "/setup/register",
     FORGOT_PASSWORD: "/forgot-password",
     PASSWORD_RESET: "/password-reset",
@@ -52,6 +53,36 @@ export function safeRedirectPath(input: unknown): string | null {
 export function getPostLoginRedirect(): string {
   const params = new URLSearchParams(window.location.search);
   return safeRedirectPath(params.get("redirect")) ?? APP_ROUTE.HOME;
+}
+
+/**
+ * Paths that a signed-out visitor is allowed to sit on WITHOUT being bounced to /login. The public
+ * front page ("/") and the request-access page render for anonymous users; the axios 401 interceptor
+ * consults this so it never hard-redirects away from them. Single source of truth shared by the
+ * router and the interceptor so the two can never drift.
+ */
+export function isPublicRoutePath(pathname: string): boolean {
+  return (
+    pathname === "/" ||
+    pathname.startsWith(APP_ROUTE.AUTH.REQUEST_ACCESS)
+  );
+}
+
+/**
+ * Build a login href that returns the visitor to where they are now (e.g. a public /share page, or
+ * "/"). Reuses the same-origin {@link safeRedirectPath} validator; the login flow already consumes
+ * `?redirect=` via {@link getPostLoginRedirect}, so this needs no login-side change.
+ */
+export function loginHrefWithReturn(): string {
+  const current = safeRedirectPath(
+    window.location.pathname + window.location.search,
+  );
+  // "/" and "/home" both land the signed-in user on /home already, so no redirect is needed there.
+  if (!current || current === "/" || current === APP_ROUTE.HOME) {
+    return APP_ROUTE.AUTH.LOGIN;
+  }
+  const params = new URLSearchParams({ redirect: current });
+  return `${APP_ROUTE.AUTH.LOGIN}?${params.toString()}`;
 }
 
 /**

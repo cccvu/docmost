@@ -1,5 +1,5 @@
 import axios, { AxiosInstance } from "axios";
-import APP_ROUTE from "@/lib/app-route.ts";
+import APP_ROUTE, { isPublicRoutePath } from "@/lib/app-route.ts";
 import { isCloud } from "@/lib/config.ts";
 
 const api: AxiosInstance = axios.create({
@@ -33,8 +33,12 @@ api.interceptors.response.use(
           if (url === "/api/auth/collab-token") return;
           if (window.location.pathname.startsWith("/share/")) return;
 
-          // Handle unauthorized error
-          redirectToLogin();
+          // On a public route (front page / request-access), a 401 from an optional probe (e.g. the
+          // anonymous `/users/me` auth check) must NOT hard-redirect to /login — let it reject so the
+          // caller can render the public experience. Every other (authed) path still hits the wall.
+          if (!isPublicRoutePath(window.location.pathname)) {
+            redirectToLogin();
+          }
           break;
         }
         case 403:

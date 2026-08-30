@@ -1,4 +1,5 @@
 import { Test } from '@nestjs/testing';
+import { Kysely, PostgresDialect, CamelCasePlugin } from 'kysely';
 import { FavoriteService } from '../../core/favorite/services/favorite.service';
 import { FavoriteRepo, FavoriteType } from '@docmost/db/repos/favorite/favorite.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
@@ -7,6 +8,7 @@ import { PdpPagePermissionRepo } from '../pdp-page-permission.repo';
 import { PdpSpaceMemberRepo } from '../pdp-space-member.repo';
 import { PdpSearchService } from '../search/pdp-search.service';
 import { SearchService } from '../../core/search/search.service';
+import { PublicDiscoveryRepo } from '../public-discovery/public-discovery.repo';
 
 /**
  * CCC authorization integration test (fork compatibility suite) — per-vector leakage coverage (§8/§9,
@@ -132,5 +134,32 @@ describe('Search is filter-then-retrieve (Phase 5) — PdpSearchService override
 
   it('PdpSearchService is a SearchService (the rebind is type-compatible)', () => {
     expect(PdpSearchService.prototype).toBeInstanceOf(SearchService);
+  });
+});
+
+describe('Anonymous public-content discovery vector (issue #26) — restricted pages never enumerated', () => {
+  // The signed-out front-page list is a NEW anonymous surface (not a PDP repo override). Its leakage
+  // gate lives in a single SQL filter; the deep matrix is in
+  // authz/public-discovery/public-discovery.service.spec.ts. This documents the vector in the leakage
+  // suite so it is never implicit: the enumeration must exclude restricted pages and list only
+  // owner-opted, discoverable shares. Compiled offline (no DB connection), mirroring the app plugin.
+  const db = new Kysely<any>({
+    dialect: new PostgresDialect({ pool: {} as any }),
+    plugins: [new CamelCasePlugin()],
+  });
+  const sql = new PublicDiscoveryRepo(db as any)
+    .buildListQuery('w1')
+    .compile()
+    .sql.toLowerCase();
+
+  it('excludes any page that is restricted or under a restricted ancestor', () => {
+    expect(sql).toContain('with recursive');
+    expect(sql).toContain('page_access');
+    expect(sql).toContain('not exists');
+  });
+
+  it('lists only owner-opted discoverable shares (search_indexing) with sharing enabled', () => {
+    expect(sql).toContain('search_indexing');
+    expect(sql.split("->> 'disabled'").length - 1).toBe(2);
   });
 });

@@ -1,5 +1,7 @@
-import { Navigate, Route, Routes } from "react-router-dom";
+import { Route, Routes } from "react-router-dom";
 import SetupWorkspace from "@/pages/auth/setup-workspace.tsx";
+import RootGate from "@/features/public/components/root-gate.tsx";
+import RequestAccess from "@/pages/public/request-access.tsx";
 import LoginPage from "@/pages/auth/login";
 import Home from "@/pages/dashboard/home";
 import Page from "@/pages/page/page";
@@ -56,8 +58,9 @@ export default function App() {
   return (
     <>
       <Routes>
-        <Route index element={<Navigate to="/home" />} />
+        <Route index element={<RootGate />} />
         <Route path={"/login"} element={<LoginPage />} />
+        <Route path={"/request-access"} element={<RequestAccess />} />
         <Route path={"/invites/:invitationId"} element={<InviteSignup />} />
         <Route path={"/forgot-password"} element={<ForgotPassword />} />
         <Route path={"/password-reset"} element={<PasswordReset />} />
