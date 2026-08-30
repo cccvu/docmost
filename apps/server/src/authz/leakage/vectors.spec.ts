@@ -5,6 +5,8 @@ import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo'
 import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
 import { PdpPagePermissionRepo } from '../pdp-page-permission.repo';
 import { PdpSpaceMemberRepo } from '../pdp-space-member.repo';
+import { PdpSearchService } from '../search/pdp-search.service';
+import { SearchService } from '../../core/search/search.service';
 
 /**
  * CCC authorization integration test (fork compatibility suite) — per-vector leakage coverage (§8/§9,
@@ -111,5 +113,24 @@ describe('Indirect-leakage vectors — §8 coverage matrix (every vector maps to
       'space.getUserSpaceIds',
       'space.getUserSpaceRoles',
     ]);
+  });
+});
+
+describe('Search is filter-then-retrieve (Phase 5) — PdpSearchService overrides the entry points', () => {
+  const searchOwn = new Set(Object.getOwnPropertyNames(PdpSearchService.prototype));
+
+  // Search routes its page post-filter through `page.filterAccessiblePageIds` (rows above), but the
+  // upstream SearchService applies LIMIT/OFFSET *before* that gate (retrieve-then-filter). The fix lives
+  // in PdpSearchService, bound to the SearchService token in core/search/search.module.ts (seam #5). If
+  // an override is dropped, search silently reverts to under-returning truncation — so assert both.
+  it.each(['searchPage', 'searchSuggestions'])(
+    'PdpSearchService overrides %s',
+    (method) => {
+      expect(searchOwn.has(method)).toBe(true);
+    },
+  );
+
+  it('PdpSearchService is a SearchService (the rebind is type-compatible)', () => {
+    expect(PdpSearchService.prototype).toBeInstanceOf(SearchService);
   });
 });

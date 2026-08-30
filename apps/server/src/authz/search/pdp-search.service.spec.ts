@@ -1,0 +1,264 @@
+import { PdpSearchService } from './pdp-search.service';
+
+/**
+ * CCC authorization integration test (fork compatibility suite) — permission-aware search is
+ * **filter-then-retrieve** (architecture D9 / §8 search row / §9 "authorized-k-under-truncation, no
+ * count/score side-channel"). These prove the subclass:
+ *   - returns a FULL page of authorized results even when higher-ranked candidates are all denied
+ *     (the truncation fix — upstream retrieve-then-filter would under-return here);
+ *   - never surfaces a denied/restricted page (the §8 absence guarantee, now structural);
+ *   - fails CLOSED when the PDP gate denies everything (platform down → empty);
+ *   - paginates stably over the AUTHORIZED set (no skip/dup across pages);
+ *   - never silently truncates — a hit on the candidate scan ceiling is logged.
+ *
+ * The FTS query itself is stubbed (a chainable db mock that windows a fixed candidate stream); the
+ * authorization decision is the `filterAccessiblePageIds` gate (the PDP-rebound repo), stubbed to deny
+ * a known set. No DB, no containers — pure unit specs, mirroring authz/leakage/primitives.spec.ts.
+ */
+
+type Row = { id: string; rank: number; title: string; highlight: string };
+
+const mkRows = (ids: string[]): Row[] =>
+  ids.map((id, i) => ({
+    id,
+    rank: 1 - i / 1000,
+    title: `title-${id}`,
+    highlight: `hi\n${id}`,
+  }));
+
+/**
+ * A chainable Kysely-like mock. Every builder method returns the same proxy; `selectFrom` resets the
+ * active table + window, `limit`/`offset` capture the window, and `execute` returns
+ * `candidatesFor(table).slice(offset, offset+limit)` — i.e. it models a rank-ordered candidate stream.
+ */
+function makeDb(candidatesFor: (table: string) => Row[]) {
+  let table = '';
+  let _limit = Number.MAX_SAFE_INTEGER;
+  let _offset = 0;
+  const proxy: any = new Proxy(
+    {},
+    {
+      get(_t, prop: string) {
+        if (prop === 'selectFrom')
+          return (t: string) => {
+            table = t;
+            _limit = Number.MAX_SAFE_INTEGER;
+            _offset = 0;
+            return proxy;
+          };
+        if (prop === 'limit')
+          return (n: number) => {
+            _limit = n;
+            return proxy;
+          };
+        if (prop === 'offset')
+          return (n: number) => {
+            _offset = n;
+            return proxy;
+          };
+        if (prop === 'execute')
+          return async () =>
+            candidatesFor(table).slice(_offset, _offset + _limit);
+        // select / where / $if / orderBy / ... → keep chaining (callback args are never invoked).
+        return (..._args: any[]) => proxy;
+      },
+    },
+  );
+  return proxy;
+}
+
+const build = (opts: {
+  pageCandidates: Row[];
+  denied: Set<string>;
+  userSpaceIds?: string[];
+}) => {
+  const filterAccessiblePageIds = jest.fn(
+    async ({ pageIds }: { pageIds: string[] }) =>
+      pageIds.filter((id) => !opts.denied.has(id)),
+  );
+  const db = makeDb((table) => (table === 'pages' ? opts.pageCandidates : []));
+  const pageRepo = { withSpace: () => ({}) };
+  const shareRepo = {};
+  const spaceMemberRepo = {
+    getUserSpaceIdsQuery: () => ({}),
+    getUserSpaceIds: jest.fn(async () => opts.userSpaceIds ?? ['space-1']),
+  };
+  const pagePermissionRepo = { filterAccessiblePageIds };
+  const service = new PdpSearchService(
+    db as any,
+    pageRepo as any,
+    shareRepo as any,
+    spaceMemberRepo as any,
+    pagePermissionRepo as any,
+  );
+  return { service, filterAccessiblePageIds, spaceMemberRepo };
+};
+
+describe('PdpSearchService — filter-then-retrieve (searchPage)', () => {
+  const WS = 'ws-1';
+  const USER = 'u1';
+
+  it('returns a FULL page of authorized results even when the top-ranked candidates are all denied (authorized-k-under-truncation)', async () => {
+    // 30 denied pages rank ABOVE 40 authorized ones. Upstream (limit-before-filter) would return 0 for
+    // limit=25; we must return 25 authorized rows.
+    const denied = new Set(Array.from({ length: 30 }, (_, i) => `d${i}`));
+    const pageCandidates = mkRows([
+      ...Array.from({ length: 30 }, (_, i) => `d${i}`),
+      ...Array.from({ length: 40 }, (_, i) => `a${i}`),
+    ]);
+    const { service } = build({ pageCandidates, denied });
+
+    const { items } = await service.searchPage(
+      { query: 'foo', limit: 25 } as any,
+      { userId: USER, workspaceId: WS },
+    );
+
+    expect(items).toHaveLength(25);
+    expect(items.map((i: any) => i.id)).toEqual(
+      Array.from({ length: 25 }, (_, i) => `a${i}`),
+    );
+    expect(items.every((i: any) => !denied.has(i.id))).toBe(true);
+  });
+
+  it('never surfaces a denied/restricted page in results (§8 absence)', async () => {
+    const CONF = 'conf-page';
+    const denied = new Set([CONF]);
+    const pageCandidates = mkRows(['a', CONF, 'b', 'c']);
+    const { service } = build({ pageCandidates, denied });
+
+    const { items } = await service.searchPage(
+      { query: 'foo', limit: 25 } as any,
+      { userId: USER, workspaceId: WS },
+    );
+
+    expect(items.map((i: any) => i.id)).toEqual(['a', 'b', 'c']);
+    expect(items.map((i: any) => i.id)).not.toContain(CONF);
+  });
+
+  it('fails CLOSED — the PDP gate denying everything (platform down) yields empty results, not the raw candidates', async () => {
+    const pageCandidates = mkRows(['a', 'b', 'c']);
+    const { service, filterAccessiblePageIds } = build({
+      pageCandidates,
+      denied: new Set(),
+    });
+    // Simulate the fail-closed client: filterAccessiblePageIds returns [] on outage.
+    filterAccessiblePageIds.mockResolvedValue([]);
+
+    const { items } = await service.searchPage(
+      { query: 'foo', limit: 25 } as any,
+      { userId: USER, workspaceId: WS },
+    );
+
+    expect(items).toEqual([]);
+  });
+
+  it('paginates stably over the AUTHORIZED set (offset applies to authorized results — no skip/dup)', async () => {
+    const denied = new Set(Array.from({ length: 30 }, (_, i) => `d${i}`));
+    const pageCandidates = mkRows([
+      ...Array.from({ length: 30 }, (_, i) => `d${i}`),
+      ...Array.from({ length: 40 }, (_, i) => `a${i}`),
+    ]);
+    const { service } = build({ pageCandidates, denied });
+
+    const page1 = (
+      await service.searchPage({ query: 'foo', limit: 25, offset: 0 } as any, {
+        userId: USER,
+        workspaceId: WS,
+      })
+    ).items.map((i: any) => i.id);
+    const page2 = (
+      await service.searchPage({ query: 'foo', limit: 25, offset: 25 } as any, {
+        userId: USER,
+        workspaceId: WS,
+      })
+    ).items.map((i: any) => i.id);
+
+    expect(page1).toEqual(Array.from({ length: 25 }, (_, i) => `a${i}`));
+    // 40 authorized total → page 2 is a25..a39 (15 rows), contiguous with page 1, no overlap.
+    expect(page2).toEqual(Array.from({ length: 15 }, (_, i) => `a${25 + i}`));
+    expect(page1.filter((id) => page2.includes(id))).toEqual([]);
+  });
+
+  it('never silently truncates — hitting the candidate scan ceiling logs a warning', async () => {
+    // 1200 candidates, ALL denied → the loop scans up to MAX_CANDIDATES (1024) then stops empty + warns.
+    const ids = Array.from({ length: 1200 }, (_, i) => `d${i}`);
+    const denied = new Set(ids);
+    const { service } = build({ pageCandidates: mkRows(ids), denied });
+    const warn = jest.spyOn((service as any).logger, 'warn').mockImplementation();
+
+    const { items } = await service.searchPage(
+      { query: 'foo', limit: 25 } as any,
+      { userId: USER, workspaceId: WS },
+    );
+
+    expect(items).toEqual([]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toMatch(/scan cap/i);
+  });
+
+  it('short-circuits an empty query without touching the PDP', async () => {
+    const { service, filterAccessiblePageIds } = build({
+      pageCandidates: mkRows(['a']),
+      denied: new Set(),
+    });
+    const { items } = await service.searchPage({ query: '' } as any, {
+      userId: USER,
+      workspaceId: WS,
+    });
+    expect(items).toEqual([]);
+    expect(filterAccessiblePageIds).not.toHaveBeenCalled();
+  });
+
+  it('the anonymous / public-share path (no userId) does not run the per-principal PDP loop', async () => {
+    // No userId, no shareId, no spaceId → the inherited upstream path returns empty and the loop
+    // (filterAccessiblePageIds) is never invoked.
+    const { service, filterAccessiblePageIds } = build({
+      pageCandidates: mkRows(['a', 'b']),
+      denied: new Set(),
+    });
+
+    const { items } = await service.searchPage({ query: 'foo' } as any, {
+      workspaceId: WS,
+    });
+
+    expect(items).toEqual([]);
+    expect(filterAccessiblePageIds).not.toHaveBeenCalled();
+  });
+});
+
+describe('PdpSearchService — filter-then-retrieve (searchSuggestions)', () => {
+  const WS = 'ws-1';
+  const USER = 'u1';
+
+  it('page suggestions exclude denied pages and stay complete up to the limit', async () => {
+    const denied = new Set(['d0', 'd1', 'd2']);
+    const pageCandidates = mkRows(['d0', 'd1', 'd2', 'p0', 'p1', 'p2', 'p3']);
+    const { service } = build({ pageCandidates, denied });
+
+    const { pages } = await service.searchSuggestions(
+      { query: 'p', includePages: true, limit: 3 } as any,
+      USER,
+      WS,
+    );
+
+    expect(pages.map((p: any) => p.id)).toEqual(['p0', 'p1', 'p2']);
+    expect(pages.map((p: any) => p.id)).not.toContain('d0');
+  });
+
+  it('returns no page suggestions when the user has no accessible spaces', async () => {
+    const { service, filterAccessiblePageIds } = build({
+      pageCandidates: mkRows(['p0']),
+      denied: new Set(),
+      userSpaceIds: [],
+    });
+
+    const { pages } = await service.searchSuggestions(
+      { query: 'p', includePages: true } as any,
+      USER,
+      WS,
+    );
+
+    expect(pages).toEqual([]);
+    expect(filterAccessiblePageIds).not.toHaveBeenCalled();
+  });
+});
