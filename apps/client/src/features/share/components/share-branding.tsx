@@ -1,16 +1,34 @@
-import { Affix, Button } from "@mantine/core";
+import { Affix, Paper } from "@mantine/core";
+import { Link } from "react-router-dom";
+import { Brand } from "@/features/brand/brand-logo.tsx";
+import { getAppName } from "@/lib/config.ts";
 
+/**
+ * Subtle brand affix on anonymous shared pages. Replaces the upstream
+ * "Powered by Docmost" promo (a removable cosmetic trademark) with the CCC mark
+ * linking home — an on-brand way in for anonymous readers.
+ */
 export default function ShareBranding() {
   return (
     <Affix position={{ bottom: 20, right: 20 }}>
-      <Button
-        variant="default"
-        component="a"
-        target="_blank"
-        href="https://docmost.com?ref=public-share"
+      <Paper
+        component={Link}
+        to="/"
+        aria-label={`${getAppName()} home`}
+        withBorder
+        shadow="xs"
+        radius="xl"
+        px="sm"
+        py={6}
+        style={{
+          display: "flex",
+          alignItems: "center",
+          textDecoration: "none",
+          color: "inherit",
+        }}
       >
-        Powered by Docmost
-      </Button>
+        <Brand variant="compact" appName={getAppName()} iconHeight={18} />
+      </Paper>
     </Affix>
   );
 }

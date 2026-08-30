@@ -5,6 +5,7 @@ import { ThemeToggle } from "@/components/theme-toggle.tsx";
 import { MAIN_CONTENT_ID, SkipToMain } from "@/components/ui/skip-to-main.tsx";
 import { useWorkspacePublicDataQuery } from "@/features/workspace/queries/workspace-query.ts";
 import { getAppName } from "@/lib/config.ts";
+import { Brand } from "@/features/brand/brand-logo.tsx";
 import { PublicAuthButtons } from "./public-auth-buttons.tsx";
 
 /**
@@ -35,12 +36,7 @@ export function PublicShell({ children }: { children: ReactNode }) {
               }}
             >
               {/* decorative — the workspace name beside it carries the accessible name */}
-              <img
-                src="/icons/favicon-32x32.png"
-                alt=""
-                width={24}
-                height={24}
-              />
+              <Brand variant="icon" iconHeight={26} />
               <Text size="lg" fw={600} lineClamp={1} style={{ userSelect: "none" }}>
                 {name}
               </Text>

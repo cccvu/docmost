@@ -3,11 +3,11 @@ import {
   Badge,
   Box,
   Group,
-  Text,
   Tooltip,
   UnstyledButton,
 } from "@mantine/core";
 import classes from "./app-header.module.css";
+import { Brand } from "@/features/brand/brand-logo";
 import React from "react";
 import TopMenu from "@/components/layouts/global/top-menu.tsx";
 import { Link, useLocation } from "react-router-dom";
@@ -23,7 +23,7 @@ import { useToggleSidebar } from "@/components/layouts/global/hooks/hooks/use-to
 import SidebarToggle from "@/components/ui/sidebar-toggle-button.tsx";
 import { useTranslation } from "react-i18next";
 import useTrial from "@/ee/hooks/use-trial.tsx";
-import { isCloud } from "@/lib/config.ts";
+import { getAppName, isCloud } from "@/lib/config.ts";
 import {
   SearchControl,
   SearchMobileControl,
@@ -84,23 +84,17 @@ export function AppHeader() {
             />
           </Tooltip>
 
-          <Link to="/home" className={classes.brand} aria-label="Docmost">
+          <Link
+            to="/home"
+            className={classes.brand}
+            aria-label={`${getAppName()} home`}
+          >
             <Box hiddenFrom="sm" className={classes.brandIcon}>
-              <img
-                src="/icons/favicon-32x32.png"
-                alt="Docmost"
-                width={22}
-                height={22}
-              />
+              <Brand variant="icon" iconHeight={24} />
             </Box>
-            <Text
-              size="lg"
-              fw={600}
-              style={{ userSelect: "none" }}
-              visibleFrom="sm"
-            >
-              Docmost
-            </Text>
+            <Box visibleFrom="sm" className={classes.brandIcon}>
+              <Brand variant="lockup" appName={getAppName()} lockupHeight={22} />
+            </Box>
           </Link>
 
           <Group ml={50} gap={5} className={classes.links} visibleFrom="sm">

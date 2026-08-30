@@ -12,7 +12,7 @@ export function PublicFooter({ year }: { year: number }) {
       <Divider mb="lg" />
       <Group justify="space-between" wrap="wrap" gap="sm">
         <Text size="sm" c="dimmed">
-          © {year} {getAppName()}
+          © {year} {getAppName()} · Vanderbilt University
         </Text>
         <Group gap="lg">
           <Anchor component={Link} to={loginHrefWithReturn()} size="sm">
@@ -20,6 +20,17 @@ export function PublicFooter({ year }: { year: number }) {
           </Anchor>
           <Anchor component={Link} to={APP_ROUTE.AUTH.REQUEST_ACCESS} size="sm">
             {t("Request access")}
+          </Anchor>
+          {/* AGPL-3.0 §13: a prominent, standing offer of the Corresponding
+              Source for this network-served, modified Docmost. Keep this link. */}
+          <Anchor
+            href="https://github.com/cccvu/wiki-v2"
+            target="_blank"
+            rel="noreferrer"
+            size="sm"
+            c="dimmed"
+          >
+            {t("Source")}
           </Anchor>
         </Group>
       </Group>

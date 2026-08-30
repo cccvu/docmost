@@ -1,10 +1,10 @@
 {
-  "name": "Docmost",
-  "short_name": "Docmost",
+  "name": "CCC Wiki",
+  "short_name": "CCC Wiki",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#222",
-  "theme_color": "#222",
+  "background_color": "#18181b",
+  "theme_color": "#18181b",
   "icons": [
     {
       "src": "icons/favicon-16x16.png",
@@ -17,9 +17,14 @@
       "sizes": "32x32"
     },
     {
+      "src": "icons/apple-touch-icon.png",
+      "type": "image/png",
+      "sizes": "180x180"
+    },
+    {
       "src": "icons/app-icon-192x192.png",
       "type": "image/png",
-      "sizes": "180x180 192x192"
+      "sizes": "192x192"
     },
     {
       "src": "icons/app-icon-512x512.png",

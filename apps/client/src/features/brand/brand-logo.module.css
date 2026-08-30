@@ -1,0 +1,25 @@
+.root {
+  align-items: center;
+}
+
+.lockup,
+.vIcon {
+  width: auto;
+  display: block;
+  /* Preserve the gold Dimensional V — never invert or recolor the artwork. */
+}
+
+.divider {
+  width: 1px;
+  background-color: var(--mantine-color-default-border);
+  flex: none;
+}
+
+.name {
+  font-family: var(--mantine-font-family);
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+  user-select: none;
+  color: var(--mantine-color-text);
+}

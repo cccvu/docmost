@@ -1,6 +1,8 @@
 import React from "react";
-import { Group, Text } from "@mantine/core";
+import { Group } from "@mantine/core";
 import classes from "./auth.module.css";
+import { Brand, INSTITUTION_NAME } from "@/features/brand/brand-logo";
+import { getAppName } from "@/lib/config.ts";
 
 type AuthLayoutProps = {
   children: React.ReactNode;
@@ -9,16 +11,14 @@ type AuthLayoutProps = {
 export function AuthLayout({ children }: AuthLayoutProps) {
   return (
     <>
-      <Group justify="center" gap={8} className={classes.logo}>
-        <img
-          src="/icons/favicon-32x32.png"
-          alt="Docmost"
-          width={22}
-          height={22}
+      <Group justify="center" className={classes.logo}>
+        {/* Not wrapped in a labelled control, so the artwork carries the name. */}
+        <Brand
+          variant="lockup"
+          appName={getAppName()}
+          lockupHeight={30}
+          alt={INSTITUTION_NAME}
         />
-        <Text size="28px" fw={700} style={{ userSelect: "none" }}>
-          Docmost
-        </Text>
       </Group>
       <main>{children}</main>
     </>

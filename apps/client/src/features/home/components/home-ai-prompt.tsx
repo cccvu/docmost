@@ -2,6 +2,7 @@ import { useAtomValue } from "jotai";
 import { useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { workspaceAtom } from "@/features/user/atoms/current-user-atom.ts";
+import { getAppName } from "@/lib/config.ts";
 import ChatInput from "@/ee/ai-chat/components/chat-input";
 import type {
   ChatAttachment,
@@ -40,7 +41,7 @@ export default function HomeAiPrompt() {
   return (
     <div className={classes.wrapper}>
       <h1 className={classes.heading}>
-        {t("Welcome to {{name}}", { name: workspace?.name ?? "Docmost" })}
+        {t("Welcome to {{name}}", { name: workspace?.name ?? getAppName() })}
       </h1>
       <div className={classes.subtitle}>
         {t("Ask anything or search your workspace")}
