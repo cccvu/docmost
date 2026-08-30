@@ -67,6 +67,37 @@ function makeDb(candidatesFor: (table: string) => Row[]) {
   return proxy;
 }
 
+/**
+ * A chainable mock that returns PRE-DEFINED successive windows per `execute()` (ignoring limit/offset),
+ * so a test can model non-snapshot windows — e.g. a row shifting into a later window under a concurrent
+ * insert. windowsByTable[table][callIndex] is returned for the Nth execute on that table.
+ */
+function makeSeqDb(windowsByTable: Record<string, Row[][]>) {
+  let table = '';
+  const counters: Record<string, number> = {};
+  const proxy: any = new Proxy(
+    {},
+    {
+      get(_t, prop: string) {
+        if (prop === 'selectFrom')
+          return (t: string) => {
+            table = t;
+            return proxy;
+          };
+        if (prop === 'execute')
+          return async () => {
+            const list = windowsByTable[table] || [];
+            const i = counters[table] ?? 0;
+            counters[table] = i + 1;
+            return list[i] ?? [];
+          };
+        return (..._args: any[]) => proxy;
+      },
+    },
+  );
+  return proxy;
+}
+
 const build = (opts: {
   pageCandidates: Row[];
   denied: Set<string>;
@@ -193,7 +224,67 @@ describe('PdpSearchService — filter-then-retrieve (searchPage)', () => {
 
     expect(items).toEqual([]);
     expect(warn).toHaveBeenCalledTimes(1);
-    expect(warn.mock.calls[0][0]).toMatch(/scan cap/i);
+    expect(warn.mock.calls[0][0]).toMatch(/scan budget/i);
+  });
+
+  it('clamps a huge caller limit to MAX_LIMIT (a large limit cannot force an unbounded scan)', async () => {
+    // 150 authorized candidates; a limit of 1000 must return at most 100 (MAX_LIMIT).
+    const pageCandidates = mkRows(
+      Array.from({ length: 150 }, (_, i) => `a${i}`),
+    );
+    const { service } = build({ pageCandidates, denied: new Set() });
+
+    const { items } = await service.searchPage(
+      { query: 'foo', limit: 1000 } as any,
+      { userId: USER, workspaceId: WS },
+    );
+
+    expect(items).toHaveLength(100);
+  });
+
+  it('clamps a negative offset to 0 (no slice-from-end over the authorized set)', async () => {
+    const pageCandidates = mkRows(['a', 'b', 'c', 'd', 'e']);
+    const { service } = build({ pageCandidates, denied: new Set() });
+
+    const { items } = await service.searchPage(
+      { query: 'foo', limit: 3, offset: -10 } as any,
+      { userId: USER, workspaceId: WS },
+    );
+
+    // offset clamped to 0 -> the first page, NOT the tail that Array.slice(-10) would return.
+    expect(items.map((i: any) => i.id)).toEqual(['a', 'b', 'c']);
+  });
+
+  it('de-duplicates rows that appear in more than one window (concurrent-write shift)', async () => {
+    // Window 1 is a FULL window (128 rows) so the loop continues; window 2 re-includes a27 (as if an
+    // insert shifted the stream by one between fetches). The result must contain a27 exactly once.
+    const w1 = mkRows([
+      ...Array.from({ length: 100 }, (_, i) => `d${i}`),
+      ...Array.from({ length: 28 }, (_, i) => `a${i}`),
+    ]);
+    const w2 = mkRows(['a27', 'a28', 'a29']); // a27 overlaps w1
+    const denied = new Set(Array.from({ length: 100 }, (_, i) => `d${i}`));
+    const filterAccessiblePageIds = jest.fn(
+      async ({ pageIds }: { pageIds: string[] }) =>
+        pageIds.filter((id) => !denied.has(id)),
+    );
+    const service = new PdpSearchService(
+      makeSeqDb({ pages: [w1, w2] }) as any,
+      { withSpace: () => ({}) } as any,
+      {} as any,
+      { getUserSpaceIdsQuery: () => ({}), getUserSpaceIds: async () => ['s1'] } as any,
+      { filterAccessiblePageIds } as any,
+    );
+
+    const { items } = await service.searchPage(
+      { query: 'foo', limit: 50 } as any,
+      { userId: USER, workspaceId: WS },
+    );
+
+    const ids = items.map((i: any) => i.id);
+    expect(ids.filter((id) => id === 'a27')).toHaveLength(1);
+    expect(new Set(ids).size).toBe(ids.length); // no duplicates
+    expect(ids).toEqual(Array.from({ length: 30 }, (_, i) => `a${i}`));
   });
 
   it('short-circuits an empty query without touching the PDP', async () => {

@@ -28,9 +28,12 @@ const tsquery = require('pg-tsquery')();
  * `limit/offset` are applied. It walks the rank-ordered FTS candidate stream in bounded windows,
  * passes each window through the same PDP gate (`filterAccessiblePageIds` → `POST /authz/filter-
  * resources`, bounded + ZedToken-fresh + decision-cached), and collects authorized rows in rank order
- * until it has `offset + limit` of them (or the stream is exhausted, or a hard scan ceiling is hit —
- * which it logs; no silent truncation). Then it slices `[offset, offset+limit]` over the *authorized*
- * set. No total-hit count is exposed, so there is no count/score side-channel.
+ * until it has `offset + limit` of them (or the stream is exhausted, or the scan budget is hit —
+ * which it logs; not silent server-side). Then it slices `[offset, offset+limit]` over the *authorized*
+ * set. No total-hit count or unauthorized row's score is exposed (no count/score side-channel). A
+ * bounded *timing* channel remains — the window count (DB+PDP round-trips) scales with how many
+ * higher-ranked matches the caller cannot see, up to the scan budget — accepted as low-risk here (see
+ * docs/adr/0005-permission-aware-retrieval.md); a higher-sensitivity RAG path should flatten it.
  *
  * The single `collectAuthorized` loop is the one filter-then-retrieve primitive — the RAG blueprint:
  * when a vector/`page_embeddings` similarity path lands, its candidate top-k MUST pass through the same
@@ -48,8 +51,16 @@ export class PdpSearchService extends SearchService {
 
   /** Rows fetched per FTS round. ≤ the platform's 1000-item filter-resources cap. */
   private static readonly CANDIDATE_WINDOW = 128;
-  /** Hard ceiling on candidate rows scanned across all windows for one query (bounds worst-case cost). */
-  private static readonly MAX_CANDIDATES = 1024;
+  /** Caller `limit` is clamped to this — a huge limit can't force an unbounded candidate scan. */
+  private static readonly MAX_LIMIT = 100;
+  /**
+   * Candidate scan budget per request: it scales with `need` (= offset + limit) so an in-range page
+   * always completes, but is floored + capped so the worst-case DB+PDP round-trips stay bounded
+   * (round-trips = ceil(scanned / CANDIDATE_WINDOW)).
+   */
+  private static readonly BASE_SCAN = 1024;
+  private static readonly HARD_SCAN_CAP = 2048;
+  private static readonly OVERSCAN = 4;
 
   // The parent keeps its deps `private`, so we cannot reuse them from here — re-hold our own
   // distinctly-named references (and pass the params straight through to super).
@@ -89,8 +100,13 @@ export class PdpSearchService extends SearchService {
     }
 
     const searchQuery = tsquery(query.trim() + '*');
-    const limit = searchParams.limit || 25;
-    const offset = searchParams.offset || 0;
+    // Clamp pagination in the fork (SearchDTO is upstream-owned + unvalidated): a huge limit can't force
+    // an unbounded scan, and a negative offset can't slice-from-end over the authorized set.
+    const limit = Math.min(
+      Math.max(Math.trunc(Number(searchParams.limit) || 25), 1),
+      PdpSearchService.MAX_LIMIT,
+    );
+    const offset = Math.max(Math.trunc(Number(searchParams.offset) || 0), 0);
 
     // Candidate generation (rank-ordered, id-tiebroken for deterministic windowing) — the coarse space
     // pre-filter (mirror subquery or the caller's spaceId) is a cheap net; the PDP gate below is
@@ -163,7 +179,11 @@ export class PdpSearchService extends SearchService {
     let groups = [];
     let pages = [];
 
-    const limit = suggestion?.limit || 10;
+    // Clamp (SearchSuggestionDTO.limit is upstream-owned + unvalidated).
+    const limit = Math.min(
+      Math.max(Math.trunc(Number(suggestion?.limit) || 10), 1),
+      PdpSearchService.MAX_LIMIT,
+    );
     const query = suggestion.query.toLowerCase().trim();
 
     if (suggestion.includeUsers) {
@@ -254,14 +274,18 @@ export class PdpSearchService extends SearchService {
     base: any,
     opts: { userId: string; spaceId?: string; need: number },
   ): Promise<any[]> {
+    // Scan budget scales with `need` (an in-range page completes) but is floored + capped (bounds
+    // round-trips — including during a platform outage, where the gate denies every window).
+    const budget = Math.min(
+      PdpSearchService.HARD_SCAN_CAP,
+      Math.max(PdpSearchService.BASE_SCAN, opts.need * PdpSearchService.OVERSCAN),
+    );
     const authorized: any[] = [];
+    const seen = new Set<string>(); // dedup across windows (a concurrent insert can shift a row)
     let cursor = 0;
     let scanned = 0;
 
-    while (
-      authorized.length < opts.need &&
-      scanned < PdpSearchService.MAX_CANDIDATES
-    ) {
+    while (authorized.length < opts.need && scanned < budget) {
       const window: any[] = await base
         .limit(PdpSearchService.CANDIDATE_WINDOW)
         .offset(cursor)
@@ -279,20 +303,20 @@ export class PdpSearchService extends SearchService {
         }),
       );
       for (const row of window) {
-        if (okIds.has(row.id)) authorized.push(row);
+        if (okIds.has(row.id) && !seen.has(row.id)) {
+          seen.add(row.id);
+          authorized.push(row);
+        }
       }
 
       if (window.length < PdpSearchService.CANDIDATE_WINDOW) break; // last (partial) window
     }
 
-    if (
-      authorized.length < opts.need &&
-      scanned >= PdpSearchService.MAX_CANDIDATES
-    ) {
+    if (authorized.length < opts.need && scanned >= budget) {
       this.logger.warn(
-        `filter-then-retrieve hit the candidate scan cap (${PdpSearchService.MAX_CANDIDATES}) ` +
-          `before collecting ${opts.need} authorized results (userId=${opts.userId}); ` +
-          `the result set may be incomplete for a very deep page of a heavily-restricted space`,
+        `filter-then-retrieve hit the candidate scan budget (${budget}) before collecting ` +
+          `${opts.need} authorized results (userId=${opts.userId}); the result set may be ` +
+          `incomplete for a very deep page of a heavily-restricted space`,
       );
     }
 
