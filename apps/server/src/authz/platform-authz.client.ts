@@ -65,7 +65,11 @@ export class PlatformAuthzClient {
   async checkBulk(subject: AuthzSubject, checks: AuthzCheckItem[]): Promise<boolean[]> {
     if (checks.length === 0) return [];
     const r = await this.post<{ results: boolean[] }>('/authz/check-bulk', { subject, checks });
-    return r?.results ?? checks.map(() => false);
+    // Fail-closed on a MALFORMED 200 (a buggy/Byzantine platform): a non-array or wrong-length `results`
+    // must not flow downstream as boolean[]. Deny the whole batch, and coerce each element to a strict
+    // boolean so a truthy non-boolean (e.g. 1, "yes") can never read as an allow.
+    if (!Array.isArray(r?.results) || r.results.length !== checks.length) return checks.map(() => false);
+    return r.results.map((x) => x === true);
   }
 
   async filterResources(
@@ -81,14 +85,17 @@ export class PlatformAuthzClient {
     for (let i = 0; i < candidateIds.length; i += FILTER_CHUNK) {
       const batch = candidateIds.slice(i, i + FILTER_CHUNK);
       const r = await this.post<{ ids: string[] }>('/authz/filter-resources', { subject, permission, resourceType, candidateIds: batch });
-      for (const id of r?.ids ?? []) allowed.add(id);
+      // Fail-closed on a malformed 200: only union string ids from an actual array (a string `ids` would
+      // otherwise iterate per-character; a non-array would throw).
+      if (Array.isArray(r?.ids)) for (const id of r.ids) if (typeof id === 'string') allowed.add(id);
     }
     return [...allowed];
   }
 
   async lookupResources(subject: AuthzSubject, permission: string, resourceType: string): Promise<string[]> {
     const r = await this.post<{ ids: string[] }>('/authz/lookup-resources', { subject, permission, resourceType });
-    return r?.ids ?? [];
+    // Fail-closed on a malformed 200: a non-array (or non-string elements) yields the empty set.
+    return Array.isArray(r?.ids) ? r.ids.filter((id): id is string => typeof id === 'string') : [];
   }
 
   /**
@@ -114,8 +121,10 @@ export class PlatformAuthzClient {
         resourceId,
         candidates,
       });
-      if (!r) continue;
-      for (const s of r.subjects) if (s.externalId) allowed.add(s.externalId);
+      // Fail-closed on a malformed 200: skip the chunk unless `subjects` is an array of objects carrying a
+      // string externalId (a non-array would throw; a bare string would iterate per-character).
+      if (!Array.isArray(r?.subjects)) continue;
+      for (const s of r.subjects) if (s && typeof s.externalId === 'string') allowed.add(s.externalId);
     }
     return [...allowed];
   }

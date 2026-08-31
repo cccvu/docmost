@@ -80,4 +80,53 @@ describe('PlatformAuthzClient', () => {
     fetchMock.mockRejectedValueOnce(new Error('down'));
     expect(await client.filterSubjects('view', 'space', 's1', ['u1', 'u2'])).toEqual([]);
   });
+
+  // A well-formed HTTP 200 with a WRONG-TYPED body (a buggy or Byzantine platform) must still fail closed —
+  // never allow, never let a non-array flow downstream as if it were the expected shape. The response-shape
+  // guards in the client enforce this (transport errors are already covered above).
+  describe('malformed 200 (Byzantine PDP) → fail-closed', () => {
+    it('check: a non-boolean `allowed` is not an allow', async () => {
+      fetchMock.mockResolvedValueOnce(ok({ allowed: 'yes' }));
+      expect(await client.check({ principalId: 'p1' }, 'view', 'page', 'x')).toBe(false);
+    });
+
+    it('checkBulk: a non-array `results` denies the whole batch', async () => {
+      fetchMock.mockResolvedValueOnce(ok({ results: 'nope' }));
+      expect(await client.checkBulk({ principalId: 'p1' }, [
+        { permission: 'view', resourceType: 'page', resourceId: 'a' },
+        { permission: 'view', resourceType: 'page', resourceId: 'b' },
+      ])).toEqual([false, false]);
+    });
+
+    it('checkBulk: a wrong-length `results` denies the whole batch', async () => {
+      fetchMock.mockResolvedValueOnce(ok({ results: [true] }));
+      expect(await client.checkBulk({ principalId: 'p1' }, [
+        { permission: 'view', resourceType: 'page', resourceId: 'a' },
+        { permission: 'view', resourceType: 'page', resourceId: 'b' },
+      ])).toEqual([false, false]);
+    });
+
+    it('checkBulk: truthy non-boolean elements are coerced to deny (never allow)', async () => {
+      fetchMock.mockResolvedValueOnce(ok({ results: [1, 'x'] }));
+      expect(await client.checkBulk({ principalId: 'p1' }, [
+        { permission: 'view', resourceType: 'page', resourceId: 'a' },
+        { permission: 'view', resourceType: 'page', resourceId: 'b' },
+      ])).toEqual([false, false]);
+    });
+
+    it('filterResources: a string `ids` does not iterate per-character (empty)', async () => {
+      fetchMock.mockResolvedValueOnce(ok({ ids: 'abc' }));
+      expect(await client.filterResources({ principalId: 'p1' }, 'view', 'page', ['a', 'b'])).toEqual([]);
+    });
+
+    it('lookupResources: a non-array `ids` yields the empty set', async () => {
+      fetchMock.mockResolvedValueOnce(ok({ ids: 5 }));
+      expect(await client.lookupResources({ principalId: 'p1' }, 'view', 'page')).toEqual([]);
+    });
+
+    it('filterSubjects: a non-array `subjects` yields empty without throwing', async () => {
+      fetchMock.mockResolvedValueOnce(ok({ subjects: 42 }));
+      expect(await client.filterSubjects('view', 'page', 'pg1', ['u1', 'u2'])).toEqual([]);
+    });
+  });
 });

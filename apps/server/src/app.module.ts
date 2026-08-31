@@ -1,5 +1,5 @@
 import { Module } from '@nestjs/common';
-import { APP_INTERCEPTOR } from '@nestjs/core';
+import { APP_GUARD, APP_INTERCEPTOR } from '@nestjs/core';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { EnvironmentService } from './integrations/environment/environment.service';
@@ -29,6 +29,8 @@ import { ClsModule } from 'nestjs-cls';
 // CCC seam: rebind AUDIT_SERVICE to the platform-forwarding audit module (replaces NoopAuditModule).
 import { PlatformAuditModule } from './authz/audit/audit.module';
 import { ThrottleModule } from './integrations/throttle/throttle.module';
+// CCC seam (GitHub #13, Layer C): fail-closed global guard — denies any route with no authentication decision.
+import { PlatformAuthorizationGuard } from './authz/route-guard/platform-authorization.guard';
 
 const enterpriseModules = [];
 try {
@@ -93,6 +95,14 @@ try {
   controllers: [AppController],
   providers: [
     AppService,
+    // CCC seam (GitHub #13, Layer C): registered as a global guard so every HTTP route is deny-by-default —
+    // a route with no @Public/@PlatformPublic, no AUTH_GUARD (JwtAuthGuard/CollabServiceSecretGuard), and no
+    // intentional-unguarded ledger entry is 403'd. Pass-through for decided routes (their own guard enforces).
+    // The build-time route-inventory fitness test keeps the ledger complete, so this cannot deny a legit route.
+    {
+      provide: APP_GUARD,
+      useClass: PlatformAuthorizationGuard,
+    },
     {
       provide: APP_INTERCEPTOR,
       useClass: AuditActorInterceptor,
