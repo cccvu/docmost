@@ -67,6 +67,13 @@ export default defineConfig(({ mode }) => {
           target: PLATFORM_URL || "http://localhost:4000",
           changeOrigin: true,
         },
+        // The BFF (platform → Docmost session exchange) also lives on the platform. Forward /bff so
+        // the browser sees /bff/docmost/session as same-origin in dev — this makes the relayed
+        // Docmost `authToken` cookie bind to the dev origin (mirroring prod's single-ALB origin).
+        "/bff": {
+          target: PLATFORM_URL || "http://localhost:4000",
+          changeOrigin: true,
+        },
         "/socket.io": {
           target: APP_URL,
           ws: true,

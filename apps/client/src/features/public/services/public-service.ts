@@ -1,5 +1,5 @@
-import axios from "axios";
 import api from "@/lib/api-client";
+import platformApi from "@/lib/platform-client";
 
 export interface IPublicPage {
   pageId: string;
@@ -35,13 +35,6 @@ export async function getPublicContent(params?: {
   return req.data as IPublicPageList;
 }
 
-// The platform's gated registration lives behind /auth on a SEPARATE service. Use an isolated axios
-// instance WITHOUT the /api 401 interceptor, so a request-access failure can never bounce the visitor
-// to /login. In dev a Vite proxy forwards /auth to the platform; in a deployed edge topology the
-// platform serves /auth same-origin. Isolated here so the transport is a one-line change / graceful
-// degrade if the topology isn't wired.
-const platformApi = axios.create({ baseURL: "/auth", withCredentials: true });
-
 export interface IRequestAccessResponse {
   id: string;
   email: string;
@@ -54,7 +47,7 @@ export async function requestAccess(data: {
   password: string;
 }): Promise<IRequestAccessResponse> {
   const res = await platformApi.post<IRequestAccessResponse>(
-    "/register",
+    "/auth/register",
     data,
   );
   return res.data;

@@ -3,6 +3,7 @@ import {
   forgotPassword,
   login,
   logout,
+  openDocmostSession,
   passwordReset,
   setupWorkspace,
   verifyUserToken,
@@ -40,16 +41,25 @@ export default function useAuth() {
 
     try {
       const response = await login(data);
-      setIsLoading(false);
 
       // Check if MFA is required
       if (response?.userHasMfa) {
+        setIsLoading(false);
         navigate(APP_ROUTE.AUTH.MFA_CHALLENGE + window.location.search);
-      } else if (response?.requiresMfaSetup) {
-        navigate(APP_ROUTE.AUTH.MFA_SETUP_REQUIRED + window.location.search);
-      } else {
-        navigate(getPostLoginRedirect());
+        return;
       }
+      if (response?.requiresMfaSetup) {
+        setIsLoading(false);
+        navigate(APP_ROUTE.AUTH.MFA_SETUP_REQUIRED + window.location.search);
+        return;
+      }
+
+      // Establish the Docmost session BEFORE navigating, so UserProvider's /api/users/me (and every
+      // other Docmost /api/* call) is authenticated the moment the app mounts. A failed exchange
+      // throws to the catch below, which surfaces the error and does NOT navigate (avoids a 401 loop).
+      await openDocmostSession();
+      setIsLoading(false);
+      navigate(getPostLoginRedirect());
     } catch (err) {
       setIsLoading(false);
 
@@ -63,7 +73,7 @@ export default function useAuth() {
       }
 
       notifications.show({
-        message,
+        message: message ?? t("Login failed. Please try again."),
         color: "red",
       });
     }
