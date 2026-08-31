@@ -44,12 +44,16 @@ export default function PasswordlessLogin() {
     if (otp.length < 6) return;
     try {
       await completeSignIn({ email: email.trim(), otp });
-    } catch {
+    } catch (err) {
+      // Distinguish "the code was fine but the session bridge failed" from "bad code" (see use-passwordless).
+      const bridge = (err as { stage?: string })?.stage === "bridge";
       notifications.show({
         color: "red",
-        message: t("That code is invalid, expired, or already used. Request a new one."),
+        message: bridge
+          ? t("You're verified, but we couldn't open your workspace session. Please try again.")
+          : t("That code is invalid, expired, or already used. Request a new one."),
       });
-      setOtp("");
+      if (!bridge) setOtp("");
     }
   }
 
@@ -96,7 +100,8 @@ export default function PasswordlessLogin() {
             </>
           ) : (
             <>
-              <Text c="dimmed" ta="center" mb="lg">
+              {/* role="status" announces the step change to screen readers when we swap email→code. */}
+              <Text c="dimmed" ta="center" mb="lg" role="status">
                 {t(
                   "Check your email. Open the sign-in link, or enter the 6-digit code below. Both expire shortly and can be used once.",
                 )}
@@ -108,6 +113,7 @@ export default function PasswordlessLogin() {
                     type="number"
                     inputMode="numeric"
                     oneTimeCode
+                    autoFocus
                     value={otp}
                     onChange={setOtp}
                     aria-label={t("One-time code")}

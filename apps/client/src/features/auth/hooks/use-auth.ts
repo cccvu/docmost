@@ -1,9 +1,7 @@
 import { useState } from "react";
 import {
   forgotPassword,
-  login,
   logout,
-  openDocmostSession,
   passwordReset,
   setupWorkspace,
   verifyUserToken,
@@ -13,7 +11,6 @@ import { useAtom } from "jotai";
 import { currentUserAtom } from "@/features/user/atoms/current-user-atom";
 import {
   IForgotPassword,
-  ILogin,
   IPasswordReset,
   ISetupWorkspace,
   IVerifyUserToken,
@@ -24,67 +21,22 @@ import {
   acceptInvitation,
   createWorkspace,
 } from "@/features/workspace/services/workspace-service.ts";
-import APP_ROUTE, { getPostLoginRedirect } from "@/lib/app-route.ts";
+import APP_ROUTE from "@/lib/app-route.ts";
 import { RESET } from "jotai/utils";
 import { useTranslation } from "react-i18next";
 import { isCloud } from "@/lib/config.ts";
 import { exchangeTokenRedirectUrl, getHostnameUrl } from "@/ee/utils.ts";
+
+// NOTE: password sign-in (`handleSignIn`/`signIn`) was removed — the platform is passwordless
+// (magic link + OTP, issue #4). The two-step "mint platform session → openDocmostSession before
+// navigate" now lives in features/public/hooks/use-passwordless.ts. useAuth still owns logout,
+// setup, invitation, forgot/reset (Docmost-side), and verify-token.
 
 export default function useAuth() {
   const { t } = useTranslation();
   const [isLoading, setIsLoading] = useState(false);
   const navigate = useNavigate();
   const [, setCurrentUser] = useAtom(currentUserAtom);
-
-  const handleSignIn = async (data: ILogin) => {
-    setIsLoading(true);
-
-    try {
-      const response = await login(data);
-
-      // Check if MFA is required
-      if (response?.userHasMfa) {
-        setIsLoading(false);
-        navigate(APP_ROUTE.AUTH.MFA_CHALLENGE + window.location.search);
-        return;
-      }
-      if (response?.requiresMfaSetup) {
-        setIsLoading(false);
-        navigate(APP_ROUTE.AUTH.MFA_SETUP_REQUIRED + window.location.search);
-        return;
-      }
-
-      // Establish the Docmost session BEFORE navigating, so UserProvider's /api/users/me (and every
-      // other Docmost /api/* call) is authenticated the moment the app mounts.
-      try {
-        await openDocmostSession();
-      } catch (exchangeErr) {
-        // The platform session is already set but the Docmost session isn't. Roll it back so a
-        // failed login never leaves a live platform cookie behind, then surface the error to the
-        // catch below (no navigate → avoids a 401 redirect loop).
-        await logout().catch(() => undefined);
-        throw exchangeErr;
-      }
-      setIsLoading(false);
-      navigate(getPostLoginRedirect());
-    } catch (err) {
-      setIsLoading(false);
-
-      const message = err.response?.data?.message;
-      if (isCloud() && message?.includes("verify your email")) {
-        const sig = err.response?.data?.emailSignature;
-        navigate(
-          `${APP_ROUTE.AUTH.VERIFY_EMAIL}?email=${encodeURIComponent(data.email)}${sig ? `&sig=${sig}` : ""}`,
-        );
-        return;
-      }
-
-      notifications.show({
-        message: message ?? t("Login failed. Please try again."),
-        color: "red",
-      });
-    }
-  };
 
   const handleInvitationSignUp = async (data: IAcceptInvite) => {
     setIsLoading(true);
@@ -223,7 +175,6 @@ export default function useAuth() {
   };
 
   return {
-    signIn: handleSignIn,
     invitationSignup: handleInvitationSignUp,
     setupWorkspace: handleSetupWorkspace,
     forgotPassword: handleForgotPassword,

@@ -42,20 +42,23 @@ export function usePasswordless() {
   }
 
   // Complete sign-in from either channel. Throws are surfaced to the caller (which shows the message)
-  // so the interstitial page can render an inline error without a redirect loop.
+  // so the interstitial page can render an inline error without a redirect loop. The two failure modes
+  // are DISTINGUISHED: a `verifyPasswordless` throw means the code/link is invalid/expired/used, while a
+  // bridge failure (the code WAS valid) is re-thrown tagged `stage: "bridge"` so the page shows a
+  // "verified but couldn't open your session" message instead of a misleading "invalid code".
   async function completeSignIn(
     args: { token: string } | { email: string; otp: string },
   ): Promise<void> {
     setIsVerifying(true);
     try {
-      await verifyPasswordless(args);
+      await verifyPasswordless(args); // throws => invalid / expired / already-used code or link
       // Two-step: establish the Docmost session before navigating; roll back the platform session on
       // failure so a half-authenticated state never persists.
       try {
         await openDocmostSession();
-      } catch (bridgeErr) {
+      } catch {
         await logout().catch(() => undefined);
-        throw bridgeErr;
+        throw Object.assign(new Error("session-bridge-failed"), { stage: "bridge" as const });
       }
       navigate(getPostLoginRedirect());
     } finally {

@@ -30,9 +30,13 @@ export default function PasswordlessVerify() {
     setError(null);
     try {
       await completeSignIn({ token });
-    } catch {
+    } catch (err) {
+      // The link was valid but the session bridge failed → say so, don't cry "invalid link".
+      const bridge = (err as { stage?: string })?.stage === "bridge";
       setError(
-        t("This sign-in link is invalid, expired, or already used. Please request a new one."),
+        bridge
+          ? t("You're verified, but we couldn't open your workspace session. Please try again.")
+          : t("This sign-in link is invalid, expired, or already used. Please request a new one."),
       );
     }
   }

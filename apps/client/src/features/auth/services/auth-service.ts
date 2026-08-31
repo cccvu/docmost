@@ -4,38 +4,17 @@ import {
   IChangePassword,
   ICollabToken,
   IForgotPassword,
-  ILogin,
   IPasswordReset,
   ISetupWorkspace,
   IVerifyUserToken,
 } from "@/features/auth/types/auth.types";
 import { IWorkspace } from "@/features/workspace/types/workspace.types.ts";
 
-// The CCC platform's login response. `id`/`email`/`workspaceId` are what the platform actually
-// returns; the MFA fields are NOT part of the platform contract today (the platform has no MFA).
-// They stay optional as forward-compat so the shared handleSignIn MFA branch — dead on this path —
-// remains type-safe.
-export interface IPlatformLoginResponse {
-  id: string;
-  email: string;
-  workspaceId: string;
-  userHasMfa?: boolean;
-  requiresMfaSetup?: boolean;
-}
+// NOTE: password login was REMOVED (platform is passwordless — magic link + OTP, issue #4). The
+// former `login()` (POST /auth/login) and the Docmost password `LoginForm` are gone; the passwordless
+// flow (features/public/hooks/use-passwordless.ts) reuses openDocmostSession() + logout() below.
 
-// Login is owned by the CCC platform, not Docmost. It must hit the platform's `/auth/login`
-// (routed to the platform target group), NOT Docmost's `/api/auth/login`, which the ALB blocks.
-//
-// INVARIANT: a non-MFA platform login only HALF-authenticates the browser — it sets the platform
-// session but not Docmost's. A successful non-MFA login MUST be followed by openDocmostSession()
-// before any Docmost `/api/*` request (see handleSignIn in use-auth.ts). login() alone returns 200
-// at the platform but leaves every `/api/*` call 401ing.
-export async function login(data: ILogin): Promise<IPlatformLoginResponse> {
-  const res = await platformApi.post<IPlatformLoginResponse>("/auth/login", data);
-  return res.data;
-}
-
-// After a platform login, exchange the platform session for a Docmost session: the platform BFF
+// After a passwordless sign-in, exchange the platform session for a Docmost session: the platform BFF
 // provisions/looks up the Docmost shadow user, performs a server-to-server Docmost login, and relays
 // Docmost's native `authToken` cookie to the browser. Without this, every Docmost `/api/*` call 401s
 // even after a successful platform login (the platform and Docmost sign with separate keys).

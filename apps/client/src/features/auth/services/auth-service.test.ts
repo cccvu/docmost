@@ -13,33 +13,17 @@ vi.mock("@/lib/api-client", () => ({
 import api from "@/lib/api-client";
 import platformApi from "@/lib/platform-client";
 import {
-  login,
   logout,
   openDocmostSession,
 } from "@/features/auth/services/auth-service";
 import { requestAccess } from "@/features/public/services/public-service";
 
+// NOTE: password login() was removed (passwordless — issue #4); its routing test is gone with it.
+// The BFF exchange + logout routing (the load-bearing #46 seam) is still asserted below, and the
+// passwordless request/verify routing is covered in features/public/services/public-service.test.ts.
 describe("auth-service platform routing (issue #46)", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-  });
-
-  it("login() posts to the platform /auth/login, never Docmost /api/auth/login", async () => {
-    await login({ email: "cccadmin@vanderbilt.edu", password: "pw" });
-    expect(platformApi.post).toHaveBeenCalledWith("/auth/login", {
-      email: "cccadmin@vanderbilt.edu",
-      password: "pw",
-    });
-    // The stock /api client (baseURL "/api") must NOT be used — that path is ALB-403-blocked.
-    expect(api.post).not.toHaveBeenCalled();
-  });
-
-  it("login() unwraps res.data (platformApi has no unwrap interceptor)", async () => {
-    (platformApi.post as any).mockResolvedValueOnce({
-      data: { id: "u1", email: "cccadmin@vanderbilt.edu", workspaceId: "ws1" },
-    });
-    const res = await login({ email: "cccadmin@vanderbilt.edu", password: "pw" });
-    expect(res).toEqual({ id: "u1", email: "cccadmin@vanderbilt.edu", workspaceId: "ws1" });
   });
 
   it("openDocmostSession() posts to the platform BFF /bff/docmost/session (no body)", async () => {
