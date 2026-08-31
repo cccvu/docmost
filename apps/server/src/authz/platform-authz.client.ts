@@ -24,12 +24,26 @@ const FILTER_CHUNK = 1000;
  *  call aborts and resolves fail-closed. Overridable via PLATFORM_AUTHZ_TIMEOUT_MS. */
 const DEFAULT_TIMEOUT_MS = 1500;
 
+/**
+ * Parse PLATFORM_AUTHZ_TIMEOUT_MS defensively. A bare `Number(env ?? default)` is a footgun: `Number('')` is
+ * `0` and `Number('abc')` is `NaN`, and EITHER makes the AbortController fire immediately → every authz call
+ * aborts → this fail-closed client DENIES ALL access (a self-inflicted outage from an empty value that IaC
+ * templating can easily produce). So a non-finite or `<= 0` value falls back to `fallback`, and the result is
+ * clamped to [250ms, 60000ms]. Mirrors the platform's own config.sanitizeTimeoutMs — duplicated here because
+ * the fork can't import platform code across the submodule boundary. (#14)
+ */
+export function sanitizeAuthzTimeoutMs(raw: string | undefined, fallback: number): number {
+  const clamp = (ms: number): number => Math.min(Math.max(ms, 250), 60000);
+  const n = Number(raw ?? fallback);
+  return clamp(Number.isFinite(n) && n > 0 ? n : fallback);
+}
+
 @Injectable()
 export class PlatformAuthzClient {
   private readonly logger = new Logger(PlatformAuthzClient.name);
   private readonly baseUrl = process.env.PLATFORM_AUTHZ_URL ?? 'http://platform:4000';
   private readonly secret = process.env.PLATFORM_AUTHZ_SERVICE_SECRET ?? '';
-  private readonly timeoutMs = Number(process.env.PLATFORM_AUTHZ_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS);
+  private readonly timeoutMs = sanitizeAuthzTimeoutMs(process.env.PLATFORM_AUTHZ_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
 
   private async post<T>(path: string, body: unknown): Promise<T | null> {
     // Bound the call: abort after `timeoutMs` so a hung platform can't hang the wiki request. The
