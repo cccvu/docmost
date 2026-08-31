@@ -5,19 +5,33 @@ import {
   ICollabToken,
   IForgotPassword,
   ILogin,
-  ILoginResponse,
   IPasswordReset,
   ISetupWorkspace,
   IVerifyUserToken,
 } from "@/features/auth/types/auth.types";
 import { IWorkspace } from "@/features/workspace/types/workspace.types.ts";
 
+// The CCC platform's login response. `id`/`email`/`workspaceId` are what the platform actually
+// returns; the MFA fields are NOT part of the platform contract today (the platform has no MFA).
+// They stay optional as forward-compat so the shared handleSignIn MFA branch — dead on this path —
+// remains type-safe.
+export interface IPlatformLoginResponse {
+  id: string;
+  email: string;
+  workspaceId: string;
+  userHasMfa?: boolean;
+  requiresMfaSetup?: boolean;
+}
+
 // Login is owned by the CCC platform, not Docmost. It must hit the platform's `/auth/login`
 // (routed to the platform target group), NOT Docmost's `/api/auth/login`, which the ALB blocks.
-// The platform returns `{ id, email, workspaceId }` (no MFA fields); `handleSignIn` only reads the
-// optional MFA flags, so the absent fields fall through to the normal post-login navigation.
-export async function login(data: ILogin): Promise<ILoginResponse> {
-  const res = await platformApi.post<ILoginResponse>("/auth/login", data);
+//
+// INVARIANT: a non-MFA platform login only HALF-authenticates the browser — it sets the platform
+// session but not Docmost's. A successful non-MFA login MUST be followed by openDocmostSession()
+// before any Docmost `/api/*` request (see handleSignIn in use-auth.ts). login() alone returns 200
+// at the platform but leaves every `/api/*` call 401ing.
+export async function login(data: ILogin): Promise<IPlatformLoginResponse> {
+  const res = await platformApi.post<IPlatformLoginResponse>("/auth/login", data);
   return res.data;
 }
 

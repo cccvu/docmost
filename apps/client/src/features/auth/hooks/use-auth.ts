@@ -55,9 +55,16 @@ export default function useAuth() {
       }
 
       // Establish the Docmost session BEFORE navigating, so UserProvider's /api/users/me (and every
-      // other Docmost /api/* call) is authenticated the moment the app mounts. A failed exchange
-      // throws to the catch below, which surfaces the error and does NOT navigate (avoids a 401 loop).
-      await openDocmostSession();
+      // other Docmost /api/* call) is authenticated the moment the app mounts.
+      try {
+        await openDocmostSession();
+      } catch (exchangeErr) {
+        // The platform session is already set but the Docmost session isn't. Roll it back so a
+        // failed login never leaves a live platform cookie behind, then surface the error to the
+        // catch below (no navigate → avoids a 401 redirect loop).
+        await logout().catch(() => undefined);
+        throw exchangeErr;
+      }
       setIsLoading(false);
       navigate(getPostLoginRedirect());
     } catch (err) {

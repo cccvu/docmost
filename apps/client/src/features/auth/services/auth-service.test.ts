@@ -34,6 +34,14 @@ describe("auth-service platform routing (issue #46)", () => {
     expect(api.post).not.toHaveBeenCalled();
   });
 
+  it("login() unwraps res.data (platformApi has no unwrap interceptor)", async () => {
+    (platformApi.post as any).mockResolvedValueOnce({
+      data: { id: "u1", email: "cccadmin@vanderbilt.edu", workspaceId: "ws1" },
+    });
+    const res = await login({ email: "cccadmin@vanderbilt.edu", password: "pw" });
+    expect(res).toEqual({ id: "u1", email: "cccadmin@vanderbilt.edu", workspaceId: "ws1" });
+  });
+
   it("openDocmostSession() posts to the platform BFF /bff/docmost/session (no body)", async () => {
     await openDocmostSession();
     expect(platformApi.post).toHaveBeenCalledWith("/bff/docmost/session");
@@ -46,6 +54,14 @@ describe("auth-service platform routing (issue #46)", () => {
     expect(platformApi.post).toHaveBeenCalledWith("/auth/logout");
     // Docmost session (authToken) via the ALB-allowed native logout:
     expect(api.post).toHaveBeenCalledWith("/auth/logout");
+  });
+
+  it("logout() still clears the Docmost session when the platform logout fails (allSettled, not all)", async () => {
+    // Exact scenario the code guards: an already-expired __Host-wiki_session → platform logout 401s.
+    // With Promise.all this would reject and skip the Docmost leg; allSettled must not.
+    (platformApi.post as any).mockRejectedValueOnce(new Error("expired session"));
+    await expect(logout()).resolves.toBeUndefined(); // does not throw
+    expect(api.post).toHaveBeenCalledWith("/auth/logout"); // Docmost still cleared
   });
 
   it("requestAccess() still targets the platform /auth/register (guards the client consolidation)", async () => {
