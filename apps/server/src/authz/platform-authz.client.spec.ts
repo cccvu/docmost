@@ -1,4 +1,4 @@
-import { PlatformAuthzClient } from './platform-authz.client';
+import { PlatformAuthzClient, sanitizeAuthzTimeoutMs } from './platform-authz.client';
 
 /**
  * CCC authorization integration test (part of the fork's compatibility suite).
@@ -128,5 +128,27 @@ describe('PlatformAuthzClient', () => {
       fetchMock.mockResolvedValueOnce(ok({ subjects: 42 }));
       expect(await client.filterSubjects('view', 'page', 'pg1', ['u1', 'u2'])).toEqual([]);
     });
+  });
+});
+
+/**
+ * PLATFORM_AUTHZ_TIMEOUT_MS drives the AbortController that bounds every PEP→platform authz call. A bad
+ * value must NEVER become 0/NaN — that fires the abort immediately, so every call aborts and this
+ * fail-closed client denies ALL access (a self-inflicted deny-all outage). An empty string is the realistic
+ * regression: IaC templating an unset var yields "". (#14)
+ */
+describe('sanitizeAuthzTimeoutMs (PLATFORM_AUTHZ_TIMEOUT_MS)', () => {
+  it('falls back (never 0/NaN) on a missing/empty/non-numeric/negative/zero value', () => {
+    expect(sanitizeAuthzTimeoutMs(undefined, 1500)).toBe(1500);
+    expect(sanitizeAuthzTimeoutMs('', 1500)).toBe(1500); // Number('') = 0 → would abort-all; falls back
+    expect(sanitizeAuthzTimeoutMs('abc', 1500)).toBe(1500); // Number('abc') = NaN → falls back
+    expect(sanitizeAuthzTimeoutMs('-10', 1500)).toBe(1500);
+    expect(sanitizeAuthzTimeoutMs('0', 1500)).toBe(1500); // 0 = "abort immediately"; never allowed
+  });
+
+  it('clamps to [250, 60000] and passes a sane value through', () => {
+    expect(sanitizeAuthzTimeoutMs('1', 1500)).toBe(250); // too-tight typo cannot self-DoS authz
+    expect(sanitizeAuthzTimeoutMs('600000', 1500)).toBe(60000); // too-loose typo cannot un-bound the call
+    expect(sanitizeAuthzTimeoutMs('2000', 1500)).toBe(2000);
   });
 });
