@@ -64,14 +64,10 @@ describe("auth-service platform routing (issue #46)", () => {
     expect(api.post).toHaveBeenCalledWith("/auth/logout"); // Docmost still cleared
   });
 
-  it("requestAccess() still targets the platform /auth/register (guards the client consolidation)", async () => {
-    await requestAccess({
-      email: "new@vanderbilt.edu",
-      password: "a-long-enough-password",
-    });
+  it("requestAccess() still targets the platform /auth/register (email-only, passwordless)", async () => {
+    await requestAccess({ email: "new@vanderbilt.edu" });
     expect(platformApi.post).toHaveBeenCalledWith("/auth/register", {
       email: "new@vanderbilt.edu",
-      password: "a-long-enough-password",
     });
   });
 });

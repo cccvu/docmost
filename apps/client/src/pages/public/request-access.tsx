@@ -6,7 +6,6 @@ import {
   Alert,
   Button,
   Container,
-  PasswordInput,
   Text,
   TextInput,
   Title,
@@ -20,11 +19,9 @@ import { requestAccess } from "@/features/public/services/public-service.ts";
 import APP_ROUTE from "@/lib/app-route.ts";
 import { getAppName } from "@/lib/config.ts";
 
+// Passwordless: request access captures only an email. Sign-in is via magic link + OTP once approved.
 const formSchema = z.object({
   email: z.email().min(1, { message: "Email is required" }),
-  password: z
-    .string()
-    .min(10, { message: "Password must be at least 10 characters" }),
 });
 type FormValues = z.infer<typeof formSchema>;
 
@@ -36,7 +33,7 @@ export default function RequestAccess() {
 
   const form = useForm<FormValues>({
     validate: zod4Resolver(formSchema),
-    initialValues: { email: "", password: "" },
+    initialValues: { email: "" },
   });
 
   async function onSubmit(values: FormValues) {
@@ -98,18 +95,6 @@ export default function RequestAccess() {
                 autoComplete="email"
                 errorProps={{ role: "alert" }}
                 {...form.getInputProps("email")}
-              />
-              <PasswordInput
-                id="password"
-                mt="md"
-                label={t("Password")}
-                placeholder={t("At least 10 characters")}
-                autoComplete="new-password"
-                errorProps={{ role: "alert" }}
-                visibilityToggleButtonProps={{
-                  "aria-label": t("Toggle password visibility"),
-                }}
-                {...form.getInputProps("password")}
               />
               <Button type="submit" fullWidth mt="lg" loading={submitting}>
                 {t("Request access")}

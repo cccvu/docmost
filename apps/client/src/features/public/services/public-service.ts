@@ -42,12 +42,47 @@ export interface IRequestAccessResponse {
   message: string;
 }
 
+// Passwordless: request access captures only an email (no password anywhere on the platform). The
+// account is created `pending` and cannot sign in until an admin approves it.
 export async function requestAccess(data: {
   email: string;
-  password: string;
 }): Promise<IRequestAccessResponse> {
   const res = await platformApi.post<IRequestAccessResponse>(
     "/auth/register",
+    data,
+  );
+  return res.data;
+}
+
+export interface IPasswordlessRequestResponse {
+  message: string;
+}
+
+// Ask the platform to email a magic link + OTP. The response is ALWAYS generic (account-enumeration
+// resistance) — the UI shows the same "check your email" state regardless of whether an account exists.
+export async function requestPasswordless(data: {
+  email: string;
+}): Promise<IPasswordlessRequestResponse> {
+  const res = await platformApi.post<IPasswordlessRequestResponse>(
+    "/auth/passwordless/request",
+    data,
+  );
+  return res.data;
+}
+
+export interface IPasswordlessVerifyResponse {
+  id: string;
+  email: string;
+  workspaceId: string;
+}
+
+// Verify EITHER a magic-link token OR an email + OTP. On success the platform sets the session cookie;
+// the caller must then run openDocmostSession() before navigating (the two-step BFF bridge).
+export async function verifyPasswordless(
+  data: { token: string } | { email: string; otp: string },
+): Promise<IPasswordlessVerifyResponse> {
+  const res = await platformApi.post<IPasswordlessVerifyResponse>(
+    "/auth/passwordless/verify",
     data,
   );
   return res.data;

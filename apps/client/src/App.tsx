@@ -2,7 +2,10 @@ import { Route, Routes } from "react-router-dom";
 import SetupWorkspace from "@/pages/auth/setup-workspace.tsx";
 import RootGate from "@/features/public/components/root-gate.tsx";
 import RequestAccess from "@/pages/public/request-access.tsx";
-import LoginPage from "@/pages/auth/login";
+// CCC passwordless auth (issue #4): the platform login is passwordless (magic link + OTP). The old
+// Docmost password LoginPage is intentionally unrouted; sign-in is these CCC-owned pages instead.
+import PasswordlessLogin from "@/pages/public/passwordless-login.tsx";
+import PasswordlessVerify from "@/pages/public/passwordless-verify.tsx";
 import Home from "@/pages/dashboard/home";
 import Page from "@/pages/page/page";
 import AccountSettings from "@/pages/settings/account/account-settings";
@@ -59,7 +62,9 @@ export default function App() {
     <>
       <Routes>
         <Route index element={<RootGate />} />
-        <Route path={"/login"} element={<LoginPage />} />
+        <Route path={"/login"} element={<PasswordlessLogin />} />
+        {/* Magic-link landing page — explicit-click consume (no auto-submit); see the component. */}
+        <Route path={"/login/verify"} element={<PasswordlessVerify />} />
         <Route path={"/request-access"} element={<RequestAccess />} />
         <Route path={"/invites/:invitationId"} element={<InviteSignup />} />
         <Route path={"/forgot-password"} element={<ForgotPassword />} />
