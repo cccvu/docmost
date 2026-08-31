@@ -34,6 +34,9 @@ import {
 } from "@/features/search/constants.ts";
 import { NotificationPopover } from "@/features/notification/components/notification-popover.tsx";
 import { workspaceAtom } from "@/features/user/atoms/current-user-atom.ts";
+// CCC seam (issue #57): platform-admin entry point → the standalone /console. Self-gating (renders only
+// for a platform workspace admin); advisory-only, all authority is re-enforced server-side by the PDP.
+import { AdminEntryLink } from "@/features/admin-entry/admin-entry-link.tsx";
 
 const links = [
   { link: APP_ROUTE.HOME, label: "Home" },
@@ -158,6 +161,7 @@ export function AppHeader() {
               </Tooltip>
             </>
           )}
+          <AdminEntryLink />
           <NotificationPopover />
           {isCloud() && isTrial && trialDaysLeft !== 0 && (
             <Badge
