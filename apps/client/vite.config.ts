@@ -74,6 +74,18 @@ export default defineConfig(({ mode }) => {
           target: PLATFORM_URL || "http://localhost:4000",
           changeOrigin: true,
         },
+        // CCC admin surface — same-origin like prod (the ALB routes these to the platform). AdminEntryLink
+        // calls /admin/context to decide whether to show the top-right "Admin" link, and the link is a
+        // full-page navigation to /console (the admin console SPA the platform serves). Without these two
+        // the /admin/context probe hits the Vite SPA fallback (not the platform) and the link never shows.
+        "/admin": {
+          target: PLATFORM_URL || "http://localhost:4000",
+          changeOrigin: true,
+        },
+        "/console": {
+          target: PLATFORM_URL || "http://localhost:4000",
+          changeOrigin: true,
+        },
         "/socket.io": {
           target: APP_URL,
           ws: true,
