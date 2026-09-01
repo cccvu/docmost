@@ -9,13 +9,15 @@
 }
 
 /* Two-line text block beside the V: the serif wordmark over the college name,
-   mirroring the computing.vanderbilt.edu lockup. `color` drives the ink for both
-   (near-black on light, near-white on dark) — the gold V keeps its own color. */
+   mirroring the computing.vanderbilt.edu lockup. The column is set to the V's
+   full height (inline) and the two lines are pushed to its edges — the wordmark
+   flush with the top of the V, the college line flush with the bottom — exactly
+   as on the official site. `color` drives the ink for both (near-black on light,
+   near-white on dark); the gold V keeps its own color. */
 .textCol {
   display: flex;
   flex-direction: column;
-  justify-content: center;
-  gap: 2px;
+  justify-content: space-between;
   color: var(--mantine-color-text);
 }
 
@@ -32,10 +34,11 @@
   display: block;
 }
 
-/* College name in Inter sans (the brand's Theinhardt substitute), medium weight —
-   the prominent line, matching the CCC site. */
+/* College name — the prominent line, matching the CCC site. Roboto (medium) is a
+   neo-grotesque whose single-story 'g' matches the site's licensed Theinhardt;
+   falls back to the app font (Inter) if Roboto hasn't loaded. */
 .college {
-  font-family: var(--mantine-font-family);
+  font-family: "Roboto", var(--mantine-font-family);
   font-weight: 500;
   line-height: 1.1;
   white-space: nowrap;

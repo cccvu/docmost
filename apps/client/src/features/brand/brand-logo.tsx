@@ -89,7 +89,7 @@ export function Brand({
         className={classes.vIcon}
         style={{ height: h }}
       />
-      <span className={classes.textCol}>
+      <span className={classes.textCol} style={{ height: h }}>
         <span
           className={classes.wordmark}
           style={{ height: Math.round(h * 0.26) }}
