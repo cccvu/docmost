@@ -95,11 +95,13 @@ export function AppHeader() {
             {/* Compact V icon up to md; the full lockup + wordmark only on
                 desktop (≥992px) where the header has room — avoids crowding the
                 search/actions at the sm breakpoint. */}
+            {/* icon-only V matches the lockup's V height (38) so it doesn't
+                visibly resize when the wordmark drops at the md breakpoint. */}
             <Box hiddenFrom="md" className={classes.brandIcon}>
-              <Brand variant="icon" iconHeight={24} />
+              <Brand variant="icon" iconHeight={38} />
             </Box>
             <Box visibleFrom="md" className={classes.brandIcon}>
-              <Brand variant="lockup" appName={getAppName()} lockupHeight={22} />
+              <Brand variant="lockup" lockupHeight={38} />
             </Box>
           </Link>
 

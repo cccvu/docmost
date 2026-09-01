@@ -85,8 +85,11 @@ export default function GlobalAppShell({
   return (
     <>
       <SkipToMain />
+      {/* CCC: header height raised from 45 → 56 to give the Vanderbilt/CCC lockup
+          room to breathe. Keep in sync with the coupled `.aside` margin-top in
+          app-shell.module.css. */}
       <AppShell
-      header={{ height: 45 }}
+      header={{ height: 56 }}
       navbar={{
         width: isSpaceRoute ? sidebarWidth : 300,
         breakpoint: "sm",

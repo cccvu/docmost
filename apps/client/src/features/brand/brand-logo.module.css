@@ -2,19 +2,44 @@
   align-items: center;
 }
 
-/* Preserve the gold Dimensional V — never invert or recolor the artwork.
-   aspect-ratio reserves the box from the set height so the mark doesn't reflow
-   when the (non-inlined) PNG decodes. */
-.lockup {
-  display: block;
-  width: auto;
-  aspect-ratio: 720 / 109;
-}
-
 .vIcon {
   display: block;
   width: auto;
   aspect-ratio: 178 / 128;
+}
+
+/* Two-line text block beside the V: the serif wordmark over the college name,
+   mirroring the computing.vanderbilt.edu lockup. `color` drives the ink for both
+   (near-black on light, near-white on dark) — the gold V keeps its own color. */
+.textCol {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  color: var(--mantine-color-text);
+}
+
+/* Official "VANDERBILT UNIVERSITY" serif wordmark (inline SVG, fill=currentColor).
+   Height is set inline from lockupHeight; the SVG scales to it. */
+.wordmark {
+  display: inline-flex;
+  line-height: 0;
+}
+
+.wordmark > svg {
+  height: 100%;
+  width: auto;
+  display: block;
+}
+
+/* College name in Inter sans (the brand's Theinhardt substitute), medium weight —
+   the prominent line, matching the CCC site. */
+.college {
+  font-family: var(--mantine-font-family);
+  font-weight: 500;
+  line-height: 1.1;
+  white-space: nowrap;
+  color: var(--mantine-color-text);
 }
 
 .divider {
