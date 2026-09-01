@@ -63,12 +63,24 @@
 }
 
 .sectionHeader {
+    display: flex;
+    align-items: center;
+    gap: rem(6px);
     padding: var(--mantine-spacing-xs) var(--mantine-spacing-sm);
     font-size: var(--mantine-font-size-xs);
     color: var(--mantine-color-dimmed);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.5px;
+}
+
+/* CCC: heart mark on the "Favorite spaces" header — sized just above the xs
+   label, normal stroke, slightly stronger ink than the dimmed text. */
+.sectionHeaderIcon {
+    flex: none;
+    width: rem(15px);
+    height: rem(15px);
+    color: light-dark(var(--mantine-color-gray-6), var(--mantine-color-dark-2));
 }
 
 .spacer {
@@ -105,5 +117,64 @@
     &:focus-visible {
         outline: 2px solid var(--mantine-primary-color-filled);
         outline-offset: 2px;
+    }
+}
+
+/* CCC: collapsed icon rail — DESKTOP ONLY. The sidebar always renders its full
+   markup (labels stay in the DOM for a11y and for the mobile overlay); these
+   rules apply only at sm+ when the navbar carries [data-collapsed], hiding text
+   and centering the icons into the ~60px rail set by the AppShell. Labels are
+   surfaced as hover tooltips (see global-sidebar.tsx). */
+@media (min-width: $mantine-breakpoint-sm) {
+    .navbar[data-collapsed] {
+        padding-left: rem(8px);
+        padding-right: rem(8px);
+    }
+
+    /* Center the single icon dead-center regardless of element type or how the
+       browser lays out <button> content. Docmost renders the fixed nav as <a>
+       (Link) but Templates + Invite as <button> (UnstyledButton); rather than
+       fight the button's content-alignment quirks (flex/grid/text-align all left
+       those two off-center), take the icon out of flow and position it absolutely
+       at the link's centre — immune to the container's layout mode. */
+    .navbar[data-collapsed] .link {
+        display: block;
+        position: relative;
+        /* A <button> is shrink-to-fit; without this it collapses to 0 width (its
+           icon + label are out of flow) and pins the icon to the rail's left edge.
+           width:100% makes both <a> and <button> fill the rail so the centre is
+           the rail's centre. */
+        width: 100%;
+        padding: 0;
+        min-height: rem(40px);
+    }
+
+    .navbar[data-collapsed] .linkIcon {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        margin: 0;
+        width: rem(20px);
+        height: rem(20px);
+    }
+
+    /* Keep the label as the accessible name, but hide it visually (sr-only). */
+    .navbar[data-collapsed] .link span {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+    }
+
+    /* Sections that can't reduce to a single icon: the favorite-spaces list, its
+       header, and the divider above it. */
+    .navbar[data-collapsed] .railHidden {
+        display: none;
     }
 }

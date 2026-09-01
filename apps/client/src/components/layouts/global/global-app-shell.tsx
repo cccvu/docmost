@@ -81,6 +81,10 @@ export default function GlobalAppShell({
   const isAiRoute = location.pathname.startsWith("/ai");
   const isPageRoute = location.pathname.includes("/p/");
   const showGlobalSidebar = !isSpaceRoute && !isSettingsRoute && !isAiRoute;
+  // CCC: the global sidebar collapses to a desktop icon rail (RAIL_WIDTH) instead
+  // of hiding entirely; space/settings/AI keep the upstream show/hide behavior.
+  const RAIL_WIDTH = 52;
+  const isGlobalRail = showGlobalSidebar && !desktopOpened;
 
   return (
     <>
@@ -91,11 +95,18 @@ export default function GlobalAppShell({
       <AppShell
       header={{ height: 56 }}
       navbar={{
-        width: isSpaceRoute ? sidebarWidth : 300,
+        // CCC: on desktop the global sidebar becomes a 60px icon rail when
+        // "collapsed" rather than hiding; mobile always uses the full 300px
+        // overlay (rail styles are gated to sm+ in global-sidebar.module.css).
+        width: isSpaceRoute
+          ? sidebarWidth
+          : { base: 300, sm: isGlobalRail ? RAIL_WIDTH : 300 },
         breakpoint: "sm",
         collapsed: {
           mobile: !mobileOpened,
-          desktop: !desktopOpened,
+          // Global sidebar never fully hides on desktop (it rails); settings/AI
+          // keep the upstream show/hide toggle.
+          desktop: showGlobalSidebar ? false : !desktopOpened,
         },
       }}
       aside={
@@ -130,7 +141,7 @@ export default function GlobalAppShell({
         {isSpaceRoute && <SpaceSidebar />}
         {isSettingsRoute && <SettingsSidebar />}
         {isAiRoute && <AiChatSidebar />}
-        {showGlobalSidebar && <GlobalSidebar />}
+        {showGlobalSidebar && <GlobalSidebar collapsed={isGlobalRail} />}
       </AppShell.Navbar>
       <AppShell.Main id={MAIN_CONTENT_ID} tabIndex={-1}>
         {isSettingsRoute ? (
