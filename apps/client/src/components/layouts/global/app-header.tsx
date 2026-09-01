@@ -38,10 +38,6 @@ import { workspaceAtom } from "@/features/user/atoms/current-user-atom.ts";
 // for a platform workspace admin); advisory-only, all authority is re-enforced server-side by the PDP.
 import { AdminEntryLink } from "@/features/admin-entry/admin-entry-link.tsx";
 
-const links = [
-  { link: APP_ROUTE.HOME, label: "Home" },
-];
-
 export function AppHeader() {
   const { t } = useTranslation();
   const [mobileOpened] = useAtom(mobileSidebarAtom);
@@ -56,12 +52,6 @@ export function AppHeader() {
   const aiChatEnabled = workspace?.settings?.ai?.chat === true;
 
   const isPageRoute = location.pathname.includes("/p/");
-
-  const items = links.map((link) => (
-    <Link key={link.label} to={link.link} className={classes.link}>
-      {t(link.label)}
-    </Link>
-  ));
 
   return (
     <>
@@ -104,10 +94,6 @@ export function AppHeader() {
               <Brand variant="lockup" lockupHeight={38} />
             </Box>
           </Link>
-
-          <Group ml={50} gap={5} className={classes.links} visibleFrom="sm">
-            {items}
-          </Group>
         </Group>
 
         <div>
