@@ -1,6 +1,7 @@
 import type { Editor } from "@tiptap/react";
 
-const PLACEHOLDER = "link";
+/** The literal text inserted when a Link is requested with no word under the caret. */
+export const LINK_PLACEHOLDER = "link";
 
 /** A doc range a caller may need to clean up (see `ensureLinkableSelection`). */
 export interface PlaceholderRange {
@@ -68,8 +69,40 @@ export function ensureLinkableSelection(
   const at = selection.from;
   editor
     .chain()
-    .insertContent(PLACEHOLDER)
-    .setTextSelection({ from: at, to: at + PLACEHOLDER.length })
+    .insertContent(LINK_PLACEHOLDER)
+    .setTextSelection({ from: at, to: at + LINK_PLACEHOLDER.length })
     .run();
-  return { placeholder: { from: at, to: at + PLACEHOLDER.length } };
+  return { placeholder: { from: at, to: at + LINK_PLACEHOLDER.length } };
+}
+
+/**
+ * Whether a pending link placeholder should be removed on a cancelled panel.
+ *
+ * The caller tracks the placeholder range across document changes (mapping it
+ * through every transaction, local AND remote-collab), then asks this before
+ * deleting. It returns true ONLY when the range is in-bounds, still holds
+ * exactly the placeholder text, and carries no link mark — i.e. the user
+ * dismissed the panel without applying a link. This is the safety gate on a
+ * DESTRUCTIVE `deleteRange`: a stale or rewritten range (e.g. a concurrent
+ * remote edit consumed or shifted the text) returns false, so cleanup can
+ * never delete the wrong content or throw on an out-of-range position.
+ */
+export function shouldRemovePlaceholder(
+  editor: Editor,
+  range: PlaceholderRange,
+): boolean {
+  const { from, to } = range;
+  const size = editor.state.doc.content.size;
+  if (from < 0 || to > size || from >= to) return false;
+  if (editor.state.doc.textBetween(from, to) !== LINK_PLACEHOLDER) return false;
+
+  const linkType = editor.schema.marks.link;
+  if (!linkType) return true;
+  let linked = false;
+  editor.state.doc.nodesBetween(from, to, (node) => {
+    if (node.isText && node.marks.some((m) => m.type === linkType)) {
+      linked = true;
+    }
+  });
+  return !linked;
 }
