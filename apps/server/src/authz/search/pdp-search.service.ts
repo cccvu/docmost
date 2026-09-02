@@ -1,4 +1,4 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { InjectKysely } from 'nestjs-kysely';
 import { sql } from 'kysely';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
@@ -7,7 +7,7 @@ import { ShareRepo } from '@docmost/db/repos/share/share.repo';
 import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 import { SearchService } from '../../core/search/search.service';
-import { SearchDTO, SearchSuggestionDTO } from '../../core/search/dto/search.dto';
+import { MAX_SEARCH_QUERY_LENGTH, SearchDTO, SearchSuggestionDTO } from '../../core/search/dto/search.dto';
 import { SearchResponseDto } from '../../core/search/dto/search-response.dto';
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -90,6 +90,15 @@ export class PdpSearchService extends SearchService {
     const { query } = searchParams;
     if (!query || query.length < 1) {
       return { items: [] };
+    }
+
+    // ReDoS guard (sweep F6): reject an over-long query HERE, ahead of the super() delegation below, so
+    // this ONE fork-owned choke point covers BOTH the authenticated path (tsquery below) AND the @Public
+    // /search/share-search path (which reaches the upstream tsquery via super.searchPage before any DB
+    // lookup). Bounding length keeps pg-tsquery's O(N²) backtracking negligible. Defensive twin to the DTO
+    // @MaxLength edge validation — same MAX_SEARCH_QUERY_LENGTH so the two bounds can never drift.
+    if (query.length > MAX_SEARCH_QUERY_LENGTH) {
+      throw new BadRequestException(`search query too long (max ${MAX_SEARCH_QUERY_LENGTH} characters)`);
     }
 
     // Anonymous / public-share path: there is no principal, and retrieval is already gated by an

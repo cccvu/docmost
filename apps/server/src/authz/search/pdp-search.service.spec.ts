@@ -1,4 +1,12 @@
+import { BadRequestException } from '@nestjs/common';
+import { validate } from 'class-validator';
 import { PdpSearchService } from './pdp-search.service';
+import {
+  MAX_SEARCH_QUERY_LENGTH,
+  SearchDTO,
+  SearchShareDTO,
+  SearchSuggestionDTO,
+} from '../../core/search/dto/search.dto';
 
 /**
  * CCC authorization integration test (fork compatibility suite) — permission-aware search is
@@ -351,5 +359,85 @@ describe('PdpSearchService — filter-then-retrieve (searchSuggestions)', () => 
 
     expect(pages).toEqual([]);
     expect(filterAccessiblePageIds).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Sweep F6: pg-tsquery 8.4.2 backtracks O(N²) on a crafted query, so an unbounded search string blocks the
+ * event loop for seconds before any DB call. The clamp sits at the TOP of searchPage — ahead of the
+ * `if (!opts.userId) super.searchPage(...)` delegation — so it covers BOTH the authenticated path and the
+ * unauthenticated @Public /search/share-search path (which reaches the upstream tsquery via super).
+ */
+describe('PdpSearchService — search-query length guard (sweep F6)', () => {
+  const WS = 'ws-1';
+  const USER = 'u1';
+  const overLong = 'a'.repeat(MAX_SEARCH_QUERY_LENGTH + 1);
+
+  it('rejects an over-length query on the AUTHENTICATED path before touching the PDP or tsquery', async () => {
+    const { service, filterAccessiblePageIds } = build({ pageCandidates: mkRows(['a']), denied: new Set() });
+    await expect(
+      service.searchPage({ query: overLong, limit: 25 } as any, { userId: USER, workspaceId: WS }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+    expect(filterAccessiblePageIds).not.toHaveBeenCalled(); // rejected before any retrieval work
+  });
+
+  it('rejects an over-length query on the UNAUTHENTICATED public-share path (guard precedes super.searchPage)', async () => {
+    // No userId → without the guard this would delegate to the upstream tsquery via super.searchPage. The
+    // clamp is ahead of that delegation, so the anonymous path is protected by this one fork choke point.
+    const { service } = build({ pageCandidates: mkRows(['a']), denied: new Set() });
+    await expect(
+      service.searchPage({ query: overLong, shareId: 's1' } as any, { workspaceId: WS }),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('accepts a query exactly at the limit and returns results (bound is inclusive, not off-by-one)', async () => {
+    const { service } = build({ pageCandidates: mkRows(['a']), denied: new Set() });
+    const { items } = await service.searchPage(
+      { query: 'a'.repeat(MAX_SEARCH_QUERY_LENGTH), limit: 25 } as any,
+      { userId: USER, workspaceId: WS },
+    );
+    expect(items.map((i: any) => i.id)).toEqual(['a']);
+  });
+
+  it('adversarial: a max-length run of tsquery backtracking chars parses FAST (no event-loop block)', async () => {
+    // The pre-fix attack was ~50KB of `&` then `>`. Bounded to MAX_SEARCH_QUERY_LENGTH, the same shape is
+    // parsed in well under the ReDoS timescale — this completes rather than hanging.
+    const { service } = build({ pageCandidates: mkRows(['a']), denied: new Set() });
+    const start = Date.now();
+    await service.searchPage(
+      { query: '&'.repeat(MAX_SEARCH_QUERY_LENGTH - 1) + '>', limit: 25 } as any,
+      { userId: USER, workspaceId: WS },
+    );
+    expect(Date.now() - start).toBeLessThan(1000); // negligible vs the seconds-long unbounded ReDoS
+  });
+});
+
+/**
+ * Edge validation twin (sweep F6): the global ValidationPipe enforces @MaxLength on the DTO, so an
+ * over-length query is a 400 for EVERY search route before the service runs. Asserted directly against
+ * class-validator, mirroring public-discovery.service.spec.ts.
+ */
+describe('search DTO @MaxLength (sweep F6)', () => {
+  const hasMaxLength = (errors: Awaited<ReturnType<typeof validate>>) =>
+    errors.some((e) => e.property === 'query' && e.constraints && 'maxLength' in e.constraints);
+
+  it('SearchDTO rejects an over-length query and accepts one at the bound', async () => {
+    const over = Object.assign(new SearchDTO(), { query: 'a'.repeat(MAX_SEARCH_QUERY_LENGTH + 1) });
+    const ok = Object.assign(new SearchDTO(), { query: 'a'.repeat(MAX_SEARCH_QUERY_LENGTH) });
+    expect(hasMaxLength(await validate(over))).toBe(true);
+    expect(hasMaxLength(await validate(ok))).toBe(false);
+  });
+
+  it('SearchShareDTO inherits the query bound (the @Public share route DTO)', async () => {
+    const over = Object.assign(new SearchShareDTO(), {
+      query: 'a'.repeat(MAX_SEARCH_QUERY_LENGTH + 1),
+      shareId: 's1',
+    });
+    expect(hasMaxLength(await validate(over))).toBe(true);
+  });
+
+  it('SearchSuggestionDTO rejects an over-length query', async () => {
+    const over = Object.assign(new SearchSuggestionDTO(), { query: 'a'.repeat(MAX_SEARCH_QUERY_LENGTH + 1) });
+    expect(hasMaxLength(await validate(over))).toBe(true);
   });
 });
