@@ -81,10 +81,15 @@ export default function GlobalAppShell({
   const isAiRoute = location.pathname.startsWith("/ai");
   const isPageRoute = location.pathname.includes("/p/");
   const showGlobalSidebar = !isSpaceRoute && !isSettingsRoute && !isAiRoute;
-  // CCC: the global sidebar collapses to a desktop icon rail (RAIL_WIDTH) instead
-  // of hiding entirely; space/settings/AI keep the upstream show/hide behavior.
+  // CCC: when the desktop sidebar toggle is off, NAVIGATION sidebars (home,
+  // settings) collapse to a 52px icon rail instead of hiding; CONTENT sidebars
+  // (the space page-tree, AI chat) keep the upstream show/hide behavior — a
+  // full-width reading view, since a tree/chat list has no meaningful icon rail.
+  // `railsWhenCollapsed` is the single source of truth for both the navbar width
+  // and the collapsed.desktop decision below.
   const RAIL_WIDTH = 52;
-  const isGlobalRail = showGlobalSidebar && !desktopOpened;
+  const railsWhenCollapsed = showGlobalSidebar || isSettingsRoute;
+  const isRail = railsWhenCollapsed && !desktopOpened;
 
   return (
     <>
@@ -95,18 +100,19 @@ export default function GlobalAppShell({
       <AppShell
       header={{ height: 56 }}
       navbar={{
-        // CCC: on desktop the global sidebar becomes a 60px icon rail when
-        // "collapsed" rather than hiding; mobile always uses the full 300px
-        // overlay (rail styles are gated to sm+ in global-sidebar.module.css).
+        // CCC: on desktop the home & settings sidebars become a 52px icon rail
+        // when "collapsed" rather than hiding; mobile always uses the full 300px
+        // overlay (rail styles are gated to sm+ in the sidebars' module.css).
         width: isSpaceRoute
           ? sidebarWidth
-          : { base: 300, sm: isGlobalRail ? RAIL_WIDTH : 300 },
+          : { base: 300, sm: isRail ? RAIL_WIDTH : 300 },
         breakpoint: "sm",
         collapsed: {
           mobile: !mobileOpened,
-          // Global sidebar never fully hides on desktop (it rails); settings/AI
-          // keep the upstream show/hide toggle.
-          desktop: showGlobalSidebar ? false : !desktopOpened,
+          // Navigation sidebars (home, settings) never fully hide on desktop
+          // (they rail); the space page-tree and AI chat keep the upstream
+          // show/hide toggle.
+          desktop: railsWhenCollapsed ? false : !desktopOpened,
         },
       }}
       aside={
@@ -139,9 +145,9 @@ export default function GlobalAppShell({
           <div className={classes.resizeHandle} onMouseDown={startResizing} />
         )}
         {isSpaceRoute && <SpaceSidebar />}
-        {isSettingsRoute && <SettingsSidebar />}
+        {isSettingsRoute && <SettingsSidebar collapsed={isRail} />}
         {isAiRoute && <AiChatSidebar />}
-        {showGlobalSidebar && <GlobalSidebar collapsed={isGlobalRail} />}
+        {showGlobalSidebar && <GlobalSidebar collapsed={isRail} />}
       </AppShell.Navbar>
       <AppShell.Main id={MAIN_CONTENT_ID} tabIndex={-1}>
         {isSettingsRoute ? (
