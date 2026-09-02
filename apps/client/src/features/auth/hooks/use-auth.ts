@@ -21,8 +21,9 @@ import { exchangeTokenRedirectUrl, getHostnameUrl } from "@/ee/utils.ts";
 
 // NOTE: password sign-in (`handleSignIn`/`signIn`) was removed — the platform is passwordless
 // (magic link + OTP, issue #4). The two-step "mint platform session → openDocmostSession before
-// navigate" now lives in features/public/hooks/use-passwordless.ts. useAuth still owns logout,
-// setup, invitation, forgot/reset (Docmost-side), and verify-token.
+// navigate" now lives in features/public/hooks/use-passwordless.ts. The password-lifecycle handlers
+// (forgot/reset/change/verify-token) were removed with their dead UI (issue #52); useAuth now owns only
+// logout, workspace setup, and invitation signup.
 
 export default function useAuth() {
   const { t } = useTranslation();
