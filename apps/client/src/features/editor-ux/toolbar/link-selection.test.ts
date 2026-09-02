@@ -1,10 +1,11 @@
 import { describe, it, expect, afterEach } from "vitest";
 import { Editor } from "@tiptap/core";
 import { StarterKit } from "@tiptap/starter-kit";
+import { Link } from "@tiptap/extension-link";
 import { ensureLinkableSelection } from "./link-selection";
 
 function makeEditor(content: string) {
-  return new Editor({ extensions: [StarterKit], content });
+  return new Editor({ extensions: [StarterKit, Link], content });
 }
 
 let editor: Editor;
@@ -44,5 +45,25 @@ describe("ensureLinkableSelection", () => {
     ensureLinkableSelection(editor);
     expect(editor.isFocused).toBe(false);
     expect(selectedText(editor)).toBe("alpha");
+  });
+
+  it("selects the whole link when the caret sits inside an existing link", () => {
+    editor = makeEditor(
+      '<p>see <a href="https://example.com">the link</a> here</p>',
+    );
+    // "see " = [1,5), "the link" = [5,13); put the caret inside the link text.
+    editor.commands.setTextSelection(6);
+    expect(editor.isActive("link")).toBe(true);
+    const { placeholder } = ensureLinkableSelection(editor);
+    expect(selectedText(editor)).toBe("the link");
+    expect(placeholder).toBeNull();
+  });
+
+  it("reports the placeholder range so the caller can undo a cancelled link", () => {
+    editor = makeEditor("<p></p>");
+    editor.commands.setTextSelection(1);
+    const { placeholder } = ensureLinkableSelection(editor);
+    expect(placeholder).toEqual({ from: 1, to: 1 + "link".length });
+    expect(selectedText(editor)).toBe("link");
   });
 });

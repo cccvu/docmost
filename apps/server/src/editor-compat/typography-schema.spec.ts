@@ -100,6 +100,19 @@ describe('typography schema round-trip (server)', () => {
     expect(html).not.toContain('font-size');
   });
 
+  it('render-path gate: a non-keyword family in JSON is NOT emitted as CSS', () => {
+    // Same hostile bypass for fontFamily: only the "serif"/"monospace" keywords
+    // map to a controlled stack; anything else must render to no CSS.
+    const doc = textStyleDoc({
+      color: null,
+      fontSize: null,
+      fontFamily: 'Comic Sans MS',
+    });
+    const html = jsonToHtml(doc);
+    expect(html).not.toContain('Comic Sans');
+    expect(html).not.toContain('font-family');
+  });
+
   it('htmlToJson snaps an off-scale imported size to the nearest allowed step', () => {
     const json = htmlToJson('<p><span style="font-size: 15px">x</span></p>');
     expect(textStyleAttrs(json)?.fontSize).toBe('14px');

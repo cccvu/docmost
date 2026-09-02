@@ -14,8 +14,10 @@ interface Props {
 /**
  * CCC editor-UX (issue #135): controlled font-size menu. Applies allowlisted
  * `fontSize` values via the fork `CccFontSize` command (attr on the `textStyle`
- * mark). Disabled inside code blocks; shows a check on the active value and
- * "Mixed" across a multi-size selection.
+ * mark). Disabled inside code blocks; shows a check on the active value. A
+ * selection spanning several sizes reads as "mixed" (no item checked); a
+ * visible mixed-state label + `menuitemradio` semantics are tracked as a
+ * follow-up.
  */
 export const FontSizeGroup: FC<Props> = ({ editor }) => {
   const { t } = useTranslation();

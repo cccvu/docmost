@@ -1,4 +1,4 @@
-import { RefObject, useEffect } from "react";
+import { RefObject, useEffect, useRef } from "react";
 
 /**
  * CCC editor-UX (issue #135): ARIA roving-tabindex for the `role="toolbar"`.
@@ -24,6 +24,14 @@ export function useRovingToolbar(
   ref: RefObject<HTMLElement | null>,
   onExit?: () => void,
 ): void {
+  // Hold onExit in a ref updated each render so the effect below does NOT list
+  // it as a dependency. Callers pass a fresh arrow (`() => editor.commands.focus()`)
+  // every render; if that were a dep, the effect would tear down + re-register
+  // all listeners and reset the roving tab stop to the first control on every
+  // toolbar re-render (frequent during editing) — losing the user's position.
+  const onExitRef = useRef(onExit);
+  onExitRef.current = onExit;
+
   useEffect(() => {
     const root = ref.current;
     if (!root) return;
@@ -51,7 +59,7 @@ export function useRovingToolbar(
 
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        onExit?.();
+        onExitRef.current?.();
         return;
       }
       const list = items();
@@ -96,5 +104,5 @@ export function useRovingToolbar(
       root.removeEventListener("keydown", onKeyDown);
       document.removeEventListener("keydown", onGlobalKeyDown);
     };
-  }, [ref, onExit]);
+  }, [ref]);
 }

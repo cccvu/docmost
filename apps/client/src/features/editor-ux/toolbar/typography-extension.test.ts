@@ -58,6 +58,20 @@ describe("CccFontFamily command", () => {
     expect(editor.getHTML()).not.toContain("font-family");
   });
 
+  it("render gate: a raw non-keyword family attr is not emitted as CSS", () => {
+    editor = makeEditor();
+    // Bypass the command's normalization to simulate hostile JSON/API content
+    // written straight to the mark attr (the render-path security gate, mirror
+    // of the fontSize raw-attr test above).
+    editor
+      .chain()
+      .selectAll()
+      .setMark("textStyle", { fontFamily: "Comic Sans MS" })
+      .run();
+    expect(editor.getHTML()).not.toContain("font-family");
+    expect(editor.getHTML()).not.toContain("Comic Sans");
+  });
+
   it("unsetFontFamily removes the attribute", () => {
     editor = makeEditor();
     editor.chain().selectAll().setFontFamily("monospace").run();

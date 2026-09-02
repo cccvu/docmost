@@ -31,8 +31,17 @@ export const ALLOWED_FONT_SIZES: readonly string[] = FONT_SIZE_OPTIONS.map(
   (o) => o.value,
 ).filter((v): v is string => v !== null);
 
-// 16 == Normal (unset). Kept as numbers for nearest-step snapping.
-const PX_BY_SIZE = [14, 16, 18, 20];
+// "Normal" (the null option) has no stored value but anchors the scale at 16px:
+// an incoming size closest to 16 snaps to null (no attribute).
+const NORMAL_PX = 16;
+// Derived from the single-source options so a future scale edit can't drift:
+// the allowed sizes plus the Normal anchor, as numbers for nearest-step snapping.
+// Sorted ascending so the `reduce` below breaks ties toward the SMALLER step
+// (17px → 16px/null, 19px → 18px), the documented and tested rounding rule.
+const PX_BY_SIZE = [
+  NORMAL_PX,
+  ...ALLOWED_FONT_SIZES.map((v) => parseInt(v, 10)),
+].sort((a, b) => a - b);
 
 /** px value of one CSS length, or null if unparseable. Supports px/pt/em/rem. */
 function toPx(raw: string): number | null {
@@ -70,7 +79,7 @@ export function normalizeFontSize(raw?: string | null): string | null {
   const nearest = PX_BY_SIZE.reduce((a, b) =>
     Math.abs(b - px) < Math.abs(a - px) ? b : a,
   );
-  return nearest === 16 ? null : `${nearest}px`;
+  return nearest === NORMAL_PX ? null : `${nearest}px`;
 }
 
 export type FontFamilyKeyword = "serif" | "monospace";
