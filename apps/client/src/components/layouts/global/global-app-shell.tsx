@@ -18,6 +18,7 @@ import classes from "./app-shell.module.css";
 import { useTrialEndAction } from "@/ee/hooks/use-trial-end-action.tsx";
 import { useToggleSidebar } from "@/components/layouts/global/hooks/hooks/use-toggle-sidebar.ts";
 import GlobalSidebar from "@/components/layouts/global/global-sidebar.tsx";
+import { getSidebarCollapseState } from "@/components/layouts/global/sidebar-collapse.ts";
 import { ASIDE_PANEL_ID } from "@/hooks/use-toggle-aside.tsx";
 import { MAIN_CONTENT_ID, SkipToMain } from "@/components/ui/skip-to-main.tsx";
 
@@ -80,16 +81,17 @@ export default function GlobalAppShell({
   const isSpaceRoute = location.pathname.startsWith("/s/");
   const isAiRoute = location.pathname.startsWith("/ai");
   const isPageRoute = location.pathname.includes("/p/");
-  const showGlobalSidebar = !isSpaceRoute && !isSettingsRoute && !isAiRoute;
-  // CCC: when the desktop sidebar toggle is off, NAVIGATION sidebars (home,
-  // settings) collapse to a 52px icon rail instead of hiding; CONTENT sidebars
-  // (the space page-tree, AI chat) keep the upstream show/hide behavior — a
-  // full-width reading view, since a tree/chat list has no meaningful icon rail.
-  // `railsWhenCollapsed` is the single source of truth for both the navbar width
-  // and the collapsed.desktop decision below.
   const RAIL_WIDTH = 52;
-  const railsWhenCollapsed = showGlobalSidebar || isSettingsRoute;
-  const isRail = railsWhenCollapsed && !desktopOpened;
+  // CCC: the rail-vs-hide decision is a pure, unit-tested helper (sidebar-collapse.ts)
+  // so the Settings-rail fix can't silently regress. NAVIGATION sidebars (home,
+  // settings) rail to RAIL_WIDTH when the desktop toggle is off; CONTENT sidebars
+  // (the space page-tree, AI chat) keep the upstream show/hide — a full-width reading
+  // view, since a tree/chat list has no meaningful icon rail. `railsWhenCollapsed`
+  // drives both the navbar width and the collapsed.desktop decision below.
+  const { showGlobalSidebar, railsWhenCollapsed, isRail } = getSidebarCollapseState(
+    { isSpaceRoute, isSettingsRoute, isAiRoute },
+    desktopOpened,
+  );
 
   return (
     <>
