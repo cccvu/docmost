@@ -10,6 +10,9 @@
   border-bottom: 1px solid
     light-dark(var(--mantine-color-gray-2), var(--mantine-color-dark-4));
   overflow-x: auto;
+  /* CCC (issue #135): smooth, snappy horizontal scrolling on narrow screens. */
+  scroll-behavior: smooth;
+  scroll-snap-type: x proximity;
 }
 
 .fixedToolbar::-webkit-scrollbar {
@@ -39,6 +42,7 @@
 
 .inner > * {
   flex-shrink: 0;
+  scroll-snap-align: start;
 }
 
 .spacer {
@@ -56,17 +60,57 @@
   );
 }
 
+/* CCC (issue #135): active/pressed state uses the AA-safe brand gold-ink accent
+   (was stock Mantine blue-6) so "on" controls read as on-brand in both themes. */
 .active,
 .active:hover {
-  color: var(--mantine-color-blue-6);
+  color: var(--mantine-color-gold-light-color);
   background-color: light-dark(
     var(--mantine-color-gray-1),
     var(--mantine-color-dark-5)
   );
 }
 
+/* CCC (issue #135): meet the 44px touch-target minimum on coarse (touch)
+   pointers. The theme disables touch tooltips, so the larger hit area is the
+   affordance. Icons keep their size; only the tappable box grows. */
+@media (pointer: coarse) {
+  .inner :global(.mantine-ActionIcon-root),
+  .inner :global(.mantine-Button-root) {
+    min-width: 44px;
+    min-height: 44px;
+  }
+}
+
+/* CCC (issue #135): on phones the bar scrolls horizontally — a soft edge fade
+   signals there is more to reach (Undo/Redo etc. no longer vanish silently). */
+@media (max-width: $mantine-breakpoint-sm) {
+  .fixedToolbar {
+    -webkit-mask-image: linear-gradient(
+      to right,
+      transparent 0,
+      black 12px,
+      black calc(100% - 12px),
+      transparent 100%
+    );
+    mask-image: linear-gradient(
+      to right,
+      transparent 0,
+      black 12px,
+      black calc(100% - 12px),
+      transparent 100%
+    );
+  }
+}
+
+/* CCC (issue #135): the toolbar is hidden in print AND its layout spacer, so no
+   45px blank band appears at the top of page 1. */
 @media print {
   .fixedToolbar {
+    display: none;
+  }
+
+  .spacer {
     display: none;
   }
 }

@@ -45,6 +45,8 @@ import {
   TransclusionSource,
   TransclusionReference,
   BaseEmbed,
+  CccFontSize,
+  CccFontFamily,
 } from '@docmost/editor-ext';
 import { generateText, getSchema, JSONContent } from '@tiptap/core';
 import { generateHTML, generateJSON } from '../common/helpers/prosemirror/html';
@@ -82,6 +84,12 @@ export const tiptapExtensions = [
   TrailingNode,
   TextStyle,
   Color,
+  // CCC controlled typography (issue #135) — attrs on the `textStyle` mark.
+  // MUST stay registered in lockstep with the client schema (extensions.ts),
+  // else these schema-bound paths (jsonToNode / rehydration / duplicate /
+  // share / html) would silently strip fontSize/fontFamily.
+  CccFontSize,
+  CccFontFamily,
   MathInline,
   MathBlock,
   Details,

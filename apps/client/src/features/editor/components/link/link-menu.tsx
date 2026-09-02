@@ -16,6 +16,12 @@ type EditorLinkMenuProps = {
 export const EditorLinkMenu: FC<EditorLinkMenuProps> = ({ editor }) => {
   const [showLinkMenu, setShowLinkMenu] = useAtom(showLinkMenuAtom);
   const showLinkMenuRef = useRef(showLinkMenu);
+  // CCC (issue #135): sync the ref during render, not only in the effect below.
+  // The BubbleMenu's shouldShow reads this ref on mount (when showLinkMenu flips
+  // true); updating it only in a post-mount effect left the first evaluation
+  // seeing a stale `false`, so the panel never opened from a programmatic
+  // trigger (the toolbar Link button) — and was racy for the bubble link too.
+  showLinkMenuRef.current = showLinkMenu;
 
   const containerRef = useRef<HTMLDivElement>(null);
 

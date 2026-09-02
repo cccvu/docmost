@@ -27,6 +27,7 @@ import { DeletedPageBanner } from "@/features/page/trash/components/deleted-page
 import clsx from "clsx";
 import { currentPageEditModeAtom } from "@/features/editor/atoms/editor-atoms.ts";
 import { EmptyPageGetStarted } from "@/features/editor/components/empty-page/empty-page-get-started";
+import { resolveEditorToolbarPref } from "@/features/editor-ux/prefs/editor-toolbar-pref";
 
 const MemoizedTitleEditor = React.memo(TitleEditor);
 const MemoizedPageEditor = React.memo(PageEditor);
@@ -68,8 +69,8 @@ export function FullEditor({
 }: FullEditorProps) {
   const [user] = useAtom(userAtom);
   const fullPageWidth = user.settings?.preferences?.fullPageWidth;
-  const editorToolbarEnabled =
-    user.settings?.preferences?.editorToolbar ?? false;
+  // CCC (issue #135): formatting toolbar defaults ON; explicit opt-out honored.
+  const editorToolbarEnabled = resolveEditorToolbarPref(user);
   const [currentPageEditMode, setCurrentPageEditMode] = useAtom(
     currentPageEditModeAtom,
   );

@@ -38,3 +38,7 @@ export {
   type DocxImageResolver,
 } from "./lib/prosemirror-docx";
 export * from "./lib/base-embed";
+// CCC controlled typography (issue #135): allowlist-gated font size/family as
+// attributes on the existing `textStyle` mark. Registered on both the client
+// and server schemas.
+export * from "./lib/ccc/typography";

@@ -222,7 +222,10 @@ export const ColorSelector: FC<ColorSelectorProps> = ({
       withArrow
     >
       <Popover.Target>
-        <Tooltip label={t("Text color")} withArrow>
+        {/* CCC (issue #135): the popover holds BOTH text color and highlight,
+            so the trigger names both — highlight was undiscoverable behind a
+            "Text color"-only label. */}
+        <Tooltip label={t("Text & highlight color")} withArrow>
           <Button
             variant="default"
             radius="0"
@@ -236,7 +239,7 @@ export const ColorSelector: FC<ColorSelectorProps> = ({
               fontWeight: 500,
               fontSize: rem(16),
             }}
-            aria-label={t("Text color")}
+            aria-label={t("Text & highlight color")}
             aria-haspopup="dialog"
             aria-expanded={isOpen}
           >
