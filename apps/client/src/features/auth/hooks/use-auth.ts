@@ -1,20 +1,12 @@
 import { useState } from "react";
 import {
-  forgotPassword,
   logout,
-  passwordReset,
   setupWorkspace,
-  verifyUserToken,
 } from "@/features/auth/services/auth-service";
 import { useNavigate } from "react-router-dom";
 import { useAtom } from "jotai";
 import { currentUserAtom } from "@/features/user/atoms/current-user-atom";
-import {
-  IForgotPassword,
-  IPasswordReset,
-  ISetupWorkspace,
-  IVerifyUserToken,
-} from "@/features/auth/types/auth.types";
+import { ISetupWorkspace } from "@/features/auth/types/auth.types";
 import { notifications } from "@mantine/notifications";
 import { IAcceptInvite } from "@/features/workspace/types/workspace.types.ts";
 import {
@@ -29,8 +21,9 @@ import { exchangeTokenRedirectUrl, getHostnameUrl } from "@/ee/utils.ts";
 
 // NOTE: password sign-in (`handleSignIn`/`signIn`) was removed — the platform is passwordless
 // (magic link + OTP, issue #4). The two-step "mint platform session → openDocmostSession before
-// navigate" now lives in features/public/hooks/use-passwordless.ts. useAuth still owns logout,
-// setup, invitation, forgot/reset (Docmost-side), and verify-token.
+// navigate" now lives in features/public/hooks/use-passwordless.ts. The password-lifecycle handlers
+// (forgot/reset/change/verify-token) were removed with their dead UI (issue #52); useAuth now owns only
+// logout, workspace setup, and invitation signup.
 
 export default function useAuth() {
   const { t } = useTranslation();
@@ -103,83 +96,15 @@ export default function useAuth() {
     }
   };
 
-  const handlePasswordReset = async (data: IPasswordReset) => {
-    setIsLoading(true);
-
-    try {
-      const response = await passwordReset(data);
-      setIsLoading(false);
-
-      if (response?.requiresLogin) {
-        notifications.show({
-          message: t(
-            "Password reset was successful. Please log in with your new password.",
-          ),
-        });
-        navigate(APP_ROUTE.AUTH.LOGIN);
-      } else {
-        navigate(APP_ROUTE.HOME);
-        notifications.show({
-          message: t("Password reset was successful"),
-        });
-      }
-    } catch (err) {
-      setIsLoading(false);
-      notifications.show({
-        message: err.response?.data.message,
-        color: "red",
-      });
-    }
-  };
-
   const handleLogout = async () => {
     setCurrentUser(RESET);
     await logout();
     window.location.replace(`${APP_ROUTE.AUTH.LOGIN}?logout=1`);
   };
 
-  const handleForgotPassword = async (data: IForgotPassword) => {
-    setIsLoading(true);
-
-    try {
-      await forgotPassword(data);
-      setIsLoading(false);
-
-      return true;
-    } catch (err) {
-      console.log(err);
-      setIsLoading(false);
-      notifications.show({
-        message: err.response?.data.message,
-        color: "red",
-      });
-
-      return false;
-    }
-  };
-
-  const handleVerifyUserToken = async (data: IVerifyUserToken) => {
-    setIsLoading(true);
-
-    try {
-      await verifyUserToken(data);
-      setIsLoading(false);
-    } catch (err) {
-      console.log(err);
-      setIsLoading(false);
-      notifications.show({
-        message: err.response?.data.message,
-        color: "red",
-      });
-    }
-  };
-
   return {
     invitationSignup: handleInvitationSignUp,
     setupWorkspace: handleSetupWorkspace,
-    forgotPassword: handleForgotPassword,
-    passwordReset: handlePasswordReset,
-    verifyUserToken: handleVerifyUserToken,
     logout: handleLogout,
     isLoading,
   };

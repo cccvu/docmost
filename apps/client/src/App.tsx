@@ -20,8 +20,6 @@ import SpaceHome from "@/pages/space/space-home.tsx";
 import PageRedirect from "@/pages/page/page-redirect.tsx";
 import Layout from "@/components/layouts/global/layout.tsx";
 import InviteSignup from "@/pages/auth/invite-signup.tsx";
-import ForgotPassword from "@/pages/auth/forgot-password.tsx";
-import PasswordReset from "./pages/auth/password-reset";
 import Billing from "@/ee/billing/pages/billing.tsx";
 import CloudLogin from "@/ee/pages/cloud-login.tsx";
 import CreateWorkspace from "@/ee/pages/create-workspace.tsx";
@@ -67,8 +65,6 @@ export default function App() {
         <Route path={"/login/verify"} element={<PasswordlessVerify />} />
         <Route path={"/request-access"} element={<RequestAccess />} />
         <Route path={"/invites/:invitationId"} element={<InviteSignup />} />
-        <Route path={"/forgot-password"} element={<ForgotPassword />} />
-        <Route path={"/password-reset"} element={<PasswordReset />} />
         <Route path={"/login/mfa"} element={<MfaChallengePage />} />
         <Route path={"/login/mfa/setup"} element={<MfaSetupRequiredPage />} />
 

@@ -1,18 +1,17 @@
 import api from "@/lib/api-client";
 import platformApi from "@/lib/platform-client";
 import {
-  IChangePassword,
   ICollabToken,
-  IForgotPassword,
-  IPasswordReset,
   ISetupWorkspace,
-  IVerifyUserToken,
 } from "@/features/auth/types/auth.types";
 import { IWorkspace } from "@/features/workspace/types/workspace.types.ts";
 
-// NOTE: password login was REMOVED (platform is passwordless — magic link + OTP, issue #4). The
-// former `login()` (POST /auth/login) and the Docmost password `LoginForm` are gone; the passwordless
-// flow (features/public/hooks/use-passwordless.ts) reuses openDocmostSession() + logout() below.
+// NOTE: password login AND the password-lifecycle ops (change/forgot/reset-password, verify-token) were
+// REMOVED — the platform is passwordless (magic link + OTP, issue #4), so there is no user password to
+// change/forget/reset, and those Docmost-native `/api/auth/*` routes are ALB-blocked in prod anyway
+// (403; infra/terraform/locals.tf `docmost_auth_deny_paths`). The passwordless flow
+// (features/public/hooks/use-passwordless.ts) reuses openDocmostSession() + logout() below.
+// `setupWorkspace` (`/api/auth/setup`) is kept for the operator/first-run bring-up path.
 
 // After a passwordless sign-in, exchange the platform session for a Docmost session: the platform BFF
 // provisions/looks up the Docmost shadow user, performs a server-to-server Docmost login, and relays
@@ -32,31 +31,11 @@ export async function logout(): Promise<void> {
   ]);
 }
 
-export async function changePassword(
-  data: IChangePassword,
-): Promise<IChangePassword> {
-  const req = await api.post<IChangePassword>("/auth/change-password", data);
-  return req.data;
-}
-
 export async function setupWorkspace(
   data: ISetupWorkspace,
 ): Promise<IWorkspace> {
   const req = await api.post<IWorkspace>("/auth/setup", data);
   return req.data;
-}
-
-export async function forgotPassword(data: IForgotPassword): Promise<void> {
-  await api.post<void>("/auth/forgot-password", data);
-}
-
-export async function passwordReset(data: IPasswordReset): Promise<{ requiresLogin?: boolean; }> {
-  const req = await api.post("/auth/password-reset", data);
-  return req.data;
-}
-
-export async function verifyUserToken(data: IVerifyUserToken): Promise<any> {
-  return api.post<any>("/auth/verify-token", data);
 }
 
 export async function getCollabToken(): Promise<ICollabToken> {
