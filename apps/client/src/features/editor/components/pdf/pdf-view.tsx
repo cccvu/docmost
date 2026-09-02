@@ -137,6 +137,8 @@ export default function PdfView(props: NodeViewProps) {
             src={safeSrc}
             loading="lazy"
             frameBorder="0"
+            allow="fullscreen"
+            allowFullScreen
             onError={() => setHasError(true)}
             onLoad={(e) => {
               try {
