@@ -16,6 +16,7 @@ export const LinkSelector: FC = () => {
         size="lg"
         radius="0"
         style={{ border: "none" }}
+        aria-label={t("Add link")}
         onClick={() => setShowLinkMenu(true)}
       >
         <IconLink size={16} />

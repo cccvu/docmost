@@ -62,6 +62,8 @@ import {
   TransclusionReference,
   TableView,
   BaseEmbed as BaseEmbedNode,
+  CccFontSize,
+  CccFontFamily,
 } from "@docmost/editor-ext";
 import {
   randomElement,
@@ -115,6 +117,7 @@ import { countWords } from "alfaaz";
 import AutoJoiner from "@/features/editor/extensions/autojoiner.ts";
 import GlobalDragHandle from "@/features/editor/extensions/drag-handle.ts";
 import { CleanStyles } from "@/features/editor/extensions/clean-styles.ts";
+import { EmptyDocPlaceholder } from "@/features/editor-ux/placeholder/empty-doc-placeholder";
 
 const lowlight = createLowlight(common);
 lowlight.register("mermaid", plaintext);
@@ -237,6 +240,15 @@ export const mainExtensions = [
   }),
   TextStyle,
   Color,
+  // CCC controlled typography (issue #135) — attrs on the `textStyle` mark.
+  // MUST stay registered in lockstep with the server schema
+  // (collaboration.util.ts), else the schema-bound server paths silently strip
+  // fontSize/fontFamily.
+  CccFontSize,
+  CccFontFamily,
+  // CCC (issue #135): show the placeholder on an empty, unfocused page (upstream
+  // Placeholder only renders while focused). Client-only; not a schema change.
+  EmptyDocPlaceholder,
   SlashCommand,
   EmojiCommand,
   Comment.configure({

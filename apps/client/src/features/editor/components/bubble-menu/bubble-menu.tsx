@@ -28,6 +28,7 @@ import { LinkSelector } from "@/features/editor/components/bubble-menu/link-sele
 import { useTranslation } from "react-i18next";
 import { showAiMenuAtom, showLinkMenuAtom } from "@/features/editor/atoms/editor-atoms";
 import { userAtom, workspaceAtom } from "@/features/user/atoms/current-user-atom";
+import { resolveEditorToolbarPref } from "@/features/editor-ux/prefs/editor-toolbar-pref";
 
 export interface BubbleMenuItem {
   name: string;
@@ -49,8 +50,8 @@ export const EditorBubbleMenu: FC<EditorBubbleMenuProps> = (props) => {
   const workspace = useAtomValue(workspaceAtom);
   const isGenerativeAiEnabled = workspace?.settings?.ai?.generative === true;
   const user = useAtomValue(userAtom);
-  const editorToolbarEnabled =
-    user?.settings?.preferences?.editorToolbar ?? false;
+  // CCC (issue #135): shares the toolbar default with the editor + settings row.
+  const editorToolbarEnabled = resolveEditorToolbarPref(user);
   const [, setDraftCommentId] = useAtom(draftCommentIdAtom);
   const showCommentPopupRef = useRef(showCommentPopup);
   const showAiMenuRef = useRef(showAiMenu);
