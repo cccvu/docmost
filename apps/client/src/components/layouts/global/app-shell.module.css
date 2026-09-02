@@ -10,7 +10,8 @@
 
 .aside {
   @media (max-width: $mantine-breakpoint-sm) {
-    margin-top: 45px;
+    /* CCC: matches the taller AppShell header height in global-app-shell.tsx. */
+    margin-top: 56px;
   }
 }
 

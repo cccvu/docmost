@@ -38,10 +38,6 @@ import { workspaceAtom } from "@/features/user/atoms/current-user-atom.ts";
 // for a platform workspace admin); advisory-only, all authority is re-enforced server-side by the PDP.
 import { AdminEntryLink } from "@/features/admin-entry/admin-entry-link.tsx";
 
-const links = [
-  { link: APP_ROUTE.HOME, label: "Home" },
-];
-
 export function AppHeader() {
   const { t } = useTranslation();
   const [mobileOpened] = useAtom(mobileSidebarAtom);
@@ -56,12 +52,6 @@ export function AppHeader() {
   const aiChatEnabled = workspace?.settings?.ai?.chat === true;
 
   const isPageRoute = location.pathname.includes("/p/");
-
-  const items = links.map((link) => (
-    <Link key={link.label} to={link.link} className={classes.link}>
-      {t(link.label)}
-    </Link>
-  ));
 
   return (
     <>
@@ -78,12 +68,20 @@ export function AppHeader() {
           </Tooltip>
 
           <Tooltip label={t("Sidebar toggle")}>
+            {/* CCC: shift the desktop toggle left so it sits in the same vertical
+                column as the collapsed rail's icons (both centered at x=26).
+                translateX keeps it out of layout flow, so the brand lockup (x=70),
+                the search box, and the right cluster all stay exactly in place;
+                the mobile toggle (hiddenFrom=sm, above) is unaffected. The offset
+                is rail-center(26) − the toggle's natural center (32px of header
+                padding + 11px half-width = 43) = -17px. */}
             <SidebarToggle
               aria-label={t("Sidebar toggle")}
               opened={desktopOpened}
               onClick={toggleDesktop}
               visibleFrom="sm"
               size="sm"
+              style={{ transform: "translateX(-17px)" }}
             />
           </Tooltip>
 
@@ -95,17 +93,15 @@ export function AppHeader() {
             {/* Compact V icon up to md; the full lockup + wordmark only on
                 desktop (≥992px) where the header has room — avoids crowding the
                 search/actions at the sm breakpoint. */}
+            {/* icon-only V matches the lockup's V height (38) so it doesn't
+                visibly resize when the wordmark drops at the md breakpoint. */}
             <Box hiddenFrom="md" className={classes.brandIcon}>
-              <Brand variant="icon" iconHeight={24} />
+              <Brand variant="icon" iconHeight={38} />
             </Box>
             <Box visibleFrom="md" className={classes.brandIcon}>
-              <Brand variant="lockup" appName={getAppName()} lockupHeight={22} />
+              <Brand variant="lockup" lockupHeight={38} />
             </Box>
           </Link>
-
-          <Group ml={50} gap={5} className={classes.links} visibleFrom="sm">
-            {items}
-          </Group>
         </Group>
 
         <div>

@@ -24,27 +24,35 @@ function renderBrand(ui: React.ReactNode) {
 }
 
 describe("Brand", () => {
-  it("renders the lockup artwork and the app-name wordmark", () => {
-    const { container } = renderBrand(<Brand variant="lockup" appName="CCC Wiki" />);
-    expect(container.querySelector("img")).toBeTruthy();
+  it("renders the serif wordmark art, the college line, and the app-name wordmark", () => {
+    const { container } = renderBrand(
+      <Brand variant="lockup" appName="CCC Wiki" />,
+    );
+    // "Vanderbilt University" is inline vector artwork (SVG), not a font.
+    expect(container.querySelector("svg")).toBeTruthy();
+    // "College of Connected Computing" is live text (Inter sans).
+    expect(screen.getByText("College of Connected Computing")).toBeTruthy();
     expect(screen.getByText("CCC Wiki")).toBeTruthy();
   });
 
-  it("exposes the institution as accessible artwork alt when requested", () => {
-    renderBrand(<Brand variant="lockup" alt={INSTITUTION_NAME} />);
-    expect(screen.getByAltText(INSTITUTION_NAME)).toBeTruthy();
+  it("names the wordmark 'Vanderbilt University' by default", () => {
+    const { container } = renderBrand(<Brand variant="lockup" />);
+    const wordmark = container.querySelector('[role="img"]');
+    expect(wordmark?.getAttribute("aria-label")).toBe("Vanderbilt University");
+  });
+
+  it("lets a caller override the wordmark's accessible name via alt", () => {
+    const { container } = renderBrand(
+      <Brand variant="lockup" alt={INSTITUTION_NAME} />,
+    );
+    const wordmark = container.querySelector('[role="img"]');
+    expect(wordmark?.getAttribute("aria-label")).toBe(INSTITUTION_NAME);
   });
 
   it("renders an icon-only mark with no wordmark", () => {
     const { container } = renderBrand(<Brand variant="icon" />);
     const imgs = container.querySelectorAll("img");
     expect(imgs.length).toBe(1);
-    expect(screen.queryByText("CCC Wiki")).toBeNull();
-  });
-
-  it("keeps decorative artwork out of the accessibility tree by default", () => {
-    const { container } = renderBrand(<Brand variant="lockup" appName="CCC Wiki" />);
-    const img = container.querySelector("img");
-    expect(img?.getAttribute("alt")).toBe("");
+    expect(screen.queryByText("College of Connected Computing")).toBeNull();
   });
 });

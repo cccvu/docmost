@@ -8,8 +8,10 @@ import {
   IconSettings,
   IconUserPlus,
   IconTemplate,
+  IconHeart,
 } from "@tabler/icons-react";
 import { Link, useLocation } from "react-router-dom";
+import clsx from "clsx";
 import classes from "./global-sidebar.module.css";
 import { useTranslation } from "react-i18next";
 import { useAtom } from "jotai";
@@ -25,7 +27,13 @@ import { useHasFeature } from "@/ee/hooks/use-feature";
 import { Feature } from "@/ee/features";
 import { useUpgradeLabel } from "@/ee/hooks/use-upgrade-label";
 
-export default function GlobalSidebar() {
+export default function GlobalSidebar({
+  collapsed = false,
+}: {
+  /** Desktop icon-rail mode: render icons only (labels kept in the DOM for a11y,
+      shown as hover tooltips; the visual collapse is gated to sm+ in the CSS). */
+  collapsed?: boolean;
+} = {}) {
   const { t } = useTranslation();
   const location = useLocation();
   const [active, setActive] = useState(location.pathname);
@@ -66,7 +74,7 @@ export default function GlobalSidebar() {
   };
 
   return (
-    <div className={classes.navbar}>
+    <div className={classes.navbar} data-collapsed={collapsed || undefined}>
       <ScrollArea w="100%" style={{ flex: 1 }}>
         <div className={classes.section}>
           {mainNavItems.map((item) =>
@@ -88,24 +96,34 @@ export default function GlobalSidebar() {
                 </UnstyledButton>
               </Tooltip>
             ) : (
-              <Link
+              <Tooltip
                 key={item.label}
-                className={classes.link}
-                data-active={active === item.path || undefined}
-                aria-current={active === item.path ? "page" : undefined}
-                to={item.path}
-                onClick={handleNavClick}
+                label={t(item.label)}
+                position="right"
+                withArrow
+                disabled={!collapsed}
               >
-                <item.icon className={classes.linkIcon} stroke={2} />
-                <span>{t(item.label)}</span>
-              </Link>
+                <Link
+                  className={classes.link}
+                  data-active={active === item.path || undefined}
+                  aria-current={active === item.path ? "page" : undefined}
+                  to={item.path}
+                  onClick={handleNavClick}
+                >
+                  <item.icon className={classes.linkIcon} stroke={2} />
+                  <span>{t(item.label)}</span>
+                </Link>
+              </Tooltip>
             ),
           )}
         </div>
 
-        <Divider my="xs" />
-        <div className={classes.section}>
-          <Text component="h2" className={classes.sectionHeader}>{t("Favorite spaces")}</Text>
+        <Divider my="xs" className={classes.railHidden} />
+        <div className={clsx(classes.section, classes.railHidden)}>
+          <Text component="h2" className={classes.sectionHeader}>
+            <IconHeart className={classes.sectionHeaderIcon} stroke={2} />
+            {t("Favorite spaces")}
+          </Text>
           {!isFavoritesPending && sortedFavoriteSpaces.length === 0 ? (
             <Text size="xs" c="dimmed" pl="xs" py={4}>
               {t("Favorite spaces appear here")}
@@ -150,23 +168,34 @@ export default function GlobalSidebar() {
       </ScrollArea>
 
       <div className={classes.bottomSection}>
-        <UnstyledButton
-          className={classes.link}
-          onClick={openInvite}
+        <Tooltip
+          label={t("Invite People")}
+          position="right"
+          withArrow
+          disabled={!collapsed}
         >
-          <IconUserPlus className={classes.linkIcon} stroke={2} />
-          <span>{t("Invite People")}</span>
-        </UnstyledButton>
-        <Link
-          className={classes.link}
-          data-active={active.startsWith("/settings") || undefined}
-          aria-current={active.startsWith("/settings") ? "page" : undefined}
-          to="/settings/account/profile"
-          onClick={handleNavClick}
+          <UnstyledButton className={classes.link} onClick={openInvite}>
+            <IconUserPlus className={classes.linkIcon} stroke={2} />
+            <span>{t("Invite People")}</span>
+          </UnstyledButton>
+        </Tooltip>
+        <Tooltip
+          label={t("Settings")}
+          position="right"
+          withArrow
+          disabled={!collapsed}
         >
-          <IconSettings className={classes.linkIcon} stroke={2} />
-          <span>{t("Settings")}</span>
-        </Link>
+          <Link
+            className={classes.link}
+            data-active={active.startsWith("/settings") || undefined}
+            aria-current={active.startsWith("/settings") ? "page" : undefined}
+            to="/settings/account/profile"
+            onClick={handleNavClick}
+          >
+            <IconSettings className={classes.linkIcon} stroke={2} />
+            <span>{t("Settings")}</span>
+          </Link>
+        </Tooltip>
       </div>
 
       <Modal

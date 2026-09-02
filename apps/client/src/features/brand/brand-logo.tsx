@@ -1,38 +1,42 @@
-import { Group, Text, useComputedColorScheme } from "@mantine/core";
+import { Group, Text } from "@mantine/core";
 import clsx from "clsx";
 import classes from "./brand-logo.module.css";
-import vuCccBlack from "./assets/vu-ccc-black.png";
-import vuCccWhite from "./assets/vu-ccc-white.png";
 import vIcon from "./assets/v-icon.png";
+// The official "VANDERBILT UNIVERSITY" serif wordmark, as vector artwork (the
+// exact path used by computing.vanderbilt.edu). Inlined (not <img>) so its
+// `currentColor` fill themes with the surrounding ink.
+import wordmarkSvg from "./assets/vu-wordmark.svg?raw";
 
 /**
- * CCC brand mark (issue #30). Renders the official Vanderbilt · College of
- * Connected Computing lockup (theme-swapped black↔white — never CSS-inverted, so
- * the gold Dimensional V is preserved) with an optional app-name wordmark, or a
+ * CCC brand mark (issue #30). Mirrors the College of Connected Computing site
+ * lockup (computing.vanderbilt.edu): the gold Dimensional V, the official serif
+ * "Vanderbilt University" wordmark as vector art, and "College of Connected
+ * Computing" as sans (Inter) text — with an optional app-name wordmark, or a
  * compact / icon-only variant for dense or narrow chrome.
  *
- * Accessibility: the artwork is decorative by default (`alt=""`); callers give
- * the mark an accessible name via a wrapping labelled control (e.g. a Link's
- * `aria-label`) or the adjacent visible `appName`. Callers that render the mark
- * outside a labelled control (e.g. a static auth header) should pass a
- * meaningful `alt`.
+ * Accessibility: the V is decorative (`alt=""`); the wordmark art carries the
+ * accessible name "Vanderbilt University" (or a caller-supplied `alt`), and the
+ * college line is live text. In the app header the whole mark sits inside a
+ * labelled Link, whose `aria-label` names it.
  */
 
 export const INSTITUTION_NAME =
   "Vanderbilt University · College of Connected Computing";
 
+const COLLEGE_NAME = "College of Connected Computing";
+
 type BrandVariant = "lockup" | "compact" | "icon";
 
 interface BrandProps {
-  /** `lockup` = VU·CCC art; `compact` = V icon + name; `icon` = V icon only. */
+  /** `lockup` = V + wordmark + college; `compact` = V icon + name; `icon` = V only. */
   variant?: BrandVariant;
   /** Wordmark shown beside the mark (lockup + compact). Omit for mark-only. */
   appName?: string;
-  /** Pixel height of the lockup artwork (default 24). */
+  /** Pixel height of the lockup mark — the V and text block (default 24). */
   lockupHeight?: number;
   /** Pixel height of the V icon (default 24). */
   iconHeight?: number;
-  /** Alt text for the artwork. Default "" (decorative). */
+  /** Accessible name for the wordmark artwork. Default "Vanderbilt University". */
   alt?: string;
   className?: string;
 }
@@ -45,9 +49,6 @@ export function Brand({
   alt = "",
   className,
 }: BrandProps) {
-  const scheme = useComputedColorScheme("light");
-  const lockupSrc = scheme === "dark" ? vuCccWhite : vuCccBlack;
-
   if (variant === "icon") {
     return (
       <img
@@ -77,25 +78,40 @@ export function Brand({
     );
   }
 
-  // lockup
+  // lockup — gold V + official serif wordmark (SVG) + college name (Inter sans).
+  const h = lockupHeight;
   return (
-    <Group gap="sm" wrap="nowrap" className={clsx(classes.root, className)}>
+    <Group gap={10} wrap="nowrap" className={clsx(classes.root, className)}>
       <img
-        src={lockupSrc}
-        alt={alt}
-        className={classes.lockup}
-        style={{ height: lockupHeight }}
+        src={vIcon}
+        alt=""
+        aria-hidden="true"
+        className={classes.vIcon}
+        style={{ height: h }}
       />
+      <span className={classes.textCol} style={{ height: h }}>
+        <span
+          className={classes.wordmark}
+          style={{ height: Math.round(h * 0.26) }}
+          role="img"
+          aria-label={alt || "Vanderbilt University"}
+          // Trusted, build-time-bundled brand asset (no user input).
+          dangerouslySetInnerHTML={{ __html: wordmarkSvg }}
+        />
+        <span className={classes.college} style={{ fontSize: Math.round(h * 0.4) }}>
+          {COLLEGE_NAME}
+        </span>
+      </span>
       {appName ? (
         <>
           <span
             aria-hidden="true"
             className={classes.divider}
-            style={{ height: Math.round(lockupHeight * 0.9) }}
+            style={{ height: Math.round(h * 0.9) }}
           />
           <Text
             className={classes.name}
-            style={{ fontSize: Math.round(lockupHeight * 0.72) }}
+            style={{ fontSize: Math.round(h * 0.5) }}
           >
             {appName}
           </Text>

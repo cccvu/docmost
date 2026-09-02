@@ -11,6 +11,8 @@ import {
   IconCoin,
   IconLock,
   IconKey,
+  IconApi,
+  IconLicense,
   IconWorld,
   IconSparkles,
   IconHistory,
@@ -105,8 +107,10 @@ const groupedData: DataGroup[] = [
         feature: Feature.PAGE_VERIFICATION,
       },
       {
+        // CCC: distinct from the account "API keys" IconKey so the collapsed
+        // icon rail doesn't show two identical keys.
         label: "API management",
-        icon: IconKey,
+        icon: IconApi,
         path: "/settings/api-keys",
         feature: Feature.API_KEYS,
         role: "admin",
@@ -131,15 +135,24 @@ const groupedData: DataGroup[] = [
     heading: "System",
     items: [
       {
+        // CCC: distinct icon (was IconKey) so the collapsed rail reads cleanly.
         label: "License & Edition",
-        icon: IconKey,
+        icon: IconLicense,
         path: "/settings/license",
       },
     ],
   },
 ];
 
-export default function SettingsSidebar() {
+export default function SettingsSidebar({
+  collapsed = false,
+}: {
+  /** Desktop icon-rail mode (CCC): render icons only — labels stay in the DOM for
+      a11y and surface as hover tooltips; the visual collapse is gated to sm+ in
+      settings.module.css, so the mobile overlay is unaffected. Mirrors the global
+      sidebar's rail so "minimize" behaves the same on home and settings. */
+  collapsed?: boolean;
+} = {}) {
   const { t } = useTranslation();
   const location = useLocation();
   const [active, setActive] = useState(location.pathname);
@@ -258,21 +271,35 @@ export default function SettingsSidebar() {
           }
 
           return (
-            <Link
-              onMouseEnter={prefetchHandler}
-              className={classes.link}
-              data-active={active.startsWith(item.path) || undefined}
+            // CCC: in rail mode the label is visually hidden, so surface it as a
+            // hover tooltip (disabled when expanded). Only the ENABLED link is
+            // wrapped — disabled items keep their own upgrade tooltip above, and
+            // double-wrapping one target breaks Mantine's tooltip ref.
+            <Tooltip
               key={item.label}
-              to={item.path}
-              onClick={() => {
-                if (mobileSidebarOpened) {
-                  toggleMobileSidebar();
-                }
-              }}
+              label={t(item.label)}
+              position="right"
+              withArrow
+              disabled={!collapsed}
             >
-              <item.icon className={classes.linkIcon} stroke={2} />
-              <span>{t(item.label)}</span>
-            </Link>
+              <Link
+                onMouseEnter={prefetchHandler}
+                className={classes.link}
+                data-active={active.startsWith(item.path) || undefined}
+                aria-current={
+                  active.startsWith(item.path) ? "page" : undefined
+                }
+                to={item.path}
+                onClick={() => {
+                  if (mobileSidebarOpened) {
+                    toggleMobileSidebar();
+                  }
+                }}
+              >
+                <item.icon className={classes.linkIcon} stroke={2} />
+                <span>{t(item.label)}</span>
+              </Link>
+            </Tooltip>
           );
         })}
       </div>
@@ -280,7 +307,7 @@ export default function SettingsSidebar() {
   });
 
   return (
-    <div className={classes.navbar}>
+    <div className={classes.navbar} data-collapsed={collapsed || undefined}>
       <Group className={classes.title} justify="flex-start">
         <ActionIcon
           onClick={() => {
@@ -300,7 +327,13 @@ export default function SettingsSidebar() {
 
       <ScrollArea w="100%">{menuItems}</ScrollArea>
 
-      {!isCloud() && <AppVersion />}
+      {/* CCC: always rendered; the rail hides it via CSS at sm+ (railHidden),
+          never a JS `collapsed` gate — so the mobile overlay keeps the footer. */}
+      {!isCloud() && (
+        <div className={classes.railHidden}>
+          <AppVersion />
+        </div>
+      )}
 
       {isCloud() && (
         <div className={classes.text}>

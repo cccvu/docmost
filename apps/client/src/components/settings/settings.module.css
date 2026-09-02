@@ -32,6 +32,11 @@
         color: light-dark(var(--mantine-color-black), var(--mantine-color-white));
     }
 
+    &:focus-visible {
+        outline: 2px solid var(--mantine-primary-color-filled);
+        outline-offset: 2px;
+    }
+
     &[data-active] {
         &,
         & :hover {
@@ -61,4 +66,61 @@
 .text {
     padding-left: var(--mantine-spacing-xs) ;
     padding-top: 10px;
+}
+
+/* CCC: collapsed icon rail — DESKTOP ONLY, mirroring global-sidebar.module.css so
+   "minimize" looks the same on home and settings. The sidebar always renders its
+   full markup (labels stay in the DOM for a11y and for the mobile overlay); these
+   rules apply only at sm+ when the navbar carries [data-collapsed], hiding the
+   text/headers/footer and centering each icon into the 52px rail set by the
+   AppShell. Labels surface as hover tooltips (see settings-sidebar.tsx). */
+@media (min-width: $mantine-breakpoint-sm) {
+    .navbar[data-collapsed] {
+        padding-left: rem(8px);
+        padding-right: rem(8px);
+    }
+
+    /* Center the single icon dead-center regardless of element type — Docmost
+       renders enabled items as <a> (Link) and disabled ones as <span>; taking
+       the icon out of flow (absolute) makes both center in the rail. */
+    .navbar[data-collapsed] .link {
+        display: block;
+        position: relative;
+        width: 100%;
+        padding: 0;
+        min-height: rem(40px);
+    }
+
+    .navbar[data-collapsed] .linkIcon {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        margin: 0;
+        width: rem(20px);
+        height: rem(20px);
+    }
+
+    /* Keep the label as the accessible name, but hide it visually (sr-only). */
+    .navbar[data-collapsed] .link span {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+    }
+
+    /* Chrome that can't reduce to a single icon: the "Settings" back-title row,
+       the group headings, and the version/help footer. Escape hatches remain —
+       the header brand lockup links home, and expanding restores the back arrow. */
+    .navbar[data-collapsed] .title,
+    .navbar[data-collapsed] .linkHeader,
+    .navbar[data-collapsed] .text,
+    .navbar[data-collapsed] .railHidden {
+        display: none;
+    }
 }

@@ -63,6 +63,10 @@ export default function TopMenu() {
     <Menu width={250} position="bottom-end" withArrow shadow={"lg"}>
       <Menu.Target>
         <UnstyledButton>
+          {/* CCC: avatar-only trigger (workspace-name label removed) so the wiki
+              and the admin console read identically — the console header already
+              carries the CCC brand, and the workspace/account details are in the
+              dropdown below. */}
           <Group gap={7} wrap={"nowrap"}>
             <CustomAvatar
               avatarUrl={workspace?.logo}
@@ -71,9 +75,6 @@ export default function TopMenu() {
               size="sm"
               type={AvatarIconType.WORKSPACE_ICON}
             />
-            <Text fw={500} size="sm" lh={1} mr={3} lineClamp={1}>
-              {workspace?.name}
-            </Text>
             <IconChevronDown size={16} />
           </Group>
         </UnstyledButton>
