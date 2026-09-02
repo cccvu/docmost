@@ -1,18 +1,7 @@
 import { useQuery, UseQueryResult } from "@tanstack/react-query";
-import { getCollabToken, verifyUserToken } from "../services/auth-service";
-import { ICollabToken, IVerifyUserToken } from "../types/auth.types";
+import { getCollabToken } from "../services/auth-service";
+import { ICollabToken } from "../types/auth.types";
 import { isAxiosError } from "axios";
-
-export function useVerifyUserTokenQuery(
-  verify: IVerifyUserToken,
-): UseQueryResult<any, Error> {
-  return useQuery({
-    queryKey: ["verify-token", verify],
-    queryFn: () => verifyUserToken(verify),
-    enabled: !!verify.token,
-    staleTime: 0,
-  });
-}
 
 export function useCollabToken(): UseQueryResult<ICollabToken, Error> {
   return useQuery({
