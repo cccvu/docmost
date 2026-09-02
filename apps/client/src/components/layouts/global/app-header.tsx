@@ -68,12 +68,20 @@ export function AppHeader() {
           </Tooltip>
 
           <Tooltip label={t("Sidebar toggle")}>
+            {/* CCC: shift the desktop toggle left so it sits in the same vertical
+                column as the collapsed rail's icons (both centered at x=26).
+                translateX keeps it out of layout flow, so the brand lockup (x=70),
+                the search box, and the right cluster all stay exactly in place;
+                the mobile toggle (hiddenFrom=sm, above) is unaffected. The offset
+                is rail-center(26) − the toggle's natural center (32px of header
+                padding + 11px half-width = 43) = -17px. */}
             <SidebarToggle
               aria-label={t("Sidebar toggle")}
               opened={desktopOpened}
               onClick={toggleDesktop}
               visibleFrom="sm"
               size="sm"
+              style={{ transform: "translateX(-17px)" }}
             />
           </Tooltip>
 
