@@ -60,6 +60,27 @@ describe('ServiceAuthGuard', () => {
       const g = new ServiceAuthGuard(reflectorReturning(undefined));
       expect(() => g.canActivate(ctx(SECRET))).toThrow(ForbiddenException);
     });
+
+    it('403 when the credential lacks the route scope (least privilege, not mere secret possession)', () => {
+      const g = new ServiceAuthGuard(reflectorReturning(ServiceScope.SessionMint));
+      // The shared transitional secret carries ALL scopes, so this branch is otherwise unreachable. Simulate
+      // a future per-scope credential that holds ONLY users:provision, and require session:mint — the guard
+      // must 403 (a valid secret is not a pass to a scope it doesn't hold). Pins the branch for when distinct
+      // per-scope credentials are introduced (no guard redesign needed).
+      (g as any).credentials = [
+        { id: 'scoped', secret: SECRET, scopes: new Set([ServiceScope.UsersProvision]) },
+      ];
+      expect(() => g.canActivate(ctx(SECRET))).toThrow(ForbiddenException);
+    });
+
+    it('rejects a wrong secret of EQUAL length (exercises the constant-time compare, not the length guard)', () => {
+      // The 'wrong secret' test above differs in length, so it short-circuits before timingSafeEqual. A
+      // same-length wrong secret forces the constant-time comparison path itself to reject → 401.
+      const g = new ServiceAuthGuard(reflectorReturning(ServiceScope.SessionMint));
+      const sameLenWrong = 'x'.repeat(SECRET.length);
+      expect(sameLenWrong.length).toBe(SECRET.length);
+      expect(() => g.canActivate(ctx(sameLenWrong))).toThrow(UnauthorizedException);
+    });
   });
 
   describe('with NO service secret configured (fail-closed)', () => {

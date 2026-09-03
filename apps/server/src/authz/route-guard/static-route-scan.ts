@@ -25,13 +25,27 @@ export interface StaticRoute {
   isPublic: boolean;
   /** @PlatformAuthz(...) on the class or the handler. */
   isForkAuthz: boolean;
+  /** @NativeCredentialRoute() on the class or the handler (native-auth mode gate marker, seam #87/#88). */
+  isNativeCredentialRoute: boolean;
   /** Guard identifier names from @UseGuards(...) on the class + handler (deduped). */
   guardNames: string[];
+  /**
+   * The handler BODY mints a native session cookie — `res.setCookie('authToken', …)` or the AuthController
+   * `this.setAuthCookie(…)` helper. A static (text) tell, deliberately over-reporting: it lets a fitness
+   * test assert "every native-session route is @NativeCredentialRoute()" so a NEW unmarked session-minting
+   * route (the invites/accept-class gap) cannot merge silently. See native-credential-routes.spec.ts.
+   */
+  mintsNativeSession: boolean;
 }
+
+// Text tell that a handler body establishes a native session (mints the `authToken` cookie). Matches
+// `setCookie('authToken'` / `setCookie("authToken"` (direct) and `setAuthCookie(` (the AuthController helper).
+const NATIVE_SESSION_MINT_RE = /setCookie\(\s*['"]authToken['"]|setAuthCookie\s*\(/;
 
 const ROUTE_DECORATORS = new Set(['Get', 'Post', 'Put', 'Patch', 'Delete', 'Options', 'Head', 'All', 'Search']);
 const PUBLIC_DECORATORS = new Set(['Public', 'PlatformPublic']);
 const FORK_AUTHZ_DECORATORS = new Set(['PlatformAuthz']);
+const NATIVE_CREDENTIAL_DECORATORS = new Set(['NativeCredentialRoute']);
 const SKIP_DIRS = new Set(['ee', 'node_modules', 'dist']);
 
 function walkControllerFiles(dir: string, out: string[]): void {
@@ -64,15 +78,22 @@ function trailingName(expr: ts.Expression): string | undefined {
 interface DecoratorFacts {
   isPublic: boolean;
   isForkAuthz: boolean;
+  isNativeCredentialRoute: boolean;
   guardNames: string[];
 }
 
 function readDecorators(node: ts.HasDecorators): DecoratorFacts {
-  const facts: DecoratorFacts = { isPublic: false, isForkAuthz: false, guardNames: [] };
+  const facts: DecoratorFacts = {
+    isPublic: false,
+    isForkAuthz: false,
+    isNativeCredentialRoute: false,
+    guardNames: [],
+  };
   for (const dec of ts.getDecorators(node) ?? []) {
     const name = decoratorName(dec);
     if (name && PUBLIC_DECORATORS.has(name)) facts.isPublic = true;
     if (name && FORK_AUTHZ_DECORATORS.has(name)) facts.isForkAuthz = true;
+    if (name && NATIVE_CREDENTIAL_DECORATORS.has(name)) facts.isNativeCredentialRoute = true;
     if (name === 'UseGuards' && ts.isCallExpression(dec.expression)) {
       for (const arg of dec.expression.arguments) {
         const g = trailingName(arg);
@@ -118,6 +139,9 @@ export function scanRoutes(srcRoot: string): StaticRoute[] {
           handler: member.name.text,
           isPublic: classFacts.isPublic || methodFacts.isPublic,
           isForkAuthz: classFacts.isForkAuthz || methodFacts.isForkAuthz,
+          isNativeCredentialRoute:
+            classFacts.isNativeCredentialRoute || methodFacts.isNativeCredentialRoute,
+          mintsNativeSession: NATIVE_SESSION_MINT_RE.test(member.getText(sf)),
           guardNames: [...new Set([...classFacts.guardNames, ...methodFacts.guardNames])],
         });
       }
