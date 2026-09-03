@@ -19,15 +19,21 @@ import { PLATFORM_AUTHZ_KEY, PLATFORM_PUBLIC_KEY } from './platform-authz.decora
  */
 
 /**
- * The security-sensitive allow-list of guard NAMES that constitute an AUTHENTICATION decision. Only two:
+ * The security-sensitive allow-list of guard NAMES that constitute an AUTHENTICATION decision:
  *  - JwtAuthGuard: the standard human-session authentication (honors @Public).
  *  - CollabServiceSecretGuard: service-to-service auth for the fork-owned collab force-disconnect route.
+ *  - ServiceAuthGuard: scoped service-to-service auth for the fork-owned `/api/service/*` endpoints
+ *    (session brokerage + provisioning) — fail-closed, constant-time, per-route-scope (see service-bridge/).
  * NOT ThrottlerGuard / SetupGuard (rate-limit / one-time-bootstrap gates — those routes are pre-auth public
  * and are classified via @Public or the ledger, never via this list). Matched by NAME so the static scan and
  * the runtime guard agree exactly; in the fork's codebase these names are unique. Adding to this list is a
  * security-sensitive change — a weakly-authenticating guard here would flip a real leak to a false-GREEN.
  */
-export const AUTH_GUARD_NAMES: ReadonlySet<string> = new Set(['JwtAuthGuard', 'CollabServiceSecretGuard']);
+export const AUTH_GUARD_NAMES: ReadonlySet<string> = new Set([
+  'JwtAuthGuard',
+  'CollabServiceSecretGuard',
+  'ServiceAuthGuard',
+]);
 
 export type RouteClass = 'public' | 'authenticated' | 'fork-authz' | 'ledgered' | 'offender';
 

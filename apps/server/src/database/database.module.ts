@@ -31,11 +31,16 @@ import { PageListener } from '@docmost/db/listeners/page.listener';
 import { PostgresJSDialect } from 'kysely-postgres-js';
 import * as postgres from 'postgres';
 import { normalizePostgresUrl } from '../common/helpers';
-// --- CCC authorization integration seam (the ONLY upstream edit; see /UPSTREAM_MODIFICATIONS.md).
-// Rebinds the two authorization repos to PDP-backed subclasses that defer decisions to the platform.
+// --- CCC authorization integration seam (see /UPSTREAM_MODIFICATIONS.md #1).
+// Selects the two authorization repos by AUTHZ_MODE: native → stock upstream repos (Docmost's own
+// authorization, fully standalone); remote → PDP-backed subclasses that defer decisions to an external
+// authorization service. All selection/decision logic lives in the fork-owned providers; this file only
+// registers them + AuthzModule.
 import { AuthzModule } from '../authz/authz.module';
-import { PdpSpaceMemberRepo } from '../authz/pdp-space-member.repo';
-import { PdpPagePermissionRepo } from '../authz/pdp-page-permission.repo';
+import {
+  spaceMemberRepoProvider,
+  pagePermissionRepoProvider,
+} from '../authz/mode/repo-providers';
 
 @Global()
 @Module({
@@ -81,10 +86,10 @@ import { PdpPagePermissionRepo } from '../authz/pdp-page-permission.repo';
     GroupRepo,
     GroupUserRepo,
     SpaceRepo,
-    // CCC rebind: authorization decisions come from the platform PDP, not local tables.
-    { provide: SpaceMemberRepo, useClass: PdpSpaceMemberRepo },
+    // CCC mode-selected authorization repos (native = stock upstream; remote = PDP-backed). See #1.
+    spaceMemberRepoProvider,
     PageRepo,
-    { provide: PagePermissionRepo, useClass: PdpPagePermissionRepo },
+    pagePermissionRepoProvider,
     PageTransclusionsRepo,
     PageTransclusionReferencesRepo,
     PageHistoryRepo,

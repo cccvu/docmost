@@ -5,6 +5,7 @@ import {
   ISetupWorkspace,
 } from "@/features/auth/types/auth.types";
 import { IWorkspace } from "@/features/workspace/types/workspace.types.ts";
+import { isNativeAuthEnabled } from "@/features/auth-native/lib/auth-mode.ts";
 
 // NOTE: password login AND the password-lifecycle ops (change/forgot/reset-password, verify-token) were
 // REMOVED — the platform is passwordless (magic link + OTP, issue #4), so there is no user password to
@@ -22,9 +23,15 @@ export async function openDocmostSession(): Promise<void> {
 }
 
 export async function logout(): Promise<void> {
-  // End BOTH sessions: the platform session (primary identity, `__Host-wiki_session`) and the relayed
-  // Docmost session (`authToken`). Both are same-origin and ALB-allowed. allSettled so one failing
-  // (e.g. an already-expired cookie) never blocks clearing the other.
+  if (isNativeAuthEnabled()) {
+    // Native (standalone) mode: there is no platform session — only Docmost's `authToken`. Clearing the
+    // platform session would hit a service that isn't running. End just the Docmost session.
+    await api.post<void>("/auth/logout");
+    return;
+  }
+  // Remote/integrated mode: end BOTH sessions — the platform session (primary identity,
+  // `__Host-wiki_session`) and the relayed Docmost session (`authToken`). Both are same-origin and
+  // ALB-allowed. allSettled so one failing (e.g. an already-expired cookie) never blocks the other.
   await Promise.allSettled([
     platformApi.post("/auth/logout"),
     api.post<void>("/auth/logout"),

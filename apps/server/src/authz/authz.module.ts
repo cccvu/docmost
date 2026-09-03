@@ -1,7 +1,9 @@
 import { Module } from '@nestjs/common';
 import { PlatformAuthzClient } from './platform-authz.client';
+import { AuthzModeModule } from './mode/authz-mode.module';
 import { PageRestrictionModule } from './page-restriction/page-restriction.module';
 import { PublicDiscoveryModule } from './public-discovery/public-discovery.module';
+import { ServiceBridgeModule } from '../service-bridge/service-bridge.module';
 
 /**
  * CCC authorization integration — NOT upstream Docmost code.
@@ -15,8 +17,13 @@ import { PublicDiscoveryModule } from './public-discovery/public-discovery.modul
  * already in the graph via database.module).
  */
 @Module({
-  imports: [PageRestrictionModule, PublicDiscoveryModule],
+  imports: [
+    AuthzModeModule,
+    PageRestrictionModule,
+    PublicDiscoveryModule,
+    ServiceBridgeModule,
+  ],
   providers: [PlatformAuthzClient],
-  exports: [PlatformAuthzClient],
+  exports: [AuthzModeModule, PlatformAuthzClient],
 })
 export class AuthzModule {}

@@ -170,6 +170,34 @@ export class EnvironmentVariables {
     },
   )
   CLICKHOUSE_URL: string;
+
+  // --- CCC authorization integration seam (see /UPSTREAM_MODIFICATIONS.md).
+  // AUTHZ_MODE is a REQUIRED, server-controlled security setting (no default) selecting `native` (stock
+  // Docmost authorization; fully standalone) vs `remote` (an external authorization service). Boot is
+  // refused on a missing/invalid mode, or on `remote` without the service URL + secret — so a misconfig
+  // can never silently deny-all or silently fall back to native. See docs/architecture/standalone.md.
+  @IsNotEmpty({
+    message: "AUTHZ_MODE is required and must be 'native' or 'remote' (there is no default)",
+  })
+  @IsIn(['native', 'remote'], {
+    message: "AUTHZ_MODE must be exactly 'native' or 'remote'",
+  })
+  AUTHZ_MODE: string;
+
+  @ValidateIf((obj) => obj.AUTHZ_MODE === 'remote')
+  @IsNotEmpty({
+    message:
+      'AUTHZ_MODE=remote requires PLATFORM_AUTHZ_URL (the external authorization service base URL)',
+  })
+  @IsUrl({ protocols: ['http', 'https'], require_tld: false, allow_underscores: true })
+  PLATFORM_AUTHZ_URL: string;
+
+  @ValidateIf((obj) => obj.AUTHZ_MODE === 'remote')
+  @IsNotEmpty({
+    message: 'AUTHZ_MODE=remote requires PLATFORM_AUTHZ_SERVICE_SECRET',
+  })
+  @MinLength(16)
+  PLATFORM_AUTHZ_SERVICE_SECRET: string;
 }
 
 export function validate(config: Record<string, any>) {

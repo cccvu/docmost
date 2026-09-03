@@ -40,8 +40,14 @@ describe('route-classification: the AUTH_GUARD_NAMES allow-list', () => {
     expect(guardsAuthenticate([])).toBe(false);
   });
 
-  it('the allow-list is deliberately just two entries (a security-sensitive set)', () => {
-    // A regression that widened this set would flip real leaks to false-GREEN — pin the size.
-    expect([...AUTH_GUARD_NAMES].sort()).toEqual(['CollabServiceSecretGuard', 'JwtAuthGuard']);
+  it('the allow-list is a deliberately small, security-sensitive set (pinned exactly)', () => {
+    // A regression that widened this set would flip real leaks to false-GREEN — pin it exactly.
+    // ServiceAuthGuard authenticates the fork-owned east-west /api/service/* endpoints (session
+    // brokerage + provisioning) — scoped, fail-closed, constant-time (see service-bridge/).
+    expect([...AUTH_GUARD_NAMES].sort()).toEqual([
+      'CollabServiceSecretGuard',
+      'JwtAuthGuard',
+      'ServiceAuthGuard',
+    ]);
   });
 });
