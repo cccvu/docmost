@@ -1,4 +1,4 @@
-import { IsOptional, IsString, IsUUID, Matches, MaxLength } from 'class-validator';
+import { IsOptional, IsString, Matches, MaxLength } from 'class-validator';
 
 /** CCC service-bridge — NOT upstream Docmost code. Input for `POST /api/service/users`. */
 export class ProvisionUserDto {
@@ -14,9 +14,10 @@ export class ProvisionUserDto {
   })
   externalId: string;
 
-  @IsUUID()
-  workspaceId: string;
-
+  /**
+   * Optional human-readable display name for the shadow member. The fork owns workspace selection (it
+   * resolves its own default workspace), so the caller never supplies a Docmost workspace id.
+   */
   @IsOptional()
   @IsString()
   @MaxLength(255)

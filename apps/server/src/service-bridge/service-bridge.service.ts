@@ -1,4 +1,9 @@
-import { ForbiddenException, Injectable, Logger } from '@nestjs/common';
+import {
+  ForbiddenException,
+  Injectable,
+  Logger,
+  ServiceUnavailableException,
+} from '@nestjs/common';
 import { InjectKysely } from 'nestjs-kysely';
 import { randomBytes } from 'crypto';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
@@ -16,6 +21,9 @@ import { isShadowEmail, shadowEmailFor } from './shadow-user';
  * service contract). Replaces the platform's former direct writes to Docmost's `users` table and its use
  * of native `/api/auth/login` — the fork now owns provisioning (writing its OWN database) and mints
  * sessions without a password. This is NOT a generic impersonation primitive (see `mintSession`).
+ *
+ * Both endpoints are keyed on the caller's opaque `externalId`; the fork — not the caller — derives the
+ * shadow email and resolves the workspace, so the caller never handles Docmost-internal ids.
  */
 @Injectable()
 export class ServiceBridgeService {
@@ -28,11 +36,16 @@ export class ServiceBridgeService {
   ) {}
 
   /**
-   * Ensure a fork-owned shadow member exists for the platform identity, and return its Docmost user id.
-   * Idempotent (re-provision after a crash is safe): the synthetic email guarantees the upsert can only
-   * ever match a row the fork owns, never a real Docmost user. Always a plain `member` — never elevated.
+   * Ensure a fork-owned shadow member exists for the platform identity, and return its Docmost user id +
+   * the workspace it lives in. Idempotent (re-provision after a crash is safe): the synthetic email
+   * guarantees the upsert can only ever match a row the fork owns, never a real Docmost user. Always a
+   * plain `member` — never elevated. The fork resolves its OWN default workspace so the caller stays
+   * ignorant of Docmost's internal ids.
    */
-  async provisionShadowUser(dto: ProvisionUserDto): Promise<string> {
+  async provisionShadowUser(
+    dto: ProvisionUserDto,
+  ): Promise<{ userId: string; workspaceId: string }> {
+    const workspaceId = await this.resolveDefaultWorkspaceId();
     const email = shadowEmailFor(dto.externalId);
     const name = dto.name?.trim() || dto.externalId;
     // Unusable password: sessions are minted (not password-logged-in), and native login is disabled in
@@ -46,7 +59,7 @@ export class ServiceBridgeService {
         email,
         password,
         role: 'member',
-        workspaceId: dto.workspaceId,
+        workspaceId,
         emailVerifiedAt: new Date(),
       })
       .onConflict((oc) =>
@@ -58,29 +71,52 @@ export class ServiceBridgeService {
       .executeTakeFirstOrThrow();
 
     this.logger.log(
-      `provisioned shadow member ${row.id} (externalId=${dto.externalId} ws=${dto.workspaceId})`,
+      `provisioned shadow member ${row.id} (externalId=${dto.externalId} ws=${workspaceId})`,
     );
-    return row.id;
+    return { userId: row.id, workspaceId };
   }
 
   /**
-   * Mint a Docmost session for a fork-owned shadow user. This is DELIBERATELY NOT a "log in as anyone"
-   * primitive: it refuses any user that is missing, deleted, privileged (`role != member`), or outside
-   * the shadow namespace — so it can only ever produce a plain-member session for a user the platform
-   * provisioned. Refusals are a uniform 403 (no enumeration); the specific reason is logged, not returned.
+   * Mint a Docmost session for a fork-owned shadow user, named only by the caller's `externalId`. This is
+   * DELIBERATELY NOT a "log in as anyone" primitive: the fork wraps `externalId` into the shadow namespace
+   * itself, so the caller cannot select an arbitrary Docmost identity — and, as retained defense-in-depth,
+   * it still refuses any resolved user that is missing, deleted, privileged (`role != member`), or (should
+   * a row be tampered/mis-provisioned) outside the shadow namespace. Refusals are a uniform 403 (no
+   * enumeration); the specific reason is logged, not returned.
    */
-  async mintSession(userId: string, workspaceId: string): Promise<string> {
-    const user = await this.userRepo.findById(userId, workspaceId);
+  async mintSession(externalId: string): Promise<string> {
+    const workspaceId = await this.resolveDefaultWorkspaceId();
+    const email = shadowEmailFor(externalId);
+    const user = await this.userRepo.findByEmail(email, workspaceId);
     const reason = this.disqualify(user);
     if (reason) {
       this.logger.warn(
-        `service/session refused (${reason}) user=${userId} ws=${workspaceId}`,
+        `service/session refused (${reason}) externalId=${externalId} ws=${workspaceId}`,
       );
       throw new ForbiddenException('not a mintable shadow user');
     }
     const authToken = await this.sessionService.createSessionAndToken(user);
-    this.logger.log(`minted session for shadow member ${userId} ws=${workspaceId}`);
+    this.logger.log(`minted session for shadow member ${user.id} ws=${workspaceId}`);
     return authToken;
+  }
+
+  /**
+   * The fork's own default workspace (oldest, not soft-deleted) — the single-workspace assumption the
+   * platform's BFF relied on, now owned by the fork so the caller never supplies a Docmost workspace id.
+   * A not-yet-bootstrapped fork returns 503 (not ready to provision/mint), never a silent wrong workspace.
+   */
+  private async resolveDefaultWorkspaceId(): Promise<string> {
+    const ws = await this.db
+      .selectFrom('workspaces')
+      .select('id')
+      .where('deletedAt', 'is', null)
+      .orderBy('createdAt', 'asc')
+      .limit(1)
+      .executeTakeFirst();
+    if (!ws) {
+      throw new ServiceUnavailableException('no workspace provisioned');
+    }
+    return ws.id;
   }
 
   private disqualify(user?: User): string | null {

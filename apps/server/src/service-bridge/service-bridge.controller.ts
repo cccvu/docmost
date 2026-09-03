@@ -34,8 +34,9 @@ export class ServiceBridgeController {
   @HttpCode(HttpStatus.OK)
   @RequireServiceScope(ServiceScope.UsersProvision)
   async provisionUser(@Body() dto: ProvisionUserDto) {
-    const userId = await this.service.provisionShadowUser(dto);
-    return { userId, workspaceId: dto.workspaceId };
+    // The fork resolves the workspace itself; it returns the resolved { userId, workspaceId } so the
+    // caller never has to know (or supply) a Docmost workspace id.
+    return this.service.provisionShadowUser(dto);
   }
 
   @Post('session')
@@ -45,7 +46,7 @@ export class ServiceBridgeController {
     @Body() dto: MintSessionDto,
     @Res({ passthrough: true }) res: FastifyReply,
   ) {
-    const authToken = await this.service.mintSession(dto.userId, dto.workspaceId);
+    const authToken = await this.service.mintSession(dto.externalId);
     // Mirror AuthController.setAuthCookie so the caller can relay the Set-Cookie to the browser exactly
     // as it did for native login. httpOnly + Secure(in prod) + SameSite=lax; scoped to the workspace's
     // configured session lifetime.
