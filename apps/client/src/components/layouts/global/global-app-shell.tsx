@@ -110,15 +110,18 @@ export default function GlobalAppShell({
       <AppShell
       header={{ height: HEADER_HEIGHT }}
       navbar={{
-        // CCC: on desktop EVERY sidebar becomes a RAIL_WIDTH icon rail when
+        // CCC: on desktop (sm+) EVERY sidebar becomes a RAIL_WIDTH icon rail when
         // "collapsed" rather than hiding — including the resizable space page-tree,
-        // whose width otherwise tracks `sidebarWidth`. Mobile always uses the full
-        // overlay (rail styles are gated to sm+ in each sidebar's module.css).
-        width: isSpaceRoute
-          ? isRail
-            ? RAIL_WIDTH
-            : sidebarWidth
-          : { base: SIDEBAR_WIDTH, sm: isRail ? RAIL_WIDTH : SIDEBAR_WIDTH },
+        // whose expanded width tracks `sidebarWidth`. Below the breakpoint the navbar
+        // is the full-width mobile OVERLAY (SIDEBAR_WIDTH): the rail styles are gated
+        // to sm+ in each sidebar's module.css, and `isRail` persists via localStorage,
+        // so a plain (non-responsive) rail width would leave a below-sm viewer with a
+        // 52px overlay clipping the still-rendered full tree. Keep `base` responsive on
+        // EVERY route so the mobile overlay never inherits the desktop rail width.
+        width: {
+          base: SIDEBAR_WIDTH,
+          sm: isRail ? RAIL_WIDTH : isSpaceRoute ? sidebarWidth : SIDEBAR_WIDTH,
+        },
         breakpoint: NAVBAR_BREAKPOINT,
         collapsed: {
           mobile: !mobileOpened,

@@ -17,6 +17,7 @@ import clsx from "clsx";
 import { useTranslation } from "react-i18next";
 import { useHasFeature } from "@/ee/hooks/use-feature";
 import { Feature } from "@/ee/features";
+import { getVisibleSlashItems } from "./slash-menu-visibility";
 
 const CommandList = ({
   items,
@@ -36,36 +37,25 @@ const CommandList = ({
   const [selectionAnnouncement, setSelectionAnnouncement] = useState("");
 
   const hasBases = useHasFeature(Feature.BASES);
-  const isItemDisabled = (item: SlashMenuItemType) =>
-    !hasBases && item.requiresBases === true;
 
   // CCC: HIDE gated (bases-requiring) commands when unavailable, rather than
-  // rendering them disabled with an "Upgrade" badge. Filtering the grouped items
-  // keeps the flat index / keyboard-nav consistent with what's actually rendered.
-  const visibleItems = useMemo(() => {
-    const out: SlashMenuGroupedItemsType = {};
-    for (const [category, categoryItems] of Object.entries(items)) {
-      const kept = (categoryItems as SlashMenuItemType[]).filter(
-        (item) => !isItemDisabled(item),
-      );
-      if (kept.length > 0) out[category] = kept;
-    }
-    return out;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [items, hasBases]);
-
-  const flatItems = useMemo(() => {
-    return Object.values(visibleItems).flat();
-  }, [visibleItems]);
+  // rendering them disabled with an "Upgrade" badge. `getVisibleSlashItems` (pure +
+  // unit-tested) filters the grouped items and derives the flat, keyboard-navigable
+  // order from exactly what renders, so the flat index can't point at a hidden row.
+  const { visibleItems, flatItems } = useMemo(
+    () => getVisibleSlashItems(items, hasBases),
+    [items, hasBases],
+  );
 
   const selectItem = useCallback(
     (index: number) => {
+      // flatItems already excludes unavailable commands, so any valid index is selectable.
       const item = flatItems[index];
-      if (item && !isItemDisabled(item)) {
+      if (item) {
         command(item);
       }
     },
-    [command, flatItems, hasBases],
+    [command, flatItems],
   );
 
   useEffect(() => {

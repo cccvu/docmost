@@ -11,8 +11,7 @@ import {
   SpaceCaslSubject,
 } from "@/features/space/permissions/permissions.type.ts";
 import { useTranslation } from "react-i18next";
-import { useFeatureAvailable } from "@/features/feature-availability/feature-gate.tsx";
-import { Feature } from "@/ee/features";
+import { useSpaceSecurityAvailable } from "@/features/feature-availability/feature-gate.tsx";
 
 interface SpaceSettingsModalProps {
   spaceId: string;
@@ -33,9 +32,9 @@ export default function SpaceSettingsModal({
 
   // CCC: the Security tab holds only paid space controls (public-sharing + viewer
   // comments). Hide the whole tab when neither is available so there's no empty tab.
-  const hasSpaceSecurity =
-    useFeatureAvailable(Feature.SHARING_CONTROLS) ||
-    useFeatureAvailable(Feature.VIEWER_COMMENTS);
+  // The shared predicate calls both entitlement hooks unconditionally (see
+  // feature-gate.tsx) — a bare `a || b` here would short-circuit the second hook.
+  const hasSpaceSecurity = useSpaceSecurityAvailable();
   const canManageSettings = spaceAbility.can(
     SpaceCaslAction.Manage,
     SpaceCaslSubject.Settings,
