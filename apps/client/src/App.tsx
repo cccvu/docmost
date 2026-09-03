@@ -2,10 +2,14 @@ import { Route, Routes } from "react-router-dom";
 import SetupWorkspace from "@/pages/auth/setup-workspace.tsx";
 import RootGate from "@/features/public/components/root-gate.tsx";
 import RequestAccess from "@/pages/public/request-access.tsx";
-// CCC passwordless auth (issue #4): the platform login is passwordless (magic link + OTP). The old
-// Docmost password LoginPage is intentionally unrouted; sign-in is these CCC-owned pages instead.
+// CCC passwordless auth (issue #4): in remote/integrated mode the platform login is passwordless (magic
+// link + OTP). The old Docmost password LoginPage is unrouted; sign-in is these CCC-owned pages instead.
 import PasswordlessLogin from "@/pages/public/passwordless-login.tsx";
 import PasswordlessVerify from "@/pages/public/passwordless-verify.tsx";
+// CCC standalone mode: in native mode the SAME build shows Docmost's own login instead of passwordless.
+// The server is the source of truth (NATIVE_AUTH_ENABLED capability); the client only reflects it.
+import NativeLogin from "@/features/auth-native/pages/native-login.tsx";
+import { isNativeAuthEnabled } from "@/features/auth-native/lib/auth-mode.ts";
 import Home from "@/pages/dashboard/home";
 import Page from "@/pages/page/page";
 import AccountSettings from "@/pages/settings/account/account-settings";
@@ -60,7 +64,11 @@ export default function App() {
     <>
       <Routes>
         <Route index element={<RootGate />} />
-        <Route path={"/login"} element={<PasswordlessLogin />} />
+        {/* Mode-aware sign-in: native (standalone) → Docmost login; remote → platform passwordless. */}
+        <Route
+          path={"/login"}
+          element={isNativeAuthEnabled() ? <NativeLogin /> : <PasswordlessLogin />}
+        />
         {/* Magic-link landing page — explicit-click consume (no auto-submit); see the component. */}
         <Route path={"/login/verify"} element={<PasswordlessVerify />} />
         <Route path={"/request-access"} element={<RequestAccess />} />
