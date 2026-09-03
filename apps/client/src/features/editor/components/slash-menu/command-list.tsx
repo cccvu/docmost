@@ -5,12 +5,10 @@ import {
 } from "@/features/editor/components/slash-menu/types";
 import {
   ActionIcon,
-  Badge,
   Group,
   Paper,
   ScrollArea,
   Text,
-  Tooltip,
   UnstyledButton,
   VisuallyHidden,
 } from "@mantine/core";
@@ -19,7 +17,7 @@ import clsx from "clsx";
 import { useTranslation } from "react-i18next";
 import { useHasFeature } from "@/ee/hooks/use-feature";
 import { Feature } from "@/ee/features";
-import { useUpgradeLabel } from "@/ee/hooks/use-upgrade-label";
+import { getVisibleSlashItems } from "./slash-menu-visibility";
 
 const CommandList = ({
   items,
@@ -39,25 +37,25 @@ const CommandList = ({
   const [selectionAnnouncement, setSelectionAnnouncement] = useState("");
 
   const hasBases = useHasFeature(Feature.BASES);
-  const upgradeLabel = useUpgradeLabel();
-  // Without the bases entitlement the item stays visible but inert; an
-  // expired license the client can't detect falls through to a handled
-  // create failure.
-  const isItemDisabled = (item: SlashMenuItemType) =>
-    !hasBases && item.requiresBases === true;
 
-  const flatItems = useMemo(() => {
-    return Object.values(items).flat();
-  }, [items]);
+  // CCC: HIDE gated (bases-requiring) commands when unavailable, rather than
+  // rendering them disabled with an "Upgrade" badge. `getVisibleSlashItems` (pure +
+  // unit-tested) filters the grouped items and derives the flat, keyboard-navigable
+  // order from exactly what renders, so the flat index can't point at a hidden row.
+  const { visibleItems, flatItems } = useMemo(
+    () => getVisibleSlashItems(items, hasBases),
+    [items, hasBases],
+  );
 
   const selectItem = useCallback(
     (index: number) => {
+      // flatItems already excludes unavailable commands, so any valid index is selectable.
       const item = flatItems[index];
-      if (item && !isItemDisabled(item)) {
+      if (item) {
         command(item);
       }
     },
-    [command, flatItems, hasBases],
+    [command, flatItems],
   );
 
   useEffect(() => {
@@ -145,7 +143,7 @@ const CommandList = ({
       >
         {(() => {
           let flatIndex = -1;
-          return Object.entries(items).map(([category, categoryItems]) => (
+          return Object.entries(visibleItems).map(([category, categoryItems]) => (
           <div key={category} role="group" aria-label={category}>
             <Text c="dimmed" mb={4} fw={500} tt="capitalize">
               {category}
@@ -153,24 +151,16 @@ const CommandList = ({
             {categoryItems.map((item: SlashMenuItemType) => {
               flatIndex += 1;
               const itemIndex = flatIndex;
-              const disabled = isItemDisabled(item);
               return (
-              <Tooltip
-                key={itemIndex}
-                label={upgradeLabel}
-                disabled={!disabled}
-                position="right"
-              >
               <UnstyledButton
+                key={itemIndex}
                 data-item-index={itemIndex}
                 id={`slash-command-option-${itemIndex}`}
                 role="option"
                 aria-selected={itemIndex === selectedIndex}
-                aria-disabled={disabled}
                 onClick={() => selectItem(itemIndex)}
                 className={clsx(classes.menuBtn, {
                   [classes.selectedItem]: itemIndex === selectedIndex,
-                  [classes.gatedItem]: disabled,
                 })}
               >
                 <Group wrap="nowrap">
@@ -187,15 +177,8 @@ const CommandList = ({
                       {t(item.description)}
                     </Text>
                   </div>
-
-                  {disabled && (
-                    <Badge size="xs" variant="light" color="gray">
-                      {t("Upgrade")}
-                    </Badge>
-                  )}
                 </Group>
               </UnstyledButton>
-              </Tooltip>
               );
             })}
           </div>

@@ -22,7 +22,15 @@ import AiChatSidebarItem from "./ai-chat-sidebar-item";
 import { groupChatsByAge } from "../utils/group-chats-by-age";
 import classes from "../styles/chat-sidebar.module.css";
 
-export default function AiChatSidebar() {
+export default function AiChatSidebar({
+  collapsed = false,
+}: {
+  /** Desktop icon-rail mode (CCC): show only the "New chat" action; the title,
+      search box and chat history are hidden (they can't reduce to an icon). Gated
+      to sm+ in chat-sidebar.module.css so the mobile overlay is unaffected. Mirrors
+      the other sidebars' rails so "minimize" behaves the same everywhere (#1/#2). */
+  collapsed?: boolean;
+} = {}) {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const { chatId } = useParams<{ chatId: string }>();
@@ -118,7 +126,7 @@ export default function AiChatSidebar() {
   const isLoading = chatsQuery.isLoading || searchQuery.isLoading;
 
   return (
-    <div className={classes.sidebar}>
+    <div className={classes.sidebar} data-collapsed={collapsed || undefined}>
       <div className={classes.header}>
         <h2 className={classes.title}>{t("AI Chat")}</h2>
         <Tooltip label={t("New chat")} openDelay={250} withArrow>

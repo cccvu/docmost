@@ -26,7 +26,6 @@ import useUserRole from "@/hooks/use-user-role.tsx";
 import { useAtom } from "jotai";
 import { entitlementAtom } from "@/ee/entitlement/entitlement-atom";
 import { Feature } from "@/ee/features";
-import { useUpgradeLabel } from "@/ee/hooks/use-upgrade-label";
 import {
   prefetchApiKeyManagement,
   prefetchApiKeys,
@@ -81,7 +80,15 @@ const groupedData: DataGroup[] = [
   {
     heading: "Workspace",
     items: [
-      { label: "General", icon: IconSettings, path: "/settings/workspace" },
+      // CCC: Workspace General holds only workspace-admin controls (name/icon/
+      // default edit mode) — all gated by Docmost's manage-settings ability. Hide
+      // the nav for non-managers (platform admins manage these in the Console).
+      {
+        label: "General",
+        icon: IconSettings,
+        path: "/settings/workspace",
+        role: "admin",
+      },
       { label: "Members", icon: IconUsers, path: "/settings/members" },
       {
         label: "Billing",
@@ -119,6 +126,7 @@ const groupedData: DataGroup[] = [
         label: "AI settings",
         icon: IconSparkles,
         path: "/settings/ai",
+        feature: Feature.AI,
         role: "admin",
       },
       {
@@ -159,7 +167,6 @@ export default function SettingsSidebar({
   const { goBack } = useSettingsNavigation();
   const { isAdmin, isOwner } = useUserRole();
   const [entitlements] = useAtom(entitlementAtom);
-  const upgradeLabel = useUpgradeLabel();
   const [mobileSidebarOpened] = useAtom(mobileSidebarAtom);
   const toggleMobileSidebar = useToggleSidebar(mobileSidebarAtom);
 
@@ -175,12 +182,11 @@ export default function SettingsSidebar({
     if (item.env === "selfhosted" && isCloud()) return false;
     if (item.role === "admin" && !isAdmin) return false;
     if (item.role === "owner" && !isOwner) return false;
+    // CCC: HIDE features this deployment isn't entitled to (was: render them
+    // disabled with an "Available with a paid license" tooltip). This is an
+    // internal tool — advertising unbuyable paid features is pure noise.
+    if (item.feature && !hasFeature(item.feature)) return false;
     return true;
-  };
-
-  const isItemDisabled = (item: DataItem) => {
-    if (!item.feature) return false;
-    return !hasFeature(item.feature);
   };
 
   const menuItems = groupedData.map((group) => {
@@ -240,34 +246,6 @@ export default function SettingsSidebar({
               break;
             default:
               break;
-          }
-
-          const isDisabled = isItemDisabled(item);
-
-          if (isDisabled) {
-            return (
-              <Tooltip
-                key={item.label}
-                label={upgradeLabel}
-                position="right"
-                withArrow
-              >
-                <span
-                  className={classes.link}
-                  data-disabled
-                  role="link"
-                  aria-disabled="true"
-                  tabIndex={0}
-                  style={{
-                    opacity: 0.5,
-                    cursor: "not-allowed",
-                  }}
-                >
-                  <item.icon className={classes.linkIcon} stroke={2} />
-                  <span>{t(item.label)}</span>
-                </span>
-              </Tooltip>
-            );
           }
 
           return (

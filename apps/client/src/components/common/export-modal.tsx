@@ -6,8 +6,6 @@ import {
   Select,
   Switch,
   Divider,
-  Tooltip,
-  Badge,
 } from "@mantine/core";
 import {
   exportPage,
@@ -20,7 +18,6 @@ import { exportSpace } from "@/features/space/services/space-service";
 import { useTranslation } from "react-i18next";
 import { Feature } from "@/ee/features";
 import { useHasFeature } from "@/ee/hooks/use-feature";
-import { useUpgradeLabel } from "@/ee/hooks/use-upgrade-label";
 
 interface ExportModalProps {
   id: string;
@@ -40,10 +37,8 @@ export default function ExportModal({
   const [includeAttachments, setIncludeAttachments] = useState<boolean>(false);
   const [isExporting, setIsExporting] = useState<boolean>(false);
   const { t } = useTranslation();
-  const upgradeLabel = useUpgradeLabel();
   const isDocx = format === ExportFormat.Docx;
   const docxEntitled = useHasFeature(Feature.DOCX_EXPORT);
-  const blockedByLicense = isDocx && !docxEntitled;
 
   const handleExport = async () => {
     setIsExporting(true);
@@ -164,16 +159,9 @@ export default function ExportModal({
             <Button onClick={onClose} variant="default">
               {t("Cancel")}
             </Button>
-            <Tooltip label={upgradeLabel} disabled={!blockedByLicense} withArrow>
-              <Button
-                onClick={handleExport}
-                loading={isExporting}
-                disabled={blockedByLicense}
-                data-disabled={blockedByLicense || undefined}
-              >
-                {t("Export")}
-              </Button>
-            </Tooltip>
+            <Button onClick={handleExport} loading={isExporting}>
+              {t("Export")}
+            </Button>
           </Group>
         </Modal.Body>
       </Modal.Content>
@@ -198,8 +186,10 @@ function ExportFormatSelection({
   const data = [
     { value: "markdown", label: "Markdown" },
     { value: "html", label: "HTML" },
-    ...(includeDocx
-      ? [{ value: "docx", label: "Word (.docx)", disabled: !docxEntitled }]
+    // CCC: only offer Word (.docx) when entitled — was shown disabled with an
+    // "Enterprise" badge. Internal tool — don't advertise unbuyable formats.
+    ...(includeDocx && docxEntitled
+      ? [{ value: "docx", label: "Word (.docx)" }]
       : []),
   ];
 
@@ -213,20 +203,6 @@ function ExportFormatSelection({
       allowDeselect={false}
       withCheckIcon={false}
       aria-label={t("Select export format")}
-      renderOption={({ option }) =>
-        option.value === "docx" && !docxEntitled ? (
-          <div>
-            <Text size="sm" c="dimmed">
-              {option.label}
-            </Text>
-            <Badge size="xs" mt={4}>
-              {t("Enterprise")}
-            </Badge>
-          </div>
-        ) : (
-          <Text size="sm">{option.label}</Text>
-        )
-      }
     />
   );
 }

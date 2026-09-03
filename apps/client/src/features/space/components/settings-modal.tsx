@@ -11,6 +11,7 @@ import {
   SpaceCaslSubject,
 } from "@/features/space/permissions/permissions.type.ts";
 import { useTranslation } from "react-i18next";
+import { useSpaceSecurityAvailable } from "@/features/feature-availability/feature-gate.tsx";
 
 interface SpaceSettingsModalProps {
   spaceId: string;
@@ -28,6 +29,17 @@ export default function SpaceSettingsModal({
 
   const spaceRules = space?.membership?.permissions;
   const spaceAbility = useSpaceAbility(spaceRules);
+
+  // CCC: the Security tab holds only paid space controls (public-sharing + viewer
+  // comments). Hide the whole tab when neither is available so there's no empty tab.
+  // The shared predicate calls both entitlement hooks unconditionally (see
+  // feature-gate.tsx) — a bare `a || b` here would short-circuit the second hook.
+  const hasSpaceSecurity = useSpaceSecurityAvailable();
+  const canManageSettings = spaceAbility.can(
+    SpaceCaslAction.Manage,
+    SpaceCaslSubject.Settings,
+  );
+  const showSecurityTab = canManageSettings && hasSpaceSecurity;
 
   return (
     <>
@@ -60,10 +72,7 @@ export default function SpaceSettingsModal({
                   <Tabs.Tab fw={500} value="members">
                     {t("Members")}
                   </Tabs.Tab>
-                  {spaceAbility.can(
-                    SpaceCaslAction.Manage,
-                    SpaceCaslSubject.Settings,
-                  ) && (
+                  {showSecurityTab && (
                     <Tabs.Tab fw={500} value="security">
                       {t("Security")}
                     </Tabs.Tab>
@@ -101,19 +110,18 @@ export default function SpaceSettingsModal({
                   />
                 </Tabs.Panel>
 
-                <Tabs.Panel value="security">
-                  <ScrollArea h={580} scrollbarSize={5} pr={8}>
-                    <div style={{ paddingBottom: "100px" }}>
-                      <SpaceSecuritySettings
-                        space={space}
-                        readOnly={spaceAbility.cannot(
-                          SpaceCaslAction.Manage,
-                          SpaceCaslSubject.Settings,
-                        )}
-                      />
-                    </div>
-                  </ScrollArea>
-                </Tabs.Panel>
+                {showSecurityTab && (
+                  <Tabs.Panel value="security">
+                    <ScrollArea h={580} scrollbarSize={5} pr={8}>
+                      <div style={{ paddingBottom: "100px" }}>
+                        <SpaceSecuritySettings
+                          space={space}
+                          readOnly={!canManageSettings}
+                        />
+                      </div>
+                    </ScrollArea>
+                  </Tabs.Panel>
+                )}
               </Tabs>
             </div>
           </Modal.Body>

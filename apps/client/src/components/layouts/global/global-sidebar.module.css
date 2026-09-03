@@ -123,7 +123,7 @@
 /* CCC: collapsed icon rail — DESKTOP ONLY. The sidebar always renders its full
    markup (labels stay in the DOM for a11y and for the mobile overlay); these
    rules apply only at sm+ when the navbar carries [data-collapsed], hiding text
-   and centering the icons into the ~60px rail set by the AppShell. Labels are
+   and centering the icons into the 52px rail set by the AppShell. Labels are
    surfaced as hover tooltips (see global-sidebar.tsx). */
 @media (min-width: $mantine-breakpoint-sm) {
     .navbar[data-collapsed] {

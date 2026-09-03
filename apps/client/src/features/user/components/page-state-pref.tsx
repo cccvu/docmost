@@ -36,8 +36,10 @@ export function PageStateSegmentedControl({
 }: PageStateSegmentedControlProps) {
   const { t } = useTranslation();
   const [user, setUser] = useAtom(userAtom);
+  // CCC: Read is the safe default when the user hasn't chosen (prevent accidental
+  // edits); an explicit choice here still wins over the workspace default.
   const pageEditMode =
-    user?.settings?.preferences?.pageEditMode ?? PageEditMode.Edit;
+    user?.settings?.preferences?.pageEditMode ?? PageEditMode.Read;
   const [value, setValue] = useState(pageEditMode);
 
   const handleChange = useCallback(

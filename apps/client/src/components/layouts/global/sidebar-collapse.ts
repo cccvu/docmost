@@ -3,11 +3,16 @@
 // Settings sidebar used to VANISH when the sidebar was minimized; this is the logic
 // that fixes it, so it carries a regression guard against a silent revert.
 //
-// When the desktop sidebar toggle is off, NAVIGATION sidebars (home, settings)
-// collapse to a 52px icon rail instead of hiding; CONTENT sidebars (the space
-// page-tree, AI chat) keep the upstream show/hide behavior — a full-width reading
-// view, since a tree/chat list has no meaningful icon rail. `railsWhenCollapsed` is
-// the single source of truth for both the navbar width and `collapsed.desktop`.
+// When the desktop sidebar toggle is off, EVERY navbar sidebar (home, settings,
+// the space page-tree, AI chat) collapses to a 52px icon rail — none hide. This is
+// deliberate (#1/#2): Mantine's "hide" slides the whole navbar off-screen
+// (translateX) and jumps content to full width, so collapsing the space/AI
+// sidebars used to read as "some sidebars vanish and slide" while home/settings
+// merely shrank. Railing every sidebar makes collapse consistent and non-sliding;
+// content sections that can't reduce to a single icon (the page tree, chat history)
+// are hidden within the rail via each sidebar's `railHidden` CSS.
+// `railsWhenCollapsed` is the single source of truth for both the navbar width and
+// `collapsed.desktop`.
 
 export interface SidebarRouteFlags {
   isSpaceRoute: boolean;
@@ -30,8 +35,14 @@ export function getSidebarCollapseState(
 ): SidebarCollapseState {
   const showGlobalSidebar =
     !routes.isSpaceRoute && !routes.isSettingsRoute && !routes.isAiRoute;
-  // Navigation sidebars (home, settings) rail; content sidebars (space, AI) hide.
-  const railsWhenCollapsed = showGlobalSidebar || routes.isSettingsRoute;
+  // Every navbar sidebar rails when collapsed — home, settings, the space
+  // page-tree, and AI chat alike — so none slide off-screen (#1/#2). A route
+  // with no navbar sidebar simply never rails.
+  const railsWhenCollapsed =
+    showGlobalSidebar ||
+    routes.isSettingsRoute ||
+    routes.isSpaceRoute ||
+    routes.isAiRoute;
   const isRail = railsWhenCollapsed && !desktopOpened;
   return { showGlobalSidebar, railsWhenCollapsed, isRail };
 }
