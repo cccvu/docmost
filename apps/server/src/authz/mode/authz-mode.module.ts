@@ -1,6 +1,7 @@
 import { Global, Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { AUTHZ_MODE, resolveAuthzMode } from './authz-mode';
+import { NativeAuthModeGuard } from './native-auth-mode.guard';
 
 /**
  * CCC authorization integration — NOT upstream Docmost code.
@@ -13,6 +14,10 @@ import { AUTHZ_MODE, resolveAuthzMode } from './authz-mode';
  *
  * Registered in the graph via AuthzModule (which database.module.ts already imports). Being @Global,
  * one registration makes AUTHZ_MODE injectable everywhere, including the module-local search seam.
+ *
+ * Also provides + exports `NativeAuthModeGuard` here (rather than in the upstream AuthModule): the guard
+ * needs AUTHZ_MODE, and being exported from a @Global module lets Nest resolve it when the upstream
+ * `AuthController` references it by class in `@UseGuards` — no upstream module edit.
  */
 @Global()
 @Module({
@@ -23,7 +28,8 @@ import { AUTHZ_MODE, resolveAuthzMode } from './authz-mode';
       useFactory: (config: ConfigService) =>
         resolveAuthzMode(config.get<string>('AUTHZ_MODE')),
     },
+    NativeAuthModeGuard,
   ],
-  exports: [AUTHZ_MODE],
+  exports: [AUTHZ_MODE, NativeAuthModeGuard],
 })
 export class AuthzModeModule {}
