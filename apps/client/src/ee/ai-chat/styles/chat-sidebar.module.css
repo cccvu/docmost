@@ -7,6 +7,29 @@
   gap: var(--mantine-spacing-xs);
 }
 
+/* CCC: collapsed icon rail — DESKTOP ONLY (sm+). Only the "New chat" action fits a
+   52px rail; the title, search box and chat history are hidden. Full markup stays in
+   the DOM so the mobile overlay is unaffected. Mirrors the other sidebars' rails. */
+@media (min-width: $mantine-breakpoint-sm) {
+  .sidebar[data-collapsed] {
+    padding-left: rem(8px);
+    padding-right: rem(8px);
+  }
+
+  .sidebar[data-collapsed] .title,
+  .sidebar[data-collapsed] .searchInput,
+  .sidebar[data-collapsed] .chatList {
+    display: none;
+  }
+
+  /* Center the lone "New chat" icon in the rail. */
+  .sidebar[data-collapsed] .header {
+    justify-content: center;
+    padding-bottom: 0;
+    min-height: rem(40px);
+  }
+}
+
 .header {
   display: flex;
   align-items: center;

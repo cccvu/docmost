@@ -94,3 +94,73 @@
     background-color: light-dark(var(--mantine-color-gray-2), var(--mantine-color-dark-6));
     color: light-dark(var(--mantine-color-gray-7), var(--mantine-color-dark-0));
 }
+
+/* CCC: collapsed icon rail — DESKTOP ONLY (sm+). Mirrors global-sidebar.module.css:
+   the sidebar always renders its full markup (labels stay in the DOM for a11y and
+   for the mobile overlay); these rules apply only at sm+ when the navbar carries
+   [data-collapsed]. The space switcher and the page tree can't reduce to a single
+   icon, so they are `railHidden`; the four action items (Overview/Search/Space
+   settings/New page) center their icons into the 52px rail, labels sr-only and
+   surfaced as hover tooltips (see space-sidebar.tsx). */
+@media (min-width: $mantine-breakpoint-sm) {
+    .navbar[data-collapsed] {
+        padding-left: rem(8px);
+        padding-right: rem(8px);
+    }
+
+    /* Sections that can't reduce to a single icon: the space switcher + the tree. */
+    .navbar[data-collapsed] .railHidden {
+        display: none;
+    }
+
+    /* Full-bleed section dividers/negative margins don't fit the narrow rail. */
+    .navbar[data-collapsed] .section {
+        margin-left: 0;
+        margin-right: 0;
+        border-bottom: none;
+    }
+
+    .navbar[data-collapsed] .menuItems {
+        padding-left: 0;
+        padding-right: 0;
+        padding-bottom: 0;
+    }
+
+    /* Center the single icon dead-center regardless of the button's content layout
+       (same technique as the global rail — take the icon out of flow). */
+    .navbar[data-collapsed] .menu {
+        display: block;
+        position: relative;
+        width: 100%;
+        padding: 0;
+        min-height: rem(40px);
+    }
+
+    .navbar[data-collapsed] .menuItemInner {
+        display: block;
+        height: 100%;
+    }
+
+    .navbar[data-collapsed] .menuItemIcon {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        margin: 0;
+        width: rem(20px);
+        height: rem(20px);
+    }
+
+    /* Keep the label as the accessible name, but hide it visually (sr-only). */
+    .navbar[data-collapsed] .menu span {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        margin: -1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+        border: 0;
+    }
+}

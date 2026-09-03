@@ -21,8 +21,8 @@ describe("getSidebarCollapseState (rail-vs-hide truth table)", () => {
   });
 
   // Regression guard for the Settings-sidebar-vanishing bug: settings MUST rail,
-  // never hide. If someone drops `|| isSettingsRoute` from railsWhenCollapsed, the
-  // asserts below flip and the sidebar hides again — this test fails loudly.
+  // never hide. If someone drops settings from railsWhenCollapsed, the asserts
+  // below flip and the sidebar hides again — this test fails loudly.
   it("settings is a navigation sidebar → rails when collapsed, never hides", () => {
     const collapsed = getSidebarCollapseState(SETTINGS, false);
     expect(collapsed.showGlobalSidebar).toBe(false);
@@ -31,16 +31,29 @@ describe("getSidebarCollapseState (rail-vs-hide truth table)", () => {
     expect(getSidebarCollapseState(SETTINGS, true).isRail).toBe(false);
   });
 
-  it("space page-tree is a content sidebar → hides when collapsed, never rails", () => {
+  // CCC (#1/#2): the space page-tree used to HIDE on collapse — Mantine slid the
+  // whole navbar off-screen (translateX), which read as "some sidebars vanish and
+  // slide". Every navbar sidebar now RAILS to the 52px icon strip instead, so the
+  // collapse is consistent and nothing slides. This guards against a regression to
+  // the hide-on-collapse behavior.
+  it("space page-tree rails when collapsed, never hides", () => {
     const collapsed = getSidebarCollapseState(SPACE, false);
-    expect(collapsed.railsWhenCollapsed).toBe(false);
-    expect(collapsed.isRail).toBe(false);
+    expect(collapsed.railsWhenCollapsed).toBe(true);
+    expect(collapsed.isRail).toBe(true);
+    expect(getSidebarCollapseState(SPACE, true).isRail).toBe(false);
   });
 
-  it("AI chat is a content sidebar → hides when collapsed, never rails", () => {
+  it("AI chat rails when collapsed, never hides", () => {
     const collapsed = getSidebarCollapseState(AI, false);
-    expect(collapsed.railsWhenCollapsed).toBe(false);
-    expect(collapsed.isRail).toBe(false);
+    expect(collapsed.railsWhenCollapsed).toBe(true);
+    expect(collapsed.isRail).toBe(true);
+    expect(getSidebarCollapseState(AI, true).isRail).toBe(false);
+  });
+
+  it("every navbar sidebar rails — none hides on desktop collapse", () => {
+    for (const route of [HOME, SETTINGS, SPACE, AI]) {
+      expect(getSidebarCollapseState(route, false).railsWhenCollapsed).toBe(true);
+    }
   });
 
   it("isRail is true only when the desktop toggle is off (collapsed)", () => {

@@ -56,11 +56,19 @@ import { useToggleSidebar } from "@/components/layouts/global/hooks/hooks/use-to
 import { searchSpotlight } from "@/features/search/constants";
 import TemplatePickerModal from "@/ee/template/components/template-picker-modal";
 import { useHasFeature } from "@/ee/hooks/use-feature";
-import { useUpgradeLabel } from "@/ee/hooks/use-upgrade-label";
 import { Feature } from "@/ee/features";
 import { ErrorBoundary } from "react-error-boundary";
 
-export function SpaceSidebar() {
+export function SpaceSidebar({
+  collapsed = false,
+}: {
+  /** Desktop icon-rail mode (CCC): render the space action icons only — the space
+      switcher and the page tree are hidden (railHidden), labels stay in the DOM for
+      a11y and surface as hover tooltips. The visual collapse is gated to sm+ in
+      space-sidebar.module.css, so the mobile overlay is unaffected. Mirrors the
+      global/settings sidebars so "minimize" behaves the same everywhere (#1/#2). */
+  collapsed?: boolean;
+} = {}) {
   const { t } = useTranslation();
   const location = useLocation();
   const [opened, { open: openSettings, close: closeSettings }] =
@@ -83,11 +91,20 @@ export function SpaceSidebar() {
     handleCreate(null);
   }
 
+  // CCC: in rail mode each action's label is visually hidden, so surface it as a
+  // hover tooltip (disabled when expanded). Keeps the space rail consistent with
+  // the global/settings rails.
+  const railTip = (label: string, node: React.ReactNode) => (
+    <Tooltip label={label} position="right" withArrow disabled={!collapsed}>
+      {node}
+    </Tooltip>
+  );
+
   return (
     <>
-      <div className={classes.navbar}>
+      <div className={classes.navbar} data-collapsed={collapsed || undefined}>
         <div
-          className={classes.section}
+          className={clsx(classes.section, classes.railHidden)}
           style={{
             border: "none",
             marginTop: 2,
@@ -110,78 +127,95 @@ export function SpaceSidebar() {
 
         <div className={classes.section}>
           <div className={classes.menuItems}>
-            <UnstyledButton
-              component={Link}
-              to={getSpaceUrl(spaceSlug)}
-              className={clsx(
-                classes.menu,
-                location.pathname.toLowerCase() === getSpaceUrl(spaceSlug)
-                  ? classes.activeButton
-                  : "",
-              )}
-            >
-              <div className={classes.menuItemInner}>
-                <IconHome
-                  size={18}
-                  className={classes.menuItemIcon}
-                  stroke={2}
-                />
-                <span>{t("Overview")}</span>
-              </div>
-            </UnstyledButton>
-
-            <UnstyledButton
-              className={classes.menu}
-              onClick={searchSpotlight.open}
-            >
-              <div className={classes.menuItemInner}>
-                <IconSearch
-                  size={18}
-                  className={classes.menuItemIcon}
-                  stroke={2}
-                />
-                <span>{t("Search")}</span>
-              </div>
-            </UnstyledButton>
-
-            <UnstyledButton className={classes.menu} onClick={openSettings}>
-              <div className={classes.menuItemInner}>
-                <IconSettings
-                  size={18}
-                  className={classes.menuItemIcon}
-                  stroke={2}
-                />
-                <span>{t("Space settings")}</span>
-              </div>
-            </UnstyledButton>
-
-            {spaceAbility.can(
-              SpaceCaslAction.Manage,
-              SpaceCaslSubject.Page,
-            ) && (
+            {railTip(
+              t("Overview"),
               <UnstyledButton
-                className={classes.menu}
-                onClick={() => {
-                  handleCreatePage();
-                  if (mobileSidebarOpened) {
-                    toggleMobileSidebar();
-                  }
-                }}
+                component={Link}
+                to={getSpaceUrl(spaceSlug)}
+                className={clsx(
+                  classes.menu,
+                  location.pathname.toLowerCase() === getSpaceUrl(spaceSlug)
+                    ? classes.activeButton
+                    : "",
+                )}
               >
                 <div className={classes.menuItemInner}>
-                  <IconPlus
+                  <IconHome
                     size={18}
                     className={classes.menuItemIcon}
                     stroke={2}
                   />
-                  <span>{t("New page")}</span>
+                  <span>{t("Overview")}</span>
                 </div>
-              </UnstyledButton>
+              </UnstyledButton>,
             )}
+
+            {railTip(
+              t("Search"),
+              <UnstyledButton
+                className={classes.menu}
+                onClick={searchSpotlight.open}
+              >
+                <div className={classes.menuItemInner}>
+                  <IconSearch
+                    size={18}
+                    className={classes.menuItemIcon}
+                    stroke={2}
+                  />
+                  <span>{t("Search")}</span>
+                </div>
+              </UnstyledButton>,
+            )}
+
+            {railTip(
+              t("Space settings"),
+              <UnstyledButton className={classes.menu} onClick={openSettings}>
+                <div className={classes.menuItemInner}>
+                  <IconSettings
+                    size={18}
+                    className={classes.menuItemIcon}
+                    stroke={2}
+                  />
+                  <span>{t("Space settings")}</span>
+                </div>
+              </UnstyledButton>,
+            )}
+
+            {spaceAbility.can(
+              SpaceCaslAction.Manage,
+              SpaceCaslSubject.Page,
+            ) &&
+              railTip(
+                t("New page"),
+                <UnstyledButton
+                  className={classes.menu}
+                  onClick={() => {
+                    handleCreatePage();
+                    if (mobileSidebarOpened) {
+                      toggleMobileSidebar();
+                    }
+                  }}
+                >
+                  <div className={classes.menuItemInner}>
+                    <IconPlus
+                      size={18}
+                      className={classes.menuItemIcon}
+                      stroke={2}
+                    />
+                    <span>{t("New page")}</span>
+                  </div>
+                </UnstyledButton>,
+              )}
           </div>
         </div>
 
-        <div className={clsx(classes.section, classes.sectionPages)}>
+        <div
+          className={clsx(
+            classes.section,
+            classes.sectionPages,
+            classes.railHidden,
+          )}
+        >
           <Group className={classes.pagesHeader} justify="space-between">
             <Text size="xs" fw={500} c="dimmed">
               {t("Pages")}
@@ -257,7 +291,6 @@ function SpaceMenu({
     { open: openTemplatePicker, close: closeTemplatePicker },
   ] = useDisclosure(false);
   const hasTemplates = useHasFeature(Feature.TEMPLATES);
-  const upgradeLabel = useUpgradeLabel();
 
   const { data: watchStatus } = useSpaceWatchStatusQuery(spaceId);
   const watchMutation = useWatchSpaceMutation();
@@ -327,24 +360,17 @@ function SpaceMenu({
             {isWatching ? t("Stop watching space") : t("Watch space")}
           </Menu.Item>
 
-          {canManagePages && (
+          {/* CCC: HIDE Templates when unavailable (was rendered disabled with an
+              upgrade tooltip). Internal tool — don't advertise unbuyable features. */}
+          {canManagePages && hasTemplates && (
             <>
               <Menu.Divider />
-              <Tooltip
-                label={upgradeLabel}
-                disabled={hasTemplates}
-                position="right"
-                withArrow
+              <Menu.Item
+                onClick={openTemplatePicker}
+                leftSection={<IconTemplate size={16} />}
               >
-                <Menu.Item
-                  onClick={hasTemplates ? openTemplatePicker : undefined}
-                  leftSection={<IconTemplate size={16} />}
-                  data-disabled={!hasTemplates || undefined}
-                  aria-disabled={!hasTemplates || undefined}
-                >
-                  {t("Templates")}
-                </Menu.Item>
-              </Tooltip>
+                {t("Templates")}
+              </Menu.Item>
             </>
           )}
 

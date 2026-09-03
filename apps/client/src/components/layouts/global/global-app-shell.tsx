@@ -21,6 +21,15 @@ import GlobalSidebar from "@/components/layouts/global/global-sidebar.tsx";
 import { getSidebarCollapseState } from "@/components/layouts/global/sidebar-collapse.ts";
 import { ASIDE_PANEL_ID } from "@/hooks/use-toggle-aside.tsx";
 import { MAIN_CONTENT_ID, SkipToMain } from "@/components/ui/skip-to-main.tsx";
+import {
+  ASIDE_WIDTH,
+  HEADER_HEIGHT,
+  NAVBAR_BREAKPOINT,
+  RAIL_WIDTH,
+  SIDEBAR_MAX_WIDTH,
+  SIDEBAR_MIN_WIDTH,
+  SIDEBAR_WIDTH,
+} from "@/features/layout/layout-tokens.ts";
 
 export default function GlobalAppShell({
   children,
@@ -52,12 +61,12 @@ export default function GlobalAppShell({
         const newWidth =
           mouseMoveEvent.clientX -
           sidebarRef.current.getBoundingClientRect().left;
-        if (newWidth < 220) {
-          setSidebarWidth(220);
+        if (newWidth < SIDEBAR_MIN_WIDTH) {
+          setSidebarWidth(SIDEBAR_MIN_WIDTH);
           return;
         }
-        if (newWidth > 600) {
-          setSidebarWidth(600);
+        if (newWidth > SIDEBAR_MAX_WIDTH) {
+          setSidebarWidth(SIDEBAR_MAX_WIDTH);
           return;
         }
         setSidebarWidth(newWidth);
@@ -81,13 +90,12 @@ export default function GlobalAppShell({
   const isSpaceRoute = location.pathname.startsWith("/s/");
   const isAiRoute = location.pathname.startsWith("/ai");
   const isPageRoute = location.pathname.includes("/p/");
-  const RAIL_WIDTH = 52;
   // CCC: the rail-vs-hide decision is a pure, unit-tested helper (sidebar-collapse.ts)
-  // so the Settings-rail fix can't silently regress. NAVIGATION sidebars (home,
-  // settings) rail to RAIL_WIDTH when the desktop toggle is off; CONTENT sidebars
-  // (the space page-tree, AI chat) keep the upstream show/hide — a full-width reading
-  // view, since a tree/chat list has no meaningful icon rail. `railsWhenCollapsed`
-  // drives both the navbar width and the collapsed.desktop decision below.
+  // so it can't silently regress. EVERY navbar sidebar (home, settings, the space
+  // page-tree, AI chat) rails to RAIL_WIDTH when the desktop toggle is off — none
+  // hide, so nothing slides off-screen (#1/#2). `railsWhenCollapsed` drives both the
+  // navbar width and the collapsed.desktop decision below; each sidebar hides the
+  // sections that can't reduce to an icon (tree/history) via its own `railHidden`.
   const { showGlobalSidebar, railsWhenCollapsed, isRail } = getSidebarCollapseState(
     { isSpaceRoute, isSettingsRoute, isAiRoute },
     desktopOpened,
@@ -96,31 +104,33 @@ export default function GlobalAppShell({
   return (
     <>
       <SkipToMain />
-      {/* CCC: header height raised from 45 → 56 to give the Vanderbilt/CCC lockup
-          room to breathe. Keep in sync with the coupled `.aside` margin-top in
+      {/* CCC: header height (HEADER_HEIGHT) gives the Vanderbilt/CCC lockup room to
+          breathe. Keep in sync with the coupled `.aside` margin-top in
           app-shell.module.css. */}
       <AppShell
-      header={{ height: 56 }}
+      header={{ height: HEADER_HEIGHT }}
       navbar={{
-        // CCC: on desktop the home & settings sidebars become a 52px icon rail
-        // when "collapsed" rather than hiding; mobile always uses the full 300px
-        // overlay (rail styles are gated to sm+ in the sidebars' module.css).
+        // CCC: on desktop EVERY sidebar becomes a RAIL_WIDTH icon rail when
+        // "collapsed" rather than hiding — including the resizable space page-tree,
+        // whose width otherwise tracks `sidebarWidth`. Mobile always uses the full
+        // overlay (rail styles are gated to sm+ in each sidebar's module.css).
         width: isSpaceRoute
-          ? sidebarWidth
-          : { base: 300, sm: isRail ? RAIL_WIDTH : 300 },
-        breakpoint: "sm",
+          ? isRail
+            ? RAIL_WIDTH
+            : sidebarWidth
+          : { base: SIDEBAR_WIDTH, sm: isRail ? RAIL_WIDTH : SIDEBAR_WIDTH },
+        breakpoint: NAVBAR_BREAKPOINT,
         collapsed: {
           mobile: !mobileOpened,
-          // Navigation sidebars (home, settings) never fully hide on desktop
-          // (they rail); the space page-tree and AI chat keep the upstream
-          // show/hide toggle.
+          // Every navbar sidebar rails (never fully hides) on desktop, so the
+          // navbar never slides off-screen; `isRail` (below) controls the width.
           desktop: railsWhenCollapsed ? false : !desktopOpened,
         },
       }}
       aside={
         isPageRoute && {
-          width: 350,
-          breakpoint: "sm",
+          width: ASIDE_WIDTH,
+          breakpoint: NAVBAR_BREAKPOINT,
           collapsed: { mobile: !isAsideOpen, desktop: !isAsideOpen },
         }
       }
@@ -143,12 +153,13 @@ export default function GlobalAppShell({
                 : t("Main navigation")
         }
       >
-        {isSpaceRoute && (
+        {/* No drag-to-resize while railed — the rail is a fixed 52px. */}
+        {isSpaceRoute && !isRail && (
           <div className={classes.resizeHandle} onMouseDown={startResizing} />
         )}
-        {isSpaceRoute && <SpaceSidebar />}
+        {isSpaceRoute && <SpaceSidebar collapsed={isRail} />}
         {isSettingsRoute && <SettingsSidebar collapsed={isRail} />}
-        {isAiRoute && <AiChatSidebar />}
+        {isAiRoute && <AiChatSidebar collapsed={isRail} />}
         {showGlobalSidebar && <GlobalSidebar collapsed={isRail} />}
       </AppShell.Navbar>
       <AppShell.Main id={MAIN_CONTENT_ID} tabIndex={-1}>

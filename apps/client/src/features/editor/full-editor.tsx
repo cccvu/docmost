@@ -15,7 +15,10 @@ import {
 } from "@mantine/core";
 import { IconInfoCircle } from "@tabler/icons-react";
 import { useAtom } from "jotai";
-import { userAtom } from "@/features/user/atoms/current-user-atom.ts";
+import {
+  userAtom,
+  workspaceAtom,
+} from "@/features/user/atoms/current-user-atom.ts";
 import { CustomAvatar } from "@/components/ui/custom-avatar.tsx";
 import { PageVerificationBadge } from "@/ee/page-verification";
 import { useTranslation } from "react-i18next";
@@ -26,6 +29,7 @@ import { useAsideTriggerProps } from "@/hooks/use-toggle-aside.tsx";
 import { DeletedPageBanner } from "@/features/page/trash/components/deleted-page-banner.tsx";
 import clsx from "clsx";
 import { currentPageEditModeAtom } from "@/features/editor/atoms/editor-atoms.ts";
+import { resolvePageEditMode } from "@/features/editor/resolve-page-edit-mode.ts";
 import { EmptyPageGetStarted } from "@/features/editor/components/empty-page/empty-page-get-started";
 import { resolveEditorToolbarPref } from "@/features/editor-ux/prefs/editor-toolbar-pref";
 
@@ -68,14 +72,21 @@ export function FullEditor({
   canComment,
 }: FullEditorProps) {
   const [user] = useAtom(userAtom);
+  const [workspace] = useAtom(workspaceAtom);
   const fullPageWidth = user.settings?.preferences?.fullPageWidth;
   // CCC (issue #135): formatting toolbar defaults ON; explicit opt-out honored.
   const editorToolbarEnabled = resolveEditorToolbarPref(user);
   const [currentPageEditMode, setCurrentPageEditMode] = useAtom(
     currentPageEditModeAtom,
   );
-  const userPageEditMode =
-    user.settings?.preferences?.pageEditMode ?? PageEditMode.Edit;
+  // CCC: page open-mode precedence — explicit user preference > workspace default
+  // > Read system fallback (resolvePageEditMode, unit-tested). Pages open in READ by
+  // default (prevent accidental edits); the admin's workspace default (set in the
+  // console) is the shared knob, and an explicit per-user Edit choice still wins.
+  const userPageEditMode = resolvePageEditMode(
+    user.settings?.preferences?.pageEditMode,
+    workspace?.settings?.defaultPageEditMode,
+  );
   const isEditMode = currentPageEditMode === PageEditMode.Edit;
 
   // Apply the user's saved preference only once on initial load, not on every
