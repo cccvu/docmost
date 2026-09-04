@@ -1,0 +1,432 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Docmost Remote Authorization Service",
+    "version": "1.0.0",
+    "summary": "The contract a third party implements to run this Docmost fork with AUTHZ_MODE=remote.",
+    "description": "When this Docmost fork runs with AUTHZ_MODE=remote, it delegates EVERY fine-grained authorization decision, and forwards domain audit, to an external HTTP service over this contract. Implement these six endpoints and point the fork at your service via PLATFORM_AUTHZ_URL (base URL, no path prefix) and PLATFORM_AUTHZ_SERVICE_SECRET (the shared secret sent in the x-authz-service-secret header) to run the fork without the CCC platform.\n\nThis document is the CANONICAL source of truth for the PEP to PDP + audit boundary. It supersedes the retired contract/pep-pdp.contract.json fixture; the fork consumer contract test and the reference implementation's provider contract test both derive their canonical request/response bodies and array caps from this file.\n\nSecurity model (non-negotiable, enforced by the fork, not by your service):\n  - The mode is a server-controlled boundary fixed at fork startup, never inferred from availability, and there is NO fallback to native decisions. If your service is unreachable, slow, or returns a non-2xx or malformed body, the fork FAILS CLOSED (deny / empty result). A platform outage must never silently grant access, so your service returning 5xx is safe by construction.\n  - The fork calls with a per-request AbortController timeout (PLATFORM_AUTHZ_TIMEOUT_MS, default 1500 ms, clamped to [250, 60000]); respond well within it or the call is treated as a denial.\n  - Subjects always arrive as { provider: \"docmost\", externalId: <docmost user id> }. The { principalId } shape is part of the schema for completeness but is not emitted by this fork.\n  - The reference implementation additionally rejects unknown request keys with 400 and enforces the array caps below; a faithful implementation should do the same, but the fork itself never sends unknown keys or over-cap arrays.",
+    "license": { "name": "AGPL-3.0-only", "identifier": "AGPL-3.0-only" },
+    "x-canonical": true
+  },
+  "servers": [
+    {
+      "url": "https://your-authz-service.example",
+      "description": "PLATFORM_AUTHZ_URL base (your service; e.g. http://localhost:4000 in dev). The fork appends the bare paths below (no /api, no version prefix)."
+    }
+  ],
+  "security": [{ "serviceSecret": [] }],
+  "tags": [
+    { "name": "authz", "description": "Authorization decisions (fail-closed on the fork side)." },
+    { "name": "audit", "description": "Domain-event audit sink (fire-and-forget on the fork side)." }
+  ],
+  "paths": {
+    "/authz/check": {
+      "post": {
+        "operationId": "check",
+        "tags": ["authz"],
+        "summary": "Single permission check.",
+        "description": "Decide whether the subject holds a permission on one resource. The fork returns the decision only when the response is 200 with { allowed: true }; anything else (non-2xx, malformed body, allowed !== true) is a deny.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["subject", "permission", "resourceType", "resourceId"],
+                "properties": {
+                  "subject": { "$ref": "#/components/schemas/Subject" },
+                  "permission": { "type": "string" },
+                  "resourceType": { "type": "string" },
+                  "resourceId": { "type": "string" }
+                }
+              },
+              "example": {
+                "subject": { "provider": "docmost", "externalId": "d-1" },
+                "permission": "view",
+                "resourceType": "space",
+                "resourceId": "s-1"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Decision.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["allowed"],
+                  "properties": { "allowed": { "type": "boolean" } }
+                },
+                "example": { "allowed": true }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
+    "/authz/check-bulk": {
+      "post": {
+        "operationId": "checkBulk",
+        "tags": ["authz"],
+        "summary": "Batched permission checks for one subject.",
+        "description": "Decide a batch of (permission, resourceType, resourceId) checks for one subject. Returns one boolean per check, in the SAME order as the input. On any non-2xx / malformed body the fork substitutes an all-false array of the request length, so callers can always index results positionally.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["subject", "checks"],
+                "properties": {
+                  "subject": { "$ref": "#/components/schemas/Subject" },
+                  "checks": {
+                    "type": "array",
+                    "maxItems": 256,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["permission", "resourceType", "resourceId"],
+                      "properties": {
+                        "permission": { "type": "string" },
+                        "resourceType": { "type": "string" },
+                        "resourceId": { "type": "string" }
+                      }
+                    }
+                  }
+                }
+              },
+              "example": {
+                "subject": { "provider": "docmost", "externalId": "d-1" },
+                "checks": [
+                  { "permission": "view", "resourceType": "page", "resourceId": "p-1" },
+                  { "permission": "edit", "resourceType": "page", "resourceId": "p-2" }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "One boolean per check, in order.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["results"],
+                  "properties": { "results": { "type": "array", "items": { "type": "boolean" } } }
+                },
+                "example": { "results": [true, false] }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
+    "/authz/filter-resources": {
+      "post": {
+        "operationId": "filterResources",
+        "tags": ["authz"],
+        "summary": "Resource-side filter: keep the authorized ids.",
+        "description": "Given a bounded list of candidate resource ids, return the subset the subject may access under the permission. On any non-2xx / malformed body the fork returns [] (reveal nothing), never the raw candidates.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["subject", "permission", "resourceType", "candidateIds"],
+                "properties": {
+                  "subject": { "$ref": "#/components/schemas/Subject" },
+                  "permission": { "type": "string" },
+                  "resourceType": { "type": "string" },
+                  "candidateIds": {
+                    "type": "array",
+                    "maxItems": 1000,
+                    "items": { "type": "string" }
+                  }
+                }
+              },
+              "example": {
+                "subject": { "provider": "docmost", "externalId": "d-1" },
+                "permission": "view",
+                "resourceType": "page",
+                "candidateIds": ["a", "b", "c"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The authorized subset of candidateIds.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["ids"],
+                  "properties": { "ids": { "type": "array", "items": { "type": "string" } } }
+                },
+                "example": { "ids": ["a", "c"] }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
+    "/authz/lookup-resources": {
+      "post": {
+        "operationId": "lookupResources",
+        "tags": ["authz"],
+        "summary": "Reverse index: all resource ids the subject may access.",
+        "description": "Return every resource id of resourceType the subject may access under the permission (no candidate list). On any non-2xx / malformed body the fork returns [].",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["subject", "permission", "resourceType"],
+                "properties": {
+                  "subject": { "$ref": "#/components/schemas/Subject" },
+                  "permission": { "type": "string" },
+                  "resourceType": { "type": "string" }
+                }
+              },
+              "example": {
+                "subject": { "provider": "docmost", "externalId": "d-1" },
+                "permission": "view",
+                "resourceType": "page"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The full authorized id set.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["ids"],
+                  "properties": { "ids": { "type": "array", "items": { "type": "string" } } }
+                },
+                "example": { "ids": ["pg-1", "pg-2"] }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
+    "/authz/filter-subjects": {
+      "post": {
+        "operationId": "filterSubjects",
+        "tags": ["authz"],
+        "summary": "Subject-side filter: which candidate subjects may access one resource.",
+        "description": "Given a bounded list of candidate subjects and one resource, return the subset that may access it under the permission. The body carries candidates, NOT a top-level subject. Passing subjects are echoed back VERBATIM (the caller keeps its own id namespace); the fork reads externalId off each returned subject. On any non-2xx / malformed body the fork returns [] (no recipients).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["permission", "resourceType", "resourceId", "candidates"],
+                "properties": {
+                  "permission": { "type": "string" },
+                  "resourceType": { "type": "string" },
+                  "resourceId": { "type": "string" },
+                  "candidates": {
+                    "type": "array",
+                    "maxItems": 1000,
+                    "items": { "$ref": "#/components/schemas/Subject" }
+                  }
+                }
+              },
+              "example": {
+                "permission": "view",
+                "resourceType": "page",
+                "resourceId": "pg-1",
+                "candidates": [
+                  { "provider": "docmost", "externalId": "u1" },
+                  { "provider": "docmost", "externalId": "u2" }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The passing candidate subjects, echoed verbatim.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["subjects"],
+                  "properties": {
+                    "subjects": { "type": "array", "items": { "$ref": "#/components/schemas/Subject" } }
+                  }
+                },
+                "example": { "subjects": [{ "provider": "docmost", "externalId": "u1" }] }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
+    "/audit/ingest": {
+      "post": {
+        "operationId": "auditIngest",
+        "tags": ["audit"],
+        "summary": "Ingest a batch of forwarded domain-audit events.",
+        "description": "Accept a batch of Docmost domain-audit events. The fork forwards these fire-and-forget: it does not read the response body and swallows all errors, so a minimal sink may return any 2xx. A faithful sink returns 202 with { accepted, persisted }; persisted < accepted signals dropped rows.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["events"],
+                "properties": {
+                  "events": {
+                    "type": "array",
+                    "maxItems": 500,
+                    "items": { "$ref": "#/components/schemas/AuditEvent" }
+                  }
+                }
+              },
+              "example": {
+                "events": [
+                  {
+                    "event": "page.updated",
+                    "resourceType": "page",
+                    "resourceId": "pg-1",
+                    "actorId": "d-1",
+                    "actorType": "user",
+                    "workspaceId": "ws-1"
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Batch accepted.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["accepted", "persisted"],
+                  "properties": {
+                    "accepted": { "type": "integer" },
+                    "persisted": { "type": "integer" }
+                  }
+                },
+                "example": { "accepted": 1, "persisted": 1 }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "serviceSecret": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-authz-service-secret",
+        "description": "Shared secret (PLATFORM_AUTHZ_SERVICE_SECRET) sent on every request. Compare it in constant time. Missing/wrong secret -> 401; unconfigured on the server -> 503 (fail-closed)."
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Malformed request: an unknown key, a wrong type, or an over-cap array.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "Missing or wrong x-authz-service-secret.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
+        }
+      },
+      "Unconfigured": {
+        "description": "The server has no service secret configured (fail-closed).",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/Error" }
+          }
+        }
+      }
+    },
+    "schemas": {
+      "Subject": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Either an external identity ref { provider, externalId } (what this fork always sends: provider is 'docmost', externalId is the Docmost user id) OR a platform principal ref { principalId, subjectType } (accepted for completeness, not emitted by this fork). A subject carrying neither is rejected with 400.",
+        "properties": {
+          "principalId": { "type": "string" },
+          "subjectType": { "type": "string", "enum": ["user", "service"] },
+          "provider": { "type": "string" },
+          "externalId": { "type": "string" }
+        }
+      },
+      "AuditEvent": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "One forwarded Docmost domain-audit event. event and resourceType are required; the rest are optional context.",
+        "required": ["event", "resourceType"],
+        "properties": {
+          "event": { "type": "string" },
+          "resourceType": { "type": "string" },
+          "resourceId": { "type": "string" },
+          "spaceId": { "type": "string" },
+          "changes": { "type": "object", "additionalProperties": true },
+          "metadata": { "type": "object", "additionalProperties": true },
+          "actorId": { "type": "string" },
+          "actorType": { "type": "string", "enum": ["user", "system", "api_key"] },
+          "workspaceId": { "type": "string" },
+          "ipAddress": { "type": "string" },
+          "userAgent": { "type": "string" }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "description": "Error body shape is implementation-defined; only the HTTP status is contractual. The fork ignores the body and keys off the status.",
+        "properties": {
+          "statusCode": { "type": "integer" },
+          "message": { "type": "string" },
+          "error": { "type": "string" }
+        }
+      }
+    }
+  }
+}

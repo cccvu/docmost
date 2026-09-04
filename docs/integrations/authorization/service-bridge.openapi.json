@@ -1,0 +1,229 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Docmost Service Bridge (east-west)",
+    "version": "1.0.0",
+    "summary": "The east-west endpoints this Docmost fork EXPOSES to an integrating platform.",
+    "description": "These are the machine-to-machine endpoints the fork hosts for an integrating platform (the inverse direction of authorization-service.openapi.json, which the fork calls). They exist only to let an external identity/session broker provision a fork-local shadow user and mint a Docmost session for it, and to let the platform force-disconnect a live collab session after a revocation. They are NOT part of the public north-south API and are not browser-facing.\n\nAll three are gated by a shared service secret in the x-authz-service-secret header (PLATFORM_AUTHZ_SERVICE_SECRET). The /api/service/* endpoints additionally require a per-route scope (session:mint, users:provision); today a single full-scope secret is issued, and per-scope credentials can be added later with no contract change.\n\nSecurity properties an integrator must understand:\n  - Both /api/service/* endpoints are keyed ONLY on the caller's opaque externalId. The fork derives the shadow email (externalId@shadow.wiki-v2.internal) and resolves its own default workspace, so a caller can never select an arbitrary Docmost identity, name a real/privileged/native account, or supply a workspace id. This is a strong narrowing, not impersonation.\n  - /api/service/session mints a session ONLY for a fork-owned shadow member (shadow-namespace email, role=member, not deleted); anything else is 403.\n  - Fail-closed: unconfigured secret -> 503; missing/wrong secret -> 401; wrong scope -> 403; over the per-credential rate limit -> 429; invalid body -> 400.",
+    "license": { "name": "AGPL-3.0-only", "identifier": "AGPL-3.0-only" },
+    "x-canonical": true
+  },
+  "servers": [
+    {
+      "url": "https://your-docmost.example",
+      "description": "The Docmost fork base URL (e.g. http://localhost:3000 in dev). The global prefix /api is included in the paths below."
+    }
+  ],
+  "security": [{ "serviceSecret": [] }],
+  "tags": [
+    { "name": "service-bridge", "description": "Shadow-user provisioning and session brokerage (authentication, not authorization)." },
+    { "name": "collab", "description": "Collaboration session control." }
+  ],
+  "paths": {
+    "/api/service/users": {
+      "post": {
+        "operationId": "provisionShadowUser",
+        "tags": ["service-bridge"],
+        "summary": "Provision (idempotently) a fork-local shadow user for an external identity.",
+        "description": "Create-or-return a shadow user for the caller's externalId in the fork's own default workspace, with role=member and an unusable password. Idempotent on (derived shadow email, workspace). Requires the users:provision scope.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["externalId"],
+                "properties": {
+                  "externalId": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9._+-]{1,128}$",
+                    "description": "The caller's opaque stable id. The fork derives the shadow email from it; the caller never sends a Docmost user id, email, or workspace id."
+                  },
+                  "name": {
+                    "type": "string",
+                    "maxLength": 255,
+                    "description": "Optional display name for the shadow user."
+                  }
+                }
+              },
+              "example": { "externalId": "ext-abc123", "name": "Ada Lovelace" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The provisioned (or existing) shadow user and the fork's resolved workspace.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["userId", "workspaceId"],
+                  "properties": {
+                    "userId": { "type": "string", "description": "Docmost user id (opaque to the caller)." },
+                    "workspaceId": { "type": "string", "description": "The fork's own default workspace id." }
+                  }
+                },
+                "example": {
+                  "userId": "9b1f0c2e-0000-4000-8000-000000000001",
+                  "workspaceId": "9b1f0c2e-0000-4000-8000-0000000000ff"
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
+    "/api/service/session": {
+      "post": {
+        "operationId": "mintSession",
+        "tags": ["service-bridge"],
+        "summary": "Mint a Docmost session cookie for a fork-owned shadow member.",
+        "description": "Look up the shadow user by the email derived from externalId, verify it is a mintable shadow member (shadow namespace, role=member, not deleted), and mint a Docmost session. Returns { ok: true } and sets the authToken cookie (httpOnly, sameSite=lax, path=/, secure in prod). Requires the session:mint scope. There is NO generic impersonation: a non-shadow / non-member / deleted / unknown subject is 403.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["externalId"],
+                "properties": {
+                  "externalId": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9._+-]{1,128}$",
+                    "description": "The caller's opaque stable id, matching a previously provisioned shadow user."
+                  }
+                }
+              },
+              "example": { "externalId": "ext-abc123" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Session minted; the authToken cookie is set via Set-Cookie.",
+            "headers": {
+              "Set-Cookie": {
+                "description": "authToken=<jwt>; HttpOnly; SameSite=Lax; Path=/; Secure (in production).",
+                "schema": { "type": "string" }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["ok"],
+                  "properties": { "ok": { "type": "boolean" } }
+                },
+                "example": { "ok": true }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": {
+            "description": "Not a mintable shadow user (unknown, deleted, wrong role, or outside the shadow namespace).",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+          },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
+    "/api/collab/force-disconnect": {
+      "post": {
+        "operationId": "forceDisconnect",
+        "tags": ["collab"],
+        "summary": "Force-disconnect a user's live collab session on a page after a revocation.",
+        "description": "Close the user's live collaboration connections on a page. The fork RE-CHECKS access before disconnecting (fail-safe): if the user can still access the page, it returns { disconnected: false } without disconnecting. Gated by the same x-authz-service-secret header (no per-route scope on this endpoint).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["userId", "pageId"],
+                "properties": {
+                  "userId": { "type": "string", "format": "uuid" },
+                  "pageId": { "type": "string", "format": "uuid" }
+                }
+              },
+              "example": {
+                "userId": "11111111-1111-1111-1111-111111111111",
+                "pageId": "22222222-2222-2222-2222-222222222222"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Whether the user was disconnected (false if a re-check shows they still have access).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["disconnected"],
+                  "properties": { "disconnected": { "type": "boolean" } }
+                },
+                "example": { "disconnected": true }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "serviceSecret": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "x-authz-service-secret",
+        "description": "Shared secret (PLATFORM_AUTHZ_SERVICE_SECRET) sent on every request, compared in constant time."
+      }
+    },
+    "responses": {
+      "BadRequest": {
+        "description": "Invalid body (bad shape, unknown key, or externalId failing the id pattern).",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Unauthorized": {
+        "description": "Missing or wrong x-authz-service-secret.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Forbidden": {
+        "description": "The credential lacks the required per-route scope.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "RateLimited": {
+        "description": "Per-credential, per-scope rate limit exceeded.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Unconfigured": {
+        "description": "No service secret configured on the fork (fail-closed).",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    },
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "description": "Standard Nest exception body; only the HTTP status is contractual.",
+        "properties": {
+          "statusCode": { "type": "integer" },
+          "message": { "type": "string" },
+          "error": { "type": "string" }
+        }
+      }
+    }
+  }
+}

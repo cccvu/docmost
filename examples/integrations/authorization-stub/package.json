@@ -1,0 +1,11 @@
+{
+  "name": "docmost-authorization-stub",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Zero-dependency reference implementation of the Docmost remote authorization + audit contract. Skeleton, deny-by-default, NOT a production PDP.",
+  "license": "AGPL-3.0-only",
+  "scripts": {
+    "start": "node server.mjs"
+  }
+}
