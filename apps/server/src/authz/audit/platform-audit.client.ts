@@ -4,7 +4,7 @@ import { Injectable, Logger } from '@nestjs/common';
  * CCC audit integration — NOT upstream Docmost code.
  *
  * A fire-and-forget forwarder for Docmost domain audit events to the wiki-v2 platform's central audit
- * sink (`POST /audit/ingest`). Mirrors `PlatformAuthzClient` (same base URL + `x-authz-service-secret`)
+ * sink (`POST /audit/ingest`). Mirrors `HttpAuthzClient` (same base URL + `x-authz-service-secret`)
  * but with the OPPOSITE failure posture: audit must NEVER block or break a user request, so every error
  * is swallowed (logged at warn). Best-effort by design — the high-value authN + authz-decision events
  * are captured on the platform side synchronously; a durable audit-outbox is a documented enhancement.

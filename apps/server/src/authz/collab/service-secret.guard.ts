@@ -11,7 +11,7 @@ import { timingSafeEqual } from 'crypto';
  * CCC authorization integration — NOT upstream Docmost code.
  *
  * Verifies the platform's shared service secret (`x-authz-service-secret`) on the inbound
- * force-disconnect signal — the same secret convention the fork's PlatformAuthzClient presents
+ * force-disconnect signal — the same secret convention the fork's HttpAuthzClient presents
  * outbound. Fails closed if the secret is unconfigured.
  */
 @Injectable()

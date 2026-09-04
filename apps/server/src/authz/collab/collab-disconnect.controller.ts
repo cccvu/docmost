@@ -2,6 +2,7 @@ import { Body, Controller, HttpCode, HttpStatus, Post, UseGuards } from '@nestjs
 import { IsUUID } from 'class-validator';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 import { CollaborationGateway } from '../../collaboration/collaboration.gateway';
+import { RemoteOnlyGuard } from '../mode/remote-only.guard';
 import { CollabServiceSecretGuard } from './service-secret.guard';
 
 export class ForceDisconnectDto {
@@ -16,9 +17,10 @@ export class ForceDisconnectDto {
  * access) signals that a user's access to a page may have been revoked. We RE-CHECK the decision here
  * through the rebound PDP-backed repo (fail-safe: never disconnect a user who still has access), then
  * route a force-disconnect to the doc-owning collab node via the gateway. All authorization lives
- * here in authz/; the collab seams (gateway pass-through + handler) carry no policy.
+ * here in authz/; the collab seams (gateway pass-through + handler) carry no policy. `RemoteOnlyGuard`
+ * 404s this route unless AUTHZ_MODE=remote (the surface is meaningless without the platform).
  */
-@UseGuards(CollabServiceSecretGuard)
+@UseGuards(RemoteOnlyGuard, CollabServiceSecretGuard)
 @Controller('collab')
 export class CollabDisconnectController {
   constructor(

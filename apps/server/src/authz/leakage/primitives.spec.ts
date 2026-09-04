@@ -105,7 +105,7 @@ describe('PDP repo primitives — deny propagation (leakage backbone)', () => {
   });
 
   describe('FAIL CLOSED when the platform is unreachable (client returns empty/false)', () => {
-    // Mirrors PlatformAuthzClient's fail-closed contract: outage -> deny everything.
+    // Mirrors HttpAuthzClient's fail-closed contract: outage -> deny everything.
     const down = {
       check: jest.fn(async () => false),
       checkBulk: jest.fn(async (_s: any, checks: any[]) => checks.map(() => false)),

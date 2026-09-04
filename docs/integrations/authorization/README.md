@@ -60,11 +60,33 @@ remote mode without building a real PDP. It is a skeleton, not a production auth
 
 ## The inbound contract (what the fork exposes)
 
-`service-bridge.openapi.json` describes the three east-west endpoints the fork hosts for an integrating
-platform: `POST /api/service/users` (provision a shadow user), `POST /api/service/session` (mint a session),
-and `POST /api/collab/force-disconnect`. These are keyed on an opaque `externalId`, gated by the same
-`x-authz-service-secret` header (plus per-route scopes on `/api/service/*`), and never allow a caller to
-select an arbitrary Docmost identity. You only implement a *caller* for these; the fork is the server.
+`service-bridge.openapi.json` describes the east-west endpoints the fork hosts for an integrating platform.
+You only implement a *caller* for these; the fork is the server. They fall into a few families:
+
+- **Session brokerage** (`service-bridge`): `POST /api/service/users` (provision a shadow user),
+  `POST /api/service/users/resolve` (Docmost user id -> workspace), `POST /api/service/session` (mint a
+  session).
+- **Workspace** (`workspace`): `GET /api/service/workspace/default` (the canonical workspace id),
+  `GET`/`PATCH /api/service/workspace/settings`.
+- **Space control plane** (`spaces`): `GET`/`POST /api/service/spaces`, `GET`/`PATCH
+  /api/service/spaces/{id}`, `POST .../archive` and `.../unarchive`, and `GET`/`POST`/`PATCH`/`DELETE` on
+  `.../spaces/{id}/members`.
+- **Content read model** (`pages`, `content`): `POST /api/service/pages/resolve-space`,
+  `GET /api/service/pages/{id}/permissions`, `POST /api/service/content/pages/list`,
+  `POST /api/service/content/spaces/list`, `GET /api/service/content/spaces/{id}`.
+- **Collab** (`collab`): `POST /api/collab/force-disconnect`.
+
+Three properties bind the whole surface:
+
+- **Mode-gated.** Every route is `404` unless the fork runs `AUTHZ_MODE=remote` (RemoteOnlyGuard, checked
+  before the secret). In native mode there is no integrating platform and the surface does not exist.
+- **Scoped + secret-gated.** Every request carries `x-authz-service-secret`; each `/api/service/*` route
+  requires exactly one least-privilege scope (`session:mint`, `users:provision`, `users:resolve`,
+  `workspace:read`, `workspace:settings:write`, `spaces:read`, `spaces:write`, `pages:read`, `content:read`).
+- **The platform is the authorization authority.** Identity-mutating endpoints are keyed only on an opaque
+  `externalId` (no arbitrary-identity selection). The `content/*` read endpoints are a **privileged data
+  plane, not a second gate**: the platform performs the PDP decision first and passes the authorized id set;
+  the fork returns metadata for exactly those ids and does NOT re-authorize.
 
 ## Source of truth
 

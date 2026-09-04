@@ -1,11 +1,11 @@
-import { PlatformAuthzClient, sanitizeAuthzTimeoutMs } from './platform-authz.client';
+import { HttpAuthzClient, sanitizeAuthzTimeoutMs } from './http-authz.client';
 
 /**
  * CCC authorization integration test (part of the fork's compatibility suite).
  * Proves the client is FAIL-CLOSED and shapes requests/responses correctly.
  */
-describe('PlatformAuthzClient', () => {
-  let client: PlatformAuthzClient;
+describe('HttpAuthzClient', () => {
+  let client: HttpAuthzClient;
   const fetchMock = jest.fn();
 
   beforeEach(() => {
@@ -13,7 +13,7 @@ describe('PlatformAuthzClient', () => {
     process.env.PLATFORM_AUTHZ_SERVICE_SECRET = 'sekret';
     (global as unknown as { fetch: jest.Mock }).fetch = fetchMock;
     fetchMock.mockReset();
-    client = new PlatformAuthzClient();
+    client = new HttpAuthzClient();
   });
 
   const ok = (body: unknown) => ({ ok: true, status: 200, json: async () => body });

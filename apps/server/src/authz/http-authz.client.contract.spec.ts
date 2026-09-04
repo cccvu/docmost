@@ -1,9 +1,9 @@
-import { PlatformAuthzClient } from './platform-authz.client';
+import { HttpAuthzClient } from './http-authz.client';
 
 /**
  * CCC authorization CONTRACT test (part of the fork's compatibility suite).
  *
- * Distinct from platform-authz.client.spec.ts: this file pins two transport-level
+ * Distinct from http-authz.client.spec.ts: this file pins two transport-level
  * invariants the client OWES the wiki request path, derived from intended behavior —
  * NOT from what the current implementation happens to do. Both are currently
  * unimplemented, so these tests are expected to FAIL (fail-bug-exposing) until the
@@ -15,8 +15,8 @@ import { PlatformAuthzClient } from './platform-authz.client';
  *         1000-cap (the DTO enforces @ArrayMaxSize(1000)) and union the results — never
  *         send a single over-cap request the platform would 400 (a fail-closed DROP).
  */
-describe('PlatformAuthzClient — transport contract (intended behavior)', () => {
-  let client: PlatformAuthzClient;
+describe('HttpAuthzClient — transport contract (intended behavior)', () => {
+  let client: HttpAuthzClient;
   const fetchMock = jest.fn();
 
   beforeEach(() => {
@@ -24,7 +24,7 @@ describe('PlatformAuthzClient — transport contract (intended behavior)', () =>
     process.env.PLATFORM_AUTHZ_SERVICE_SECRET = 'sekret';
     (global as unknown as { fetch: jest.Mock }).fetch = fetchMock;
     fetchMock.mockReset();
-    client = new PlatformAuthzClient();
+    client = new HttpAuthzClient();
   });
 
   const ok = (body: unknown) => ({ ok: true, status: 200, json: async () => body });

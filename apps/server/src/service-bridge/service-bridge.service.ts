@@ -1,9 +1,4 @@
-import {
-  ForbiddenException,
-  Injectable,
-  Logger,
-  ServiceUnavailableException,
-} from '@nestjs/common';
+import { ForbiddenException, Injectable, Logger } from '@nestjs/common';
 import { InjectKysely } from 'nestjs-kysely';
 import { randomBytes } from 'crypto';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
@@ -13,6 +8,7 @@ import { hashPassword } from '../common/helpers';
 import { SessionService } from '../core/session/session.service';
 import { ProvisionUserDto } from './dto/provision-user.dto';
 import { isShadowEmail, shadowEmailFor } from './shadow-user';
+import { WorkspaceResolver } from './workspace-resolver';
 
 /**
  * CCC service-bridge — NOT upstream Docmost code.
@@ -33,6 +29,7 @@ export class ServiceBridgeService {
     @InjectKysely() private readonly db: KyselyDB,
     private readonly userRepo: UserRepo,
     private readonly sessionService: SessionService,
+    private readonly workspaces: WorkspaceResolver,
   ) {}
 
   /**
@@ -45,7 +42,7 @@ export class ServiceBridgeService {
   async provisionShadowUser(
     dto: ProvisionUserDto,
   ): Promise<{ userId: string; workspaceId: string }> {
-    const workspaceId = await this.resolveDefaultWorkspaceId();
+    const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
     const email = shadowEmailFor(dto.externalId);
     const name = dto.name?.trim() || dto.externalId;
     // Unusable password: sessions are minted (not password-logged-in), and native login is disabled in
@@ -85,7 +82,7 @@ export class ServiceBridgeService {
    * enumeration); the specific reason is logged, not returned.
    */
   async mintSession(externalId: string): Promise<string> {
-    const workspaceId = await this.resolveDefaultWorkspaceId();
+    const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
     const email = shadowEmailFor(externalId);
     const user = await this.userRepo.findByEmail(email, workspaceId);
     const reason = this.disqualify(user);
@@ -98,25 +95,6 @@ export class ServiceBridgeService {
     const authToken = await this.sessionService.createSessionAndToken(user);
     this.logger.log(`minted session for shadow member ${user.id} ws=${workspaceId}`);
     return authToken;
-  }
-
-  /**
-   * The fork's own default workspace (oldest, not soft-deleted) — the single-workspace assumption the
-   * platform's BFF relied on, now owned by the fork so the caller never supplies a Docmost workspace id.
-   * A not-yet-bootstrapped fork returns 503 (not ready to provision/mint), never a silent wrong workspace.
-   */
-  private async resolveDefaultWorkspaceId(): Promise<string> {
-    const ws = await this.db
-      .selectFrom('workspaces')
-      .select('id')
-      .where('deletedAt', 'is', null)
-      .orderBy('createdAt', 'asc')
-      .limit(1)
-      .executeTakeFirst();
-    if (!ws) {
-      throw new ServiceUnavailableException('no workspace provisioned');
-    }
-    return ws.id;
   }
 
   private disqualify(user?: User): string | null {

@@ -8,7 +8,7 @@ import { SpaceRepo } from '@docmost/db/repos/space/space.repo';
 import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
 import { UserSpaceRole } from '@docmost/db/repos/space/types';
 import { SpaceRole } from '../common/helpers/types/permission';
-import { PlatformAuthzClient } from './platform-authz.client';
+import { HttpAuthzClient } from './http-authz.client';
 
 /**
  * CCC authorization integration — NOT upstream Docmost code.
@@ -25,7 +25,7 @@ export class PdpSpaceMemberRepo extends SpaceMemberRepo {
     groupRepo: GroupRepo,
     spaceRepo: SpaceRepo,
     @Inject(CACHE_MANAGER) cacheManager: Cache,
-    private readonly authz: PlatformAuthzClient,
+    private readonly authz: HttpAuthzClient,
   ) {
     super(db, groupRepo, spaceRepo, cacheManager);
   }

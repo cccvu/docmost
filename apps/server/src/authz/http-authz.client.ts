@@ -39,8 +39,8 @@ export function sanitizeAuthzTimeoutMs(raw: string | undefined, fallback: number
 }
 
 @Injectable()
-export class PlatformAuthzClient {
-  private readonly logger = new Logger(PlatformAuthzClient.name);
+export class HttpAuthzClient {
+  private readonly logger = new Logger(HttpAuthzClient.name);
   private readonly baseUrl = process.env.PLATFORM_AUTHZ_URL ?? 'http://platform:4000';
   private readonly secret = process.env.PLATFORM_AUTHZ_SERVICE_SECRET ?? '';
   private readonly timeoutMs = sanitizeAuthzTimeoutMs(process.env.PLATFORM_AUTHZ_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
