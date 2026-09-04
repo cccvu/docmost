@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Inject,
   Injectable,
   Logger,
@@ -24,20 +25,70 @@ const RETENTION_DAYS = (() => {
   return Number.isFinite(n) && n > 0 ? n : 7;
 })();
 
-export interface ChangesResult {
-  events: AuthzChangeEvent[];
-  /** The cursor to pass as `after` next time (advances past SKIPPED rows too, so a null-mapping row never
-   *  re-delivers forever). Unchanged from `after` when no row existed after it. */
-  nextCursor: number;
-  /** The current feed head (max outbox seq). The platform baselines its cursor to this on first boot. */
-  head: number;
+/** The opaque change cursor: the inserting transaction id (xid8) and the outbox row id, the SOLE ordering +
+ *  checkpoint primitive. `seq` (the bigserial) rides on events for diagnostics only. Serialized as
+ *  "<xact_id>.<id>" (both are non-negative integers; xid8 does not wrap, so this is a permanent total order). */
+interface Cursor {
+  xactId: string;
+  id: string;
 }
 
-/** Thrown when the requested `after` precedes the oldest retained row (events were GC'd past the consumer).
- *  The controller maps this to 409 so the platform REBASELINES (reconcile + reset cursor=head), never
- *  silently skips. */
+/** The zero cursor (before every row): xid8 '0' sorts below every real transaction id (which start at 3). */
+const ZERO_CURSOR = '0.0';
+
+function parseCursor(raw: string | undefined): Cursor {
+  if (!raw) return { xactId: '0', id: '0' };
+  const m = /^(\d+)\.(\d+)$/.exec(raw);
+  if (!m) throw new BadRequestException('invalid change cursor');
+  return { xactId: m[1], id: m[2] };
+}
+
+function formatCursor(xactId: string, id: string): string {
+  return `${xactId}.${id}`;
+}
+
+/** Tuple compare `a > b` on (xact_id, id), both as decimal strings (xid8 can exceed 2^53, so use BigInt). */
+function tupleGt(a: Cursor, b: Cursor): boolean {
+  const ax = BigInt(a.xactId);
+  const bx = BigInt(b.xactId);
+  if (ax !== bx) return ax > bx;
+  return BigInt(a.id) > BigInt(b.id);
+}
+
+/** postgres.js returns a `jsonb` column as a STRING (it does not auto-parse json/jsonb), and CamelCasePlugin
+ *  only recurses into an OBJECT — so the outbox `payload` arrives as the raw stored JSON with its original
+ *  snake_case keys. Parse it here to the object the mapper reads (snake_case). Defensive: a non-string object
+ *  passes through, and an unparseable value degrades to `{}` (the mapper then yields null, and the reconciler
+ *  backstops) rather than throwing and wedging the drain. */
+function parsePayload(v: unknown): Record<string, unknown> {
+  if (v && typeof v === 'object') return v as Record<string, unknown>;
+  if (typeof v === 'string') {
+    try {
+      return JSON.parse(v) as Record<string, unknown>;
+    } catch {
+      return {};
+    }
+  }
+  return {};
+}
+
+export interface ChangesResult {
+  events: AuthzChangeEvent[];
+  /** The opaque cursor to pass as `after` next time (advances past SKIPPED/null-mapping rows too, so a
+   *  skipped row never re-delivers). Unchanged from `after` when no safe row existed after it. */
+  nextCursor: string;
+  /** The current SAFE frontier: the max committed-and-settled `(xact_id, id)`. Diagnostic (lag/caught-up). */
+  head: string;
+  /** Age in ms of the OLDEST safe row still pending after `nextCursor` (null when caught up). Feeds the
+   *  platform's oldest-unconsumed-age alarm without the platform ever querying Docmost. */
+  oldestPendingAgeMs: number | null;
+}
+
+/** Thrown when the requested cursor is at/below the retention high-water mark (events were GC'd past the
+ *  consumer). The controller maps this to 409 so the platform REBASELINES (reconcile + reset cursor to the
+ *  snapshot baseline), never silently skips. `head` is the current safe frontier cursor. */
 export class StaleCursorError extends Error {
-  constructor(readonly head: number) {
+  constructor(readonly head: string) {
     super('cursor is older than the oldest retained change; rebaseline required');
     this.name = 'StaleCursorError';
   }
@@ -47,24 +98,23 @@ export class StaleCursorError extends Error {
  * CCC service-bridge — NOT upstream Docmost code (Group D, issue #171).
  *
  * Serves the authz change feed the platform drains to project membership/page/restriction changes into
- * SpiceDB. THE DURABLE OUTBOX TABLE IS THE SOURCE OF TRUTH: every request reads `where id > :after order by
- * id` from the table; LISTEN/NOTIFY is WAKEUP-ONLY (it only resolves a blocked long-poll early), so a missed
- * NOTIFY or a dropped LISTEN adds only LATENCY (the platform also runs an unconditional backstop poll). The
- * internal LISTEN is best-effort (postgres.js auto-reconnects); if it can't be established the feed degrades
- * to poll latency, not an outage.
+ * SpiceDB. THE DURABLE OUTBOX TABLE IS THE SOURCE OF TRUTH: every request reads from the table; LISTEN/NOTIFY
+ * is WAKEUP-ONLY (it only resolves a blocked long-poll early), so a missed NOTIFY or a dropped LISTEN adds
+ * only LATENCY (the platform also runs an unconditional backstop poll). The internal LISTEN is best-effort
+ * (postgres.js auto-reconnects); if it can't be established the feed degrades to poll latency, not an outage.
  *
- * DELIVERY IS AT-LEAST-ONCE, NOT EXACTLY-ONCE, AND HAS ONE KNOWN GAP: the `id > cursor` high-watermark is a
- * bigserial assigned at INSERT time, but transactions COMMIT out of order, so a lower id that commits AFTER
- * the consumer advanced past a higher id is never re-read (the classic transactional-outbox commit-ordering
- * gap; the legacy `where processed_at is null` relay was immune). This is INERT in R1 (nothing drains the
- * feed) and, once consumed, is backstopped by the reconciler's full desired-vs-actual diff — the load-bearing
- * safety net (a lost `page_access` INSERT is the repo's P0 fail-open, which the reconciler re-closes). R2 MUST
- * add a commit-safe consumption bound (an xmin / low-watermark gate, or a mandated reconcile cadence) before
- * the feed becomes the sole live path. Tracked in issue #171.
+ * COMMIT-SAFE, GAP-FREE DELIVERY (R2, issue #171): the read is gated by
+ * `xact_id < pg_snapshot_xmin(pg_current_snapshot())` and ordered/cursored by `(xact_id, id)`. A row is served
+ * ONLY once its inserting transaction (and every older one) is fully settled, so the classic transactional-
+ * outbox commit-ordering skip (a lower bigserial that commits after the consumer passed a higher one) is
+ * impossible: the cursor advances in transaction-id order, never in bigserial order. `xid8` is the non-wrapping
+ * 64-bit FullTransactionId, so the cursor is a permanent total order. See the plan's proof; the real-PG
+ * two-connection concurrency test proves it on the engine.
  *
  * `getChanges` long-polls: if nothing is available it waits up to `waitMs` for a NOTIFY (or the timeout), then
- * reads once more. Stale-cursor detection guards future outbox retention: if `after` precedes the oldest
- * retained row it throws (409) so the platform rebaselines rather than skipping the GC'd gap.
+ * reads once more. Stale-cursor detection guards future outbox retention: the retention sweep records the max
+ * `(xact_id, id)` it ever deletes into `authz_outbox_gc`; a cursor at/below that mark means an un-consumed row
+ * was GC'd, so the feed throws (409) and the platform rebaselines rather than skipping the gap.
  */
 @Injectable()
 export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
@@ -143,84 +193,126 @@ export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  /** Long-poll for changes after `after`. */
-  async getChanges(afterRaw: number, waitMs: number, limit: number): Promise<ChangesResult> {
-    const after = Math.max(0, Math.trunc(afterRaw));
+  /** Long-poll for changes after the opaque `after` cursor. */
+  async getChanges(after: string | undefined, waitMs: number, limit: number): Promise<ChangesResult> {
+    const cursor = parseCursor(after);
     const cappedWait = Math.max(0, Math.min(waitMs, MAX_WAIT_MS));
     const cappedLimit = Math.max(1, Math.min(limit, MAX_LIMIT));
 
     const head = await this.head();
-    await this.assertNotStale(after, head);
+    await this.assertNotStale(cursor, head);
 
-    let raw = await this.readRawAfter(after, cappedLimit);
+    let raw = await this.readRawAfter(cursor, cappedLimit);
     if (raw.length === 0 && cappedWait > 0) {
       await this.waitForWake(cappedWait);
-      raw = await this.readRawAfter(after, cappedLimit);
+      raw = await this.readRawAfter(cursor, cappedLimit);
     }
 
     const events: AuthzChangeEvent[] = [];
     for (const r of raw) {
-      const ev = mapOutboxRow(r);
+      const ev = mapOutboxRow(r.row);
       if (ev) events.push(ev);
     }
-    // Advance past every RAW row read (including null-mapping/skipped rows), so a skipped row never re-delivers.
-    const nextCursor = raw.length ? raw[raw.length - 1].id : after;
-    return { events, nextCursor, head: Math.max(head, nextCursor) };
+    // Advance past every RAW safe row read (including null-mapping/skipped rows), so a skipped row never
+    // re-delivers. Unchanged from `after` when nothing safe followed it.
+    const last = raw.length ? raw[raw.length - 1] : null;
+    const nextCursor = last ? formatCursor(last.xactId, last.id) : formatCursor(cursor.xactId, cursor.id);
+    const oldestPendingAgeMs = await this.oldestPendingAgeMs(parseCursor(nextCursor));
+    return { events, nextCursor, head, oldestPendingAgeMs };
   }
 
-  private async readRawAfter(after: number, limit: number): Promise<OutboxRow[]> {
-    const res = await sql<{ id: number; op: string; tableName: string; payload: Record<string, unknown> }>`
-      select id, op, table_name, payload
+  private async readRawAfter(
+    cursor: Cursor,
+    limit: number,
+  ): Promise<{ row: OutboxRow; xactId: string; id: string }[]> {
+    const res = await sql<{
+      id: string;
+      op: string;
+      tableName: string;
+      payload: Record<string, unknown>;
+      xactId: string;
+    }>`
+      select id, op, table_name, payload, xact_id
       from authz_outbox
-      where id > ${after}
-      order by id asc
+      where (xact_id, id) > (${cursor.xactId}::xid8, ${cursor.id}::bigint)
+        and xact_id < pg_snapshot_xmin(pg_current_snapshot())
+      order by xact_id asc, id asc
       limit ${limit}
     `.execute(this.db);
     return res.rows.map((r) => ({
-      id: Number(r.id),
-      op: r.op as OutboxRow['op'],
-      tableName: r.tableName,
-      payload: r.payload,
+      row: {
+        id: Number(r.id),
+        op: r.op as OutboxRow['op'],
+        tableName: r.tableName,
+        payload: parsePayload(r.payload),
+      },
+      xactId: String(r.xactId),
+      id: String(r.id),
     }));
   }
 
-  /** The current feed head from the outbox sequence (monotonic, survives retention GC of the rows). */
-  async head(): Promise<number> {
-    const res = await sql<{ lastValue: number; isCalled: boolean }>`
-      select last_value, is_called from authz_outbox_id_seq
+  /** The current SAFE frontier as an opaque cursor: the max committed-and-settled `(xact_id, id)`, or the zero
+   *  cursor when nothing is settled/pending. Diagnostic (and the head carried on a stale 409). */
+  async head(): Promise<string> {
+    const res = await sql<{ xactId: string; id: string }>`
+      select xact_id, id from authz_outbox
+      where xact_id < pg_snapshot_xmin(pg_current_snapshot())
+      order by xact_id desc, id desc limit 1
     `.execute(this.db);
     const row = res.rows[0];
-    if (!row || !row.isCalled) return 0;
-    return Number(row.lastValue);
+    return row ? formatCursor(String(row.xactId), String(row.id)) : ZERO_CURSOR;
   }
 
-  /** Throw StaleCursorError if events after `after` have already been GC'd (a retention gap). */
-  private async assertNotStale(after: number, head: number): Promise<void> {
-    const res = await sql<{ oldest: number | null }>`select min(id) as oldest from authz_outbox`.execute(this.db);
-    const oldest = res.rows[0]?.oldest;
-    const firstNeeded = after + 1;
-    if (oldest == null) {
-      // Empty table: everything up to head has been consumed or GC'd. Stale only if the consumer is behind head.
-      if (after < head) throw new StaleCursorError(head);
-      return;
-    }
-    if (Number(oldest) > firstNeeded) {
-      // A gap: rows firstNeeded..oldest-1 were GC'd before this consumer read them.
-      throw new StaleCursorError(head);
-    }
+  /** Age (ms) of the oldest SAFE row still pending after `cursor`, or null when caught up. */
+  private async oldestPendingAgeMs(cursor: Cursor): Promise<number | null> {
+    const res = await sql<{ ageMs: number | null }>`
+      select extract(epoch from (now() - min(created_at))) * 1000 as age_ms
+      from authz_outbox
+      where (xact_id, id) > (${cursor.xactId}::xid8, ${cursor.id}::bigint)
+        and xact_id < pg_snapshot_xmin(pg_current_snapshot())
+    `.execute(this.db);
+    const age = res.rows[0]?.ageMs;
+    return age == null ? null : Math.round(Number(age));
   }
 
-  /** Retention sweep. Bounded by age; the platform keeps up in ~ms so this never races the consumer. */
+  /** Throw StaleCursorError if `cursor` is at/below the retention high-water mark (an un-consumed row was GC'd).
+   *  Precise: `authz_outbox_gc` holds the MAX `(xact_id, id)` ever deleted; if the consumer has not passed it,
+   *  a GC'd row lies after its cursor and is lost -> rebaseline. This is correct even under commit reordering
+   *  (a min(created_at)/min(id) heuristic could miss a late-committing higher-xid row GC'd early). */
+  private async assertNotStale(cursor: Cursor, head: string): Promise<void> {
+    const res = await sql<{ stale: boolean }>`
+      select (g.xact_id, g.id) > (${cursor.xactId}::xid8, ${cursor.id}::bigint) as stale
+      from authz_outbox_gc g
+      where g.singleton = true
+    `.execute(this.db);
+    if (res.rows[0]?.stale) throw new StaleCursorError(head);
+  }
+
+  /** Retention sweep. Deletes rows older than the window and advances the GC high-water mark to the max
+   *  `(xact_id, id)` removed (monotonic), so stale detection stays correct as retention reclaims the table. */
   private async gc(): Promise<void> {
     try {
-      const res = await sql<{ id: string }>`
-        delete from authz_outbox
-        where created_at < now() - ${sql.raw(`interval '${RETENTION_DAYS} days'`)}
-        returning id
-      `.execute(this.db);
-      if (res.rows.length > 0) {
-        this.logger.log(`authz_outbox retention sweep removed ${res.rows.length} rows older than ${RETENTION_DAYS}d`);
-      }
+      await this.db.transaction().execute(async (trx) => {
+        const del = await sql<{ xactId: string; id: string }>`
+          delete from authz_outbox
+          where created_at < now() - ${sql.raw(`interval '${RETENTION_DAYS} days'`)}
+          returning xact_id, id
+        `.execute(trx);
+        if (del.rows.length === 0) return;
+        let mx: Cursor = { xactId: String(del.rows[0].xactId), id: String(del.rows[0].id) };
+        for (const r of del.rows) {
+          const c: Cursor = { xactId: String(r.xactId), id: String(r.id) };
+          if (tupleGt(c, mx)) mx = c;
+        }
+        await sql`
+          update authz_outbox_gc
+          set xact_id = ${mx.xactId}::xid8, id = ${mx.id}::bigint
+          where (xact_id, id) < (${mx.xactId}::xid8, ${mx.id}::bigint)
+        `.execute(trx);
+        this.logger.log(
+          `authz_outbox retention sweep removed ${del.rows.length} rows older than ${RETENTION_DAYS}d (gc mark -> ${mx.xactId}.${mx.id})`,
+        );
+      });
     } catch (e) {
       this.logger.warn(`authz_outbox retention sweep failed (will retry): ${(e as Error).message}`);
     }

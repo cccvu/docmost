@@ -12,6 +12,23 @@ import { AUTHZ_MODE, AuthzMode } from '../authz/mode/authz-mode';
 /** Advisory-lock key so concurrent replicas / processes serialize the DDL (no DROP/CREATE-trigger race). */
 const INSTALL_LOCK_KEY = 774615092310;
 
+/** Minimum PostgreSQL major version (server_version_num) the change feed requires: 13 (130000) for the
+ *  non-wrapping `xid8` type + `pg_current_xact_id()` + `pg_snapshot_xmin(pg_current_snapshot())` that back the
+ *  commit-safe consumption gate (Group D R2, issue #171). Deploy is Postgres 18; this is the floor invariant. */
+const MIN_PG_VERSION_NUM = 130000;
+
+/** A TERMINAL install failure (the engine can never satisfy the feed's commit-safety contract). Distinct from
+ *  a transient "Docmost tables not ready" so the boot fails IMMEDIATELY without burning the retry budget. */
+export class UnsupportedPgVersionError extends Error {
+  constructor(readonly versionNum: number) {
+    super(
+      `PostgreSQL server_version_num ${versionNum} < ${MIN_PG_VERSION_NUM}: the authz change feed requires xid8 / ` +
+        `pg_current_xact_id / pg_snapshot_xmin (PG 13+) for its commit-safe watermark`,
+    );
+    this.name = 'UnsupportedPgVersionError';
+  }
+}
+
 const sanitizeInt = (raw: string | undefined, def: number, min: number): number => {
   const n = Number.parseInt(raw ?? '', 10);
   return Number.isFinite(n) && n >= min ? n : def;
@@ -31,6 +48,13 @@ const sanitizeInt = (raw: string | undefined, def: number, min: number): number 
  * stores ONLY the authz-relevant columns per table (data minimization + no write amplification — never the
  * large `pages.content`/`ydoc`) and ENRICHES `page_permissions` with `page_id` (resolved from `page_access`
  * while the RI cascade still leaves it visible), so the change feed never needs a live `page_access` lookup.
+ *
+ * R2 (issue #171) adds the COMMIT-SAFE WATERMARK the platform's cutover depends on: an `xact_id xid8` column
+ * (the inserting transaction id) whose DEFAULT is `pg_current_xact_id()`, plus a `pg_current_xact_id`/
+ * `pg_snapshot_xmin` version invariant (fail-fast in remote) and an `authz_outbox_gc` high-water table so the
+ * feed's `(xact_id, id)` cursor is gap-free under commit reordering AND retention can never silently skip. The
+ * capture function itself is UNCHANGED — the column DEFAULT supplies `xact_id` for both this trigger and the
+ * legacy platform trigger during the rollout window.
  *
  * Design choices:
  *  - A boot installer, NOT a Kysely migration: it runs uniformly in dev + prod (auto-migrate is prod-only),
@@ -83,6 +107,11 @@ export class AuthzOutboxInstaller implements OnApplicationBootstrap {
         this.logger.log('authz_outbox table + capture trigger ensured on Docmost DB (remote mode)');
         return;
       } catch (e) {
+        // A too-old engine can NEVER satisfy the feed contract — fail the boot now, do not retry 30x.
+        if (e instanceof UnsupportedPgVersionError) {
+          this.logger.error(`authz outbox install refused: ${e.message}`);
+          throw e;
+        }
         const msg = (e as Error).message;
         if (attempt === this.maxAttempts) {
           // Fail-closed: in remote mode a missing feed = silent authorization drift. Crash the boot.
@@ -103,6 +132,13 @@ export class AuthzOutboxInstaller implements OnApplicationBootstrap {
     await this.db.transaction().execute(async (trx) => {
       await sql`select pg_advisory_xact_lock(${INSTALL_LOCK_KEY})`.execute(trx);
 
+      // Fail-fast supported-version invariant (Group D R2): the commit-safe watermark needs xid8 +
+      // pg_current_xact_id + pg_snapshot_xmin (PG 13+). Assert BEFORE any DDL so a too-old engine crashes the
+      // boot immediately (terminal, no retry) rather than installing an unsafe feed.
+      const ver = await sql<{ v: number }>`select current_setting('server_version_num')::int as v`.execute(trx);
+      const versionNum = Number(ver.rows[0]?.v ?? 0);
+      if (versionNum < MIN_PG_VERSION_NUM) throw new UnsupportedPgVersionError(versionNum);
+
       // The outbox table. `processed_at`/`attempts`/`error` are the LEGACY platform-consumer columns, kept
       // for old-platform compatibility during the rollout; the new platform consumer uses its OWN cursor.
       await sql`
@@ -119,6 +155,33 @@ export class AuthzOutboxInstaller implements OnApplicationBootstrap {
         alter table authz_outbox add column if not exists attempts integer not null default 0;
         create index if not exists authz_outbox_unprocessed_idx on authz_outbox (id) where processed_at is null;
         create index if not exists authz_outbox_created_at_idx on authz_outbox (created_at);
+      `.execute(trx);
+
+      // R2 commit-safe watermark: capture the inserting transaction id (xid8, the 64-bit non-wrapping
+      // FullTransactionId) on every outbox row. The DEFAULT evaluates in the WRITING transaction's context, so
+      // BOTH this fork trigger AND the legacy platform trigger (which omits xact_id during the rollout window)
+      // get the correct id. Backfill existing rows to a settled sentinel ('3' = the first normal xid8; every
+      // pre-migration row is already committed, so any value below the live xmin is correct). NOT NULL so a
+      // null can never be silently withheld by the feed gate (that would be a fail-open skip); the small table
+      // makes the validating scan trivial. The (xact_id, id) index backs the feed's ordered, gated scan.
+      await sql`
+        alter table authz_outbox add column if not exists xact_id xid8;
+        update authz_outbox set xact_id = '3'::xid8 where xact_id is null;
+        alter table authz_outbox alter column xact_id set default pg_current_xact_id();
+        alter table authz_outbox alter column xact_id set not null;
+        create index if not exists authz_outbox_xact_idx on authz_outbox (xact_id, id);
+      `.execute(trx);
+
+      // GC high-water mark: the max (xact_id, id) ever removed by the retention sweep. The feed's stale-cursor
+      // check compares a consumer's cursor against this so age-based retention can NEVER silently skip an
+      // un-consumed event (a consumer at/below this mark gets a 409 -> rebaseline). A singleton row.
+      await sql`
+        create table if not exists authz_outbox_gc (
+          singleton boolean primary key default true,
+          xact_id   xid8    not null default '0',
+          id        bigint  not null default 0
+        );
+        insert into authz_outbox_gc (singleton) values (true) on conflict do nothing;
       `.execute(trx);
 
       // The capture function. Stores ONLY the authz-relevant columns per table (jsonb_build_object, never the

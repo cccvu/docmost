@@ -3,11 +3,13 @@ import { spyKysely, SpyQuery } from './kysely-spy.testkit';
 
 /**
  * The reconciler snapshot (Group D, #171): the full desired set as typed events, keyset-paginated on each
- * row's IMMUTABLE id (the race-safety guarantee), one concern-phase per page.
+ * row's IMMUTABLE id (the race-safety guarantee), one concern-phase per page. R2 adds the phase-0 `baseline`
+ * (the xmin-horizon change cursor) the platform checkpoints to after a successful reconcile.
  */
 describe('AuthzSnapshotService', () => {
   it('emits SpaceChanged for the spaces phase and advances to the next phase when a page is short', async () => {
     const spy = spyKysely((q: SpyQuery) => {
+      if (q.sql.includes('pg_snapshot_xmin')) return [{ xmin: '42' }];
       if (q.sql.includes('from spaces')) return [{ id: 's1', workspace_id: 'w1' }];
       return [];
     });
@@ -17,12 +19,36 @@ describe('AuthzSnapshotService', () => {
     // spaces returned < limit -> advance to phase index 1 (space_members) at the zero uuid.
     expect(res.nextCursor).toBe('1.00000000-0000-0000-0000-000000000000');
     // keyset uses the immutable id, filters non-deleted.
-    expect(spy.calls[0].sql).toMatch(/deleted_at is null/);
-    expect(spy.calls[0].sql).toMatch(/id >/);
+    const spacesCall = spy.calls.find((c) => c.sql.includes('from spaces'))!;
+    expect(spacesCall.sql).toMatch(/deleted_at is null/);
+    expect(spacesCall.sql).toMatch(/id >/);
+  });
+
+  it('phase-0 (no cursor) captures the baseline = "<pg_snapshot_xmin>.0"', async () => {
+    const spy = spyKysely((q: SpyQuery) => {
+      if (q.sql.includes('pg_snapshot_xmin')) return [{ xmin: '77' }];
+      if (q.sql.includes('from spaces')) return [{ id: 's1', workspace_id: 'w1' }];
+      return [];
+    });
+    const svc = new AuthzSnapshotService(spy.db);
+    const res = await svc.getSnapshot(undefined, 500);
+    expect(res.baseline).toBe('77.0');
+  });
+
+  it('later pages carry a null baseline (never re-captured mid-stream)', async () => {
+    const spy = spyKysely((q: SpyQuery) => {
+      if (q.sql.includes('pg_snapshot_xmin')) throw new Error('baseline must NOT be captured on a later page');
+      if (q.sql.includes('from page_permissions')) return [];
+      return [];
+    });
+    const svc = new AuthzSnapshotService(spy.db);
+    const res = await svc.getSnapshot('5.00000000-0000-0000-0000-000000000000', 500);
+    expect(res.baseline).toBeNull();
   });
 
   it('keeps paging the same phase when a full page is returned', async () => {
     const spy = spyKysely((q: SpyQuery) => {
+      if (q.sql.includes('pg_snapshot_xmin')) return [{ xmin: '1' }];
       if (q.sql.includes('from spaces')) return [{ id: 's9', workspace_id: 'w1' }];
       return [];
     });

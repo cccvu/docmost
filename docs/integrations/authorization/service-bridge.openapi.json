@@ -417,9 +417,9 @@
         "operationId": "getAuthzChanges",
         "tags": ["changes"],
         "summary": "Long-poll the authz change feed (membership / page / restriction changes).",
-        "description": "Returns typed change events with seq > `after`, ordered by seq asc. Blocks up to `wait` ms for new events (an internal LISTEN/NOTIFY wakeup) then returns immediately; the durable outbox table is the SOURCE OF TRUTH, so a missed wake or dropped LISTEN is only latency, never lost events. `nextCursor` advances past skipped rows too. A cursor older than the oldest retained event returns 409 { stale, head } so the platform REBASELINES (reconcile + reset cursor=head) rather than silently skipping a GC'd gap. Read-only privileged data plane: the platform owns projection into SpiceDB and the Docmost-user -> principal identity mapping (which never leaves the platform). Scope: changes:read.",
+        "description": "Returns typed change events after the opaque `after` cursor, ordered and gated by (xact_id, id): a row is served ONLY once its inserting transaction is fully settled (xact_id < pg_snapshot_xmin), so delivery is commit-safe and GAP-FREE — never the classic transactional-outbox skip of a lower id that commits after the consumer passed a higher one. The cursor is opaque \"<xact_id>.<id>\"; treat it as an opaque token (the event `seq` is diagnostic only, never a cursor). Blocks up to `wait` ms for new events (an internal LISTEN/NOTIFY wakeup) then returns immediately; the durable outbox table is the SOURCE OF TRUTH, so a missed wake or dropped LISTEN is only latency, never lost events. `nextCursor` advances past skipped rows too. A cursor at/below the retention high-water mark returns 409 { stale, head } so the platform REBASELINES (reconcile + reset cursor to the snapshot baseline) rather than silently skipping a GC'd gap. Read-only privileged data plane: the platform owns projection into SpiceDB and the Docmost-user -> principal identity mapping (which never leaves the platform). Scope: changes:read.",
         "parameters": [
-          { "name": "after", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 0, "default": 0 }, "description": "Return events with seq > after (the last cursor the platform durably advanced)." },
+          { "name": "after", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Opaque cursor (the last `nextCursor` the platform durably advanced); omit for the first read (from the beginning)." },
           { "name": "wait", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 0, "maximum": 25000, "default": 0 }, "description": "Max milliseconds to long-poll for new events before returning empty." },
           { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 500 } }
         ],
@@ -428,7 +428,7 @@
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" },
-          "409": { "description": "Stale cursor: events after `after` were already GC'd by retention; the platform must rebaseline.", "content": { "application/json": { "schema": { "type": "object", "required": ["stale", "head"], "properties": { "stale": { "const": true }, "head": { "type": "integer" }, "message": { "type": "string" } } } } } },
+          "409": { "description": "Stale cursor: events after `after` were already GC'd by retention; the platform must rebaseline.", "content": { "application/json": { "schema": { "type": "object", "required": ["stale", "head"], "properties": { "stale": { "const": true }, "head": { "type": "string" }, "message": { "type": "string" } } } } } },
           "429": { "$ref": "#/components/responses/RateLimited" },
           "503": { "$ref": "#/components/responses/Unconfigured" }
         }
@@ -439,7 +439,7 @@
         "operationId": "getAuthzSnapshot",
         "tags": ["changes"],
         "summary": "Stream the full desired authorization set (for the reconciler's drift repair).",
-        "description": "The current membership / page / restriction state emitted as the SAME typed events the live feed uses (seq=0, removed/deleted=false). Keyset-paginated on each row's IMMUTABLE primary id so a concurrent change during pagination can never cause a false orphan-delete on the platform (fail-open); combined with the platform pinning its PDP snapshot BEFORE reading, drift repair stays fail-closed. Pass `cursor` from the previous response; a null nextCursor means the whole set has been streamed. Scope: changes:read.",
+        "description": "The current membership / page / restriction state emitted as the SAME typed events the live feed uses (seq=0, removed/deleted=false). Keyset-paginated on each row's IMMUTABLE primary id so a concurrent change during pagination can never cause a false orphan-delete on the platform (fail-open); combined with the platform pinning its PDP snapshot BEFORE reading, drift repair stays fail-closed. The FIRST-page response (no `cursor`) carries `baseline`, the change-feed cursor captured at snapshot start; the platform persists THAT as its change cursor after the reconcile succeeds (never the feed head) so a transaction in-flight at snapshot start is replayed by the live drain, not skipped. Pass `cursor` from the previous response; a null nextCursor means the whole set has been streamed. Scope: changes:read.",
         "parameters": [
           { "name": "cursor", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Opaque cursor from the previous page; omit for the first page." },
           { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 500 } }
@@ -719,20 +719,22 @@
       "AuthzChangesResponse": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["events", "nextCursor", "head"],
+        "required": ["events", "nextCursor", "head", "oldestPendingAgeMs"],
         "properties": {
           "events": { "type": "array", "items": { "$ref": "#/components/schemas/AuthzChangeEvent" } },
-          "nextCursor": { "type": "integer", "description": "Pass as `after` on the next call; advances past skipped (null-mapping) rows so they never re-deliver." },
-          "head": { "type": "integer", "description": "Current feed head (max outbox seq, monotonic across retention GC); baseline the cursor to this on first boot." }
+          "nextCursor": { "type": "string", "description": "Opaque cursor to pass as `after` on the next call; advances past skipped (null-mapping) rows so they never re-deliver. Unchanged from `after` when nothing safe followed it." },
+          "head": { "type": "string", "description": "Current SAFE frontier as an opaque cursor (max committed-and-settled (xact_id,id)); diagnostic only. Do NOT use it to baseline the first-boot cursor — use the snapshot `baseline`." },
+          "oldestPendingAgeMs": { "type": ["integer", "null"], "description": "Age in ms of the oldest safe row still pending after `nextCursor`, or null when caught up; feeds the platform's oldest-unconsumed-age alarm." }
         }
       },
       "AuthzSnapshotResponse": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["events", "nextCursor"],
+        "required": ["events", "nextCursor", "baseline"],
         "properties": {
           "events": { "type": "array", "items": { "$ref": "#/components/schemas/AuthzChangeEvent" } },
-          "nextCursor": { "type": ["string", "null"], "description": "Opaque cursor for the next page, or null when the whole desired set has been streamed." }
+          "nextCursor": { "type": ["string", "null"], "description": "Opaque cursor for the next page, or null when the whole desired set has been streamed." },
+          "baseline": { "type": ["string", "null"], "description": "ONLY on the first page (no incoming cursor): the change-feed cursor \"<pg_snapshot_xmin>.0\" captured at snapshot start; the platform persists this as its change cursor after a successful reconcile so an in-flight-at-baseline transaction is replayed by the live drain, not skipped. Null on later pages." }
         }
       },
       "Error": {

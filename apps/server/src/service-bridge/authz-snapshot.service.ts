@@ -22,6 +22,12 @@ export interface SnapshotResult {
   events: AuthzChangeEvent[];
   /** Opaque cursor to pass back for the next page, or null when the whole desired set has been streamed. */
   nextCursor: string | null;
+  /** ONLY on the phase-0 response (no incoming cursor): the change-feed cursor `"<pg_snapshot_xmin>.0"`
+   *  captured at the START of this snapshot read. The platform persists THIS as its change cursor after the
+   *  reconcile succeeds — never the feed head — so a transaction in-flight at snapshot start (whose xact_id is
+   *  >= this xmin, and which the non-atomic paginated snapshot may not have observed) is still replayed by the
+   *  live drain (`(xact_id,id) > baseline`) instead of being skipped. Null on every later page. */
+  baseline: string | null;
 }
 
 /**
@@ -49,6 +55,10 @@ export class AuthzSnapshotService {
     const cappedLimit = Math.max(1, Math.min(limit, MAX_LIMIT));
     const { phaseIdx, lastId } = this.decode(rawCursor);
 
+    // Capture the commit-safe baseline BEFORE the phase-0 read: the current xmin horizon as a feed cursor.
+    // Only on the first page (no incoming cursor) — later pages carry null.
+    const baseline = rawCursor ? null : await this.captureBaseline();
+
     const { events, count, lastRowId } = await this.readPhase(PHASES[phaseIdx], lastId, cappedLimit);
 
     let nextCursor: string | null;
@@ -59,7 +69,17 @@ export class AuthzSnapshotService {
     } else {
       nextCursor = null; // last phase exhausted -> done
     }
-    return { events, nextCursor };
+    return { events, nextCursor, baseline };
+  }
+
+  /** The change-feed baseline cursor `"<pg_snapshot_xmin>.0"`: draining `(xact_id,id) > baseline` after a
+   *  reconcile replays every transaction that was in-flight-or-future at snapshot start (xact_id >= xmin),
+   *  idempotently, so the non-atomic paginated snapshot can never cause a skip. */
+  private async captureBaseline(): Promise<string> {
+    const res = await sql<{ xmin: string }>`
+      select pg_snapshot_xmin(pg_current_snapshot())::text as xmin
+    `.execute(this.db);
+    return `${res.rows[0]?.xmin ?? '0'}.0`;
   }
 
   private async readPhase(

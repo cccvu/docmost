@@ -75,12 +75,17 @@ You only implement a *caller* for these; the fork is the server. They fall into 
   `GET /api/service/pages/{id}/permissions`, `POST /api/service/content/pages/list`,
   `POST /api/service/content/spaces/list`, `GET /api/service/content/spaces/{id}`.
 - **Change feed** (`changes`): `GET /api/service/authz/changes` (long-poll for membership/page/restriction
-  change events after a cursor) and `GET /api/service/authz/snapshot` (the full desired set, paginated, for
-  drift repair). The fork owns a transactional outbox (an AFTER trigger writes a change row inside Docmost's
-  own write transaction, so capture is atomic + at-least-once) and emits TYPED domain events; the platform
-  projects them into its PDP and owns the Docmost-user -> principal identity mapping. The durable outbox is the
-  source of truth (LISTEN/NOTIFY is a wakeup-only latency optimization); a cursor older than the retained
-  window returns `409 {stale, head}` so the platform rebaselines rather than skipping. This replaces the
+  change events after an opaque cursor) and `GET /api/service/authz/snapshot` (the full desired set,
+  paginated, for drift repair). The fork owns a transactional outbox (an AFTER trigger writes a change row
+  inside Docmost's own write transaction, so capture is atomic + at-least-once) and emits TYPED domain events;
+  the platform projects them into its PDP and owns the Docmost-user -> principal identity mapping. Delivery is
+  COMMIT-SAFE and gap-free: the feed serves a row only once its inserting transaction is fully settled
+  (ordered + cursored by `(xact_id, id)` under an `xact_id < pg_snapshot_xmin` gate; `xact_id` is the
+  non-wrapping `xid8`), so the classic transactional-outbox skip cannot occur, and the cursor is opaque (the
+  event `seq` is diagnostic only). This requires PostgreSQL 13+ (the installer fails the boot in remote mode
+  otherwise). The durable outbox is the source of truth (LISTEN/NOTIFY is a wakeup-only latency optimization);
+  a cursor at/below the retention high-water mark returns `409 {stale, head}` so the platform rebaselines
+  (reconcile, then reset its cursor to the snapshot `baseline`) rather than skipping. This replaces the
   platform reaching directly into Docmost's database, so it needs no Docmost DB credentials.
 - **Collab** (`collab`): `POST /api/collab/force-disconnect`.
 
