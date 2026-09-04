@@ -1,0 +1,8 @@
+{
+  "_comment": "Deny-by-default demo policy for the reference authorization stub. Each grant is an EXACT { externalId, permission, resourceType, resourceId } tuple; anything not listed is denied. No wildcards, no allow-all. These grants match the examples in ../../../docs/integrations/authorization/authorization-service.openapi.json so the stub is consistent with the published contract examples (subject externalId 'd-1').",
+  "grants": [
+    { "externalId": "d-1", "permission": "view", "resourceType": "space", "resourceId": "s-1" },
+    { "externalId": "d-1", "permission": "view", "resourceType": "page", "resourceId": "pg-1" },
+    { "externalId": "d-1", "permission": "view", "resourceType": "page", "resourceId": "pg-2" }
+  ]
+}

@@ -1,0 +1,82 @@
+# Standalone Docmost (AUTHZ_MODE=native), built from THIS fork, with NO CCC platform and NO SpiceDB.
+#
+# This file lives inside the fork on purpose: a third party who clones only this repository can build,
+# boot, and prove the fork runs independently, with no access to the proprietary super-repo.
+#
+#   cp deploy/standalone/.env.example deploy/standalone/.env    # then edit APP_SECRET + POSTGRES_PASSWORD
+#   docker compose -f deploy/standalone/docker-compose.yml up --build
+#
+# Its own project name isolates its network + volumes from any other Docmost compose stack on the host.
+name: docmost-standalone
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: docmost
+      POSTGRES_USER: docmost
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-docmost}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docmost -d docmost"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+    volumes:
+      # postgres:18 keeps PGDATA under /var/lib/postgresql/<version>/docker, so persist the parent dir
+      - pg_data:/var/lib/postgresql
+
+  redis:
+    image: redis:8
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+
+  # Optional SMTP catcher so native invites / password-reset work locally. In a real standalone
+  # deployment, point SMTP_* at your own mail server instead. UI at http://localhost:8025.
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    ports:
+      # bound to loopback: the dev mail catcher should not be reachable from the LAN
+      - "127.0.0.1:${MAILPIT_UI_PORT:-8025}:8025"
+
+  docmost:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      # The one required security setting: Docmost's own authorization, fully standalone.
+      AUTHZ_MODE: native
+      # migrations auto-run only when NODE_ENV=production
+      NODE_ENV: production
+      APP_URL: ${APP_URL:-http://localhost:3000}
+      PORT: "3000"
+      APP_SECRET: ${APP_SECRET:?set APP_SECRET in deploy/standalone/.env (openssl rand -hex 32)}
+      DATABASE_URL: postgres://docmost:${POSTGRES_PASSWORD:-docmost}@postgres:5432/docmost
+      REDIS_URL: redis://redis:6379
+      # local disk storage keeps the standalone stack to postgres + redis + this app (no S3/MinIO)
+      STORAGE_DRIVER: local
+      MAIL_DRIVER: smtp
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+      SMTP_SECURE: "false"
+      MAIL_FROM_ADDRESS: ${MAIL_FROM_ADDRESS:-docmost@localhost}
+      MAIL_FROM_NAME: ${MAIL_FROM_NAME:-Docmost}
+      DISABLE_TELEMETRY: "true"
+    ports:
+      - "${DOCMOST_PORT:-3000}:3000"
+    restart: unless-stopped
+    volumes:
+      - docmost_storage:/app/data/storage
+
+volumes:
+  pg_data:
+  redis_data:
+  docmost_storage:

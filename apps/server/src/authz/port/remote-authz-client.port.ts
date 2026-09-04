@@ -5,10 +5,12 @@ import type { AuthzSubject, AuthzCheckItem } from '../platform-authz.client';
  *
  * Implementation-neutral transport port for the external authorization service (the Policy Decision
  * Point a `remote`-mode deployment calls). The fork is the CLIENT of this contract; a third party
- * implements the SERVER (see the published contract under `docs/integrations/authorization`, Phase B).
- * The concrete `PlatformAuthzClient` (to be renamed `HttpAuthzClient`, Phase B) satisfies this
- * interface. Every method is FAIL-CLOSED: any transport error, non-2xx, timeout, or malformed body
- * resolves to deny/empty — and, per the security model, MUST NOT fall back to native decisions.
+ * implements the SERVER against the published, canonical OpenAPI contract at
+ * `docs/integrations/authorization/authorization-service.openapi.json` (with a zero-dependency reference
+ * implementation under `examples/integrations/authorization-stub/`). The concrete `PlatformAuthzClient`
+ * satisfies this interface (a future rename to `HttpAuthzClient` is tracked as Phase C in issue #157).
+ * Every method is FAIL-CLOSED: any transport error, non-2xx, timeout, or malformed body resolves to
+ * deny/empty — and, per the security model, MUST NOT fall back to native decisions.
  */
 export interface RemoteAuthzClient {
   check(

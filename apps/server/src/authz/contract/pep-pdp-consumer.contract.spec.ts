@@ -1,5 +1,7 @@
+import { readFileSync } from 'fs';
 import * as http from 'http';
 import type { AddressInfo } from 'net';
+import { join } from 'path';
 import { PlatformAuthzClient } from '../platform-authz.client';
 import { PlatformAuditClient } from '../audit/platform-audit.client';
 
@@ -27,88 +29,63 @@ import { PlatformAuditClient } from '../audit/platform-audit.client';
  * (no Docker, no live stack) so the assertions are made against the bytes actually put on the wire
  * by the real `fetch` path, not a hand-rolled fetch stub.
  *
- * source of truth: contract/pep-pdp.contract.json
- * The canonical request/response shapes are embedded INLINE below on purpose: the fork is a git
- * submodule, so reading the platform-side fixture file at runtime is fragile across the boundary.
- * These constants MUST stay in lock-step with contract/pep-pdp.contract.json — that file is the
- * shared source of truth for both halves of this seam.
+ * source of truth: docs/integrations/authorization/authorization-service.openapi.json (the canonical,
+ * published contract, in THIS fork). This spec DERIVES its canonical request/response bodies and its
+ * parse expectations directly from that OpenAPI file, so a drift between the fork client and the
+ * published contract breaks a test. (Supersedes the retired contract/pep-pdp.contract.json fixture and
+ * the hand-copied inline mirror that used to live here; because the canonical contract now ships inside
+ * the fork, reading it needs no cross-submodule path.)
  */
 
 const SERVICE_SECRET = 'test-service-secret';
 
-/** Canonical fixtures — mirror of contract/pep-pdp.contract.json (see source-of-truth note above). */
+// The canonical outbound contract, read from the published OpenAPI shipped in this fork. Path is relative
+// to this spec: contract/ -> authz -> src -> server -> apps -> docmost(root) -> docs/...
+const OAS_PATH = join(
+  __dirname,
+  '../../../../../docs/integrations/authorization/authorization-service.openapi.json',
+);
+const OAS = JSON.parse(readFileSync(OAS_PATH, 'utf8')) as {
+  paths: Record<string, { post?: { operationId?: string; requestBody: any; responses: any } }>;
+};
+
+/** Pull { path, canonical request example, canonical 2xx response example } for one operationId. */
+function op(operationId: string): { path: string; request: any; response: any } {
+  for (const [path, item] of Object.entries(OAS.paths)) {
+    if (item.post?.operationId === operationId) {
+      const request = item.post.requestBody.content['application/json'].example;
+      const res = item.post.responses['200'] ?? item.post.responses['202'];
+      const response = res.content['application/json'].example;
+      return { path, request, response };
+    }
+  }
+  throw new Error(`operation ${operationId} not found in ${OAS_PATH}`);
+}
+
+// Fixtures derived from the published contract. `expected` is what the fork client MUST return after
+// parsing the canonical response — the parse rule IS the contract, asserted against the real client
+// below (not the client's own code). filterSubjects also carries the raw input ids it is called with
+// (pre-wrapping) so we can prove the client wraps them into {provider:'docmost', externalId}.
+const _check = op('check');
+const _checkBulk = op('checkBulk');
+const _filterResources = op('filterResources');
+const _lookupResources = op('lookupResources');
+const _filterSubjects = op('filterSubjects');
+const _auditIngest = op('auditIngest');
+
 const CONTRACT = {
-  check: {
-    path: '/authz/check',
-    request: {
-      subject: { provider: 'docmost', externalId: 'u-alice' },
-      permission: 'view',
-      resourceType: 'space',
-      resourceId: 'sp-eng',
-    },
-    response: { allowed: true },
-    expected: true,
-  },
-  checkBulk: {
-    path: '/authz/check-bulk',
-    request: {
-      subject: { provider: 'docmost', externalId: 'u-alice' },
-      checks: [
-        { permission: 'view', resourceType: 'space', resourceId: 'sp-eng' },
-        { permission: 'edit', resourceType: 'space', resourceId: 'sp-eng' },
-        { permission: 'delete', resourceType: 'space', resourceId: 'sp-eng' },
-      ],
-    },
-    response: { results: [true, false, true] },
-    expected: [true, false, true],
-  },
-  filterResources: {
-    path: '/authz/filter-resources',
-    request: {
-      subject: { provider: 'docmost', externalId: 'u-alice' },
-      permission: 'view',
-      resourceType: 'page',
-      candidateIds: ['pg-1', 'pg-2', 'pg-3'],
-    },
-    response: { ids: ['pg-1', 'pg-3'] },
-    expected: ['pg-1', 'pg-3'],
-  },
-  lookupResources: {
-    path: '/authz/lookup-resources',
-    request: {
-      subject: { provider: 'docmost', externalId: 'u-alice' },
-      permission: 'view',
-      resourceType: 'page',
-    },
-    response: { ids: ['pg-7', 'pg-9'] },
-    expected: ['pg-7', 'pg-9'],
-  },
+  check: { ..._check, expected: _check.response.allowed === true },
+  checkBulk: { ..._checkBulk, expected: _checkBulk.response.results as boolean[] },
+  filterResources: { ..._filterResources, expected: _filterResources.response.ids as string[] },
+  lookupResources: { ..._lookupResources, expected: _lookupResources.response.ids as string[] },
   filterSubjects: {
-    path: '/authz/filter-subjects',
-    // NOTE: subject-SIDE filter — the body carries `candidates` (docmost-wrapped user ids), NOT a
-    // `subject`. The client wraps raw candidate user ids into {provider:'docmost', externalId}.
-    request: {
-      permission: 'view',
-      resourceType: 'page',
-      resourceId: 'pg-1',
-      candidates: [
-        { provider: 'docmost', externalId: 'u1' },
-        { provider: 'docmost', externalId: 'u2' },
-        { provider: 'docmost', externalId: 'u3' },
-      ],
-    },
-    // input user ids the client is called with (pre-wrapping):
-    inputUserIds: ['u1', 'u2', 'u3'],
-    response: { subjects: [
-      { provider: 'docmost', externalId: 'u1' },
-      { provider: 'docmost', externalId: 'u3' },
-    ] },
-    expected: ['u1', 'u3'],
+    ..._filterSubjects,
+    inputUserIds: (_filterSubjects.request.candidates as Array<{ externalId: string }>).map((c) => c.externalId),
+    expected: (_filterSubjects.response.subjects as Array<{ externalId?: string }>)
+      .map((s) => s.externalId)
+      .filter(Boolean) as string[],
   },
-  auditIngest: {
-    path: '/audit/ingest',
-    event: { event: 'page.restricted', resourceType: 'page', resourceId: 'pg1', workspaceId: 'w1' },
-  },
+  auditIngest: { path: _auditIngest.path, event: _auditIngest.request.events[0] },
 } as const;
 
 interface CapturedRequest {
@@ -186,6 +163,21 @@ describe('PEP↔PDP consumer contract — real clients over a loopback PDP (#13)
     expect(String(captured!.headers['content-type'])).toContain('application/json');
   }
 
+  // Independent pin on the response KEY NAMES the client depends on. Because `expected` above derives from
+  // the same canonical example the loopback returns, a rename of a response key that was applied to BOTH
+  // the contract and the client could otherwise stay green; asserting the key names here makes such a
+  // rename fail this test. (The untouched, still-required pep-pdp-roundtrip spec, real controller x real
+  // client with an independent oracle, is the runtime backstop.)
+  it('the canonical contract exposes the expected /authz response keys (independent pin)', () => {
+    expect(CONTRACT.check.response).toHaveProperty('allowed');
+    expect(CONTRACT.checkBulk.response).toHaveProperty('results');
+    expect(CONTRACT.filterResources.response).toHaveProperty('ids');
+    expect(CONTRACT.lookupResources.response).toHaveProperty('ids');
+    expect(CONTRACT.filterSubjects.response).toHaveProperty('subjects');
+    expect(Array.isArray(CONTRACT.filterSubjects.response.subjects)).toBe(true);
+    expect(CONTRACT.filterSubjects.response.subjects[0]).toHaveProperty('externalId');
+  });
+
   // ---------------------------------------------------------------------------------------------
   // check()
   // ---------------------------------------------------------------------------------------------
@@ -245,13 +237,17 @@ describe('PEP↔PDP consumer contract — real clients over a loopback PDP (#13)
     it('FAILS CLOSED to an all-false array of the SAME length on a non-200', async () => {
       // Invariant (c): length must be preserved so callers index results positionally, all denied.
       nextResponse = { status: 500, body: {} };
-      expect(await authz.checkBulk(F.request.subject, [...F.request.checks])).toEqual([false, false, false]);
+      expect(await authz.checkBulk(F.request.subject, [...F.request.checks])).toEqual(
+        new Array(F.request.checks.length).fill(false),
+      );
     });
 
     it('FAILS CLOSED to an all-false array of the SAME length on a transport error', async () => {
       // Invariant (c): same as above for a dropped connection.
       nextResponse = { destroy: true };
-      expect(await authz.checkBulk(F.request.subject, [...F.request.checks])).toEqual([false, false, false]);
+      expect(await authz.checkBulk(F.request.subject, [...F.request.checks])).toEqual(
+        new Array(F.request.checks.length).fill(false),
+      );
     });
   });
 
