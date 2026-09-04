@@ -263,13 +263,18 @@ export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
     return row ? formatCursor(String(row.xactId), String(row.id)) : ZERO_CURSOR;
   }
 
-  /** Age (ms) of the oldest SAFE row still pending after `cursor`, or null when caught up. */
+  /** Age (ms) of the HEAD-OF-LINE safe row still pending after `cursor` (the next to be delivered), or null
+   *  when caught up. An index-ordered `limit 1` seek on the `(xact_id, id)` index (O(log n)) rather than a
+   *  `min(created_at)` aggregate scan over the pending tail — so a bulk burst drained one-per-poll stays
+   *  O(M log n), not O(M^2). Head-of-line age is also the truer "drainer stuck" signal than min-age. */
   private async oldestPendingAgeMs(cursor: Cursor): Promise<number | null> {
-    const res = await sql<{ ageMs: number | null }>`
-      select extract(epoch from (now() - min(created_at))) * 1000 as age_ms
+    const res = await sql<{ ageMs: number }>`
+      select extract(epoch from (now() - created_at)) * 1000 as age_ms
       from authz_outbox
       where (xact_id, id) > (${cursor.xactId}::xid8, ${cursor.id}::bigint)
         and xact_id < pg_snapshot_xmin(pg_current_snapshot())
+      order by xact_id asc, id asc
+      limit 1
     `.execute(this.db);
     const age = res.rows[0]?.ageMs;
     return age == null ? null : Math.round(Number(age));

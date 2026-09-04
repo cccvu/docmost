@@ -22,6 +22,18 @@ import { AuthzChangeFeedService } from './authz-change-feed.service';
 const PG_URL = process.env.AUTHZ_TEST_PG_URL;
 const d = PG_URL ? describe : describe.skip;
 
+// Anti-vacuity guard (ALWAYS runs, even without a URL): if the CI lane declares it REQUIRES Postgres
+// (AUTHZ_REQUIRE_PG=1, set by the docmost-authz-pg job) but AUTHZ_TEST_PG_URL is unset, the commit-safety
+// proof would silently self-skip and the required gate would go green with ZERO coverage. Fail loudly instead,
+// so a regression in the ci.yml env wiring reds the lane rather than passing vacuously.
+describe('real-PG commit-safety gate', () => {
+  it('is not vacuous — runs against a real Postgres when the CI lane requires it', () => {
+    if (process.env.AUTHZ_REQUIRE_PG === '1') {
+      expect(PG_URL).toBeTruthy();
+    }
+  });
+});
+
 d('AuthzChangeFeedService — real-Postgres commit-safety (Group D R2)', () => {
   // Mirror the production Kysely config so id parses to number and xid8 stays a string (see database.module).
   const mkPg = (max: number): postgres.Sql =>
