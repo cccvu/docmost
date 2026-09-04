@@ -599,7 +599,7 @@
         "additionalProperties": false,
         "required": ["ids", "limit"],
         "properties": {
-          "ids": { "type": "array", "maxItems": 1000, "items": { "type": "string", "format": "uuid" }, "description": "The platform's PDP-authorized id set (the belt). Capped at 1000 to match the authorized-id cap." },
+          "ids": { "type": "array", "maxItems": 10000, "items": { "type": "string", "format": "uuid" }, "description": "The platform's PDP-authorized id set (the belt). maxItems MUST stay >= the platform's content.maxListAuthorizedIds default (10000) or a well-authorized principal gets a 400; the provider/consumer contract tests enforce this." },
           "spaceId": { "type": "string", "format": "uuid", "description": "Pages only: scope the list to one space." },
           "before": {
             "type": "object",

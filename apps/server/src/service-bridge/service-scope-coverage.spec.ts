@@ -23,21 +23,61 @@ const routeMethods = (ctrl: any): string[] =>
   Object.getOwnPropertyNames(ctrl.prototype).filter((n) => n !== 'constructor');
 
 /**
+ * The intended least-privilege scope for EVERY route, keyed by `Controller.method`. Pinning the exact scope
+ * (not just "some valid scope") turns a wrong-scope edit into a failing build. Note the deliberate split:
+ * `pages.resolveSpace` is a page-tree lookup (`pages:read`) while `pages.listPermissions` returns an ACL that
+ * is part of the `/v1` content read model (`content:read`). Reads and writes are always distinct scopes.
+ */
+const EXPECTED_SCOPE: Record<string, ServiceScope> = {
+  'ServiceBridgeController.provisionUser': ServiceScope.UsersProvision,
+  'ServiceBridgeController.resolveUser': ServiceScope.UsersResolve,
+  'ServiceBridgeController.mintSession': ServiceScope.SessionMint,
+  'ServiceWorkspaceController.getDefault': ServiceScope.WorkspaceRead,
+  'ServiceWorkspaceController.getSettings': ServiceScope.WorkspaceRead,
+  'ServiceWorkspaceController.updateSettings': ServiceScope.WorkspaceSettingsWrite,
+  'ServiceSpaceController.list': ServiceScope.SpacesRead,
+  'ServiceSpaceController.getDetail': ServiceScope.SpacesRead,
+  'ServiceSpaceController.listMembers': ServiceScope.SpacesRead,
+  'ServiceSpaceController.create': ServiceScope.SpacesWrite,
+  'ServiceSpaceController.update': ServiceScope.SpacesWrite,
+  'ServiceSpaceController.archive': ServiceScope.SpacesWrite,
+  'ServiceSpaceController.unarchive': ServiceScope.SpacesWrite,
+  'ServiceSpaceController.addMember': ServiceScope.SpacesWrite,
+  'ServiceSpaceController.changeMemberRole': ServiceScope.SpacesWrite,
+  'ServiceSpaceController.removeMember': ServiceScope.SpacesWrite,
+  'ServicePageController.resolveSpace': ServiceScope.PagesRead,
+  'ServicePageController.listPermissions': ServiceScope.ContentRead,
+  'ServiceContentController.listPages': ServiceScope.ContentRead,
+  'ServiceContentController.listSpaces': ServiceScope.ContentRead,
+  'ServiceContentController.getSpace': ServiceScope.ContentRead,
+};
+
+/**
  * Least-privilege is not optional design: EVERY service-bridge route must declare exactly one ServiceScope
  * (the guard 403s a route with no declaration, but this catches it at build time, per route), and EVERY
  * controller must be gated by RemoteOnlyGuard THEN ServiceAuthGuard (mode-off in native, then scoped auth).
  */
 describe('service-bridge scope + guard coverage', () => {
   it.each(CONTROLLERS.map((c) => [c.name, c] as const))(
-    '%s: every route declares a valid ServiceScope',
-    (_name, ctrl) => {
+    '%s: every route declares exactly the intended least-privilege ServiceScope',
+    (name, ctrl) => {
       for (const method of routeMethods(ctrl)) {
         const scope = Reflect.getMetadata(SERVICE_SCOPE_KEY, (ctrl as any).prototype[method]);
         expect(scope).toBeDefined();
         expect(validScopes.has(scope)).toBe(true);
+        const key = `${name}.${method}`;
+        expect(EXPECTED_SCOPE[key]).toBeDefined(); // a new route must be added to the intended map
+        expect(scope).toBe(EXPECTED_SCOPE[key]); // and must carry exactly its intended scope
       }
     },
   );
+
+  it('the intended-scope map has no stale entries (every mapped route still exists)', () => {
+    const actual = new Set(
+      CONTROLLERS.flatMap((c) => routeMethods(c).map((m) => `${c.name}.${m}`)),
+    );
+    expect(Object.keys(EXPECTED_SCOPE).filter((k) => !actual.has(k))).toEqual([]);
+  });
 
   it.each(CONTROLLERS.map((c) => [c.name, c] as const))(
     '%s: is gated by RemoteOnlyGuard (first) then ServiceAuthGuard',

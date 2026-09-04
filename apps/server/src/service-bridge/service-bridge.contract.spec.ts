@@ -8,6 +8,7 @@ import { ServiceWorkspaceController } from './service-workspace.controller';
 import { ServiceSpaceController } from './service-space.controller';
 import { ServicePageController } from './service-page.controller';
 import { ServiceContentController } from './service-content.controller';
+import { CONTENT_LIST_MAX_IDS, CONTENT_LIST_MAX_LIMIT } from './dto/content-read.dto';
 
 /**
  * Provider-side contract test: the routes the fork actually implements MUST equal the operations declared in
@@ -24,7 +25,10 @@ const SPEC = JSON.parse(
     join(__dirname, '../../../../docs/integrations/authorization/service-bridge.openapi.json'),
     'utf8',
   ),
-) as { paths: Record<string, Record<string, unknown>> };
+) as {
+  paths: Record<string, Record<string, unknown>>;
+  components: { schemas: Record<string, any> };
+};
 
 const CONTROLLERS = [
   ServiceBridgeController,
@@ -85,5 +89,16 @@ describe('service-bridge.openapi.json is the canonical inbound contract (provide
     const impl = implementedRoutes();
     const unimplemented = [...specRoutes()].filter((r) => !impl.has(r));
     expect(unimplemented).toEqual([]);
+  });
+
+  // The content-list caps are enforced in three places (the fork DTO decorators, the OpenAPI request schema,
+  // and — on the platform side — content.maxListAuthorizedIds). A silent divergence is exactly what shipped
+  // the /v1 regression this guard exists to prevent: the DTO said 1000 while the platform forwarded up to
+  // 10000, so a well-authorized principal got a 400. Bind the DTO caps to the canonical spec here; the
+  // platform consumer contract test guards its side against the same spec.
+  it('the content-list caps match the canonical spec (no silent DTO/spec cap drift)', () => {
+    const req = SPEC.components.schemas.ContentListRequest.properties;
+    expect(req.ids.maxItems).toBe(CONTENT_LIST_MAX_IDS);
+    expect(req.limit.maximum).toBe(CONTENT_LIST_MAX_LIMIT);
   });
 });

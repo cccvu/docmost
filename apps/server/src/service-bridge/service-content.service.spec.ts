@@ -42,6 +42,80 @@ describe('ServiceContentService — privileged data plane (trusts the platform P
     expect(call.parameters).toContainEqual(ids); // the id set bound as ONE array parameter
   });
 
+  // Confidentiality is enforced by two predicates the trust model depends on: single-tenant scoping and
+  // soft-delete exclusion. The deleted real-Postgres contract test used to assert these end to end; pin them
+  // on the compiled SQL here so a future edit that drops either predicate fails CI instead of silently
+  // leaking trashed or cross-workspace content into /v1. (Real-Postgres re-homing is tracked in issue 174.)
+  it('scopes both list queries to the workspace AND excludes soft-deleted rows', async () => {
+    const ids = ['11111111-1111-1111-1111-111111111111'];
+    const pages = make(() => []);
+    await pages.svc.listPagesByIds({ ids, limit: 10 } as any);
+    const pageSql = q(pages.spy.calls[0].sql);
+    expect(pageSql).toContain('workspace_id =');
+    expect(pageSql).toContain('deleted_at is null');
+
+    const spaces = make(() => []);
+    await spaces.svc.listSpacesByIds({ ids, limit: 10 } as any);
+    const spaceSql = q(spaces.spy.calls[0].sql);
+    expect(spaceSql).toContain('workspace_id =');
+    expect(spaceSql).toContain('deleted_at is null');
+  });
+
+  it('listSpacesByIds returns the supplied spaces and honours the keyset cursor', async () => {
+    const ids = ['11111111-1111-1111-1111-111111111111'];
+    const { svc, spy } = make(() => [
+      {
+        id: ids[0],
+        name: 's',
+        slug: 'slug',
+        description: null,
+        visibility: 'open',
+        createdAt: new Date('2026-01-01T00:00:00.000Z'),
+        updatedAt: new Date('2026-01-02T00:00:00.000Z'),
+      },
+    ]);
+    const res = await svc.listSpacesByIds({
+      ids,
+      before: { updatedAt: '2026-01-01T00:00:00.000Z', id: 'x' },
+      limit: 5,
+    } as any);
+    expect(res.items.map((i) => i.id)).toEqual(ids);
+    const sql = q(spy.calls[0].sql);
+    expect(sql).toContain("date_trunc('milliseconds', updated_at)");
+    expect(sql).toContain('order by');
+  });
+
+  it('resolvePageSpace excludes deleted pages by default but includes them when asked', async () => {
+    const pageId = '55555555-5555-5555-5555-555555555555';
+    const active = make(() => [{ spaceId: 'sp1' }]);
+    expect(await active.svc.resolvePageSpace({ pageId } as any)).toEqual({ pageId, spaceId: 'sp1' });
+    expect(q(active.spy.calls[0].sql)).toContain('deleted_at is null');
+
+    const anyState = make(() => [{ spaceId: 'sp1' }]);
+    await anyState.svc.resolvePageSpace({ pageId, includeDeleted: true } as any);
+    expect(q(anyState.spy.calls[0].sql)).not.toContain('deleted_at is null');
+
+    const missing = make(() => []);
+    await expect(missing.svc.resolvePageSpace({ pageId } as any)).rejects.toBeInstanceOf(
+      NotFoundException,
+    );
+  });
+
+  it('listPagePermissions returns the ACL grants joined workspace-scoped', async () => {
+    const pageId = '66666666-6666-6666-6666-666666666666';
+    const { svc, spy } = make(() => [
+      { id: 'perm1', userId: 'u1', groupId: null, role: 'reader', createdAt: new Date('2026-01-01T00:00:00.000Z') },
+    ]);
+    const res = await svc.listPagePermissions(pageId);
+    expect(res.items).toEqual([
+      { id: 'perm1', userId: 'u1', groupId: null, role: 'reader', createdAt: '2026-01-01T00:00:00.000Z' },
+    ]);
+    const sql = q(spy.calls[0].sql);
+    expect(sql).toContain('page_permissions');
+    expect(sql).toContain('join page_access');
+    expect(sql).toContain('workspace_id ='); // ACL read is tenant-scoped too
+  });
+
   it('applies the space filter and the keyset cursor bound when given', async () => {
     const { svc, spy } = make(() => []);
     await svc.listPagesByIds({
