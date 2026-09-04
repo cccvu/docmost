@@ -33,6 +33,6 @@ export function resolveAuthzMode(raw: string | undefined | null): AuthzMode {
   throw new Error(
     `AUTHZ_MODE must be exactly 'native' or 'remote' (got ${JSON.stringify(raw)}). ` +
       `It is a required, server-controlled security setting and has no default; refusing to boot. ` +
-      `See docmost/docs/architecture/standalone.md.`,
+      `See docs/architecture/standalone.md.`,
   );
 }

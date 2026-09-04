@@ -21,7 +21,9 @@ cd "$FORK_ROOT"
 # never collides with a running dev stack on 3000 / 8025.
 export DOCMOST_PORT="${DOCMOST_PORT:-13300}"
 export MAILPIT_UI_PORT="${MAILPIT_UI_PORT:-18025}"
-COMPOSE=(docker compose -f deploy/standalone/docker-compose.yml)
+# Own compose project (-p) so the smoke's `down -v` can NEVER wipe a persistent `make standalone` stack
+# (which uses the compose file's default project name `docmost-standalone`).
+COMPOSE=(docker compose -p docmost-standalone-smoke -f deploy/standalone/docker-compose.yml)
 PORT="$DOCMOST_PORT"
 BASE="http://localhost:${PORT}"
 TMP="$(mktemp -d)"
@@ -43,7 +45,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for bin in docker curl jq; do command -v "$bin" >/dev/null || { echo "missing required tool: $bin"; exit 2; }; done
+for bin in docker curl jq openssl; do command -v "$bin" >/dev/null || { echo "missing required tool: $bin"; exit 2; }; done
 
 # Ensure an env file exists (self-contained run).
 if [ ! -f deploy/standalone/.env ]; then
@@ -135,8 +137,16 @@ blogin="$(curl -s -o /dev/null -w '%{http_code}' -c "$B_JAR" -H 'content-type: a
   -d '{"email":"bob@example.com","password":"BobPw123!"}' "${BASE}/api/auth/login")"
 [ "$blogin" = "200" ] && pass "Bob provisioned + logged in via native auth" || { bad "Bob login failed ($blogin)"; exit 1; }
 
+# Positive control: Bob's session is REAL and discriminating. An authenticated user can read their own
+# profile (POST /api/users/me -> 200); a broken/unauthenticated session would 401 here. Without this, the
+# denial below could pass for the WRONG reason (a silently-broken Bob session), not "authenticated
+# non-member is denied".
+bob_me="$(curl -s -o /dev/null -w '%{http_code}' -b "$B_JAR" -H 'content-type: application/json' -d '{}' "${BASE}/api/users/me")"
+[ "$bob_me" = "200" ] && pass "Bob's session is authenticated (POST /api/users/me -> 200)" \
+  || bad "Bob positive control failed (/api/users/me -> $bob_me); the denial below would be inconclusive"
+
 # --- 3c. THE native-ACL assertion: Bob is DENIED Alice's page -------------------------------------
-log "native authorization enforcement: Bob (non-member) must be denied Alice's page"
+log "native authorization enforcement: authenticated Bob (non-member) must be denied Alice's page"
 bob_read="$(curl -s -o "$TMP/bobread.json" -w '%{http_code}' -b "$B_JAR" -H 'content-type: application/json' \
   -d "{\"pageId\":\"$PAGE_ID\"}" "${BASE}/api/pages/info")"
 if [ "$bob_read" = "403" ] || [ "$bob_read" = "404" ]; then

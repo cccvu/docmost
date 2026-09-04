@@ -30,6 +30,32 @@ const CAPS = {
   '/audit/ingest': ['events', 500],
 };
 
+// The allowed top-level request keys per path. The real platform rejects unknown keys (class-validator
+// forbidNonWhitelisted); this stub does the same so it faithfully matches the published contract.
+const ALLOWED_KEYS = {
+  '/authz/check': ['subject', 'permission', 'resourceType', 'resourceId'],
+  '/authz/check-bulk': ['subject', 'checks'],
+  '/authz/filter-resources': ['subject', 'permission', 'resourceType', 'candidateIds'],
+  '/authz/lookup-resources': ['subject', 'permission', 'resourceType'],
+  '/authz/filter-subjects': ['permission', 'resourceType', 'resourceId', 'candidates'],
+  '/audit/ingest': ['events'],
+};
+
+// Validate a parsed body BEFORE any handler runs: reject a non-object, an unknown top-level key, or a
+// non-array where the contract requires an array (so malformed authenticated input is a clean 400, never a
+// crash). Returns an error string, or null when OK.
+function validateBody(path, body) {
+  if (body === null || typeof body !== 'object' || Array.isArray(body)) return 'body must be a JSON object';
+  const allowed = ALLOWED_KEYS[path] || [];
+  for (const k of Object.keys(body)) if (!allowed.includes(k)) return `unknown field: ${k}`;
+  const capSpec = CAPS[path];
+  if (capSpec) {
+    const [field] = capSpec;
+    if (body[field] !== undefined && !Array.isArray(body[field])) return `${field} must be an array`;
+  }
+  return null;
+}
+
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const policy = JSON.parse(readFileSync(join(__dirname, 'stub-policy.json'), 'utf8'));
 const GRANTS = Array.isArray(policy.grants) ? policy.grants : [];
@@ -128,15 +154,22 @@ const server = createServer((req, res) => {
     } catch {
       return send(res, 400, { error: 'invalid json' });
     }
+    const invalid = validateBody(path, body);
+    if (invalid) return send(res, 400, { error: invalid });
     if (overCap(path, body)) return send(res, 400, { error: 'array over cap' });
 
-    if (isAudit) {
-      const events = Array.isArray(body.events) ? body.events : [];
-      // A real sink would persist here; the stub just counts and logs.
-      console.error(`[stub] audit/ingest accepted ${events.length} event(s)`);
-      return send(res, 202, { accepted: events.length, persisted: events.length });
+    // Any unexpected handler error is a 400, never a process-killing uncaughtException.
+    try {
+      if (isAudit) {
+        const events = Array.isArray(body.events) ? body.events : [];
+        // A real sink would persist here; the stub just counts and logs.
+        console.error(`[stub] audit/ingest accepted ${events.length} event(s)`);
+        return send(res, 202, { accepted: events.length, persisted: events.length });
+      }
+      return send(res, 200, HANDLERS[path](body));
+    } catch {
+      return send(res, 400, { error: 'malformed request' });
     }
-    return send(res, 200, HANDLERS[path](body));
   });
 });
 

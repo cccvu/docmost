@@ -39,7 +39,8 @@ services:
     image: axllent/mailpit:latest
     restart: unless-stopped
     ports:
-      - "${MAILPIT_UI_PORT:-8025}:8025"
+      # bound to loopback: the dev mail catcher should not be reachable from the LAN
+      - "127.0.0.1:${MAILPIT_UI_PORT:-8025}:8025"
 
   docmost:
     build:

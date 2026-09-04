@@ -27,8 +27,9 @@ Attachments use local disk (`STORAGE_DRIVER=local`); switch to S3 if you prefer.
 
 1. the fork builds and boots in `AUTHZ_MODE=native`,
 2. native credential auth works (setup + login; a wrong password is `401`, not the remote-mode `404`),
-3. **native authorization is enforced, not allow-all**: a second user is denied (`403`) a page in a space
-   they are not a member of, while the owner reads it (`200`),
+3. **native authorization is enforced, not allow-all**: a second user is denied (`403`/`404`; Docmost
+   returns not-found to a non-member) a page in a space they are not a member of, while the owner reads it
+   (`200`),
 4. no CCC services (`platform` / `spicedb`) are in the stack.
 
 ```bash

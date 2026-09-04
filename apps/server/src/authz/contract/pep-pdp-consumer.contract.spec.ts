@@ -163,6 +163,21 @@ describe('PEP↔PDP consumer contract — real clients over a loopback PDP (#13)
     expect(String(captured!.headers['content-type'])).toContain('application/json');
   }
 
+  // Independent pin on the response KEY NAMES the client depends on. Because `expected` above derives from
+  // the same canonical example the loopback returns, a rename of a response key that was applied to BOTH
+  // the contract and the client could otherwise stay green; asserting the key names here makes such a
+  // rename fail this test. (The untouched, still-required pep-pdp-roundtrip spec, real controller x real
+  // client with an independent oracle, is the runtime backstop.)
+  it('the canonical contract exposes the expected /authz response keys (independent pin)', () => {
+    expect(CONTRACT.check.response).toHaveProperty('allowed');
+    expect(CONTRACT.checkBulk.response).toHaveProperty('results');
+    expect(CONTRACT.filterResources.response).toHaveProperty('ids');
+    expect(CONTRACT.lookupResources.response).toHaveProperty('ids');
+    expect(CONTRACT.filterSubjects.response).toHaveProperty('subjects');
+    expect(Array.isArray(CONTRACT.filterSubjects.response.subjects)).toBe(true);
+    expect(CONTRACT.filterSubjects.response.subjects[0]).toHaveProperty('externalId');
+  });
+
   // ---------------------------------------------------------------------------------------------
   // check()
   // ---------------------------------------------------------------------------------------------
