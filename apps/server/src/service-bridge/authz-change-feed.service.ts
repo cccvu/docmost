@@ -48,10 +48,19 @@ export class StaleCursorError extends Error {
  *
  * Serves the authz change feed the platform drains to project membership/page/restriction changes into
  * SpiceDB. THE DURABLE OUTBOX TABLE IS THE SOURCE OF TRUTH: every request reads `where id > :after order by
- * id` from the table; LISTEN/NOTIFY is WAKEUP-ONLY (it only resolves a blocked long-poll early). A missed
- * NOTIFY or a dropped LISTEN can therefore only add latency, never lose an event — the platform also runs an
- * unconditional backstop poll. The internal LISTEN is best-effort (postgres.js auto-reconnects); if it can't
- * be established the feed degrades to poll latency, not an outage.
+ * id` from the table; LISTEN/NOTIFY is WAKEUP-ONLY (it only resolves a blocked long-poll early), so a missed
+ * NOTIFY or a dropped LISTEN adds only LATENCY (the platform also runs an unconditional backstop poll). The
+ * internal LISTEN is best-effort (postgres.js auto-reconnects); if it can't be established the feed degrades
+ * to poll latency, not an outage.
+ *
+ * DELIVERY IS AT-LEAST-ONCE, NOT EXACTLY-ONCE, AND HAS ONE KNOWN GAP: the `id > cursor` high-watermark is a
+ * bigserial assigned at INSERT time, but transactions COMMIT out of order, so a lower id that commits AFTER
+ * the consumer advanced past a higher id is never re-read (the classic transactional-outbox commit-ordering
+ * gap; the legacy `where processed_at is null` relay was immune). This is INERT in R1 (nothing drains the
+ * feed) and, once consumed, is backstopped by the reconciler's full desired-vs-actual diff — the load-bearing
+ * safety net (a lost `page_access` INSERT is the repo's P0 fail-open, which the reconciler re-closes). R2 MUST
+ * add a commit-safe consumption bound (an xmin / low-watermark gate, or a mandated reconcile cadence) before
+ * the feed becomes the sole live path. Tracked in issue #171.
  *
  * `getChanges` long-polls: if nothing is available it waits up to `waitMs` for a NOTIFY (or the timeout), then
  * reads once more. Stale-cursor detection guards future outbox retention: if `after` precedes the oldest

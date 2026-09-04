@@ -195,7 +195,10 @@ export class AuthzSnapshotService {
     if (!Number.isInteger(phaseIdx) || phaseIdx < 0 || phaseIdx >= PHASES.length) {
       throw new BadRequestException('invalid snapshot cursor phase');
     }
-    if (!/^[0-9a-fA-F-]{36}$/.test(lastId)) throw new BadRequestException('invalid snapshot cursor id');
+    // Strict UUID shape so a malformed-but-36-char cursor is a 400 at validation, not a 500 at the uuid cast.
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(lastId)) {
+      throw new BadRequestException('invalid snapshot cursor id');
+    }
     return { phaseIdx, lastId };
   }
 }

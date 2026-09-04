@@ -59,4 +59,40 @@ describe('AuthzChangeFeedService', () => {
     expect(res.events).toEqual([]);
     expect(res.nextCursor).toBe(10);
   });
+
+  it('empty outbox: a cursor behind head is stale (rebaseline required)', async () => {
+    // All rows GC'd (min(id) null) but head has advanced -> a consumer behind head must rebaseline, not skip.
+    const { svc } = feed(responder({ head: 10, oldest: null, rows: [] }));
+    await expect(svc.getChanges(5, 0, 500)).rejects.toBeInstanceOf(StaleCursorError);
+  });
+
+  it('empty outbox: a cursor AT head resolves empty (not stale)', async () => {
+    const { svc } = feed(responder({ head: 10, oldest: null, rows: [] }));
+    const res = await svc.getChanges(10, 0, 500);
+    expect(res.events).toEqual([]);
+    expect(res.nextCursor).toBe(10);
+  });
+
+  it('long-poll returns promptly on a NOTIFY wake (not only on timeout)', async () => {
+    // Prove the wakeup path: a change that lands mid-wait + a wake resolves the poll before its (large) timeout.
+    let rows: unknown[] = [];
+    const spy = spyKysely((q: SpyQuery) => {
+      if (q.sql.includes('authz_outbox_id_seq')) return [{ last_value: 10, is_called: true }];
+      if (q.sql.includes('min(id)')) return [{ oldest: 1 }];
+      if (q.sql.includes('from authz_outbox') && q.sql.includes('id >')) return rows;
+      return [];
+    });
+    const svc = new AuthzChangeFeedService(spy.db, {} as any, 'remote' as any);
+    const p = svc.getChanges(5, 10_000, 500); // 10s wait; must NOT actually wait that long
+    // Wait for the long-poll to register its waiter (after the initial empty read).
+    for (let i = 0; i < 200 && (svc as any).waiters.size === 0; i++) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+    rows = [{ id: 6, op: 'INSERT', table_name: 'space_members', payload: { space_id: 's1', user_id: 'u1', group_id: null, role: 'reader' } }];
+    (svc as unknown as { wakeAll(): void }).wakeAll();
+    const res = await p;
+    expect(res.events).toHaveLength(1);
+    expect(res.events[0]).toMatchObject({ type: 'SpaceMemberChanged', seq: 6 });
+    expect(res.nextCursor).toBe(6);
+  });
 });

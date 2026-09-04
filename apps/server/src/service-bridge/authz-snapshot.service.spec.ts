@@ -50,5 +50,7 @@ describe('AuthzSnapshotService', () => {
     const svc = new AuthzSnapshotService(spyKysely(() => []).db);
     await expect(svc.getSnapshot('nope', 500)).rejects.toThrow();
     await expect(svc.getSnapshot('9.00000000-0000-0000-0000-000000000000', 500)).rejects.toThrow(); // phase out of range
+    // 36 chars but not a valid UUID -> 400 at validation, not a 500 at the uuid cast.
+    await expect(svc.getSnapshot('0.------------------------------------', 500)).rejects.toThrow();
   });
 });

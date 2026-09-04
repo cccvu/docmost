@@ -76,6 +76,14 @@ describe('mapOutboxRow', () => {
     ).toEqual({ seq: 42, type: 'PagePermissionChanged', pageId: 'p1', userId: 'u1', groupId: null, role: 'reader', removed: false });
   });
 
+  it('page_permissions normal DELETE with a resolved pageId -> PagePermissionChanged removed=true', () => {
+    // The common single-permission revoke: page_access still exists so page_id resolves; the grant must be
+    // reported REMOVED (not skipped, and removed must track the op — guards the removed:isDelete branch).
+    expect(
+      mapOutboxRow(row({ op: 'DELETE', tableName: 'page_permissions', payload: { pageAccessId: 'pa1', pageId: 'p1', userId: 'u1', groupId: null, role: 'reader' } })),
+    ).toEqual({ seq: 42, type: 'PagePermissionChanged', pageId: 'p1', userId: 'u1', groupId: null, role: 'reader', removed: true });
+  });
+
   it('page_permissions cascade-delete with UNRESOLVED pageId -> skip (null; covered by PageRestrictionChanged)', () => {
     expect(
       mapOutboxRow(row({ op: 'DELETE', tableName: 'page_permissions', payload: { pageAccessId: 'pa1', pageId: null, userId: 'u1' } })),

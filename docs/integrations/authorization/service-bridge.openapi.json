@@ -425,6 +425,7 @@
         ],
         "responses": {
           "200": { "description": "A batch of change events (possibly empty on a long-poll timeout).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuthzChangesResponse" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" },
           "409": { "description": "Stale cursor: events after `after` were already GC'd by retention; the platform must rebaseline.", "content": { "application/json": { "schema": { "type": "object", "required": ["stale", "head"], "properties": { "stale": { "const": true }, "head": { "type": "integer" }, "message": { "type": "string" } } } } } },
