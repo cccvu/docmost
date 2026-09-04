@@ -8,7 +8,7 @@ import { SpaceRepo } from '@docmost/db/repos/space/space.repo';
 import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 import { AUTHZ_MODE, AuthzMode } from './authz-mode';
-import { PlatformAuthzClient } from '../platform-authz.client';
+import { HttpAuthzClient } from '../http-authz.client';
 import { PdpSpaceMemberRepo } from '../pdp-space-member.repo';
 import { PdpPagePermissionRepo } from '../pdp-page-permission.repo';
 
@@ -28,14 +28,14 @@ const KYSELY = KYSELY_MODULE_CONNECTION_TOKEN();
 
 export const spaceMemberRepoProvider: Provider = {
   provide: SpaceMemberRepo,
-  inject: [AUTHZ_MODE, KYSELY, GroupRepo, SpaceRepo, CACHE_MANAGER, PlatformAuthzClient],
+  inject: [AUTHZ_MODE, KYSELY, GroupRepo, SpaceRepo, CACHE_MANAGER, HttpAuthzClient],
   useFactory: (
     mode: AuthzMode,
     db: KyselyDB,
     groupRepo: GroupRepo,
     spaceRepo: SpaceRepo,
     cache: Cache,
-    authz: PlatformAuthzClient,
+    authz: HttpAuthzClient,
   ): SpaceMemberRepo =>
     mode === 'remote'
       ? new PdpSpaceMemberRepo(db, groupRepo, spaceRepo, cache, authz)
@@ -44,13 +44,13 @@ export const spaceMemberRepoProvider: Provider = {
 
 export const pagePermissionRepoProvider: Provider = {
   provide: PagePermissionRepo,
-  inject: [AUTHZ_MODE, KYSELY, GroupRepo, CACHE_MANAGER, PlatformAuthzClient],
+  inject: [AUTHZ_MODE, KYSELY, GroupRepo, CACHE_MANAGER, HttpAuthzClient],
   useFactory: (
     mode: AuthzMode,
     db: KyselyDB,
     groupRepo: GroupRepo,
     cache: Cache,
-    authz: PlatformAuthzClient,
+    authz: HttpAuthzClient,
   ): PagePermissionRepo =>
     mode === 'remote'
       ? new PdpPagePermissionRepo(db, groupRepo, cache, authz)

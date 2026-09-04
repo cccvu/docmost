@@ -5,7 +5,7 @@ import { InjectKysely } from 'nestjs-kysely';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
 import { GroupRepo } from '@docmost/db/repos/group/group.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
-import { PlatformAuthzClient } from './platform-authz.client';
+import { HttpAuthzClient } from './http-authz.client';
 
 /**
  * CCC authorization integration — NOT upstream Docmost code.
@@ -21,7 +21,7 @@ export class PdpPagePermissionRepo extends PagePermissionRepo {
     @InjectKysely() db: KyselyDB,
     groupRepo: GroupRepo,
     @Inject(CACHE_MANAGER) cacheManager: Cache,
-    private readonly authz: PlatformAuthzClient,
+    private readonly authz: HttpAuthzClient,
   ) {
     super(db, groupRepo, cacheManager);
   }

@@ -2,21 +2,21 @@ import { readFileSync } from 'fs';
 import * as http from 'http';
 import type { AddressInfo } from 'net';
 import { join } from 'path';
-import { PlatformAuthzClient } from '../platform-authz.client';
+import { HttpAuthzClient } from '../http-authz.client';
 import { PlatformAuditClient } from '../audit/platform-audit.client';
 
 /**
  * PEP↔PDP CONSUMER contract (fork / Docmost side of the seam) — GitHub Task #16, contract #13.
  *
  * The fork's enforcement funnels EVERY fine-grained authorization decision through
- * `PlatformAuthzClient` (the PEP calling the platform's Authorization API) and forwards domain
+ * `HttpAuthzClient` (the PEP calling the platform's Authorization API) and forwards domain
  * audit through `PlatformAuditClient`. If the wire shape this consumer emits silently drifts from
  * what the platform (producer) expects, the platform will answer "deny"/"no match" to malformed
  * requests and — because the client is FAIL-CLOSED — the fork keeps running while quietly enforcing
  * NOTHING correctly (or, worse, mis-parsing a response into a grant). This spec pins the consumer
  * half so any such drift breaks a test instead of security.
  *
- * INTENDED behavior asserted (from platform-authz.client.ts / platform-audit.client.ts doc-comments
+ * INTENDED behavior asserted (from http-authz.client.ts / platform-audit.client.ts doc-comments
  * + docs/architecture.md "the platform owns policy; this is only a client; FAIL-CLOSED"):
  *   (a) each method emits the exact canonical request: POST, correct path, x-authz-service-secret
  *       header, and an exact body shape (toEqual — no extra/renamed/missing fields);
@@ -105,7 +105,7 @@ describe('PEP↔PDP consumer contract — real clients over a loopback PDP (#13)
   let captured: CapturedRequest | undefined;
   let nextResponse: NextResponse;
 
-  let authz: PlatformAuthzClient;
+  let authz: HttpAuthzClient;
   let audit: PlatformAuditClient;
 
   const savedEnv = {
@@ -150,7 +150,7 @@ describe('PEP↔PDP consumer contract — real clients over a loopback PDP (#13)
   beforeEach(() => {
     captured = undefined;
     nextResponse = { status: 200, body: {} };
-    authz = new PlatformAuthzClient();
+    authz = new HttpAuthzClient();
     audit = new PlatformAuditClient();
   });
 

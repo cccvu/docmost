@@ -1,5 +1,5 @@
 import { Module } from '@nestjs/common';
-import { PlatformAuthzClient } from './platform-authz.client';
+import { HttpAuthzClient } from './http-authz.client';
 import { AuthzModeModule } from './mode/authz-mode.module';
 import { PageRestrictionModule } from './page-restriction/page-restriction.module';
 import { PublicDiscoveryModule } from './public-discovery/public-discovery.module';
@@ -23,7 +23,7 @@ import { ServiceBridgeModule } from '../service-bridge/service-bridge.module';
     PublicDiscoveryModule,
     ServiceBridgeModule,
   ],
-  providers: [PlatformAuthzClient],
-  exports: [AuthzModeModule, PlatformAuthzClient],
+  providers: [HttpAuthzClient],
+  exports: [AuthzModeModule, HttpAuthzClient],
 })
 export class AuthzModule {}
