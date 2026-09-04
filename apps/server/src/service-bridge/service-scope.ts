@@ -19,4 +19,7 @@ export enum ServiceScope {
   SpacesRead = 'spaces:read',
   SpacesWrite = 'spaces:write',
   ContentRead = 'content:read',
+  // Group D (issue #171): the authz change-feed + snapshot the platform drains to project membership/page/
+  // restriction changes into SpiceDB. Read-only; replaces the platform's direct Docmost-DB outbox access.
+  ChangesRead = 'changes:read',
 }

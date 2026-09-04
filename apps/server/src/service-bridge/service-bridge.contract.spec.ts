@@ -8,6 +8,7 @@ import { ServiceWorkspaceController } from './service-workspace.controller';
 import { ServiceSpaceController } from './service-space.controller';
 import { ServicePageController } from './service-page.controller';
 import { ServiceContentController } from './service-content.controller';
+import { AuthzChangeController } from './authz-change.controller';
 import { CONTENT_LIST_MAX_IDS, CONTENT_LIST_MAX_LIMIT } from './dto/content-read.dto';
 
 /**
@@ -36,6 +37,7 @@ const CONTROLLERS = [
   ServiceSpaceController,
   ServicePageController,
   ServiceContentController,
+  AuthzChangeController,
 ];
 
 const METHOD_NAME: Record<number, string> = {

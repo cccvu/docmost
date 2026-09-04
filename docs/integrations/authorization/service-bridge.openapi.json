@@ -4,7 +4,7 @@
     "title": "Docmost Service Bridge (east-west)",
     "version": "1.1.0",
     "summary": "The east-west endpoints this Docmost fork EXPOSES to an integrating platform.",
-    "description": "These are the machine-to-machine endpoints the fork hosts for an integrating platform (the inverse direction of authorization-service.openapi.json, which the fork calls). They exist so an external identity/session broker can provision a fork-local shadow user and mint a Docmost session for it, force-disconnect a live collab session after a revocation, and (Phase C) administer workspace settings + spaces and read the content model WITHOUT the platform reaching into Docmost's database directly. They are NOT part of the public north-south API and are not browser-facing.\n\nMode: the whole surface is 404 unless the fork runs with AUTHZ_MODE=remote (RemoteOnlyGuard, checked BEFORE the secret). In AUTHZ_MODE=native there is no integrating platform and every route below returns 404 for all callers.\n\nAuth: every request carries a shared service secret in the x-authz-service-secret header (PLATFORM_AUTHZ_SERVICE_SECRET). Each /api/service/* route additionally requires exactly one least-privilege scope: session:mint, users:provision, users:resolve, workspace:read, workspace:settings:write, spaces:read, spaces:write, pages:read, content:read. Today a single full-scope secret is issued; per-scope credentials can be added later with no contract change.\n\nSecurity properties an integrator must understand:\n  - Identity-mutating endpoints are keyed ONLY on the caller's opaque externalId. The fork derives the shadow email (externalId@shadow.wiki-v2.internal) and resolves its own default workspace, so a caller can never select an arbitrary Docmost identity, name a real/privileged/native account, or supply a workspace id. This is a strong narrowing, not impersonation.\n  - The platform is the authorization authority: it performs the PDP decision (space/workspace administer, or the filter-then-retrieve authorized-id set) BEFORE calling these endpoints. The content read endpoints are a PRIVILEGED DATA PLANE, not a second gate: they return metadata for exactly the supplied ids and do NOT re-authorize. The security of the caller's /v1 surface rests entirely on it passing an authorized id set.\n  - Fail-closed: not remote -> 404; unconfigured secret -> 503; missing/wrong secret -> 401; wrong scope -> 403; over the per-credential rate limit -> 429; invalid body -> 400.",
+    "description": "These are the machine-to-machine endpoints the fork hosts for an integrating platform (the inverse direction of authorization-service.openapi.json, which the fork calls). They exist so an external identity/session broker can provision a fork-local shadow user and mint a Docmost session for it, force-disconnect a live collab session after a revocation, and (Phase C) administer workspace settings + spaces and read the content model WITHOUT the platform reaching into Docmost's database directly. They are NOT part of the public north-south API and are not browser-facing.\n\nMode: the whole surface is 404 unless the fork runs with AUTHZ_MODE=remote (RemoteOnlyGuard, checked BEFORE the secret). In AUTHZ_MODE=native there is no integrating platform and every route below returns 404 for all callers.\n\nAuth: every request carries a shared service secret in the x-authz-service-secret header (PLATFORM_AUTHZ_SERVICE_SECRET). Each /api/service/* route additionally requires exactly one least-privilege scope: session:mint, users:provision, users:resolve, workspace:read, workspace:settings:write, spaces:read, spaces:write, pages:read, content:read, changes:read. Today a single full-scope secret is issued; per-scope credentials can be added later with no contract change.\n\nSecurity properties an integrator must understand:\n  - Identity-mutating endpoints are keyed ONLY on the caller's opaque externalId. The fork derives the shadow email (externalId@shadow.wiki-v2.internal) and resolves its own default workspace, so a caller can never select an arbitrary Docmost identity, name a real/privileged/native account, or supply a workspace id. This is a strong narrowing, not impersonation.\n  - The platform is the authorization authority: it performs the PDP decision (space/workspace administer, or the filter-then-retrieve authorized-id set) BEFORE calling these endpoints. The content read endpoints are a PRIVILEGED DATA PLANE, not a second gate: they return metadata for exactly the supplied ids and do NOT re-authorize. The security of the caller's /v1 surface rests entirely on it passing an authorized id set.\n  - Fail-closed: not remote -> 404; unconfigured secret -> 503; missing/wrong secret -> 401; wrong scope -> 403; over the per-credential rate limit -> 429; invalid body -> 400.",
     "license": { "name": "AGPL-3.0-only", "identifier": "AGPL-3.0-only" },
     "x-canonical": true
   },
@@ -21,6 +21,7 @@
     { "name": "spaces", "description": "The platform-governed space + membership control plane (data only; the platform authorizes first)." },
     { "name": "pages", "description": "Bounded page lookups (structural) for the platform's authorization + content reads." },
     { "name": "content", "description": "The /v1 filter-then-retrieve read model (privileged data plane; trusts the platform's authorized id set)." },
+    { "name": "changes", "description": "The authz change feed + snapshot the platform drains to project membership/page/restriction changes into its PDP (Group D; replaces the platform's direct Docmost-DB outbox)." },
     { "name": "collab", "description": "Collaboration session control." }
   ],
   "paths": {
@@ -411,6 +412,48 @@
         }
       }
     },
+    "/api/service/authz/changes": {
+      "get": {
+        "operationId": "getAuthzChanges",
+        "tags": ["changes"],
+        "summary": "Long-poll the authz change feed (membership / page / restriction changes).",
+        "description": "Returns typed change events with seq > `after`, ordered by seq asc. Blocks up to `wait` ms for new events (an internal LISTEN/NOTIFY wakeup) then returns immediately; the durable outbox table is the SOURCE OF TRUTH, so a missed wake or dropped LISTEN is only latency, never lost events. `nextCursor` advances past skipped rows too. A cursor older than the oldest retained event returns 409 { stale, head } so the platform REBASELINES (reconcile + reset cursor=head) rather than silently skipping a GC'd gap. Read-only privileged data plane: the platform owns projection into SpiceDB and the Docmost-user -> principal identity mapping (which never leaves the platform). Scope: changes:read.",
+        "parameters": [
+          { "name": "after", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 0, "default": 0 }, "description": "Return events with seq > after (the last cursor the platform durably advanced)." },
+          { "name": "wait", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 0, "maximum": 25000, "default": 0 }, "description": "Max milliseconds to long-poll for new events before returning empty." },
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 500 } }
+        ],
+        "responses": {
+          "200": { "description": "A batch of change events (possibly empty on a long-poll timeout).", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuthzChangesResponse" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "409": { "description": "Stale cursor: events after `after` were already GC'd by retention; the platform must rebaseline.", "content": { "application/json": { "schema": { "type": "object", "required": ["stale", "head"], "properties": { "stale": { "const": true }, "head": { "type": "integer" }, "message": { "type": "string" } } } } } },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
+    "/api/service/authz/snapshot": {
+      "get": {
+        "operationId": "getAuthzSnapshot",
+        "tags": ["changes"],
+        "summary": "Stream the full desired authorization set (for the reconciler's drift repair).",
+        "description": "The current membership / page / restriction state emitted as the SAME typed events the live feed uses (seq=0, removed/deleted=false). Keyset-paginated on each row's IMMUTABLE primary id so a concurrent change during pagination can never cause a false orphan-delete on the platform (fail-open); combined with the platform pinning its PDP snapshot BEFORE reading, drift repair stays fail-closed. Pass `cursor` from the previous response; a null nextCursor means the whole set has been streamed. Scope: changes:read.",
+        "parameters": [
+          { "name": "cursor", "in": "query", "required": false, "schema": { "type": "string" }, "description": "Opaque cursor from the previous page; omit for the first page." },
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 1000, "default": 500 } }
+        ],
+        "responses": {
+          "200": { "description": "A page of the desired set.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuthzSnapshotResponse" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
     "/api/collab/force-disconnect": {
       "post": {
         "operationId": "forceDisconnect",
@@ -648,6 +691,48 @@
           "groupId": { "type": ["string", "null"] },
           "role": { "type": "string" },
           "createdAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "AuthzChangeEvent": {
+        "description": "One typed authorization change. `seq` is the outbox cursor on the live feed and 0 in a snapshot. Ids are Docmost ids; the platform maps Docmost user ids to its own principals (that mapping never leaves the platform).",
+        "oneOf": [
+          { "type": "object", "additionalProperties": false, "required": ["seq", "type", "spaceId", "workspaceId", "deleted"], "properties": {
+            "seq": { "type": "integer" }, "type": { "const": "SpaceChanged" },
+            "spaceId": { "type": "string", "format": "uuid" }, "workspaceId": { "type": ["string", "null"], "format": "uuid" }, "deleted": { "type": "boolean" } } },
+          { "type": "object", "additionalProperties": false, "required": ["seq", "type", "spaceId", "userId", "groupId", "role", "removed"], "properties": {
+            "seq": { "type": "integer" }, "type": { "const": "SpaceMemberChanged" },
+            "spaceId": { "type": "string", "format": "uuid" }, "userId": { "type": ["string", "null"], "format": "uuid" }, "groupId": { "type": ["string", "null"], "format": "uuid" }, "role": { "type": ["string", "null"] }, "removed": { "type": "boolean" } } },
+          { "type": "object", "additionalProperties": false, "required": ["seq", "type", "groupId", "userId", "removed"], "properties": {
+            "seq": { "type": "integer" }, "type": { "const": "GroupMemberChanged" },
+            "groupId": { "type": "string", "format": "uuid" }, "userId": { "type": "string", "format": "uuid" }, "removed": { "type": "boolean" } } },
+          { "type": "object", "additionalProperties": false, "required": ["seq", "type", "pageId", "spaceId", "parentPageId", "deleted"], "properties": {
+            "seq": { "type": "integer" }, "type": { "const": "PageStructureChanged" },
+            "pageId": { "type": "string", "format": "uuid" }, "spaceId": { "type": "string", "format": "uuid" }, "parentPageId": { "type": ["string", "null"], "format": "uuid" }, "deleted": { "type": "boolean" } } },
+          { "type": "object", "additionalProperties": false, "required": ["seq", "type", "pageId", "restricted"], "properties": {
+            "seq": { "type": "integer" }, "type": { "const": "PageRestrictionChanged" },
+            "pageId": { "type": "string", "format": "uuid" }, "restricted": { "type": "boolean" } } },
+          { "type": "object", "additionalProperties": false, "required": ["seq", "type", "pageId", "userId", "groupId", "role", "removed"], "properties": {
+            "seq": { "type": "integer" }, "type": { "const": "PagePermissionChanged" },
+            "pageId": { "type": "string", "format": "uuid" }, "userId": { "type": ["string", "null"], "format": "uuid" }, "groupId": { "type": ["string", "null"], "format": "uuid" }, "role": { "type": ["string", "null"] }, "removed": { "type": "boolean" } } }
+        ]
+      },
+      "AuthzChangesResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["events", "nextCursor", "head"],
+        "properties": {
+          "events": { "type": "array", "items": { "$ref": "#/components/schemas/AuthzChangeEvent" } },
+          "nextCursor": { "type": "integer", "description": "Pass as `after` on the next call; advances past skipped (null-mapping) rows so they never re-deliver." },
+          "head": { "type": "integer", "description": "Current feed head (max outbox seq, monotonic across retention GC); baseline the cursor to this on first boot." }
+        }
+      },
+      "AuthzSnapshotResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["events", "nextCursor"],
+        "properties": {
+          "events": { "type": "array", "items": { "$ref": "#/components/schemas/AuthzChangeEvent" } },
+          "nextCursor": { "type": ["string", "null"], "description": "Opaque cursor for the next page, or null when the whole desired set has been streamed." }
         }
       },
       "Error": {
