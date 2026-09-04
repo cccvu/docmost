@@ -74,6 +74,14 @@ You only implement a *caller* for these; the fork is the server. They fall into 
 - **Content read model** (`pages`, `content`): `POST /api/service/pages/resolve-space`,
   `GET /api/service/pages/{id}/permissions`, `POST /api/service/content/pages/list`,
   `POST /api/service/content/spaces/list`, `GET /api/service/content/spaces/{id}`.
+- **Change feed** (`changes`): `GET /api/service/authz/changes` (long-poll for membership/page/restriction
+  change events after a cursor) and `GET /api/service/authz/snapshot` (the full desired set, paginated, for
+  drift repair). The fork owns a transactional outbox (an AFTER trigger writes a change row inside Docmost's
+  own write transaction, so capture is atomic + at-least-once) and emits TYPED domain events; the platform
+  projects them into its PDP and owns the Docmost-user -> principal identity mapping. The durable outbox is the
+  source of truth (LISTEN/NOTIFY is a wakeup-only latency optimization); a cursor older than the retained
+  window returns `409 {stale, head}` so the platform rebaselines rather than skipping. This replaces the
+  platform reaching directly into Docmost's database, so it needs no Docmost DB credentials.
 - **Collab** (`collab`): `POST /api/collab/force-disconnect`.
 
 Three properties bind the whole surface:
@@ -82,7 +90,8 @@ Three properties bind the whole surface:
   before the secret). In native mode there is no integrating platform and the surface does not exist.
 - **Scoped + secret-gated.** Every request carries `x-authz-service-secret`; each `/api/service/*` route
   requires exactly one least-privilege scope (`session:mint`, `users:provision`, `users:resolve`,
-  `workspace:read`, `workspace:settings:write`, `spaces:read`, `spaces:write`, `pages:read`, `content:read`).
+  `workspace:read`, `workspace:settings:write`, `spaces:read`, `spaces:write`, `pages:read`, `content:read`,
+  `changes:read`).
 - **The platform is the authorization authority.** Identity-mutating endpoints are keyed only on an opaque
   `externalId` (no arbitrary-identity selection). The `content/*` read endpoints are a **privileged data
   plane, not a second gate**: the platform performs the PDP decision first and passes the authorized id set;

@@ -8,6 +8,7 @@ import { ServiceWorkspaceController } from './service-workspace.controller';
 import { ServiceSpaceController } from './service-space.controller';
 import { ServicePageController } from './service-page.controller';
 import { ServiceContentController } from './service-content.controller';
+import { AuthzChangeController } from './authz-change.controller';
 
 const CONTROLLERS = [
   ServiceBridgeController,
@@ -15,6 +16,7 @@ const CONTROLLERS = [
   ServiceSpaceController,
   ServicePageController,
   ServiceContentController,
+  AuthzChangeController,
 ];
 
 const validScopes = new Set<string>(Object.values(ServiceScope));
@@ -50,6 +52,8 @@ const EXPECTED_SCOPE: Record<string, ServiceScope> = {
   'ServiceContentController.listPages': ServiceScope.ContentRead,
   'ServiceContentController.listSpaces': ServiceScope.ContentRead,
   'ServiceContentController.getSpace': ServiceScope.ContentRead,
+  'AuthzChangeController.changes': ServiceScope.ChangesRead,
+  'AuthzChangeController.getSnapshot': ServiceScope.ChangesRead,
 };
 
 /**

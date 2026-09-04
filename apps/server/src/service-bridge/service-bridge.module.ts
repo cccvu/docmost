@@ -10,6 +10,10 @@ import { ServiceSpaceService } from './service-space.service';
 import { ServicePageController } from './service-page.controller';
 import { ServiceContentController } from './service-content.controller';
 import { ServiceContentService } from './service-content.service';
+import { AuthzChangeController } from './authz-change.controller';
+import { AuthzChangeFeedService } from './authz-change-feed.service';
+import { AuthzSnapshotService } from './authz-snapshot.service';
+import { AuthzOutboxInstaller } from './authz-outbox.installer';
 
 /**
  * CCC service-bridge — NOT upstream Docmost code.
@@ -30,12 +34,16 @@ import { ServiceContentService } from './service-content.service';
     ServiceSpaceController,
     ServicePageController,
     ServiceContentController,
+    AuthzChangeController,
   ],
   providers: [
     ServiceBridgeService,
     ServiceWorkspaceService,
     ServiceSpaceService,
     ServiceContentService,
+    AuthzChangeFeedService,
+    AuthzSnapshotService,
+    AuthzOutboxInstaller,
     WorkspaceResolver,
     ServiceAuthGuard,
   ],
