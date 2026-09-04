@@ -1,11 +1,11 @@
-import { AuthzOutboxInstaller } from './authz-outbox.installer';
-import { spyKysely } from './kysely-spy.testkit';
+import { AuthzOutboxInstaller, UnsupportedPgVersionError } from './authz-outbox.installer';
+import { spyKysely, SpyQuery } from './kysely-spy.testkit';
 
 /**
  * The fork-owned outbox installer (Group D, #171): mode-gated, advisory-locked, idempotent, column-scoped
- * capture, and FAIL-CLOSED in remote. In native it must install NO CCC DDL (the standalone story); in remote
- * it installs the table + capture function + AFTER triggers in one advisory-locked transaction, retries the
- * transient "tables not ready" case, and crashes the boot if it never succeeds.
+ * capture, and FAIL-CLOSED in remote. R2 adds the commit-safe watermark DDL (the `xact_id xid8` column with a
+ * `pg_current_xact_id()` default + the `authz_outbox_gc` high-water table) behind a PG 13+ version invariant
+ * that fails the boot IMMEDIATELY (no retry) on a too-old engine.
  */
 describe('AuthzOutboxInstaller', () => {
   const ENV = ['AUTHZ_OUTBOX_INSTALL_MAX_ATTEMPTS', 'AUTHZ_OUTBOX_INSTALL_RETRY_MS'] as const;
@@ -15,6 +15,10 @@ describe('AuthzOutboxInstaller', () => {
     ENV.forEach((k) => (saved[k] === undefined ? delete process.env[k] : (process.env[k] = saved[k]))),
   );
 
+  /** A supported engine unless overridden: the version probe returns PG 18, everything else is a no-op. */
+  const pg18 = (rest: (q: SpyQuery) => unknown[] = () => []) => (q: SpyQuery): unknown[] =>
+    q.sql.includes('server_version_num') ? [{ v: 180000 }] : rest(q);
+
   it('installs NOTHING in native mode', async () => {
     const spy = spyKysely(() => []);
     const installer = new AuthzOutboxInstaller(spy.db, 'native' as any);
@@ -23,15 +27,22 @@ describe('AuthzOutboxInstaller', () => {
     expect(spy.tx).toEqual([]);
   });
 
-  it('installs a column-scoped outbox + capture trigger inside one advisory-locked transaction in remote', async () => {
-    const spy = spyKysely(() => []);
+  it('installs the commit-safe outbox + capture trigger inside one advisory-locked transaction in remote', async () => {
+    const spy = spyKysely(pg18());
     const installer = new AuthzOutboxInstaller(spy.db, 'remote' as any);
     await installer.onApplicationBootstrap();
 
     expect(spy.tx).toEqual(['begin', 'commit']); // one transaction, committed
     const all = spy.calls.map((c) => c.sql).join('\n');
     expect(all).toContain('pg_advisory_xact_lock'); // serialized across replicas/processes
+    expect(all).toContain('server_version_num'); // PG-version invariant probed before any DDL
     expect(all).toContain('create table if not exists authz_outbox');
+    // R2 commit-safe watermark: the xact_id column (xid8, pg_current_xact_id default) + the (xact_id, id) index.
+    expect(all).toContain('xact_id xid8');
+    expect(all).toContain('pg_current_xact_id');
+    expect(all).toContain('authz_outbox_xact_idx');
+    // R2 stale-detection high-water table.
+    expect(all).toContain('create table if not exists authz_outbox_gc');
     expect(all).toContain('authz_outbox_capture'); // the capture function
     // Column-scoped capture (data minimization — never store full rows / pages.content|ydoc).
     expect(all).toContain('jsonb_build_object');
@@ -45,6 +56,14 @@ describe('AuthzOutboxInstaller', () => {
     // Deliberately NO trigger on users (platform-admin is not derived from Docmost roles).
     expect(all).toContain('drop trigger if exists authz_outbox_users on users');
     expect(all).not.toContain('create trigger authz_outbox_users');
+  });
+
+  it('FAILS the boot IMMEDIATELY (no retry) on an unsupported PG version', async () => {
+    process.env.AUTHZ_OUTBOX_INSTALL_MAX_ATTEMPTS = '30';
+    const spy = spyKysely((q) => (q.sql.includes('server_version_num') ? [{ v: 120000 }] : []));
+    const installer = new AuthzOutboxInstaller(spy.db, 'remote' as any);
+    await expect(installer.onApplicationBootstrap()).rejects.toBeInstanceOf(UnsupportedPgVersionError);
+    expect(spy.tx).toEqual(['begin', 'rollback']); // ONE attempt — the retry budget is not burned
   });
 
   it('FAILS the boot (fail-closed) in remote when the DDL never succeeds', async () => {
@@ -61,12 +80,16 @@ describe('AuthzOutboxInstaller', () => {
   it('RETRIES the transient "tables not ready" case then succeeds', async () => {
     process.env.AUTHZ_OUTBOX_INSTALL_MAX_ATTEMPTS = '5';
     process.env.AUTHZ_OUTBOX_INSTALL_RETRY_MS = '0';
-    let call = 0;
-    const spy = spyKysely(() => {
-      call += 1;
-      if (call === 1) throw new Error('relation "space_members" does not exist'); // first attempt fails
-      return [];
-    });
+    let failedOnce = false;
+    const spy = spyKysely(
+      pg18((q) => {
+        if (!failedOnce && q.sql.includes('create table if not exists authz_outbox')) {
+          failedOnce = true;
+          throw new Error('relation "space_members" does not exist'); // first attempt: migrations not ready
+        }
+        return [];
+      }),
+    );
     const installer = new AuthzOutboxInstaller(spy.db, 'remote' as any);
     await expect(installer.onApplicationBootstrap()).resolves.toBeUndefined();
     expect(spy.tx).toEqual(['begin', 'rollback', 'begin', 'commit']); // failed once, then committed

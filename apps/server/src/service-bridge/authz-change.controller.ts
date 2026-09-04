@@ -40,7 +40,7 @@ export class AuthzChangeController {
   @Get('changes')
   @RequireServiceScope(ServiceScope.ChangesRead)
   async changes(
-    @Query('after', new DefaultValuePipe(0), ParseIntPipe) after: number,
+    @Query('after') after: string | undefined,
     @Query('wait', new DefaultValuePipe(0), ParseIntPipe) wait: number,
     @Query('limit', new DefaultValuePipe(500), ParseIntPipe) limit: number,
   ): Promise<ChangesResult> {

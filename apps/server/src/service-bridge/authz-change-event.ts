@@ -10,8 +10,10 @@
  *
  * Ids are Docmost ids (user/group/space/page): the platform translates Docmost user ids to its own principals
  * via SubjectResolverService, and that mapping never leaves the platform. `seq` is the outbox row id (a
- * monotonic bigserial) and is the change-feed cursor; snapshot events (the reconciler's full desired set)
- * reuse the same shapes with `seq = 0` since they carry no outbox position.
+ * monotonic bigserial) and is DIAGNOSTIC ONLY (logging/tracing) — the change-feed's ordering + checkpoint
+ * primitive is the opaque `(xact_id, id)` cursor the feed returns (see AuthzChangeFeedService), never `seq`.
+ * Snapshot events (the reconciler's full desired set) reuse the same shapes with `seq = 0` since they carry
+ * no outbox position.
  */
 export type AuthzChangeEvent =
   | {
@@ -63,10 +65,14 @@ export type AuthzChangeEvent =
 
 export type AuthzChangeEventType = AuthzChangeEvent['type'];
 
-/** A raw `authz_outbox` row as delivered by the fork's Kysely. The trigger STORES `to_jsonb(NEW/OLD)` with
- *  snake_case column keys, but the fork's `CamelCasePlugin` recurses into the jsonb on read (verified: it does
- *  NOT stop at the top-level column), so `payload` arrives with CAMELCASE keys (spaceId, deletedAt, pageId,
- *  pageAccessId, ...). This mapper reads them camelCased accordingly. */
+/** A raw `authz_outbox` row after the feed has parsed its jsonb `payload` to an object (see
+ *  AuthzChangeFeedService.parsePayload). The trigger stores the payload via `jsonb_build_object('space_id',
+ *  ...)` with SNAKE_CASE keys, and postgres.js returns a `jsonb` column as a raw JSON STRING (it does not
+ *  auto-parse json/jsonb; CamelCasePlugin only recurses into objects, so it never touches the string) — so
+ *  once parsed the payload carries the ORIGINAL snake_case keys (space_id, deleted_at, page_id, ...). This
+ *  mapper reads them snake_cased accordingly. (The R1 "CamelCasePlugin recurses into the payload" note assumed
+ *  an object result; on the real driver the payload is a string, which the change feed is the only consumer of
+ *  and which was unexercised until the R2 real-PG test — see authz-outbox-commit-safety.pg.spec.ts.) */
 export interface OutboxRow {
   id: number;
   op: 'INSERT' | 'UPDATE' | 'DELETE';
@@ -87,9 +93,9 @@ const str = (v: unknown): string | null => (typeof v === 'string' && v.length > 
  * hard-vs-soft divergence); `group_users`/`page_access`/`page_permissions` are hard-delete only.
  */
 export function mapOutboxRow(row: OutboxRow): AuthzChangeEvent | null {
-  const p = row.payload; // CAMELCASE keys (CamelCasePlugin recurses into the jsonb) — see OutboxRow.
+  const p = row.payload; // SNAKE_CASE keys (the stored jsonb, parsed off the wire) — see OutboxRow.
   const isDelete = row.op === 'DELETE';
-  const softDeleted = (p['deletedAt'] ?? null) != null;
+  const softDeleted = (p['deleted_at'] ?? null) != null;
 
   switch (row.tableName) {
     case 'spaces': {
@@ -99,44 +105,44 @@ export function mapOutboxRow(row: OutboxRow): AuthzChangeEvent | null {
         seq: row.id,
         type: 'SpaceChanged',
         spaceId,
-        workspaceId: str(p['workspaceId']),
+        workspaceId: str(p['workspace_id']),
         deleted: isDelete || softDeleted,
       };
     }
     case 'space_members': {
-      const spaceId = str(p['spaceId']);
+      const spaceId = str(p['space_id']);
       if (!spaceId) return null;
       return {
         seq: row.id,
         type: 'SpaceMemberChanged',
         spaceId,
-        userId: str(p['userId']),
-        groupId: str(p['groupId']),
+        userId: str(p['user_id']),
+        groupId: str(p['group_id']),
         role: str(p['role']),
         removed: isDelete || softDeleted,
       };
     }
     case 'group_users': {
-      const groupId = str(p['groupId']);
-      const userId = str(p['userId']);
+      const groupId = str(p['group_id']);
+      const userId = str(p['user_id']);
       if (!groupId || !userId) return null;
       return { seq: row.id, type: 'GroupMemberChanged', groupId, userId, removed: isDelete };
     }
     case 'pages': {
       const pageId = str(p['id']);
-      const spaceId = str(p['spaceId']);
+      const spaceId = str(p['space_id']);
       if (!pageId || !spaceId) return null;
       return {
         seq: row.id,
         type: 'PageStructureChanged',
         pageId,
         spaceId,
-        parentPageId: str(p['parentPageId']),
+        parentPageId: str(p['parent_page_id']),
         deleted: isDelete || softDeleted,
       };
     }
     case 'page_access': {
-      const pageId = str(p['pageId']);
+      const pageId = str(p['page_id']);
       if (!pageId) return null;
       // A row exists => the page is restricted; a DELETE => unrestricted.
       return { seq: row.id, type: 'PageRestrictionChanged', pageId, restricted: !isDelete };
@@ -144,14 +150,14 @@ export function mapOutboxRow(row: OutboxRow): AuthzChangeEvent | null {
     case 'page_permissions': {
       // page_id is enriched into the payload by the trigger (resolved from page_access while it still exists).
       // A cascade-delete that could not resolve it => skip; the PageRestrictionChanged{false} covers the page.
-      const pageId = str(p['pageId']);
+      const pageId = str(p['page_id']);
       if (!pageId) return null;
       return {
         seq: row.id,
         type: 'PagePermissionChanged',
         pageId,
-        userId: str(p['userId']),
-        groupId: str(p['groupId']),
+        userId: str(p['user_id']),
+        groupId: str(p['group_id']),
         role: str(p['role']),
         removed: isDelete,
       };
