@@ -13,22 +13,13 @@ const shadow = (over: Record<string, unknown> = {}) => ({
 });
 
 /**
- * A minimal Kysely stand-in that answers ONLY the two queries the service issues:
- *  - `selectFrom('workspaces')…executeTakeFirst()` → the default-workspace resolution.
+ * A minimal Kysely stand-in that answers ONLY the one query the service issues directly:
  *  - `insertInto('users')…executeTakeFirstOrThrow()` → provisioning; captures the inserted values.
+ * The default-workspace resolution now lives in WorkspaceResolver (mocked separately below).
  */
-function makeDb(opts: { workspace?: { id: string } | undefined; insertedId?: string } = {}) {
-  const workspace = 'workspace' in opts ? opts.workspace : { id: 'ws1' };
+function makeDb(opts: { insertedId?: string } = {}) {
   const insertedId = opts.insertedId ?? 'new-id';
   const captured: { values?: Record<string, unknown> } = {};
-
-  const wsChain: any = {
-    select: () => wsChain,
-    where: () => wsChain,
-    orderBy: () => wsChain,
-    limit: () => wsChain,
-    executeTakeFirst: async () => workspace,
-  };
 
   const onConflict = jest.fn((cb: any) => {
     cb({ columns: () => ({ doUpdateSet: () => ({}) }) });
@@ -40,10 +31,6 @@ function makeDb(opts: { workspace?: { id: string } | undefined; insertedId?: str
   });
 
   const db: any = {
-    selectFrom: (table: string) => {
-      if (table !== 'workspaces') throw new Error(`unexpected selectFrom(${table})`);
-      return wsChain;
-    },
     insertInto: jest.fn((table: string) => {
       if (table !== 'users') throw new Error(`unexpected insertInto(${table})`);
       return { values };
@@ -52,14 +39,23 @@ function makeDb(opts: { workspace?: { id: string } | undefined; insertedId?: str
   return { db, captured, insertInto: db.insertInto };
 }
 
-function makeService(user: unknown, dbOpts?: Parameters<typeof makeDb>[0]) {
-  const { db, captured, insertInto } = makeDb(dbOpts);
+function makeService(user: unknown, opts: { workspaceId?: string | null } = {}) {
+  const { db, captured, insertInto } = makeDb();
   const userRepo = { findByEmail: jest.fn(async () => user) } as any;
   const sessionService = {
     createSessionAndToken: jest.fn(async () => 'authtoken-xyz'),
   } as any;
-  const svc = new ServiceBridgeService(db, userRepo, sessionService);
-  return { svc, sessionService, userRepo, captured, insertInto };
+  const workspaceId = 'workspaceId' in opts ? opts.workspaceId : 'ws1';
+  const workspaces = {
+    resolveDefaultWorkspaceId: jest.fn(async () => {
+      if (workspaceId == null) {
+        throw new ServiceUnavailableException('no workspace provisioned');
+      }
+      return workspaceId;
+    }),
+  } as any;
+  const svc = new ServiceBridgeService(db, userRepo, sessionService, workspaces);
+  return { svc, sessionService, userRepo, captured, insertInto, workspaces };
 }
 
 describe('ServiceBridgeService.mintSession — no direct identity selection', () => {
@@ -94,7 +90,7 @@ describe('ServiceBridgeService.mintSession — no direct identity selection', ()
   });
 
   it('503s when the fork has no workspace provisioned yet (never a silent wrong workspace)', async () => {
-    const { svc } = makeService(shadow(), { workspace: undefined });
+    const { svc } = makeService(shadow(), { workspaceId: null });
     await expect(svc.mintSession(EXTERNAL_ID)).rejects.toBeInstanceOf(
       ServiceUnavailableException,
     );

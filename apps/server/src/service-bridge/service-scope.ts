@@ -9,4 +9,14 @@
 export enum ServiceScope {
   SessionMint = 'session:mint',
   UsersProvision = 'users:provision',
+  // Phase C reverse-coupling: the platform stops reaching into Docmost's DB and instead calls these
+  // scoped, service-secret-guarded endpoints. Reads and writes are distinct scopes so a future
+  // per-scope credential can be granted read-only access without any write capability.
+  UsersResolve = 'users:resolve',
+  WorkspaceRead = 'workspace:read',
+  WorkspaceSettingsWrite = 'workspace:settings:write',
+  PagesRead = 'pages:read',
+  SpacesRead = 'spaces:read',
+  SpacesWrite = 'spaces:write',
+  ContentRead = 'content:read',
 }
