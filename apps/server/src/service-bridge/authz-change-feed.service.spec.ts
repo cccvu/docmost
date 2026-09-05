@@ -33,18 +33,35 @@ const responder =
     return [];
   };
 
-// postgres.js returns a jsonb column as a raw JSON STRING (snake_case keys), so the spy returns the payload
-// as a string too — the feed JSON.parses it. (An object payload would be camelCased by the spy's
-// CamelCasePlugin, which does NOT match the real driver.)
+// The feed reads `payload::text as payload_json` (a STRING), so the spy answers `payload_json` as a string
+// (the spy's CamelCasePlugin maps the column NAME to payloadJson and never touches the keys inside a string).
+// This mirrors production: the driver parses a jsonb column to an object and the plugin would camelCase its
+// nested keys, which is exactly why the feed never reads the jsonb column directly (incident #181).
 const memberRow = (id: number, xactId: string) => ({
   id,
   op: 'INSERT',
   table_name: 'space_members',
-  payload: JSON.stringify({ space_id: 's1', user_id: 'u1', group_id: null, role: 'reader' }),
+  payload_json: JSON.stringify({ space_id: 's1', user_id: 'u1', group_id: null, role: 'reader' }),
   xact_id: xactId,
 });
 
 describe('AuthzChangeFeedService (R2 commit-safe cursor)', () => {
+  it('reads the outbox payload as TEXT so no result-key plugin can rewrite its keys (incident #181)', async () => {
+    // In production postgres.js parses jsonb to an OBJECT and the app Kysely's CamelCasePlugin camelCases the
+    // NESTED keys (workspace_id -> workspaceId), which silently defeated the snake_case mapper for every live
+    // event (the reconcile path masked it). Reading `payload::text` is the mechanism that makes the key case
+    // independent of the driver and of any plugin; this pins it at the SQL level.
+    const seen: string[] = [];
+    const { svc } = feed((q) => {
+      seen.push(q.sql);
+      return responder({ head: { xact_id: '50', id: '7' }, rows: [memberRow(6, '50')] })(q);
+    });
+    await svc.getChanges('0.0', 0, 500);
+    const read = seen.find((q) => q.includes('from authz_outbox') && q.includes('order by xact_id asc'));
+    expect(read).toBeDefined();
+    expect(read).toMatch(/payload::text as payload_json/);
+  });
+
   it('head() returns the SAFE frontier as an opaque (xact_id.id) cursor', async () => {
     const { svc } = feed(responder({ head: { xact_id: '100', id: '5' } }));
     expect(await svc.head()).toBe('100.5');

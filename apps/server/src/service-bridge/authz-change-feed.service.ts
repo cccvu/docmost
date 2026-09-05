@@ -55,11 +55,15 @@ function tupleGt(a: Cursor, b: Cursor): boolean {
   return BigInt(a.id) > BigInt(b.id);
 }
 
-/** postgres.js returns a `jsonb` column as a STRING (it does not auto-parse json/jsonb), and CamelCasePlugin
- *  only recurses into an OBJECT — so the outbox `payload` arrives as the raw stored JSON with its original
- *  snake_case keys. Parse it here to the object the mapper reads (snake_case). Defensive: a non-string object
- *  passes through, and an unparseable value degrades to `{}` (the mapper then yields null, and the reconciler
- *  backstops) rather than throwing and wedging the drain. */
+/** The outbox `payload` is read as TEXT (`payload::text`) on purpose (incident #181 follow-through). In the
+ *  built image (plain node) postgres.js parses a stored `jsonb` column to an OBJECT and the application
+ *  Kysely's CamelCasePlugin then camelCases its NESTED keys (workspace_id -> workspaceId), which silently
+ *  defeated the snake_case mapper for every live event: spaces projected with a null workspace, members and
+ *  pages dropped, while only the snapshot reconcile wrote tuples. (Under jest the same column arrived as a
+ *  string, which is why the R2 real-Postgres spec never caught it.) A text column can be touched by no
+ *  result-key plugin, so parsing it here yields exactly the snake_case keys the trigger stored, in every
+ *  environment. Defensive: an object passes through unchanged, and an unparseable value degrades to `{}`
+ *  (the mapper then yields null, and the reconciler backstops) rather than throwing and wedging the drain. */
 function parsePayload(v: unknown): Record<string, unknown> {
   if (v && typeof v === 'object') return v as Record<string, unknown>;
   if (typeof v === 'string') {
@@ -229,10 +233,10 @@ export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
       id: string;
       op: string;
       tableName: string;
-      payload: Record<string, unknown>;
+      payloadJson: string;
       xactId: string;
     }>`
-      select id, op, table_name, payload, xact_id
+      select id, op, table_name, payload::text as payload_json, xact_id
       from authz_outbox
       where (xact_id, id) > (${cursor.xactId}::xid8, ${cursor.id}::bigint)
         and xact_id < pg_snapshot_xmin(pg_current_snapshot())
@@ -244,7 +248,7 @@ export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
         id: Number(r.id),
         op: r.op as OutboxRow['op'],
         tableName: r.tableName,
-        payload: parsePayload(r.payload),
+        payload: parsePayload(r.payloadJson),
       },
       xactId: String(r.xactId),
       id: String(r.id),

@@ -65,14 +65,16 @@ export type AuthzChangeEvent =
 
 export type AuthzChangeEventType = AuthzChangeEvent['type'];
 
-/** A raw `authz_outbox` row after the feed has parsed its jsonb `payload` to an object (see
+/** A raw `authz_outbox` row after the feed has parsed its `payload` to an object (see
  *  AuthzChangeFeedService.parsePayload). The trigger stores the payload via `jsonb_build_object('space_id',
- *  ...)` with SNAKE_CASE keys, and postgres.js returns a `jsonb` column as a raw JSON STRING (it does not
- *  auto-parse json/jsonb; CamelCasePlugin only recurses into objects, so it never touches the string) — so
- *  once parsed the payload carries the ORIGINAL snake_case keys (space_id, deleted_at, page_id, ...). This
- *  mapper reads them snake_cased accordingly. (The R1 "CamelCasePlugin recurses into the payload" note assumed
- *  an object result; on the real driver the payload is a string, which the change feed is the only consumer of
- *  and which was unexercised until the R2 real-PG test — see authz-outbox-commit-safety.pg.spec.ts.) */
+ *  ...)` with SNAKE_CASE keys and the feed reads it as TEXT (`payload::text`), so the parsed object carries the
+ *  ORIGINAL snake_case keys (space_id, deleted_at, page_id, ...) and this mapper reads them snake_cased.
+ *  History (incident #181): the R1 note that CamelCasePlugin recurses into the payload was RIGHT for the
+ *  production read path (postgres.js parses jsonb to an object in the built image; the plugin camelCases
+ *  nested keys); R2 observed a string under jest and switched the mapper to snake_case, which left every live
+ *  event unmapped in production. Reading the column as text makes the key case independent of the driver,
+ *  the environment and any result-key plugin; pinned by authz-change-feed.service.spec.ts (SQL mechanism) and
+ *  authz-outbox-commit-safety.pg.spec.ts (real rows through the app-shaped Kysely). */
 export interface OutboxRow {
   id: number;
   op: 'INSERT' | 'UPDATE' | 'DELETE';
