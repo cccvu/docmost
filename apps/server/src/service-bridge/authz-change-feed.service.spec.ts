@@ -33,18 +33,35 @@ const responder =
     return [];
   };
 
-// postgres.js returns a jsonb column as a raw JSON STRING (snake_case keys), so the spy returns the payload
-// as a string too — the feed JSON.parses it. (An object payload would be camelCased by the spy's
-// CamelCasePlugin, which does NOT match the real driver.)
+// The feed reads `payload::text as payload_json` (a STRING), so the spy answers `payload_json` as a string
+// (the spy's CamelCasePlugin maps the column NAME to payloadJson and never touches the keys inside a string).
+// This mirrors production: the driver parses a jsonb column to an object and the plugin would camelCase its
+// nested keys, which is exactly why the feed never reads the jsonb column directly (incident #181).
 const memberRow = (id: number, xactId: string) => ({
   id,
   op: 'INSERT',
   table_name: 'space_members',
-  payload: JSON.stringify({ space_id: 's1', user_id: 'u1', group_id: null, role: 'reader' }),
+  payload_json: JSON.stringify({ space_id: 's1', user_id: 'u1', group_id: null, role: 'reader' }),
   xact_id: xactId,
 });
 
 describe('AuthzChangeFeedService (R2 commit-safe cursor)', () => {
+  it('reads the outbox payload as TEXT so no result-key plugin can rewrite its keys (incident #181)', async () => {
+    // In production postgres.js parses jsonb to an OBJECT and the app Kysely's CamelCasePlugin camelCases the
+    // NESTED keys (workspace_id -> workspaceId), which silently defeated the snake_case mapper for every live
+    // event (the reconcile path masked it). Reading `payload::text` is the mechanism that makes the key case
+    // independent of the driver and of any plugin; this pins it at the SQL level.
+    const seen: string[] = [];
+    const { svc } = feed((q) => {
+      seen.push(q.sql);
+      return responder({ head: { xact_id: '50', id: '7' }, rows: [memberRow(6, '50')] })(q);
+    });
+    await svc.getChanges('0.0', 0, 500);
+    const read = seen.find((q) => q.includes('from authz_outbox') && q.includes('order by xact_id asc'));
+    expect(read).toBeDefined();
+    expect(read).toMatch(/payload::text as payload_json/);
+  });
+
   it('head() returns the SAFE frontier as an opaque (xact_id.id) cursor', async () => {
     const { svc } = feed(responder({ head: { xact_id: '100', id: '5' } }));
     expect(await svc.head()).toBe('100.5');
@@ -88,6 +105,27 @@ describe('AuthzChangeFeedService (R2 commit-safe cursor)', () => {
     expect(res.events).toHaveLength(1);
     expect(res.events[0]).toMatchObject({ type: 'SpaceMemberChanged', seq: 6 });
     expect(res.nextCursor).toBe('50.7'); // advanced past the skipped id 7, in (xact_id, id) space
+  });
+
+  it('warns AUTHZ_CHANGE_EVENT_DROPPED when a KNOWN authz table row does not map (defect detector, incident #181) and stays silent for unknown tables', async () => {
+    // The second #181 defect (every live event dropped by a key-shape mismatch) survived a whole release because a
+    // null mapping was silent. A row from a table the mapper KNOWS that still maps to null is a mapper/payload
+    // defect and must leave a greppable marker; rows from tables the mapper ignores stay a silent skip.
+    const rows = [
+      memberRow(6, '50'),
+      { id: 7, op: 'INSERT', table_name: 'space_members', payload_json: JSON.stringify({ user_id: 'u1', role: 'reader' }), xact_id: '50' }, // known table, no space_id -> null
+      { id: 8, op: 'INSERT', table_name: 'users', payload_json: JSON.stringify({ id: 'u9' }), xact_id: '50' }, // unknown table -> silent skip
+    ];
+    const { svc } = feed(responder({ head: { xact_id: '50', id: '8' }, rows, oldestAgeMs: null }));
+    const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+    const res = await svc.getChanges('49.0', 0, 500);
+    expect(res.events).toHaveLength(1);
+    expect(res.nextCursor).toBe('50.8'); // the cursor still advances past the dropped row (the reconciler is the backstop)
+    const dropped = warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('AUTHZ_CHANGE_EVENT_DROPPED'));
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toContain('space_members');
+    expect(dropped[0]).toContain('id=7');
+    expect(dropped[0]).not.toContain('users');
   });
 
   it('surfaces oldestPendingAgeMs from the feed (fork-provided, no platform DB query)', async () => {

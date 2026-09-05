@@ -19,6 +19,7 @@ import {
   ForceDisconnectDto,
 } from './collab-disconnect.controller';
 import { CollabServiceSecretGuard } from './service-secret.guard';
+import { SKIP_TRANSFORM_KEY } from '../../common/decorators/skip-transform.decorator';
 
 /**
  * CCC authorization integration test (part of the fork's compatibility suite).
@@ -219,5 +220,13 @@ describe('ForceDisconnectDto validation (userId/pageId are UUIDs)', () => {
     const props = errors.map((e) => e.property);
     expect(props).toContain('userId');
     expect(props).toContain('pageId');
+  });
+});
+
+describe('CollabDisconnectController wire shape (incident #181)', () => {
+  it('forceDisconnect carries @SkipTransform() so the body is bare per service-bridge.openapi.json', () => {
+    expect(
+      Reflect.getMetadata(SKIP_TRANSFORM_KEY, CollabDisconnectController.prototype.forceDisconnect),
+    ).toBe(true);
   });
 });

@@ -57,10 +57,16 @@ d('AuthzChangeFeedService — real-Postgres commit-safety (Group D R2)', () => {
   let a: postgres.ReservedSql;
   let b: postgres.ReservedSql;
 
+  // Store a REAL jsonb object, exactly as the capture trigger's jsonb_build_object does. (The earlier fixture
+  // passed a pre-stringified JSON string to a ::jsonb parameter; postgres.js infers json for that parameter
+  // and stringifies it AGAIN, so the stored value was a jsonb STRING scalar. That masked incident #181: a
+  // string scalar reads back as a string the old feed then parsed, while production's object reads back as
+  // an object whose nested keys the app Kysely camelCases.)
+  const memberPayload = (space: string) => ({ space_id: space, user_id: 'u', group_id: null, role: 'reader' });
   const insertMember = (conn: postgres.Sql | postgres.ReservedSql, space: string) =>
     conn`
       insert into authz_outbox (op, table_name, payload)
-      values ('INSERT', 'space_members', ${JSON.stringify({ space_id: space, user_id: 'u', group_id: null, role: 'reader' })}::jsonb)
+      values ('INSERT', 'space_members', ${admin.json(memberPayload(space))})
     `;
 
   beforeAll(async () => {
@@ -164,6 +170,26 @@ d('AuthzChangeFeedService — real-Postgres commit-safety (Group D R2)', () => {
 
     const res = await feed.getChanges('0.0', 0, 100);
     expect(res.events.map((e: any) => e.spaceId)).toEqual(['sB']); // only B; A's dead row is never served
+  });
+
+  it('a spaces row keeps its workspace id through the app-shaped Kysely (CamelCasePlugin must not touch the payload)', async () => {
+    // Incident #181 follow-through: in the built image postgres.js returns jsonb as a parsed OBJECT and the
+    // application Kysely's CamelCasePlugin then camelCases the NESTED keys (workspace_id -> workspaceId), so a
+    // mapper reading the stored snake_case keys sees nothing: spaces mapped with workspaceId null, members and
+    // pages dropped, the live feed projecting nothing while only the snapshot reconcile wrote tuples. The feed
+    // must read the payload as text so no result-key plugin can rewrite the data. This spec uses the SAME
+    // Kysely config as database.module.ts, so it fails if the read path regresses.
+    await admin`
+      insert into authz_outbox (op, table_name, payload)
+      values ('INSERT', 'spaces', ${admin.json({ id: 'sW', deleted_at: null, workspace_id: 'wX' })})
+    `;
+    // Guard the fixture itself: the stored payload must be a jsonb OBJECT (what the trigger writes), never a
+    // string scalar, or this spec would test the wrong shape again.
+    const shape = await admin`select jsonb_typeof(payload) as t from authz_outbox where payload ->> 'id' = 'sW'`;
+    expect(shape[0].t).toBe('object');
+    const res = await feed.getChanges('0.0', 0, 100);
+    const space = res.events.find((e: any) => e.type === 'SpaceChanged' && e.spaceId === 'sW');
+    expect(space).toMatchObject({ type: 'SpaceChanged', spaceId: 'sW', workspaceId: 'wX', deleted: false });
   });
 
   it('a settled row is delivered, its jsonb payload is parsed, and the opaque cursor round-trips', async () => {

@@ -1,5 +1,7 @@
 import 'reflect-metadata';
-import { GUARDS_METADATA } from '@nestjs/common/constants';
+import { GUARDS_METADATA, MODULE_METADATA } from '@nestjs/common/constants';
+import { SKIP_TRANSFORM_KEY } from '../common/decorators/skip-transform.decorator';
+import { ServiceBridgeModule } from './service-bridge.module';
 import { ServiceAuthGuard, SERVICE_SCOPE_KEY } from './service-auth.guard';
 import { ServiceScope } from './service-scope';
 import { RemoteOnlyGuard } from '../authz/mode/remote-only.guard';
@@ -10,7 +12,10 @@ import { ServicePageController } from './service-page.controller';
 import { ServiceContentController } from './service-content.controller';
 import { AuthzChangeController } from './authz-change.controller';
 
-const CONTROLLERS = [
+// Derived from the module's own registration (not a hand-maintained list) so a controller added to
+// ServiceBridgeModule can never escape these assertions. The named imports below pin the KNOWN set: if one
+// goes missing from the module, or the module registers something we never reviewed, the sanity check fails.
+const KNOWN_CONTROLLERS = [
   ServiceBridgeController,
   ServiceWorkspaceController,
   ServiceSpaceController,
@@ -18,6 +23,9 @@ const CONTROLLERS = [
   ServiceContentController,
   AuthzChangeController,
 ];
+const CONTROLLERS = Reflect.getMetadata(MODULE_METADATA.CONTROLLERS, ServiceBridgeModule) as Array<
+  new (...args: any[]) => unknown
+>;
 
 const validScopes = new Set<string>(Object.values(ServiceScope));
 
@@ -62,6 +70,27 @@ const EXPECTED_SCOPE: Record<string, ServiceScope> = {
  * controller must be gated by RemoteOnlyGuard THEN ServiceAuthGuard (mode-off in native, then scoped auth).
  */
 describe('service-bridge scope + guard coverage', () => {
+  it('the module registers exactly the reviewed controller set', () => {
+    expect([...CONTROLLERS].sort((a, b) => a.name.localeCompare(b.name))).toEqual(
+      [...KNOWN_CONTROLLERS].sort((a, b) => a.name.localeCompare(b.name)),
+    );
+  });
+
+  /**
+   * Incident #181: the upstream global TransformHttpResponseInterceptor (main.ts) wraps EVERY handler's
+   * return value as { data, success, status } unless the HANDLER carries SKIP_TRANSFORM metadata (it reads
+   * the handler, never the class). The canonical spec declares bare bodies, so every east-west handler MUST
+   * opt out; a new route without @SkipTransform() ships envelope-wrapped and silently breaks the platform.
+   */
+  it.each(CONTROLLERS.map((c) => [c.name, c] as const))(
+    '%s: every route handler carries @SkipTransform() (bare body on the wire, per the spec)',
+    (_name, ctrl) => {
+      for (const method of routeMethods(ctrl)) {
+        expect(Reflect.getMetadata(SKIP_TRANSFORM_KEY, (ctrl as any).prototype[method])).toBe(true);
+      }
+    },
+  );
+
   it.each(CONTROLLERS.map((c) => [c.name, c] as const))(
     '%s: every route declares exactly the intended least-privilege ServiceScope',
     (name, ctrl) => {

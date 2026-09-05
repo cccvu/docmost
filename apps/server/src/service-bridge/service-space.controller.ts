@@ -12,6 +12,7 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
+import { SkipTransform } from '../common/decorators/skip-transform.decorator';
 import { RemoteOnlyGuard } from '../authz/mode/remote-only.guard';
 import { RequireServiceScope, ServiceAuthGuard } from './service-auth.guard';
 import { ServiceScope } from './service-scope';
@@ -39,11 +40,15 @@ import {
 export class ServiceSpaceController {
   constructor(private readonly service: ServiceSpaceService) {}
 
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
   @Get()
   @RequireServiceScope(ServiceScope.SpacesRead)
   async list(@Query('includeArchived') includeArchived?: string): Promise<SpaceView[]> {
     return this.service.list(includeArchived === 'true');
   }
+
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
 
   @Get(':spaceId')
   @RequireServiceScope(ServiceScope.SpacesRead)
@@ -51,11 +56,15 @@ export class ServiceSpaceController {
     return this.service.getDetail(spaceId);
   }
 
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
   @Get(':spaceId/members')
   @RequireServiceScope(ServiceScope.SpacesRead)
   async listMembers(@Param('spaceId', ParseUUIDPipe) spaceId: string): Promise<RawSpaceMember[]> {
     return this.service.listMembers(spaceId);
   }
+
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
 
   @Post()
   @HttpCode(HttpStatus.OK)
@@ -63,6 +72,8 @@ export class ServiceSpaceController {
   async create(@Body() dto: CreateSpaceDto): Promise<{ id: string; slug: string; name: string | null }> {
     return this.service.create(dto);
   }
+
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
 
   @Patch(':spaceId')
   @HttpCode(HttpStatus.OK)
@@ -75,6 +86,8 @@ export class ServiceSpaceController {
     return { ok: true };
   }
 
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
   @Post(':spaceId/archive')
   @HttpCode(HttpStatus.OK)
   @RequireServiceScope(ServiceScope.SpacesWrite)
@@ -83,6 +96,8 @@ export class ServiceSpaceController {
     return { ok: true };
   }
 
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
   @Post(':spaceId/unarchive')
   @HttpCode(HttpStatus.OK)
   @RequireServiceScope(ServiceScope.SpacesWrite)
@@ -90,6 +105,8 @@ export class ServiceSpaceController {
     await this.service.unarchive(spaceId);
     return { ok: true };
   }
+
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
 
   @Post(':spaceId/members')
   @HttpCode(HttpStatus.OK)
@@ -100,6 +117,8 @@ export class ServiceSpaceController {
   ): Promise<{ memberId: string; userId: string }> {
     return this.service.addMember(spaceId, dto);
   }
+
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
 
   @Patch(':spaceId/members/:memberId')
   @HttpCode(HttpStatus.OK)
@@ -112,6 +131,8 @@ export class ServiceSpaceController {
     await this.service.changeMemberRole(spaceId, memberId, dto.role);
     return { ok: true };
   }
+
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
 
   @Delete(':spaceId/members/:memberId')
   @HttpCode(HttpStatus.OK)

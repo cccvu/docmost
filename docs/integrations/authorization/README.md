@@ -108,3 +108,15 @@ These two specs are the single source of truth for the request/response shapes a
 consumer contract test and the reference platform's provider contract test both derive their canonical bodies
 and caps from `authorization-service.openapi.json`; a drift between the code and this contract fails a test.
 They supersede the retired `contract/pep-pdp.contract.json` fixture.
+
+## Response shape on the east-west surface (incident #181)
+
+Every `/api/service/*` operation and `POST /api/collab/force-disconnect` returns EXACTLY the body its
+OpenAPI schema declares. Docmost's global `{ data, success, status }` response envelope (the upstream
+`TransformHttpResponseInterceptor` registered in `main.ts`) is skipped on this surface via the upstream
+per-handler `@SkipTransform()` decorator on every east-west handler. Two fork specs keep that true:
+`service-bridge/service-scope-coverage.spec.ts` asserts the metadata on every route handler (build-time),
+and `service-bridge/service-bridge.wire.spec.ts` boots the real Fastify pipeline with the interceptor and
+asserts bare bodies against an undecorated negative control (pipeline-time). Until first-run setup creates
+a workspace row, every operation answers the upstream `404 "Workspace not found"`; that exact pair is the
+only response a consumer may read as "no workspace provisioned yet".

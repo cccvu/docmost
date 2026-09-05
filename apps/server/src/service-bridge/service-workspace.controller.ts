@@ -1,4 +1,5 @@
 import { Body, Controller, Get, HttpCode, HttpStatus, Patch, UseGuards } from '@nestjs/common';
+import { SkipTransform } from '../common/decorators/skip-transform.decorator';
 import { RemoteOnlyGuard } from '../authz/mode/remote-only.guard';
 import { RequireServiceScope, ServiceAuthGuard } from './service-auth.guard';
 import { ServiceScope } from './service-scope';
@@ -21,17 +22,23 @@ export class ServiceWorkspaceController {
     private readonly service: ServiceWorkspaceService,
   ) {}
 
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
   @Get('default')
   @RequireServiceScope(ServiceScope.WorkspaceRead)
   async getDefault(): Promise<{ workspaceId: string }> {
     return { workspaceId: await this.workspaces.resolveDefaultWorkspaceId() };
   }
 
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
   @Get('settings')
   @RequireServiceScope(ServiceScope.WorkspaceRead)
   async getSettings(): Promise<WorkspaceSettingsView> {
     return this.service.getSettings();
   }
+
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
 
   @Patch('settings')
   @HttpCode(HttpStatus.OK)
