@@ -7,6 +7,7 @@ import {
   Res,
   UseGuards,
 } from '@nestjs/common';
+import { SkipTransform } from '../common/decorators/skip-transform.decorator';
 import { FastifyReply } from 'fastify';
 import { EnvironmentService } from '../integrations/environment/environment.service';
 import { RemoteOnlyGuard } from '../authz/mode/remote-only.guard';
@@ -35,6 +36,8 @@ export class ServiceBridgeController {
     private readonly workspaces: WorkspaceResolver,
   ) {}
 
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
   @Post('users')
   @HttpCode(HttpStatus.OK)
   @RequireServiceScope(ServiceScope.UsersProvision)
@@ -44,6 +47,8 @@ export class ServiceBridgeController {
     return this.service.provisionShadowUser(dto);
   }
 
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
   @Post('users/resolve')
   @HttpCode(HttpStatus.OK)
   @RequireServiceScope(ServiceScope.UsersResolve)
@@ -52,6 +57,8 @@ export class ServiceBridgeController {
     const workspaceId = await this.workspaces.resolveUserWorkspaceId(dto.userId);
     return { userId: dto.userId, workspaceId };
   }
+
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
 
   @Post('session')
   @HttpCode(HttpStatus.OK)

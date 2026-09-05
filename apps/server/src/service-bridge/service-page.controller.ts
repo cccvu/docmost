@@ -9,6 +9,7 @@ import {
   Post,
   UseGuards,
 } from '@nestjs/common';
+import { SkipTransform } from '../common/decorators/skip-transform.decorator';
 import { RemoteOnlyGuard } from '../authz/mode/remote-only.guard';
 import { RequireServiceScope, ServiceAuthGuard } from './service-auth.guard';
 import { ServiceScope } from './service-scope';
@@ -28,12 +29,16 @@ import { ResolvePageSpaceDto } from './dto/content-read.dto';
 export class ServicePageController {
   constructor(private readonly content: ServiceContentService) {}
 
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
   @Post('resolve-space')
   @HttpCode(HttpStatus.OK)
   @RequireServiceScope(ServiceScope.PagesRead)
   async resolveSpace(@Body() dto: ResolvePageSpaceDto): Promise<{ pageId: string; spaceId: string }> {
     return this.content.resolvePageSpace(dto);
   }
+
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
 
   @Get(':pageId/permissions')
   @RequireServiceScope(ServiceScope.ContentRead)

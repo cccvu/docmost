@@ -1,4 +1,5 @@
 import { Body, Controller, HttpCode, HttpStatus, Post, UseGuards } from '@nestjs/common';
+import { SkipTransform } from '../../common/decorators/skip-transform.decorator';
 import { IsUUID } from 'class-validator';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 import { CollaborationGateway } from '../../collaboration/collaboration.gateway';
@@ -29,6 +30,7 @@ export class CollabDisconnectController {
   ) {}
 
   @HttpCode(HttpStatus.OK)
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
   @Post('force-disconnect')
   async forceDisconnect(@Body() dto: ForceDisconnectDto): Promise<{ disconnected: boolean }> {
     const canAccess = await this.pagePermissionRepo.canUserAccessPage(dto.userId, dto.pageId);

@@ -1,7 +1,8 @@
 import 'reflect-metadata';
 import { readFileSync } from 'fs';
 import { join } from 'path';
-import { PATH_METADATA, METHOD_METADATA } from '@nestjs/common/constants';
+import { PATH_METADATA, METHOD_METADATA, MODULE_METADATA } from '@nestjs/common/constants';
+import { ServiceBridgeModule } from './service-bridge.module';
 import { RequestMethod } from '@nestjs/common';
 import { ServiceBridgeController } from './service-bridge.controller';
 import { ServiceWorkspaceController } from './service-workspace.controller';
@@ -31,14 +32,12 @@ const SPEC = JSON.parse(
   components: { schemas: Record<string, any> };
 };
 
-const CONTROLLERS = [
-  ServiceBridgeController,
-  ServiceWorkspaceController,
-  ServiceSpaceController,
-  ServicePageController,
-  ServiceContentController,
-  AuthzChangeController,
-];
+// Derived from ServiceBridgeModule so a newly registered controller is always compared against the spec.
+const CONTROLLERS = Reflect.getMetadata(MODULE_METADATA.CONTROLLERS, ServiceBridgeModule) as Array<
+  new (...args: any[]) => unknown
+>;
+// The reviewed set (kept as imports so a removal from the module is a visible diff here too).
+void [ServiceBridgeController, ServiceWorkspaceController, ServiceSpaceController, ServicePageController, ServiceContentController, AuthzChangeController];
 
 const METHOD_NAME: Record<number, string> = {
   [RequestMethod.GET]: 'get',

@@ -9,6 +9,7 @@ import {
   Post,
   UseGuards,
 } from '@nestjs/common';
+import { SkipTransform } from '../common/decorators/skip-transform.decorator';
 import { RemoteOnlyGuard } from '../authz/mode/remote-only.guard';
 import { RequireServiceScope, ServiceAuthGuard } from './service-auth.guard';
 import { ServiceScope } from './service-scope';
@@ -32,6 +33,8 @@ import { ContentListDto } from './dto/content-read.dto';
 export class ServiceContentController {
   constructor(private readonly content: ServiceContentService) {}
 
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
   @Post('pages/list')
   @HttpCode(HttpStatus.OK)
   @RequireServiceScope(ServiceScope.ContentRead)
@@ -39,12 +42,16 @@ export class ServiceContentController {
     return this.content.listPagesByIds(dto);
   }
 
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
   @Post('spaces/list')
   @HttpCode(HttpStatus.OK)
   @RequireServiceScope(ServiceScope.ContentRead)
   async listSpaces(@Body() dto: ContentListDto): Promise<{ items: PublicSpaceSummary[] }> {
     return this.content.listSpacesByIds(dto);
   }
+
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
 
   @Get('spaces/:spaceId')
   @RequireServiceScope(ServiceScope.ContentRead)

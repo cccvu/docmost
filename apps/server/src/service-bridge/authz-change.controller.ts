@@ -7,6 +7,7 @@ import {
   Query,
   UseGuards,
 } from '@nestjs/common';
+import { SkipTransform } from '../common/decorators/skip-transform.decorator';
 import { RemoteOnlyGuard } from '../authz/mode/remote-only.guard';
 import { RequireServiceScope, ServiceAuthGuard } from './service-auth.guard';
 import { ServiceScope } from './service-scope';
@@ -37,6 +38,8 @@ export class AuthzChangeController {
     private readonly snapshot: AuthzSnapshotService,
   ) {}
 
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
   @Get('changes')
   @RequireServiceScope(ServiceScope.ChangesRead)
   async changes(
@@ -53,6 +56,8 @@ export class AuthzChangeController {
       throw e;
     }
   }
+
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
 
   @Get('snapshot')
   @RequireServiceScope(ServiceScope.ChangesRead)
