@@ -13,7 +13,7 @@ import { KyselyDB } from '@docmost/db/types/kysely.types';
 import { EnvironmentService } from '../integrations/environment/environment.service';
 import { normalizePostgresUrl } from '../common/helpers';
 import { AUTHZ_MODE, AuthzMode } from '../authz/mode/authz-mode';
-import { AuthzChangeEvent, mapOutboxRow, OutboxRow } from './authz-change-event';
+import { AuthzChangeEvent, mapOutboxRow, OutboxRow, isExpectedSkip } from './authz-change-event';
 
 const NOTIFY_CHANNEL = 'authz_outbox';
 const MAX_WAIT_MS = 25_000;
@@ -213,9 +213,19 @@ export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
     }
 
     const events: AuthzChangeEvent[] = [];
+    const dropped: string[] = [];
     for (const r of raw) {
       const ev = mapOutboxRow(r.row);
       if (ev) events.push(ev);
+      else if (!isExpectedSkip(r.row)) dropped.push(`${r.row.tableName}:id=${r.row.id}:op=${r.row.op}`);
+    }
+    if (dropped.length > 0) {
+      // DETECTOR for the incident #181 class (a key-shape mismatch silently dropped every live event for a release):
+      // a row from a table the mapper knows that still maps to nothing is a defect, never a routine skip. The cursor
+      // still advances (below) so the feed cannot wedge; the reconciler is the backstop. Greppable marker.
+      this.logger.warn(
+        `AUTHZ_CHANGE_EVENT_DROPPED count=${dropped.length} rows=[${dropped.join(',')}] a known authz table row did not map to an event (payload shape or mapper defect); the cursor advances past it and the reconciler is the backstop`,
+      );
     }
     // Advance past every RAW safe row read (including null-mapping/skipped rows), so a skipped row never
     // re-delivers. Unchanged from `after` when nothing safe followed it.

@@ -94,6 +94,18 @@ const str = (v: unknown): string | null => (typeof v === 'string' && v.length > 
  * `removed` normalizes BOTH a hard DELETE and an UPDATE that set `deleted_at` (the `space_members`/`spaces`
  * hard-vs-soft divergence); `group_users`/`page_access`/`page_permissions` are hard-delete only.
  */
+/** Tables `mapOutboxRow` knows. A row from one of these that still maps to `null` is a payload-shape or mapper
+ *  defect (incident #181: every live event was dropped this way for a whole release), EXCEPT the one documented
+ *  no-op above (a `page_permissions` cascade DELETE whose `page_id` could not be resolved). */
+const AUTHZ_TABLES = new Set(['spaces', 'space_members', 'group_users', 'pages', 'page_access', 'page_permissions']);
+
+/** True when a `null` mapping for this row is EXPECTED (unknown table, or the documented page_permissions cascade
+ *  no-op); false means the feed must flag it (`AUTHZ_CHANGE_EVENT_DROPPED`). */
+export function isExpectedSkip(row: OutboxRow): boolean {
+  if (!AUTHZ_TABLES.has(row.tableName)) return true;
+  return row.tableName === 'page_permissions' && row.op === 'DELETE';
+}
+
 export function mapOutboxRow(row: OutboxRow): AuthzChangeEvent | null {
   const p = row.payload; // SNAKE_CASE keys (the stored jsonb, parsed off the wire) — see OutboxRow.
   const isDelete = row.op === 'DELETE';

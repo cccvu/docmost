@@ -107,6 +107,27 @@ describe('AuthzChangeFeedService (R2 commit-safe cursor)', () => {
     expect(res.nextCursor).toBe('50.7'); // advanced past the skipped id 7, in (xact_id, id) space
   });
 
+  it('warns AUTHZ_CHANGE_EVENT_DROPPED when a KNOWN authz table row does not map (defect detector, incident #181) and stays silent for unknown tables', async () => {
+    // The second #181 defect (every live event dropped by a key-shape mismatch) survived a whole release because a
+    // null mapping was silent. A row from a table the mapper KNOWS that still maps to null is a mapper/payload
+    // defect and must leave a greppable marker; rows from tables the mapper ignores stay a silent skip.
+    const rows = [
+      memberRow(6, '50'),
+      { id: 7, op: 'INSERT', table_name: 'space_members', payload_json: JSON.stringify({ user_id: 'u1', role: 'reader' }), xact_id: '50' }, // known table, no space_id -> null
+      { id: 8, op: 'INSERT', table_name: 'users', payload_json: JSON.stringify({ id: 'u9' }), xact_id: '50' }, // unknown table -> silent skip
+    ];
+    const { svc } = feed(responder({ head: { xact_id: '50', id: '8' }, rows, oldestAgeMs: null }));
+    const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+    const res = await svc.getChanges('49.0', 0, 500);
+    expect(res.events).toHaveLength(1);
+    expect(res.nextCursor).toBe('50.8'); // the cursor still advances past the dropped row (the reconciler is the backstop)
+    const dropped = warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('AUTHZ_CHANGE_EVENT_DROPPED'));
+    expect(dropped).toHaveLength(1);
+    expect(dropped[0]).toContain('space_members');
+    expect(dropped[0]).toContain('id=7');
+    expect(dropped[0]).not.toContain('users');
+  });
+
   it('surfaces oldestPendingAgeMs from the feed (fork-provided, no platform DB query)', async () => {
     const { svc } = feed(responder({ head: { xact_id: '50', id: '7' }, rows: [memberRow(6, '50')], oldestAgeMs: 4200 }));
     const res = await svc.getChanges('49.0', 0, 500);
