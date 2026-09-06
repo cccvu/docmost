@@ -164,3 +164,60 @@ describe('AuthzChangeFeedService (R2 commit-safe cursor)', () => {
     expect(res.nextCursor).toBe('50.6');
   });
 });
+
+/** The same env reading as the service (module-load constant, default 7). */
+const RETENTION_DAYS = (() => {
+  const n = Number.parseInt(process.env.AUTHZ_OUTBOX_RETENTION_DAYS ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : 7;
+})();
+
+/** Route the sweep's queries: the retention DELETE (returning the reclaimed tuples), the mark UPDATE, and the
+ *  post-sweep mark read. `mark: null` models a missing gc singleton row. */
+const gcResponder =
+  (opts: { deleted?: { xact_id: string; id: string }[]; mark?: { xact_id: string; id: string } | null }) =>
+  (q: SpyQuery): unknown[] => {
+    const text = q.sql.trim();
+    if (text.startsWith('delete from authz_outbox')) return opts.deleted ?? [];
+    if (text.startsWith('update authz_outbox_gc')) return [];
+    if (text.startsWith('select') && text.includes('authz_outbox_gc')) {
+      if (opts.mark === null) return [];
+      return [opts.mark ?? { xact_id: '0', id: '0' }];
+    }
+    return [];
+  };
+
+describe('AuthzChangeFeedService gc() sweep observability (AUTHZ_OUTBOX_GC_SWEEP)', () => {
+  const sweep = async (respond: (q: SpyQuery) => unknown[]) => {
+    const { svc, spy } = feed(respond);
+    const log = jest.spyOn((svc as any).logger, 'log').mockImplementation(() => undefined);
+    const warn = jest.spyOn((svc as any).logger, 'warn').mockImplementation(() => undefined);
+    await (svc as unknown as { gc(): Promise<void> }).gc();
+    const lines = log.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('AUTHZ_OUTBOX_GC_SWEEP'));
+    return { lines, log, warn, spy };
+  };
+
+  it('logs AUTHZ_OUTBOX_GC_SWEEP on a no-op sweep (nothing reclaimed) with the current mark', async () => {
+    // Every hourly sweep leaves exactly one greppable line, even when it removed nothing, so an operator can
+    // tell "the sweep ran and found nothing" from "the sweep never ran" (the S2 observability gap).
+    const { lines, warn } = await sweep(gcResponder({ deleted: [], mark: { xact_id: '40', id: '2' } }));
+    expect(lines).toEqual([`AUTHZ_OUTBOX_GC_SWEEP removed=0 mark=40.2 retentionDays=${RETENTION_DAYS}`]);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('reports mark=none on a no-op sweep when nothing has ever been reclaimed (the zero mark)', async () => {
+    const { lines } = await sweep(gcResponder({ deleted: [], mark: { xact_id: '0', id: '0' } }));
+    expect(lines).toEqual([`AUTHZ_OUTBOX_GC_SWEEP removed=0 mark=none retentionDays=${RETENTION_DAYS}`]);
+  });
+
+  it('logs AUTHZ_OUTBOX_GC_SWEEP on a reclaiming sweep with the count and the mark after the sweep', async () => {
+    // Two reclaimed tuples; the mark read back after the sweep is the max tuple (the existing detail line stays).
+    const deleted = [
+      { xact_id: '50', id: '3' },
+      { xact_id: '51', id: '2' },
+    ];
+    const { lines, log } = await sweep(gcResponder({ deleted, mark: { xact_id: '51', id: '2' } }));
+    expect(lines).toEqual([`AUTHZ_OUTBOX_GC_SWEEP removed=2 mark=51.2 retentionDays=${RETENTION_DAYS}`]);
+    const detail = log.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('retention sweep removed 2 rows'));
+    expect(detail).toHaveLength(1);
+  });
+});

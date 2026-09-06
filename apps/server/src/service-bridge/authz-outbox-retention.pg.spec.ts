@@ -204,6 +204,10 @@ d('AuthzChangeFeedService retention on real Postgres (gc sweep + stale-cursor ma
     expect(logSpy).toHaveBeenCalledWith(
       expect.stringContaining(`removed 2 rows older than ${RETENTION_DAYS}d (gc mark -> ${cursorOf(r2)})`),
     );
+    // The unconditional per-sweep line carries the mark the table actually holds after the sweep (S2).
+    expect(logSpy).toHaveBeenCalledWith(
+      `AUTHZ_OUTBOX_GC_SWEEP removed=2 mark=${cursorOf(r2)} retentionDays=${RETENTION_DAYS}`,
+    );
 
     // Idle sweep: nothing to delete, the mark is untouched.
     await gc();
