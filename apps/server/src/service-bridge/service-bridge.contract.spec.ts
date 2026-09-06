@@ -11,6 +11,9 @@ import { ServicePageController } from './service-page.controller';
 import { ServiceContentController } from './service-content.controller';
 import { AuthzChangeController } from './authz-change.controller';
 import { CONTENT_LIST_MAX_IDS, CONTENT_LIST_MAX_LIMIT } from './dto/content-read.dto';
+import { AuthzChangeEvent, AuthzChangeEventType } from './authz-change-event';
+import { ChangesResult } from './authz-change-feed.service';
+import { SnapshotResult } from './authz-snapshot.service';
 
 /**
  * Provider-side contract test: the routes the fork actually implements MUST equal the operations declared in
@@ -101,5 +104,49 @@ describe('service-bridge.openapi.json is the canonical inbound contract (provide
     const req = SPEC.components.schemas.ContentListRequest.properties;
     expect(req.ids.maxItems).toBe(CONTENT_LIST_MAX_IDS);
     expect(req.limit.maximum).toBe(CONTENT_LIST_MAX_LIMIT);
+  });
+
+  // ---- Feed-schema tether, provider half (issue #179) -----------------------------------------------------
+  // The fork's typed change feed (every `AuthzChangeEvent` variant, and `ChangesResult` / `SnapshotResult` as
+  // the controller returns them) vs what this document DECLARES in `components.schemas`. The key maps are typed
+  // against the fork's own types (`Record<keyof T, true>` + excess-property checks), so a fork-side rename
+  // fails to COMPILE and a document-side rename fails the closed-set comparison: a renamed wire key cannot pass
+  // from either direction. The platform's consumer contract test pins its client types to the same document,
+  // so the two halves close the loop through the document.
+  type KeysOf<T extends AuthzChangeEventType> = Record<keyof Extract<AuthzChangeEvent, { type: T }>, true>;
+  const FORK_EVENT_KEYS: { [T in AuthzChangeEventType]: KeysOf<T> } = {
+    SpaceChanged: { seq: true, type: true, spaceId: true, workspaceId: true, deleted: true },
+    SpaceMemberChanged: { seq: true, type: true, spaceId: true, userId: true, groupId: true, role: true, removed: true },
+    GroupMemberChanged: { seq: true, type: true, groupId: true, userId: true, removed: true },
+    PageStructureChanged: { seq: true, type: true, pageId: true, spaceId: true, parentPageId: true, deleted: true },
+    PageRestrictionChanged: { seq: true, type: true, pageId: true, restricted: true },
+    PagePermissionChanged: { seq: true, type: true, pageId: true, userId: true, groupId: true, role: true, removed: true },
+  };
+  const FORK_CHANGES_KEYS: Record<keyof ChangesResult, true> = { events: true, nextCursor: true, head: true, oldestPendingAgeMs: true };
+  const FORK_SNAPSHOT_KEYS: Record<keyof SnapshotResult, true> = { events: true, nextCursor: true, baseline: true };
+  const sortedKeys = (o: object): string[] => Object.keys(o).sort();
+
+  /** `properties` as a closed key set, and `required` (when declared) as the same set. */
+  const closedKeys = (schema: any, expected: string[]): void => {
+    expect(schema.additionalProperties).toBe(false); // closed: a renamed key is a removed key, never an extra
+    expect(sortedKeys(schema.properties)).toEqual(expected);
+    if (schema.required) expect([...schema.required].sort()).toEqual(expected);
+  };
+
+  it('#179 tether (provider): every AuthzChangeEvent variant in the document has exactly the keys the fork type emits (closed set)', () => {
+    const variants: any[] = SPEC.components.schemas.AuthzChangeEvent.oneOf;
+    const documentKeys: Record<string, string[]> = {};
+    for (const v of variants) {
+      expect(v.additionalProperties).toBe(false);
+      if (v.required) expect([...v.required].sort()).toEqual(sortedKeys(v.properties));
+      documentKeys[v.properties.type.const] = sortedKeys(v.properties);
+    }
+    const forkKeys = Object.fromEntries(Object.entries(FORK_EVENT_KEYS).map(([t, k]) => [t, sortedKeys(k)]));
+    expect(documentKeys).toEqual(forkKeys);
+  });
+
+  it('#179 tether (provider): the changes and snapshot response schemas have exactly the keys the controller returns', () => {
+    closedKeys(SPEC.components.schemas.AuthzChangesResponse, sortedKeys(FORK_CHANGES_KEYS));
+    closedKeys(SPEC.components.schemas.AuthzSnapshotResponse, sortedKeys(FORK_SNAPSHOT_KEYS));
   });
 });

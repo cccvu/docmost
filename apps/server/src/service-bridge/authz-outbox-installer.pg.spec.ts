@@ -25,10 +25,11 @@ import { AuthzChangeEvent, isExpectedSkip } from './authz-change-event';
  *     + the bigint parser of database.module.ts) into the expected typed `AuthzChangeEvent`, with the feed's
  *     `AUTHZ_CHANGE_EVENT_DROPPED` detector never firing.
  *
- * Runs only when AUTHZ_TEST_PG_URL points at a PostgreSQL 13+ instance (a throwaway `postgres:18` container or
- * the local compose PG); otherwise it self-skips so the Docker-less unit lane stays green. The dedicated
- * `docmost-authz-pg` CI job provisions Postgres and sets the URL so this gate always runs there. The spec owns a
- * private schema (search_path) so it can share one database with the sibling pg specs under parallel workers.
+ * Runs only when AUTHZ_TEST_PG_URL points at a THROWAWAY PostgreSQL 13+ instance (a `postgres:18` container the
+ * run owns, never the shared compose PG); otherwise it self-skips so the Docker-less unit lane stays green. The
+ * dedicated `docmost-authz-pg` CI job provisions Postgres, sets the URL and runs the pg specs IN BAND: this spec
+ * owns a private schema (search_path), but the pre-existing commit-safety spec assumes a quiet cluster
+ * (`pg_snapshot_xmin` is cluster-wide, not schema-isolated), so the pg specs must not share the engine concurrently.
  */
 const PG_URL = process.env.AUTHZ_TEST_PG_URL;
 const d = PG_URL ? describe : describe.skip;
@@ -201,8 +202,12 @@ d('AuthzOutboxInstaller on real Postgres (legacy upgrade, idempotence, trigger c
 
   afterAll(async () => {
     ENV.forEach((k) => (savedEnv[k] === undefined ? delete process.env[k] : (process.env[k] = savedEnv[k])));
-    await db?.destroy?.();
-    await pg?.end?.({ timeout: 5 });
+    // Bounded teardown: a timed-out case can leave a query in flight, and Kysely's `destroy()` is an UNBOUNDED
+    // `postgres.end()` that would then wedge the worker. Close both pools with a timeout, each independently,
+    // so one failure never skips the other; any failure is still surfaced after both have been attempted.
+    const closed = await Promise.allSettled([appPg?.end?.({ timeout: 5 }), pg?.end?.({ timeout: 5 })]);
+    const failed = closed.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+    if (failed) throw failed.reason;
   });
 
   beforeEach(async () => {
@@ -364,9 +369,10 @@ d('AuthzOutboxInstaller on real Postgres (legacy upgrade, idempotence, trigger c
     };
     const row = (op: string, table: string) => ({ op, table, t: 'object' });
 
-    // (b) The REAL feed under the production Kysely config, cursored like the platform relay. The commit-safety
-    //     spec (same database, parallel worker) holds transactions open on purpose, which moves the cluster-wide
-    //     xmin and can briefly WITHHOLD settled rows; poll (bounded) until the expected count has been served.
+    // (b) The REAL feed under the production Kysely config, cursored like the platform relay. The feed is gated
+    //     by the cluster-wide `pg_snapshot_xmin`, so ANY xid-bearing transaction held open on the engine (a
+    //     sibling spec's, were the lane not run in band) briefly WITHHOLDS settled rows; poll (bounded, 15 s)
+    //     until the expected count has been served. The case's own jest timeout (30 s) sits above that deadline.
     let cursor = '0.0';
     const drain = async (expected: number): Promise<AuthzChangeEvent[]> => {
       const out: AuthzChangeEvent[] = [];
@@ -709,5 +715,5 @@ d('AuthzOutboxInstaller on real Postgres (legacy upgrade, idempotence, trigger c
     expect(cursor).toMatch(new RegExp(`^\\d+\\.${lastId}$`));
     const dropped = warnSpy.mock.calls.filter((c) => String(c[0]).includes('AUTHZ_CHANGE_EVENT_DROPPED'));
     expect(dropped).toEqual([]);
-  });
+  }, 30_000);
 });
