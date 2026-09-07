@@ -138,7 +138,7 @@ export function AppHeader() {
                   component={Link}
                   to="/ai"
                   variant="subtle"
-                  color="dark"
+                  color="gray"
                   size="sm"
                   hiddenFrom="sm"
                   aria-label={t("AI Chat")}

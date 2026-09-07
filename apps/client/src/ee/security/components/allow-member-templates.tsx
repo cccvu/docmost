@@ -1,4 +1,4 @@
-import { Group, Text, Switch, Tooltip } from "@mantine/core";
+import { Group, Text, Switch } from "@mantine/core";
 import { useAtom } from "jotai";
 import { workspaceAtom } from "@/features/user/atoms/current-user-atom.ts";
 import { useState } from "react";
@@ -7,10 +7,14 @@ import { updateWorkspace } from "@/features/workspace/services/workspace-service
 import { notifications } from "@mantine/notifications";
 import { useHasFeature } from "@/ee/hooks/use-feature";
 import { Feature } from "@/ee/features";
-import { useUpgradeLabel } from "@/ee/hooks/use-upgrade-label.ts";
 
 export default function AllowMemberTemplates() {
   const { t } = useTranslation();
+  const hasTemplates = useHasFeature(Feature.TEMPLATES);
+
+  // CCC: HIDE the whole row (description + toggle) when templates aren't
+  // available, rather than showing it with a disabled control. Internal tool.
+  if (!hasTemplates) return null;
 
   return (
     <Group justify="space-between" wrap="nowrap" gap="xl">
@@ -35,7 +39,6 @@ function AllowMemberTemplatesToggle() {
     workspace?.settings?.templates?.allowMemberTemplates === true,
   );
   const hasTemplates = useHasFeature(Feature.TEMPLATES);
-  const upgradeLabel = useUpgradeLabel();
 
   const handleChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const value = event.currentTarget.checked;
@@ -53,14 +56,14 @@ function AllowMemberTemplatesToggle() {
     }
   };
 
+  // CCC: HIDE the control when templates aren't available. Internal tool.
+  if (!hasTemplates) return null;
+
   return (
-    <Tooltip label={upgradeLabel} disabled={hasTemplates} refProp="rootRef">
-      <Switch
-        checked={checked}
-        onChange={handleChange}
-        disabled={!hasTemplates}
-        aria-label={t("Toggle allow members to create templates")}
-      />
-    </Tooltip>
+    <Switch
+      checked={checked}
+      onChange={handleChange}
+      aria-label={t("Toggle allow members to create templates")}
+    />
   );
 }

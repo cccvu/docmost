@@ -1,4 +1,4 @@
-import { Text, Switch, Tooltip } from "@mantine/core";
+import { Text, Switch } from "@mantine/core";
 import { useAtom } from "jotai";
 import { workspaceAtom } from "@/features/user/atoms/current-user-atom.ts";
 import React, { useState } from "react";
@@ -12,7 +12,6 @@ import {
   ResponsiveSettingsContent,
   ResponsiveSettingsControl,
 } from "@/components/ui/responsive-settings-row";
-import { useUpgradeLabel } from "@/ee/hooks/use-upgrade-label.ts";
 
 export default function RestrictApiToAdmins() {
   const { t } = useTranslation();
@@ -21,7 +20,6 @@ export default function RestrictApiToAdmins() {
     workspace?.settings?.api?.restrictToAdmins === true,
   );
   const hasAccess = useHasFeature(Feature.API_KEYS);
-  const upgradeLabel = useUpgradeLabel();
 
   const handleChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const value = event.currentTarget.checked;
@@ -39,6 +37,8 @@ export default function RestrictApiToAdmins() {
     }
   };
 
+  if (!hasAccess) return null;
+
   return (
     <ResponsiveSettingsRow>
       <ResponsiveSettingsContent>
@@ -53,18 +53,11 @@ export default function RestrictApiToAdmins() {
       </ResponsiveSettingsContent>
 
       <ResponsiveSettingsControl>
-        <Tooltip
-          label={upgradeLabel}
-          disabled={hasAccess}
-          refProp="rootRef"
-        >
-          <Switch
-            checked={checked}
-            onChange={handleChange}
-            disabled={!hasAccess}
-            aria-label={t("Toggle restrict API keys to admins")}
-          />
-        </Tooltip>
+        <Switch
+          checked={checked}
+          onChange={handleChange}
+          aria-label={t("Toggle restrict API keys to admins")}
+        />
       </ResponsiveSettingsControl>
     </ResponsiveSettingsRow>
   );

@@ -1,5 +1,5 @@
 import { AppShell, Container } from "@mantine/core";
-import React, { useEffect, useRef, useState } from "react";
+import React from "react";
 import { useLocation } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import SettingsSidebar from "@/components/settings/settings-sidebar.tsx";
@@ -8,7 +8,6 @@ import {
   asideStateAtom,
   desktopSidebarAtom,
   mobileSidebarAtom,
-  sidebarWidthAtom,
 } from "@/components/layouts/global/hooks/atoms/sidebar-atom.ts";
 import { SpaceSidebar } from "@/features/space/components/sidebar/space-sidebar.tsx";
 import AiChatSidebar from "@/ee/ai-chat/components/ai-chat-sidebar.tsx";
@@ -26,8 +25,6 @@ import {
   HEADER_HEIGHT,
   NAVBAR_BREAKPOINT,
   RAIL_WIDTH,
-  SIDEBAR_MAX_WIDTH,
-  SIDEBAR_MIN_WIDTH,
   SIDEBAR_WIDTH,
 } from "@/features/layout/layout-tokens.ts";
 
@@ -42,48 +39,6 @@ export default function GlobalAppShell({
   const toggleMobile = useToggleSidebar(mobileSidebarAtom);
   const [desktopOpened] = useAtom(desktopSidebarAtom);
   const [{ isAsideOpen, tab: asideTab }] = useAtom(asideStateAtom);
-  const [sidebarWidth, setSidebarWidth] = useAtom(sidebarWidthAtom);
-  const [isResizing, setIsResizing] = useState(false);
-  const sidebarRef = useRef(null);
-
-  const startResizing = React.useCallback((mouseDownEvent) => {
-    mouseDownEvent.preventDefault();
-    setIsResizing(true);
-  }, []);
-
-  const stopResizing = React.useCallback(() => {
-    setIsResizing(false);
-  }, []);
-
-  const resize = React.useCallback(
-    (mouseMoveEvent) => {
-      if (isResizing) {
-        const newWidth =
-          mouseMoveEvent.clientX -
-          sidebarRef.current.getBoundingClientRect().left;
-        if (newWidth < SIDEBAR_MIN_WIDTH) {
-          setSidebarWidth(SIDEBAR_MIN_WIDTH);
-          return;
-        }
-        if (newWidth > SIDEBAR_MAX_WIDTH) {
-          setSidebarWidth(SIDEBAR_MAX_WIDTH);
-          return;
-        }
-        setSidebarWidth(newWidth);
-      }
-    },
-    [isResizing],
-  );
-
-  useEffect(() => {
-    //https://codesandbox.io/p/sandbox/kz9de
-    window.addEventListener("mousemove", resize);
-    window.addEventListener("mouseup", stopResizing);
-    return () => {
-      window.removeEventListener("mousemove", resize);
-      window.removeEventListener("mouseup", stopResizing);
-    };
-  }, [resize, stopResizing]);
 
   const location = useLocation();
   const isSettingsRoute = location.pathname.startsWith("/settings");
@@ -111,16 +66,18 @@ export default function GlobalAppShell({
       header={{ height: HEADER_HEIGHT }}
       navbar={{
         // CCC: on desktop (sm+) EVERY sidebar becomes a RAIL_WIDTH icon rail when
-        // "collapsed" rather than hiding — including the resizable space page-tree,
-        // whose expanded width tracks `sidebarWidth`. Below the breakpoint the navbar
-        // is the full-width mobile OVERLAY (SIDEBAR_WIDTH): the rail styles are gated
-        // to sm+ in each sidebar's module.css, and `isRail` persists via localStorage,
-        // so a plain (non-responsive) rail width would leave a below-sm viewer with a
-        // 52px overlay clipping the still-rendered full tree. Keep `base` responsive on
-        // EVERY route so the mobile overlay never inherits the desktop rail width.
+        // "collapsed" rather than hiding, and expands to the SAME fixed SIDEBAR_WIDTH
+        // on every route (home / space page-tree / settings / AI) — no per-view width
+        // and no drag-to-resize, so the panel reads identically wherever you are.
+        // Below the breakpoint the navbar is the full-width mobile OVERLAY
+        // (SIDEBAR_WIDTH): the rail styles are gated to sm+ in each sidebar's
+        // module.css, and `isRail` persists via localStorage, so a plain
+        // (non-responsive) rail width would leave a below-sm viewer with a 52px overlay
+        // clipping the still-rendered full tree. Keep `base` responsive on EVERY route
+        // so the mobile overlay never inherits the desktop rail width.
         width: {
           base: SIDEBAR_WIDTH,
-          sm: isRail ? RAIL_WIDTH : isSpaceRoute ? sidebarWidth : SIDEBAR_WIDTH,
+          sm: isRail ? RAIL_WIDTH : SIDEBAR_WIDTH,
         },
         breakpoint: NAVBAR_BREAKPOINT,
         collapsed: {
@@ -145,7 +102,6 @@ export default function GlobalAppShell({
       <AppShell.Navbar
         className={classes.navbar}
         withBorder={false}
-        ref={sidebarRef}
         aria-label={
           isSpaceRoute
             ? t("Space navigation")
@@ -156,10 +112,6 @@ export default function GlobalAppShell({
                 : t("Main navigation")
         }
       >
-        {/* No drag-to-resize while railed — the rail is a fixed 52px. */}
-        {isSpaceRoute && !isRail && (
-          <div className={classes.resizeHandle} onMouseDown={startResizing} />
-        )}
         {isSpaceRoute && <SpaceSidebar collapsed={isRail} />}
         {isSettingsRoute && <SettingsSidebar collapsed={isRail} />}
         {isAiRoute && <AiChatSidebar collapsed={isRail} />}

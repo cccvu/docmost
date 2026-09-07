@@ -4,9 +4,7 @@ import {
   Indicator,
   Loader,
   Modal,
-  Stack,
   Tabs,
-  Text,
   Center,
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
@@ -88,7 +86,11 @@ export function PageShareModal({ readOnly }: PageShareModalProps) {
       >
         <Tabs value={activeTab} color="dark" onChange={setActiveTab}>
           <Tabs.List mb="md">
-            <Tabs.Tab value="access">{t("Access")}</Tabs.Tab>
+            {/* CCC hide-paid: page permissions is enterprise-only; hide the whole
+                Access tab when unavailable instead of showing an upgrade message. */}
+            {hasPagePermissions && (
+              <Tabs.Tab value="access">{t("Access")}</Tabs.Tab>
+            )}
             <Tabs.Tab
               value="publish"
               rightSection={
@@ -101,30 +103,20 @@ export function PageShareModal({ readOnly }: PageShareModalProps) {
             </Tabs.Tab>
           </Tabs.List>
 
-          <Tabs.Panel value="access">
-            {!hasPagePermissions ? (
-              <Stack align="center" py="md">
-                <IconLock size={20} stroke={1.5} />
-                <Text size="sm" ta="center" fw={500}>
-                  {t("Page permissions")}
-                </Text>
-                <Text size="sm" c="dimmed" ta="center">
-                  {t(
-                    "Control who can view and edit individual pages. Available with an enterprise license.",
-                  )}
-                </Text>
-              </Stack>
-            ) : restrictionLoading || !pageId || !restrictionInfo ? (
-              <Center py="xl">
-                <Loader size="sm" />
-              </Center>
-            ) : (
-              <PagePermissionTab
-                pageId={pageId}
-                restrictionInfo={restrictionInfo}
-              />
-            )}
-          </Tabs.Panel>
+          {hasPagePermissions && (
+            <Tabs.Panel value="access">
+              {restrictionLoading || !pageId || !restrictionInfo ? (
+                <Center py="xl">
+                  <Loader size="sm" />
+                </Center>
+              ) : (
+                <PagePermissionTab
+                  pageId={pageId}
+                  restrictionInfo={restrictionInfo}
+                />
+              )}
+            </Tabs.Panel>
+          )}
 
           <Tabs.Panel value="publish">
             <PublishTab

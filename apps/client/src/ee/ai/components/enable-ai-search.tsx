@@ -1,4 +1,4 @@
-import { Group, Text, Switch, MantineSize, Tooltip } from "@mantine/core";
+import { Group, Text, Switch, MantineSize } from "@mantine/core";
 import { useAtom } from "jotai";
 import { workspaceAtom } from "@/features/user/atoms/current-user-atom.ts";
 import React, { useState } from "react";
@@ -7,10 +7,12 @@ import { updateWorkspace } from "@/features/workspace/services/workspace-service
 import { notifications } from "@mantine/notifications";
 import { useHasFeature } from "@/ee/hooks/use-feature";
 import { Feature } from "@/ee/features";
-import { useUpgradeLabel } from "@/ee/hooks/use-upgrade-label";
 
 export default function EnableAiSearch() {
   const { t } = useTranslation();
+  const hasAccess = useHasFeature(Feature.AI);
+
+  if (!hasAccess) return null;
 
   return (
     <>
@@ -39,7 +41,6 @@ export function AiSearchToggle({ size, label }: AiSearchToggleProps) {
   const [workspace, setWorkspace] = useAtom(workspaceAtom);
   const [checked, setChecked] = useState(workspace?.settings?.ai?.search);
   const hasAccess = useHasFeature(Feature.AI);
-  const upgradeLabel = useUpgradeLabel();
 
   const handleChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const value = event.currentTarget.checked;
@@ -55,17 +56,16 @@ export function AiSearchToggle({ size, label }: AiSearchToggleProps) {
     }
   };
 
+  if (!hasAccess) return null;
+
   return (
-    <Tooltip label={upgradeLabel} disabled={hasAccess} refProp="rootRef">
-      <Switch
-        size={size}
-        label={label}
-        labelPosition="left"
-        defaultChecked={checked}
-        onChange={handleChange}
-        disabled={!hasAccess}
-        aria-label={t("Toggle AI search")}
-      />
-    </Tooltip>
+    <Switch
+      size={size}
+      label={label}
+      labelPosition="left"
+      defaultChecked={checked}
+      onChange={handleChange}
+      aria-label={t("Toggle AI search")}
+    />
   );
 }

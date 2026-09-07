@@ -1,4 +1,4 @@
-import { Group, Text, Switch, Tooltip } from "@mantine/core";
+import { Group, Text, Switch } from "@mantine/core";
 import { useAtom } from "jotai";
 import { workspaceAtom } from "@/features/user/atoms/current-user-atom.ts";
 import { useState } from "react";
@@ -7,10 +7,16 @@ import { updateWorkspace } from "@/features/workspace/services/workspace-service
 import { notifications } from "@mantine/notifications";
 import { useHasFeature } from "@/ee/hooks/use-feature";
 import { Feature } from "@/ee/features";
-import { useUpgradeLabel } from "@/ee/hooks/use-upgrade-label.ts";
 
 export default function PersonalSpacesSetting() {
   const { t } = useTranslation();
+  const hasPersonalSpaces = useHasFeature(Feature.PERSONAL_SPACES);
+
+  // CCC: HIDE the whole personal-spaces row (descriptive text + toggle) when the
+  // feature isn't available, instead of rendering it disabled. Internal tool.
+  if (!hasPersonalSpaces) {
+    return null;
+  }
 
   return (
     <Group justify="space-between" wrap="nowrap" gap="xl">
@@ -33,7 +39,12 @@ function PersonalSpacesToggle() {
     workspace?.settings?.spaces?.allowPersonal === true,
   );
   const hasPersonalSpaces = useHasFeature(Feature.PERSONAL_SPACES);
-  const upgradeLabel = useUpgradeLabel();
+
+  // CCC: HIDE the toggle when the feature isn't available (was a disabled Switch
+  // with an upgrade tooltip). The control is only rendered when usable.
+  if (!hasPersonalSpaces) {
+    return null;
+  }
 
   const handleChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const value = event.currentTarget.checked;
@@ -52,13 +63,10 @@ function PersonalSpacesToggle() {
   };
 
   return (
-    <Tooltip label={upgradeLabel} disabled={hasPersonalSpaces} refProp="rootRef">
-      <Switch
-        checked={checked}
-        onChange={handleChange}
-        disabled={!hasPersonalSpaces}
-        aria-label={t("Toggle allow personal spaces")}
-      />
-    </Tooltip>
+    <Switch
+      checked={checked}
+      onChange={handleChange}
+      aria-label={t("Toggle allow personal spaces")}
+    />
   );
 }

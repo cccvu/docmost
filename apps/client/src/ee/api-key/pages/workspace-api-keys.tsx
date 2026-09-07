@@ -15,6 +15,8 @@ import { useGetApiKeysQuery } from "@/ee/api-key/queries/api-key-query.ts";
 import { IApiKey } from "@/ee/api-key";
 import useUserRole from '@/hooks/use-user-role.tsx';
 import RestrictApiToAdmins from "@/ee/api-key/components/restrict-api-to-admins";
+import { FeatureGate } from "@/features/feature-availability/feature-gate.tsx";
+import { Feature } from "@/ee/features";
 
 export default function WorkspaceApiKeys() {
   const { t } = useTranslation();
@@ -64,8 +66,12 @@ export default function WorkspaceApiKeys() {
         />
       </Text>
 
-      <RestrictApiToAdmins />
-      <Divider my="lg" />
+      {/* CCC hide-paid: gate the toggle + its divider together so nothing orphans
+          when the feature is unavailable (the toggle also self-hides). */}
+      <FeatureGate feature={Feature.API_KEYS}>
+        <RestrictApiToAdmins />
+        <Divider my="lg" />
+      </FeatureGate>
 
       <Group justify="flex-end" mb="md">
         <Button onClick={() => setCreateModalOpened(true)}>

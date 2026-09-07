@@ -1,6 +1,7 @@
 import React from "react";
 import { useHasFeature } from "@/ee/hooks/use-feature";
 import { Feature } from "@/ee/features";
+import { isCloud } from "@/lib/config";
 
 // CCC feature-availability gate (issue: UI consistency).
 //
@@ -35,6 +36,30 @@ export function useSpaceSecurityAvailable(): boolean {
   const hasSharingControls = useFeatureAvailable(Feature.SHARING_CONTROLS);
   const hasViewerComments = useFeatureAvailable(Feature.VIEWER_COMMENTS);
   return hasSharingControls || hasViewerComments;
+}
+
+/**
+ * True iff the workspace "Security" settings page has any section to show — i.e. any of
+ * its paid controls (MFA / public-sharing / trash-retention / custom SSO / SCIM), or
+ * SSO's cloud affordance, is available. Defined once here (same doctrine as
+ * `useSpaceSecurityAvailable`) so the page can hide itself entirely — like `ai-settings`
+ * — instead of rendering a lone title when every child section self-hides. All hooks are
+ * called UNCONDITIONALLY to keep hook order stable.
+ */
+export function useSecuritySettingsAvailable(): boolean {
+  const hasMfa = useFeatureAvailable(Feature.MFA);
+  const hasSharingControls = useFeatureAvailable(Feature.SHARING_CONTROLS);
+  const hasRetention = useFeatureAvailable(Feature.RETENTION);
+  const hasCustomSso = useFeatureAvailable(Feature.SSO_CUSTOM);
+  const hasScim = useFeatureAvailable(Feature.SCIM);
+  return (
+    hasMfa ||
+    hasSharingControls ||
+    hasRetention ||
+    hasCustomSso ||
+    isCloud() ||
+    hasScim
+  );
 }
 
 /**

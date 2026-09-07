@@ -38,6 +38,7 @@ import {
 import { decodeBase64ToSvgString, svgStringToFile } from "@/lib/utils";
 import { IAttachment } from "@/features/attachments/types/attachment.types";
 import { modals } from "@mantine/modals";
+import { runDrawioSave } from "./drawio-save";
 import { useAltTextControl } from "@/features/editor/components/common/use-alt-text-control.tsx";
 import classes from "../common/toolbar-menu.module.css";
 
@@ -387,7 +388,10 @@ export function DrawioMenu({ editor }: EditorMenuProps) {
                   if (data.parentEvent !== "save") {
                     return;
                   }
-                  saveData(data.xml).then(() => close()).catch(() => {});
+                  // Close only on success; on failure surface a toast and keep the modal
+                  // open (isDirtyRef stays set) instead of silently losing edits. Shared
+                  // handler (unit-tested) — identical contract to the node-view editor.
+                  runDrawioSave(saveData(data.xml), close, t);
                 }}
                 onClose={(data: EventExit) => {
                   if (data.parentEvent) {
@@ -399,7 +403,14 @@ export function DrawioMenu({ editor }: EditorMenuProps) {
                   isDirtyRef.current = true;
                 }}
                 onExport={(data: EventExport) => {
-                  saveData(data.data).catch(() => {});
+                  // Background autosave/export — log failures but don't toast every
+                  // interval; the explicit Save path is what alerts the user.
+                  saveData(data.data).catch((err) => {
+                    console.error(
+                      "drawio: autosave/export failed",
+                      err instanceof Error ? err.message : err,
+                    );
+                  });
                 }}
               />
             </div>
