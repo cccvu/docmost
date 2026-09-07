@@ -54,6 +54,10 @@ services:
     environment:
       # The one required security setting: Docmost's own authorization, fully standalone.
       AUTHZ_MODE: native
+      # Deliberately pass-through (default empty): the smoke sets this to prove RemoteOnlyGuard 404s the
+      # privileged east-west /api/service/* surface in native mode even when the secret IS present — the
+      # guard is mode-driven, never secret-driven (Phase C). Harmless in native mode (ignored, not validated).
+      PLATFORM_AUTHZ_SERVICE_SECRET: ${PLATFORM_AUTHZ_SERVICE_SECRET:-}
       # migrations auto-run only when NODE_ENV=production
       NODE_ENV: production
       APP_URL: ${APP_URL:-http://localhost:3000}
