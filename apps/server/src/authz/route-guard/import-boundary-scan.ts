@@ -105,8 +105,8 @@ export function classifySpecifier(fileAbs: string, specifier: string, srcRoot: s
   const forkRoot = resolve(srcRoot, '..', '..', '..'); // apps/server/src -> server -> apps -> docmost
   const eeDir = join(srcRoot, 'ee');
   // The first-class CCC module roots — kept in lockstep with the spec's CCC_PREFIXES so an upstream import
-  // into ANY of them classifies as 'ccc' and rule 3 can fire (editor-compat/ is planned but not yet created;
-  // classification is path-based so it is guarded from the moment it exists).
+  // into ANY of them classifies as 'ccc' and rule 3 can fire. (editor-compat/ exists as a CCC module — the
+  // typography-schema work — so this guards it today; classification is path-based, so it holds regardless.)
   const cccDirs = [join(srcRoot, 'authz'), join(srcRoot, 'service-bridge'), join(srcRoot, 'editor-compat')];
 
   // The `@docmost/ee/*` alias points straight at the empty EE gitlink.

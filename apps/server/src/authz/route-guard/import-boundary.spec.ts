@@ -125,8 +125,8 @@ describe('the import classifier recognizes every boundary-crossing shape (meta-g
     expect(k('core/auth/auth.controller.ts', '../../authz/mode/native-auth-mode.guard')).toBe('ccc');
     expect(k('app.module.ts', './authz/audit/audit.module')).toBe('ccc');
     expect(k('some/upstream/file.ts', '../../service-bridge/service-bridge.module')).toBe('ccc');
-    // editor-compat/ is a planned CCC module (not yet created); the classifier guards it in lockstep with
-    // CCC_PREFIXES so rule 3 fires the moment an upstream file reaches into it. Path-based, so it holds pre-creation.
+    // editor-compat/ is a CCC module (the typography-schema work); the classifier guards it in lockstep with
+    // CCC_PREFIXES so rule 3 fires if an upstream file reaches into it. Path-based, so it holds as it grows.
     expect(k('some/upstream/file.ts', '../../editor-compat/schema/x')).toBe('ccc');
     expect(k('probe.ts', 'src/authz/mode/authz-mode')).toBe('ccc');
   });
