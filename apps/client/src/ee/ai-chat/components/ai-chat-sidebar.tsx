@@ -129,7 +129,11 @@ export default function AiChatSidebar({
     <div className={classes.sidebar} data-collapsed={collapsed || undefined}>
       <div className={classes.header}>
         <h2 className={classes.title}>{t("AI Chat")}</h2>
-        <Tooltip label={t("New chat")} openDelay={250} withArrow>
+        {/* CCC: the "New chat" button is icon-only in BOTH expanded and rail modes
+            (no text label ever), so — like the space sidebar's icon-only "Create page"
+            action — the tooltip stays enabled in both, positioned to the right to match
+            the other rails. `size={20}` matches every other rail icon. */}
+        <Tooltip label={t("New chat")} position="right" withArrow>
           <ActionIcon
             component={Link}
             to="/ai"
@@ -138,7 +142,7 @@ export default function AiChatSidebar({
             onClick={handleNewChat}
             aria-label={t("New chat")}
           >
-            <IconPlus size={18} />
+            <IconPlus size={20} />
           </ActionIcon>
         </Tooltip>
       </div>

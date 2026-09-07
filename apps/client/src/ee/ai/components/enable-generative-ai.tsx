@@ -1,4 +1,4 @@
-import { Group, Text, Switch, Tooltip } from "@mantine/core";
+import { Group, Text, Switch } from "@mantine/core";
 import { useAtom } from "jotai";
 import { workspaceAtom } from "@/features/user/atoms/current-user-atom.ts";
 import React, { useState } from "react";
@@ -7,14 +7,12 @@ import { updateWorkspace } from "@/features/workspace/services/workspace-service
 import { notifications } from "@mantine/notifications";
 import { useHasFeature } from "@/ee/hooks/use-feature";
 import { Feature } from "@/ee/features";
-import { useUpgradeLabel } from "@/ee/hooks/use-upgrade-label";
 
 export default function EnableGenerativeAi() {
   const { t } = useTranslation();
   const [workspace, setWorkspace] = useAtom(workspaceAtom);
   const [checked, setChecked] = useState(workspace?.settings?.ai?.generative);
   const hasAccess = useHasFeature(Feature.AI);
-  const upgradeLabel = useUpgradeLabel();
 
   const handleChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const value = event.currentTarget.checked;
@@ -30,6 +28,8 @@ export default function EnableGenerativeAi() {
     }
   };
 
+  if (!hasAccess) return null;
+
   return (
     <Group justify="space-between" wrap="nowrap" gap="xl">
       <div>
@@ -41,13 +41,7 @@ export default function EnableGenerativeAi() {
         </Text>
       </div>
 
-      <Tooltip label={upgradeLabel} disabled={hasAccess} refProp="rootRef">
-        <Switch
-          defaultChecked={checked}
-          onChange={handleChange}
-          disabled={!hasAccess}
-        />
-      </Tooltip>
+      <Switch defaultChecked={checked} onChange={handleChange} />
     </Group>
   );
 }

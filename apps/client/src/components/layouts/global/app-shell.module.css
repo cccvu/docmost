@@ -1,8 +1,14 @@
+/* CCC: shell surface. This is the SHELL_BG value in features/layout/layout-tokens.ts
+   (CSS modules can't import TS, so the literal is inlined) — the standalone console
+   imports that token. Keep this in sync with layout-tokens.ts SHELL_BG. */
 .header, .navbar, .aside {
   background-color: light-dark(#f6f7f9, var(--mantine-color-dark-8));
 }
 
-.navbar, .aside {
+/* CCC: mobile OVERLAY width. The navbar overlay uses the JS `base: SIDEBAR_WIDTH`
+   (global-app-shell.tsx) so it stays on the shared sidebar width; only the aside is
+   pinned here — to ASIDE_WIDTH. Keep 350 in sync with layout-tokens.ts ASIDE_WIDTH. */
+.aside {
   @media (max-width: $mantine-breakpoint-sm) {
     width: 350px;
   }
@@ -15,16 +21,3 @@
   }
 }
 
-.resizeHandle {
-  width: 3px;
-  cursor: col-resize;
-  position: absolute;
-  right: 0;
-  top: 0;
-  bottom: 0;
-
-  &:hover, &:active {
-    width: 5px;
-    background: light-dark(var(--mantine-color-gray-4), var(--mantine-color-dark-5))
-  }
-}

@@ -45,6 +45,11 @@ export default function Security() {
   const { isAdmin } = useUserRole();
   const hasCustomSso = useHasFeature(Feature.SSO_CUSTOM);
   const hasScim = useHasFeature(Feature.SCIM);
+  // CCC hide-paid: gate each leaf's surrounding chrome (Divider/Title) on the same
+  // feature the leaf self-hides on, so nothing is left orphaned when a control hides.
+  const hasMfa = useHasFeature(Feature.MFA);
+  const hasSharingControls = useHasFeature(Feature.SHARING_CONTROLS);
+  const hasRetention = useHasFeature(Feature.RETENTION);
   const [workspace] = useAtom(workspaceAtom);
   const isScimEnabled = workspace?.isScimEnabled ?? false;
 
@@ -69,38 +74,53 @@ export default function Security() {
       </Helmet>
       <SettingsTitle title={t("Security")} />
 
-      <EnforceMfa />
-
-      <Divider my="lg" />
-
-      <DisablePublicSharing />
-      <Divider my="lg" />
-
-      <TrashRetention />
-      <Divider my="lg" />
-
-      <Title order={4} my="lg">
-        {t("Single sign-on (SSO)")}
-      </Title>
-
-      <EnforceSso />
-      <Divider my="lg" />
-
-      {(isCloud() || hasCustomSso) && (
+      {hasMfa && (
         <>
-          <AllowedDomains />
+          <EnforceMfa />
           <Divider my="lg" />
         </>
       )}
 
-      {hasCustomSso && (
+      {hasSharingControls && (
         <>
-          <CreateSsoProvider />
-          <Divider size={0} my="lg" />
+          <DisablePublicSharing />
+          <Divider my="lg" />
         </>
       )}
 
-      <SsoProviderList />
+      {hasRetention && (
+        <>
+          <TrashRetention />
+          <Divider my="lg" />
+        </>
+      )}
+
+      {(isCloud() || hasCustomSso) && (
+        <>
+          <Title order={4} my="lg">
+            {t("Single sign-on (SSO)")}
+          </Title>
+
+          {hasCustomSso && (
+            <>
+              <EnforceSso />
+              <Divider my="lg" />
+            </>
+          )}
+
+          <AllowedDomains />
+          <Divider my="lg" />
+
+          {hasCustomSso && (
+            <>
+              <CreateSsoProvider />
+              <Divider size={0} my="lg" />
+            </>
+          )}
+
+          <SsoProviderList />
+        </>
+      )}
 
       {hasScim && (
         <>

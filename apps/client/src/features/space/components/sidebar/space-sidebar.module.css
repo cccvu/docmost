@@ -30,8 +30,11 @@
 }
 
 .menuItems {
-    padding-left: calc(var(--mantine-spacing-md) - var(--mantine-spacing-xs));
-    padding-right: calc(var(--mantine-spacing-md) - var(--mantine-spacing-xs));
+    /* CCC: inset the action rows by md so each row's icon lands at the SAME x (26px)
+       as the home/settings nav icons — the sidebar's contents line up across views
+       when switching. (md padding + the .menu's xs padding = 16 + 10 = 26.) */
+    padding-left: var(--mantine-spacing-md);
+    padding-right: var(--mantine-spacing-md);
     padding-bottom: var(--mantine-spacing-md);
 }
 
@@ -39,6 +42,7 @@
     display: flex;
     align-items: center;
     width: 100%;
+    min-height: rem(30px);
     font-size: var(--mantine-font-size-sm);
     padding: rem(4px) var(--mantine-spacing-xs);
     border-radius: var(--mantine-radius-sm);
@@ -60,6 +64,10 @@
 .menuItemIcon {
     margin-right: var(--mantine-spacing-sm);
     color: light-dark(var(--mantine-color-gray-6), var(--mantine-color-dark-2));
+    /* CCC: 16px expanded to match the home/settings nav icons (.linkIcon); the
+       collapsed rail override below promotes it to 20px like every other rail. */
+    width: rem(16px);
+    height: rem(16px);
 }
 
 .pages {

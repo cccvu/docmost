@@ -7,6 +7,7 @@ import { useWorkspacePublicDataQuery } from "@/features/workspace/queries/worksp
 import { getAppName } from "@/lib/config.ts";
 import { Brand } from "@/features/brand/brand-logo.tsx";
 import { PublicAuthButtons } from "./public-auth-buttons.tsx";
+import { HEADER_HEIGHT } from "@/features/layout/layout-tokens.ts";
 
 /**
  * A lightweight, header-only app shell for the anonymous public surface (front page + request-access).
@@ -20,7 +21,7 @@ export function PublicShell({ children }: { children: ReactNode }) {
   return (
     <>
       <SkipToMain />
-      <AppShell header={{ height: 60 }} padding="md">
+      <AppShell header={{ height: HEADER_HEIGHT }} padding="md">
         <AppShell.Header>
           <Group h="100%" px="md" justify="space-between" wrap="nowrap">
             <Link
@@ -35,8 +36,10 @@ export function PublicShell({ children }: { children: ReactNode }) {
                 minWidth: 0,
               }}
             >
-              {/* decorative — the workspace name beside it carries the accessible name */}
-              <Brand variant="icon" iconHeight={26} />
+              {/* decorative — the workspace name beside it carries the accessible name.
+                  iconHeight matches the main app header's brand mark (38) so the V reads
+                  the same size across the authenticated and public surfaces. */}
+              <Brand variant="icon" iconHeight={38} />
               <Text size="lg" fw={600} lineClamp={1} style={{ userSelect: "none" }}>
                 {name}
               </Text>

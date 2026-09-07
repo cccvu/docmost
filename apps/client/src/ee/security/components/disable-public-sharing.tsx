@@ -1,4 +1,4 @@
-import { Group, Text, Switch, Tooltip } from "@mantine/core";
+import { Group, Text, Switch } from "@mantine/core";
 import { modals } from "@mantine/modals";
 import { useAtom } from "jotai";
 import { workspaceAtom } from "@/features/user/atoms/current-user-atom.ts";
@@ -8,10 +8,12 @@ import { updateWorkspace } from "@/features/workspace/services/workspace-service
 import { notifications } from "@mantine/notifications";
 import { useHasFeature } from "@/ee/hooks/use-feature";
 import { Feature } from "@/ee/features";
-import { useUpgradeLabel } from "@/ee/hooks/use-upgrade-label.ts";
 
 export default function DisablePublicSharing() {
   const { t } = useTranslation();
+  const hasSharingControls = useHasFeature(Feature.SHARING_CONTROLS);
+
+  if (!hasSharingControls) return null;
 
   return (
     <Group justify="space-between" wrap="nowrap" gap="xl">
@@ -34,7 +36,8 @@ function DisablePublicSharingToggle() {
     workspace?.settings?.sharing?.disabled === true,
   );
   const hasSharingControls = useHasFeature(Feature.SHARING_CONTROLS);
-  const upgradeLabel = useUpgradeLabel();
+
+  if (!hasSharingControls) return null;
 
   const applyChange = async (value: boolean) => {
     try {
@@ -75,13 +78,10 @@ function DisablePublicSharingToggle() {
   };
 
   return (
-    <Tooltip label={upgradeLabel} disabled={hasSharingControls} refProp="rootRef">
-      <Switch
-        checked={checked}
-        onChange={handleChange}
-        disabled={!hasSharingControls}
-        aria-label={t("Toggle public sharing")}
-      />
-    </Tooltip>
+    <Switch
+      checked={checked}
+      onChange={handleChange}
+      aria-label={t("Toggle public sharing")}
+    />
   );
 }

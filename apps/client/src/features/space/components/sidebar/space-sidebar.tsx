@@ -141,7 +141,6 @@ export function SpaceSidebar({
               >
                 <div className={classes.menuItemInner}>
                   <IconHome
-                    size={18}
                     className={classes.menuItemIcon}
                     stroke={2}
                   />
@@ -158,7 +157,6 @@ export function SpaceSidebar({
               >
                 <div className={classes.menuItemInner}>
                   <IconSearch
-                    size={18}
                     className={classes.menuItemIcon}
                     stroke={2}
                   />
@@ -172,7 +170,6 @@ export function SpaceSidebar({
               <UnstyledButton className={classes.menu} onClick={openSettings}>
                 <div className={classes.menuItemInner}>
                   <IconSettings
-                    size={18}
                     className={classes.menuItemIcon}
                     stroke={2}
                   />

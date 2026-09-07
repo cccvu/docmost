@@ -18,15 +18,18 @@ export const HEADER_HEIGHT = 56;
 /** Collapsed icon-rail width (px). Every navbar sidebar rails to this on collapse. */
 export const RAIL_WIDTH = 52;
 
-/** Expanded navigation-sidebar width (px) — home/settings, and the space page-tree default. */
-export const SIDEBAR_WIDTH = 300;
-
-/** Resize clamp for the space page-tree sidebar (px). */
-export const SIDEBAR_MIN_WIDTH = 220;
-export const SIDEBAR_MAX_WIDTH = 600;
+/** Expanded navigation-sidebar width (px) — a FIXED width shared by every sidebar
+ *  (home / space page-tree / settings / AI). Not resizable: all views read identically. */
+export const SIDEBAR_WIDTH = 260;
 
 /** Right-hand aside (comments / TOC / details) width (px). */
 export const ASIDE_WIDTH = 350;
+
+/** App-shell surface color for the header + navbar/aside. A native CSS `light-dark()`
+ *  expression so the shell tracks the color scheme. The fork's CSS module
+ *  (app-shell.module.css) inlines this same value; the standalone console imports this
+ *  token. KEEP IN SYNC across both layout-tokens files (drift guard) and that CSS. */
+export const SHELL_BG = "light-dark(#f6f7f9, var(--mantine-color-dark-8))";
 
 /** Mantine AppShell navbar/aside breakpoint — below this the navbar is a mobile overlay. */
 export const NAVBAR_BREAKPOINT = "sm";
