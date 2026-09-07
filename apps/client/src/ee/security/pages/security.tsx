@@ -25,6 +25,10 @@ import TrashRetention from "@/ee/security/components/trash-retention.tsx";
 import { useAtom } from "jotai";
 import { workspaceAtom } from "@/features/user/atoms/current-user-atom.ts";
 import { useHasFeature } from "@/ee/hooks/use-feature";
+import {
+  FeatureGate,
+  useSecuritySettingsAvailable,
+} from "@/features/feature-availability/feature-gate.tsx";
 import { Feature } from "@/ee/features";
 import { useGetScimTokensQuery } from "@/ee/scim/queries/scim-token-query";
 import { ScimUrlPanel } from "@/ee/scim/components/scim-url-panel";
@@ -45,11 +49,11 @@ export default function Security() {
   const { isAdmin } = useUserRole();
   const hasCustomSso = useHasFeature(Feature.SSO_CUSTOM);
   const hasScim = useHasFeature(Feature.SCIM);
-  // CCC hide-paid: gate each leaf's surrounding chrome (Divider/Title) on the same
-  // feature the leaf self-hides on, so nothing is left orphaned when a control hides.
-  const hasMfa = useHasFeature(Feature.MFA);
-  const hasSharingControls = useHasFeature(Feature.SHARING_CONTROLS);
-  const hasRetention = useHasFeature(Feature.RETENTION);
+  // CCC hide-paid: each control-plus-chrome group is gated with <FeatureGate> below (the
+  // same declarative primitive workspace-api-keys.tsx uses), and the leaf self-hides on
+  // the same flag. `hasSecurityContent` gates the whole page: if no section is entitled,
+  // hide it entirely (parity with ai-settings) rather than render a lone title.
+  const hasSecurityContent = useSecuritySettingsAvailable();
   const [workspace] = useAtom(workspaceAtom);
   const isScimEnabled = workspace?.isScimEnabled ?? false;
 
@@ -67,6 +71,11 @@ export default function Security() {
     return null;
   }
 
+  // Nothing entitled → hide the whole page instead of a title-only empty state.
+  if (!hasSecurityContent) {
+    return null;
+  }
+
   return (
     <>
       <Helmet>
@@ -74,26 +83,20 @@ export default function Security() {
       </Helmet>
       <SettingsTitle title={t("Security")} />
 
-      {hasMfa && (
-        <>
-          <EnforceMfa />
-          <Divider my="lg" />
-        </>
-      )}
+      <FeatureGate feature={Feature.MFA}>
+        <EnforceMfa />
+        <Divider my="lg" />
+      </FeatureGate>
 
-      {hasSharingControls && (
-        <>
-          <DisablePublicSharing />
-          <Divider my="lg" />
-        </>
-      )}
+      <FeatureGate feature={Feature.SHARING_CONTROLS}>
+        <DisablePublicSharing />
+        <Divider my="lg" />
+      </FeatureGate>
 
-      {hasRetention && (
-        <>
-          <TrashRetention />
-          <Divider my="lg" />
-        </>
-      )}
+      <FeatureGate feature={Feature.RETENTION}>
+        <TrashRetention />
+        <Divider my="lg" />
+      </FeatureGate>
 
       {(isCloud() || hasCustomSso) && (
         <>

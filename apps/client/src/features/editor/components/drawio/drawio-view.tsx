@@ -24,7 +24,7 @@ import clsx from "clsx";
 import { IconEdit } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import { modals } from "@mantine/modals";
-import { notifications } from "@mantine/notifications";
+import { runDrawioSave } from "./drawio-save";
 
 export default function DrawioView(props: NodeViewProps) {
   const { t } = useTranslation();
@@ -166,18 +166,11 @@ export default function DrawioView(props: NodeViewProps) {
                   if (data.parentEvent !== "save") {
                     return;
                   }
-                  // Close only on a successful save; on failure surface a toast and
-                  // keep the modal open (isDirtyRef stays set, so exit still warns) —
-                  // never swallow the error silently and lose the diagram (CCC).
-                  saveData(data.xml, true)
-                    .then(() => close())
-                    .catch((err) => {
-                      console.error("drawio: failed to save diagram", err);
-                      notifications.show({
-                        message: t("Failed to save the diagram. Please try again."),
-                        color: "red",
-                      });
-                    });
+                  // Close only on a successful save; on failure surface a toast and keep
+                  // the modal open (isDirtyRef stays set, so exit still warns) — never
+                  // swallow the error and lose the diagram (CCC). Shared handler so the
+                  // contract is unit-tested and identical to the bubble-menu editor.
+                  runDrawioSave(saveData(data.xml, true), close, t);
                 }}
                 onClose={(data: EventExit) => {
                   if (data.parentEvent) {
@@ -192,7 +185,10 @@ export default function DrawioView(props: NodeViewProps) {
                   // Background autosave/export — log failures but don't toast on every
                   // interval; the explicit Save path (above) is what alerts the user.
                   saveData(data.data, false).catch((err) => {
-                    console.error("drawio: autosave/export failed", err);
+                    console.error(
+                      "drawio: autosave/export failed",
+                      err instanceof Error ? err.message : err,
+                    );
                   });
                 }}
               />

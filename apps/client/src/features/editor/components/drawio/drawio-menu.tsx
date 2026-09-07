@@ -38,7 +38,7 @@ import {
 import { decodeBase64ToSvgString, svgStringToFile } from "@/lib/utils";
 import { IAttachment } from "@/features/attachments/types/attachment.types";
 import { modals } from "@mantine/modals";
-import { notifications } from "@mantine/notifications";
+import { runDrawioSave } from "./drawio-save";
 import { useAltTextControl } from "@/features/editor/components/common/use-alt-text-control.tsx";
 import classes from "../common/toolbar-menu.module.css";
 
@@ -388,17 +388,10 @@ export function DrawioMenu({ editor }: EditorMenuProps) {
                   if (data.parentEvent !== "save") {
                     return;
                   }
-                  // Close only on success; on failure surface a toast and keep the
-                  // modal open (isDirtyRef stays set) instead of silently losing edits.
-                  saveData(data.xml)
-                    .then(() => close())
-                    .catch((err) => {
-                      console.error("drawio: failed to save diagram", err);
-                      notifications.show({
-                        message: t("Failed to save the diagram. Please try again."),
-                        color: "red",
-                      });
-                    });
+                  // Close only on success; on failure surface a toast and keep the modal
+                  // open (isDirtyRef stays set) instead of silently losing edits. Shared
+                  // handler (unit-tested) — identical contract to the node-view editor.
+                  runDrawioSave(saveData(data.xml), close, t);
                 }}
                 onClose={(data: EventExit) => {
                   if (data.parentEvent) {
@@ -413,7 +406,10 @@ export function DrawioMenu({ editor }: EditorMenuProps) {
                   // Background autosave/export — log failures but don't toast every
                   // interval; the explicit Save path is what alerts the user.
                   saveData(data.data).catch((err) => {
-                    console.error("drawio: autosave/export failed", err);
+                    console.error(
+                      "drawio: autosave/export failed",
+                      err instanceof Error ? err.message : err,
+                    );
                   });
                 }}
               />

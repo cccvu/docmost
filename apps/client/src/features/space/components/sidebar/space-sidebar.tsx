@@ -194,11 +194,7 @@ export function SpaceSidebar({
                   }}
                 >
                   <div className={classes.menuItemInner}>
-                    <IconPlus
-                      size={18}
-                      className={classes.menuItemIcon}
-                      stroke={2}
-                    />
+                    <IconPlus className={classes.menuItemIcon} stroke={2} />
                     <span>{t("New page")}</span>
                   </div>
                 </UnstyledButton>,

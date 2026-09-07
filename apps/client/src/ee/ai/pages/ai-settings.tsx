@@ -18,10 +18,13 @@ export default function AiSettings() {
   const { t } = useTranslation();
   const { isAdmin } = useUserRole();
   const hasAccess = useHasFeature(Feature.AI);
+  const hasMcp = useHasFeature(Feature.MCP);
   const location = useLocation();
   const navigate = useNavigate();
 
-  const activeTab = location.pathname.endsWith("/mcp") ? "mcp" : "ai";
+  // CCC hide-paid: only treat /mcp as active when MCP is entitled — otherwise the MCP tab
+  // is hidden and the URL falls back to the AI tab, so no blank MCP panel is shown.
+  const activeTab = hasMcp && location.pathname.endsWith("/mcp") ? "mcp" : "ai";
 
   if (!isAdmin) {
     return null;
@@ -54,9 +57,11 @@ export default function AiSettings() {
           <Tabs.Tab fw={500} value="ai">
             {t("AI")}
           </Tabs.Tab>
-          <Tabs.Tab fw={500} value="mcp">
-            {t("MCP")}
-          </Tabs.Tab>
+          {hasMcp && (
+            <Tabs.Tab fw={500} value="mcp">
+              {t("MCP")}
+            </Tabs.Tab>
+          )}
         </Tabs.List>
 
         <Tabs.Panel value="ai" pt="md">
@@ -67,9 +72,11 @@ export default function AiSettings() {
           </Stack>
         </Tabs.Panel>
 
-        <Tabs.Panel value="mcp" pt="md">
-          <McpSettings />
-        </Tabs.Panel>
+        {hasMcp && (
+          <Tabs.Panel value="mcp" pt="md">
+            <McpSettings />
+          </Tabs.Panel>
+        )}
       </Tabs>
     </>
   );
