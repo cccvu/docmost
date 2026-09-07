@@ -7,20 +7,30 @@ import { spyKysely, SpyQuery } from './kysely-spy.testkit';
  * (the xmin-horizon change cursor) the platform checkpoints to after a successful reconcile.
  */
 describe('AuthzSnapshotService', () => {
-  it('emits SpaceChanged for the spaces phase and advances to the next phase when a page is short', async () => {
+  it('emits SpaceChanged for the spaces phase (live AND archived, #193) and advances when a page is short', async () => {
     const spy = spyKysely((q: SpyQuery) => {
       if (q.sql.includes('pg_snapshot_xmin')) return [{ xmin: '42' }];
-      if (q.sql.includes('from spaces')) return [{ id: 's1', workspace_id: 'w1' }];
+      if (q.sql.includes('from spaces')) return [
+        { id: 's1', workspace_id: 'w1', deleted_at: null },
+        { id: 's2', workspace_id: 'w1', deleted_at: '2026-09-07T00:00:00Z' }, // archived
+      ];
       return [];
     });
     const svc = new AuthzSnapshotService(spy.db);
     const res = await svc.getSnapshot(undefined, 500);
-    expect(res.events).toEqual([{ seq: 0, type: 'SpaceChanged', spaceId: 's1', workspaceId: 'w1', deleted: false }]);
+    // #193: an archived space is emitted with deleted:true so the platform keeps its access-severing #archived
+    // marker in the reconciler's desired set (a missing marker fails OPEN).
+    expect(res.events).toEqual([
+      { seq: 0, type: 'SpaceChanged', spaceId: 's1', workspaceId: 'w1', deleted: false },
+      { seq: 0, type: 'SpaceChanged', spaceId: 's2', workspaceId: 'w1', deleted: true },
+    ]);
     // spaces returned < limit -> advance to phase index 1 (space_members) at the zero uuid.
     expect(res.nextCursor).toBe('1.00000000-0000-0000-0000-000000000000');
-    // keyset uses the immutable id, filters non-deleted.
+    // #193: the spaces phase no longer filters archived spaces out — it selects deleted_at and keysets on the
+    // immutable id. (space_members/pages KEEP their own `deleted_at is null` — their rows stay desired.)
     const spacesCall = spy.calls.find((c) => c.sql.includes('from spaces'))!;
-    expect(spacesCall.sql).toMatch(/deleted_at is null/);
+    expect(spacesCall.sql).not.toMatch(/deleted_at is null/);
+    expect(spacesCall.sql).toMatch(/deleted_at/);
     expect(spacesCall.sql).toMatch(/id >/);
   });
 

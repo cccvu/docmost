@@ -43,7 +43,9 @@ export interface SnapshotResult {
  * present throughout is never skipped by immutable-key keyset; a row added mid-pagination is fresher than the
  * pinned SpiceDB `actual`, so a miss is not an orphan; a row deleted mid-pagination is correctly absent. Worst
  * case the system simply converges on the next reconcile pass. Behavior-preserving: this is a faithful port
- * of the reconciler's six direct SELECTs (single-tenant, non-deleted), which never scoped by workspace.
+ * of the reconciler's six direct SELECTs (single-tenant, non-deleted), which never scoped by workspace — EXCEPT
+ * the `spaces` phase, which since #193 emits archived spaces too (with deleted:true) so the platform can keep
+ * their access-severing `#archived` marker fail-closed.
  *
  * One concern-phase is paged per request; the opaque cursor is `<phaseIndex>.<lastId>`.
  */
@@ -89,9 +91,16 @@ export class AuthzSnapshotService {
   ): Promise<{ events: AuthzChangeEvent[]; count: number; lastRowId: string }> {
     switch (phase) {
       case 'spaces': {
-        const res = await sql<{ id: string; workspaceId: string | null }>`
-          select id, workspace_id from spaces
-          where deleted_at is null and id > ${lastId}
+        // #193: emit ALL spaces (live AND archived) with their archived state — NOT just `deleted_at is null`.
+        // The platform gates an archived space's access with a `space#archived` wildcard marker (schema
+        // `space.view = ... - archived`); a MISSING marker fails OPEN, so the marker must be in the reconciler's
+        // DESIRED set to be re-added on drift. That requires the snapshot to surface archived spaces here (with
+        // deleted:true). The `space_members`/`pages` phases KEEP their own `deleted_at is null` filter — their
+        // rows stay desired (content preserved) and the schema `- archived` gate does the severance.
+        // CamelCasePlugin returns `deletedAt` from raw SQL (as it does `workspaceId`).
+        const res = await sql<{ id: string; workspaceId: string | null; deletedAt: unknown }>`
+          select id, workspace_id, deleted_at from spaces
+          where id > ${lastId}
           order by id asc limit ${limit}
         `.execute(this.db);
         return this.pack(res.rows, (r) => ({
@@ -99,7 +108,7 @@ export class AuthzSnapshotService {
           type: 'SpaceChanged',
           spaceId: r.id,
           workspaceId: r.workspaceId,
-          deleted: false,
+          deleted: r.deletedAt != null,
         }));
       }
       case 'space_members': {
