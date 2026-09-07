@@ -7,8 +7,11 @@
 #
 #   1. the fork boots in AUTHZ_MODE=remote, fail-closed, delegating every fine-grained decision to the stub,
 #   2. native credential login is disabled in remote mode (POST /api/auth/login -> 404),
-#   3. a DOCUMENTED-ALLOW decision round-trips through the real PEP: a user the stub grants reads a page (200),
-#   4. a NON-FIXTURE decision denies: a user the stub does NOT grant is denied the same page (403/404).
+#   3. a DOCUMENTED-ALLOW round-trips through the real PEP: a stub-granted user reads a page (200),
+#   4. the fork's decisions track the STUB, not native ACLs — a non-member the stub GRANTS reads page1 (200,
+#      native would DENY), while the same user, ungranted on page2, is DENIED (403/404). That divergence from
+#      native can only come from a real delegation to the stub, closing the OUTBOUND contract-parse gap that is
+#      the reciprocal of #181's INBOUND envelope break (a fork ignoring the stub or fail-opening would flip it).
 #
 # Because the stub matches EXACT { externalId, permission, resourceType, resourceId } tuples and the fork
 # generates its own UUIDs, we first bootstrap real data in a NATIVE-mode boot (native credential routes are
@@ -71,6 +74,21 @@ wait_ready() { # $1 = human label
 }
 psql() { "${COMPOSE[@]}" exec -T postgres psql -U docmost -d docmost -tAc "$1" | tr -d '[:space:]'; }
 
+# The stub port (4000) is internal (not published), so probe it from INSIDE the stub container. Any HTTP
+# response (the stub answers 405 to a GET) means it is listening; connection-refused/timeout means not ready.
+# Guards the race where the fork boots in remote mode and delegates a decision before the stub is up.
+wait_stub() {
+  for _ in $(seq 1 60); do
+    if "${COMPOSE[@]}" exec -T stub node -e \
+      'const r=require("http").get({host:"127.0.0.1",port:4000,path:"/",timeout:2000},()=>process.exit(0));r.on("timeout",()=>{r.destroy();process.exit(1)});r.on("error",()=>process.exit(1))' \
+      >/dev/null 2>&1; then
+      pass "stub ready (authorization service listening on :4000)"; return 0
+    fi
+    sleep 1
+  done
+  bad "stub never became ready"; "${COMPOSE[@]}" logs stub --tail 40 || true; exit 1
+}
+
 # ── Phase 1: NATIVE bootstrap — build + boot the fork in native mode and create real data ──────────────
 log "build + boot the fork in NATIVE mode to bootstrap real ids (stub not needed yet)"
 export DOCMOST_AUTHZ_MODE=native
@@ -94,15 +112,30 @@ case "$setup_code" in
   *) bad "setup failed (HTTP $setup_code): $(cat "$TMP/setup.json" 2>/dev/null)"; exit 1 ;;
 esac
 
-log "owner creates a private space + page"
-curl -s -o "$TMP/space.json" -b "$A_JAR" -H 'content-type: application/json' \
-  -d '{"name":"Alice Private","slug":"alice-private"}' "${BASE}/api/spaces/create"
-SPACE_ID="$(jq -r '.id // .data.id // empty' "$TMP/space.json")"
-[ -n "$SPACE_ID" ] && pass "space created ($SPACE_ID)" || { bad "space create failed: $(cat "$TMP/space.json")"; exit 1; }
-curl -s -o "$TMP/page.json" -b "$A_JAR" -H 'content-type: application/json' \
-  -d "{\"spaceId\":\"$SPACE_ID\",\"title\":\"Secret page\"}" "${BASE}/api/pages/create"
-PAGE_ID="$(jq -r '.id // .data.id // empty' "$TMP/page.json")"
-[ -n "$PAGE_ID" ] && pass "page created ($PAGE_ID)" || { bad "page create failed: $(cat "$TMP/page.json")"; exit 1; }
+# Two independent spaces, each with a page. The stub will GRANT Bob the FIRST (space1/page1) and grant him
+# NOTHING on the SECOND (space2/page2). Because space2 shares no grant with Bob, his denial there is
+# unambiguous regardless of the fork's space→page inheritance model — the divergence assertions below need
+# both a stub-driven ALLOW (native would deny) and a stub-driven DENY that can't be an inheritance artifact.
+mkspace() { # $1 = name, $2 = slug  -> echoes the new space id
+  curl -s -o "$TMP/space.json" -b "$A_JAR" -H 'content-type: application/json' \
+    -d "{\"name\":\"$1\",\"slug\":\"$2\"}" "${BASE}/api/spaces/create"
+  jq -r '.id // .data.id // empty' "$TMP/space.json"
+}
+mkpage() { # $1 = spaceId, $2 = title  -> echoes the new page id
+  curl -s -o "$TMP/page.json" -b "$A_JAR" -H 'content-type: application/json' \
+    -d "{\"spaceId\":\"$1\",\"title\":\"$2\"}" "${BASE}/api/pages/create"
+  jq -r '.id // .data.id // empty' "$TMP/page.json"
+}
+
+log "owner creates TWO private spaces, each with a page (space1 -> Bob will be granted; space2 -> never)"
+SPACE_ID="$(mkspace 'Alice Private' 'alice-private')"
+[ -n "$SPACE_ID" ] && pass "space1 created ($SPACE_ID)" || { bad "space1 create failed: $(cat "$TMP/space.json")"; exit 1; }
+PAGE_ID="$(mkpage "$SPACE_ID" 'Secret page')"
+[ -n "$PAGE_ID" ] && pass "page1 created ($PAGE_ID)" || { bad "page1 create failed: $(cat "$TMP/page.json")"; exit 1; }
+SPACE2_ID="$(mkspace 'Alice Private 2' 'alice-private-2')"
+[ -n "$SPACE2_ID" ] && pass "space2 created ($SPACE2_ID)" || { bad "space2 create failed: $(cat "$TMP/space.json")"; exit 1; }
+PAGE2_ID="$(mkpage "$SPACE2_ID" 'Other secret page')"
+[ -n "$PAGE2_ID" ] && pass "page2 created ($PAGE2_ID)" || { bad "page2 create failed: $(cat "$TMP/page.json")"; exit 1; }
 
 log "invite + provision a second user (Bob), NOT granted anything"
 curl -s -o "$TMP/invite.json" -b "$A_JAR" -H 'content-type: application/json' \
@@ -118,22 +151,34 @@ blogin="$(curl -s -o /dev/null -w '%{http_code}' -c "$B_JAR" -H 'content-type: a
   -d '{"email":"bob@example.com","password":"BobPw123!"}' "${BASE}/api/auth/login")"
 [ "$blogin" = "200" ] && pass "Bob provisioned + logged in (native)" || { bad "Bob login failed ($blogin)"; exit 1; }
 
-# The exact subject the fork's PEP sends is { provider:'docmost', externalId: <users.id UUID> } — capture it.
+# The exact subject the fork's PEP sends is { provider:'docmost', externalId: <users.id UUID> } — capture
+# both users' ids so the stub policy can grant them by the SAME externalId the fork will present.
 ALICE_ID="$(psql "select id from users where email='alice@example.com'")"
 [ -n "$ALICE_ID" ] && pass "captured Alice's externalId ($ALICE_ID)" || { bad "could not read Alice's user id"; exit 1; }
+BOB_ID="$(psql "select id from users where email='bob@example.com'")"
+[ -n "$BOB_ID" ] && pass "captured Bob's externalId ($BOB_ID)" || { bad "could not read Bob's user id"; exit 1; }
 
 # ── Phase 2: seed the stub policy with the REAL ids, then flip the fork to REMOTE ──────────────────────
-log "seed the stub policy — grant ONLY Alice view on the space + page (Bob gets nothing)"
+# Grant Alice AND Bob view on space1/page1; grant NEITHER anything on space2/page2. Bob is a plain workspace
+# member with NO native membership of either space, so in NATIVE mode he would be denied BOTH pages. The only
+# reason he can read page1 in REMOTE mode is that the stub grants it — a decision native could never make. So
+# page1(Bob)=allow and page2(Bob)=deny is a DIVERGENCE from native that ONLY a real delegation to the stub can
+# produce; a fork that silently fell back to native authz (or fail-open on a stub DENY) would flip both and RED
+# the smoke. This closes the OUTBOUND contract-parse gap symmetric to #181 (which was an INBOUND envelope break).
+log "seed the stub policy — grant Alice + Bob view on space1/page1; grant NOTHING on space2/page2"
 cat > "$POLICY_GEN" <<JSON
 { "grants": [
   { "externalId": "$ALICE_ID", "permission": "view", "resourceType": "space", "resourceId": "$SPACE_ID" },
-  { "externalId": "$ALICE_ID", "permission": "view", "resourceType": "page",  "resourceId": "$PAGE_ID" }
+  { "externalId": "$ALICE_ID", "permission": "view", "resourceType": "page",  "resourceId": "$PAGE_ID" },
+  { "externalId": "$BOB_ID",   "permission": "view", "resourceType": "space", "resourceId": "$SPACE_ID" },
+  { "externalId": "$BOB_ID",   "permission": "view", "resourceType": "page",  "resourceId": "$PAGE_ID" }
 ] }
 JSON
 pass "policy written ($POLICY_GEN)"
 
 log "boot the reference stub, then recreate the fork in AUTHZ_MODE=remote pointed at it"
 "${COMPOSE[@]}" up -d stub
+wait_stub   # ensure the stub is accepting decisions BEFORE the fork boots in remote mode (no delegation race)
 export DOCMOST_AUTHZ_MODE=remote
 "${COMPOSE[@]}" up -d --force-recreate --no-deps docmost
 wait_ready "fork re-booted in REMOTE mode (fail-closed validation passed)"
@@ -145,19 +190,33 @@ login_remote="$(curl -s -o /dev/null -w '%{http_code}' -H 'content-type: applica
 [ "$login_remote" = "404" ] && pass "native login route 404 in remote mode (NativeAuthModeGuard)" \
   || bad "native login route not 404 in remote (HTTP $login_remote) — mode boundary broken"
 
-log "CONTRACT round-trip: a stub-GRANTED read succeeds, a NON-fixture read is denied — through the real PEP"
-alice_read="$(curl -s -o "$TMP/aread.json" -w '%{http_code}' -b "$A_JAR" -H 'content-type: application/json' \
-  -d "{\"pageId\":\"$PAGE_ID\"}" "${BASE}/api/pages/info")"
-[ "$alice_read" = "200" ] \
-  && pass "Alice (stub-granted) reads the page (200) — documented ALLOW round-trips fork -> stub -> fork" \
-  || bad "Alice was NOT allowed (HTTP $alice_read) — the allow decision did not round-trip: $(cat "$TMP/aread.json" 2>/dev/null)"
+read_page() { # $1 = cookie jar, $2 = pageId  -> echoes HTTP status, body in $TMP/read.json
+  curl -s -o "$TMP/read.json" -w '%{http_code}' -b "$1" -H 'content-type: application/json' \
+    -d "{\"pageId\":\"$2\"}" "${BASE}/api/pages/info"
+}
 
-bob_read="$(curl -s -o "$TMP/bread.json" -w '%{http_code}' -b "$B_JAR" -H 'content-type: application/json' \
-  -d "{\"pageId\":\"$PAGE_ID\"}" "${BASE}/api/pages/info")"
-if [ "$bob_read" = "403" ] || [ "$bob_read" = "404" ]; then
-  pass "Bob (no stub grant) is DENIED the page ($bob_read) — non-fixture denies, deny-by-default holds"
+log "CONTRACT round-trip: the fork's decisions track the STUB, not native ACLs (through the real PEP)"
+# (a) documented ALLOW round-trips: Alice, granted by the stub, reads page1.
+alice_read="$(read_page "$A_JAR" "$PAGE_ID")"
+[ "$alice_read" = "200" ] \
+  && pass "Alice (stub-granted) reads page1 (200) — documented ALLOW round-trips fork -> stub -> fork" \
+  || bad "Alice was NOT allowed (HTTP $alice_read) — the allow decision did not round-trip: $(cat "$TMP/read.json" 2>/dev/null)"
+
+# (b) DIVERGENCE / stub-driven ALLOW: Bob is a non-member — native would DENY him page1 — but the stub grants
+# it, so remote mode must ALLOW (200). This is the proof the fork actually delegated: native could not produce it.
+bob_read1="$(read_page "$B_JAR" "$PAGE_ID")"
+[ "$bob_read1" = "200" ] \
+  && pass "Bob (non-member, stub-GRANTED) reads page1 (200) — the fork honored a stub ALLOW native would refuse" \
+  || bad "Bob was NOT allowed page1 (HTTP $bob_read1) — the fork did not honor the stub's grant (fell back to native / broke the OUTBOUND contract?): $(cat "$TMP/read.json" 2>/dev/null)"
+
+# (c) DIVERGENCE / stub-driven DENY: Bob has NO grant on space2/page2, so remote mode must DENY (403/404).
+# Paired with (b) this is discriminating — Bob allowed on page1 and denied on page2 can ONLY come from the
+# stub (native denies a non-member BOTH); a blanket allow-all or an ignored stub would fail one of the two.
+bob_read2="$(read_page "$B_JAR" "$PAGE2_ID")"
+if [ "$bob_read2" = "403" ] || [ "$bob_read2" = "404" ]; then
+  pass "Bob (no stub grant) is DENIED page2 ($bob_read2) — deny-by-default holds; the page1 allow was not allow-all"
 else
-  bad "Bob was NOT denied (HTTP $bob_read) — the stub's deny-by-default did not gate the fork: $(cat "$TMP/bread.json" 2>/dev/null)"
+  bad "Bob was NOT denied page2 (HTTP $bob_read2) — the stub's deny-by-default did not gate the fork: $(cat "$TMP/read.json" 2>/dev/null)"
 fi
 
 log "RESULT"

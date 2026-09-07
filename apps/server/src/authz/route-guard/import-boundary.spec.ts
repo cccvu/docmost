@@ -53,7 +53,7 @@ const SEAM_ALLOWLIST = new Set<string>([
   'database/database.module.ts', // seam #1 — the DI rebind (AuthzModule + mode/repo-providers)
   'app.module.ts', // seam #4 — CollabDisconnectModule + PlatformAuditModule + PlatformAuthorizationGuard
   'core/search/search.module.ts', // seam #5 — PDP-gated search provider
-  'integrations/static/static.module.ts', // NATIVE_AUTH_ENABLED capability injection (reads authz mode)
+  'integrations/static/static.module.ts', // seam #86 — client capability injection (NATIVE_AUTH_ENABLED, reads authz mode)
   'core/auth/auth.controller.ts', // seam #87 — NativeAuthModeGuard/NativeCredentialRoute on credential routes
   'core/workspace/controllers/workspace.controller.ts', // seam #87/#88 — native-auth gate on the session-mint route
 ]);
@@ -121,10 +121,13 @@ describe('the import classifier recognizes every boundary-crossing shape (meta-g
     expect(k('probe.ts', '../../../packages/x')).toBe('other');
   });
 
-  it("flags 'ccc' — an import that resolves into authz/ or service-bridge/", () => {
+  it("flags 'ccc' — an import that resolves into authz/, service-bridge/, or editor-compat/", () => {
     expect(k('core/auth/auth.controller.ts', '../../authz/mode/native-auth-mode.guard')).toBe('ccc');
     expect(k('app.module.ts', './authz/audit/audit.module')).toBe('ccc');
     expect(k('some/upstream/file.ts', '../../service-bridge/service-bridge.module')).toBe('ccc');
+    // editor-compat/ is a planned CCC module (not yet created); the classifier guards it in lockstep with
+    // CCC_PREFIXES so rule 3 fires the moment an upstream file reaches into it. Path-based, so it holds pre-creation.
+    expect(k('some/upstream/file.ts', '../../editor-compat/schema/x')).toBe('ccc');
     expect(k('probe.ts', 'src/authz/mode/authz-mode')).toBe('ccc');
   });
 

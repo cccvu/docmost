@@ -71,7 +71,10 @@ for i in $(seq 1 120); do
   if curl -fsS -o /dev/null "${BASE}/"; then ready=1; break; fi
   sleep 2
 done
-[ "$ready" = "1" ] && pass "app responding at ${BASE}" || { bad "app never came up"; exit 1; }
+# On a boot timeout, dump recent container logs before exiting so a CI failure is diagnosable without a
+# re-run (symmetric with contract-smoke.sh's wait_ready).
+[ "$ready" = "1" ] && pass "app responding at ${BASE}" \
+  || { bad "app never came up"; "${COMPOSE[@]}" logs docmost --tail 80 || true; exit 1; }
 
 # psql helper against the bundled db
 psql() { "${COMPOSE[@]}" exec -T postgres psql -U docmost -d docmost -tAc "$1"; }

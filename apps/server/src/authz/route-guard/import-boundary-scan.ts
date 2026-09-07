@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync, statSync } from 'fs';
+import { readFileSync, readdirSync } from 'fs';
 import { join, resolve, dirname, sep } from 'path';
 import * as ts from 'typescript';
 
@@ -21,10 +21,11 @@ import * as ts from 'typescript';
  *                "fork depends on the super repo": a `../../../../services/...` climb RESOLVES in a super
  *                checkout (where `docmost/` is a subdir) so it passes the fork's own build, yet breaks a
  *                standalone clone. The one non-vacuous, non-build-covered independence guard.
- *   - 'ccc'    — resolves into `apps/server/src/authz/` or `apps/server/src/service-bridge/` (the first-class
- *                CCC modules). An UPSTREAM-owned file importing these is wrong-direction coupling — CCC
- *                integration must enter upstream ONLY at the documented DI/composition seams. (The spec owns
- *                the upstream/CCC classification + the seam allowlist; the scanner just reports the edge.)
+ *   - 'ccc'    — resolves into `apps/server/src/authz/`, `apps/server/src/service-bridge/`, or
+ *                `apps/server/src/editor-compat/` (the first-class CCC modules — kept in lockstep with the
+ *                spec's CCC_PREFIXES). An UPSTREAM-owned file importing these is wrong-direction coupling —
+ *                CCC integration must enter upstream ONLY at the documented DI/composition seams. (The spec
+ *                owns the upstream/CCC classification + the seam allowlist; the scanner just reports the edge.)
  *   - 'other'  — anything else (node_modules OSS deps, `@docmost/{db,transactional,base-formula}` aliases,
  *                internal upstream/CCC relative imports). Not boundary-relevant.
  *
@@ -46,15 +47,13 @@ export interface ImportEdge {
 }
 
 function walkTsFiles(dir: string, out: string[]): void {
-  for (const name of readdirSync(dir)) {
-    const full = join(dir, name);
-    if (statSync(full).isDirectory()) {
-      if (!SKIP_DIRS.has(name)) walkTsFiles(full, out);
-    } else if (
-      name.endsWith('.ts') &&
-      !name.endsWith('.d.ts') &&
-      !name.endsWith('.spec.ts')
-    ) {
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const full = join(dir, entry.name);
+    if (entry.isDirectory()) {
+      if (!SKIP_DIRS.has(entry.name)) walkTsFiles(full, out);
+    } else if (entry.isFile() && entry.name.endsWith('.ts') && !entry.name.endsWith('.d.ts')) {
+      // .spec.ts IS scanned (symmetric with the AGPL scanner): a fork spec that imports ee/ or escapes the
+      // fork root would still break `pnpm test` in a standalone clone, so it is in-scope for the boundary.
       out.push(full);
     }
   }
@@ -105,8 +104,10 @@ function isUnder(abs: string, base: string): boolean {
 export function classifySpecifier(fileAbs: string, specifier: string, srcRoot: string): EdgeKind {
   const forkRoot = resolve(srcRoot, '..', '..', '..'); // apps/server/src -> server -> apps -> docmost
   const eeDir = join(srcRoot, 'ee');
-  const authzDir = join(srcRoot, 'authz');
-  const bridgeDir = join(srcRoot, 'service-bridge');
+  // The first-class CCC module roots — kept in lockstep with the spec's CCC_PREFIXES so an upstream import
+  // into ANY of them classifies as 'ccc' and rule 3 can fire (editor-compat/ is planned but not yet created;
+  // classification is path-based so it is guarded from the moment it exists).
+  const cccDirs = [join(srcRoot, 'authz'), join(srcRoot, 'service-bridge'), join(srcRoot, 'editor-compat')];
 
   // The `@docmost/ee/*` alias points straight at the empty EE gitlink.
   if (specifier === '@docmost/ee' || specifier.startsWith('@docmost/ee/')) return 'ee';
@@ -121,7 +122,7 @@ export function classifySpecifier(fileAbs: string, specifier: string, srcRoot: s
 
   if (isUnder(abs, eeDir)) return 'ee';
   if (!isUnder(abs, forkRoot)) return 'escape'; // a relative climb out of docmost/
-  if (isUnder(abs, authzDir) || isUnder(abs, bridgeDir)) return 'ccc';
+  if (cccDirs.some((d) => isUnder(abs, d))) return 'ccc';
   return 'other';
 }
 
