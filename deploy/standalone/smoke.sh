@@ -21,6 +21,9 @@ cd "$FORK_ROOT"
 # never collides with a running dev stack on 3000 / 8025.
 export DOCMOST_PORT="${DOCMOST_PORT:-13300}"
 export MAILPIT_UI_PORT="${MAILPIT_UI_PORT:-18025}"
+# A real (>=16-char) service secret, PRESENT in native mode on purpose: the east-west 404 assertion below
+# proves RemoteOnlyGuard is mode-driven, not merely inert for lack of a secret (Phase C). openssl -> 64 hex.
+export PLATFORM_AUTHZ_SERVICE_SECRET="${PLATFORM_AUTHZ_SERVICE_SECRET:-$(openssl rand -hex 32)}"
 # Own compose project (-p) so the smoke's `down -v` can NEVER wipe a persistent `make standalone` stack
 # (which uses the compose file's default project name `docmost-standalone`).
 COMPOSE=(docker compose -p docmost-standalone-smoke -f deploy/standalone/docker-compose.yml)
@@ -68,7 +71,10 @@ for i in $(seq 1 120); do
   if curl -fsS -o /dev/null "${BASE}/"; then ready=1; break; fi
   sleep 2
 done
-[ "$ready" = "1" ] && pass "app responding at ${BASE}" || { bad "app never came up"; exit 1; }
+# On a boot timeout, dump recent container logs before exiting so a CI failure is diagnosable without a
+# re-run (symmetric with contract-smoke.sh's wait_ready).
+[ "$ready" = "1" ] && pass "app responding at ${BASE}" \
+  || { bad "app never came up"; "${COMPOSE[@]}" logs docmost --tail 80 || true; exit 1; }
 
 # psql helper against the bundled db
 psql() { "${COMPOSE[@]}" exec -T postgres psql -U docmost -d docmost -tAc "$1"; }
@@ -103,6 +109,19 @@ login_bad="$(curl -s -o /dev/null -w '%{http_code}' -H 'content-type: applicatio
   -d '{"email":"alice@example.com","password":"wrong"}' "${BASE}/api/auth/login")"
 [ "$login_bad" = "401" ] && pass "native login route live (bad password -> 401, not 404)" \
   || bad "native login route not behaving as native (bad password -> $login_bad, expected 401)"
+
+# --- 2b. the privileged east-west surface is 404 in native mode, even WITH the service secret set --------
+# RemoteOnlyGuard 404s every /api/service/* for ALL callers unless AUTHZ_MODE=remote, and it never reads the
+# secret — so a native box that HAS PLATFORM_AUTHZ_SERVICE_SECRET set (exported above) must STILL be 404
+# (mode-driven, not secret-driven; Phase C). Send the correct secret header so a 404 can only be the guard,
+# never a failed auth. This is the boundary invariant a native deployment relies on: the privileged CCC
+# service surface is unreachable, not merely dormant.
+svc_code="$(curl -s -o /dev/null -w '%{http_code}' -H 'content-type: application/json' \
+  -H "x-authz-service-secret: ${PLATFORM_AUTHZ_SERVICE_SECRET}" \
+  -d '{"externalId":"probe"}' "${BASE}/api/service/session")"
+[ "$svc_code" = "404" ] \
+  && pass "east-west /api/service/session -> 404 in native WITH the secret set (RemoteOnlyGuard is mode-driven)" \
+  || bad "east-west surface NOT 404 in native (HTTP $svc_code) — a native box could expose the privileged CCC service surface"
 
 # --- 3a. owner creates a private space + a page ----------------------------------------------------
 log "owner creates a private space and a page in it"

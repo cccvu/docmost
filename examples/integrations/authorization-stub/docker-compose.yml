@@ -1,0 +1,96 @@
+# Contract-replacement smoke: the Docmost fork in AUTHZ_MODE=remote, delegating every fine-grained
+# authorization decision to the ZERO-DEPENDENCY reference authorization stub in this directory — proving a
+# third party can implement the authorization service from the published contract
+# (../../../docs/integrations/authorization/authorization-service.openapi.json) ALONE, with no CCC platform.
+#
+# Driven by contract-smoke.sh (which seeds the stub policy with the real ids it creates). See that script;
+# a bare `docker compose -f docker-compose.yml up` here will boot but deny everything (empty seeded policy).
+#
+# Its own project name isolates network + volumes from any other Docmost stack on the host.
+name: docmost-contract-stub
+
+services:
+  postgres:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: docmost
+      POSTGRES_USER: docmost
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-docmost}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docmost -d docmost"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+    volumes:
+      - pg_data:/var/lib/postgresql
+
+  redis:
+    image: redis:8
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data
+
+  # Optional SMTP catcher so the native-phase invite flow (create Bob) completes locally.
+  mailpit:
+    image: axllent/mailpit:v1.31.0 # pinned (no :latest) — reproducible CI smoke
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${MAILPIT_UI_PORT:-18026}:8025"
+
+  # The reference authorization service (this directory's zero-dep server.mjs). Deny-by-default; fail-closed
+  # 503 until PLATFORM_AUTHZ_SERVICE_SECRET is set. Reads stub-policy.json ONCE at boot, so contract-smoke.sh
+  # writes the real-id policy to STUB_POLICY_FILE and mounts it here BEFORE this service starts.
+  stub:
+    image: node:22-slim
+    working_dir: /stub
+    command: ["node", "server.mjs"]
+    environment:
+      PORT: "4000"
+      PLATFORM_AUTHZ_SERVICE_SECRET: ${PLATFORM_AUTHZ_SERVICE_SECRET:?set PLATFORM_AUTHZ_SERVICE_SECRET (shared with the fork)}
+    volumes:
+      - ./server.mjs:/stub/server.mjs:ro
+      - ${STUB_POLICY_FILE:-./stub-policy.json}:/stub/stub-policy.json:ro
+    restart: unless-stopped
+
+  # The fork, built from THIS repo. AUTHZ_MODE is parameterized: the smoke boots it in `native` to bootstrap
+  # a workspace/users/space/page (native credential routes are 404 in remote — #184), then recreates it in
+  # `remote` pointed at the stub. NOT dependent on the stub, so the native bootstrap phase needs no stub.
+  docmost:
+    build:
+      context: ../../..
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    environment:
+      AUTHZ_MODE: ${DOCMOST_AUTHZ_MODE:-remote}
+      PLATFORM_AUTHZ_URL: http://stub:4000
+      PLATFORM_AUTHZ_SERVICE_SECRET: ${PLATFORM_AUTHZ_SERVICE_SECRET:?set PLATFORM_AUTHZ_SERVICE_SECRET (shared with the stub)}
+      NODE_ENV: production
+      APP_URL: ${APP_URL:-http://localhost:13400}
+      PORT: "3000"
+      APP_SECRET: ${APP_SECRET:?set APP_SECRET (openssl rand -hex 32)}
+      DATABASE_URL: postgres://docmost:${POSTGRES_PASSWORD:-docmost}@postgres:5432/docmost
+      REDIS_URL: redis://redis:6379
+      STORAGE_DRIVER: local
+      MAIL_DRIVER: smtp
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+      SMTP_SECURE: "false"
+      MAIL_FROM_ADDRESS: ${MAIL_FROM_ADDRESS:-docmost@localhost}
+      MAIL_FROM_NAME: ${MAIL_FROM_NAME:-Docmost}
+      DISABLE_TELEMETRY: "true"
+    ports:
+      - "${DOCMOST_PORT:-13400}:3000"
+    restart: unless-stopped
+    volumes:
+      - docmost_storage:/app/data/storage
+
+volumes:
+  pg_data:
+  redis_data:
+  docmost_storage:

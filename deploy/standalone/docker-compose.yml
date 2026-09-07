@@ -36,7 +36,7 @@ services:
   # Optional SMTP catcher so native invites / password-reset work locally. In a real standalone
   # deployment, point SMTP_* at your own mail server instead. UI at http://localhost:8025.
   mailpit:
-    image: axllent/mailpit:latest
+    image: axllent/mailpit:v1.31.0 # pinned (no :latest) — reproducible CI smoke
     restart: unless-stopped
     ports:
       # bound to loopback: the dev mail catcher should not be reachable from the LAN
@@ -54,6 +54,10 @@ services:
     environment:
       # The one required security setting: Docmost's own authorization, fully standalone.
       AUTHZ_MODE: native
+      # Deliberately pass-through (default empty): the smoke sets this to prove RemoteOnlyGuard 404s the
+      # privileged east-west /api/service/* surface in native mode even when the secret IS present — the
+      # guard is mode-driven, never secret-driven (Phase C). Harmless in native mode (ignored, not validated).
+      PLATFORM_AUTHZ_SERVICE_SECRET: ${PLATFORM_AUTHZ_SERVICE_SECRET:-}
       # migrations auto-run only when NODE_ENV=production
       NODE_ENV: production
       APP_URL: ${APP_URL:-http://localhost:3000}
