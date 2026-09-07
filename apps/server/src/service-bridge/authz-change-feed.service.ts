@@ -88,9 +88,10 @@ export interface ChangesResult {
   oldestPendingAgeMs: number | null;
 }
 
-/** Thrown when the requested cursor is at/below the retention high-water mark (events were GC'd past the
- *  consumer). The controller maps this to 409 so the platform REBASELINES (reconcile + reset cursor to the
- *  snapshot baseline), never silently skips. `head` is the current safe frontier cursor. */
+/** Thrown when the requested cursor is STRICTLY below the retention high-water mark (an un-consumed event was
+ *  GC'd past the consumer; a cursor AT the mark means the reclaimed row was already consumed, so it passes).
+ *  The controller maps this to 409 so the platform REBASELINES (reconcile + reset cursor to the snapshot
+ *  baseline), never silently skips. `head` is the current safe frontier cursor. */
 export class StaleCursorError extends Error {
   constructor(readonly head: string) {
     super('cursor is older than the oldest retained change; rebaseline required');
@@ -117,8 +118,9 @@ export class StaleCursorError extends Error {
  *
  * `getChanges` long-polls: if nothing is available it waits up to `waitMs` for a NOTIFY (or the timeout), then
  * reads once more. Stale-cursor detection guards future outbox retention: the retention sweep records the max
- * `(xact_id, id)` it ever deletes into `authz_outbox_gc`; a cursor at/below that mark means an un-consumed row
- * was GC'd, so the feed throws (409) and the platform rebaselines rather than skipping the gap.
+ * `(xact_id, id)` it ever deletes into `authz_outbox_gc`; a cursor STRICTLY below that mark means an un-consumed
+ * row was GC'd, so the feed throws (409) and the platform rebaselines rather than skipping the gap (a cursor AT
+ * the mark has already consumed the reclaimed row, so it passes).
  */
 @Injectable()
 export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
@@ -294,10 +296,11 @@ export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
     return age == null ? null : Math.round(Number(age));
   }
 
-  /** Throw StaleCursorError if `cursor` is at/below the retention high-water mark (an un-consumed row was GC'd).
-   *  Precise: `authz_outbox_gc` holds the MAX `(xact_id, id)` ever deleted; if the consumer has not passed it,
-   *  a GC'd row lies after its cursor and is lost -> rebaseline. This is correct even under commit reordering
-   *  (a min(created_at)/min(id) heuristic could miss a late-committing higher-xid row GC'd early). */
+  /** Throw StaleCursorError if `cursor` is STRICTLY below the retention high-water mark (an un-consumed row was
+   *  GC'd; AT the mark the reclaimed max row was already consumed, so it passes). Precise: `authz_outbox_gc`
+   *  holds the MAX `(xact_id, id)` ever deleted; if the consumer has not reached it, a GC'd row lies after its
+   *  cursor and is lost -> rebaseline. This is correct even under commit reordering (a min(created_at)/min(id)
+   *  heuristic could miss a late-committing higher-xid row GC'd early). */
   private async assertNotStale(cursor: Cursor, head: string): Promise<void> {
     const res = await sql<{ stale: boolean }>`
       select (g.xact_id, g.id) > (${cursor.xactId}::xid8, ${cursor.id}::bigint) as stale
@@ -308,7 +311,10 @@ export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
   }
 
   /** Retention sweep. Deletes rows older than the window and advances the GC high-water mark to the max
-   *  `(xact_id, id)` removed (monotonic), so stale detection stays correct as retention reclaims the table. */
+   *  `(xact_id, id)` removed (monotonic), so stale detection stays correct as retention reclaims the table.
+   *  EVERY sweep (reclaiming or not) ends with one greppable `AUTHZ_OUTBOX_GC_SWEEP` line carrying the count and
+   *  the mark the table holds afterwards (`none` until something has ever been reclaimed), so an operator can
+   *  tell a sweep that found nothing from a sweep that never ran. */
   private async gc(): Promise<void> {
     try {
       await this.db.transaction().execute(async (trx) => {
@@ -317,19 +323,29 @@ export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
           where created_at < now() - ${sql.raw(`interval '${RETENTION_DAYS} days'`)}
           returning xact_id, id
         `.execute(trx);
-        if (del.rows.length === 0) return;
-        let mx: Cursor = { xactId: String(del.rows[0].xactId), id: String(del.rows[0].id) };
-        for (const r of del.rows) {
-          const c: Cursor = { xactId: String(r.xactId), id: String(r.id) };
-          if (tupleGt(c, mx)) mx = c;
+        if (del.rows.length > 0) {
+          let mx: Cursor = { xactId: String(del.rows[0].xactId), id: String(del.rows[0].id) };
+          for (const r of del.rows) {
+            const c: Cursor = { xactId: String(r.xactId), id: String(r.id) };
+            if (tupleGt(c, mx)) mx = c;
+          }
+          await sql`
+            update authz_outbox_gc
+            set xact_id = ${mx.xactId}::xid8, id = ${mx.id}::bigint
+            where (xact_id, id) < (${mx.xactId}::xid8, ${mx.id}::bigint)
+          `.execute(trx);
+          this.logger.log(
+            `authz_outbox retention sweep removed ${del.rows.length} rows older than ${RETENTION_DAYS}d (gc mark -> ${mx.xactId}.${mx.id})`,
+          );
         }
-        await sql`
-          update authz_outbox_gc
-          set xact_id = ${mx.xactId}::xid8, id = ${mx.id}::bigint
-          where (xact_id, id) < (${mx.xactId}::xid8, ${mx.id}::bigint)
+        // The mark as the table holds it AFTER the sweep (the monotonic guard above may have kept a higher one).
+        const g = await sql<{ xactId: string; id: string }>`
+          select xact_id, id from authz_outbox_gc where singleton = true
         `.execute(trx);
+        const row = g.rows[0];
+        const mark = row ? formatCursor(String(row.xactId), String(row.id)) : ZERO_CURSOR;
         this.logger.log(
-          `authz_outbox retention sweep removed ${del.rows.length} rows older than ${RETENTION_DAYS}d (gc mark -> ${mx.xactId}.${mx.id})`,
+          `AUTHZ_OUTBOX_GC_SWEEP removed=${del.rows.length} mark=${mark === ZERO_CURSOR ? 'none' : mark} retentionDays=${RETENTION_DAYS}`,
         );
       });
     } catch (e) {
