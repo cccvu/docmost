@@ -15,6 +15,7 @@ import { AuthzChangeEvent, AuthzChangeEventType } from './authz-change-event';
 import { ChangesResult } from './authz-change-feed.service';
 import { SnapshotResult } from './authz-snapshot.service';
 import { PublicPageSummary, PublicSpaceSummary, RawPagePermission } from './service-content.service';
+import { PublicSearchHit } from './service-search.service';
 import { SpaceView, RawSpaceMember } from './service-space.service';
 import { WorkspaceSettingsView } from './service-workspace.service';
 
@@ -183,6 +184,7 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     PublicPageSummary: keysOf<PublicPageSummary>({ id: true, slugId: true, title: true, icon: true, spaceId: true, parentPageId: true, position: true, createdAt: true, updatedAt: true }),
     PublicSpaceSummary: keysOf<PublicSpaceSummary>({ id: true, name: true, slug: true, description: true, visibility: true, createdAt: true, updatedAt: true }),
     RawPagePermission: keysOf<RawPagePermission>({ id: true, userId: true, groupId: true, role: true, createdAt: true }),
+    PublicSearchHit: keysOf<PublicSearchHit>({ id: true, title: true, icon: true, parentPageId: true, space: true, highlight: true, createdAt: true, updatedAt: true }),
   };
 
   // The 5 inline (non-component) scalar bodies, tied to the CONTROLLER return types (a signature change reds).
@@ -215,6 +217,7 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     { id: 'listContentPages', method: 'post', path: '/api/service/content/pages/list', expect: { kind: 'items', name: 'PublicPageSummary' } },
     { id: 'listContentSpaces', method: 'post', path: '/api/service/content/spaces/list', expect: { kind: 'items', name: 'PublicSpaceSummary' } },
     { id: 'getContentSpace', method: 'get', path: '/api/service/content/spaces/{spaceId}', expect: { kind: 'ref', name: 'PublicSpaceSummary' } },
+    { id: 'searchContent', method: 'post', path: '/api/service/content/search', expect: { kind: 'items', name: 'PublicSearchHit' } },
   ];
 
   const refName = (s: any): string | null => (s && typeof s.$ref === 'string' ? s.$ref.split('/').pop()! : null);

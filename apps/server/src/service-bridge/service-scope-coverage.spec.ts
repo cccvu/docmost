@@ -60,6 +60,7 @@ const EXPECTED_SCOPE: Record<string, ServiceScope> = {
   'ServiceContentController.listPages': ServiceScope.ContentRead,
   'ServiceContentController.listSpaces': ServiceScope.ContentRead,
   'ServiceContentController.getSpace': ServiceScope.ContentRead,
+  'ServiceContentController.search': ServiceScope.ContentSearch,
   'AuthzChangeController.changes': ServiceScope.ChangesRead,
   'AuthzChangeController.getSnapshot': ServiceScope.ChangesRead,
 };

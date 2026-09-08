@@ -18,7 +18,9 @@ import {
   PublicSpaceSummary,
   ServiceContentService,
 } from './service-content.service';
+import { PublicSearchHit, ServiceSearchService } from './service-search.service';
 import { ContentListDto } from './dto/content-read.dto';
+import { ContentSearchDto } from './dto/content-search.dto';
 
 /**
  * CCC service-bridge — NOT upstream Docmost code.
@@ -31,7 +33,10 @@ import { ContentListDto } from './dto/content-read.dto';
 @Controller('service/content')
 @UseGuards(RemoteOnlyGuard, ServiceAuthGuard)
 export class ServiceContentController {
-  constructor(private readonly content: ServiceContentService) {}
+  constructor(
+    private readonly content: ServiceContentService,
+    private readonly searchSvc: ServiceSearchService,
+  ) {}
 
   @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
 
@@ -59,5 +64,17 @@ export class ServiceContentController {
     @Param('spaceId', ParseUUIDPipe) spaceId: string,
   ): Promise<PublicSpaceSummary> {
     return this.content.getSpace(spaceId);
+  }
+
+  // Permission-aware search. UNLIKE the list ops above, this is NOT a privileged data plane over a pre-
+  // authorized id set — it IS the authorization gate (PdpSearchService, filter-then-retrieve), so it carries
+  // its own scope (content:search) and the platform must not post-filter the result.
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
+  @Post('search')
+  @HttpCode(HttpStatus.OK)
+  @RequireServiceScope(ServiceScope.ContentSearch)
+  async search(@Body() dto: ContentSearchDto): Promise<{ items: PublicSearchHit[] }> {
+    return this.searchSvc.searchContent(dto);
   }
 }

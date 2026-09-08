@@ -10,10 +10,16 @@ import { ServiceSpaceService } from './service-space.service';
 import { ServicePageController } from './service-page.controller';
 import { ServiceContentController } from './service-content.controller';
 import { ServiceContentService } from './service-content.service';
+import { ServiceSearchService } from './service-search.service';
 import { AuthzChangeController } from './authz-change.controller';
 import { AuthzChangeFeedService } from './authz-change-feed.service';
 import { AuthzSnapshotService } from './authz-snapshot.service';
 import { AuthzOutboxInstaller } from './authz-outbox.installer';
+// Seam #5 (see UPSTREAM_MODIFICATIONS.md): SearchModule binds the SearchService token to PdpSearchService in
+// AUTHZ_MODE=remote. Importing it here lets ServiceSearchService inject that PDP-gated search — the binding
+// is module-local, so the token must be resolved through the module that exports it (a @Global rebind can't
+// win). No cycle: SearchModule imports no modules (its provider deps are all @Global).
+import { SearchModule } from '../core/search/search.module';
 
 /**
  * CCC service-bridge — NOT upstream Docmost code.
@@ -28,6 +34,7 @@ import { AuthzOutboxInstaller } from './authz-outbox.installer';
  * ENFORCEMENT in native mode, not by the accident of a missing secret.
  */
 @Module({
+  imports: [SearchModule],
   controllers: [
     ServiceBridgeController,
     ServiceWorkspaceController,
@@ -41,6 +48,7 @@ import { AuthzOutboxInstaller } from './authz-outbox.installer';
     ServiceWorkspaceService,
     ServiceSpaceService,
     ServiceContentService,
+    ServiceSearchService,
     AuthzChangeFeedService,
     AuthzSnapshotService,
     AuthzOutboxInstaller,
