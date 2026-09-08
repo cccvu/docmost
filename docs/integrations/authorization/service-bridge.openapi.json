@@ -698,11 +698,33 @@
         "properties": {
           "ids": { "type": "array", "maxItems": 10000, "items": { "type": "string", "format": "uuid" }, "description": "The platform's PDP-authorized id set (the belt). maxItems MUST stay >= the platform's content.maxListAuthorizedIds default (10000) or a well-authorized principal gets a 400; the provider/consumer contract tests enforce this." },
           "spaceId": { "type": "string", "format": "uuid", "description": "Pages only: scope the list to one space." },
+          "parentPageId": { "type": "string", "format": "uuid", "description": "Pages only: children of this parent." },
+          "titleContains": { "type": "string", "maxLength": 256, "description": "Pages only: case-insensitive title substring (ilike; %/_ matched literally)." },
+          "creatorId": { "type": "string", "format": "uuid", "description": "Pages only: the page's Docmost creator id (the platform translates identity → docmost id BEFORE calling)." },
+          "nameContains": { "type": "string", "maxLength": 256, "description": "Spaces only: case-insensitive name substring." },
+          "updatedSince": { "type": "string", "format": "date-time", "description": "Pages + spaces: updated-at >= (inclusive)." },
+          "updatedUntil": { "type": "string", "format": "date-time", "description": "Pages + spaces: updated-at < (exclusive)." },
+          "createdSince": { "type": "string", "format": "date-time", "description": "Spaces only: created-at >= (inclusive)." },
+          "createdUntil": { "type": "string", "format": "date-time", "description": "Spaces only: created-at < (exclusive)." },
+          "sort": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["field", "direction"],
+            "properties": {
+              "field": { "type": "string", "enum": ["updatedAt", "createdAt", "title", "name"], "description": "title is pages-only, name is spaces-only; a cross-resource field is a 400. Always tie-broken by id." },
+              "direction": { "type": "string", "enum": ["asc", "desc"] }
+            },
+            "description": "Allowlisted sort key + direction; absent → the legacy `updatedAt desc` default (id-tiebroken). The keyset SQL is generalized to the chosen field; text sorts coalesce null → ''."
+          },
           "before": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["updatedAt", "id"],
-            "properties": { "updatedAt": { "type": "string" }, "id": { "type": "string" } },
+            "required": ["id"],
+            "properties": {
+              "updatedAt": { "type": "string", "description": "Legacy / timestamp-sort bound (bound as ::timestamptz). Optional so a text-sort cursor still validates." },
+              "value": { "type": "string", "maxLength": 512, "description": "Generic cursor-v2 bound for the ACTIVE sort field — a timestamp (updatedAt/createdAt) or the coalesced title/name string." },
+              "id": { "type": "string" }
+            },
             "description": "The decoded keyset cursor position (cursor encode/decode stays on the platform)."
           },
           "limit": { "type": "integer", "minimum": 1, "maximum": 100 }

@@ -1,4 +1,4 @@
-import { NotFoundException } from '@nestjs/common';
+import { BadRequestException, NotFoundException } from '@nestjs/common';
 import { ServiceContentService } from './service-content.service';
 import { spyKysely, SpyQuery } from './kysely-spy.testkit';
 
@@ -136,5 +136,119 @@ describe('ServiceContentService — privileged data plane (trusts the platform P
     await expect(
       svc.getSpace('44444444-4444-4444-4444-444444444444'),
     ).rejects.toBeInstanceOf(NotFoundException);
+  });
+});
+
+describe('ServiceContentService — allowlisted filters + sort pushdown (backward-compatible)', () => {
+  const IDS = ['11111111-1111-1111-1111-111111111111'];
+
+  it('the default path (no sort) emits the exact legacy keyset SQL', async () => {
+    const { spy, svc } = make(() => []);
+    await svc.listPagesByIds({ ids: IDS, limit: 10 } as any);
+    const sql = q(spy.calls[0].sql);
+    // The backward-compat invariant: no sort → millisecond-truncated updated_at desc, id::text desc.
+    expect(sql).toContain("date_trunc('milliseconds', updated_at) desc");
+    expect(sql).toContain('id::text desc');
+    expect(sql).not.toContain('coalesce(');
+  });
+
+  it('pushes the allowlisted page filters into the WHERE (bound params, ilike substring)', async () => {
+    const { spy, svc } = make(() => []);
+    await svc.listPagesByIds({
+      ids: IDS,
+      parentPageId: '22222222-2222-2222-2222-222222222222',
+      titleContains: 'road%map',
+      creatorId: '33333333-3333-3333-3333-333333333333',
+      updatedSince: '2026-01-01T00:00:00.000Z',
+      updatedUntil: '2026-02-01T00:00:00.000Z',
+      limit: 10,
+    } as any);
+    const call = spy.calls[0];
+    const sql = q(call.sql);
+    expect(sql).toContain('parent_page_id =');
+    expect(sql).toContain('title ilike');
+    expect(sql).toContain('creator_id =');
+    expect(sql).toContain('updated_at >=');
+    expect(sql).toContain('updated_at <');
+    // The ilike metacharacter in the user input is escaped so it matches literally.
+    expect(call.parameters).toContainEqual('%road\\%map%');
+  });
+
+  it('pushes the allowlisted space filters into the WHERE', async () => {
+    const { spy, svc } = make(() => []);
+    await svc.listSpacesByIds({
+      ids: IDS,
+      nameContains: 'eng',
+      createdSince: '2026-01-01T00:00:00.000Z',
+      createdUntil: '2026-02-01T00:00:00.000Z',
+      limit: 10,
+    } as any);
+    const sql = q(spy.calls[0].sql);
+    expect(sql).toContain('name ilike');
+    expect(sql).toContain('created_at >=');
+    expect(sql).toContain('created_at <');
+  });
+
+  it('sort=createdAt desc emits a created_at keyset (ms-truncated) instead of updated_at', async () => {
+    const { spy, svc } = make(() => []);
+    await svc.listPagesByIds({
+      ids: IDS,
+      sort: { field: 'createdAt', direction: 'desc' },
+      before: { value: '2026-01-05T00:00:00.000Z', id: 'x' },
+      limit: 10,
+    } as any);
+    const sql = q(spy.calls[0].sql);
+    expect(sql).toContain("date_trunc('milliseconds', created_at)");
+    expect(sql).toContain('order by');
+  });
+
+  it('sort=title asc (pages) coalesces null titles and uses a > keyset bound', async () => {
+    const { spy, svc } = make(() => []);
+    await svc.listPagesByIds({
+      ids: IDS,
+      sort: { field: 'title', direction: 'asc' },
+      before: { value: 'Roadmap', id: 'x' },
+      limit: 10,
+    } as any);
+    const call = spy.calls[0];
+    const sql = q(call.sql);
+    expect(sql).toContain("coalesce(title, '')");
+    expect(sql).toContain('asc');
+    expect(sql).toContain('::text'); // text-typed keyset bound
+    expect(call.parameters).toContainEqual('Roadmap');
+  });
+
+  it('sort=name (spaces) coalesces the name column', async () => {
+    const { spy, svc } = make(() => []);
+    await svc.listSpacesByIds({
+      ids: IDS,
+      sort: { field: 'name', direction: 'asc' },
+      limit: 10,
+    } as any);
+    expect(q(spy.calls[0].sql)).toContain("coalesce(name, '')");
+  });
+
+  it('rejects a cross-resource sort field (name on pages, title on spaces) with 400', async () => {
+    const pages = make(() => []);
+    await expect(
+      pages.svc.listPagesByIds({ ids: IDS, sort: { field: 'name', direction: 'asc' }, limit: 10 } as any),
+    ).rejects.toBeInstanceOf(BadRequestException);
+
+    const spaces = make(() => []);
+    await expect(
+      spaces.svc.listSpacesByIds({ ids: IDS, sort: { field: 'title', direction: 'asc' }, limit: 10 } as any),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('a text-sort cursor missing its bound value is a 400 (not a 500 at the cast)', async () => {
+    const { svc } = make(() => []);
+    await expect(
+      svc.listPagesByIds({
+        ids: IDS,
+        sort: { field: 'title', direction: 'asc' },
+        before: { id: 'x' }, // no value, no updatedAt
+        limit: 10,
+      } as any),
+    ).rejects.toBeInstanceOf(BadRequestException);
   });
 });
