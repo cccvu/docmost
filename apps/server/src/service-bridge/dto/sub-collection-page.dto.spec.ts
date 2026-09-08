@@ -1,5 +1,5 @@
 import { BadRequestException } from '@nestjs/common';
-import { parseSubCollectionQuery, SUB_COLLECTION_MAX_LIMIT } from './sub-collection-page.dto';
+import { isIsoInstant, parseSubCollectionQuery, SUB_COLLECTION_MAX_LIMIT } from './sub-collection-page.dto';
 
 describe('parseSubCollectionQuery', () => {
   it('returns an empty page (unpaged) when nothing is supplied', () => {
@@ -35,7 +35,23 @@ describe('parseSubCollectionQuery', () => {
     );
   });
 
-  it('rejects a non-ISO beforeCreatedAt (a 400, not a 500 at the cast)', () => {
+  it('rejects a non-ISO beforeCreatedAt as a 400 — including a Date.parse-lenient-but-PG-invalid value', () => {
     expect(() => parseSubCollectionQuery('10', 'not-a-date', 'm-1')).toThrow(BadRequestException);
+    // bare '2026' passes Date.parse but 500s at `::timestamptz`; the strict guard must reject it up front.
+    expect(() => parseSubCollectionQuery('10', '2026', 'm-1')).toThrow(BadRequestException);
+  });
+});
+
+describe('isIsoInstant', () => {
+  it('accepts full ISO instants (what the platform sends via toISOString) and date-only', () => {
+    expect(isIsoInstant('2026-01-01T00:00:00.000Z')).toBe(true);
+    expect(isIsoInstant('2026-01-01T12:34:56+05:30')).toBe(true);
+    expect(isIsoInstant('2026-01-01')).toBe(true);
+  });
+  it('rejects Date.parse-lenient-but-Postgres-invalid values', () => {
+    expect(isIsoInstant('2026')).toBe(false);
+    expect(isIsoInstant('2026-01')).toBe(false);
+    expect(isIsoInstant('not-a-date')).toBe(false);
+    expect(isIsoInstant('')).toBe(false);
   });
 });

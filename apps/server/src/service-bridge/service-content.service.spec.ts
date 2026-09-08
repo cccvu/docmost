@@ -251,6 +251,32 @@ describe('ServiceContentService — allowlisted filters + sort pushdown (backwar
       } as any),
     ).rejects.toBeInstanceOf(BadRequestException);
   });
+
+  it('a text sort does NOT fall back to a legacy timestamp cursor (400, never wrong-boundary pagination)', async () => {
+    const { svc } = make(() => []);
+    // A title sort with only `updatedAt` (a timestamp) and no `value` must 400 — falling back would compare a
+    // timestamp string against titles and paginate wrong (Correctness #2).
+    await expect(
+      svc.listPagesByIds({
+        ids: IDS,
+        sort: { field: 'title', direction: 'asc' },
+        before: { updatedAt: '2026-01-01T00:00:00.000Z', id: 'x' },
+        limit: 10,
+      } as any),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('a timestamp-sort cursor whose bound is not a valid instant is a 400 (not a 500 at the ::timestamptz cast)', async () => {
+    const { svc } = make(() => []);
+    await expect(
+      svc.listPagesByIds({
+        ids: IDS,
+        sort: { field: 'updatedAt', direction: 'desc' },
+        before: { value: '2026', id: 'x' }, // Date.parse-lenient but PG-invalid
+        limit: 10,
+      } as any),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
 });
 
 describe('ServiceContentService.listPagePermissions — opt-in keyset paging (backward-compatible)', () => {

@@ -16,6 +16,19 @@ export interface SubCollectionPage {
 }
 
 /**
+ * A strict-enough ISO-8601 instant guard for a keyset timestamp bound: requires a full YYYY-MM-DD date (time
+ * optional), so a `Date.parse`-lenient-but-Postgres-invalid value like bare `'2026'` is rejected HERE (a 400)
+ * instead of 500-ing at the `::timestamptz` cast. The platform always sends `Date.prototype.toISOString()`
+ * output, which passes; this guards a direct service-bridge caller. Shared with the content keyset builder.
+ */
+export function isIsoInstant(s: string): boolean {
+  return (
+    /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?)?$/.test(s) &&
+    !Number.isNaN(Date.parse(s))
+  );
+}
+
+/**
  * Parse the `{ limit, beforeCreatedAt, beforeId }` query triple into a SubCollectionPage. Undefined `limit`
  * → unpaged (return all). A malformed limit, a half-supplied cursor, a cursor without a limit, or a
  * non-parseable timestamp is a 400 (never a 500 at the SQL cast).
@@ -42,7 +55,7 @@ export function parseSubCollectionQuery(
     if (page.limit === undefined) {
       throw new BadRequestException('a cursor (beforeCreatedAt/beforeId) requires limit');
     }
-    if (Number.isNaN(Date.parse(beforeCreatedAt as string))) {
+    if (!isIsoInstant(beforeCreatedAt as string)) {
       throw new BadRequestException('beforeCreatedAt must be an ISO-8601 timestamp');
     }
     page.before = { createdAt: beforeCreatedAt as string, id: beforeId as string };

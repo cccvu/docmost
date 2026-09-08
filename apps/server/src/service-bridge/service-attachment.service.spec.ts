@@ -72,4 +72,27 @@ describe('ServiceAttachmentService — page-scoped attachment reads (privileged 
     const res = await svc.listByPage('44444444-4444-4444-4444-444444444444');
     expect(res.items[0].fileSize).toBeNull();
   });
+
+  it('listByPage unpaged (no page arg) keeps the legacy query: created_at asc, no keyset, no limit', async () => {
+    const { svc, spy } = make(() => []);
+    await svc.listByPage('44444444-4444-4444-4444-444444444444');
+    const sql = q(spy.calls[0].sql);
+    expect(sql).toContain('order by created_at asc');
+    expect(sql).not.toContain('date_trunc');
+    expect(sql).not.toContain('limit');
+  });
+
+  it('listByPage paged uses the ms-truncated id-tiebroken ascending keyset + limit+1', async () => {
+    const { svc, spy } = make(() => []);
+    await svc.listByPage('44444444-4444-4444-4444-444444444444', {
+      limit: 20,
+      before: { createdAt: '2026-01-01T00:00:00.000Z', id: 'a-9' },
+    });
+    const call = spy.calls[0];
+    const sql = q(call.sql);
+    expect(sql).toContain("date_trunc('milliseconds', created_at) asc");
+    expect(sql).toContain('id::text asc');
+    expect(sql).toContain('> (');
+    expect(call.parameters).toContainEqual(21); // limit + 1
+  });
 });

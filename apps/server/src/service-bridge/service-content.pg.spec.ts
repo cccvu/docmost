@@ -244,6 +244,39 @@ d('ServiceContentService on real Postgres (keyset ordering + confidentiality)', 
       const res = await svc.listPagesByIds({ ids: titleIds, titleContains: 'ban', limit: 100 } as any);
       expect(res.items.map((p) => p.id).sort()).toEqual([uuid(92), uuid(93)]);
     });
+
+    it('updatedAt asc walks the shared-ms tie ascending with no skip and no duplicate (timestamp keyset)', async () => {
+      const tids = [uuid(1), uuid(2), uuid(3)]; // uuid(1)/uuid(2) share a truncated ms; uuid(3) is +1s.
+      const sort = { field: 'updatedAt' as const, direction: 'asc' as const };
+      const walk: string[] = [];
+      let cursor: { value: string; id: string } | undefined;
+      for (let guard = 0; guard < 10; guard++) {
+        const page = await svc.listPagesByIds({ ids: tids, sort, limit: 2, before: cursor } as any);
+        const kept = page.items.slice(0, 2);
+        walk.push(...kept.map((p) => p.id));
+        if (page.items.length <= 2) break;
+        const last = kept[kept.length - 1];
+        cursor = { value: last.updatedAt, id: last.id }; // the platform builds cursor-v2 from the row's field
+      }
+      // Ascending id::text keeps uuid(1) before uuid(2) at the shared ms and puts uuid(2) on the correct page.
+      expect(walk).toEqual([uuid(1), uuid(2), uuid(3)]);
+      expect(new Set(walk).size).toBe(walk.length);
+    });
+
+    it('title asc with value="" (null title) as a mid-walk cursor bound does not re-include the null-title row', async () => {
+      // limit 1 so uuid(90) (null title → coalesced '') is page 1, and its value='' becomes the page-2 bound.
+      const first = await svc.listPagesByIds({ ids: titleIds, sort: { field: 'title', direction: 'asc' }, limit: 1 } as any);
+      expect(first.items[0].id).toBe(uuid(90)); // null title sorts first
+      const boundary = { value: first.items[0].title ?? '', id: first.items[0].id };
+      expect(boundary.value).toBe(''); // the coalesced null-title bound
+      const second = await svc.listPagesByIds({
+        ids: titleIds,
+        sort: { field: 'title', direction: 'asc' },
+        limit: 1,
+        before: boundary,
+      } as any);
+      expect(second.items[0].id).toBe(uuid(91)); // 'apple' next — uuid(90) is NOT re-included
+    });
   });
 
   // ---- F2: confidentiality invariant, executed on the engine ----

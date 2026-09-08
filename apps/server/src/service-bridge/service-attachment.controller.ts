@@ -1,4 +1,4 @@
-import { Controller, Get, Param, ParseUUIDPipe, UseGuards } from '@nestjs/common';
+import { Controller, Get, Param, ParseUUIDPipe, Query, UseGuards } from '@nestjs/common';
 import { SkipTransform } from '../common/decorators/skip-transform.decorator';
 import { RemoteOnlyGuard } from '../authz/mode/remote-only.guard';
 import { RequireServiceScope, ServiceAuthGuard } from './service-auth.guard';
@@ -7,6 +7,7 @@ import {
   PublicAttachmentSummary,
   ServiceAttachmentService,
 } from './service-attachment.service';
+import { parseSubCollectionQuery } from './dto/sub-collection-page.dto';
 
 /**
  * CCC service-bridge — NOT upstream Docmost code.
@@ -38,7 +39,11 @@ export class ServiceAttachmentController {
   @RequireServiceScope(ServiceScope.AttachmentsRead)
   async listByPage(
     @Param('pageId', ParseUUIDPipe) pageId: string,
+    @Query('limit') limit?: string,
+    @Query('beforeCreatedAt') beforeCreatedAt?: string,
+    @Query('beforeId') beforeId?: string,
   ): Promise<{ items: PublicAttachmentSummary[] }> {
-    return this.attachments.listByPage(pageId);
+    // Opt-in keyset paging (no params → all file attachments, the backward-compatible default).
+    return this.attachments.listByPage(pageId, parseSubCollectionQuery(limit, beforeCreatedAt, beforeId));
   }
 }

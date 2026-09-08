@@ -3,6 +3,7 @@ import { InjectKysely } from 'nestjs-kysely';
 import { sql } from 'kysely';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
 import { WorkspaceResolver } from './workspace-resolver';
+import { SubCollectionPage } from './dto/sub-collection-page.dto';
 import { AttachmentType } from '../core/attachment/attachment.constants';
 
 /** Compact, PII-free attachment shape for `/v1` list responses (ISO timestamps over the wire). */
@@ -70,15 +71,40 @@ export class ServiceAttachmentService {
    * The file attachments on a page (compact projection). `type = 'file'` excludes avatars/icons/chat uploads
    * (only file-type rows carry a pageId anyway); workspace-scoped and soft-delete-excluded. Ordered oldest
    * first with an id tiebreak for a stable list. The platform authorizes page#view BEFORE calling.
+   *
+   * Opt-in keyset paging (the same contract as space members / page ACL — see SubCollectionPage): with
+   * `page.limit` the fork walks `(created_at, id)` ascending and returns up to limit+1 (so the platform can
+   * detect hasMore + build the next cursor from the last kept row); without it the read is unpaged (all file
+   * attachments). This gives a heavily-attached page a bounded read instead of an unbounded array, and keeps
+   * attachments consistent with the other sub-collection reads. The default (unpaged) shape is unchanged.
    */
-  async listByPage(pageId: string): Promise<{ items: PublicAttachmentSummary[] }> {
+  async listByPage(
+    pageId: string,
+    page?: SubCollectionPage,
+  ): Promise<{ items: PublicAttachmentSummary[] }> {
     const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
+    const paged = page?.limit !== undefined;
+    const conds = [
+      sql`page_id = ${pageId}`,
+      sql`workspace_id = ${workspaceId}`,
+      sql`type = ${AttachmentType.File}`,
+      sql`deleted_at is null`,
+    ];
+    if (paged && page!.before) {
+      conds.push(
+        sql`(date_trunc('milliseconds', created_at), id::text) > (${page!.before.createdAt}::timestamptz, ${page!.before.id}::text)`,
+      );
+    }
+    const order = paged
+      ? sql`order by date_trunc('milliseconds', created_at) asc, id::text asc`
+      : sql`order by created_at asc, id::text asc`;
+    const limitClause = paged ? sql`limit ${page!.limit! + 1}` : sql``;
     const res = await sql<AttachmentRow>`
       select id, file_name, mime_type, file_size, type, created_at
       from attachments
-      where page_id = ${pageId} and workspace_id = ${workspaceId}
-        and type = ${AttachmentType.File} and deleted_at is null
-      order by created_at asc, id::text asc
+      where ${sql.join(conds, sql` and `)}
+      ${order}
+      ${limitClause}
     `.execute(this.db);
     return { items: res.rows.map(toAttachmentSummary) };
   }

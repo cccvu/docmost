@@ -9,7 +9,7 @@ import {
   ContentSortField,
   ResolvePageSpaceDto,
 } from './dto/content-read.dto';
-import { SubCollectionPage } from './dto/sub-collection-page.dto';
+import { isIsoInstant, SubCollectionPage } from './dto/sub-collection-page.dto';
 import { WorkspaceResolver } from './workspace-resolver';
 
 // Escape LIKE/ILIKE metacharacters so a user-supplied substring matches literally (Postgres LIKE's default
@@ -195,12 +195,26 @@ export class ServiceContentService {
       if (before.updatedAt === undefined) throw new BadRequestException('cursor is missing updatedAt');
       return sql`(date_trunc('milliseconds', updated_at), id::text) < (${before.updatedAt}::timestamptz, ${before.id}::text)`;
     }
-    const bound = before.value ?? before.updatedAt;
-    if (bound === undefined) throw new BadRequestException('cursor is missing its bound value');
+    const isTimestamp = sort.field === 'updatedAt' || sort.field === 'createdAt';
+    // A TEXT sort (title/name) MUST carry `value`: falling back to a timestamp `updatedAt` would compare a
+    // timestamp string against titles and paginate WRONG (Correctness #2). Timestamp sorts may use either
+    // (both are instants), keeping the legacy `updatedAt`-only cursor working.
+    const bound = isTimestamp ? (before.value ?? before.updatedAt) : before.value;
+    if (bound === undefined) {
+      throw new BadRequestException(
+        isTimestamp
+          ? 'cursor is missing its bound value'
+          : `sort by '${sort.field}' requires a cursor 'value'`,
+      );
+    }
+    // Guard the cast: a Date.parse-lenient-but-Postgres-invalid bound (e.g. bare '2026') must 400 HERE, not
+    // 500 at the ::timestamptz cast (Security F1 / Correctness #1).
+    if (isTimestamp && !isIsoInstant(bound)) {
+      throw new BadRequestException("cursor bound is not a valid ISO-8601 timestamp");
+    }
     const cmp = sort.direction === 'asc' ? sql`>` : sql`<`;
     const expr = this.sortExpr(sort.field, textCol);
     // Timestamp fields cast the bound to ::timestamptz; text fields (coalesced) compare as ::text.
-    const isTimestamp = sort.field === 'updatedAt' || sort.field === 'createdAt';
     const boundExpr = isTimestamp ? sql`${bound}::timestamptz` : sql`${bound}::text`;
     return sql`(${expr}, id::text) ${cmp} (${boundExpr}, ${before.id}::text)`;
   }
