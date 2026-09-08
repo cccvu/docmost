@@ -2,9 +2,9 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Docmost Service Bridge (east-west)",
-    "version": "1.1.1",
+    "version": "1.2.0",
     "summary": "The east-west endpoints this Docmost fork EXPOSES to an integrating platform.",
-    "description": "These are the machine-to-machine endpoints the fork hosts for an integrating platform (the inverse direction of authorization-service.openapi.json, which the fork calls). They exist so an external identity/session broker can provision a fork-local shadow user and mint a Docmost session for it, force-disconnect a live collab session after a revocation, and (Phase C) administer workspace settings + spaces and read the content model WITHOUT the platform reaching into Docmost's database directly. They are NOT part of the public north-south API and are not browser-facing.\n\nMode: the whole surface is 404 unless the fork runs with AUTHZ_MODE=remote (RemoteOnlyGuard, checked BEFORE the secret). In AUTHZ_MODE=native there is no integrating platform and every route below returns 404 for all callers.\n\nAuth: every request carries a shared service secret in the x-authz-service-secret header (PLATFORM_AUTHZ_SERVICE_SECRET). Each /api/service/* route additionally requires exactly one least-privilege scope: session:mint, users:provision, users:resolve, workspace:read, workspace:settings:write, spaces:read, spaces:write, pages:read, content:read, changes:read. Today a single full-scope secret is issued; per-scope credentials can be added later with no contract change.\n\nSecurity properties an integrator must understand:\n  - Identity-mutating endpoints are keyed ONLY on the caller's opaque externalId. The fork derives the shadow email (externalId@shadow.wiki-v2.internal) and resolves its own default workspace, so a caller can never select an arbitrary Docmost identity, name a real/privileged/native account, or supply a workspace id. This is a strong narrowing, not impersonation.\n  - The platform is the authorization authority: it performs the PDP decision (space/workspace administer, or the filter-then-retrieve authorized-id set) BEFORE calling these endpoints. The content read endpoints are a PRIVILEGED DATA PLANE, not a second gate: they return metadata for exactly the supplied ids and do NOT re-authorize. The security of the caller's /v1 surface rests entirely on it passing an authorized id set.\n  - Fail-closed: not remote -> 404; unconfigured secret -> 503; missing/wrong secret -> 401; wrong scope -> 403; over the per-credential rate limit -> 429; invalid body -> 400.\n\nResponse shape (incident #181): every 2xx body is EXACTLY the schema declared for its operation. The fork's global { data, success, status } response envelope (upstream TransformHttpResponseInterceptor) is skipped on this whole surface via per-handler @SkipTransform(); an integrator that receives an envelope is talking to a mis-built fork. Bring-up precondition: until Docmost first-run setup (POST /api/auth/setup) has created a workspace row, EVERY operation answers HTTP 404 with message exactly \"Workspace not found\" (an upstream pre-handler that runs before the service-bridge guards). That status + message pair is the ONLY response a consumer may treat as \"no workspace provisioned yet\"; any other 404 (e.g. the bare \"Not Found\" the fork answers when not in AUTHZ_MODE=remote) is a configuration error, and any 2xx body that does not match its declared schema is a contract violation the consumer must fail closed on.",
+    "description": "These are the machine-to-machine endpoints the fork hosts for an integrating platform (the inverse direction of authorization-service.openapi.json, which the fork calls). They exist so an external identity/session broker can provision a fork-local shadow user and mint a Docmost session for it, force-disconnect a live collab session after a revocation, and (Phase C) administer workspace settings + spaces and read the content model WITHOUT the platform reaching into Docmost's database directly. They are NOT part of the public north-south API and are not browser-facing.\n\nMode: the whole surface is 404 unless the fork runs with AUTHZ_MODE=remote (RemoteOnlyGuard, checked BEFORE the secret). In AUTHZ_MODE=native there is no integrating platform and every route below returns 404 for all callers.\n\nAuth: every request carries a shared service secret in the x-authz-service-secret header (PLATFORM_AUTHZ_SERVICE_SECRET). Each /api/service/* route additionally requires exactly one least-privilege scope: session:mint, users:provision, users:resolve, workspace:read, workspace:settings:write, spaces:read, spaces:write, pages:read, content:read, content:search, attachments:read, changes:read. Today a single full-scope secret is issued; per-scope credentials can be added later with no contract change.\n\nSecurity properties an integrator must understand:\n  - Identity-mutating endpoints are keyed ONLY on the caller's opaque externalId. The fork derives the shadow email (externalId@shadow.wiki-v2.internal) and resolves its own default workspace, so a caller can never select an arbitrary Docmost identity, name a real/privileged/native account, or supply a workspace id. This is a strong narrowing, not impersonation.\n  - The platform is the authorization authority: it performs the PDP decision (space/workspace administer, or the filter-then-retrieve authorized-id set) BEFORE calling these endpoints. The content read endpoints are a PRIVILEGED DATA PLANE, not a second gate: they return metadata for exactly the supplied ids and do NOT re-authorize. The security of the caller's /v1 surface rests entirely on it passing an authorized id set.\n  - Fail-closed: not remote -> 404; unconfigured secret -> 503; missing/wrong secret -> 401; wrong scope -> 403; over the per-credential rate limit -> 429; invalid body -> 400.\n\nResponse shape (incident #181): every 2xx body is EXACTLY the schema declared for its operation. The fork's global { data, success, status } response envelope (upstream TransformHttpResponseInterceptor) is skipped on this whole surface via per-handler @SkipTransform(); an integrator that receives an envelope is talking to a mis-built fork. Bring-up precondition: until Docmost first-run setup (POST /api/auth/setup) has created a workspace row, EVERY operation answers HTTP 404 with message exactly \"Workspace not found\" (an upstream pre-handler that runs before the service-bridge guards). That status + message pair is the ONLY response a consumer may treat as \"no workspace provisioned yet\"; any other 404 (e.g. the bare \"Not Found\" the fork answers when not in AUTHZ_MODE=remote) is a configuration error, and any 2xx body that does not match its declared schema is a contract violation the consumer must fail closed on.",
     "license": { "name": "AGPL-3.0-only", "identifier": "AGPL-3.0-only" },
     "x-canonical": true
   },
@@ -21,6 +21,7 @@
     { "name": "spaces", "description": "The platform-governed space + membership control plane (data only; the platform authorizes first)." },
     { "name": "pages", "description": "Bounded page lookups (structural) for the platform's authorization + content reads." },
     { "name": "content", "description": "The /v1 filter-then-retrieve read model (privileged data plane; trusts the platform's authorized id set)." },
+    { "name": "attachments", "description": "Read-only attachment lookups (resolve attachment→page + list a page's file attachments) for the platform's /v1 attachment surface; the bytes ride Docmost's native file endpoint." },
     { "name": "changes", "description": "The authz change feed + snapshot the platform drains to project membership/page/restriction changes into its PDP (Group D; replaces the platform's direct Docmost-DB outbox)." },
     { "name": "collab", "description": "Collaboration session control." }
   ],
@@ -252,7 +253,12 @@
         "operationId": "listSpaceMembers",
         "tags": ["spaces"],
         "summary": "Raw space members (Docmost user/group ids).",
-        "description": "Returns Docmost user/group ids ONLY; the platform maps user ids back to its own identities. Scope: spaces:read.",
+        "description": "Returns Docmost user/group ids ONLY; the platform maps user ids back to its own identities. Opt-in keyset paging: send `limit` (+ optional `beforeCreatedAt`/`beforeId` cursor) to page over `(created_at, id)` ascending — up to limit+1 rows; omit `limit` for all members (the default). The response shape is unchanged (a bare array) either way. Scope: spaces:read.",
+        "parameters": [
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 200 }, "description": "Opt-in: page size (returns up to limit+1); omit for all rows." },
+          { "name": "beforeCreatedAt", "in": "query", "required": false, "schema": { "type": "string", "format": "date-time" }, "description": "Keyset cursor bound (last kept row's createdAt). Requires beforeId + limit." },
+          { "name": "beforeId", "in": "query", "required": false, "schema": { "type": "string", "format": "uuid" }, "description": "Keyset cursor tiebreak (last kept row's id). Requires beforeCreatedAt + limit." }
+        ],
         "responses": {
           "200": { "description": "The space members.", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/RawSpaceMember" } } } } },
           "401": { "$ref": "#/components/responses/Unauthorized" },
@@ -345,7 +351,12 @@
         "operationId": "listPagePermissions",
         "tags": ["pages"],
         "summary": "The explicit ACL grants on a page.",
-        "description": "page_permissions joined to page_access; grantee by Docmost user/group id (the platform maps user ids to identities). Scope: content:read.",
+        "description": "page_permissions joined to page_access; grantee by Docmost user/group id (the platform maps user ids to identities). Opt-in keyset paging: send `limit` (+ optional `beforeCreatedAt`/`beforeId` cursor) to page over `(pp.created_at, pp.id)` ascending — up to limit+1 items; omit `limit` for all grants (the default). The response shape ({items}) is unchanged either way. Scope: content:read.",
+        "parameters": [
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 200 }, "description": "Opt-in: page size (returns up to limit+1); omit for all rows." },
+          { "name": "beforeCreatedAt", "in": "query", "required": false, "schema": { "type": "string", "format": "date-time" }, "description": "Keyset cursor bound (last kept row's createdAt). Requires beforeId + limit." },
+          { "name": "beforeId", "in": "query", "required": false, "schema": { "type": "string", "format": "uuid" }, "description": "Keyset cursor tiebreak (last kept row's id). Requires beforeCreatedAt + limit." }
+        ],
         "responses": {
           "200": { "description": "The ACL grants.", "content": { "application/json": { "schema": { "type": "object", "required": ["items"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/RawPagePermission" } } } } } } },
           "401": { "$ref": "#/components/responses/Unauthorized" },
@@ -407,6 +418,64 @@
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
+    "/api/service/content/search": {
+      "post": {
+        "operationId": "searchContent",
+        "tags": ["content"],
+        "summary": "Permission-aware full-text search over the pages the caller can see.",
+        "description": "The AUTHORIZATION GATE for /v1 search (unlike the list ops, which are a privileged data plane over an already-authorized id set). PdpSearchService walks the rank-ordered FTS candidate stream in bounded windows and admits ONLY the caller's authorized pages BEFORE the limit/offset slice (filter-then-retrieve; ADR-0005), so a principal too broad to LIST can still SEARCH. The platform passes the caller's Docmost user id and MUST NOT post-filter the result (that reintroduces reverse-index truncation). The hit shape is PII-free: NO creatorId (ADR-0001) and NO rank / total count (no ranking side-channel). Scope: content:search.",
+        "requestBody": { "required": true, "content": { "application/json": {
+          "schema": { "$ref": "#/components/schemas/ContentSearchRequest" },
+          "example": { "userId": "9b1f0c2e-0000-4000-8000-000000000001", "query": "release notes", "limit": 25 }
+        } } },
+        "responses": {
+          "200": { "description": "Authorized search hits (rank-ordered, up to limit).", "content": { "application/json": { "schema": { "type": "object", "required": ["items"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/PublicSearchHit" } } } } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
+    "/api/service/attachments/{attachmentId}/page": {
+      "parameters": [{ "name": "attachmentId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+      "get": {
+        "operationId": "resolveAttachmentPage",
+        "tags": ["attachments"],
+        "summary": "Resolve an attachment to its owning page + space.",
+        "description": "Option A (resolve→page): the platform maps attachment→page here, then authorizes page#view/#edit ITSELF (the schema inherits attachment access from the page — no attachment tuple in the PDP). pageId/spaceId are null for non-page attachments (avatars, workspace/space icons, chat uploads), so the platform denies them (no page to authorize). Workspace-scoped, active only; unknown / cross-workspace / soft-deleted → 404. Scope: attachments:read.",
+        "responses": {
+          "200": { "description": "The attachment's owning page + space (null for non-page attachments).", "content": { "application/json": { "schema": { "type": "object", "required": ["attachmentId", "pageId", "spaceId"], "properties": { "attachmentId": { "type": "string", "format": "uuid" }, "pageId": { "type": ["string", "null"], "format": "uuid" }, "spaceId": { "type": ["string", "null"], "format": "uuid" } } } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
+    "/api/service/attachments/by-page/{pageId}": {
+      "parameters": [{ "name": "pageId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+      "get": {
+        "operationId": "listPageAttachments",
+        "tags": ["attachments"],
+        "summary": "List a page's file attachments (compact projection).",
+        "description": "PRIVILEGED DATA PLANE: the platform authorizes page#view BEFORE calling. Returns type='file' rows only (avatars/icons/chat uploads carry no pageId), workspace-scoped and soft-delete-excluded, oldest first. An unknown page returns an empty list (not 404). Opt-in keyset paging (same contract as members/ACL): send `limit` (+ optional `beforeCreatedAt`/`beforeId` cursor) to page over `(created_at, id)` ascending — up to limit+1 rows; omit `limit` for all file attachments (the default). The response shape ({items}) is unchanged either way. Scope: attachments:read.",
+        "parameters": [
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 200 }, "description": "Opt-in: page size (returns up to limit+1); omit for all rows." },
+          { "name": "beforeCreatedAt", "in": "query", "required": false, "schema": { "type": "string", "format": "date-time" }, "description": "Keyset cursor bound (last kept row's createdAt). Requires beforeId + limit." },
+          { "name": "beforeId", "in": "query", "required": false, "schema": { "type": "string", "format": "uuid" }, "description": "Keyset cursor tiebreak (last kept row's id). Requires beforeCreatedAt + limit." }
+        ],
+        "responses": {
+          "200": { "description": "The page's file attachments (possibly empty).", "content": { "application/json": { "schema": { "type": "object", "required": ["items"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/PublicAttachmentSummary" } } } } } } },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "429": { "$ref": "#/components/responses/RateLimited" },
           "503": { "$ref": "#/components/responses/Unconfigured" }
         }
@@ -644,11 +713,33 @@
         "properties": {
           "ids": { "type": "array", "maxItems": 10000, "items": { "type": "string", "format": "uuid" }, "description": "The platform's PDP-authorized id set (the belt). maxItems MUST stay >= the platform's content.maxListAuthorizedIds default (10000) or a well-authorized principal gets a 400; the provider/consumer contract tests enforce this." },
           "spaceId": { "type": "string", "format": "uuid", "description": "Pages only: scope the list to one space." },
+          "parentPageId": { "type": "string", "format": "uuid", "description": "Pages only: children of this parent." },
+          "titleContains": { "type": "string", "maxLength": 256, "description": "Pages only: case-insensitive title substring (ilike; %/_ matched literally)." },
+          "creatorId": { "type": "string", "format": "uuid", "description": "Pages only: the page's Docmost creator id (the platform translates identity → docmost id BEFORE calling)." },
+          "nameContains": { "type": "string", "maxLength": 256, "description": "Spaces only: case-insensitive name substring." },
+          "updatedSince": { "type": "string", "format": "date-time", "description": "Pages + spaces: updated-at >= (inclusive)." },
+          "updatedUntil": { "type": "string", "format": "date-time", "description": "Pages + spaces: updated-at < (exclusive)." },
+          "createdSince": { "type": "string", "format": "date-time", "description": "Spaces only: created-at >= (inclusive)." },
+          "createdUntil": { "type": "string", "format": "date-time", "description": "Spaces only: created-at < (exclusive)." },
+          "sort": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["field", "direction"],
+            "properties": {
+              "field": { "type": "string", "enum": ["updatedAt", "createdAt", "title", "name"], "description": "title is pages-only, name is spaces-only; a cross-resource field is a 400. Always tie-broken by id." },
+              "direction": { "type": "string", "enum": ["asc", "desc"] }
+            },
+            "description": "Allowlisted sort key + direction; absent → the legacy `updatedAt desc` default (id-tiebroken). The keyset SQL is generalized to the chosen field; text sorts coalesce null → ''."
+          },
           "before": {
             "type": "object",
             "additionalProperties": false,
-            "required": ["updatedAt", "id"],
-            "properties": { "updatedAt": { "type": "string" }, "id": { "type": "string" } },
+            "required": ["id"],
+            "properties": {
+              "updatedAt": { "type": "string", "description": "Legacy / timestamp-sort bound (bound as ::timestamptz). Optional so a text-sort cursor still validates." },
+              "value": { "type": "string", "maxLength": 512, "description": "Generic cursor-v2 bound for the ACTIVE sort field — a timestamp (updatedAt/createdAt) or the coalesced title/name string." },
+              "id": { "type": "string" }
+            },
             "description": "The decoded keyset cursor position (cursor encode/decode stays on the platform)."
           },
           "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
@@ -690,6 +781,54 @@
           "userId": { "type": ["string", "null"], "description": "Docmost user id (null for a group grant)." },
           "groupId": { "type": ["string", "null"] },
           "role": { "type": "string" },
+          "createdAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "ContentSearchRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["userId", "query"],
+        "properties": {
+          "userId": { "type": "string", "format": "uuid", "description": "The searching user's Docmost id (the platform's resolved shadow id); search runs AS this user." },
+          "query": { "type": "string", "minLength": 1, "maxLength": 1024, "description": "Full-text query. Bounded to defeat pg-tsquery ReDoS; the fork re-clamps limit/offset server-side." },
+          "spaceId": { "type": "string", "format": "uuid", "description": "Restrict to one space; omitted → the user's member spaces (the PDP gate is authoritative either way)." },
+          "creatorId": { "type": "string", "format": "uuid", "description": "Restrict to one Docmost creator id (the platform translates identity → docmost id before calling)." },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+          "offset": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "PublicSearchHit": {
+        "type": "object",
+        "required": ["id", "title", "icon", "parentPageId", "space", "highlight", "createdAt", "updatedAt"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "title": { "type": ["string", "null"] },
+          "icon": { "type": ["string", "null"] },
+          "parentPageId": { "type": ["string", "null"], "format": "uuid" },
+          "space": {
+            "type": ["object", "null"],
+            "required": ["id", "name", "slug"],
+            "properties": {
+              "id": { "type": "string", "format": "uuid" },
+              "name": { "type": ["string", "null"] },
+              "slug": { "type": "string" }
+            },
+            "description": "The hit's space (id/name/slug). DELIBERATELY carries NO creatorId and NO rank/score (ADR-0001 / ADR-0005 — no Docmost-user-id or ranking side-channel)."
+          },
+          "highlight": { "type": ["string", "null"] },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "updatedAt": { "type": "string", "format": "date-time" }
+        }
+      },
+      "PublicAttachmentSummary": {
+        "type": "object",
+        "required": ["id", "fileName", "mimeType", "fileSize", "type", "createdAt"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "fileName": { "type": "string" },
+          "mimeType": { "type": ["string", "null"] },
+          "fileSize": { "type": ["integer", "null"], "description": "Bytes (int8 in the DB; coerced to a JSON integer — file sizes stay < 2^53)." },
+          "type": { "type": ["string", "null"] },
           "createdAt": { "type": "string", "format": "date-time" }
         }
       },

@@ -58,12 +58,14 @@ d('ServiceContentService on real Postgres (keyset ordering + confidentiality)', 
   const insertPage = (
     id: string,
     baseIso: string,
-    opts: { workspaceId?: string; spaceId?: string; deleted?: boolean; title?: string; micros?: number } = {},
+    opts: { workspaceId?: string; spaceId?: string; deleted?: boolean; title?: string | null; micros?: number } = {},
   ) => {
     const ts = pg`(${baseIso}::timestamptz + (${opts.micros ?? 0} * interval '1 microsecond'))`;
+    // `title: null` is explicit (for the coalesce-null sort fixtures); undefined → a generated default.
+    const title = opts.title === undefined ? 'page ' + id.slice(-3) : opts.title;
     return pg`
       insert into pages (id, slug_id, title, icon, position, space_id, parent_page_id, workspace_id, created_at, updated_at, deleted_at)
-      values (${id}, ${'slug-' + id.slice(-3)}, ${opts.title ?? 'page ' + id.slice(-3)}, null, null,
+      values (${id}, ${'slug-' + id.slice(-3)}, ${title}, null, null,
               ${opts.spaceId ?? SPACE}, null, ${opts.workspaceId ?? DEFAULT_WS},
               ${ts}, ${ts}, ${opts.deleted ? pg`now()` : null})`;
   };
@@ -123,6 +125,14 @@ d('ServiceContentService on real Postgres (keyset ordering + confidentiality)', 
     await insertSpace(uuid(63), '2026-04-01T00:00:00Z', { micros: 900 });
     await insertSpace(uuid(64), '2026-04-01T00:00:00Z', { micros: 100 });
     await insertSpace(uuid(65), '2026-04-01T00:00:01Z', { micros: 0 });
+
+    // ---- sort-pushdown fixtures (C12): title sort must coalesce a null title and id-tiebreak duplicates.
+    // All share one updated_at so the DEFAULT sort is a pure id::text tiebreak, isolating the title-sort effect.
+    await insertPage(uuid(90), '2026-05-01T00:00:00Z', { title: null });
+    await insertPage(uuid(91), '2026-05-01T00:00:00Z', { title: 'apple' });
+    await insertPage(uuid(92), '2026-05-01T00:00:00Z', { title: 'banana' });
+    await insertPage(uuid(93), '2026-05-01T00:00:00Z', { title: 'banana' });
+    await insertPage(uuid(94), '2026-05-01T00:00:00Z', { title: 'cherry' });
   });
 
   afterAll(async () => {
@@ -186,6 +196,86 @@ d('ServiceContentService on real Postgres (keyset ordering + confidentiality)', 
       expect(second.items.map((s) => s.id)).toEqual([uuid(63)]);
       const seen = [...taken, ...second.items].map((s) => s.id);
       expect(new Set(seen).size).toBe(seen.length);
+    });
+  });
+
+  // ---- C12: generalized sort keyset (title / createdAt) + filter pushdown, executed on the engine ----
+  describe('sort pushdown keyset (title / createdAt) walks with no skip or duplicate', () => {
+    const titleIds = [uuid(90), uuid(91), uuid(92), uuid(93), uuid(94)];
+
+    it('title asc coalesces a null title to first and tiebreaks duplicate titles by id::text', async () => {
+      const res = await svc.listPagesByIds({
+        ids: titleIds,
+        sort: { field: 'title', direction: 'asc' },
+        limit: 100,
+      } as any);
+      // '' (null-coalesced) < apple < banana < banana (id tiebreak 92 before 93) < cherry.
+      expect(res.items.map((p) => p.id)).toEqual([uuid(90), uuid(91), uuid(92), uuid(93), uuid(94)]);
+    });
+
+    it('title asc pages across the duplicate-title boundary with no skip and no duplicate', async () => {
+      const sort = { field: 'title' as const, direction: 'asc' as const };
+      const seen: string[] = [];
+      // Walk the whole set two at a time, building the cursor exactly as the platform will: value = title ?? ''.
+      let cursor: { value: string; id: string } | undefined;
+      for (let guard = 0; guard < 10; guard++) {
+        const page = await svc.listPagesByIds({ ids: titleIds, sort, limit: 2, before: cursor } as any);
+        const kept = page.items.slice(0, 2);
+        seen.push(...kept.map((p) => p.id));
+        if (page.items.length <= 2) break; // no limit+1 overflow → this was the last page
+        const last = kept[kept.length - 1];
+        cursor = { value: last.title ?? '', id: last.id };
+      }
+      expect(seen).toEqual([uuid(90), uuid(91), uuid(92), uuid(93), uuid(94)]); // in order, once each
+      expect(new Set(seen).size).toBe(seen.length); // no id observed twice across pages
+    });
+
+    it('createdAt desc orders by created_at (ms-truncated, id-tiebroken)', async () => {
+      const res = await svc.listPagesByIds({
+        ids: [uuid(1), uuid(2), uuid(3)],
+        sort: { field: 'createdAt', direction: 'desc' },
+        limit: 100,
+      } as any);
+      // created_at == updated_at in these fixtures, so the same [+1s first, then id-tiebreak on the tie] order.
+      expect(res.items.map((p) => p.id)).toEqual([uuid(3), uuid(2), uuid(1)]);
+    });
+
+    it('a page filter (titleContains) narrows the set on the engine (ilike substring)', async () => {
+      const res = await svc.listPagesByIds({ ids: titleIds, titleContains: 'ban', limit: 100 } as any);
+      expect(res.items.map((p) => p.id).sort()).toEqual([uuid(92), uuid(93)]);
+    });
+
+    it('updatedAt asc walks the shared-ms tie ascending with no skip and no duplicate (timestamp keyset)', async () => {
+      const tids = [uuid(1), uuid(2), uuid(3)]; // uuid(1)/uuid(2) share a truncated ms; uuid(3) is +1s.
+      const sort = { field: 'updatedAt' as const, direction: 'asc' as const };
+      const walk: string[] = [];
+      let cursor: { value: string; id: string } | undefined;
+      for (let guard = 0; guard < 10; guard++) {
+        const page = await svc.listPagesByIds({ ids: tids, sort, limit: 2, before: cursor } as any);
+        const kept = page.items.slice(0, 2);
+        walk.push(...kept.map((p) => p.id));
+        if (page.items.length <= 2) break;
+        const last = kept[kept.length - 1];
+        cursor = { value: last.updatedAt, id: last.id }; // the platform builds cursor-v2 from the row's field
+      }
+      // Ascending id::text keeps uuid(1) before uuid(2) at the shared ms and puts uuid(2) on the correct page.
+      expect(walk).toEqual([uuid(1), uuid(2), uuid(3)]);
+      expect(new Set(walk).size).toBe(walk.length);
+    });
+
+    it('title asc with value="" (null title) as a mid-walk cursor bound does not re-include the null-title row', async () => {
+      // limit 1 so uuid(90) (null title → coalesced '') is page 1, and its value='' becomes the page-2 bound.
+      const first = await svc.listPagesByIds({ ids: titleIds, sort: { field: 'title', direction: 'asc' }, limit: 1 } as any);
+      expect(first.items[0].id).toBe(uuid(90)); // null title sorts first
+      const boundary = { value: first.items[0].title ?? '', id: first.items[0].id };
+      expect(boundary.value).toBe(''); // the coalesced null-title bound
+      const second = await svc.listPagesByIds({
+        ids: titleIds,
+        sort: { field: 'title', direction: 'asc' },
+        limit: 1,
+        before: boundary,
+      } as any);
+      expect(second.items[0].id).toBe(uuid(91)); // 'apple' next — uuid(90) is NOT re-included
     });
   });
 

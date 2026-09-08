@@ -27,6 +27,7 @@ import {
   UpdateSpaceDto,
   UpdateSpaceMemberDto,
 } from './dto/space-admin.dto';
+import { parseSubCollectionQuery } from './dto/sub-collection-page.dto';
 
 /**
  * CCC service-bridge — NOT upstream Docmost code.
@@ -60,8 +61,14 @@ export class ServiceSpaceController {
 
   @Get(':spaceId/members')
   @RequireServiceScope(ServiceScope.SpacesRead)
-  async listMembers(@Param('spaceId', ParseUUIDPipe) spaceId: string): Promise<RawSpaceMember[]> {
-    return this.service.listMembers(spaceId);
+  async listMembers(
+    @Param('spaceId', ParseUUIDPipe) spaceId: string,
+    @Query('limit') limit?: string,
+    @Query('beforeCreatedAt') beforeCreatedAt?: string,
+    @Query('beforeId') beforeId?: string,
+  ): Promise<RawSpaceMember[]> {
+    // Opt-in keyset paging (no params → all members, the backward-compatible default).
+    return this.service.listMembers(spaceId, parseSubCollectionQuery(limit, beforeCreatedAt, beforeId));
   }
 
   @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)

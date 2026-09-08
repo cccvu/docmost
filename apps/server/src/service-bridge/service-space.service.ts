@@ -13,6 +13,7 @@ import {
   SpaceMemberRole,
   UpdateSpaceDto,
 } from './dto/space-admin.dto';
+import { SubCollectionPage } from './dto/sub-collection-page.dto';
 import { ServiceBridgeService } from './service-bridge.service';
 import { WorkspaceResolver } from './workspace-resolver';
 
@@ -125,9 +126,25 @@ export class ServiceSpaceService {
     return this.loadSpace(spaceId);
   }
 
-  /** Raw members of a space (the platform enriches user ids with its own identities). */
-  async listMembers(spaceId: string): Promise<RawSpaceMember[]> {
+  /**
+   * Raw members of a space (the platform enriches user ids with its own identities). Opt-in keyset paging:
+   * with `page.limit` the fork walks `(created_at, id)` ascending and returns up to limit+1 (so the platform
+   * can detect hasMore + build the next cursor from the last kept row); without it the read is unpaged
+   * (returns all — the backward-compatible default). The default (unpaged) query is unchanged.
+   */
+  async listMembers(spaceId: string, page?: SubCollectionPage): Promise<RawSpaceMember[]> {
     await this.loadSpace(spaceId);
+    const paged = page?.limit !== undefined;
+    const conds = [sql`space_id = ${spaceId}`, sql`deleted_at is null`];
+    if (paged && page!.before) {
+      conds.push(
+        sql`(date_trunc('milliseconds', created_at), id::text) > (${page!.before.createdAt}::timestamptz, ${page!.before.id}::text)`,
+      );
+    }
+    const order = paged
+      ? sql`order by date_trunc('milliseconds', created_at) asc, id::text asc`
+      : sql`order by created_at asc`;
+    const limitClause = paged ? sql`limit ${page!.limit! + 1}` : sql``;
     const res = await sql<{
       id: string;
       userId: string | null;
@@ -136,8 +153,9 @@ export class ServiceSpaceService {
       createdAt: Date;
     }>`
       select id, user_id, group_id, role, created_at
-      from space_members where space_id = ${spaceId} and deleted_at is null
-      order by created_at asc
+      from space_members where ${sql.join(conds, sql` and `)}
+      ${order}
+      ${limitClause}
     `.execute(this.db);
     return res.rows.map((r) => ({
       memberId: r.id,

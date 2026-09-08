@@ -19,6 +19,14 @@ export enum ServiceScope {
   SpacesRead = 'spaces:read',
   SpacesWrite = 'spaces:write',
   ContentRead = 'content:read',
+  // The /v1 permission-aware search (PdpSearchService — filter-then-retrieve). A DISTINCT read scope from
+  // content:read so a future least-privilege credential can be granted list-retrieval without search (or
+  // search without bulk list); search is a different capability class (it walks the FTS candidate stream).
+  ContentSearch = 'content:search',
+  // Read-only attachment lookups (resolve attachment→page + list a page's file attachments) backing the
+  // platform's /v1 attachment surface. Option A: the platform authorizes page#view/#edit off the resolved
+  // page — this scope guards the metadata lookups only; the bytes ride Docmost's native file endpoint.
+  AttachmentsRead = 'attachments:read',
   // Group D (issue #171): the authz change-feed + snapshot the platform drains to project membership/page/
   // restriction changes into SpiceDB. Read-only; replaces the platform's direct Docmost-DB outbox access.
   ChangesRead = 'changes:read',

@@ -11,6 +11,7 @@ import { AuthzChangeController } from './authz-change.controller';
 import { WorkspaceResolver } from './workspace-resolver';
 import { ServiceWorkspaceService } from './service-workspace.service';
 import { ServiceContentService } from './service-content.service';
+import { ServiceSearchService } from './service-search.service';
 import { AuthzChangeFeedService } from './authz-change-feed.service';
 import { AuthzSnapshotService } from './authz-snapshot.service';
 
@@ -46,6 +47,7 @@ describe('service-bridge wire shape through the real response pipeline', () => {
         { provide: WorkspaceResolver, useValue: { resolveDefaultWorkspaceId: async () => WS } },
         { provide: ServiceWorkspaceService, useValue: { getSettings: async () => ({ name: 'CCC', defaultPageEditMode: 'read' }) } },
         { provide: ServiceContentService, useValue: { listSpacesByIds: async () => ({ items: [] }) } },
+        { provide: ServiceSearchService, useValue: { searchContent: async () => ({ items: [] }) } },
         { provide: AuthzChangeFeedService, useValue: {} },
         { provide: AuthzSnapshotService, useValue: { getSnapshot: async () => ({ events: [], nextCursor: null, baseline: '7.0' }) } },
       ],
@@ -88,6 +90,16 @@ describe('service-bridge wire shape through the real response pipeline', () => {
       method: 'POST',
       url: '/api/service/content/spaces/list',
       payload: { ids: [PAGE], limit: 10 },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ items: [] });
+  });
+
+  it('POST /api/service/content/search answers the bare { items } list', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/service/content/search',
+      payload: { userId: WS, query: 'x' },
     });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ items: [] });
