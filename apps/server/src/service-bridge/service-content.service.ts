@@ -9,6 +9,7 @@ import {
   ContentSortField,
   ResolvePageSpaceDto,
 } from './dto/content-read.dto';
+import { SubCollectionPage } from './dto/sub-collection-page.dto';
 import { WorkspaceResolver } from './workspace-resolver';
 
 // Escape LIKE/ILIKE metacharacters so a user-supplied substring matches literally (Postgres LIKE's default
@@ -231,9 +232,28 @@ export class ServiceContentService {
     return toSpaceSummary(row);
   }
 
-  /** The explicit ACL grants on a page (page_permissions ⋈ page_access); grantee by Docmost user/group id. */
-  async listPagePermissions(pageId: string): Promise<{ items: RawPagePermission[] }> {
+  /**
+   * The explicit ACL grants on a page (page_permissions ⋈ page_access); grantee by Docmost user/group id.
+   * Opt-in keyset paging (same contract as space members): with `page.limit` the fork walks
+   * `(pp.created_at, pp.id)` ascending and returns up to limit+1; without it the read is unpaged (all grants).
+   * The default (unpaged) query is unchanged.
+   */
+  async listPagePermissions(
+    pageId: string,
+    page?: SubCollectionPage,
+  ): Promise<{ items: RawPagePermission[] }> {
     const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
+    const paged = page?.limit !== undefined;
+    const conds = [sql`pa.page_id = ${pageId}`, sql`pa.workspace_id = ${workspaceId}`];
+    if (paged && page!.before) {
+      conds.push(
+        sql`(date_trunc('milliseconds', pp.created_at), pp.id::text) > (${page!.before.createdAt}::timestamptz, ${page!.before.id}::text)`,
+      );
+    }
+    const order = paged
+      ? sql`order by date_trunc('milliseconds', pp.created_at) asc, pp.id::text asc`
+      : sql`order by pp.created_at asc`;
+    const limitClause = paged ? sql`limit ${page!.limit! + 1}` : sql``;
     const res = await sql<{
       id: string;
       userId: string | null;
@@ -244,8 +264,9 @@ export class ServiceContentService {
       select pp.id, pp.user_id, pp.group_id, pp.role, pp.created_at
       from page_permissions pp
       join page_access pa on pa.id = pp.page_access_id
-      where pa.page_id = ${pageId} and pa.workspace_id = ${workspaceId}
-      order by pp.created_at asc
+      where ${sql.join(conds, sql` and `)}
+      ${order}
+      ${limitClause}
     `.execute(this.db);
     return {
       items: res.rows.map((r) => ({

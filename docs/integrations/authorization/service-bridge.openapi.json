@@ -253,7 +253,12 @@
         "operationId": "listSpaceMembers",
         "tags": ["spaces"],
         "summary": "Raw space members (Docmost user/group ids).",
-        "description": "Returns Docmost user/group ids ONLY; the platform maps user ids back to its own identities. Scope: spaces:read.",
+        "description": "Returns Docmost user/group ids ONLY; the platform maps user ids back to its own identities. Opt-in keyset paging: send `limit` (+ optional `beforeCreatedAt`/`beforeId` cursor) to page over `(created_at, id)` ascending — up to limit+1 rows; omit `limit` for all members (the default). The response shape is unchanged (a bare array) either way. Scope: spaces:read.",
+        "parameters": [
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 200 }, "description": "Opt-in: page size (returns up to limit+1); omit for all rows." },
+          { "name": "beforeCreatedAt", "in": "query", "required": false, "schema": { "type": "string", "format": "date-time" }, "description": "Keyset cursor bound (last kept row's createdAt). Requires beforeId + limit." },
+          { "name": "beforeId", "in": "query", "required": false, "schema": { "type": "string", "format": "uuid" }, "description": "Keyset cursor tiebreak (last kept row's id). Requires beforeCreatedAt + limit." }
+        ],
         "responses": {
           "200": { "description": "The space members.", "content": { "application/json": { "schema": { "type": "array", "items": { "$ref": "#/components/schemas/RawSpaceMember" } } } } },
           "401": { "$ref": "#/components/responses/Unauthorized" },
@@ -346,7 +351,12 @@
         "operationId": "listPagePermissions",
         "tags": ["pages"],
         "summary": "The explicit ACL grants on a page.",
-        "description": "page_permissions joined to page_access; grantee by Docmost user/group id (the platform maps user ids to identities). Scope: content:read.",
+        "description": "page_permissions joined to page_access; grantee by Docmost user/group id (the platform maps user ids to identities). Opt-in keyset paging: send `limit` (+ optional `beforeCreatedAt`/`beforeId` cursor) to page over `(pp.created_at, pp.id)` ascending — up to limit+1 items; omit `limit` for all grants (the default). The response shape ({items}) is unchanged either way. Scope: content:read.",
+        "parameters": [
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 200 }, "description": "Opt-in: page size (returns up to limit+1); omit for all rows." },
+          { "name": "beforeCreatedAt", "in": "query", "required": false, "schema": { "type": "string", "format": "date-time" }, "description": "Keyset cursor bound (last kept row's createdAt). Requires beforeId + limit." },
+          { "name": "beforeId", "in": "query", "required": false, "schema": { "type": "string", "format": "uuid" }, "description": "Keyset cursor tiebreak (last kept row's id). Requires beforeCreatedAt + limit." }
+        ],
         "responses": {
           "200": { "description": "The ACL grants.", "content": { "application/json": { "schema": { "type": "object", "required": ["items"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/RawPagePermission" } } } } } } },
           "401": { "$ref": "#/components/responses/Unauthorized" },

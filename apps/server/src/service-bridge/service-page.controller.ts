@@ -7,6 +7,7 @@ import {
   Param,
   ParseUUIDPipe,
   Post,
+  Query,
   UseGuards,
 } from '@nestjs/common';
 import { SkipTransform } from '../common/decorators/skip-transform.decorator';
@@ -15,6 +16,7 @@ import { RequireServiceScope, ServiceAuthGuard } from './service-auth.guard';
 import { ServiceScope } from './service-scope';
 import { RawPagePermission, ServiceContentService } from './service-content.service';
 import { ResolvePageSpaceDto } from './dto/content-read.dto';
+import { parseSubCollectionQuery } from './dto/sub-collection-page.dto';
 
 /**
  * CCC service-bridge — NOT upstream Docmost code.
@@ -44,7 +46,11 @@ export class ServicePageController {
   @RequireServiceScope(ServiceScope.ContentRead)
   async listPermissions(
     @Param('pageId', ParseUUIDPipe) pageId: string,
+    @Query('limit') limit?: string,
+    @Query('beforeCreatedAt') beforeCreatedAt?: string,
+    @Query('beforeId') beforeId?: string,
   ): Promise<{ items: RawPagePermission[] }> {
-    return this.content.listPagePermissions(pageId);
+    // Opt-in keyset paging (no params → all grants, the backward-compatible default).
+    return this.content.listPagePermissions(pageId, parseSubCollectionQuery(limit, beforeCreatedAt, beforeId));
   }
 }

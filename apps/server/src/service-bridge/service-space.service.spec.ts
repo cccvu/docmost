@@ -82,3 +82,33 @@ describe('ServiceSpaceService.archive — reversible soft-delete', () => {
     await expect(missing.svc.archive('sp1')).rejects.toBeInstanceOf(NotFoundException);
   });
 });
+
+describe('ServiceSpaceService.listMembers — opt-in keyset paging (backward-compatible)', () => {
+  // listMembers runs loadSpace (a `from spaces` query) first, then the `from space_members` query, so the
+  // members query is always the SECOND spy call (spy.calls[1]).
+  const spaceRow = () => ({
+    id: 'sp1', name: 'S', slug: 's', description: null, visibility: 'private',
+    createdAt: new Date('2026-01-01T00:00:00.000Z'), deletedAt: null, memberCount: '0',
+  });
+  const respond = (query: SpyQuery) => (q(query.sql).includes('from spaces') ? [spaceRow()] : []);
+
+  it('unpaged (no limit) keeps the legacy query: created_at asc, no keyset, no limit', async () => {
+    const { svc, spy } = make(respond);
+    await svc.listMembers('sp1');
+    const sql = q(spy.calls[1].sql);
+    expect(sql).toContain('order by created_at asc');
+    expect(sql).not.toContain('date_trunc');
+    expect(sql).not.toContain('limit');
+  });
+
+  it('paged uses the ms-truncated id-tiebroken ascending keyset + limit+1', async () => {
+    const { svc, spy } = make(respond);
+    await svc.listMembers('sp1', { limit: 25, before: { createdAt: '2026-01-01T00:00:00.000Z', id: 'm-9' } });
+    const call = spy.calls[1];
+    const sql = q(call.sql);
+    expect(sql).toContain("date_trunc('milliseconds', created_at) asc");
+    expect(sql).toContain('id::text asc');
+    expect(sql).toContain('> (');
+    expect(call.parameters).toContainEqual(26); // limit + 1
+  });
+});

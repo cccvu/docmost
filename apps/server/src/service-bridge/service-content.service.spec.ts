@@ -252,3 +252,30 @@ describe('ServiceContentService — allowlisted filters + sort pushdown (backwar
     ).rejects.toBeInstanceOf(BadRequestException);
   });
 });
+
+describe('ServiceContentService.listPagePermissions — opt-in keyset paging (backward-compatible)', () => {
+  const PAGE = '66666666-6666-6666-6666-666666666666';
+
+  it('unpaged (no limit) keeps the legacy query: pp.created_at asc, no keyset, no limit', async () => {
+    const { svc, spy } = make(() => []);
+    await svc.listPagePermissions(PAGE);
+    const sql = q(spy.calls[0].sql);
+    expect(sql).toContain('order by pp.created_at asc');
+    expect(sql).not.toContain('date_trunc');
+    expect(sql).not.toContain('limit');
+  });
+
+  it('paged uses the ms-truncated id-tiebroken ascending keyset + limit+1', async () => {
+    const { svc, spy } = make(() => []);
+    await svc.listPagePermissions(PAGE, {
+      limit: 10,
+      before: { createdAt: '2026-01-01T00:00:00.000Z', id: 'perm-3' },
+    });
+    const call = spy.calls[0];
+    const sql = q(call.sql);
+    expect(sql).toContain("date_trunc('milliseconds', pp.created_at) asc");
+    expect(sql).toContain('pp.id::text asc');
+    expect(sql).toContain('> ('); // ascending keyset bound
+    expect(call.parameters).toContainEqual(11); // limit + 1
+  });
+});

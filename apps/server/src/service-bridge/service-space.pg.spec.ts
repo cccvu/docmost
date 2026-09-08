@@ -39,6 +39,7 @@ const S_VISIBLE = uuid(1);
 const S_ARCHIVED = uuid(2);
 const S_PERSONAL = uuid(3);
 const S_FOREIGN = uuid(4);
+const S_PAGING = uuid(6);
 
 d('ServiceSpaceService reads on real Postgres (list / members / detail confidentiality)', () => {
   let pg: postgres.Sql;
@@ -56,10 +57,11 @@ d('ServiceSpaceService reads on real Postgres (list / members / detail confident
       values (${id}, ${name}, ${'slug-' + id.slice(-3)}, null, 'private', ${opts.personal ?? false},
               ${opts.workspaceId ?? DEFAULT_WS}, now(), now(), ${opts.deleted ? pg`now()` : null})`;
 
-  const insertMember = (id: string, spaceId: string, userId: string, deleted = false) =>
+  const insertMember = (id: string, spaceId: string, userId: string, deleted = false, createdAtIso?: string) =>
     pg`
       insert into space_members (id, user_id, group_id, space_id, role, added_by_id, created_at, updated_at, deleted_at)
-      values (${id}, ${userId}, null, ${spaceId}, 'writer', ${userId}, now(), now(), ${deleted ? pg`now()` : null})`;
+      values (${id}, ${userId}, null, ${spaceId}, 'writer', ${userId},
+              ${createdAtIso ? pg`${createdAtIso}::timestamptz` : pg`now()`}, now(), ${deleted ? pg`now()` : null})`;
 
   beforeAll(async () => {
     await bootstrapSchema(SCHEMA);
@@ -77,6 +79,15 @@ d('ServiceSpaceService reads on real Postgres (list / members / detail confident
     // S_VISIBLE has one live member and one soft-deleted member (member_count must count only the live one).
     await insertMember(uuid(20), S_VISIBLE, uuid(30));
     await insertMember(uuid(21), S_VISIBLE, uuid(31), true);
+
+    // ---- C14 sub-collection paging fixtures: 4 live members on one space with controlled created_at. uuid(41)
+    // and uuid(42) share a millisecond, so the id::text tiebreak + no-skip/no-dupe walk are proven under paging.
+    // Personal so it stays OUT of the list() assertions above (loadSpace/listMembers load it regardless).
+    await insertSpace(S_PAGING, 'paging', { personal: true });
+    await insertMember(uuid(40), S_PAGING, uuid(40), false, '2026-01-01T00:00:00.000Z');
+    await insertMember(uuid(41), S_PAGING, uuid(41), false, '2026-01-01T00:00:01.000Z');
+    await insertMember(uuid(42), S_PAGING, uuid(42), false, '2026-01-01T00:00:01.000Z');
+    await insertMember(uuid(43), S_PAGING, uuid(43), false, '2026-01-01T00:00:02.000Z');
   });
 
   afterAll(async () => {
@@ -110,5 +121,27 @@ d('ServiceSpaceService reads on real Postgres (list / members / detail confident
     const members = await svc.listMembers(S_VISIBLE);
     expect(members.map((m) => m.userId)).toEqual([uuid(30)]);
     await expect(svc.listMembers(S_FOREIGN)).rejects.toBeInstanceOf(NotFoundException);
+  });
+
+  it('listMembers unpaged returns ALL members (backward-compatible default)', async () => {
+    const members = await svc.listMembers(S_PAGING);
+    expect(members.map((m) => m.memberId)).toEqual([uuid(40), uuid(41), uuid(42), uuid(43)]);
+  });
+
+  it('listMembers pages the keyset ascending across a same-ms tie with no skip and no duplicate (C14)', async () => {
+    const walk: string[] = [];
+    let cursor: { createdAt: string; id: string } | undefined;
+    for (let guard = 0; guard < 10; guard++) {
+      const page = await svc.listMembers(S_PAGING, { limit: 2, before: cursor });
+      const kept = page.slice(0, 2);
+      walk.push(...kept.map((m) => m.memberId));
+      if (page.length <= 2) break; // no limit+1 overflow → this was the last page
+      const last = kept[kept.length - 1];
+      cursor = { createdAt: last.createdAt, id: last.memberId };
+    }
+    // uuid(41)/uuid(42) share a truncated ms; the ascending id::text tiebreak keeps 41 before 42 and puts 42
+    // on the correct page — no skip, no duplicate.
+    expect(walk).toEqual([uuid(40), uuid(41), uuid(42), uuid(43)]);
+    expect(new Set(walk).size).toBe(walk.length);
   });
 });
