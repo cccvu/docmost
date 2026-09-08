@@ -10,6 +10,7 @@ import { ServiceWorkspaceController } from './service-workspace.controller';
 import { ServiceSpaceController } from './service-space.controller';
 import { ServicePageController } from './service-page.controller';
 import { ServiceContentController } from './service-content.controller';
+import { ServiceAttachmentController } from './service-attachment.controller';
 import { AuthzChangeController } from './authz-change.controller';
 
 // Derived from the module's own registration (not a hand-maintained list) so a controller added to
@@ -21,6 +22,7 @@ const KNOWN_CONTROLLERS = [
   ServiceSpaceController,
   ServicePageController,
   ServiceContentController,
+  ServiceAttachmentController,
   AuthzChangeController,
 ];
 const CONTROLLERS = Reflect.getMetadata(MODULE_METADATA.CONTROLLERS, ServiceBridgeModule) as Array<
@@ -61,6 +63,8 @@ const EXPECTED_SCOPE: Record<string, ServiceScope> = {
   'ServiceContentController.listSpaces': ServiceScope.ContentRead,
   'ServiceContentController.getSpace': ServiceScope.ContentRead,
   'ServiceContentController.search': ServiceScope.ContentSearch,
+  'ServiceAttachmentController.resolvePage': ServiceScope.AttachmentsRead,
+  'ServiceAttachmentController.listByPage': ServiceScope.AttachmentsRead,
   'AuthzChangeController.changes': ServiceScope.ChangesRead,
   'AuthzChangeController.getSnapshot': ServiceScope.ChangesRead,
 };

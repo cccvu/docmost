@@ -11,6 +11,8 @@ import { ServicePageController } from './service-page.controller';
 import { ServiceContentController } from './service-content.controller';
 import { ServiceContentService } from './service-content.service';
 import { ServiceSearchService } from './service-search.service';
+import { ServiceAttachmentController } from './service-attachment.controller';
+import { ServiceAttachmentService } from './service-attachment.service';
 import { AuthzChangeController } from './authz-change.controller';
 import { AuthzChangeFeedService } from './authz-change-feed.service';
 import { AuthzSnapshotService } from './authz-snapshot.service';
@@ -41,6 +43,7 @@ import { SearchModule } from '../core/search/search.module';
     ServiceSpaceController,
     ServicePageController,
     ServiceContentController,
+    ServiceAttachmentController,
     AuthzChangeController,
   ],
   providers: [
@@ -49,6 +52,7 @@ import { SearchModule } from '../core/search/search.module';
     ServiceSpaceService,
     ServiceContentService,
     ServiceSearchService,
+    ServiceAttachmentService,
     AuthzChangeFeedService,
     AuthzSnapshotService,
     AuthzOutboxInstaller,

@@ -9,6 +9,7 @@ import { ServiceWorkspaceController } from './service-workspace.controller';
 import { ServiceSpaceController } from './service-space.controller';
 import { ServicePageController } from './service-page.controller';
 import { ServiceContentController } from './service-content.controller';
+import { ServiceAttachmentController } from './service-attachment.controller';
 import { AuthzChangeController } from './authz-change.controller';
 import { CONTENT_LIST_MAX_IDS, CONTENT_LIST_MAX_LIMIT } from './dto/content-read.dto';
 import { AuthzChangeEvent, AuthzChangeEventType } from './authz-change-event';
@@ -16,6 +17,7 @@ import { ChangesResult } from './authz-change-feed.service';
 import { SnapshotResult } from './authz-snapshot.service';
 import { PublicPageSummary, PublicSpaceSummary, RawPagePermission } from './service-content.service';
 import { PublicSearchHit } from './service-search.service';
+import { PublicAttachmentSummary } from './service-attachment.service';
 import { SpaceView, RawSpaceMember } from './service-space.service';
 import { WorkspaceSettingsView } from './service-workspace.service';
 
@@ -44,7 +46,7 @@ const CONTROLLERS = Reflect.getMetadata(MODULE_METADATA.CONTROLLERS, ServiceBrid
   new (...args: any[]) => unknown
 >;
 // The reviewed set (kept as imports so a removal from the module is a visible diff here too).
-void [ServiceBridgeController, ServiceWorkspaceController, ServiceSpaceController, ServicePageController, ServiceContentController, AuthzChangeController];
+void [ServiceBridgeController, ServiceWorkspaceController, ServiceSpaceController, ServicePageController, ServiceContentController, ServiceAttachmentController, AuthzChangeController];
 
 const METHOD_NAME: Record<number, string> = {
   [RequestMethod.GET]: 'get',
@@ -185,6 +187,7 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     PublicSpaceSummary: keysOf<PublicSpaceSummary>({ id: true, name: true, slug: true, description: true, visibility: true, createdAt: true, updatedAt: true }),
     RawPagePermission: keysOf<RawPagePermission>({ id: true, userId: true, groupId: true, role: true, createdAt: true }),
     PublicSearchHit: keysOf<PublicSearchHit>({ id: true, title: true, icon: true, parentPageId: true, space: true, highlight: true, createdAt: true, updatedAt: true }),
+    PublicAttachmentSummary: keysOf<PublicAttachmentSummary>({ id: true, fileName: true, mimeType: true, fileSize: true, type: true, createdAt: true }),
   };
 
   // The 5 inline (non-component) scalar bodies, tied to the CONTROLLER return types (a signature change reds).
@@ -193,6 +196,7 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
   const CREATE_SPACE = keysOf<Awaited<ReturnType<ServiceSpaceController['create']>>>({ id: true, slug: true, name: true });
   const ADD_MEMBER = keysOf<Awaited<ReturnType<ServiceSpaceController['addMember']>>>({ memberId: true, userId: true });
   const RESOLVE_PAGE_SPACE = keysOf<Awaited<ReturnType<ServicePageController['resolveSpace']>>>({ pageId: true, spaceId: true });
+  const RESOLVE_ATTACHMENT_PAGE = keysOf<Awaited<ReturnType<ServiceAttachmentController['resolvePage']>>>({ attachmentId: true, pageId: true, spaceId: true });
 
   type OpExpect =
     | { kind: 'ref'; name: string }
@@ -218,6 +222,8 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     { id: 'listContentSpaces', method: 'post', path: '/api/service/content/spaces/list', expect: { kind: 'items', name: 'PublicSpaceSummary' } },
     { id: 'getContentSpace', method: 'get', path: '/api/service/content/spaces/{spaceId}', expect: { kind: 'ref', name: 'PublicSpaceSummary' } },
     { id: 'searchContent', method: 'post', path: '/api/service/content/search', expect: { kind: 'items', name: 'PublicSearchHit' } },
+    { id: 'resolveAttachmentPage', method: 'get', path: '/api/service/attachments/{attachmentId}/page', expect: { kind: 'inline', keys: RESOLVE_ATTACHMENT_PAGE } },
+    { id: 'listPageAttachments', method: 'get', path: '/api/service/attachments/by-page/{pageId}', expect: { kind: 'items', name: 'PublicAttachmentSummary' } },
   ];
 
   const refName = (s: any): string | null => (s && typeof s.$ref === 'string' ? s.$ref.split('/').pop()! : null);
