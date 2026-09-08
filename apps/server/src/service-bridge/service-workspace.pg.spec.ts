@@ -101,10 +101,17 @@ d('ServiceWorkspaceService.updateSettings JSONB merge on real Postgres', () => {
   });
 
   it('a no-op update (neither field set) returns the current view and issues no write', async () => {
-    const before = await readSettings();
+    const before = await pg<{ settings: Record<string, unknown>; updated_at: Date }[]>`
+      select settings, updated_at from workspaces where id = ${WS_ID}`;
     const view = await svc.updateSettings({} as any);
     expect(view).toEqual({ name: 'CCC Wiki', defaultPageEditMode: 'edit' });
-    expect(await readSettings()).toEqual(before); // the settings jsonb is untouched (short-circuits to getSettings)
+    const after = await pg<{ settings: Record<string, unknown>; updated_at: Date }[]>`
+      select settings, updated_at from workspaces where id = ${WS_ID}`;
+    expect(after[0].settings).toEqual(before[0].settings);
+    // The short-circuit returns getSettings() with NO UPDATE, so updated_at is byte-identical. This is what
+    // actually proves "no write": dropping the short-circuit runs the fragments UPDATE (which always sets
+    // `updated_at = now()`), bumping updated_at even with no field change, which reddens this assertion.
+    expect(after[0].updated_at.getTime()).toBe(before[0].updated_at.getTime());
   });
 
   it('getSettings normalizes an unknown defaultPageEditMode to null in the view while preserving the stored value', async () => {
