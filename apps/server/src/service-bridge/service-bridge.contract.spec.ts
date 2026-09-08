@@ -14,6 +14,9 @@ import { CONTENT_LIST_MAX_IDS, CONTENT_LIST_MAX_LIMIT } from './dto/content-read
 import { AuthzChangeEvent, AuthzChangeEventType } from './authz-change-event';
 import { ChangesResult } from './authz-change-feed.service';
 import { SnapshotResult } from './authz-snapshot.service';
+import { PublicPageSummary, PublicSpaceSummary, RawPagePermission } from './service-content.service';
+import { SpaceView, RawSpaceMember } from './service-space.service';
+import { WorkspaceSettingsView } from './service-workspace.service';
 
 /**
  * Provider-side contract test: the routes the fork actually implements MUST equal the operations declared in
@@ -148,5 +151,100 @@ describe('service-bridge.openapi.json is the canonical inbound contract (provide
   it('#179 tether (provider): the changes and snapshot response schemas have exactly the keys the controller returns', () => {
     closedKeys(SPEC.components.schemas.AuthzChangesResponse, sortedKeys(FORK_CHANGES_KEYS));
     closedKeys(SPEC.components.schemas.AuthzSnapshotResponse, sortedKeys(FORK_SNAPSHOT_KEYS));
+  });
+});
+
+/**
+ * Response-body schema tether (issue #174 remainder). C.4 (#179) tethered only the two feed responses; this
+ * extends the SAME typed-key-map tether to the 16 body-bearing `/api/service/*` operations, so a renamed or
+ * dropped field in any 2xx response schema fails a test from BOTH directions: a fork-type rename fails to
+ * COMPILE (the `keysOf<T>(...)` maps below stop matching `keyof T`), and a document-side rename fails the
+ * key-set comparison. The 7 reusable component schemas are all-required but not `additionalProperties:false`,
+ * so their tether pins `properties` + `required` equality (the closure the feed responses get from AP:false).
+ * The 5 inline scalar bodies and the wrapper shapes (array-of, `{ items: array-of }`) are pinned by walking
+ * each operation's 2xx body, which also proves the operation points at the RIGHT schema.
+ */
+describe('service-bridge.openapi.json 2xx response bodies match the fork return types (provider side, #174)', () => {
+  const sortedKeys = (o: object): string[] => Object.keys(o).sort();
+  /** Sorted key list of a `Record<keyof T, true>` literal: a missing key (Record) or an extra key (excess
+   *  property) is a COMPILE error, so the list always tracks the fork type exactly. */
+  const keysOf = <T,>(m: Record<keyof T, true>): string[] => Object.keys(m).sort();
+
+  // The 7 reusable named response schemas, tied to the fork interfaces the controllers actually return.
+  const NAMED: Record<string, string[]> = {
+    ProvisionedUser: keysOf<{ userId: string; workspaceId: string }>({ userId: true, workspaceId: true }),
+    WorkspaceSettings: keysOf<WorkspaceSettingsView>({ name: true, defaultPageEditMode: true }),
+    SpaceView: keysOf<SpaceView>({ id: true, name: true, slug: true, description: true, visibility: true, memberCount: true, archived: true, createdAt: true }),
+    RawSpaceMember: keysOf<RawSpaceMember>({ memberId: true, userId: true, groupId: true, role: true, createdAt: true }),
+    PublicPageSummary: keysOf<PublicPageSummary>({ id: true, slugId: true, title: true, icon: true, spaceId: true, parentPageId: true, position: true, createdAt: true, updatedAt: true }),
+    PublicSpaceSummary: keysOf<PublicSpaceSummary>({ id: true, name: true, slug: true, description: true, visibility: true, createdAt: true, updatedAt: true }),
+    RawPagePermission: keysOf<RawPagePermission>({ id: true, userId: true, groupId: true, role: true, createdAt: true }),
+  };
+
+  // The 5 inline (non-component) scalar bodies, tied to the CONTROLLER return types (a signature change reds).
+  const MINT = keysOf<Awaited<ReturnType<ServiceBridgeController['mintSession']>>>({ ok: true });
+  const DEFAULT_WS = keysOf<Awaited<ReturnType<ServiceWorkspaceController['getDefault']>>>({ workspaceId: true });
+  const CREATE_SPACE = keysOf<Awaited<ReturnType<ServiceSpaceController['create']>>>({ id: true, slug: true, name: true });
+  const ADD_MEMBER = keysOf<Awaited<ReturnType<ServiceSpaceController['addMember']>>>({ memberId: true, userId: true });
+  const RESOLVE_PAGE_SPACE = keysOf<Awaited<ReturnType<ServicePageController['resolveSpace']>>>({ pageId: true, spaceId: true });
+
+  type OpExpect =
+    | { kind: 'ref'; name: string }
+    | { kind: 'array'; name: string }
+    | { kind: 'items'; name: string }
+    | { kind: 'inline'; keys: string[] };
+
+  const OPS: Array<{ id: string; method: string; path: string; expect: OpExpect }> = [
+    { id: 'provisionShadowUser', method: 'post', path: '/api/service/users', expect: { kind: 'ref', name: 'ProvisionedUser' } },
+    { id: 'resolveUser', method: 'post', path: '/api/service/users/resolve', expect: { kind: 'ref', name: 'ProvisionedUser' } },
+    { id: 'mintSession', method: 'post', path: '/api/service/session', expect: { kind: 'inline', keys: MINT } },
+    { id: 'getDefaultWorkspace', method: 'get', path: '/api/service/workspace/default', expect: { kind: 'inline', keys: DEFAULT_WS } },
+    { id: 'getWorkspaceSettings', method: 'get', path: '/api/service/workspace/settings', expect: { kind: 'ref', name: 'WorkspaceSettings' } },
+    { id: 'updateWorkspaceSettings', method: 'patch', path: '/api/service/workspace/settings', expect: { kind: 'ref', name: 'WorkspaceSettings' } },
+    { id: 'listSpaces', method: 'get', path: '/api/service/spaces', expect: { kind: 'array', name: 'SpaceView' } },
+    { id: 'createSpace', method: 'post', path: '/api/service/spaces', expect: { kind: 'inline', keys: CREATE_SPACE } },
+    { id: 'getSpace', method: 'get', path: '/api/service/spaces/{spaceId}', expect: { kind: 'ref', name: 'SpaceView' } },
+    { id: 'listSpaceMembers', method: 'get', path: '/api/service/spaces/{spaceId}/members', expect: { kind: 'array', name: 'RawSpaceMember' } },
+    { id: 'addSpaceMember', method: 'post', path: '/api/service/spaces/{spaceId}/members', expect: { kind: 'inline', keys: ADD_MEMBER } },
+    { id: 'resolvePageSpace', method: 'post', path: '/api/service/pages/resolve-space', expect: { kind: 'inline', keys: RESOLVE_PAGE_SPACE } },
+    { id: 'listPagePermissions', method: 'get', path: '/api/service/pages/{pageId}/permissions', expect: { kind: 'items', name: 'RawPagePermission' } },
+    { id: 'listContentPages', method: 'post', path: '/api/service/content/pages/list', expect: { kind: 'items', name: 'PublicPageSummary' } },
+    { id: 'listContentSpaces', method: 'post', path: '/api/service/content/spaces/list', expect: { kind: 'items', name: 'PublicSpaceSummary' } },
+    { id: 'getContentSpace', method: 'get', path: '/api/service/content/spaces/{spaceId}', expect: { kind: 'ref', name: 'PublicSpaceSummary' } },
+  ];
+
+  const refName = (s: any): string | null => (s && typeof s.$ref === 'string' ? s.$ref.split('/').pop()! : null);
+  const body2xx = (method: string, path: string): any => {
+    const op = (SPEC.paths as any)[path]?.[method];
+    expect(op).toBeDefined();
+    const code = Object.keys(op.responses).find((c) => c.startsWith('2'));
+    return op.responses[code as string].content['application/json'].schema;
+  };
+
+  it('every reusable response component schema has exactly the keys its fork type declares (required-closed)', () => {
+    for (const [name, keys] of Object.entries(NAMED)) {
+      const schema = SPEC.components.schemas[name];
+      expect(sortedKeys(schema.properties)).toEqual(keys);
+      // All-required is the closure here (these response schemas are not additionalProperties:false), so a
+      // renamed/dropped field is caught by the required-set equality as well as the properties comparison.
+      expect([...schema.required].sort()).toEqual(keys);
+    }
+  });
+
+  it.each(OPS)('$id: the 2xx body schema matches the fork return shape', ({ method, path, expect: exp }) => {
+    const schema = body2xx(method, path);
+    if (exp.kind === 'ref') {
+      expect(refName(schema)).toBe(exp.name);
+    } else if (exp.kind === 'array') {
+      expect(schema.type).toBe('array');
+      expect(refName(schema.items)).toBe(exp.name);
+    } else if (exp.kind === 'items') {
+      expect(sortedKeys(schema.properties)).toEqual(['items']);
+      expect(schema.properties.items.type).toBe('array');
+      expect(refName(schema.properties.items.items)).toBe(exp.name);
+    } else {
+      expect(sortedKeys(schema.properties)).toEqual(exp.keys);
+      if (schema.required) expect([...schema.required].sort()).toEqual(exp.keys);
+    }
   });
 });
