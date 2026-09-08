@@ -163,6 +163,10 @@ describe('service-bridge.openapi.json is the canonical inbound contract (provide
  * so their tether pins `properties` + `required` equality (the closure the feed responses get from AP:false).
  * The 5 inline scalar bodies and the wrapper shapes (array-of, `{ items: array-of }`) are pinned by walking
  * each operation's 2xx body, which also proves the operation points at the RIGHT schema.
+ *
+ * Scope: this pins key SETS (property presence, closedness, required) so a renamed/dropped/added field is
+ * caught. It does NOT validate per-field value TYPES or formats of a live body; that (a real HTTP response
+ * conforming field-by-field) is the job of the contract-replacement smoke, not this structural spec.
  */
 describe('service-bridge.openapi.json 2xx response bodies match the fork return types (provider side, #174)', () => {
   const sortedKeys = (o: object): string[] => Object.keys(o).sort();
@@ -172,7 +176,7 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
 
   // The 7 reusable named response schemas, tied to the fork interfaces the controllers actually return.
   const NAMED: Record<string, string[]> = {
-    ProvisionedUser: keysOf<{ userId: string; workspaceId: string }>({ userId: true, workspaceId: true }),
+    ProvisionedUser: keysOf<Awaited<ReturnType<ServiceBridgeController['resolveUser']>>>({ userId: true, workspaceId: true }),
     WorkspaceSettings: keysOf<WorkspaceSettingsView>({ name: true, defaultPageEditMode: true }),
     SpaceView: keysOf<SpaceView>({ id: true, name: true, slug: true, description: true, visibility: true, memberCount: true, archived: true, createdAt: true }),
     RawSpaceMember: keysOf<RawSpaceMember>({ memberId: true, userId: true, groupId: true, role: true, createdAt: true }),

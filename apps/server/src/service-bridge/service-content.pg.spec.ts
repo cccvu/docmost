@@ -43,6 +43,7 @@ const SCHEMA = 'service_content_pg_spec';
 const DEFAULT_WS = uuid(100);
 const FOREIGN_WS = uuid(200);
 const SPACE = uuid(50);
+const SPACE_B = uuid(51);
 
 d('ServiceContentService on real Postgres (keyset ordering + confidentiality)', () => {
   let pg: postgres.Sql;
@@ -67,16 +68,19 @@ d('ServiceContentService on real Postgres (keyset ordering + confidentiality)', 
               ${ts}, ${ts}, ${opts.deleted ? pg`now()` : null})`;
   };
 
+  // Same sub-millisecond fixture discipline as insertPage (postgres.js drops sub-ms from a bound ISO string).
   const insertSpace = (
     id: string,
-    updatedAt: string,
-    opts: { workspaceId?: string; deleted?: boolean } = {},
-  ) =>
-    pg`
+    baseIso: string,
+    opts: { workspaceId?: string; deleted?: boolean; micros?: number } = {},
+  ) => {
+    const ts = pg`(${baseIso}::timestamptz + (${opts.micros ?? 0} * interval '1 microsecond'))`;
+    return pg`
       insert into spaces (id, name, slug, description, visibility, is_personal, workspace_id, created_at, updated_at, deleted_at)
       values (${id}, ${'space ' + id.slice(-3)}, ${'sslug-' + id.slice(-3)}, ${'desc ' + id.slice(-3)},
               'private', false, ${opts.workspaceId ?? DEFAULT_WS},
-              ${updatedAt}::timestamptz, ${updatedAt}::timestamptz, ${opts.deleted ? updatedAt : null})`;
+              ${ts}, ${ts}, ${opts.deleted ? pg`now()` : null})`;
+  };
 
   beforeAll(async () => {
     await bootstrapSchema(SCHEMA);
@@ -108,6 +112,17 @@ d('ServiceContentService on real Postgres (keyset ordering + confidentiality)', 
     await pg`insert into page_access (id, page_id, workspace_id) values (${uuid(71)}, ${uuid(12)}, ${FOREIGN_WS})`;
     await pg`insert into page_permissions (id, page_access_id, user_id, group_id, role) values (${uuid(72)}, ${uuid(70)}, ${uuid(80)}, null, 'reader')`;
     await pg`insert into page_permissions (id, page_access_id, user_id, group_id, role) values (${uuid(73)}, ${uuid(71)}, ${uuid(81)}, null, 'writer')`;
+
+    // spaceId-narrowing fixture: a page in a DIFFERENT space (same tenant, live), supplied in ids but excluded
+    // by the pages-only `space_id = <dto.spaceId>` filter.
+    await insertPage(uuid(4), '2026-03-01T00:00:00Z', { spaceId: SPACE_B });
+
+    // spaces keyset-tie fixtures, mirroring the pages fixtures so listSpacesByIds is tie/paging-proven too:
+    // uuid(63) smaller id::text but later raw sub-ms; uuid(64) larger id::text, earlier raw sub-ms (same
+    // truncated ms); uuid(65) one full second later.
+    await insertSpace(uuid(63), '2026-04-01T00:00:00Z', { micros: 900 });
+    await insertSpace(uuid(64), '2026-04-01T00:00:00Z', { micros: 100 });
+    await insertSpace(uuid(65), '2026-04-01T00:00:01Z', { micros: 0 });
   });
 
   afterAll(async () => {
@@ -149,9 +164,28 @@ d('ServiceContentService on real Postgres (keyset ordering + confidentiality)', 
       expect(new Set(seen).size).toBe(seen.length); // no id observed twice across the two pages
     });
 
-    it('the spaceId filter and limit+1 shape hold for listSpacesByIds too', async () => {
-      const res = await svc.listSpacesByIds({ ids: [uuid(62)], limit: 1 } as any);
-      expect(res.items.map((s) => s.id)).toEqual([uuid(62)]);
+    it('listPagesByIds narrows to dto.spaceId, excluding an out-of-space id even when it is supplied', async () => {
+      // uuid(1) is in SPACE, uuid(4) is in SPACE_B; both are supplied, both pass the tenant/liveness guards,
+      // so ONLY the `space_id = ${dto.spaceId}` filter keeps uuid(4) out. Dropping that filter reddens this.
+      const res = await svc.listPagesByIds({ ids: [uuid(1), uuid(4)], spaceId: SPACE, limit: 100 } as any);
+      expect(res.items.map((p) => p.id)).toEqual([uuid(1)]);
+    });
+
+    it('listSpacesByIds applies the same truncated-ms ordering and cross-boundary paging as pages', async () => {
+      const sids = [uuid(63), uuid(64), uuid(65)];
+      const first = await svc.listSpacesByIds({ ids: sids, limit: 2 } as any);
+      expect(first.items).toHaveLength(3); // limit+1
+      const taken = first.items.slice(0, 2);
+      // uuid(65) (+1s) first; the tie at .000 resolves by id::text desc: uuid(64) before uuid(63).
+      expect(taken.map((s) => s.id)).toEqual([uuid(65), uuid(64)]);
+
+      const cursor = { updatedAt: taken[1].updatedAt, id: taken[1].id };
+      const second = await svc.listSpacesByIds({ ids: sids, limit: 2, before: cursor } as any);
+      // uuid(63) shares uuid(64)'s truncated ms but a smaller id::text, so it belongs on page 2 (no skip);
+      // uuid(64)/uuid(65) do not reappear (no duplicate).
+      expect(second.items.map((s) => s.id)).toEqual([uuid(63)]);
+      const seen = [...taken, ...second.items].map((s) => s.id);
+      expect(new Set(seen).size).toBe(seen.length);
     });
   });
 

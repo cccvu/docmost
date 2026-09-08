@@ -99,4 +99,18 @@ d('ServiceWorkspaceService.updateSettings JSONB merge on real Postgres', () => {
     await pg`update workspaces set deleted_at = now() where id = ${WS_ID}`;
     await expect(svc.updateSettings({ defaultPageEditMode: 'read' } as any)).rejects.toBeInstanceOf(NotFoundException);
   });
+
+  it('a no-op update (neither field set) returns the current view and issues no write', async () => {
+    const before = await readSettings();
+    const view = await svc.updateSettings({} as any);
+    expect(view).toEqual({ name: 'CCC Wiki', defaultPageEditMode: 'edit' });
+    expect(await readSettings()).toEqual(before); // the settings jsonb is untouched (short-circuits to getSettings)
+  });
+
+  it('getSettings normalizes an unknown defaultPageEditMode to null in the view while preserving the stored value', async () => {
+    await pg`update workspaces set settings = ${pg.json({ defaultPageEditMode: 'weird', other: 'keep-me' })} where id = ${WS_ID}`;
+    const view = await svc.getSettings();
+    expect(view.defaultPageEditMode).toBeNull(); // only 'read' | 'edit' pass the view guard
+    expect((await readSettings()).defaultPageEditMode).toBe('weird'); // the raw jsonb is not rewritten
+  });
 });
