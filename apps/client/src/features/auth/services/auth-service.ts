@@ -6,6 +6,7 @@ import {
 } from "@/features/auth/types/auth.types";
 import { IWorkspace } from "@/features/workspace/types/workspace.types.ts";
 import { isNativeAuthEnabled } from "@/features/auth-native/lib/auth-mode.ts";
+import { clearPlatformAdminSeen } from "@/features/admin-entry/use-platform-admin-context";
 
 // NOTE: password login AND the password-lifecycle ops (change/forgot/reset-password, verify-token) were
 // REMOVED — the platform is passwordless (magic link + OTP, issue #4), so there is no user password to
@@ -23,6 +24,8 @@ export async function openDocmostSession(): Promise<void> {
 }
 
 export async function logout(): Promise<void> {
+  // Drop the advisory platform-admin hint so a signed-out browser never shows the re-auth affordance.
+  clearPlatformAdminSeen();
   if (isNativeAuthEnabled()) {
     // Native (standalone) mode: there is no platform session — only Docmost's `authToken`. Clearing the
     // platform session would hit a service that isn't running. End just the Docmost session.
