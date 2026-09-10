@@ -54,7 +54,7 @@ const SEAM_ALLOWLIST = new Set<string>([
   'app.module.ts', // seam #4 — CollabDisconnectModule + PlatformAuditModule + PlatformAuthorizationGuard
   'core/search/search.module.ts', // seam #5 — PDP-gated search provider
   'integrations/static/static.module.ts', // seam #86 — client capability injection (NATIVE_AUTH_ENABLED, reads authz mode)
-  'core/auth/auth.controller.ts', // seam #87 — NativeAuthModeGuard/NativeCredentialRoute on credential routes
+  'core/auth/auth.controller.ts', // seam #87 — NativeAuthModeGuard + @SessionScopedRoute() allowlist (collab-token/logout)
   'core/workspace/controllers/workspace.controller.ts', // seam #87/#88 — native-auth gate on the session-mint route
 ]);
 

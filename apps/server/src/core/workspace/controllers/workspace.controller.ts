@@ -37,9 +37,9 @@ import { CheckHostnameDto } from '../dto/check-hostname.dto';
 import { RemoveWorkspaceUserDto } from '../dto/remove-workspace-user.dto';
 import { WorkspaceRepo } from '@docmost/db/repos/workspace/workspace.repo';
 // CCC seam (UPSTREAM_MODIFICATIONS.md #88): native-auth mode gate for the invitation-accept route below,
-// which mints a native session outside AuthController. Logic lives in authz/mode/.
+// which mints a native session outside AuthController. It carries NO @SessionScopedRoute() marker, so the
+// method-level NativeAuthModeGuard 404s it by default in AUTHZ_MODE=remote. Logic lives in authz/mode/.
 import { NativeAuthModeGuard } from '../../../authz/mode/native-auth-mode.guard';
-import { NativeCredentialRoute } from '../../../authz/mode/native-auth-mode.decorator';
 
 @UseGuards(JwtAuthGuard)
 @Controller('workspace')
@@ -299,7 +299,6 @@ export class WorkspaceController {
   // POST /api/service/session; role/membership come from the authorization service). Inert in native mode.
   @Public()
   @UseGuards(NativeAuthModeGuard)
-  @NativeCredentialRoute()
   @HttpCode(HttpStatus.OK)
   @Post('invites/accept')
   async acceptInvite(

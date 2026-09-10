@@ -37,11 +37,13 @@ import {
   AUDIT_SERVICE,
   IAuditService,
 } from '../../integrations/audit/audit.service';
-// CCC seam (UPSTREAM_MODIFICATIONS.md #87): native-auth mode gate. In AUTHZ_MODE=remote every route
-// marked @NativeCredentialRoute() below is 404'd for ALL callers (native auth is disabled server-side;
-// sessions are brokered via POST /api/service/session). Inert in native mode. Logic lives in authz/mode/.
+// CCC seam (UPSTREAM_MODIFICATIONS.md #87): native-auth mode gate. The class-level NativeAuthModeGuard
+// DENIES every route on this controller in AUTHZ_MODE=remote (404 for ALL callers — native auth is disabled
+// server-side; sessions are brokered via POST /api/service/session) EXCEPT the handlers marked
+// @SessionScopedRoute() (collab-token / logout, which carry no native credential). Fail-closed by default: a
+// new unmarked route here is denied in remote. Inert in native mode. Logic lives in authz/mode/.
 import { NativeAuthModeGuard } from '../../authz/mode/native-auth-mode.guard';
-import { NativeCredentialRoute } from '../../authz/mode/native-auth-mode.decorator';
+import { SessionScopedRoute } from '../../authz/mode/native-auth-mode.decorator';
 
 @SkipThrottle({ [AI_CHAT_THROTTLER]: true })
 @UseGuards(ThrottlerGuard, NativeAuthModeGuard)
@@ -57,7 +59,6 @@ export class AuthController {
     @Inject(AUDIT_SERVICE) private readonly auditService: IAuditService,
   ) {}
 
-  @NativeCredentialRoute()
   @HttpCode(HttpStatus.OK)
   @Post('login')
   async login(
@@ -110,7 +111,6 @@ export class AuthController {
     this.setAuthCookie(res, authToken);
   }
 
-  @NativeCredentialRoute()
   @UseGuards(SetupGuard)
   @HttpCode(HttpStatus.OK)
   @Post('setup')
@@ -125,7 +125,6 @@ export class AuthController {
     return workspace;
   }
 
-  @NativeCredentialRoute()
   @SkipThrottle({ [AUTH_THROTTLER]: true })
   @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
@@ -145,7 +144,6 @@ export class AuthController {
     );
   }
 
-  @NativeCredentialRoute()
   @HttpCode(HttpStatus.OK)
   @Post('forgot-password')
   async forgotPassword(
@@ -156,7 +154,6 @@ export class AuthController {
     return this.authService.forgotPassword(forgotPasswordDto, workspace);
   }
 
-  @NativeCredentialRoute()
   @HttpCode(HttpStatus.OK)
   @Post('password-reset')
   async passwordReset(
@@ -182,7 +179,6 @@ export class AuthController {
     };
   }
 
-  @NativeCredentialRoute()
   @HttpCode(HttpStatus.OK)
   @Post('verify-token')
   async verifyResetToken(
@@ -192,6 +188,7 @@ export class AuthController {
     return this.authService.verifyUserToken(verifyUserTokenDto, workspace.id);
   }
 
+  @SessionScopedRoute() // native-auth allowlist (seam #87): stays reachable in remote — no native credential
   @SkipThrottle({ [AUTH_THROTTLER]: true })
   @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
@@ -203,6 +200,7 @@ export class AuthController {
     return this.authService.getCollabToken(user, workspace.id);
   }
 
+  @SessionScopedRoute() // native-auth allowlist (seam #87): stays reachable in remote — no native credential
   @SkipThrottle({ [AUTH_THROTTLER]: true })
   @UseGuards(JwtAuthGuard)
   @HttpCode(HttpStatus.OK)
