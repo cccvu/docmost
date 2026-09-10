@@ -36,18 +36,29 @@ export interface StaticRoute {
   /** Guard identifier names from @UseGuards(...) on the class + handler (deduped). */
   guardNames: string[];
   /**
-   * The handler BODY mints a native session cookie — `res.setCookie('authToken', …)` or the AuthController
-   * `this.setAuthCookie(…)` helper. A static (text) tell, deliberately over-reporting: it lets a fitness
-   * test assert "every native-session route is denied in remote (under NativeAuthModeGuard and NOT
-   * @SessionScopedRoute())" so a NEW unmarked session-minting route (the invites/accept-class gap) cannot
-   * merge silently. See native-credential-routes.spec.ts.
+   * The handler BODY appears to mint a native session — it sets the `authToken` cookie
+   * (`res.setCookie('authToken', …)` / the AuthController `setAuthCookie(…)` helper) or calls the
+   * `createSessionAndToken(…)` session-token factory. A static (text) tell, deliberately over-reporting so a
+   * fitness test can assert "every DETECTED native-session route is denied in remote (under
+   * NativeAuthModeGuard and NOT @SessionScopedRoute())".
+   *
+   * SCOPE — do NOT overstate this as "any new minter fails RED": it catches mints written with the known
+   * patterns above. A future handler that establishes a session via an UNRECOGNIZED indirection (a
+   * differently-named cookie/helper, or delegating the cookie-set to a service) would NOT be flagged.
+   * `AuthController` is backstopped by the fail-closed class-level guard regardless of this tell; OTHER
+   * controllers rely on this heuristic, so widen the pattern below whenever session issuance changes. See
+   * native-credential-routes.spec.ts.
    */
   mintsNativeSession: boolean;
 }
 
-// Text tell that a handler body establishes a native session (mints the `authToken` cookie). Matches
-// `setCookie('authToken'` / `setCookie("authToken"` (direct) and `setAuthCookie(` (the AuthController helper).
-const NATIVE_SESSION_MINT_RE = /setCookie\(\s*['"]authToken['"]|setAuthCookie\s*\(/;
+// Text tell that a handler body establishes a native session. Matches the `authToken` cookie set
+// (`setCookie('authToken'` / `setCookie("authToken"`), the `setAuthCookie(` helper, and the
+// `createSessionAndToken(` session-token factory that every current mint funnels through. A HEURISTIC (see
+// the mintsNativeSession doc): it over-reports on purpose but cannot see a session minted via an
+// unrecognized indirection — widen it if session issuance grows a new shape.
+const NATIVE_SESSION_MINT_RE =
+  /setCookie\(\s*['"]authToken['"]|setAuthCookie\s*\(|createSessionAndToken\s*\(/;
 
 const ROUTE_DECORATORS = new Set(['Get', 'Post', 'Put', 'Patch', 'Delete', 'Options', 'Head', 'All', 'Search']);
 const PUBLIC_DECORATORS = new Set(['Public', 'PlatformPublic']);

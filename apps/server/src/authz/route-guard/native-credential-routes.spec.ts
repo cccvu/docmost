@@ -19,9 +19,17 @@ import { scanRoutes } from './static-route-scan';
  *    so it is kept exact and both-directional;
  *  - NO marker is at the controller-class level (the guard ignores a class marker, but we reject it loudly so
  *    nobody relies on the ignored-but-present state);
- *  - every native `authToken`-minting route (except the fork-owned service-bridge) is UNDER the guard AND not
- *    session-scoped → therefore denied in remote. That closes the invites/accept class: a new native-session
- *    route added without the guard — or wrongly allowlisted — fails RED here, not in production.
+ *  - every native `authToken`-minting route THE SCANNER DETECTS (except the fork-owned service-bridge) is
+ *    UNDER the guard AND not session-scoped → therefore denied in remote. That closes the invites/accept
+ *    class for mints written with the recognized patterns: such a route added without the guard — or wrongly
+ *    allowlisted — fails RED here, not in production.
+ *
+ * SCOPE (honest limits, not a blanket guarantee): the minter invariant is only as complete as the
+ * `mintsNativeSession` text heuristic (see static-route-scan.ts). A future handler that establishes a
+ * session via an UNRECOGNIZED indirection (a differently-named cookie/helper, or delegating the cookie-set to
+ * a service) would be invisible to this scan. `AuthController` is backstopped by the fail-closed class-level
+ * guard regardless; other controllers rely on the heuristic — widen `NATIVE_SESSION_MINT_RE` when session
+ * issuance changes. Tracked as a known limitation (wiki-v2 issue #139 follow-up).
  */
 const SRC_ROOT = join(__dirname, '..', '..'); // .../apps/server/src
 const SERVICE_BRIDGE_PREFIX = 'service-bridge/'; // fork-owned remote-mode session broker — intentionally native-session-minting
