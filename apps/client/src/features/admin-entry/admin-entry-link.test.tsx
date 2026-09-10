@@ -49,7 +49,7 @@ function renderLink() {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, gcTime: Infinity } },
   });
-  return render(
+  const utils = render(
     <QueryClientProvider client={client}>
       <MantineProvider>
         <MemoryRouter>
@@ -58,6 +58,7 @@ function renderLink() {
       </MantineProvider>
     </QueryClientProvider>,
   );
+  return { client, ...utils };
 }
 
 function hrefs() {
@@ -103,5 +104,41 @@ describe("AdminEntryLink", () => {
     renderLink();
     await waitFor(() => expect(getMock).toHaveBeenCalled());
     await waitFor(() => expect(hrefs()).toHaveLength(0));
+  });
+
+  it("keeps the /console link on a transient background-refetch failure (a blip must not blank it)", async () => {
+    getMock.mockResolvedValue({ data: { isAdmin: true } });
+    const { client } = renderLink();
+    await waitFor(() => expect(hrefs()).toContain("/console"));
+    // A background refetch now fails (transient 5xx). react-query v5 keeps the last-good data, so the
+    // gate stays "admin" — the whole point of gcTime:Infinity + retained data.
+    getMock.mockRejectedValue({ response: { status: 503 } });
+    await client.refetchQueries({ queryKey: ["platform-admin-context"] }).catch(() => {});
+    await waitFor(() => expect(getMock).toHaveBeenCalledTimes(2));
+    expect(hrefs()).toContain("/console");
+    expect(hrefs().some((h) => h.startsWith("/login"))).toBe(false);
+  });
+
+  it("shows the re-auth affordance on a network error (no response) when previously an admin", async () => {
+    localStorage.setItem(PLATFORM_ADMIN_SEEN_KEY, "1");
+    getMock.mockRejectedValue(new Error("Network Error")); // no .response → recoverable
+    renderLink();
+    await waitFor(() => expect(hrefs().some((h) => h.startsWith("/login"))).toBe(true));
+  });
+
+  it("renders nothing on a NON-recoverable error (e.g. 404), even with an admin hint", async () => {
+    localStorage.setItem(PLATFORM_ADMIN_SEEN_KEY, "1");
+    getMock.mockRejectedValue({ response: { status: 404 } });
+    renderLink();
+    await waitFor(() => expect(getMock).toHaveBeenCalled());
+    await waitFor(() => expect(hrefs()).toHaveLength(0));
+  });
+
+  it("clears the admin hint on a genuine 200 isAdmin:false (a demoted admin stops seeing re-auth)", async () => {
+    localStorage.setItem(PLATFORM_ADMIN_SEEN_KEY, "1");
+    getMock.mockResolvedValue({ data: { isAdmin: false } });
+    renderLink();
+    await waitFor(() => expect(localStorage.getItem(PLATFORM_ADMIN_SEEN_KEY)).toBeNull());
+    expect(hrefs()).toHaveLength(0);
   });
 });

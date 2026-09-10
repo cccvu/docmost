@@ -9,6 +9,11 @@ vi.mock("@/lib/platform-client", () => ({
 vi.mock("@/lib/api-client", () => ({
   default: { post: vi.fn(async () => ({ data: {} })) },
 }));
+// The advisory platform-admin hint lives here; logout() must clear it. Mock so we can assert the call
+// without a real localStorage (and without pulling react-query into this routing test).
+vi.mock("@/features/admin-entry/use-platform-admin-context", () => ({
+  clearPlatformAdminSeen: vi.fn(),
+}));
 
 import api from "@/lib/api-client";
 import platformApi from "@/lib/platform-client";
@@ -16,6 +21,7 @@ import {
   logout,
   openDocmostSession,
 } from "@/features/auth/services/auth-service";
+import { clearPlatformAdminSeen } from "@/features/admin-entry/use-platform-admin-context";
 import { requestAccess } from "@/features/public/services/public-service";
 
 // NOTE: password login() was removed (passwordless — issue #4); its routing test is gone with it.
@@ -38,6 +44,11 @@ describe("auth-service platform routing (issue #46)", () => {
     expect(platformApi.post).toHaveBeenCalledWith("/auth/logout");
     // Docmost session (authToken) via the ALB-allowed native logout:
     expect(api.post).toHaveBeenCalledWith("/auth/logout");
+  });
+
+  it("logout() clears the platform-admin hint (a signed-out browser shows no re-auth affordance)", async () => {
+    await logout();
+    expect(clearPlatformAdminSeen).toHaveBeenCalled();
   });
 
   it("logout() still clears the Docmost session when the platform logout fails (allSettled, not all)", async () => {

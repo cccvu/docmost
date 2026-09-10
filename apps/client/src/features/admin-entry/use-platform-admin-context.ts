@@ -68,7 +68,10 @@ export function usePlatformAdminContext(): PlatformAdminGate {
     queryKey: ["platform-admin-context"],
     queryFn: async () => {
       const res = await platformApi.get<{ isAdmin: boolean }>("/admin/context");
+      // Keep the advisory hint in sync with the authoritative answer: set it when admin, and CLEAR it on a
+      // genuine 200 {isAdmin:false} — so a demoted former admin stops getting the re-authenticate affordance.
       if (res.data?.isAdmin) rememberPlatformAdminSeen();
+      else clearPlatformAdminSeen();
       return res.data;
     },
     retry: false,

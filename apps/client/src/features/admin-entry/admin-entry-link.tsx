@@ -41,6 +41,7 @@ export function AdminEntryLink() {
             size="sm"
             leftSection={<IconShieldLock size={18} stroke={1.5} />}
             visibleFrom="sm"
+            aria-label={label}
           >
             {t("Sign in")}
           </Button>
