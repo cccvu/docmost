@@ -9,7 +9,8 @@ import { useBrandConfig } from "./brand-hooks";
  * The public AGPL fork ships NO brand artwork — `assets/` was removed. When `/brand/manifest.json` is
  * served (by the proprietary platform, same-origin) the mark renders that institution's lockup: the icon,
  * the wordmark as inline vector art (fetched as text so its `currentColor` fill themes with the surrounding
- * ink), and the college line. Without a bundle every variant falls back to the app name as plain text —
+ * ink), and the college line. Without a bundle the lockup falls back to the app name as plain text (the
+ * compact variant shows the name only when the caller passes one, and the icon variant renders nothing) —
  * never to a trademark.
  *
  * Accessibility: the icon is decorative; the wordmark art carries the accessible name (the institution

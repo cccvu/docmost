@@ -78,6 +78,17 @@ describe("loadBrandConfig", () => {
     expect(config.webManifest).toBe("/brand/site.webmanifest");
     expect((config.assets as Record<string, string>).injected).toBeUndefined();
 
+    // One shared deadline: manifest + wordmark use the SAME AbortSignal, so a hung /brand cannot stack
+    // two 1.5s timeouts into ~3s of blocked first paint.
+    const manifestCall = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
+    const wordmarkCall = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
+    expect(manifestCall[1].signal).toBeDefined();
+    expect(wordmarkCall[1].signal).toBe(manifestCall[1].signal);
+
+    // Memoized: a second call reuses the first load (no extra fetches).
+    await mod.loadBrandConfig();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
     // The document identity is swapped from neutral to branded.
     expect(document.title).toBe("Example Wiki");
     expect(
@@ -115,6 +126,42 @@ describe("loadBrandConfig", () => {
     const mod = await freshModule();
     const config = await mod.loadBrandConfig();
     expect(config).toEqual(mod.NEUTRAL_BRAND);
+  });
+
+  it("falls back to neutral on a non-2xx manifest", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 500 }) as unknown as Response));
+    const mod = await freshModule();
+    const config = await mod.loadBrandConfig();
+    expect(config).toEqual(mod.NEUTRAL_BRAND);
+    expect(document.title).not.toBe("Example Wiki");
+  });
+
+  it("falls back to neutral when the shared deadline aborts the manifest fetch", async () => {
+    const abortError = Object.assign(new Error("The operation was aborted."), {
+      name: "AbortError",
+    });
+    vi.stubGlobal("fetch", vi.fn(async () => Promise.reject(abortError)));
+    const mod = await freshModule();
+    const config = await mod.loadBrandConfig();
+    expect(config).toEqual(mod.NEUTRAL_BRAND);
+  });
+
+  it("keeps the branded identity when only the wordmark fetch fails", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/brand/manifest.json") {
+        return jsonResponse({
+          name: "Example Wiki",
+          assets: { icon: "/brand/v-icon.png", wordmarkSvg: "/brand/wordmark.svg" },
+        });
+      }
+      return { ok: false, status: 404 } as unknown as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const mod = await freshModule();
+    const config = await mod.loadBrandConfig();
+    expect(config.name).toBe("Example Wiki");
+    expect(config.wordmarkSvg).toBeUndefined();
+    expect(config.assets.icon).toBe("/brand/v-icon.png");
   });
 
   it("drops an asset URL that escapes the /brand/ prefix", async () => {
