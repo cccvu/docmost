@@ -85,7 +85,7 @@ describe('ServiceBridgeService.mintSession — no direct identity selection', ()
   });
 
   it('defense-in-depth: refuses a resolved row whose email left the shadow namespace (tampered)', async () => {
-    const { svc } = makeService(shadow({ email: 'real.person@vanderbilt.edu' }));
+    const { svc } = makeService(shadow({ email: 'real.person@example.edu' }));
     await expect(svc.mintSession(EXTERNAL_ID)).rejects.toBeInstanceOf(ForbiddenException);
   });
 

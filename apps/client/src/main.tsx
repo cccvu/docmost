@@ -22,6 +22,7 @@ import {
   isPostHogEnabled,
 } from "@/lib/config.ts";
 import posthog from "posthog-js";
+import { loadBrandConfig } from "@/features/brand/brand-config.ts";
 
 export const queryClient = new QueryClient({
   defaultOptions: {
@@ -46,19 +47,24 @@ if (isCloud() && isPostHogEnabled) {
 const container = document.getElementById("root") as HTMLElement;
 const root = (container as any).__reactRoot ??= ReactDOM.createRoot(container);
 
-root.render(
-  <BrowserRouter>
-    <MantineProvider theme={theme} cssVariablesResolver={mantineCssResolver}>
-      <ModalsProvider>
-        <QueryClientProvider client={queryClient}>
-          <Notifications position="bottom-center" limit={3} zIndex={10000} />
-          <HelmetProvider>
-            <PostHogProvider client={posthog}>
-              <App />
-            </PostHogProvider>
-          </HelmetProvider>
-        </QueryClientProvider>
-      </ModalsProvider>
-    </MantineProvider>
-  </BrowserRouter>,
-);
+// Runtime brand bundle (issue #30 follow-up): the fork ships no institution trademarks, so fetch the
+// platform's /brand manifest (bounded; neutral fallback when absent) before the first render — that way
+// every getAppName() page title renders branded without a flash of the generic name.
+void loadBrandConfig().finally(() => {
+  root.render(
+    <BrowserRouter>
+      <MantineProvider theme={theme} cssVariablesResolver={mantineCssResolver}>
+        <ModalsProvider>
+          <QueryClientProvider client={queryClient}>
+            <Notifications position="bottom-center" limit={3} zIndex={10000} />
+            <HelmetProvider>
+              <PostHogProvider client={posthog}>
+                <App />
+              </PostHogProvider>
+            </HelmetProvider>
+          </QueryClientProvider>
+        </ModalsProvider>
+      </MantineProvider>
+    </BrowserRouter>,
+  );
+});

@@ -1,42 +1,33 @@
 import { Group, Text } from "@mantine/core";
 import clsx from "clsx";
 import classes from "./brand-logo.module.css";
-import vIcon from "./assets/v-icon.png";
-// The official "VANDERBILT UNIVERSITY" serif wordmark, as vector artwork (the
-// exact path used by computing.vanderbilt.edu). Inlined (not <img>) so its
-// `currentColor` fill themes with the surrounding ink.
-import wordmarkSvg from "./assets/vu-wordmark.svg?raw";
+import { useBrandConfig } from "./brand-hooks";
 
 /**
- * CCC brand mark (issue #30). Mirrors the College of Connected Computing site
- * lockup (computing.vanderbilt.edu): the gold Dimensional V, the official serif
- * "Vanderbilt University" wordmark as vector art, and "College of Connected
- * Computing" as sans (Inter) text — with an optional app-name wordmark, or a
- * compact / icon-only variant for dense or narrow chrome.
+ * Institution brand mark, rendered from the runtime brand bundle (issue #30 follow-up).
  *
- * Accessibility: the V is decorative (`alt=""`); the wordmark art carries the
- * accessible name "Vanderbilt University" (or a caller-supplied `alt`), and the
- * college line is live text. In the app header the whole mark sits inside a
- * labelled Link, whose `aria-label` names it.
+ * The public AGPL fork ships NO brand artwork — `assets/` was removed. When `/brand/manifest.json` is
+ * served (by the proprietary platform, same-origin) the mark renders that institution's lockup: the icon,
+ * the wordmark as inline vector art (fetched as text so its `currentColor` fill themes with the surrounding
+ * ink), and the college line. Without a bundle every variant falls back to the app name as plain text —
+ * never to a trademark.
+ *
+ * Accessibility: the icon is decorative; the wordmark art carries the accessible name (the institution
+ * name, or a caller-supplied `alt`); the college line is live text.
  */
-
-export const INSTITUTION_NAME =
-  "Vanderbilt University · College of Connected Computing";
-
-const COLLEGE_NAME = "College of Connected Computing";
 
 type BrandVariant = "lockup" | "compact" | "icon";
 
 interface BrandProps {
-  /** `lockup` = V + wordmark + college; `compact` = V icon + name; `icon` = V only. */
+  /** `lockup` = mark + wordmark + college; `compact` = icon + name; `icon` = mark only. */
   variant?: BrandVariant;
-  /** Wordmark shown beside the mark (lockup + compact). Omit for mark-only. */
+  /** Text shown beside the mark (lockup + compact), or as the fallback when no bundle is loaded. */
   appName?: string;
-  /** Pixel height of the lockup mark — the V and text block (default 24). */
+  /** Pixel height of the lockup mark — the icon and text block (default 24). */
   lockupHeight?: number;
-  /** Pixel height of the V icon (default 24). */
+  /** Pixel height of the icon (default 24). */
   iconHeight?: number;
-  /** Accessible name for the wordmark artwork. Default "Vanderbilt University". */
+  /** Accessible name for the wordmark artwork. Defaults to the bundle's institution name. */
   alt?: string;
   className?: string;
 }
@@ -46,14 +37,21 @@ export function Brand({
   appName,
   lockupHeight = 24,
   iconHeight = 24,
-  alt = "",
+  alt,
   className,
 }: BrandProps) {
+  const brand = useBrandConfig();
+  const icon = brand.assets.icon;
+  const wordmark = brand.wordmarkSvg;
+  const college = brand.collegeName;
+  const fallbackName = appName ?? brand.name;
+
   if (variant === "icon") {
+    if (!icon) return null;
     return (
       <img
-        src={vIcon}
-        alt={alt}
+        src={icon}
+        alt={alt ?? ""}
         className={clsx(classes.vIcon, className)}
         style={{ height: iconHeight }}
       />
@@ -63,12 +61,14 @@ export function Brand({
   if (variant === "compact") {
     return (
       <Group gap={8} wrap="nowrap" className={clsx(classes.root, className)}>
-        <img
-          src={vIcon}
-          alt={alt}
-          className={classes.vIcon}
-          style={{ height: iconHeight }}
-        />
+        {icon ? (
+          <img
+            src={icon}
+            alt={alt ?? ""}
+            className={classes.vIcon}
+            style={{ height: iconHeight }}
+          />
+        ) : null}
         {appName ? (
           <Text className={classes.name} style={{ fontSize: iconHeight * 0.72 }}>
             {appName}
@@ -78,12 +78,24 @@ export function Brand({
     );
   }
 
-  // lockup — gold V + official serif wordmark (SVG) + college name (Inter sans).
+  // No runtime bundle (or the artwork failed to load): name as text, no trademark artwork.
+  if (!icon || !wordmark) {
+    return fallbackName ? (
+      <Text
+        component="span"
+        className={clsx(classes.name, className)}
+        style={{ fontSize: Math.round(lockupHeight * 0.6) }}
+      >
+        {fallbackName}
+      </Text>
+    ) : null;
+  }
+
   const h = lockupHeight;
   return (
     <Group gap={10} wrap="nowrap" className={clsx(classes.root, className)}>
       <img
-        src={vIcon}
+        src={icon}
         alt=""
         aria-hidden="true"
         className={classes.vIcon}
@@ -94,13 +106,15 @@ export function Brand({
           className={classes.wordmark}
           style={{ height: Math.round(h * 0.26) }}
           role="img"
-          aria-label={alt || "Vanderbilt University"}
-          // Trusted, build-time-bundled brand asset (no user input).
-          dangerouslySetInnerHTML={{ __html: wordmarkSvg }}
+          aria-label={alt ?? brand.institutionName ?? appName ?? brand.name}
+          // Trusted same-origin artwork fetched from the /brand bundle (see brand-config.ts).
+          dangerouslySetInnerHTML={{ __html: wordmark }}
         />
-        <span className={classes.college} style={{ fontSize: Math.round(h * 0.4) }}>
-          {COLLEGE_NAME}
-        </span>
+        {college ? (
+          <span className={classes.college} style={{ fontSize: Math.round(h * 0.4) }}>
+            {college}
+          </span>
+        ) : null}
       </span>
       {appName ? (
         <>

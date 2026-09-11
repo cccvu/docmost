@@ -24,7 +24,7 @@ export function PublicHero({ workspaceName }: { workspaceName: string }) {
         </Text>
 
         <Group justify="center" gap="sm">
-          {/* Bright Vanderbilt gold (shade 6) in both themes; autoContrast +
+          {/* Bright brand gold (shade 6) in both themes; autoContrast +
               explicit dark text keeps the label legible on gold. */}
           <Button component="a" href="#browse" size="md" color="gold.6" c="black">
             {t("Browse public content")}

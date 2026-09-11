@@ -60,9 +60,9 @@ describe("auth-service platform routing (issue #46)", () => {
   });
 
   it("requestAccess() still targets the platform /auth/register (email-only, passwordless)", async () => {
-    await requestAccess({ email: "new@vanderbilt.edu" });
+    await requestAccess({ email: "new@example.edu" });
     expect(platformApi.post).toHaveBeenCalledWith("/auth/register", {
-      email: "new@vanderbilt.edu",
+      email: "new@example.edu",
     });
   });
 
@@ -79,7 +79,7 @@ describe("auth-service platform routing (issue #46)", () => {
 
     await openDocmostSession();
     await logout();
-    await requestAccess({ email: "x@vanderbilt.edu" });
+    await requestAccess({ email: "x@example.edu" });
 
     // No platform-owned op may hit an ALB-blocked /api/auth/* path:
     for (const call of (api.post as any).mock.calls) {
@@ -88,7 +88,7 @@ describe("auth-service platform routing (issue #46)", () => {
     // ...and the session/registration ops must actually reach the platform surface:
     expect(platformApi.post).toHaveBeenCalledWith("/bff/docmost/session");
     expect(platformApi.post).toHaveBeenCalledWith("/auth/register", {
-      email: "x@vanderbilt.edu",
+      email: "x@example.edu",
     });
   });
 });

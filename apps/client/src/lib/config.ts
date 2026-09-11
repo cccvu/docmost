@@ -1,6 +1,7 @@
 import bytes from "bytes";
 import { castToBoolean } from "@/lib/utils.tsx";
 import { AvatarIconType } from "@/features/attachments/types/attachment.types.ts";
+import { getBrandConfig } from "@/features/brand/brand-config.ts";
 import { sanitizeUrl } from "@docmost/editor-ext";
 
 declare global {
@@ -10,7 +11,9 @@ declare global {
 }
 
 export function getAppName(): string {
-  return "CCC Wiki";
+  // Runtime brand bundle (features/brand): the fork ships no institution name; this is "Wiki" unless the
+  // platform's /brand manifest is loaded (main.tsx awaits it before the first render).
+  return getBrandConfig().name;
 }
 
 export function getAppUrl(): string {

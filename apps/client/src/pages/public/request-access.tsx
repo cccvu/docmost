@@ -91,7 +91,7 @@ export default function RequestAccess() {
                 id="email"
                 type="email"
                 label={t("Email")}
-                placeholder="email@vanderbilt.edu"
+                placeholder="email@example.edu"
                 autoComplete="email"
                 errorProps={{ role: "alert" }}
                 {...form.getInputProps("email")}

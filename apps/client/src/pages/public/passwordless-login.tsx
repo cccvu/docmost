@@ -81,7 +81,7 @@ export default function PasswordlessLogin() {
                   id="email"
                   type="email"
                   label={t("Email")}
-                  placeholder="email@vanderbilt.edu"
+                  placeholder="email@example.edu"
                   autoComplete="email"
                   required
                   value={email}

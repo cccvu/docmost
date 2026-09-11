@@ -11,7 +11,7 @@ import { getAppName } from "@/lib/config.ts";
 /**
  * Magic-link landing page (`/login/verify?token=...`).
  *
- * SECURITY — DO NOT AUTO-SUBMIT / AUTO-LOGIN HERE. Vanderbilt mailboxes are fronted by Microsoft
+ * SECURITY — DO NOT AUTO-SUBMIT / AUTO-LOGIN HERE. Institutional mailboxes are fronted by Microsoft
  * Defender / Proofpoint "Safe Links", which pre-fetches every emailed URL AND executes the landing
  * page's JavaScript in a sandbox before the human ever clicks. Our sister project verified this in
  * production: a scanner bot redeemed each single-use token seconds before the real user (who then
