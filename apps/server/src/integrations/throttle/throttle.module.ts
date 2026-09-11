@@ -27,6 +27,7 @@ import Redis from 'ioredis';
               password: redisConfig.password,
               db: redisConfig.db,
               family: redisConfig.family,
+              tls: redisConfig.tls, // #267: TLS for a rediss:// URL (undefined otherwise)
               keyPrefix: 'throttle:',
             }),
           ),

@@ -30,6 +30,10 @@ export type RedisConfig = {
   db: number;
   password?: string;
   family?: number;
+  // Set (to `{}` = default TLS with cert verification) only for a `rediss://` URL, so consumers that build
+  // an ioredis options object from this config (rather than passing the raw URL) actually encrypt in transit
+  // (#267). ElastiCache uses a public-CA cert whose SAN matches the endpoint, so default verification passes.
+  tls?: import('ioredis').RedisOptions['tls'];
 };
 
 export function parseRedisUrl(redisUrl: string): RedisConfig {
@@ -54,7 +58,11 @@ export function parseRedisUrl(redisUrl: string): RedisConfig {
     family = parseInt(familyParam, 10);
   }
 
-  return { host: hostname, port: portInt, password, db, family };
+  // A `rediss://` URL enables TLS for consumers that pass the raw URL to ioredis; for consumers that build
+  // an options object from these fields, carry it explicitly so they encrypt too (#267).
+  const tls = url.protocol === 'rediss:' ? {} : undefined;
+
+  return { host: hostname, port: portInt, password, db, family, tls };
 }
 
 export function createRetryStrategy() {
