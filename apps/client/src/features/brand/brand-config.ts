@@ -37,6 +37,7 @@ export const NEUTRAL_BRAND: BrandConfig = { name: "Wiki", assets: {} };
 /** Same-origin path served by the platform (services/platform/assets/brand). */
 const BRAND_MANIFEST_URL = "/brand/manifest.json";
 const BRAND_ASSET_PREFIX = "/brand/";
+/** Shared deadline for the whole boot load (manifest + wordmark), so first paint is bounded overall. */
 const LOAD_TIMEOUT_MS = 1500;
 
 let brand: BrandConfig = NEUTRAL_BRAND;
@@ -61,27 +62,31 @@ export function setBrandConfigForTest(next: BrandConfig): void {
 }
 
 /**
- * Fetch the manifest (and the wordmark artwork) once, then install it. Bounded by {@link LOAD_TIMEOUT_MS};
- * `main.tsx` awaits this before the first render so every `getAppName()` title is correct immediately.
+ * Fetch the manifest and the wordmark artwork once, then install the config. ONE shared deadline
+ * ({@link LOAD_TIMEOUT_MS}) covers BOTH requests, so `main.tsx` bounds first paint at ~1.5 s TOTAL — not
+ * 1.5 s per request (a per-request timeout could stack to ~3 s when `/brand` hangs). `main.tsx` awaits
+ * this before the first render so every `getAppName()` title is correct immediately.
  */
 export function loadBrandConfig(): Promise<BrandConfig> {
-  loadPromise ??= fetchBrandConfig().then(async (config) => {
+  loadPromise ??= (async () => {
+    const signal = timeoutSignal(LOAD_TIMEOUT_MS);
+    const config = await fetchBrandConfig(signal);
     if (config.assets.wordmarkSvg) {
-      config.wordmarkSvg = (await fetchWordmarkSvg(config.assets.wordmarkSvg)) ?? undefined;
+      config.wordmarkSvg = (await fetchWordmarkSvg(config.assets.wordmarkSvg, signal)) ?? undefined;
     }
     brand = config;
     listeners.forEach((listener) => listener());
     applyBrandDocument(config);
     return config;
-  });
+  })();
   return loadPromise;
 }
 
-async function fetchBrandConfig(): Promise<BrandConfig> {
+async function fetchBrandConfig(signal: AbortSignal): Promise<BrandConfig> {
   try {
     const response = await fetch(BRAND_MANIFEST_URL, {
       headers: { accept: "application/json" },
-      signal: timeoutSignal(LOAD_TIMEOUT_MS),
+      signal,
     });
     if (!response.ok) return NEUTRAL_BRAND;
     const contentType = response.headers.get("content-type") ?? "";
@@ -120,9 +125,9 @@ export function sanitizeBrandAssetUrl(url: unknown): string | undefined {
   return url;
 }
 
-async function fetchWordmarkSvg(url: string): Promise<string | null> {
+async function fetchWordmarkSvg(url: string, signal: AbortSignal): Promise<string | null> {
   try {
-    const response = await fetch(url, { signal: timeoutSignal(LOAD_TIMEOUT_MS) });
+    const response = await fetch(url, { signal });
     if (!response.ok) return null;
     const markup = (await response.text()).trim();
     return markup.startsWith("<svg") ? markup : null;
