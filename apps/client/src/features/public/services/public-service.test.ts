@@ -21,17 +21,17 @@ describe("public-service passwordless routing", () => {
   beforeEach(() => vi.clearAllMocks());
 
   it("requestPasswordless() posts to the platform /auth/passwordless/request", async () => {
-    await requestPasswordless({ email: "user@vanderbilt.edu" });
+    await requestPasswordless({ email: "user@example.edu" });
     expect(platformApi.post).toHaveBeenCalledWith("/auth/passwordless/request", {
-      email: "user@vanderbilt.edu",
+      email: "user@example.edu",
     });
     expect(api.post).not.toHaveBeenCalled(); // never the ALB-blocked Docmost /api client
   });
 
   it("verifyPasswordless() posts an OTP to the platform /auth/passwordless/verify", async () => {
-    await verifyPasswordless({ email: "user@vanderbilt.edu", otp: "482913" });
+    await verifyPasswordless({ email: "user@example.edu", otp: "482913" });
     expect(platformApi.post).toHaveBeenCalledWith("/auth/passwordless/verify", {
-      email: "user@vanderbilt.edu",
+      email: "user@example.edu",
       otp: "482913",
     });
     expect(api.post).not.toHaveBeenCalled();
@@ -45,9 +45,9 @@ describe("public-service passwordless routing", () => {
   });
 
   it("requestAccess() targets the platform /auth/register (email-only, passwordless)", async () => {
-    await requestAccess({ email: "new@vanderbilt.edu" });
+    await requestAccess({ email: "new@example.edu" });
     expect(platformApi.post).toHaveBeenCalledWith("/auth/register", {
-      email: "new@vanderbilt.edu",
+      email: "new@example.edu",
     });
   });
 });

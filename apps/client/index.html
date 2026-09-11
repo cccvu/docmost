@@ -4,22 +4,21 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/png" sizes="32x32" href="/icons/favicon-32x32.png" />
     <link rel="icon" type="image/png" sizes="16x16" href="/icons/favicon-16x16.png" />
-    <link rel="apple-touch-icon" sizes="180x180" href="/icons/apple-touch-icon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0 user-scalable=no" />
-    <title>CCC Wiki</title>
+    <!-- Neutral defaults; the runtime brand bundle (features/brand) swaps title, favicons and the PWA
+         manifest when one is served (see /brand/manifest.json). -->
+    <title>Wiki</title>
     <meta name="theme-color" content="#18181b" media="(prefers-color-scheme: dark)" />
     <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
     <link rel="manifest" href="/manifest.json" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-touch-fullscreen" content="yes" />
-    <meta name="apple-mobile-web-app-title" content="CCC Wiki" />
+    <meta name="apple-mobile-web-app-title" content="Wiki" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="default" />
-    <!-- Vanderbilt brand type: Inter (UI/body/headings). Roboto (medium) is used
-         only for the brand lockup's "College of Connected Computing" line — a
-         neo-grotesque with the single-story 'g' that matches the college site's
-         licensed Theinhardt (which we can't ship). The institution wordmark is
-         the official vector lockup (features/brand), not a webfont. -->
+    <!-- UI/body/headings type is Inter. Roboto (medium) is used only for the brand lockup's college line —
+         a neo-grotesque whose single-story 'g' matches the college site's typeface. The institution
+         wordmark is vector artwork served by the runtime brand bundle, not a webfont. -->
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link

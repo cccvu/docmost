@@ -2,17 +2,19 @@ import { Anchor, Container, Divider, Group, Text } from "@mantine/core";
 import { Link } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import APP_ROUTE, { loginHrefWithReturn } from "@/lib/app-route.ts";
-import { getAppName } from "@/lib/config.ts";
+import { useBrandConfig } from "@/features/brand/brand-hooks.ts";
 
 export function PublicFooter({ year }: { year: number }) {
   const { t } = useTranslation();
+  const brand = useBrandConfig();
 
   return (
     <Container size="lg" component="footer" pb="xl">
       <Divider mb="lg" />
       <Group justify="space-between" wrap="wrap" gap="sm">
         <Text size="sm" c="dimmed">
-          © {year} {getAppName()} · Vanderbilt University
+          © {year} {brand.name}
+          {brand.institutionName ? ` · ${brand.institutionName}` : ""}
         </Text>
         <Group gap="lg">
           <Anchor component={Link} to={loginHrefWithReturn()} size="sm">

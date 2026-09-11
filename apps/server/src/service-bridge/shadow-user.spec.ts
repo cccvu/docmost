@@ -8,7 +8,7 @@ describe('shadow-user namespace (no-impersonation boundary)', () => {
   });
 
   it('rejects real users, docmost-native anchors, and empty/null — the impersonation guard', () => {
-    expect(isShadowEmail('real.person@vanderbilt.edu')).toBe(false);
+    expect(isShadowEmail('real.person@example.edu')).toBe(false);
     expect(isShadowEmail('docmost-native+x@users.invalid')).toBe(false);
     expect(isShadowEmail('')).toBe(false);
     expect(isShadowEmail(null)).toBe(false);

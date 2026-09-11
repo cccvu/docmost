@@ -65,12 +65,12 @@ d('ServiceWorkspaceService.updateSettings JSONB merge on real Postgres', () => {
     await pg`truncate workspaces`;
     await pg`
       insert into workspaces (id, name, settings, created_at, deleted_at)
-      values (${WS_ID}, 'CCC Wiki', ${pg.json({ defaultPageEditMode: 'edit', other: 'keep-me', nested: { a: 1 } })}, now(), null)`;
+      values (${WS_ID}, 'Example Wiki', ${pg.json({ defaultPageEditMode: 'edit', other: 'keep-me', nested: { a: 1 } })}, now(), null)`;
   });
 
   it('changing defaultPageEditMode preserves sibling keys (the shallow-merge round-trip)', async () => {
     const view = await svc.updateSettings({ defaultPageEditMode: 'read' } as any);
-    expect(view).toEqual({ name: 'CCC Wiki', defaultPageEditMode: 'read' });
+    expect(view).toEqual({ name: 'Example Wiki', defaultPageEditMode: 'read' });
 
     const settings = await readSettings();
     expect(settings.defaultPageEditMode).toBe('read'); // the changed key
@@ -104,7 +104,7 @@ d('ServiceWorkspaceService.updateSettings JSONB merge on real Postgres', () => {
     const before = await pg<{ settings: Record<string, unknown>; updated_at: Date }[]>`
       select settings, updated_at from workspaces where id = ${WS_ID}`;
     const view = await svc.updateSettings({} as any);
-    expect(view).toEqual({ name: 'CCC Wiki', defaultPageEditMode: 'edit' });
+    expect(view).toEqual({ name: 'Example Wiki', defaultPageEditMode: 'edit' });
     const after = await pg<{ settings: Record<string, unknown>; updated_at: Date }[]>`
       select settings, updated_at from workspaces where id = ${WS_ID}`;
     expect(after[0].settings).toEqual(before[0].settings);

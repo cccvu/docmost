@@ -59,7 +59,7 @@ export default function GlobalAppShell({
   return (
     <>
       <SkipToMain />
-      {/* CCC: header height (HEADER_HEIGHT) gives the Vanderbilt/CCC lockup room to
+      {/* CCC: header height (HEADER_HEIGHT) gives the brand lockup room to
           breathe. Keep in sync with the coupled `.aside` margin-top in
           app-shell.module.css. */}
       <AppShell

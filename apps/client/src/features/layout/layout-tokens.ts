@@ -12,7 +12,7 @@
 // diverge. KEEP THE SHARED TOKENS IN SYNC with that file (same pattern as
 // brand-sync.test.ts / theme.ts "KEEP IN SYNC").
 
-/** App-shell header height (px). Raised 45→56 for the Vanderbilt/CCC lockup. */
+/** App-shell header height (px). Raised 45→56 to give the brand lockup room. */
 export const HEADER_HEIGHT = 56;
 
 /** Collapsed icon-rail width (px). Every navbar sidebar rails to this on collapse. */

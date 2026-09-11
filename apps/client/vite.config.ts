@@ -86,6 +86,12 @@ export default defineConfig(({ mode }) => {
           target: PLATFORM_URL || "http://localhost:4000",
           changeOrigin: true,
         },
+        // Runtime brand bundle (issue #30 follow-up) — the fork fetches /brand/manifest.json at boot;
+        // in prod the ALB routes /brand to the platform, so mirror that here (neutral fallback if down).
+        "/brand": {
+          target: PLATFORM_URL || "http://localhost:4000",
+          changeOrigin: true,
+        },
         "/socket.io": {
           target: APP_URL,
           ws: true,

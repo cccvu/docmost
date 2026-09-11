@@ -9,7 +9,7 @@ const make = (respond: (q: SpyQuery) => unknown[]) => {
 };
 const q = (s: string) => s.toLowerCase();
 const row = (over: Partial<{ name: string | null; settings: unknown }> = {}) => ({
-  name: 'CCC Wiki',
+  name: 'Example Wiki',
   settings: { defaultPageEditMode: 'edit', other: 'keep-me' },
   ...over,
 });
@@ -24,7 +24,7 @@ const row = (over: Partial<{ name: string | null; settings: unknown }> = {}) => 
 describe('ServiceWorkspaceService — workspace settings (JSONB shallow-merge preserved)', () => {
   it('getSettings normalises the mode and 404s a missing workspace', async () => {
     const ok = make(() => [row()]);
-    expect(await ok.svc.getSettings()).toEqual({ name: 'CCC Wiki', defaultPageEditMode: 'edit' });
+    expect(await ok.svc.getSettings()).toEqual({ name: 'Example Wiki', defaultPageEditMode: 'edit' });
 
     const unknownMode = make(() => [row({ settings: { defaultPageEditMode: 'bogus' } })]);
     expect((await unknownMode.svc.getSettings()).defaultPageEditMode).toBeNull();

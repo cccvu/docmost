@@ -13,10 +13,10 @@ import {
 } from "@mantine/core";
 
 /*
- * Vanderbilt / College of Connected Computing (CCC) brand theme (issue #30).
+ * CCC brand theme (issue #30).
  *
  * Design intent: a restrained institutional look. Chrome is near-black on a cool
- * Zinc neutral; Vanderbilt gold is an ACCENT only (CTAs, brand mark), never
+ * Zinc neutral; the brand gold is an ACCENT only (CTAs, brand mark), never
  * everyday chrome. The primary filled control is near-black in light and inverts
  * to near-white in dark (shadcn / CCC-sister-app pattern) via the
  * `variantColorResolver` below. Gold text always uses the darkened, AA-safe
@@ -27,23 +27,23 @@ import {
  * boundary). Any palette/contrast change here must be mirrored in that file.
  */
 
-// Near-black primary (Vanderbilt Black). Shade 6 (the default filled shade) is
-// the near-black used for light-mode primary buttons/active states; shade 1
-// (near-white) is used for dark-mode primary buttons via the resolver.
-const vandyBlack: MantineColorsTuple = [
+// Near-black primary. Shade 6 (the default filled shade) is the near-black used
+// for light-mode primary buttons/active states; shade 1 (near-white) is used for
+// dark-mode primary buttons via the resolver.
+const brandBlack: MantineColorsTuple = [
   "#f6f6f7",
   "#ececee", // near-white — dark-scheme primary bg
   "#d6d6d9",
   "#b5b5bb",
   "#8d8d95",
   "#46464d",
-  "#18181b", // Vanderbilt Black — light-scheme primary bg (default shade 6)
+  "#18181b", // near-black — light-scheme primary bg (default shade 6)
   "#101014",
   "#0c0c0f",
   "#060608",
 ];
 
-// Vanderbilt gold — bright #F2CC0C at index 6 (the filled shade), amber darks for
+// Brand gold — bright #F2CC0C at index 6 (the filled shade), amber darks for
 // hover/active, deep gold-ink at index 9 for gold TEXT (AA on light).
 const gold: MantineColorsTuple = [
   "#fffdf2",
@@ -52,7 +52,7 @@ const gold: MantineColorsTuple = [
   "#f9e38a",
   "#f6d64e",
   "#f3ce24",
-  "#f2cc0c", // bright Vanderbilt gold — brand CTA fill
+  "#f2cc0c", // bright brand gold — CTA fill
   "#d9b00a",
   "#b08900",
   "#8a6d00", // deepest gold — see gold-ink override for AA gold text
@@ -137,11 +137,11 @@ const variantColorResolver: VariantColorsResolver = (input) => {
 };
 
 export const theme = createTheme({
-  primaryColor: "vandyBlack",
+  primaryColor: "brandBlack",
   autoContrast: true,
   variantColorResolver,
   colors: {
-    vandyBlack,
+    brandBlack,
     gold,
     gray,
     dark,
@@ -208,8 +208,8 @@ export const mantineCssResolver: CSSVariablesResolver = (theme) => ({
     "--mantine-color-dark-light-color": "#4e5359",
     "--mantine-color-dark-light-hover": "var(--mantine-color-gray-light-hover)",
     // Primary filled control: near-black bg + white text in light mode.
-    "--brand-primary-bg": "var(--mantine-color-vandyBlack-6)",
-    "--brand-primary-bg-hover": "var(--mantine-color-vandyBlack-7)",
+    "--brand-primary-bg": "var(--mantine-color-brandBlack-6)",
+    "--brand-primary-bg-hover": "var(--mantine-color-brandBlack-7)",
     "--brand-on-primary": "var(--mantine-color-white)",
     // Override the semantic error color so input error text / borders /
     // required asterisks meet WCAG AA 4.5:1 contrast on the filled-input
@@ -243,8 +243,8 @@ export const mantineCssResolver: CSSVariablesResolver = (theme) => ({
     // Primary filled control inverts in dark: near-white bg + near-black text.
     // Note we do NOT override --mantine-primary-color-filled here, so Checkbox /
     // Switch keep the default near-black fill + white icon (legible in dark).
-    "--brand-primary-bg": "var(--mantine-color-vandyBlack-1)",
-    "--brand-primary-bg-hover": "var(--mantine-color-vandyBlack-2)",
-    "--brand-on-primary": "var(--mantine-color-vandyBlack-9)",
+    "--brand-primary-bg": "var(--mantine-color-brandBlack-1)",
+    "--brand-primary-bg-hover": "var(--mantine-color-brandBlack-2)",
+    "--brand-on-primary": "var(--mantine-color-brandBlack-9)",
   },
 });
