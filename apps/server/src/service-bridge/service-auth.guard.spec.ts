@@ -81,6 +81,75 @@ describe('ServiceAuthGuard', () => {
       expect(sameLenWrong.length).toBe(SECRET.length);
       expect(() => g.canActivate(ctx(sameLenWrong))).toThrow(UnauthorizedException);
     });
+
+    // F6 (companion #272): the UNAUTHENTICATED path is rate-limited too. Once the single coarse anon bucket
+    // is exhausted, a wrong/missing-secret flood gets 429 (not an unbounded stream of cheap 401s) — the DoS
+    // backstop now actually covers the pre-auth path.
+    it('F6: rate-limits the unauthenticated (wrong-secret) path with 429 once the anon bucket is exhausted', () => {
+      const g = new ServiceAuthGuard(reflectorReturning(ServiceScope.SessionMint));
+      const limiter = (g as any).limiter;
+      while (limiter.allow('anon')) {
+        /* fill the single coarse anon window to its limit */
+      }
+      let status: number | undefined;
+      try {
+        g.canActivate(ctx('wrong-secret'));
+      } catch (e: any) {
+        status = e.getStatus?.();
+      }
+      expect(status).toBe(429);
+    });
+
+    // F6 hardening: the anon bucket is a SINGLE constant key, NOT keyed on req.ip. Under `trustProxy: true`
+    // req.ip is X-Forwarded-For-derived (attacker-controlled), so a per-IP key would let a spoofed XFF mint a
+    // fresh budget per request (bypassing the backstop) AND grow the limiter Map without bound. A varying
+    // req.ip must therefore NOT create new buckets — once 'anon' is exhausted, spoofed-IP requests still 429.
+    it('F6: a spoofed/varying X-Forwarded-For (req.ip) cannot bypass the anon limit', () => {
+      const g = new ServiceAuthGuard(reflectorReturning(ServiceScope.SessionMint));
+      const limiter = (g as any).limiter;
+      while (limiter.allow('anon')) {
+        /* exhaust the single coarse bucket */
+      }
+      const ctxWithIp = (ip: string) =>
+        ({
+          switchToHttp: () => ({
+            getRequest: () => ({ headers: { 'x-authz-service-secret': 'wrong' }, ip }),
+          }),
+          getHandler: () => () => undefined,
+          getClass: () => class {},
+        }) as any;
+      for (const ip of ['1.1.1.1', '2.2.2.2', '3.3.3.3']) {
+        let status: number | undefined;
+        try {
+          g.canActivate(ctxWithIp(ip));
+        } catch (e: any) {
+          status = e.getStatus?.();
+        }
+        expect(status).toBe(429); // still throttled — no per-IP bucket to escape into
+      }
+    });
+
+    // F6: a valid credential is NOT starved by a flood of bad requests — the anon bucket and the
+    // per-credential bucket are separate keys.
+    it('F6: a valid credential still passes even after the anon bucket is exhausted', () => {
+      const g = new ServiceAuthGuard(reflectorReturning(ServiceScope.SessionMint));
+      const limiter = (g as any).limiter;
+      while (limiter.allow('anon')) {
+        /* exhaust the anonymous bucket */
+      }
+      expect(g.canActivate(ctx(SECRET))).toBe(true); // separate per-credential bucket
+    });
+  });
+
+  describe('with a whitespace-only service secret (fail-closed, F6)', () => {
+    beforeEach(() => {
+      process.env.PLATFORM_AUTHZ_SERVICE_SECRET = '   ';
+    });
+
+    it('503 — a blank/whitespace secret is NOT a configured credential', () => {
+      const g = new ServiceAuthGuard(reflectorReturning(ServiceScope.SessionMint));
+      expect(() => g.canActivate(ctx('   '))).toThrow(ServiceUnavailableException);
+    });
   });
 
   describe('with NO service secret configured (fail-closed)', () => {

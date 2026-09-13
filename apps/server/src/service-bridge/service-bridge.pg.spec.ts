@@ -133,7 +133,7 @@ d('ServiceBridgeService.provisionShadowUser on real Postgres (no-takeover upsert
   it('T-042: a planted real user is untouched and gets no shadow takeover', async () => {
     const victimId = uuid(5);
     await pg`insert into users (id, name, email, password, role, workspace_id)
-             values (${victimId}, 'Victim', 'victim@vanderbilt.edu', 'VICTIM_HASH', 'owner', ${DEFAULT_WS})`;
+             values (${victimId}, 'Victim', 'victim@example.edu', 'VICTIM_HASH', 'owner', ${DEFAULT_WS})`;
 
     const res = await svc.provisionShadowUser({ externalId: 'victim' } as any);
 
@@ -141,7 +141,7 @@ d('ServiceBridgeService.provisionShadowUser on real Postgres (no-takeover upsert
     expect(await countUsers()).toBe(2);
     const rows = (await pg`select * from users where id = ${victimId}`) as unknown as Array<any>;
     expect(rows[0]).toMatchObject({
-      email: 'victim@vanderbilt.edu',
+      email: 'victim@example.edu',
       role: 'owner',
       password: 'VICTIM_HASH',
     });
@@ -184,13 +184,13 @@ d('ServiceBridgeService.provisionShadowUser on real Postgres (no-takeover upsert
   });
 
   /**
-   * T-046 (RED — companion issue P5). Provisioning is documented as idempotent, but the conflict update
-   * only refreshes `emailVerifiedAt`. A shadow user that was soft-deleted (offboarding / restore to a
-   * deleted state) stays `deleted_at != null`, and mintSession refuses a deleted user — so the identity can
-   * NEVER log into Docmost again, no matter how many times the platform re-provisions. Intended: the
-   * upsert resurrects the fork-owned row (`deleted_at = null`). Left red on purpose.
+   * T-046 (companion issue P5 — FIXED). Provisioning is documented as idempotent. A shadow user that was
+   * soft-deleted (offboarding / restore to a deleted state) must not stay `deleted_at != null` forever, or
+   * mintSession refuses it and the identity can NEVER log into Docmost again. The conflict upsert now
+   * resurrects the fork-owned row (`deleted_at = null`) against real ON CONFLICT semantics. (Was committed
+   * red-on-purpose; the P5 fix flips it green.)
    */
-  it('T-046 🔴 re-provisioning a soft-deleted shadow user resurrects it (currently stays deleted)', async () => {
+  it('T-046: re-provisioning a soft-deleted shadow user resurrects it (deleted_at cleared)', async () => {
     const first = await svc.provisionShadowUser({ externalId: 'bob' } as any);
     await pg`update users set deleted_at = now() where id = ${first.userId}`;
 
@@ -199,5 +199,42 @@ d('ServiceBridgeService.provisionShadowUser on real Postgres (no-takeover upsert
     expect(second.userId).toBe(first.userId);
     const rows = (await pg`select * from users where id = ${first.userId}`) as unknown as Array<any>;
     expect(rows[0].deleted_at).toBeNull();
+  });
+
+  /**
+   * T-047 (companion F3): the conflict upsert self-heals a TAMPERED/out-of-band-elevated shadow row back to
+   * the "plain, live member" shape — role reset to `member` and `deleted_at` cleared — against real ON
+   * CONFLICT semantics. Proves the de-escalation is a real UPDATE (the sibling `space_members` pattern),
+   * not just a captured callback shape. `password` is deliberately left untouched by the upsert.
+   */
+  it('T-047 (F3): re-provisioning an out-of-band-elevated + deleted shadow row de-escalates and resurrects it', async () => {
+    const first = await svc.provisionShadowUser({ externalId: 'carol' } as any);
+    const before = (await pg`select password from users where id = ${first.userId}`) as unknown as Array<any>;
+    await pg`update users set role = 'owner', deleted_at = now() where id = ${first.userId}`;
+
+    const second = await svc.provisionShadowUser({ externalId: 'carol' } as any);
+
+    expect(second.userId).toBe(first.userId);
+    const rows = (await pg`select * from users where id = ${first.userId}`) as unknown as Array<any>;
+    expect(rows[0].role).toBe('member'); // de-escalated (never re-elevated by a re-provision)
+    expect(rows[0].deleted_at).toBeNull(); // resurrected
+    expect(rows[0].password).toBe(before[0].password); // a credential swap never rides a re-provision
+  });
+
+  /**
+   * T-048 (companion F2): case-variant `externalId`s must converge on ONE shadow row. The `(email,
+   * workspace_id)` unique constraint is case-SENSITIVE and `findByEmail` matches case-INSENSITIVELY, so
+   * without the case-normalizing derivation `Dave` and `dave` would insert TWO rows the lookup then resolves
+   * ambiguously. With normalization the upsert matches and there is exactly one row.
+   */
+  it('T-048 (F2): case-variant externalIds converge on ONE shadow row (no duplicate/cross-map)', async () => {
+    const a = await svc.provisionShadowUser({ externalId: 'Dave' } as any);
+    const b = await svc.provisionShadowUser({ externalId: 'dave' } as any);
+
+    expect(b.userId).toBe(a.userId);
+    expect(await countUsers()).toBe(1);
+    const rows = (await pg`select email from users`) as unknown as Array<any>;
+    expect(rows[0].email).toBe(shadowEmailFor('Dave')); // the normalized (lower-cased) address
+    expect(rows[0].email).toBe(shadowEmailFor('dave'));
   });
 });
