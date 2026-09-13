@@ -42,7 +42,8 @@ const RATE_LIMIT = (() => {
  *  - Fail-closed: unconfigured credential → 503; a route missing its scope declaration → 403 (a bug is
  *    not an open door); missing/wrong secret → 401; a valid credential lacking the route's scope → 403.
  *  - Constant-time secret comparison.
- *  - Per-credential rate limiting (429) as a DoS backstop.
+ *  - Rate limiting (429) as a DoS backstop — per-credential for authenticated calls AND per-client-IP for
+ *    the unauthenticated (missing/wrong-secret) path, so a bad-secret flood is bounded too.
  */
 @Injectable()
 export class ServiceAuthGuard implements CanActivate {
@@ -50,7 +51,10 @@ export class ServiceAuthGuard implements CanActivate {
   private readonly limiter = new FixedWindowRateLimiter(RATE_LIMIT, 60_000);
 
   constructor(private readonly reflector: Reflector) {
-    const shared = process.env.PLATFORM_AUTHZ_SERVICE_SECRET ?? '';
+    const raw = process.env.PLATFORM_AUTHZ_SERVICE_SECRET ?? '';
+    // F6 (companion #272): a whitespace-only value is NOT a configured credential — it would otherwise pass
+    // the truthy check and be accepted as a real secret. Treat blank/whitespace as unconfigured → 503.
+    const shared = raw.trim().length > 0 ? raw : '';
     this.credentials = shared
       ? [
           {
@@ -77,11 +81,15 @@ export class ServiceAuthGuard implements CanActivate {
     const req = context.switchToHttp().getRequest();
     const provided = req.headers?.['x-authz-service-secret'];
     if (typeof provided !== 'string' || provided.length === 0) {
+      this.enforceAnonLimit();
       throw new UnauthorizedException('missing service credential');
     }
 
     const cred = this.credentials.find((c) => this.equals(provided, c.secret));
-    if (!cred) throw new UnauthorizedException('invalid service credential');
+    if (!cred) {
+      this.enforceAnonLimit();
+      throw new UnauthorizedException('invalid service credential');
+    }
     if (!cred.scopes.has(required)) {
       throw new ForbiddenException(`service credential lacks scope ${required}`);
     }
@@ -93,6 +101,28 @@ export class ServiceAuthGuard implements CanActivate {
       );
     }
     return true;
+  }
+
+  /**
+   * F6 (companion #272): rate-limit the UNAUTHENTICATED path too. The per-credential limiter below only runs
+   * AFTER a valid credential matches, so a missing/wrong-secret flood was previously unbounded — the "DoS
+   * backstop" the class docstring promises did not cover the anonymous path.
+   *
+   * A SINGLE coarse `anon` bucket — deliberately NOT keyed on `req.ip`. `main.ts` sets `trustProxy: true`, so
+   * `req.ip` is derived from a client-supplied `X-Forwarded-For`; keying on it would let an attacker (a) mint
+   * a fresh 600/min budget per spoofed header (bypassing the very backstop this adds) and (b) grow the
+   * limiter's in-memory window Map without bound (a memory-exhaustion vector). Every legitimate caller holds
+   * the secret and uses the separate per-credential bucket, so all traffic that reaches this path is already
+   * illegitimate; capping it collectively is exactly the intent, and the key space stays bounded and
+   * unspoofable. (`/api/service/*` is east-west/internal, so this is a backstop, not the primary control.)
+   */
+  private enforceAnonLimit(): void {
+    if (!this.limiter.allow('anon')) {
+      throw new HttpException(
+        'service rate limit exceeded',
+        HttpStatus.TOO_MANY_REQUESTS,
+      );
+    }
   }
 
   private equals(a: string, b: string): boolean {
