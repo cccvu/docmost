@@ -24,7 +24,10 @@ export class CollaborationHandler {
       // CCC integration seam (UPSTREAM_MODIFICATIONS.md): force-disconnect a user's live sessions on a
       // document when their access is revoked mid-session. Runs on the doc-owning node (RedisSync
       // routes here); pure connection logic — the authorization decision is made in apps/server/src/authz/.
-      forceDisconnect: async (documentName: string, payload: { userId: string }) => {
+      forceDisconnect: async (
+        documentName: string,
+        payload: { userId: string },
+      ) => {
         const doc = hocuspocus.documents.get(documentName);
         if (!doc) return;
         for (const connection of doc.getConnections()) {
@@ -32,6 +35,41 @@ export class CollaborationHandler {
             connection.close();
           }
         }
+      },
+      // CCC integration seam (UPSTREAM_MODIFICATIONS.md): run a document's PENDING debounced
+      // onStoreDocument NOW, on the doc-owning node (RedisSync routes here). Pure collab mechanics — no
+      // authorization, no policy; the caller in apps/server/src/authz/ owns that. Used by the platform so
+      // its optimistic-concurrency anchor is compared against settled content rather than a `pages` row
+      // that trails the live Y.Doc by up to `maxDebounce` (issue 282).
+      //
+      // `executeNow` re-runs the ALREADY-SCHEDULED store closure with its ORIGINAL payload, so
+      // `lastUpdatedById` stays the human who actually typed. Opening a direct connection and transacting
+      // a no-op would instead store under THIS caller's context — mis-attributing the edit, or (with an
+      // empty context) throwing a TypeError that persistence.extension's catch swallows, silently dropping
+      // the store. It is also the primitive Hocuspocus itself uses on last-client-disconnect.
+      //
+      // Never throws: an uncaught rejection here is an unhandled rejection locally and, cross-node, hangs
+      // RedisSync's customEvent reply until its TTL.
+      flushPageContent: async (documentName: string) => {
+        const doc = hocuspocus.documents.get(documentName);
+        // Not resident on the owning node ⇒ no unpersisted delta exists (Hocuspocus refuses to unload a
+        // document while a store is debounced, executing, or holding saveMutex), so the row is already
+        // authoritative and there is nothing to flush.
+        if (!doc) return { flushed: false };
+        const debounceId = `onStoreDocument-${documentName}`;
+        try {
+          if (hocuspocus.debouncer.isDebounced(debounceId)) {
+            await hocuspocus.debouncer.executeNow(debounceId);
+          }
+          // Drain a store that was already executing when we arrived.
+          await doc.saveMutex.runExclusive(async () => undefined);
+        } catch (err) {
+          this.logger.warn(
+            `flushPageContent failed for ${documentName}: ${err?.['message']}`,
+          );
+          return { flushed: false };
+        }
+        return { flushed: true };
       },
       alterState: async (documentName: string, payload: { pageId: string }) => {
         // dummy

@@ -117,7 +117,11 @@ export class CollaborationGateway {
 
       // Forward close events
       client.on('close', (code: number, reason: Buffer) => {
-        this.redisSync!.onSocketClose(socketId, code, reason.buffer as ArrayBuffer);
+        this.redisSync!.onSocketClose(
+          socketId,
+          code,
+          reason.buffer as ArrayBuffer,
+        );
       });
 
       // Forward pong events for keepalive
@@ -153,6 +157,17 @@ export class CollaborationGateway {
    */
   forceDisconnectUserFromPage(pageId: string, userId: string) {
     return this.handleYjsEvent('forceDisconnect', `page.${pageId}`, { userId });
+  }
+
+  /**
+   * CCC integration seam (UPSTREAM_MODIFICATIONS.md): settle a page's live collaborative document by
+   * running its pending debounced store NOW, routed to the doc-owning node via RedisSync. Thin
+   * pass-through — the handler carries no policy and the caller (authz/) owns the authorization.
+   * Returns `undefined` when RedisSync is disabled (COLLAB_DISABLE_REDIS), which the caller treats as
+   * "not flushed".
+   */
+  flushPageContent(pageId: string) {
+    return this.handleYjsEvent('flushPageContent', `page.${pageId}`, undefined);
   }
 
   openDirectConnection(documentName: string, context?: any) {
