@@ -12,6 +12,10 @@ import { User } from '@docmost/db/types/entity.types';
 // the conditional page write compares the LIVE document against a caller-supplied digest, and the digest
 // function is cross-service contract code that must live beside its shared vectors in authz/.
 import { stableHash } from '../authz/page-write/stable-hash';
+import {
+  ConditionalUpdateOutcome,
+  FlushPageContentOutcome,
+} from '../authz/page-write/collab-outcomes';
 
 export type CollabEventHandlers = ReturnType<
   CollaborationHandler['getHandlers']
@@ -54,7 +58,7 @@ export class CollaborationHandler {
       flushPageContent: async (
         documentName: string,
         payload?: { withDigest?: boolean },
-      ) => {
+      ): Promise<FlushPageContentOutcome> => {
         const doc = hocuspocus.documents.get(documentName);
         // Not resident on the owning node ⇒ no unpersisted delta exists (Hocuspocus refuses to unload a
         // document while a store is debounced, executing, or holding saveMutex), so the row is already
@@ -192,10 +196,10 @@ export class CollaborationHandler {
           user: User;
           expectedContentHash?: string;
         },
-      ) => {
+      ): Promise<ConditionalUpdateOutcome> => {
         const { prosemirrorJson, operation, user, expectedContentHash } =
           payload;
-        let outcome: { applied: boolean; reason?: string } = {
+        let outcome: ConditionalUpdateOutcome = {
           applied: false,
           reason: 'unknown',
         };
@@ -207,6 +211,12 @@ export class CollaborationHandler {
           // service account, rotating `updatedAt`, broadcasting `page.updated` under the caller's name,
           // firing the history/AI/mention jobs, and cancelling the human's own pending store. Checking the
           // resident document first means a refusal normally touches nothing at all.
+          //
+          // RESIDUAL, stated rather than implied: a refusal detected by the in-transaction compare below
+          // — an edit that lands while this connection is opening, a window of an event-loop turn or two
+          // — still pays `disconnect()`'s store, and so still reattributes that edit to the API caller.
+          // No content is lost either way; the pre-check shrinks this from "every 412" to "a 412 that
+          // races connection setup".
           const resident = expectedContentHash
             ? hocuspocus.documents.get(documentName)
             : undefined;

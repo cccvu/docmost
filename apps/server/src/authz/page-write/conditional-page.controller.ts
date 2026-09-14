@@ -18,6 +18,7 @@ import { PageService } from '../../core/page/services/page.service';
 import { PageAccessService } from '../../core/page/page-access/page-access.service';
 import { UpdatePageDto } from '../../core/page/dto/update-page.dto';
 import { CollaborationGateway } from '../../collaboration/collaboration.gateway';
+import { ConditionalUpdateOutcome } from './collab-outcomes';
 
 /**
  * EXTENDS `UpdatePageDto` deliberately, rather than restating its fields. The fork's global
@@ -107,7 +108,9 @@ export class ConditionalPageController {
         operation: dto.operation ?? 'replace',
         user,
         expectedContentHash: dto.expectedContentHash,
-      })) as { applied?: boolean; reason?: string } | undefined;
+        // Typed from the handler's own return shape: `reason` is a literal union there, so renaming a
+        // discriminator fails to compile at BOTH ends instead of silently changing what this branches on.
+      })) as ConditionalUpdateOutcome | undefined;
 
       if (result?.applied !== true) {
         if (result?.reason === 'precondition') {

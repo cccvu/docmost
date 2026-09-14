@@ -12,6 +12,7 @@ import { IsBoolean, IsOptional, IsUUID } from 'class-validator';
 import { CollaborationGateway } from '../../collaboration/collaboration.gateway';
 import { RemoteOnlyGuard } from '../mode/remote-only.guard';
 import { CollabServiceSecretGuard } from './service-secret.guard';
+import { FlushPageContentOutcome } from '../page-write/collab-outcomes';
 
 export class FlushPageContentDto {
   @IsUUID() pageId!: string;
@@ -52,11 +53,12 @@ export class CollabFlushController {
   async flushPageContent(
     @Body() dto: FlushPageContentDto,
   ): Promise<{ flushed: boolean; contentDigest?: string }> {
+    // Typed from the handler's own return shape, so the `reason: 'error'` discriminator below cannot
+    // drift apart from the producer: renaming it there fails to compile HERE rather than silently
+    // turning every failed settle back into an indistinguishable `{flushed:false}`.
     const result = (await this.gateway.flushPageContent(dto.pageId, {
       withDigest: dto.withDigest === true,
-    })) as
-      | { flushed?: boolean; reason?: string; contentDigest?: string }
-      | undefined;
+    })) as FlushPageContentOutcome | undefined;
 
     // "We could not settle" MUST be distinguishable from "there was nothing to settle". A resident
     // document whose flush threw may still hold unpersisted edits; answering `{flushed:false}` — the

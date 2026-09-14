@@ -217,6 +217,34 @@ describe('ConditionalPageController.conditionalUpdate', () => {
     }
   });
 
+  // The fork half of the falsy-content agreement. Upstream `PageService.update` gates its content branch
+  // on TRUTHINESS (`updatePageDto.content && …`), so `content: ""` is "no content supplied" there. If this
+  // route treated it as supplied, `htmlToJson('')` would produce a valid EMPTY document and the same
+  // request would WIPE the page here while no-opping on the ordinary route — an outcome decided by
+  // whether a colleague happens to have the page open. The platform mirrors this predicate; both halves
+  // need their own test, or reverting either one silently reintroduces the divergence.
+  it.each([
+    ['empty string', ''],
+    ['null', null],
+  ])(
+    'treats a falsy content (%s) as metadata-only, like the ordinary route',
+    async (_label, content) => {
+      const { controller, calls, gateway, pageService } = build({});
+      await controller.conditionalUpdate(
+        dto({
+          content: content as never,
+          format: 'html',
+          operation: 'replace',
+        }),
+        USER,
+      );
+      expect(gateway.conditionalUpdatePageContent).not.toHaveBeenCalled();
+      expect(calls).toEqual(['findById', 'validateCanEdit', 'update']);
+      // …and the falsy content is not smuggled through to PageService either.
+      expect(pageService.update.mock.calls[0][1]).not.toHaveProperty('content');
+    },
+  );
+
   // A metadata-only conditional write skips the collab round-trip entirely — there is no content to guard.
   it('skips the conditional apply when the request carries no content', async () => {
     const { controller, calls, gateway } = build({});
