@@ -56,13 +56,18 @@ const SEAM_ALLOWLIST = new Set<string>([
   'integrations/static/static.module.ts', // seam #86 — client capability injection (NATIVE_AUTH_ENABLED, reads authz mode)
   'core/auth/auth.controller.ts', // seam #87 — NativeAuthModeGuard + @SessionScopedRoute() allowlist (collab-token/logout)
   'core/workspace/controllers/workspace.controller.ts', // seam #87/#88 — native-auth gate on the session-mint route
+  'collaboration/collaboration.handler.ts', // seam #2 — conditional content write compares via authz/page-write/stable-hash (#282)
 ]);
 
 const posix = (p: string) => p.split(sep).join('/');
-const isUpstream = (file: string) => !CCC_PREFIXES.some((p) => file === p || file.startsWith(p + '/'));
+const isUpstream = (file: string) =>
+  !CCC_PREFIXES.some((p) => file === p || file.startsWith(p + '/'));
 
 describe('fork import boundary — the fork stays independently buildable (issue #172, ADR 0014)', () => {
-  const edges: ImportEdge[] = scanImportEdges(SRC_ROOT).map((e) => ({ ...e, file: posix(e.file) }));
+  const edges: ImportEdge[] = scanImportEdges(SRC_ROOT).map((e) => ({
+    ...e,
+    file: posix(e.file),
+  }));
 
   it('actually scanned the tree (guards against a silently-empty / broken walk)', () => {
     // A regression that broke the walker/AST (wrong root, parse failure) would find nothing and pass vacuously.
@@ -70,7 +75,11 @@ describe('fork import boundary — the fork stays independently buildable (issue
     expect(files.size).toBeGreaterThanOrEqual(100);
     expect(edges.length).toBeGreaterThanOrEqual(500);
     // Sanity: the known seams are present in the scan (so rule 3 is exercising real edges).
-    expect(edges.some((e) => e.file === 'database/database.module.ts' && e.kind === 'ccc')).toBe(true);
+    expect(
+      edges.some(
+        (e) => e.file === 'database/database.module.ts' && e.kind === 'ccc',
+      ),
+    ).toBe(true);
   });
 
   it('(rule 2) no CCC-owned code (authz/service-bridge/editor-compat) couples to the closed EE gitlink', () => {
@@ -82,19 +91,28 @@ describe('fork import boundary — the fork stays independently buildable (issue
   });
 
   it('(rule 4) no import escapes the fork root (docmost/) — no dependency on the super repo', () => {
-    const violations = edges.filter((e) => e.kind === 'escape').map((e) => `${e.file}  ->  ${e.specifier}`);
+    const violations = edges
+      .filter((e) => e.kind === 'escape')
+      .map((e) => `${e.file}  ->  ${e.specifier}`);
     expect(violations).toEqual([]);
   });
 
   it('(rule 3) no upstream-owned file imports authz/** or service-bridge/** outside the documented seams', () => {
-    const offenders = edges.filter((e) => e.kind === 'ccc' && isUpstream(e.file) && !SEAM_ALLOWLIST.has(e.file));
+    const offenders = edges.filter(
+      (e) =>
+        e.kind === 'ccc' && isUpstream(e.file) && !SEAM_ALLOWLIST.has(e.file),
+    );
     // A new upstream file reaching into CCC code. Either move the integration to a documented seam, or (if it
     // genuinely IS a new seam) add it to SEAM_ALLOWLIST here AND to UPSTREAM_MODIFICATIONS.md.
     expect(offenders.map((e) => `${e.file}  ->  ${e.specifier}`)).toEqual([]);
   });
 
   it('(rule 3 hygiene) every SEAM_ALLOWLIST entry is still an upstream file that imports CCC code (no stale grant)', () => {
-    const importers = new Set(edges.filter((e) => e.kind === 'ccc' && isUpstream(e.file)).map((e) => e.file));
+    const importers = new Set(
+      edges
+        .filter((e) => e.kind === 'ccc' && isUpstream(e.file))
+        .map((e) => e.file),
+    );
     const stale = [...SEAM_ALLOWLIST].filter((f) => !importers.has(f));
     // A seam allow-listed here that no longer imports authz/service-bridge (file deleted, or the import moved).
     // Remove it (dead grant) so the allowlist reflects the true seam set.
@@ -107,7 +125,8 @@ describe('fork import boundary — the fork stays independently buildable (issue
 // detection (so a real leak slips through) reds HERE — the mutation guard for the guard itself.
 describe('the import classifier recognizes every boundary-crossing shape (meta-guard)', () => {
   const at = (rel: string) => join(SRC_ROOT, rel); // a synthetic importing file, resolved against the real root
-  const k = (fileRel: string, spec: string) => classifySpecifier(at(fileRel), spec, SRC_ROOT);
+  const k = (fileRel: string, spec: string) =>
+    classifySpecifier(at(fileRel), spec, SRC_ROOT);
 
   it("flags 'ee' — @docmost/ee alias and a relative import into ee/", () => {
     expect(k('probe.ts', '@docmost/ee/billing/billing.service')).toBe('ee');
@@ -122,12 +141,21 @@ describe('the import classifier recognizes every boundary-crossing shape (meta-g
   });
 
   it("flags 'ccc' — an import that resolves into authz/, service-bridge/, or editor-compat/", () => {
-    expect(k('core/auth/auth.controller.ts', '../../authz/mode/native-auth-mode.guard')).toBe('ccc');
+    expect(
+      k(
+        'core/auth/auth.controller.ts',
+        '../../authz/mode/native-auth-mode.guard',
+      ),
+    ).toBe('ccc');
     expect(k('app.module.ts', './authz/audit/audit.module')).toBe('ccc');
-    expect(k('some/upstream/file.ts', '../../service-bridge/service-bridge.module')).toBe('ccc');
+    expect(
+      k('some/upstream/file.ts', '../../service-bridge/service-bridge.module'),
+    ).toBe('ccc');
     // editor-compat/ is a CCC module (the typography-schema work); the classifier guards it in lockstep with
     // CCC_PREFIXES so rule 3 fires if an upstream file reaches into it. Path-based, so it holds as it grows.
-    expect(k('some/upstream/file.ts', '../../editor-compat/schema/x')).toBe('ccc');
+    expect(k('some/upstream/file.ts', '../../editor-compat/schema/x')).toBe(
+      'ccc',
+    );
     expect(k('probe.ts', 'src/authz/mode/authz-mode')).toBe('ccc');
   });
 
@@ -136,7 +164,12 @@ describe('the import classifier recognizes every boundary-crossing shape (meta-g
     expect(k('probe.ts', '@docmost/db/repos/user/user.repo')).toBe('other');
     expect(k('probe.ts', '@docmost/transactional/emails/x')).toBe('other');
     expect(k('core/page/page.controller.ts', './page.service')).toBe('other');
-    expect(k('core/page/page.controller.ts', '../casl/abilities/space-ability.factory')).toBe('other');
+    expect(
+      k(
+        'core/page/page.controller.ts',
+        '../casl/abilities/space-ability.factory',
+      ),
+    ).toBe('other');
   });
 
   it('collects every import form (static, type-only, export-from, dynamic import(), require)', () => {

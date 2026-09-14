@@ -8,6 +8,10 @@ import {
 import { setYjsMark, updateYjsMarkAttribute, YjsSelection } from './yjs.util';
 import * as Y from 'yjs';
 import { User } from '@docmost/db/types/entity.types';
+// CCC integration seam (UPSTREAM_MODIFICATIONS.md + authz/route-guard/import-boundary.spec.ts):
+// the conditional page write compares the LIVE document against a caller-supplied digest, and the digest
+// function is cross-service contract code that must live beside its shared vectors in authz/.
+import { stableHash } from '../authz/page-write/stable-hash';
 
 export type CollabEventHandlers = ReturnType<
   CollaborationHandler['getHandlers']
@@ -139,30 +143,101 @@ export class CollaborationHandler {
           hocuspocus,
           documentName,
           { user },
-          (doc) => {
-            const fragment = doc.getXmlFragment('default');
-
-            if (operation === 'replace') {
-              if (fragment.length > 0) {
-                fragment.delete(0, fragment.length);
-              }
-
-              const newDoc = TiptapTransformer.toYdoc(
-                prosemirrorJson,
-                'default',
-                tiptapExtensions,
-              );
-              Y.applyUpdate(doc, Y.encodeStateAsUpdate(newDoc));
-            } else {
-              const newContent = prosemirrorJson.content || [];
-              const yElements = newContent.map(prosemirrorNodeToYElement);
-              const position = operation === 'prepend' ? 0 : fragment.length;
-              fragment.insert(position, yElements);
-            }
-          },
+          (doc) => this.applyContentOperation(doc, prosemirrorJson, operation),
         );
       },
+      // CCC integration seam (UPSTREAM_MODIFICATIONS.md): a COMPARE-AND-SWAP content write (#282).
+      //
+      // `updatePageContent` above applies unconditionally, so a caller that checked a version a moment
+      // earlier can still clobber a keystroke that landed in between. Here the compare happens INSIDE the
+      // same transaction as the mutation: `transact` invokes this callback synchronously and incoming
+      // websocket frames are handled on separate ticks, so nothing can interleave between reading the
+      // document and replacing it. That makes the precondition atomic with respect to live editors.
+      //
+      // Skips the compare when the document was NOT already resident: no live editors means no unpersisted
+      // delta (Hocuspocus refuses to unload while a store is pending), so the caller's row-based check was
+      // already authoritative — and a page written through the API stores its content verbatim while this
+      // serialization is normalized, so comparing there would 412 forever. Residency is read BEFORE opening
+      // the connection, which would otherwise load the document and flip the answer.
+      //
+      // Returns an outcome and NEVER throws: cross-node, a throwing handler never publishes its RedisSync
+      // reply and hangs the caller until the custom-event TTL.
+      conditionalUpdatePageContent: async (
+        documentName: string,
+        payload: {
+          prosemirrorJson: any;
+          operation: string;
+          user: User;
+          expectedContentHash: string;
+        },
+      ) => {
+        const { prosemirrorJson, operation, user, expectedContentHash } =
+          payload;
+        const wasResident = hocuspocus.documents.has(documentName);
+        let outcome: { applied: boolean; reason?: string } = {
+          applied: false,
+          reason: 'unknown',
+        };
+        try {
+          await this.withYdocConnection(
+            hocuspocus,
+            documentName,
+            { user },
+            (doc) => {
+              if (
+                wasResident &&
+                stableHash(TiptapTransformer.fromYdoc(doc, 'default')) !==
+                  expectedContentHash
+              ) {
+                // No mutation — the immediate store that follows is a no-op, so a refused write cannot
+                // even rotate the page's version.
+                outcome = { applied: false, reason: 'precondition' };
+                return;
+              }
+              this.applyContentOperation(doc, prosemirrorJson, operation);
+              outcome = { applied: true };
+            },
+          );
+        } catch (err) {
+          this.logger.warn(
+            `conditionalUpdatePageContent failed for ${documentName}: ${err?.['message']}`,
+          );
+          return { applied: false, reason: 'error' };
+        }
+        return outcome;
+      },
     };
+  }
+
+  /**
+   * Apply a content operation to a live document. Extracted verbatim from `updatePageContent` so the
+   * conditional write (#282) applies byte-identical semantics — there must be exactly one definition of
+   * what `replace`/`append`/`prepend` mean.
+   */
+  private applyContentOperation(
+    doc: Document,
+    prosemirrorJson: any,
+    operation: string,
+  ): void {
+    const fragment = doc.getXmlFragment('default');
+
+    if (operation === 'replace') {
+      if (fragment.length > 0) {
+        fragment.delete(0, fragment.length);
+      }
+
+      const newDoc = TiptapTransformer.toYdoc(
+        prosemirrorJson,
+        'default',
+        tiptapExtensions,
+      );
+      Y.applyUpdate(doc, Y.encodeStateAsUpdate(newDoc));
+    } else {
+      const newContent = prosemirrorJson.content || [];
+      const yElements = newContent.map(prosemirrorNodeToYElement);
+      const position = operation === 'prepend' ? 0 : fragment.length;
+      fragment.insert(position, yElements);
+    }
   }
 
   async withYdocConnection(

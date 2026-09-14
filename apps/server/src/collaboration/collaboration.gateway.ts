@@ -170,6 +170,28 @@ export class CollaborationGateway {
     return this.handleYjsEvent('flushPageContent', `page.${pageId}`, undefined);
   }
 
+  /**
+   * CCC integration seam (UPSTREAM_MODIFICATIONS.md): a compare-and-swap content write (#282) — apply the
+   * content only if the live document still hashes to `expectedContentHash`. Thin pass-through; the handler
+   * carries no policy and the caller (authz/) owns the authorization. Returns `undefined` when RedisSync is
+   * disabled (COLLAB_DISABLE_REDIS), which the caller treats as "not applied".
+   */
+  conditionalUpdatePageContent(
+    pageId: string,
+    payload: {
+      prosemirrorJson: unknown;
+      operation: string;
+      user: unknown;
+      expectedContentHash: string;
+    },
+  ) {
+    return this.handleYjsEvent(
+      'conditionalUpdatePageContent',
+      `page.${pageId}`,
+      payload as never,
+    );
+  }
+
   openDirectConnection(documentName: string, context?: any) {
     return this.hocuspocus.openDirectConnection(documentName, context);
   }

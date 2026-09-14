@@ -129,24 +129,27 @@ export class PageService {
       ydoc = createYdocFromJson(prosemirrorJson);
     }
 
-    const page = await this.pageRepo.insertPage({
-      slugId: generateSlugId(),
-      title: createPageDto.title,
-      position: await this.nextPagePosition(
-        createPageDto.spaceId,
-        parentPageId,
-      ),
-      icon: createPageDto.icon,
-      parentPageId: parentPageId,
-      spaceId: createPageDto.spaceId,
-      creatorId: userId,
-      workspaceId: workspaceId,
-      lastUpdatedById: userId,
-      isBase,
-      content,
-      textContent,
-      ydoc,
-    }, trx);
+    const page = await this.pageRepo.insertPage(
+      {
+        slugId: generateSlugId(),
+        title: createPageDto.title,
+        position: await this.nextPagePosition(
+          createPageDto.spaceId,
+          parentPageId,
+        ),
+        icon: createPageDto.icon,
+        parentPageId: parentPageId,
+        spaceId: createPageDto.spaceId,
+        creatorId: userId,
+        workspaceId: workspaceId,
+        lastUpdatedById: userId,
+        isBase,
+        content,
+        textContent,
+        ydoc,
+      },
+      trx,
+    );
 
     if (trx) {
       // Add the watcher inside the caller's transaction so the async worker
@@ -1045,7 +1048,10 @@ export class PageService {
     await this.pageRepo.removePage(pageId, userId, workspaceId);
   }
 
-  private async parseProsemirrorContent(
+  // CCC integration seam (UPSTREAM_MODIFICATIONS.md #121): visibility widened from `private` to `public`
+  // so the fork's conditional page write (#282) converts markdown/HTML with the SAME parser this service
+  // uses, rather than re-implementing it and drifting at the next upstream bump. No logic change.
+  async parseProsemirrorContent(
     content: string | object,
     format: ContentFormat,
   ): Promise<any> {
