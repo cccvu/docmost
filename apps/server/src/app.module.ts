@@ -8,6 +8,7 @@ import { CoreModule } from './core/core.module';
 import { EnvironmentModule } from './integrations/environment/environment.module';
 import { CollaborationModule } from './collaboration/collaboration.module';
 import { CollabDisconnectModule } from './authz/collab/collab-disconnect.module';
+import { ConditionalPageModule } from './authz/page-write/conditional-page.module';
 import { WsModule } from './ws/ws.module';
 import { DatabaseModule } from '@docmost/db/database.module';
 import { StorageModule } from './integrations/storage/storage.module';
@@ -74,6 +75,7 @@ try {
     }),
     CollaborationModule,
     CollabDisconnectModule,
+    ConditionalPageModule,
     WsModule,
     QueueModule,
     StaticModule,

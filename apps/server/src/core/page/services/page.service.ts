@@ -1045,7 +1045,10 @@ export class PageService {
     await this.pageRepo.removePage(pageId, userId, workspaceId);
   }
 
-  private async parseProsemirrorContent(
+  // CCC integration seam (UPSTREAM_MODIFICATIONS.md #121): visibility widened from `private` to `public`
+  // so the fork's conditional page write (#282) converts markdown/HTML with the SAME parser this service
+  // uses, rather than re-implementing it and drifting at the next upstream bump. No logic change.
+  async parseProsemirrorContent(
     content: string | object,
     format: ContentFormat,
   ): Promise<any> {
