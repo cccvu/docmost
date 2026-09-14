@@ -4,16 +4,24 @@ import {
   HttpCode,
   HttpStatus,
   Post,
+  ServiceUnavailableException,
   UseGuards,
 } from '@nestjs/common';
 import { SkipTransform } from '../../common/decorators/skip-transform.decorator';
-import { IsUUID } from 'class-validator';
+import { IsBoolean, IsOptional, IsUUID } from 'class-validator';
 import { CollaborationGateway } from '../../collaboration/collaboration.gateway';
 import { RemoteOnlyGuard } from '../mode/remote-only.guard';
 import { CollabServiceSecretGuard } from './service-secret.guard';
 
 export class FlushPageContentDto {
   @IsUUID() pageId!: string;
+
+  /**
+   * Ask for the settled document's digest. Off by default: producing it serializes and hashes the whole
+   * document on the event loop every live editor on this node shares, and a read settle
+   * (`GET /v1/pages/:id?settle=true`) only ever wants the store.
+   */
+  @IsOptional() @IsBoolean() withDigest?: boolean;
 }
 
 /**
@@ -29,7 +37,8 @@ export class FlushPageContentDto {
  * NOT an authorization decision, so no PDP re-check (unlike the sibling force-disconnect route, which
  * DENIES a user and therefore re-checks): it denies nobody, returns only a boolean, and persists only
  * content the collaboration server has already accepted. The platform has already made the page decision
- * before calling. `RemoteOnlyGuard` 404s this route unless AUTHZ_MODE=remote (the surface is meaningless
+ * before calling. Responds 503 when the settle could not be established — the caller cannot be allowed to
+ * read that as "nothing was live". `RemoteOnlyGuard` 404s this route unless AUTHZ_MODE=remote (the surface is meaningless
  * without the platform); `CollabServiceSecretGuard` verifies the shared service secret.
  */
 @UseGuards(RemoteOnlyGuard, CollabServiceSecretGuard)
@@ -43,12 +52,24 @@ export class CollabFlushController {
   async flushPageContent(
     @Body() dto: FlushPageContentDto,
   ): Promise<{ flushed: boolean; contentDigest?: string }> {
-    // `handleYjsEvent` resolves to undefined when RedisSync is disabled; treat that as "not flushed"
-    // rather than failing the caller — the platform's settle is best-effort by design.
-    const result = (await this.gateway.flushPageContent(dto.pageId)) as
-      | { flushed?: boolean; contentDigest?: string }
+    const result = (await this.gateway.flushPageContent(dto.pageId, {
+      withDigest: dto.withDigest === true,
+    })) as
+      | { flushed?: boolean; reason?: string; contentDigest?: string }
       | undefined;
-    if (result?.flushed !== true) return { flushed: false };
+
+    // "We could not settle" MUST be distinguishable from "there was nothing to settle". A resident
+    // document whose flush threw may still hold unpersisted edits; answering `{flushed:false}` — the
+    // very same answer a page nobody has open gives — would tell the platform it is safe to write
+    // unconditionally against a stale row, which is precisely the lost update this endpoint exists to
+    // prevent. `undefined` (RedisSync disabled) is the same "we don't know". Fail loudly; the platform
+    // fails the guarded write closed and still lets reads through.
+    if (!result || result.reason === 'error') {
+      throw new ServiceUnavailableException(
+        'could not settle the page content',
+      );
+    }
+    if (result.flushed !== true) return { flushed: false };
     // The live document's digest, for a follow-up conditional write. Present only when a document was
     // actually resident — its absence is the caller's signal that nothing was live to race with.
     return typeof result.contentDigest === 'string'

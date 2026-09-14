@@ -1,3 +1,4 @@
+import { ServiceUnavailableException } from '@nestjs/common';
 import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
 
@@ -20,8 +21,10 @@ import { SKIP_TRANSFORM_KEY } from '../../common/decorators/skip-transform.decor
  * The inbound content-settle seam (issue 282). Intended behavior, from the controller doc-comment:
  *   - route the settle to the doc-owning node through the gateway, keyed by pageId;
  *   - report a boolean outcome, never leaking the gateway's shape;
- *   - tolerate `undefined` from `handleYjsEvent` (RedisSync disabled) as "not flushed" rather than
- *     failing the caller — the platform's settle is best-effort;
+ *   - keep "there was nothing to settle" and "we could not settle" DISTINGUISHABLE: the first is a
+ *     successful 200 `{flushed:false}`, the second a 503. Both would otherwise be `{flushed:false}`, and
+ *     the caller reads that as "no live document to race with" — which would let a guarded write proceed
+ *     unconditionally against a stale row, i.e. the #282 lost update this seam exists to prevent;
  *   - emit a BARE body (no upstream `{data,success,status}` envelope), per incident #181.
  */
 describe('CollabFlushController.flushPageContent', () => {
@@ -43,7 +46,7 @@ describe('CollabFlushController.flushPageContent', () => {
       flushed: true,
     });
     expect(flushPageContent).toHaveBeenCalledTimes(1);
-    expect(flushPageContent).toHaveBeenCalledWith(PAGE);
+    expect(flushPageContent).toHaveBeenCalledWith(PAGE, { withDigest: false });
   });
 
   it('reports flushed:false when the document was not resident (nothing to settle)', async () => {
@@ -56,25 +59,56 @@ describe('CollabFlushController.flushPageContent', () => {
   });
 
   // RedisSync disabled ⇒ gateway.handleYjsEvent resolves to undefined. That must degrade to
-  // "not flushed", NOT a 500 — the platform treats the settle as best-effort and falls through.
-  it('treats an undefined gateway result (RedisSync disabled) as not flushed', async () => {
+  // RedisSync disabled makes handleYjsEvent resolve to undefined. That is "we don't know whether a live
+  // document holds unsaved edits", NOT "there is none" — and with Redis off, content writes are dropped
+  // silently anyway, so answering "nothing to settle" would be the worst possible guess. Fail loudly.
+  it('503s on an undefined gateway result (RedisSync disabled) rather than reporting nothing to settle', async () => {
     const { controller } = build(undefined);
     await expect(
       controller.flushPageContent({ pageId: PAGE }),
-    ).resolves.toEqual({
-      flushed: false,
+    ).rejects.toBeInstanceOf(ServiceUnavailableException);
+  });
+
+  // The distinction this whole endpoint turns on.
+  it('503s when the flush ERRORED, but 200s when there was simply nothing resident', async () => {
+    const errored = build({ flushed: false, reason: 'error' });
+    await expect(
+      errored.controller.flushPageContent({ pageId: PAGE }),
+    ).rejects.toBeInstanceOf(ServiceUnavailableException);
+
+    const quiet = build({ flushed: false });
+    await expect(
+      quiet.controller.flushPageContent({ pageId: PAGE }),
+    ).resolves.toEqual({ flushed: false });
+  });
+
+  // The digest costs a full serialize + hash of the document on the shared collab event loop, so the
+  // caller decides. A read settle asks for `withDigest: false`; only a guarded write needs the version.
+  it('passes the caller\u2019s withDigest choice through to the collab node', async () => {
+    const { controller, flushPageContent } = build({ flushed: true });
+    await controller.flushPageContent({ pageId: PAGE, withDigest: true });
+    expect(flushPageContent).toHaveBeenLastCalledWith(PAGE, {
+      withDigest: true,
+    });
+    await controller.flushPageContent({ pageId: PAGE });
+    expect(flushPageContent).toHaveBeenLastCalledWith(PAGE, {
+      withDigest: false,
     });
   });
 
   // The outcome is normalized to a strict boolean so a malformed handler result can never be
   // mistaken for a successful settle by the caller.
   it('normalizes any non-true flushed value to false', async () => {
-    for (const result of [{}, { flushed: 'yes' }, { flushed: 1 }, null]) {
+    for (const result of [{}, { flushed: 'yes' }, { flushed: 1 }]) {
       const { controller } = build(result);
       await expect(
         controller.flushPageContent({ pageId: PAGE }),
       ).resolves.toEqual({ flushed: false });
     }
+    // `null` is not a shape we can read an outcome from — same "we don't know" as undefined.
+    await expect(
+      build(null).controller.flushPageContent({ pageId: PAGE }),
+    ).rejects.toBeInstanceOf(ServiceUnavailableException);
   });
 
   it('validates pageId as a UUID', async () => {

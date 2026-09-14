@@ -31,7 +31,9 @@ import {
  *      cannot run twice.
  */
 describe('ConditionalPageController.conditionalUpdate', () => {
-  const PAGE = { id: 'page-1', spaceId: 'space-1' };
+  // `id` deliberately DIFFERS from the `pageId` callers send (see the slug test below): a fixture where
+  // they are equal cannot tell `dto.pageId` and `page.id` apart, and that blindness hid a real defect.
+  const PAGE = { id: 'page-uuid-1', spaceId: 'space-1' };
   const USER = { id: 'user-1' } as never;
   const DIGEST = 'a'.repeat(64);
 
@@ -62,7 +64,7 @@ describe('ConditionalPageController.conditionalUpdate', () => {
       update: jest.fn(async (_page: unknown, _dto: unknown, _user: unknown) => {
         calls.push('update');
         if (opts.updateThrows) throw new Error('metadata write failed');
-        return { id: 'page-1', title: 'T', content: { type: 'doc' } };
+        return { id: 'page-uuid-1', title: 'T', content: { type: 'doc' } };
       }),
     };
     const gateway = {
@@ -131,7 +133,7 @@ describe('ConditionalPageController.conditionalUpdate', () => {
       'update',
     ]);
     expect(gateway.conditionalUpdatePageContent).toHaveBeenCalledWith(
-      'page-1',
+      'page-uuid-1',
       expect.objectContaining({
         expectedContentHash: DIGEST,
         operation: 'replace',
@@ -145,6 +147,31 @@ describe('ConditionalPageController.conditionalUpdate', () => {
     >;
     expect(metadataDto).not.toHaveProperty('content');
     expect(metadataDto.title).toBe('New title');
+  });
+
+  // The compare-and-swap is keyed on the DOCUMENT NAME, and live documents are named `page.<uuid>`.
+  // `PageRepo.findById` also resolves a non-UUID as a slugId, so forwarding the caller's raw `pageId`
+  // would name a document that does not exist: the precondition would find nothing to compare and apply
+  // UNCONDITIONALLY while still reporting success, and the direct connection would fork a second
+  // RedisSync-owned Y.Doc over the same row whose store races the real one. Both failures are silent,
+  // and both are the lost update this route exists to prevent — reachable through the route itself.
+  it('hands the collab layer the RESOLVED page id, never the slug the caller sent', async () => {
+    const { controller, gateway, pageService } = build({});
+    await controller.conditionalUpdate(
+      dto({ pageId: 'my-page-slug-abc123', title: 'New title' }),
+      USER,
+    );
+    expect(gateway.conditionalUpdatePageContent).toHaveBeenCalledWith(
+      'page-uuid-1',
+      expect.anything(),
+    );
+    expect(gateway.conditionalUpdatePageContent).not.toHaveBeenCalledWith(
+      'my-page-slug-abc123',
+      expect.anything(),
+    );
+    expect(
+      (pageService.update.mock.calls[0][1] as { pageId: string }).pageId,
+    ).toBe('page-uuid-1');
   });
 
   // (2) A refused precondition must leave the page exactly as it was — including its metadata, so the
@@ -218,11 +245,41 @@ describe('ConditionalPageController.conditionalUpdate', () => {
   it('returns the canonical page plus its permissions, like the ordinary update route', async () => {
     const { controller } = build({});
     await expect(controller.conditionalUpdate(dto(), USER)).resolves.toEqual({
-      id: 'page-1',
+      id: 'page-uuid-1',
       title: 'T',
       content: { type: 'doc' },
       permissions: { canEdit: true, hasRestriction: false },
     });
+  });
+
+  // The metadata projection forwards by subtraction, so a field added to the upstream UpdatePageDto keeps
+  // flowing through this route instead of being silently stripped on it alone (whitelist: true, no
+  // forbidNonWhitelisted) — which would make the same PATCH behave differently depending on whether
+  // someone has the page open.
+  it('forwards inherited metadata fields and strips only content/operation/format/digest', async () => {
+    const { controller, pageService } = build({});
+    await controller.conditionalUpdate(
+      dto({ title: 'T2', icon: '\u2b50', parentPageId: 'parent-1' }),
+      USER,
+    );
+    const metadataDto = pageService.update.mock.calls[0][1] as Record<
+      string,
+      unknown
+    >;
+    expect(metadataDto).toEqual({
+      pageId: 'page-uuid-1',
+      title: 'T2',
+      icon: '\u2b50',
+      parentPageId: 'parent-1',
+    });
+    for (const stripped of [
+      'content',
+      'operation',
+      'format',
+      'expectedContentHash',
+    ]) {
+      expect(metadataDto).not.toHaveProperty(stripped);
+    }
   });
 
   it('accepts a digest-less request, and validates operation/format when content is present', async () => {

@@ -28,10 +28,7 @@ export class CollaborationHandler {
       // CCC integration seam (UPSTREAM_MODIFICATIONS.md): force-disconnect a user's live sessions on a
       // document when their access is revoked mid-session. Runs on the doc-owning node (RedisSync
       // routes here); pure connection logic — the authorization decision is made in apps/server/src/authz/.
-      forceDisconnect: async (
-        documentName: string,
-        payload: { userId: string },
-      ) => {
+      forceDisconnect: async (documentName: string, payload: { userId: string }) => {
         const doc = hocuspocus.documents.get(documentName);
         if (!doc) return;
         for (const connection of doc.getConnections()) {
@@ -54,11 +51,15 @@ export class CollaborationHandler {
       //
       // Never throws: an uncaught rejection here is an unhandled rejection locally and, cross-node, hangs
       // RedisSync's customEvent reply until its TTL.
-      flushPageContent: async (documentName: string) => {
+      flushPageContent: async (
+        documentName: string,
+        payload?: { withDigest?: boolean },
+      ) => {
         const doc = hocuspocus.documents.get(documentName);
         // Not resident on the owning node ⇒ no unpersisted delta exists (Hocuspocus refuses to unload a
         // document while a store is debounced, executing, or holding saveMutex), so the row is already
-        // authoritative and there is nothing to flush.
+        // authoritative and there is nothing to flush. `reason` is absent here ON PURPOSE: this is a
+        // successful settle with nothing to do, which the caller must NOT confuse with a failure.
         if (!doc) return { flushed: false };
         const debounceId = `onStoreDocument-${documentName}`;
         try {
@@ -67,6 +68,10 @@ export class CollaborationHandler {
           }
           // Drain a store that was already executing when we arrived.
           await doc.saveMutex.runExclusive(async () => undefined);
+          // Serializing + hashing a whole document is not free and it runs on the event loop every live
+          // editor on this node shares, so only do it when the caller is going to use the digest. A read
+          // settle (`GET ?settle=true`) wants the store, never the version.
+          if (!payload?.withDigest) return { flushed: true };
           // Hand back the LIVE document's digest so a follow-up conditional write can name a version this
           // server will actually recognise. The caller must not derive one from the `pages` row: content
           // authored through the API is stored verbatim, while this serialization fills in ProseMirror's
@@ -83,7 +88,11 @@ export class CollaborationHandler {
           this.logger.warn(
             `flushPageContent failed for ${documentName}: ${err?.['message']}`,
           );
-          return { flushed: false };
+          // `reason: 'error'` is load-bearing. A bare `{ flushed: false }` is ALSO what a non-resident
+          // document returns, and that one means "safe, the row is authoritative". Collapsing the two
+          // lets a guarded write silently fall back to an unconditional one against a stale row — the
+          // exact lost update this seam exists to prevent (#282). The caller fails closed on this.
+          return { flushed: false, reason: 'error' };
         }
       },
       alterState: async (documentName: string, payload: { pageId: string }) => {
@@ -165,11 +174,13 @@ export class CollaborationHandler {
       // websocket frames are handled on separate ticks, so nothing can interleave between reading the
       // document and replacing it. That makes the precondition atomic with respect to live editors.
       //
-      // Skips the compare when the document was NOT already resident: no live editors means no unpersisted
-      // delta (Hocuspocus refuses to unload while a store is pending), so the caller's row-based check was
-      // already authoritative — and a page written through the API stores its content verbatim while this
-      // serialization is normalized, so comparing there would 412 forever. Residency is read BEFORE opening
-      // the connection, which would otherwise load the document and flip the answer.
+      // Skips the compare when the caller supplied NO digest. The settle omits one when it found no
+      // resident document, which means no live editors, no unpersisted delta (Hocuspocus refuses to unload
+      // while a store is pending) and therefore a row-based check that was already authoritative — and a
+      // page written through the API stores its content verbatim while this serialization normalizes it,
+      // so comparing there would 412 forever. Absence of a digest is the whole signal; residency is NOT
+      // re-tested here, because a document that was resident at settle time and unloaded since is exactly
+      // the concurrent-edit race this must catch, not an excuse to skip the check.
       //
       // Returns an outcome and NEVER throws: cross-node, a throwing handler never publishes its RedisSync
       // reply and hangs the caller until the custom-event TTL.
@@ -184,27 +195,41 @@ export class CollaborationHandler {
       ) => {
         const { prosemirrorJson, operation, user, expectedContentHash } =
           payload;
-        const wasResident = hocuspocus.documents.has(documentName);
         let outcome: { applied: boolean; reason?: string } = {
           applied: false,
           reason: 'unknown',
         };
         try {
+          // Refuse the COMMON case before opening a direct connection. `DirectConnection.transact()` and
+          // `.disconnect()` each run an immediate store, and on a refusal that store is not a no-op: the
+          // live document has moved past the settled row by construction, so it would persist a human's
+          // in-flight text under THIS caller's context — reassigning `lastUpdatedById` to the API/MCP
+          // service account, rotating `updatedAt`, broadcasting `page.updated` under the caller's name,
+          // firing the history/AI/mention jobs, and cancelling the human's own pending store. Checking the
+          // resident document first means a refusal normally touches nothing at all.
+          const resident = expectedContentHash
+            ? hocuspocus.documents.get(documentName)
+            : undefined;
+          if (
+            resident &&
+            stableHash(TiptapTransformer.fromYdoc(resident, 'default')) !==
+              expectedContentHash
+          ) {
+            return { applied: false, reason: 'precondition' };
+          }
           await this.withYdocConnection(
             hocuspocus,
             documentName,
             { user },
             (doc) => {
-              // No digest ⇒ the caller observed no live document to race with (the settle found none), so
-              // there is nothing to compare against and nothing that could be lost.
+              // The authoritative compare: inside the transaction, so an edit cannot land between it and
+              // the mutation. The pre-check above is an optimization, not a substitute — it cannot see an
+              // edit that arrives while the connection is opening.
               if (
                 expectedContentHash &&
-                wasResident &&
                 stableHash(TiptapTransformer.fromYdoc(doc, 'default')) !==
                   expectedContentHash
               ) {
-                // No mutation — the immediate store that follows is a no-op, so a refused write cannot
-                // even rotate the page's version.
                 outcome = { applied: false, reason: 'precondition' };
                 return;
               }

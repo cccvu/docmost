@@ -28,8 +28,10 @@ import { stableHash } from './stable-hash';
  * Compare-and-swap content write (#282, ADR 0017).
  *
  * The guarantee: the version check and the mutation happen in the SAME synchronous transaction callback,
- * so a websocket frame — a person typing — cannot land between them. These tests pin that, plus the two
- * branches of the residency rule that decides whether the check applies at all.
+ * so a websocket frame — a person typing — cannot land between them. These tests pin that; that a refusal
+ * is inert in the strong sense (it never opens a direct connection, because opening one would persist the
+ * human's live text under the API caller's identity); that the digest's ABSENCE — not residency — is what
+ * waives the check; and that every non-applied outcome is reported as non-applied.
  */
 describe('CollaborationHandler.conditionalUpdatePageContent (#282)', () => {
   const DOC = 'page.22222222-2222-4222-8222-222222222222';
@@ -47,8 +49,13 @@ describe('CollaborationHandler.conditionalUpdatePageContent (#282)', () => {
     const ops: string[] = [];
     const fragment = makeFragment(ops);
     const doc = { getXmlFragment: jest.fn(() => fragment) };
-    const documents = new Map<string, unknown>();
-    if (opts.resident) documents.set(DOC, doc);
+    const reads: string[] = [];
+    const backing = new Map<string, unknown>();
+    if (opts.resident) backing.set(DOC, doc);
+    const documents = {
+      get: (name: string) => (reads.push('get'), backing.get(name)),
+      has: (name: string) => (reads.push('has'), backing.has(name)),
+    };
 
     const connection = {
       transact: jest.fn(async (fn: (d: unknown) => void) => {
@@ -64,7 +71,7 @@ describe('CollaborationHandler.conditionalUpdatePageContent (#282)', () => {
     const handler = new CollaborationHandler().getHandlers(
       hocuspocus as never,
     ).conditionalUpdatePageContent;
-    return { handler, ops, connection, hocuspocus, doc };
+    return { handler, ops, connection, hocuspocus, doc, reads };
   };
 
   beforeEach(() => {
@@ -98,13 +105,18 @@ describe('CollaborationHandler.conditionalUpdatePageContent (#282)', () => {
     });
   });
 
-  // A refusal must be inert: no mutation at all, so the refused write cannot even rotate the page version
-  // (which would make the caller's next attempt fail for a second, spurious reason).
-  it('mutates nothing when it refuses', async () => {
-    const { handler, ops, doc } = build({ resident: true });
+  // A refusal must be inert in the STRONG sense: it must not even open a direct connection.
+  // `DirectConnection.transact()` and `.disconnect()` each run an immediate store, and on a refusal that
+  // store is NOT a no-op — the live document has moved past the settled row by construction, so it would
+  // write the human's in-flight text under the API caller's context: `lastUpdatedById` reassigned to the
+  // service account, `updatedAt` rotated, a `page.updated` broadcast in the caller's name, the
+  // history/AI/mention jobs fired, and the human's own pending store cancelled. Asserting only "the Y
+  // fragment was untouched" cannot see any of that, which is why this asserts on the connection.
+  it('opens no connection and mutates nothing when it refuses', async () => {
+    const { handler, ops, doc, hocuspocus } = build({ resident: true });
     await handler(DOC, payload(stableHash({ different: true })));
-    expect(ops).not.toContain('delete');
-    expect(ops).not.toContain('insert');
+    expect(hocuspocus.openDirectConnection).not.toHaveBeenCalled();
+    expect(ops).toEqual([]);
     expect(doc.getXmlFragment).not.toHaveBeenCalled();
   });
 
@@ -140,7 +152,11 @@ describe('CollaborationHandler.conditionalUpdatePageContent (#282)', () => {
     ).conditionalUpdatePageContent;
 
     await handler(DOC, payload(stableHash(LIVE), 'append'));
+    // The first 'compare' is the cheap pre-check against the resident document (which only ever refuses
+    // early, never applies). The load-bearing one is the second: inside the transaction, before the
+    // mutation — a check outside `transact()` would reintroduce exactly the race this closes.
     expect(order).toEqual([
+      'compare',
       'transact:start',
       'compare',
       'mutate',
@@ -148,48 +164,80 @@ describe('CollaborationHandler.conditionalUpdatePageContent (#282)', () => {
     ]);
   });
 
-  // Residency branch A: nobody has the page open, so there is no unpersisted delta and the caller's
-  // row-based check was already authoritative. Comparing here would 412 forever on API-created pages,
-  // whose stored content is verbatim while this serialization is normalized.
-  it('skips the comparison when the document was NOT resident', async () => {
-    const { handler, ops } = build({ resident: false });
+  // The ABSENCE of a digest — not residency — is what waives the check. The settle omits the digest only
+  // when it found no resident document, which means nobody had the page open, so there was no unpersisted
+  // delta and the caller's row-based check was already authoritative. Comparing anyway would 412 forever
+  // on API-created pages, whose stored content is verbatim while this serialization normalizes it.
+  it('applies unconditionally when the caller supplies NO digest, even for a resident document', async () => {
+    const { handler, ops } = build({ resident: true });
     await expect(
-      handler(DOC, payload('a-digest-that-matches-nothing')),
-    ).resolves.toEqual({
-      applied: true,
-    });
+      handler(DOC, {
+        prosemirrorJson: { type: 'doc', content: [] },
+        operation: 'replace',
+        user: USER as never,
+        expectedContentHash: undefined,
+      }),
+    ).resolves.toEqual({ applied: true });
     expect(ops).toContain('delete');
-    expect(fromYdoc).not.toHaveBeenCalled();
+    expect(fromYdoc).not.toHaveBeenCalled(); // no digest ⇒ nothing to serialize or compare
   });
 
-  // Residency must be read BEFORE opening the connection — opening it loads the document, which would
-  // flip the answer and silently disable the check for every page that was idle.
-  it('reads residency before opening the connection', async () => {
+  // The settle-then-unload race, which the previous `wasResident` term silently waived: a digest can only
+  // exist because the document WAS resident when the settle ran, so finding it gone now means it stored
+  // and unloaded inside our own request window — the concurrent-edit case, not a reason to skip the check.
+  // The connection reloads it from the row, and the compare must still run.
+  it('still compares when the document unloaded between the settle and the apply', async () => {
+    const { handler, ops } = build({ resident: false });
+    await expect(
+      handler(DOC, payload(stableHash({ someone: 'typed since' }))),
+    ).resolves.toEqual({ applied: false, reason: 'precondition' });
+    expect(ops).not.toContain('delete');
+  });
+
+  // The resident document is read BEFORE the connection is opened — opening it would load the document
+  // and defeat the early refusal, putting the mis-attributing store back on the refusal path.
+  it('reads the resident document before opening a connection', async () => {
+    const { handler, reads, hocuspocus } = build({ resident: true });
     const order: string[] = [];
-    const documents = { has: jest.fn(() => (order.push('has'), true)) };
+    const openSpy = hocuspocus.openDirectConnection;
+    (hocuspocus as { openDirectConnection: unknown }).openDirectConnection =
+      jest.fn(async (...a: unknown[]) => {
+        order.push('open');
+        return (openSpy as (...x: unknown[]) => unknown)(...a);
+      });
+    await handler(DOC, payload(stableHash(LIVE)));
+    expect(reads[0]).toBe('get');
+    expect(order).toEqual(['open']);
+  });
+
+  // The fail-closed default. If `transact` resolves without ever invoking the callback, no write happened
+  // — and reporting `applied: true` there would hand the caller a 200 with a fresh ETag for content that
+  // was never stored: the inverse of the lost update this exists to prevent, and just as invisible.
+  it('reports NOT applied when the transaction never runs the callback', async () => {
     const connection = {
-      transact: jest.fn(async () => undefined),
+      transact: jest.fn(async () => undefined), // resolves without calling fn
       disconnect: jest.fn(async () => undefined),
     };
     const hocuspocus = {
-      documents,
-      openDirectConnection: jest.fn(
-        async () => (order.push('open'), connection),
-      ),
+      documents: { get: jest.fn(() => undefined), has: jest.fn(() => false) },
+      openDirectConnection: jest.fn(async () => connection),
     };
     const handler = new CollaborationHandler().getHandlers(
       hocuspocus as never,
     ).conditionalUpdatePageContent;
 
-    await handler(DOC, payload('x'));
-    expect(order).toEqual(['has', 'open']);
+    await expect(handler(DOC, payload('x'))).resolves.toEqual({
+      applied: false,
+      reason: 'unknown',
+    });
   });
 
   // Cross-node, a throwing custom-event handler never publishes its RedisSync reply and hangs the caller
   // until the custom-event TTL. It must report instead — and "error" must NOT read as applied.
   it('reports an error outcome instead of throwing when the transaction fails', async () => {
     const hocuspocus = {
-      documents: new Map([[DOC, {}]]),
+      // Not resident, so the cheap pre-check waives and we actually reach the connection that throws.
+      documents: { get: jest.fn(() => undefined), has: jest.fn(() => false) },
       openDirectConnection: jest.fn(async () => {
         throw new Error('collab node exploded');
       }),
@@ -204,8 +252,10 @@ describe('CollaborationHandler.conditionalUpdatePageContent (#282)', () => {
     });
   });
 
-  it('always disconnects, even when it refuses the write', async () => {
-    const { handler, connection } = build({ resident: true });
+  // When a connection IS opened (the mid-request race: the document was not resident at the pre-check but
+  // the in-transaction compare then refuses), it must still be released.
+  it('always disconnects when it opened a connection, even on a refusal', async () => {
+    const { handler, connection } = build({ resident: false });
     await handler(DOC, payload(stableHash({ different: true })));
     expect(connection.disconnect).toHaveBeenCalledTimes(1);
   });

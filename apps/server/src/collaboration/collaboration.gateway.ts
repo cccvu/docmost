@@ -117,11 +117,7 @@ export class CollaborationGateway {
 
       // Forward close events
       client.on('close', (code: number, reason: Buffer) => {
-        this.redisSync!.onSocketClose(
-          socketId,
-          code,
-          reason.buffer as ArrayBuffer,
-        );
+        this.redisSync!.onSocketClose(socketId, code, reason.buffer as ArrayBuffer);
       });
 
       // Forward pong events for keepalive
@@ -166,8 +162,11 @@ export class CollaborationGateway {
    * Returns `undefined` when RedisSync is disabled (COLLAB_DISABLE_REDIS), which the caller treats as
    * "not flushed".
    */
-  flushPageContent(pageId: string) {
-    return this.handleYjsEvent('flushPageContent', `page.${pageId}`, undefined);
+  flushPageContent(
+    pageId: string,
+    payload?: Parameters<CollabEventHandlers['flushPageContent']>[1],
+  ) {
+    return this.handleYjsEvent('flushPageContent', `page.${pageId}`, payload);
   }
 
   /**
@@ -178,17 +177,12 @@ export class CollaborationGateway {
    */
   conditionalUpdatePageContent(
     pageId: string,
-    payload: {
-      prosemirrorJson: unknown;
-      operation: string;
-      user: unknown;
-      expectedContentHash: string;
-    },
+    payload: Parameters<CollabEventHandlers['conditionalUpdatePageContent']>[1],
   ) {
     return this.handleYjsEvent(
       'conditionalUpdatePageContent',
       `page.${pageId}`,
-      payload as never,
+      payload,
     );
   }
 

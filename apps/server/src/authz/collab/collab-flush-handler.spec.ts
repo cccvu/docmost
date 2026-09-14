@@ -69,7 +69,11 @@ describe('CollaborationHandler.flushPageContent (content settle, issue 282)', ()
   // the settle must be a cheap no-op — NOT a load-and-store, which would rewrite the row for nothing.
   it('is a no-op when the document is not resident', async () => {
     const hocuspocus = makeHocuspocus(null);
-    await expect(flushOf(hocuspocus)(DOC)).resolves.toEqual({ flushed: false });
+    // NO `reason` here, deliberately: this is a SUCCESSFUL settle with nothing to do. The error paths
+    // below return `flushed: false` too, and the caller must be able to tell them apart.
+    await expect(
+      flushOf(hocuspocus)(DOC, { withDigest: true }),
+    ).resolves.toEqual({ flushed: false });
     expect(hocuspocus.debouncer.isDebounced).not.toHaveBeenCalled();
     expect(hocuspocus.debouncer.executeNow).not.toHaveBeenCalled();
   });
@@ -84,7 +88,9 @@ describe('CollaborationHandler.flushPageContent (content settle, issue 282)', ()
       executeNow,
     });
 
-    await expect(flushOf(hocuspocus)(DOC)).resolves.toEqual({
+    await expect(
+      flushOf(hocuspocus)(DOC, { withDigest: true }),
+    ).resolves.toEqual({
       flushed: true,
       contentDigest: stableHash({ type: 'doc', content: [] }),
     });
@@ -104,7 +110,7 @@ describe('CollaborationHandler.flushPageContent (content settle, issue 282)', ()
       storeDocumentHooks: jest.fn(),
     };
 
-    await flushOf(hocuspocus)(DOC);
+    await flushOf(hocuspocus)(DOC, { withDigest: true });
     expect(hocuspocus.openDirectConnection).not.toHaveBeenCalled();
     expect(hocuspocus.storeDocumentHooks).not.toHaveBeenCalled();
   });
@@ -117,7 +123,9 @@ describe('CollaborationHandler.flushPageContent (content settle, issue 282)', ()
       isDebounced: jest.fn(() => false),
     });
 
-    await expect(flushOf(hocuspocus)(DOC)).resolves.toEqual({
+    await expect(
+      flushOf(hocuspocus)(DOC, { withDigest: true }),
+    ).resolves.toEqual({
       flushed: true,
       contentDigest: stableHash({ type: 'doc', content: [] }),
     });
@@ -141,7 +149,7 @@ describe('CollaborationHandler.flushPageContent (content settle, issue 282)', ()
       { isDebounced: jest.fn(() => true), executeNow },
     );
 
-    await flushOf(hocuspocus)(DOC);
+    await flushOf(hocuspocus)(DOC, { withDigest: true });
     expect(order).toEqual(['executeNow', 'drain']);
   });
 
@@ -164,7 +172,7 @@ describe('CollaborationHandler.flushPageContent (content settle, issue 282)', ()
       executeNow,
     });
 
-    await flushOf(hocuspocus)(DOC);
+    await flushOf(hocuspocus)(DOC, { withDigest: true });
     expect(settled).toBe(true);
   });
 
@@ -184,7 +192,7 @@ describe('CollaborationHandler.flushPageContent (content settle, issue 282)', ()
       }),
     });
 
-    const result = await flushOf(hocuspocus)(DOC);
+    const result = await flushOf(hocuspocus)(DOC, { withDigest: true });
     expect(order).toEqual(['store', 'serialize']);
     expect(result).toEqual({
       flushed: true,
@@ -203,11 +211,26 @@ describe('CollaborationHandler.flushPageContent (content settle, issue 282)', ()
     >;
     expect(result).toEqual({ flushed: false });
     expect(result.contentDigest).toBeUndefined();
+    expect(result.reason).toBeUndefined(); // a successful settle, not a failure
   });
 
   // Cross-node, a throwing custom-event handler never publishes its reply and the caller hangs until
   // RedisSync's customEvent TTL. The settle must therefore report failure, never throw.
-  it('reports flushed:false instead of throwing when the store rejects', async () => {
+  // The digest is only produced on request. Serializing and hashing a whole document runs on the event
+  // loop every live editor on this node shares, and a read settle (`GET ?settle=true`) never looks at it.
+  it('does NOT serialize or hash the document unless a digest was requested', async () => {
+    const { doc } = makeDoc();
+    const hocuspocus = makeHocuspocus(doc, {
+      isDebounced: jest.fn(() => true),
+      executeNow: jest.fn(async () => undefined),
+    });
+    await expect(flushOf(hocuspocus)(DOC)).resolves.toEqual({ flushed: true });
+    expect(fromYdoc).not.toHaveBeenCalled();
+    // ...but the store still ran: the settle's real job is the persist, not the digest.
+    expect(hocuspocus.debouncer.executeNow).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports an ERROR outcome instead of throwing when the store rejects', async () => {
     const { doc } = makeDoc();
     const hocuspocus = makeHocuspocus(doc, {
       isDebounced: jest.fn(() => true),
@@ -216,10 +239,15 @@ describe('CollaborationHandler.flushPageContent (content settle, issue 282)', ()
       }),
     });
 
-    await expect(flushOf(hocuspocus)(DOC)).resolves.toEqual({ flushed: false });
+    // `reason: 'error'` distinguishes this from the not-resident answer below, which is ALSO
+    // `flushed: false` but means "safe, the row is authoritative". Collapsing the two lets a guarded
+    // write fall back to an unconditional one against a stale row — the #282 lost update itself.
+    await expect(
+      flushOf(hocuspocus)(DOC, { withDigest: true }),
+    ).resolves.toEqual({ flushed: false, reason: 'error' });
   });
 
-  it('reports flushed:false instead of throwing when the mutex drain rejects', async () => {
+  it('reports an ERROR outcome instead of throwing when the mutex drain rejects', async () => {
     const hocuspocus = makeHocuspocus({
       saveMutex: {
         runExclusive: jest.fn(async () => {
@@ -228,6 +256,11 @@ describe('CollaborationHandler.flushPageContent (content settle, issue 282)', ()
       },
     });
 
-    await expect(flushOf(hocuspocus)(DOC)).resolves.toEqual({ flushed: false });
+    // `reason: 'error'` distinguishes this from the not-resident answer below, which is ALSO
+    // `flushed: false` but means "safe, the row is authoritative". Collapsing the two lets a guarded
+    // write fall back to an unconditional one against a stale row — the #282 lost update itself.
+    await expect(
+      flushOf(hocuspocus)(DOC, { withDigest: true }),
+    ).resolves.toEqual({ flushed: false, reason: 'error' });
   });
 });

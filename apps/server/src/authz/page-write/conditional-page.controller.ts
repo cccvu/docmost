@@ -9,24 +9,26 @@ import {
   ServiceUnavailableException,
   UseGuards,
 } from '@nestjs/common';
-import { IsIn, IsOptional, IsString, ValidateIf } from 'class-validator';
-import { Transform } from 'class-transformer';
+import { IsOptional, IsString } from 'class-validator';
 import { AuthUser } from '../../common/decorators/auth-user.decorator';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { User } from '@docmost/db/types/entity.types';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { PageService } from '../../core/page/services/page.service';
 import { PageAccessService } from '../../core/page/page-access/page-access.service';
-import {
-  ContentOperation,
-  UpdatePageDto,
-} from '../../core/page/dto/update-page.dto';
-import { ContentFormat } from '../../core/page/dto/create-page.dto';
+import { UpdatePageDto } from '../../core/page/dto/update-page.dto';
 import { CollaborationGateway } from '../../collaboration/collaboration.gateway';
 
-export class ConditionalUpdatePageDto {
-  @IsString() pageId!: string;
-
+/**
+ * EXTENDS `UpdatePageDto` deliberately, rather than restating its fields. The fork's global
+ * ValidationPipe runs `whitelist: true` WITHOUT `forbidNonWhitelisted`, so an undeclared property is
+ * silently stripped, not rejected: a hand-copied field set would mean that the moment a field is added
+ * upstream (or to our own `/v1` mapper), the same PATCH applies it when nobody has the page open and
+ * silently drops it when someone does — a difference in behaviour decided by whether a colleague has a
+ * tab open, with no error anywhere. Inheriting is the same argument that justifies widening
+ * `parseProsemirrorContent` in seam #121: one definition of what this route accepts.
+ */
+export class ConditionalUpdatePageDto extends UpdatePageDto {
   /**
    * The digest of the live document this write expects to be replacing, as issued by the settle
    * (`POST /api/collab/flush-page-content`). Optional: the settle omits it when no document was resident,
@@ -34,22 +36,6 @@ export class ConditionalUpdatePageDto {
    * It must NEVER be derived from stored content — see the note in stable-hash.ts.
    */
   @IsOptional() @IsString() expectedContentHash?: string;
-
-  @IsOptional() content?: string | object;
-
-  @ValidateIf((o) => o.content !== undefined)
-  @Transform(({ value }) => value?.toLowerCase())
-  @IsIn(['append', 'prepend', 'replace'])
-  operation?: ContentOperation;
-
-  @ValidateIf((o) => o.content !== undefined)
-  @Transform(({ value }) => value?.toLowerCase() ?? 'json')
-  @IsIn(['json', 'markdown', 'html'])
-  format?: ContentFormat;
-
-  @IsOptional() @IsString() title?: string;
-  @IsOptional() @IsString() icon?: string;
-  @IsOptional() @IsString() parentPageId?: string;
 }
 
 /**
@@ -102,20 +88,26 @@ export class ConditionalPageController {
       user,
     );
 
-    if (dto.content !== undefined) {
+    // TRUTHINESS, matching upstream `PageService.update` (`updatePageDto.content && …`). A falsy
+    // `content` ("" / null) is "no content supplied" there, so treating it as supplied here would make
+    // the same request wipe the page on this route while no-opping on the ordinary one — a difference
+    // decided by whether anyone has the page open.
+    if (dto.content) {
       const prosemirrorJson = await this.pageService.parseProsemirrorContent(
         dto.content,
         dto.format ?? 'json',
       );
-      const result = (await this.gateway.conditionalUpdatePageContent(
-        dto.pageId,
-        {
-          prosemirrorJson,
-          operation: dto.operation ?? 'replace',
-          user,
-          expectedContentHash: dto.expectedContentHash,
-        },
-      )) as { applied?: boolean; reason?: string } | undefined;
+      // `page.id`, NEVER `dto.pageId`. `PageRepo.findById` resolves a non-UUID as a slugId, and live
+      // documents are keyed `page.<uuid>` — so a slug-shaped id would name a DIFFERENT document: the
+      // precondition would find nothing resident and silently apply unconditionally, and the direct
+      // connection would fork a second RedisSync-owned Y.Doc over the same row, whose store races the
+      // real one. Upstream normalizes the same way (`PageService.update` → `updatePageContent(page.id)`).
+      const result = (await this.gateway.conditionalUpdatePageContent(page.id, {
+        prosemirrorJson,
+        operation: dto.operation ?? 'replace',
+        user,
+        expectedContentHash: dto.expectedContentHash,
+      })) as { applied?: boolean; reason?: string } | undefined;
 
       if (result?.applied !== true) {
         if (result?.reason === 'precondition') {
@@ -130,15 +122,19 @@ export class ConditionalPageController {
       }
     }
 
-    // Metadata only — `content`/`operation`/`format` are deliberately omitted, so PageService.update's
-    // content branch (guarded on all three being present) cannot run a second time, while its row bump,
+    // Metadata only. `content`/`operation`/`format` are removed ON PURPOSE, so PageService.update's
+    // content branch (guarded on all three) cannot run a second time, while its row bump,
     // lastUpdatedById, contributorIds and watcher enqueue stay identical to the ordinary update path.
-    const metadataOnly: UpdatePageDto = {
-      pageId: dto.pageId,
-      title: dto.title,
-      icon: dto.icon,
-      parentPageId: dto.parentPageId,
-    };
+    // Everything else is forwarded by SUBTRACTION rather than re-listed, so a field added to
+    // UpdatePageDto keeps working here instead of being silently dropped on this route alone.
+    const {
+      content: _content,
+      operation: _operation,
+      format: _format,
+      expectedContentHash: _expectedContentHash,
+      ...rest
+    } = dto;
+    const metadataOnly: UpdatePageDto = { ...rest, pageId: page.id };
     const updatedPage = await this.pageService.update(page, metadataOnly, user);
 
     return { ...updatedPage, permissions: { canEdit: true, hasRestriction } };
