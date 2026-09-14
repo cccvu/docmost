@@ -4,7 +4,7 @@ import { randomBytes } from 'crypto';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
 import { User } from '@docmost/db/types/entity.types';
 import { UserRepo } from '@docmost/db/repos/user/user.repo';
-import { hashPassword } from '../common/helpers';
+import { hashPassword, isUserDisabled } from '../common/helpers';
 import { SessionService } from '../core/session/session.service';
 import { ProvisionUserDto } from './dto/provision-user.dto';
 import { isShadowEmail, shadowEmailFor } from './shadow-user';
@@ -59,9 +59,25 @@ export class ServiceBridgeService {
         workspaceId,
         emailVerifiedAt: new Date(),
       })
+      // Idempotent re-provision is a self-HEAL, not just a touch (#272 P5 + companion F3): a shadow row
+      // the fork itself owns (guaranteed by the reserved-domain email = the conflict key) must come back in
+      // the exact "plain, live member" shape provisioning promises. So the conflict update:
+      //   - clears `deletedAt` — a soft-deleted shadow user (fork DB restore, offboard) is resurrected
+      //     (without this, `mintSession` refuses "deleted"/"disabled" forever — #272 P5);
+      //   - forces `role: 'member'` — an out-of-band-elevated shadow row is de-escalated back to plain
+      //     member (the literal is never caller-supplied, so this STRENGTHENS the no-escalation property:
+      //     the upsert can only ever write `'member'`, never a privileged role — the sibling `space_members`
+      //     upsert resets `role` the same way);
+      //   - refreshes `name` and `emailVerifiedAt`.
+      // It deliberately does NOT touch `password` (never rewritten by an upsert). NOTE: it does NOT clear
+      // `deactivatedAt` — a deliberate admin deactivation is not undone by a re-provision (and `disqualify`
+      // still refuses a deactivated user via `isUserDisabled`).
       .onConflict((oc) =>
         oc.columns(['email', 'workspaceId']).doUpdateSet({
+          name,
           emailVerifiedAt: new Date(),
+          deletedAt: null,
+          role: 'member',
         }),
       )
       .returning('id')
@@ -99,7 +115,11 @@ export class ServiceBridgeService {
 
   private disqualify(user?: User): string | null {
     if (!user) return 'no such user';
-    if (user.deletedAt) return 'deleted';
+    // Companion F1: "not usable" is the platform-wide `isUserDisabled` (deactivatedAt OR deletedAt), the
+    // same predicate every native auth entrypoint enforces (jwt.strategy, token/auth services). Checking
+    // only `deletedAt` here was a fail-OPEN divergence: a workspace-admin-DEACTIVATED shadow member (which
+    // sets `deactivatedAt`, not `deletedAt`) would still mint a live session.
+    if (isUserDisabled(user)) return 'disabled';
     if (user.role !== 'member') return `privileged role ${user.role ?? 'null'}`;
     if (!isShadowEmail(user.email)) return 'outside shadow namespace';
     return null;

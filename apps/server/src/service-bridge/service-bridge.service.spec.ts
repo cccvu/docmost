@@ -14,15 +14,32 @@ const shadow = (over: Record<string, unknown> = {}) => ({
 
 /**
  * A minimal Kysely stand-in that answers ONLY the one query the service issues directly:
- *  - `insertInto('users')…executeTakeFirstOrThrow()` → provisioning; captures the inserted values.
- * The default-workspace resolution now lives in WorkspaceResolver (mocked separately below).
+ *  - `insertInto('users')…executeTakeFirstOrThrow()` → provisioning; captures the inserted values AND
+ *    (issue #50) the `onConflict` target columns + `doUpdateSet` payload, so the conflict semantics are
+ *    asserted rather than assumed.
+ * The default-workspace resolution now lives in WorkspaceResolver (mocked separately below); the REAL
+ * upsert SQL is proven against Postgres in `service-bridge.pg.spec.ts` (T-040…T-046).
  */
 function makeDb(opts: { insertedId?: string } = {}) {
   const insertedId = opts.insertedId ?? 'new-id';
-  const captured: { values?: Record<string, unknown> } = {};
+  const captured: {
+    values?: Record<string, unknown>;
+    conflictColumns?: string[];
+    conflictUpdate?: Record<string, unknown>;
+  } = {};
 
   const onConflict = jest.fn((cb: any) => {
-    cb({ columns: () => ({ doUpdateSet: () => ({}) }) });
+    cb({
+      columns: (cols: string[]) => {
+        captured.conflictColumns = cols;
+        return {
+          doUpdateSet: (v: Record<string, unknown>) => {
+            captured.conflictUpdate = v;
+            return {};
+          },
+        };
+      },
+    });
     return { returning: () => ({ executeTakeFirstOrThrow: async () => ({ id: insertedId }) }) };
   });
   const values = jest.fn((v: Record<string, unknown>) => {
@@ -84,6 +101,19 @@ describe('ServiceBridgeService.mintSession — no direct identity selection', ()
     await expect(svc.mintSession(EXTERNAL_ID)).rejects.toBeInstanceOf(ForbiddenException);
   });
 
+  // F1 (companion #272): a DEACTIVATED shadow member (deactivatedAt set, deletedAt still null — the state a
+  // workspace admin's "deactivate member" produces) must also be refused. `isUserDisabled` = deactivatedAt
+  // OR deletedAt is the platform-wide "not usable" predicate every native auth entrypoint enforces; the
+  // mint path checking only `deletedAt` was a fail-OPEN divergence that would issue a live session to a
+  // deliberately-disabled account.
+  it('F1: refuses a DEACTIVATED user (deactivatedAt set, not deleted) — no fail-open divergence', async () => {
+    const { svc, sessionService } = makeService(
+      shadow({ deactivatedAt: new Date(), deletedAt: null }),
+    );
+    await expect(svc.mintSession(EXTERNAL_ID)).rejects.toBeInstanceOf(ForbiddenException);
+    expect(sessionService.createSessionAndToken).not.toHaveBeenCalled();
+  });
+
   it('defense-in-depth: refuses a resolved row whose email left the shadow namespace (tampered)', async () => {
     const { svc } = makeService(shadow({ email: 'real.person@example.edu' }));
     await expect(svc.mintSession(EXTERNAL_ID)).rejects.toBeInstanceOf(ForbiddenException);
@@ -94,6 +124,30 @@ describe('ServiceBridgeService.mintSession — no direct identity selection', ()
     await expect(svc.mintSession(EXTERNAL_ID)).rejects.toBeInstanceOf(
       ServiceUnavailableException,
     );
+  });
+
+  // T-033 (issue #50): a refusal must not disclose WHICH condition failed (missing vs deleted vs
+  // privileged vs outside-namespace are all one message and one status), or the 403 becomes an
+  // enumeration oracle for the shadow namespace / role state.
+  it('T-033: every refusal reason is a uniform 403 with an identical message', async () => {
+    const reasons: Array<unknown> = [
+      undefined, // no such user
+      shadow({ deletedAt: new Date() }), // deleted
+      shadow({ deactivatedAt: new Date(), deletedAt: null }), // deactivated (F1)
+      shadow({ role: 'owner' }), // privileged
+      shadow({ email: 'real@example.edu' }), // outside namespace
+    ];
+    const observed: Array<{ status?: number; message?: string }> = [];
+    for (const user of reasons) {
+      const { svc } = makeService(user);
+      const err = await svc.mintSession(EXTERNAL_ID).then(
+        () => undefined,
+        (e: any) => e,
+      );
+      expect(err).toBeInstanceOf(ForbiddenException);
+      observed.push({ status: err.getStatus?.(), message: err.message });
+    }
+    expect(new Set(observed.map((o) => JSON.stringify(o))).size).toBe(1); // one shape for all reasons
   });
 });
 
@@ -110,5 +164,65 @@ describe('ServiceBridgeService.provisionShadowUser', () => {
     expect(vals.role).toBe('member'); // never elevated
     expect(vals.workspaceId).toBe('ws1'); // fork-resolved, not caller-supplied
     expect(typeof vals.password).toBe('string'); // an (unusable) hash, not null
+  });
+
+  // T-030 (issue #50 + companion P5/F3): the takeover boundary IS the conflict target. Only a row the fork
+  // owns can match (reserved synthetic domain + same workspace). The conflict update SELF-HEALS to the
+  // "plain, live member" shape provisioning promises — resurrect (deletedAt:null), de-escalate
+  // (role:'member'), refresh name + emailVerifiedAt — but must NEVER rewrite the password or the email.
+  // Note vs the branch's original pin: `role` is now PRESENT in the update but pinned to the literal
+  // 'member'. That STRENGTHENS no-escalation (the upsert can only ever write plain-member — the value is
+  // never caller-supplied) rather than weakening it; it also matches the sibling `space_members` upsert
+  // (service-space.service.ts) which resets role + deleted_at the same way.
+  it('T-030: the upsert conflicts on (email, workspaceId) and self-heals to plain-member (never password/email, never an elevated role)', async () => {
+    const { svc, captured } = makeService(shadow());
+
+    await svc.provisionShadowUser({ externalId: EXTERNAL_ID } as any);
+
+    expect(captured.conflictColumns).toEqual(['email', 'workspaceId']);
+    const update = captured.conflictUpdate as Record<string, unknown>;
+    expect(new Set(Object.keys(update))).toEqual(
+      new Set(['name', 'emailVerifiedAt', 'deletedAt', 'role']),
+    );
+    expect(update.role).toBe('member'); // only ever the plain-member literal — no escalation vector
+    expect(update.deletedAt).toBeNull();
+    expect(update).not.toHaveProperty('password'); // a credential swap must never ride a re-provision
+    expect(update).not.toHaveProperty('email');
+  });
+
+  // T-031 (issue #50): the no-workspace guard fires BEFORE any write — never create a shadow user in an
+  // unknown/placeholder workspace.
+  it('T-031: 503s on no provisioned workspace and performs NO insert', async () => {
+    const { svc, insertInto } = makeService(shadow(), { workspaceId: null });
+    await expect(svc.provisionShadowUser({ externalId: EXTERNAL_ID } as any)).rejects.toBeInstanceOf(
+      ServiceUnavailableException,
+    );
+    expect(insertInto).not.toHaveBeenCalled();
+  });
+
+  // T-032: the display name is cosmetic; a blank one falls back to externalId (so the fork never stores an
+  // empty/blank name) and a provided one is trimmed.
+  it('T-032: blank name falls back to externalId; provided name is trimmed', async () => {
+    const blank = makeService(shadow());
+    await blank.svc.provisionShadowUser({ externalId: EXTERNAL_ID, name: '   ' } as any);
+    expect((blank.captured.values as Record<string, unknown>).name).toBe(EXTERNAL_ID);
+
+    const named = makeService(shadow());
+    await named.svc.provisionShadowUser({ externalId: EXTERNAL_ID, name: '  Alice  ' } as any);
+    expect((named.captured.values as Record<string, unknown>).name).toBe('Alice');
+  });
+
+  /**
+   * T-036 (companion issue P5 — FIXED). A soft-deleted shadow user (offboarding, DB restore to a deleted
+   * state) must become usable again on re-provision, or `mintSession` disqualifies on `deletedAt` forever.
+   * The conflict update now clears `deletedAt`, so re-provisioning the same externalId resurrects the
+   * fork-owned row. (Was committed red-on-purpose; the P5 fix flips it green.) Real-Postgres mirror: T-046.
+   */
+  it('T-036: re-provisioning a soft-deleted shadow user clears deletedAt (resurrects the row)', async () => {
+    const { svc, captured } = makeService(shadow());
+
+    await svc.provisionShadowUser({ externalId: EXTERNAL_ID } as any);
+
+    expect(captured.conflictUpdate).toMatchObject({ deletedAt: null });
   });
 });
