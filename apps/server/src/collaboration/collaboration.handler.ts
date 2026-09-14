@@ -67,13 +67,24 @@ export class CollaborationHandler {
           }
           // Drain a store that was already executing when we arrived.
           await doc.saveMutex.runExclusive(async () => undefined);
+          // Hand back the LIVE document's digest so a follow-up conditional write can name a version this
+          // server will actually recognise. The caller must not derive one from the `pages` row: content
+          // authored through the API is stored verbatim, while this serialization fills in ProseMirror's
+          // default attributes (e.g. `attrs: {indent: 0}`), so the two never hash alike until a store has
+          // rewritten the row — and a caller comparing row-derived digests against a resident document
+          // would 412 on every attempt, forever, with a re-read that never changes anything.
+          return {
+            flushed: true,
+            contentDigest: stableHash(
+              TiptapTransformer.fromYdoc(doc, 'default'),
+            ),
+          };
         } catch (err) {
           this.logger.warn(
             `flushPageContent failed for ${documentName}: ${err?.['message']}`,
           );
           return { flushed: false };
         }
-        return { flushed: true };
       },
       alterState: async (documentName: string, payload: { pageId: string }) => {
         // dummy
@@ -168,7 +179,7 @@ export class CollaborationHandler {
           prosemirrorJson: any;
           operation: string;
           user: User;
-          expectedContentHash: string;
+          expectedContentHash?: string;
         },
       ) => {
         const { prosemirrorJson, operation, user, expectedContentHash } =
@@ -184,7 +195,10 @@ export class CollaborationHandler {
             documentName,
             { user },
             (doc) => {
+              // No digest ⇒ the caller observed no live document to race with (the settle found none), so
+              // there is nothing to compare against and nothing that could be lost.
               if (
+                expectedContentHash &&
                 wasResident &&
                 stableHash(TiptapTransformer.fromYdoc(doc, 'default')) !==
                   expectedContentHash

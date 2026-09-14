@@ -27,8 +27,13 @@ import { CollaborationGateway } from '../../collaboration/collaboration.gateway'
 export class ConditionalUpdatePageDto {
   @IsString() pageId!: string;
 
-  /** The digest of the content this write expects to be replacing. */
-  @IsString() expectedContentHash!: string;
+  /**
+   * The digest of the live document this write expects to be replacing, as issued by the settle
+   * (`POST /api/collab/flush-page-content`). Optional: the settle omits it when no document was resident,
+   * and its absence means there was nothing live to race with, so the write applies unconditionally.
+   * It must NEVER be derived from stored content — see the note in stable-hash.ts.
+   */
+  @IsOptional() @IsString() expectedContentHash?: string;
 
   @IsOptional() content?: string | object;
 

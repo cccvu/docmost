@@ -6,13 +6,18 @@ import { createHash } from 'crypto';
  * Deterministic JSON: object keys sorted recursively, so key ORDER can never change the output. Cycles
  * collapse to null.
  *
- * ⚠️ CROSS-SERVICE CONTRACT. This is a deliberate byte-for-byte mirror of the platform's
- * `services/platform/src/v1/stable-stringify.ts`. The conditional page write (#282, ADR 0017) compares a
- * digest the PLATFORM computes over the `pages` row against one computed HERE over the live Y.Doc; if the
- * two normalizations ever diverge, every conditional content write 412s. The duplication is intentional —
- * the two deployables must not couple their release cycles across the AGPL boundary for a pure transform —
- * and it is pinned from both sides by `content-digest-vectors.json` in this directory, which the platform's
- * contract spec reads out of this submodule. Change one side and that test reds.
+ * BOTH SIDES OF THE CONDITIONAL WRITE HASH HERE. The settle hands the caller a digest of the live document
+ * and the conditional write compares the caller's digest against the live document again — so this is the
+ * only implementation involved, and there is deliberately no cross-service hashing contract to drift.
+ *
+ * That is not an accident of convenience: content authored through the API is stored verbatim, while
+ * `TiptapTransformer.fromYdoc` fills in ProseMirror's default attributes (e.g. `attrs: {indent: 0}`). A
+ * digest derived from the `pages` row therefore cannot equal one derived from a resident document until a
+ * store has rewritten the row — a caller comparing the two would 412 forever. The digest must always be
+ * issued by, and checked against, the same serialization.
+ *
+ * `content-digest-vectors.json` beside this file pins the transform so an accidental change (or an upstream
+ * bump that alters serialization) shows up as a red test rather than a round of surprise 412s.
  */
 export function stableStringify(value: unknown): string {
   const seen = new WeakSet<object>();

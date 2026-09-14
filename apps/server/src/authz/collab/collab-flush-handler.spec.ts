@@ -1,7 +1,10 @@
 // The handler module pulls the tiptap/yjs graph (lib0 ESM) that jest cannot parse. Only the FLUSH
 // handler is under test here and it touches none of it, so stub the heavy value-imports; the
 // `@hocuspocus/server` import is type-only and is elided by ts-jest.
-jest.mock('@hocuspocus/transformer', () => ({ TiptapTransformer: {} }));
+const fromYdoc = jest.fn(() => ({ type: 'doc', content: [] }));
+jest.mock('@hocuspocus/transformer', () => ({
+  TiptapTransformer: { fromYdoc: (...a: unknown[]) => fromYdoc(...(a as [])) },
+}));
 jest.mock('yjs', () => ({}));
 jest.mock('../../collaboration/collaboration.util', () => ({
   prosemirrorNodeToYElement: jest.fn(),
@@ -13,6 +16,7 @@ jest.mock('../../collaboration/yjs.util', () => ({
 }));
 
 import { CollaborationHandler } from '../../collaboration/collaboration.handler';
+import { stableHash } from '../page-write/stable-hash';
 
 /**
  * CCC integration test (part of the fork's compatibility suite) for the CONTENT SETTLE seam, issue 282.
@@ -51,6 +55,11 @@ describe('CollaborationHandler.flushPageContent (content settle, issue 282)', ()
     };
   };
 
+  beforeEach(() => {
+    fromYdoc.mockReset();
+    fromYdoc.mockReturnValue({ type: 'doc', content: [] });
+  });
+
   const flushOf = (hocuspocus: unknown) =>
     new CollaborationHandler().getHandlers(hocuspocus as never)
       .flushPageContent;
@@ -75,7 +84,10 @@ describe('CollaborationHandler.flushPageContent (content settle, issue 282)', ()
       executeNow,
     });
 
-    await expect(flushOf(hocuspocus)(DOC)).resolves.toEqual({ flushed: true });
+    await expect(flushOf(hocuspocus)(DOC)).resolves.toEqual({
+      flushed: true,
+      contentDigest: stableHash({ type: 'doc', content: [] }),
+    });
     expect(hocuspocus.debouncer.isDebounced).toHaveBeenCalledWith(DEBOUNCE_ID);
     expect(executeNow).toHaveBeenCalledWith(DEBOUNCE_ID);
     expect(runExclusive).toHaveBeenCalledTimes(1);
@@ -105,7 +117,10 @@ describe('CollaborationHandler.flushPageContent (content settle, issue 282)', ()
       isDebounced: jest.fn(() => false),
     });
 
-    await expect(flushOf(hocuspocus)(DOC)).resolves.toEqual({ flushed: true });
+    await expect(flushOf(hocuspocus)(DOC)).resolves.toEqual({
+      flushed: true,
+      contentDigest: stableHash({ type: 'doc', content: [] }),
+    });
     expect(hocuspocus.debouncer.executeNow).not.toHaveBeenCalled();
     expect(runExclusive).toHaveBeenCalledTimes(1);
   });
@@ -151,6 +166,43 @@ describe('CollaborationHandler.flushPageContent (content settle, issue 282)', ()
 
     await flushOf(hocuspocus)(DOC);
     expect(settled).toBe(true);
+  });
+
+  // The digest must be taken from the LIVE document, and only AFTER the pending store has run — a digest
+  // captured before it would name a version the conditional write would then reject.
+  it('returns the live document’s digest, computed after the store', async () => {
+    const order: string[] = [];
+    const { doc } = makeDoc();
+    fromYdoc.mockImplementation(() => {
+      order.push('serialize');
+      return { type: 'doc', content: [{ type: 'paragraph' }] };
+    });
+    const hocuspocus = makeHocuspocus(doc, {
+      isDebounced: jest.fn(() => true),
+      executeNow: jest.fn(async () => {
+        order.push('store');
+      }),
+    });
+
+    const result = await flushOf(hocuspocus)(DOC);
+    expect(order).toEqual(['store', 'serialize']);
+    expect(result).toEqual({
+      flushed: true,
+      contentDigest: stableHash({
+        type: 'doc',
+        content: [{ type: 'paragraph' }],
+      }),
+    });
+  });
+
+  // No digest when nothing was live: its ABSENCE is how the caller learns there was nothing to race with.
+  it('reports no digest when the document is not resident', async () => {
+    const result = (await flushOf(makeHocuspocus(null))(DOC)) as Record<
+      string,
+      unknown
+    >;
+    expect(result).toEqual({ flushed: false });
+    expect(result.contentDigest).toBeUndefined();
   });
 
   // Cross-node, a throwing custom-event handler never publishes its reply and the caller hangs until

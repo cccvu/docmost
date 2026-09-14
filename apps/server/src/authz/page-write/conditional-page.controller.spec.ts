@@ -225,12 +225,14 @@ describe('ConditionalPageController.conditionalUpdate', () => {
     });
   });
 
-  it('requires pageId and expectedContentHash, and validates operation/format when content is present', async () => {
+  it('accepts a digest-less request, and validates operation/format when content is present', async () => {
+    // expectedContentHash is OPTIONAL: the settle omits it when no document was resident, and its absence
+    // means there was nothing live to race with, so the write applies unconditionally.
     expect(
       await validate(
         plainToInstance(ConditionalUpdatePageDto, { pageId: 'p' }),
       ),
-    ).not.toHaveLength(0); // no expectedContentHash
+    ).toHaveLength(0);
     expect(
       await validate(
         plainToInstance(ConditionalUpdatePageDto, {

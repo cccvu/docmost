@@ -42,12 +42,17 @@ export class CollabFlushController {
   @Post('flush-page-content')
   async flushPageContent(
     @Body() dto: FlushPageContentDto,
-  ): Promise<{ flushed: boolean }> {
+  ): Promise<{ flushed: boolean; contentDigest?: string }> {
     // `handleYjsEvent` resolves to undefined when RedisSync is disabled; treat that as "not flushed"
     // rather than failing the caller — the platform's settle is best-effort by design.
     const result = (await this.gateway.flushPageContent(dto.pageId)) as
-      | { flushed?: boolean }
+      | { flushed?: boolean; contentDigest?: string }
       | undefined;
-    return { flushed: result?.flushed === true };
+    if (result?.flushed !== true) return { flushed: false };
+    // The live document's digest, for a follow-up conditional write. Present only when a document was
+    // actually resident — its absence is the caller's signal that nothing was live to race with.
+    return typeof result.contentDigest === 'string'
+      ? { flushed: true, contentDigest: result.contentDigest }
+      : { flushed: true };
   }
 }
