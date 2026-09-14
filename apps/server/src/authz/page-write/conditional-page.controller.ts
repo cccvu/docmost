@@ -17,7 +17,10 @@ import { User } from '@docmost/db/types/entity.types';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { PageService } from '../../core/page/services/page.service';
 import { PageAccessService } from '../../core/page/page-access/page-access.service';
-import { ContentOperation } from '../../core/page/dto/update-page.dto';
+import {
+  ContentOperation,
+  UpdatePageDto,
+} from '../../core/page/dto/update-page.dto';
 import { ContentFormat } from '../../core/page/dto/create-page.dto';
 import { CollaborationGateway } from '../../collaboration/collaboration.gateway';
 
@@ -122,17 +125,16 @@ export class ConditionalPageController {
       }
     }
 
-    // Metadata only — the content branch of PageService.update must not run a second time.
-    const updatedPage = await this.pageService.update(
-      page,
-      {
-        pageId: dto.pageId,
-        title: dto.title,
-        icon: dto.icon,
-        parentPageId: dto.parentPageId,
-      } as never,
-      user,
-    );
+    // Metadata only — `content`/`operation`/`format` are deliberately omitted, so PageService.update's
+    // content branch (guarded on all three being present) cannot run a second time, while its row bump,
+    // lastUpdatedById, contributorIds and watcher enqueue stay identical to the ordinary update path.
+    const metadataOnly: UpdatePageDto = {
+      pageId: dto.pageId,
+      title: dto.title,
+      icon: dto.icon,
+      parentPageId: dto.parentPageId,
+    };
+    const updatedPage = await this.pageService.update(page, metadataOnly, user);
 
     return { ...updatedPage, permissions: { canEdit: true, hasRestriction } };
   }
