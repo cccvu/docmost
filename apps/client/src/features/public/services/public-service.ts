@@ -74,6 +74,10 @@ export interface IPasswordlessVerifyResponse {
   id: string;
   email: string;
   workspaceId: string;
+  // Set (#302) when this browser began an MCP OAuth flow before signing in: the platform saw the HttpOnly
+  // `oauth_resume` handle on the verify request and is telling the SPA to resume `/oauth/authorize` (a
+  // full-page navigation back to a platform route) instead of going to the wiki home.
+  resume?: boolean;
 }
 
 // Verify EITHER a magic-link token OR an email + OTP. On success the platform sets the session cookie;
