@@ -48,6 +48,8 @@ describe("usePasswordless().completeSignIn — verify → BFF bridge → navigat
     const navOrder = navigateMock.mock.invocationCallOrder[0];
     expect(verifyOrder).toBeLessThan(bridgeOrder);
     expect(bridgeOrder).toBeLessThan(navOrder);
+    // Normal (non-resume) path: the spinner is CLEARED (the redirect-hold only applies to the resume branch).
+    expect(result.current.isVerifying).toBe(false);
   });
 
   it("rolls back (logout) and does NOT navigate if the BFF bridge fails", async () => {
@@ -60,6 +62,7 @@ describe("usePasswordless().completeSignIn — verify → BFF bridge → navigat
 
     expect(logout).toHaveBeenCalledTimes(1); // platform session rolled back
     expect(navigateMock).not.toHaveBeenCalled(); // no 401 redirect loop
+    expect(result.current.isVerifying).toBe(false); // spinner cleared on the error path (no stuck spinner)
   });
 
   // INVARIANT (issue #52, PR 48 Round-2 test re-review): when the compensating rollback logout() ITSELF
