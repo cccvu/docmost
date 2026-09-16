@@ -50,6 +50,11 @@ export function usePasswordless() {
     args: { token: string } | { email: string; otp: string },
   ): Promise<void> {
     setIsVerifying(true);
+    // On the resume branch we hand off to a FULL-PAGE navigation, which does not tear the page down
+    // synchronously — so clearing `isVerifying` in `finally` would re-enable the sign-in button mid-navigation
+    // and invite a double-submit that re-verifies an already-consumed OTP/token (a confusing "invalid code"
+    // flash). Keep the spinner up through the redirect, matching use-auth.ts (#302 review, Frontend).
+    let redirecting = false;
     try {
       const res = await verifyPasswordless(args); // throws => invalid / expired / already-used code or link
 
@@ -65,6 +70,7 @@ export function usePasswordless() {
         } catch {
           // non-fatal on the resume path — the platform session alone satisfies /oauth/authorize + consent.
         }
+        redirecting = true;
         window.location.assign("/oauth/authorize");
         return;
       }
@@ -80,7 +86,9 @@ export function usePasswordless() {
       }
       navigate(getPostLoginRedirect());
     } finally {
-      setIsVerifying(false);
+      // Leave the spinner up when a full-page redirect is under way (see above); only clear it for in-SPA
+      // outcomes and for any thrown/error path, where the page stays and the button must return to idle.
+      if (!redirecting) setIsVerifying(false);
     }
   }
 

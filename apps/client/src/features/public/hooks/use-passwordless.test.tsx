@@ -139,6 +139,8 @@ describe("usePasswordless().completeSignIn — OAuth resume (#302)", () => {
     expect(logout).not.toHaveBeenCalled();
     // the bridge runs before the resume navigation
     expect((openDocmostSession as any).mock.invocationCallOrder[0]).toBeLessThan(assign.mock.invocationCallOrder[0]);
+    // The spinner stays UP through the full-page redirect (never re-enable the button mid-nav → no double-submit).
+    expect(result.current.isVerifying).toBe(true);
   });
 
   it("on resume: a bridge FAILURE is non-fatal — still resumes /oauth/authorize and does NOT logout (platform session preserved)", async () => {
@@ -154,5 +156,6 @@ describe("usePasswordless().completeSignIn — OAuth resume (#302)", () => {
     expect(logout).not.toHaveBeenCalled(); // never wipe the platform session the OAuth resume needs
     expect(assign).toHaveBeenCalledWith("/oauth/authorize"); // resume completes on the platform session alone
     expect(navigateMock).not.toHaveBeenCalled();
+    expect(result.current.isVerifying).toBe(true); // spinner held through the redirect even on a bridge failure
   });
 });
