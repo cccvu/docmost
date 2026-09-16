@@ -168,6 +168,13 @@ export default function PasswordlessLogin() {
                     autoComplete="email"
                     required
                     w="100%"
+                    // Focus follows the field that is actually empty. Arriving via "I already have a
+                    // code" there is no address yet, so focusing the PinInput would skip straight past
+                    // it — and because Mantine puts `disabled` on the submit button as the NATIVE
+                    // attribute, that button leaves the tab order while either field is incomplete. The
+                    // next Tab from the last code cell would then land on "Resend email", whose Enter
+                    // supersedes the code just typed. Focusing here keeps the order honest.
+                    autoFocus={!sent}
                     value={email}
                     onChange={(e) => setEmail(e.currentTarget.value)}
                   />
@@ -176,7 +183,9 @@ export default function PasswordlessLogin() {
                     type="number"
                     inputMode="numeric"
                     oneTimeCode
-                    autoFocus
+                    // Only when we just sent the email: then the address is already known and the code
+                    // is the empty field. See the note on the TextInput above.
+                    autoFocus={sent}
                     value={otp}
                     onChange={setOtp}
                     aria-label={t("One-time code")}
@@ -209,6 +218,10 @@ export default function PasswordlessLogin() {
                     }
                   }}
                   loading={isRequesting}
+                  // Reachable with a blank address since the entry guard moved to this step. Firing
+                  // requestEmail("") surfaces the catch-all "we couldn't send" toast, which blames a
+                  // transient outage for an empty field sitting visibly above it.
+                  disabled={!email.trim()}
                 >
                   {t("Resend email")}
                 </Button>

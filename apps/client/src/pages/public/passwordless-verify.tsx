@@ -145,7 +145,7 @@ export default function PasswordlessVerify() {
                 {t("sign-in page")}
               </Anchor>
               {t(
-                ' and choose "I already have a code". If it has expired, request a new email from the same page.',
+                ' and choose "I already have a code". If the code has expired, request a new email from the same page.',
               )}
             </Alert>
           ) : (

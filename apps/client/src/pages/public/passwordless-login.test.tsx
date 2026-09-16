@@ -135,7 +135,33 @@ describe("PasswordlessLogin — the OTP is reachable without destroying it", () 
     expect(requestEmail).not.toHaveBeenCalled();
   });
 
-  it("will not submit a code without an address — the pair is verified together", async () => {
+  // The previous version of this test asserted only that nothing happened, and was satisfied by the HTML
+  // `required` attribute rather than by either guard it named: deleting `!email.trim()` from the button's
+  // `disabled`, from the `onVerify` guard, or from BOTH left it green. A "did not happen" assertion with
+  // no positive control on the same path is exactly how that drifts. These two pin each guard directly and
+  // each carries its own positive control.
+
+  it("DISABLES the submit button until both an address and a full code are present", async () => {
+    renderLogin();
+    fireEvent.click(
+      screen.getByRole("button", { name: /i already have a code/i }),
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText(/one-time code/i)).toBeTruthy(),
+    );
+    const submit = screen.getByRole("button", { name: /sign in with code/i });
+
+    fillOtp();
+    // A full code but no address: the button must still be out of reach.
+    expect(submit.hasAttribute("disabled")).toBe(true);
+
+    // POSITIVE CONTROL on the same path — with the address supplied it must become reachable, otherwise
+    // the assertion above would pass against a button that is simply always disabled.
+    typeEmail();
+    await waitFor(() => expect(submit.hasAttribute("disabled")).toBe(false));
+  });
+
+  it("onVerify itself refuses a blank address, independently of the button and of `required`", async () => {
     renderLogin();
     fireEvent.click(
       screen.getByRole("button", { name: /i already have a code/i }),
@@ -144,9 +170,68 @@ describe("PasswordlessLogin — the OTP is reachable without destroying it", () 
       expect(screen.getByLabelText(/one-time code/i)).toBeTruthy(),
     );
     fillOtp();
-    fireEvent.click(screen.getByRole("button", { name: /sign in with code/i }));
+
+    // Submitting the FORM directly bypasses both the disabled button and native `required` validation,
+    // so what is left is the guard inside onVerify — and nothing else.
+    const form = document.querySelector("form") as HTMLFormElement;
+    fireEvent.submit(form);
     await new Promise((r) => setTimeout(r, 20));
     expect(completeSignIn).not.toHaveBeenCalled();
+
+    // POSITIVE CONTROL: the same direct submit must go through once an address is present, proving the
+    // refusal above came from the guard rather than from the submit never reaching the handler.
+    typeEmail();
+    fireEvent.submit(form);
+    await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
+  });
+
+  it("FOCUSES the empty address field when arriving without one", async () => {
+    // Focus has to follow the field that is actually empty. If it stays on the PinInput, mount focus
+    // skips the address entirely — and since Mantine renders the submit button's `disabled` as the
+    // native attribute, that button leaves the tab order, so one Tab from the last code cell lands on
+    // "Resend email", whose Enter supersedes the code the user just typed.
+    renderLogin();
+    fireEvent.click(
+      screen.getByRole("button", { name: /i already have a code/i }),
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText(/one-time code/i)).toBeTruthy(),
+    );
+    expect(document.activeElement).toBe(screen.getByLabelText(/email/i));
+
+    // In this exact state, "Resend email" must also be out of reach: firing requestEmail("") surfaces
+    // the catch-all "we couldn't send" toast, blaming a transient outage for the empty field above it.
+    expect(
+      screen
+        .getByRole("button", { name: /resend email/i })
+        .hasAttribute("disabled"),
+    ).toBe(true);
+    // Positive control — it comes back once there is an address to resend to.
+    typeEmail();
+    await waitFor(() =>
+      expect(
+        screen
+          .getByRole("button", { name: /resend email/i })
+          .hasAttribute("disabled"),
+      ).toBe(false),
+    );
+  });
+
+  it("FOCUSES the code field when we just sent the email", async () => {
+    // Positive control for the pair: on this path the address is already known, so the code is the
+    // empty field and focus belongs there. Without this, `autoFocus={false}` on both would pass above.
+    renderLogin();
+    typeEmail();
+    fireEvent.click(
+      screen.getByRole("button", { name: /email me a sign-in link and code/i }),
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText(/one-time code/i)).toBeTruthy(),
+    );
+    const cells = Array.from(
+      document.querySelectorAll<HTMLInputElement>('input[inputmode="numeric"]'),
+    );
+    expect(cells).toContain(document.activeElement as HTMLInputElement);
   });
 
   it("RETURNS to the email step via 'Use a different email'", async () => {
@@ -197,6 +282,11 @@ describe("PasswordlessLogin — the OTP is reachable without destroying it", () 
           .slice(0, 6)
           .every((i) => i.value === ""),
       ).toBe(true),
+    );
+    // ...and the copy flips to the sent wording, which is the other half of `setSent(true)`. Without
+    // this the success branch was unasserted in either direction: dropping it left the suite green.
+    await waitFor(() =>
+      expect(screen.getByText(/Check your email/i)).toBeTruthy(),
     );
   });
 
