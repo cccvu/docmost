@@ -7,7 +7,7 @@ import { ConditionalPageController } from './conditional-page.controller';
 /**
  * CCC authorization integration — NOT upstream Docmost code.
  *
- * Mounts the compare-and-swap page write (#282, ADR 0017). Imports PageModule for `PageService` (the
+ * Mounts the compare-and-swap page write (#282, ADR 0019). Imports PageModule for `PageService` (the
  * shared content parser + the metadata update, so this path keeps the ordinary update's side effects),
  * PageAccessModule for the `validateCanEdit` re-check, and CollaborationModule for the gateway that routes
  * the conditional apply to the doc-owning node. PageRepo comes from the @Global DatabaseModule.

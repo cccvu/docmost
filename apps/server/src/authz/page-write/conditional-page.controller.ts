@@ -42,7 +42,7 @@ export class ConditionalUpdatePageDto extends UpdatePageDto {
 /**
  * CCC authorization integration — NOT upstream Docmost code.
  *
- * A COMPARE-AND-SWAP page write (#282, ADR 0017). `POST /api/pages/update` applies content
+ * A COMPARE-AND-SWAP page write (#282, ADR 0019). `POST /api/pages/update` applies content
  * unconditionally, so a caller that verified a version a moment earlier can still overwrite a keystroke
  * that landed in between — and because pages are edited live over the collab websocket, "in between"
  * is a real interval, not a theoretical one. Here the version check happens INSIDE the Yjs transaction

@@ -19,7 +19,7 @@ import {
 } from './conditional-page.controller';
 
 /**
- * Compare-and-swap page write (#282, ADR 0017) — the request-level contract.
+ * Compare-and-swap page write (#282, ADR 0019) — the request-level contract.
  *
  * What these pin, in order of importance:
  *   1. the fork still re-enforces authorization itself (the "suspenders" half of the platform/fork

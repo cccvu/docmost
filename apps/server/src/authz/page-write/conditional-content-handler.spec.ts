@@ -25,7 +25,7 @@ import { CollaborationHandler } from '../../collaboration/collaboration.handler'
 import { stableHash } from './stable-hash';
 
 /**
- * Compare-and-swap content write (#282, ADR 0017).
+ * Compare-and-swap content write (#282, ADR 0019).
  *
  * The guarantee: the version check and the mutation happen in the SAME synchronous transaction callback,
  * so a websocket frame — a person typing — cannot land between them. These tests pin that; that a refusal

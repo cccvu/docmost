@@ -1,5 +1,5 @@
 {
-  "$comment": "Regression fixture for the conditional page write's content digest (#282, ADR 0017). The settle issues a digest of the live document and the conditional write re-derives one from it, so a change to this transform silently invalidates every in-flight digest and produces a round of surprise 412s. Pinning it here turns that into a red test. Regenerate deliberately, never to make a test pass.",
+  "$comment": "Regression fixture for the conditional page write's content digest (#282, ADR 0019). The settle issues a digest of the live document and the conditional write re-derives one from it, so a change to this transform silently invalidates every in-flight digest and produces a round of surprise 412s. Pinning it here turns that into a red test. Regenerate deliberately, never to make a test pass.",
   "algorithm": "sha256(stableStringify(value)) — recursive key sort, cycles to null, hex digest",
   "vectors": [
     {

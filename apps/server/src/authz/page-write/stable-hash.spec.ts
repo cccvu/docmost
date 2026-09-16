@@ -3,7 +3,7 @@ import { join } from 'path';
 import { stableHash, stableStringify } from './stable-hash';
 
 /**
- * The conditional page write's digest (#282, ADR 0017).
+ * The conditional page write's digest (#282, ADR 0019).
  *
  * The settle issues a digest of the live document and the conditional write re-derives one from the live
  * document, so this is the only implementation in play — there is no cross-service contract to drift. What
