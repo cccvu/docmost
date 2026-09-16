@@ -54,7 +54,8 @@ export default function PasswordlessLogin() {
 
   async function onVerify(e: FormEvent) {
     e.preventDefault();
-    if (otp.length < 6) return;
+    // The address can legitimately be blank here: "I already have a code" reaches this step without one.
+    if (!email.trim() || otp.length < 6) return;
     try {
       await completeSignIn({ email: email.trim(), otp });
     } catch (err) {
@@ -122,13 +123,18 @@ export default function PasswordlessLogin() {
                 Needs the address because completeSignIn verifies { email, otp } as a pair.
               */}
               <Text ta="center" mt="xs" size="sm" c="dimmed">
+                {/*
+                  NEVER `disabled`. Mantine's Anchor ships no `:disabled` rule — its only styling is the link
+                  colour, a pointer cursor and a hover underline — so a disabled one looks completely live and
+                  swallows the click in silence. The user's next move is then "Email me a sign-in link and
+                  code", which supersedes the very code they came to redeem: the #319 failure arriving through
+                  a different door. The address is collected on the next step instead, where it is visible and
+                  correctable.
+                */}
                 <Anchor
                   component="button"
                   type="button"
-                  disabled={!email.trim()}
-                  onClick={() => {
-                    if (email.trim()) setHaveCode(true);
-                  }}
+                  onClick={() => setHaveCode(true)}
                 >
                   {t("I already have a code")}
                 </Anchor>
@@ -148,6 +154,23 @@ export default function PasswordlessLogin() {
               </Text>
               <form onSubmit={onVerify}>
                 <Stack align="center" gap="md">
+                  {/*
+                    The address is shown and editable HERE, not hidden behind the previous step. The code is
+                    verified as an { email, otp } PAIR, so a typo comes back as "That code is invalid, expired,
+                    or already used" — blaming the code and sending the user to request a new one, which
+                    destroys the good code they were holding. Showing the pair makes the real mistake fixable.
+                  */}
+                  <TextInput
+                    id="verify-email"
+                    type="email"
+                    label={t("Email")}
+                    placeholder="email@example.edu"
+                    autoComplete="email"
+                    required
+                    w="100%"
+                    value={email}
+                    onChange={(e) => setEmail(e.currentTarget.value)}
+                  />
                   <PinInput
                     length={6}
                     type="number"
@@ -162,7 +185,7 @@ export default function PasswordlessLogin() {
                     type="submit"
                     fullWidth
                     loading={isVerifying}
-                    disabled={otp.length < 6}
+                    disabled={otp.length < 6 || !email.trim()}
                   >
                     {t("Sign in with code")}
                   </Button>
@@ -175,10 +198,15 @@ export default function PasswordlessLogin() {
                 <Button
                   variant="subtle"
                   size="xs"
-                  onClick={() => {
-                    setOtp("");
-                    setSent(true);
-                    void requestEmail(email.trim());
+                  onClick={async () => {
+                    // Await the result before claiming anything. `requestEmail` resolves false rather than
+                    // throwing, so an optimistic `setSent(true)` would permanently flip the copy to "Check
+                    // your email" for a message that never went — and would clear the code the user is
+                    // holding on the way. Mirrors onRequest, which already gets this right.
+                    if (await requestEmail(email.trim())) {
+                      setOtp("");
+                      setSent(true);
+                    }
                   }}
                   loading={isRequesting}
                 >
