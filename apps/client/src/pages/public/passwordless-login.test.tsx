@@ -65,7 +65,7 @@ function renderLogin() {
   );
 }
 
-function typeEmail(value = "user@vanderbilt.edu") {
+function typeEmail(value = "user@example.edu") {
   fireEvent.change(screen.getByLabelText(/email/i), { target: { value } });
 }
 
@@ -105,7 +105,7 @@ describe("PasswordlessLogin — the OTP is reachable without destroying it", () 
 
     await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
     expect(completeSignIn).toHaveBeenCalledWith({
-      email: "user@vanderbilt.edu",
+      email: "user@example.edu",
       otp: "111111",
     });
     expect(requestEmail).not.toHaveBeenCalled();
@@ -128,6 +128,6 @@ describe("PasswordlessLogin — the OTP is reachable without destroying it", () 
       screen.getByRole("button", { name: /email me a sign-in link and code/i }),
     );
     await waitFor(() => expect(requestEmail).toHaveBeenCalledTimes(1));
-    expect(requestEmail).toHaveBeenCalledWith("user@vanderbilt.edu");
+    expect(requestEmail).toHaveBeenCalledWith("user@example.edu");
   });
 });
