@@ -57,7 +57,11 @@ d('AuthzOutboxInstaller on real Postgres (legacy upgrade, idempotence, trigger c
   // Mirror the production Kysely config (database.module.ts): int8/numeric parse to number, xid8 stays a
   // string, CamelCasePlugin on the result keys. The `connection.search_path` pins every unqualified name
   // (the installer's DDL, the feed's reads, the trigger function's `page_access` lookup) to this spec's schema.
-  const mkPg = (max: number): postgres.Sql =>
+  // `Sql<{ bigint: number }>`, not the bare `postgres.Sql` (= `Sql<{}>`): the custom `types.bigint`
+  // passed below is part of the returned type, so the bare annotation is a genuine mismatch. It only
+  // surfaces where the SPEC files are type-checked (ts-jest) — `tsconfig.build.json` excludes them —
+  // which is why it sat latent until a CI lane compiled them.
+  const mkPg = (max: number): postgres.Sql<{ bigint: number }> =>
     postgres(PG_URL as string, {
       max,
       onnotice: () => {},
@@ -75,8 +79,8 @@ d('AuthzOutboxInstaller on real Postgres (legacy upgrade, idempotence, trigger c
   const ENV = ['AUTHZ_OUTBOX_INSTALL_MAX_ATTEMPTS', 'AUTHZ_OUTBOX_INSTALL_RETRY_MS'] as const;
   const savedEnv: Record<string, string | undefined> = {};
 
-  let pg: postgres.Sql;
-  let appPg: postgres.Sql;
+  let pg: postgres.Sql<{ bigint: number }>;
+  let appPg: postgres.Sql<{ bigint: number }>;
   let db: Kysely<any>;
   let installer: AuthzOutboxInstaller;
   let feed: AuthzChangeFeedService;
