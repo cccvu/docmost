@@ -36,7 +36,11 @@ describe('real-PG commit-safety gate', () => {
 
 d('AuthzChangeFeedService — real-Postgres commit-safety (Group D R2)', () => {
   // Mirror the production Kysely config so id parses to number and xid8 stays a string (see database.module).
-  const mkPg = (max: number): postgres.Sql =>
+  // `Sql<{ bigint: number }>`, not the bare `postgres.Sql` (= `Sql<{}>`): the custom `types.bigint`
+  // passed below is part of the returned type, so the bare annotation is a genuine mismatch. It only
+  // surfaces where the SPEC files are type-checked (ts-jest) — `tsconfig.build.json` excludes them —
+  // which is why it sat latent until a CI lane compiled them.
+  const mkPg = (max: number): postgres.Sql<{ bigint: number }> =>
     postgres(PG_URL as string, {
       max,
       onnotice: () => {},
@@ -50,8 +54,8 @@ d('AuthzChangeFeedService — real-Postgres commit-safety (Group D R2)', () => {
       },
     });
 
-  let admin: postgres.Sql;
-  let feedPg: postgres.Sql;
+  let admin: postgres.Sql<{ bigint: number }>;
+  let feedPg: postgres.Sql<{ bigint: number }>;
   let db: Kysely<any>;
   let feed: AuthzChangeFeedService;
   let a: postgres.ReservedSql;

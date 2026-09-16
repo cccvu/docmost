@@ -61,7 +61,11 @@ const tupleGt = (a: Tuple, b: Tuple): boolean =>
   BigInt(a.xactId) !== BigInt(b.xactId) ? BigInt(a.xactId) > BigInt(b.xactId) : a.id > b.id;
 
 d('AuthzChangeFeedService retention on real Postgres (gc sweep + stale-cursor mark)', () => {
-  const mkPg = (max: number): postgres.Sql =>
+  // `Sql<{ bigint: number }>`, not the bare `postgres.Sql` (= `Sql<{}>`): the custom `types.bigint`
+  // passed below is part of the returned type, so the bare annotation is a genuine mismatch. It only
+  // surfaces where the SPEC files are type-checked (ts-jest) — `tsconfig.build.json` excludes them —
+  // which is why it sat latent until a CI lane compiled them.
+  const mkPg = (max: number): postgres.Sql<{ bigint: number }> =>
     postgres(PG_URL as string, {
       max,
       onnotice: () => {},
@@ -76,8 +80,8 @@ d('AuthzChangeFeedService retention on real Postgres (gc sweep + stale-cursor ma
       },
     });
 
-  let pg: postgres.Sql;
-  let appPg: postgres.Sql;
+  let pg: postgres.Sql<{ bigint: number }>;
+  let appPg: postgres.Sql<{ bigint: number }>;
   let db: Kysely<any>;
   let feed: AuthzChangeFeedService;
   let warnSpy: jest.SpyInstance;
