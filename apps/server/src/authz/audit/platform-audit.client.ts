@@ -9,6 +9,26 @@ import { Injectable, Logger } from '@nestjs/common';
  * is swallowed (logged at warn). Best-effort by design — the high-value authN + authz-decision events
  * are captured on the platform side synchronously; a durable audit-outbox is a documented enhancement.
  */
+/**
+ * Raw transport evidence for ONE event — data, never an address.
+ *
+ * The platform resolves this against its own trust predicate rather than believing a value we computed
+ * (wiki-v2 #320). `socketPeer` is what makes the object usable, so send it whenever you send the object
+ * at all and omit the object entirely when there is no peer — never send a peerless one. The sink treats
+ * a supplied `clientEvidence` as AUTHORITATIVE, so `forwardedFor` on its own is recorded as a refusal,
+ * which would mislabel a torn-down socket as a forgery attempt. `forwardedFor` itself is optional: a
+ * request that carried no `X-Forwarded-For` legitimately yields `{ socketPeer }` alone.
+ *
+ * Exactly these two keys and no others. The platform validates with `forbidNonWhitelisted`, and one
+ * unknown nested key 400s the WHOLE batch (up to 500 events), which this client swallows as a warn.
+ */
+export interface AuditClientEvidence {
+  /** The peer address of the socket Docmost served the request on — the chain's hop 0. */
+  socketPeer?: string;
+  /** The raw `X-Forwarded-For` header, comma-separated, exactly as received. Never parsed here. */
+  forwardedFor?: string;
+}
+
 export interface AuditIngestEvent {
   event: string;
   resourceType: string;
@@ -19,7 +39,13 @@ export interface AuditIngestEvent {
   actorId?: string;
   actorType?: 'user' | 'system' | 'api_key';
   workspaceId?: string;
+  /**
+   * LEGACY. Docmost's own `request.ip`, which at middleware time is the unvalidated leftmost
+   * `X-Forwarded-For` token. Still sent so an older platform build keeps working; the platform ignores
+   * it whenever `clientEvidence` is present.
+   */
   ipAddress?: string;
+  clientEvidence?: AuditClientEvidence;
   userAgent?: string;
 }
 
@@ -39,10 +65,13 @@ export class PlatformAuditClient {
         body: JSON.stringify({ events }),
       });
       if (!res.ok) {
-        this.logger.warn(`audit ingest -> HTTP ${res.status} (${events.length} event(s) dropped)`);
+        // AUDIT_FORWARD_FAILED opens the line so the drop is greppable and alarmable. Without a token this
+        // failure is invisible: the forward is fire-and-forget, so a systematic rejection (a contract
+        // mismatch, say) would drop EVERY event while the request path stays perfectly healthy.
+        this.logger.warn(`AUDIT_FORWARD_FAILED http status=${res.status} dropped=${events.length}`);
       }
     } catch (e) {
-      this.logger.warn(`audit ingest failed: ${(e as Error).message} (${events.length} event(s) dropped)`);
+      this.logger.warn(`AUDIT_FORWARD_FAILED transport error=${(e as Error).message} dropped=${events.length}`);
     }
   }
 }

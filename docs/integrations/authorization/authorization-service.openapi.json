@@ -321,7 +321,11 @@
                     "resourceId": "pg-1",
                     "actorId": "d-1",
                     "actorType": "user",
-                    "workspaceId": "ws-1"
+                    "workspaceId": "ws-1",
+                    "clientEvidence": {
+                      "socketPeer": "172.31.20.10",
+                      "forwardedFor": "198.51.100.7, 107.22.62.237"
+                    }
                   }
                 ]
               }
@@ -414,8 +418,18 @@
           "actorId": { "type": "string" },
           "actorType": { "type": "string", "enum": ["user", "system", "api_key"] },
           "workspaceId": { "type": "string" },
-          "ipAddress": { "type": "string" },
+          "ipAddress": { "type": "string", "description": "LEGACY. Docmost's own request.ip, which is the unvalidated leftmost X-Forwarded-For token. Ignored by the sink whenever clientEvidence is present; kept so an older sink still works." },
+          "clientEvidence": { "$ref": "#/components/schemas/AuditClientEvidence" },
           "userAgent": { "type": "string" }
+        }
+      },
+      "AuditClientEvidence": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Raw transport evidence for one event — data, never an address. The sink resolves it against its own trusted-proxy predicate instead of believing an address the forwarder computed. PRODUCERS must send socketPeer whenever they send this object at all, and omit the object entirely when no peer is available: a supplied clientEvidence is authoritative, so a peerless one is recorded as a refusal rather than guessed at. That obligation is deliberately NOT expressed as `required`, because a SINK must still accept a peerless object and record the refusal — rejecting it would fail a whole batch (up to maxItems events) over one malformed entry, turning a spoofing attempt into audit loss. forwardedFor is optional and absent when the request carried no such header.",
+        "properties": {
+          "socketPeer": { "type": "string", "description": "Peer address of the socket the forwarder served the request on — the chain's hop 0." },
+          "forwardedFor": { "type": "string", "description": "The raw X-Forwarded-For header, comma-separated, exactly as received. Not parsed by the forwarder." }
         }
       },
       "Error": {
