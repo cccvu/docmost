@@ -1,9 +1,10 @@
 import { Injectable } from '@nestjs/common';
-import { ClsService } from 'nestjs-cls';
+import type { IncomingMessage } from 'node:http';
+import { CLS_REQ, ClsService } from 'nestjs-cls';
 import { AuditContext, AUDIT_CONTEXT_KEY } from '../../common/middlewares/audit-context.middleware';
 import { AuditLogContext, IAuditService } from '../../integrations/audit/audit.service';
 import { ActorType, AuditLogPayload } from '../../common/events/audit-events';
-import { AuditIngestEvent, PlatformAuditClient } from './platform-audit.client';
+import { AuditClientEvidence, AuditIngestEvent, PlatformAuditClient } from './platform-audit.client';
 
 /**
  * CCC audit integration — NOT upstream Docmost code.
@@ -29,8 +30,18 @@ export class PlatformAuditService implements IAuditService {
     private readonly client: PlatformAuditClient,
   ) {}
 
+  /**
+   * Evidence rides ONLY with the CLS-derived context, never with a caller-supplied one.
+   *
+   * `logWithContext` / `logBatchWithContext` exist so a caller can state the context explicitly — today
+   * that is the import worker, which runs on a queue with no request in scope. If those paths also read
+   * ambient CLS, an event's actor would come from the caller while its network origin came from whatever
+   * request happened to be on the stack: two halves of one provenance claim from different sources,
+   * written into a hash-chained log. Benign now, but `IAuditService` is an upstream-owned interface, so a
+   * future upstream caller could invoke it mid-request and silently attribute the wrong socket peer.
+   */
   log(payload: AuditLogPayload): void {
-    void this.client.forward([this.toEvent(payload, this.currentContext())]);
+    void this.client.forward([this.toEvent(payload, this.currentContext(), this.clientEvidence())]);
   }
 
   logWithContext(payload: AuditLogPayload, context: AuditLogContext): void {
@@ -68,6 +79,7 @@ export class PlatformAuditService implements IAuditService {
         workspaceId,
         actorId: ctx?.actorId,
         actorType: ctx?.actorType,
+        clientEvidence: this.clientEvidence(),
         metadata: { retentionDays },
       },
     ]);
@@ -85,7 +97,40 @@ export class PlatformAuditService implements IAuditService {
     };
   }
 
-  private toEvent(payload: AuditLogPayload, context?: ForwardContext): AuditIngestEvent {
+  /**
+   * Raw transport evidence for the request in scope, for the platform to resolve itself (#320).
+   *
+   * Why this is read HERE and not taken from the audit context: `AuditContext.ipAddress` is Docmost's
+   * `request.ip`, and at middleware time — where that context is captured — Nest's middie hook runs
+   * BEFORE `fastify-ip`'s, so the value is Fastify's `trustProxy: true` result: the LEFTMOST
+   * `X-Forwarded-For` token, never parsed as an address. A client picks it. `platform-audit.wiring.spec.ts`
+   * pins that ordering, because it is the whole reason this method exists.
+   *
+   * `CLS_REQ` is nestjs-cls's own key (`saveReq` defaults to true, and `ClsModule.forRoot` is mounted
+   * globally in `app.module.ts`), and Nest runs every middleware through middie with the RAW node
+   * request — so the untouched socket peer and header are reachable from this CCC-owned service without
+   * modifying a single upstream file.
+   */
+  private clientEvidence(): AuditClientEvidence | undefined {
+    const req = this.cls.get<IncomingMessage | undefined>(CLS_REQ);
+    // No request in scope (a background job, or a route outside the CLS middleware) — nothing to claim.
+    const socketPeer = req?.socket?.remoteAddress;
+    // Together-or-neither: the platform treats supplied evidence as authoritative and records a refusal
+    // when it cannot resolve a peer, so sending `forwardedFor` alone would mislabel a torn-down socket as
+    // a forgery attempt. With no peer we send nothing and let the platform fall back to the legacy field.
+    if (!socketPeer) return undefined;
+    const raw = req?.headers?.['x-forwarded-for'];
+    // Typed `string | string[]` because IncomingHttpHeaders has no declared key for it. Node comma-joins
+    // repeated header lines, so the array branch is unreachable in practice — narrowed, not cast away.
+    const forwardedFor = Array.isArray(raw) ? raw.join(', ') : raw;
+    return forwardedFor ? { socketPeer, forwardedFor } : { socketPeer };
+  }
+
+  private toEvent(
+    payload: AuditLogPayload,
+    context?: ForwardContext,
+    clientEvidence?: AuditClientEvidence,
+  ): AuditIngestEvent {
     return {
       event: payload.event,
       resourceType: payload.resourceType,
@@ -97,6 +142,7 @@ export class PlatformAuditService implements IAuditService {
       actorType: context?.actorType,
       workspaceId: context?.workspaceId,
       ipAddress: context?.ipAddress,
+      clientEvidence,
       userAgent: context?.userAgent,
     };
   }
