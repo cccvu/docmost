@@ -43,7 +43,9 @@ describe('audit client-IP wiring (#320)', () => {
     it('still constructs the adapter with trustProxy: true', () => {
       // If this ever becomes a predicate or a hop count, middleware-time request.ip changes meaning and
       // the ordering assertions below need re-deriving before anything downstream is trusted.
-      expect(mainSrc).toMatch(/trustProxy:\s*true/);
+      // Anchored to a code line: an unanchored pattern also matches the word inside a comment, so the
+      // pin would keep passing after the real setting was changed or removed.
+      expect(mainSrc).toMatch(/^\s*trustProxy:\s*true\s*,?\s*$/m);
     });
 
     it('still registers fastify-ip AFTER NestFactory.create', () => {
@@ -135,9 +137,13 @@ describe('audit client-IP wiring (#320)', () => {
       expect(appModuleSrc).toMatch(/middleware:\s*\{[^}]*mount:\s*true/s);
     });
 
-    it('never disables saveReq, which is what puts the request in CLS', () => {
+    it('never configures saveReq at all, so the request is always in CLS', () => {
+      // Deliberately stricter than "not false": `saveReq: someExpression` — an env flag, say — would
+      // disable it in production while every test stayed green, since the probe below builds its own
+      // config and the source pin would match nothing. The default is what we depend on, so the
+      // assertion is that nobody has reached for the knob.
       const appModuleSrc = readFileSync(join(__dirname, '..', '..', 'app.module.ts'), 'utf8');
-      expect(appModuleSrc).not.toMatch(/saveReq:\s*false/);
+      expect(appModuleSrc).not.toMatch(/saveReq\s*:/);
     });
 
     it('actually populates CLS_REQ with the raw request, socket and headers intact', async () => {

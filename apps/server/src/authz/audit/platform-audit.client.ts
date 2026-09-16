@@ -13,9 +13,11 @@ import { Injectable, Logger } from '@nestjs/common';
  * Raw transport evidence for ONE event — data, never an address.
  *
  * The platform resolves this against its own trust predicate rather than believing a value we computed
- * (wiki-v2 #320). Send both fields together or omit the object entirely: the platform treats a supplied
- * `clientEvidence` as AUTHORITATIVE, so `forwardedFor` on its own — no usable `socketPeer` — is recorded
- * as a refusal, which would mislabel a destroyed socket as a forgery attempt.
+ * (wiki-v2 #320). `socketPeer` is what makes the object usable, so send it whenever you send the object
+ * at all and omit the object entirely when there is no peer — never send a peerless one. The sink treats
+ * a supplied `clientEvidence` as AUTHORITATIVE, so `forwardedFor` on its own is recorded as a refusal,
+ * which would mislabel a torn-down socket as a forgery attempt. `forwardedFor` itself is optional: a
+ * request that carried no `X-Forwarded-For` legitimately yields `{ socketPeer }` alone.
  *
  * Exactly these two keys and no others. The platform validates with `forbidNonWhitelisted`, and one
  * unknown nested key 400s the WHOLE batch (up to 500 events), which this client swallows as a warn.

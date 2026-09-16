@@ -43,6 +43,25 @@ describe('PlatformAuditClient (fire-and-forget forwarder)', () => {
     fetchMock.mockRejectedValueOnce(new Error('ECONNREFUSED'));
     await expect(client.forward([evt])).resolves.toBeUndefined();
   });
+
+  /**
+   * The dropped-batch warning is the ONLY signal that forwarded audit is being lost — the forward is
+   * fire-and-forget, so a systematic rejection drops every event while the request path stays healthy.
+   * A CloudWatch metric filter keys on the bare token, so the alarm's entire trigger is this substring:
+   * reword the line without it and the alarm goes quietly dead while still reading OK. A whole-file grep
+   * (check-infra-config §14b) proves the token EXISTS somewhere; only this proves the failure path emits it.
+   */
+  it.each([
+    ['a rejected batch', () => fetchMock.mockResolvedValueOnce({ ok: false, status: 400, json: async () => ({}) })],
+    ['an unreachable sink', () => fetchMock.mockRejectedValueOnce(new Error('ECONNREFUSED'))],
+  ])('emits the AUDIT_FORWARD_FAILED alarm token on %s', async (_name, arrange) => {
+    const warn = jest.spyOn((client as unknown as { logger: { warn: jest.Mock } }).logger, 'warn').mockImplementation();
+    arrange();
+    await client.forward([evt]);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('AUDIT_FORWARD_FAILED');
+    warn.mockRestore();
+  });
 });
 
 describe('PlatformAuditService (AUDIT_SERVICE rebind)', () => {
