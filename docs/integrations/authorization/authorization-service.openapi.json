@@ -414,8 +414,18 @@
           "actorId": { "type": "string" },
           "actorType": { "type": "string", "enum": ["user", "system", "api_key"] },
           "workspaceId": { "type": "string" },
-          "ipAddress": { "type": "string" },
+          "ipAddress": { "type": "string", "description": "LEGACY. Docmost's own request.ip, which is the unvalidated leftmost X-Forwarded-For token. Ignored by the sink whenever clientEvidence is present; kept so an older sink still works." },
+          "clientEvidence": { "$ref": "#/components/schemas/AuditClientEvidence" },
           "userAgent": { "type": "string" }
+        }
+      },
+      "AuditClientEvidence": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Raw transport evidence for one event — data, never an address. The sink resolves it against its own trusted-proxy predicate instead of believing an address the forwarder computed. Send both fields together or omit the object: a supplied clientEvidence is authoritative, so forwardedFor without a usable socketPeer is recorded as a refusal.",
+        "properties": {
+          "socketPeer": { "type": "string", "description": "Peer address of the socket the forwarder served the request on — the chain's hop 0." },
+          "forwardedFor": { "type": "string", "description": "The raw X-Forwarded-For header, comma-separated, exactly as received. Not parsed by the forwarder." }
         }
       },
       "Error": {
