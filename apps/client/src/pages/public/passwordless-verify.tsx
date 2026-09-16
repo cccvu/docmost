@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { Alert, Anchor, Button, Container, Text, Title } from "@mantine/core";
 import { Helmet } from "react-helmet-async";
@@ -36,9 +36,23 @@ function readLinkToken(hash: string): string {
 export default function PasswordlessVerify() {
   const { t } = useTranslation();
   const { hash } = useLocation();
-  // Captured ONCE, on first render: onComplete drops the fragment from the address bar before redeeming,
-  // so a later read would come back empty.
-  const [token] = useState(() => readLinkToken(hash));
+  // Held in state rather than read at redeem time, because onComplete deliberately blanks the fragment before
+  // redeeming — a later read of the address bar would come back empty.
+  const [token, setToken] = useState(() => readLinkToken(hash));
+
+  // ...but a first-render-only capture is NOT enough. Opening a second sign-in link in a tab that is already
+  // on this page changes only the fragment, which is a SAME-DOCUMENT navigation: this component never
+  // remounts, so it would keep redeeming the FIRST link's token and the user would get "invalid, expired, or
+  // already used" on a link that is none of those. Caught in a real browser, not by a unit test.
+  //
+  // This effect only READS the fragment. It must never call completeSignIn — see the Safe-Links docblock
+  // above; a scanner runs this page's JS, and an effect that submits is exactly the token burn we prevent.
+  // It also never CLEARS the token: onComplete blanks the fragment on purpose, and losing the token between
+  // that write and the request would break the very sign-in it is redeeming.
+  useEffect(() => {
+    const next = readLinkToken(hash);
+    if (next && next !== token) setToken(next);
+  }, [hash, token]);
   const { completeSignIn, isVerifying } = usePasswordless();
   const [error, setError] = useState<string | null>(null);
 

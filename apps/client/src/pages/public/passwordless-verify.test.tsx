@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeAll, beforeEach, vi } from "vitest";
 import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { MantineProvider } from "@mantine/core";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useNavigate } from "react-router-dom";
 
 /**
  * THE Safe-Links invariant guard (issue #4). The magic-link landing page must NEVER consume the token
@@ -53,6 +53,31 @@ function renderAt(url: string) {
     <MantineProvider>
       <MemoryRouter initialEntries={[url]}>
         <PasswordlessVerify />
+      </MemoryRouter>
+    </MantineProvider>,
+  );
+}
+
+/**
+ * Renders the page AND a control that navigates to another fragment on the SAME path. That is what a browser
+ * does when a user opens a second sign-in email in a tab already sitting on this page: only the fragment
+ * changes, so it is a same-document navigation and this component never remounts.
+ */
+function NavTo({ to }: { to: string }) {
+  const navigate = useNavigate();
+  return (
+    <button type="button" onClick={() => navigate(to)}>
+      open another link
+    </button>
+  );
+}
+
+function renderWithFragmentNav(url: string, next: string) {
+  return render(
+    <MantineProvider>
+      <MemoryRouter initialEntries={[url]}>
+        <PasswordlessVerify />
+        <NavTo to={next} />
       </MemoryRouter>
     </MantineProvider>,
   );
@@ -119,6 +144,38 @@ describe("PasswordlessVerify — the token comes from the FRAGMENT only (issue #
     await waitFor(() =>
       expect(completeSignIn).toHaveBeenCalledWith({ token: "raw-link-token" }),
     );
+  });
+
+  it("re-reads the fragment on a SAME-DOCUMENT navigation (a second link opened in the same tab)", async () => {
+    // Regression, found in a real browser: a first-render-only capture kept redeeming the FIRST token, so the
+    // user got "invalid, expired, or already used" on a link that was none of those. A unit test that only
+    // ever mounts the page cannot see this — the component is never remounted by a fragment change.
+    renderWithFragmentNav(
+      "/login/verify#token=first-token",
+      "/login/verify#token=second-token",
+    );
+    fireEvent.click(screen.getByRole("button", { name: /open another link/i }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /complete sign-in/i }),
+      ).toBeTruthy(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: /complete sign-in/i }));
+    await waitFor(() =>
+      expect(completeSignIn).toHaveBeenCalledWith({ token: "second-token" }),
+    );
+    expect(completeSignIn).toHaveBeenCalledTimes(1);
+  });
+
+  it("does NOT consume on a fragment navigation — only the click still redeems", async () => {
+    // The re-read is an effect, and effects are exactly what the Safe-Links guard forbids submitting from.
+    renderWithFragmentNav(
+      "/login/verify#token=first-token",
+      "/login/verify#token=second-token",
+    );
+    fireEvent.click(screen.getByRole("button", { name: /open another link/i }));
+    await new Promise((r) => setTimeout(r, 20));
+    expect(completeSignIn).not.toHaveBeenCalled();
   });
 
   it("drops the fragment from the address bar when the human redeems it", async () => {
