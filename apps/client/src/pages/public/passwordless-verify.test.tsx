@@ -8,14 +8,24 @@ import { MemoryRouter } from "react-router-dom";
  * on mount — VUIT Defender/Proofpoint executes landing-page JS, so an auto-submit would let a scanner
  * redeem the single-use token before the human (the sister-project's production token-burn incident).
  * If someone adds a `useEffect` that submits on mount, THIS test fails. Do not weaken it.
+ *
+ * AND the fragment invariant (issue #319). The token arrives in the URL FRAGMENT, which the browser
+ * never puts on the wire, because the ALB access log records the full request line with no redaction
+ * available and lives in an AWS account shared with other VUIT projects. The last case below is the
+ * one that matters: a `?token=` query string must be IGNORED, not honoured as a fallback — a fallback
+ * would keep the leak alive for anyone who re-introduced the old URL shape. Do not weaken it either.
  */
 
 const completeSignIn = vi.fn(async () => {});
 
-vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (k: string) => k }) }));
+vi.mock("react-i18next", () => ({
+  useTranslation: () => ({ t: (k: string) => k }),
+}));
 vi.mock("react-helmet-async", () => ({ Helmet: () => null }));
 vi.mock("@/features/public/components/public-shell.tsx", () => ({
-  PublicShell: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  PublicShell: ({ children }: { children: React.ReactNode }) => (
+    <div>{children}</div>
+  ),
 }));
 vi.mock("@/features/public/hooks/use-passwordless.ts", () => ({
   usePasswordless: () => ({ completeSignIn, isVerifying: false }),
@@ -26,9 +36,14 @@ import PasswordlessVerify from "./passwordless-verify";
 beforeAll(() => {
   if (!window.matchMedia) {
     window.matchMedia = ((q: string) => ({
-      matches: false, media: q, onchange: null,
-      addListener: () => {}, removeListener: () => {},
-      addEventListener: () => {}, removeEventListener: () => {}, dispatchEvent: () => false,
+      matches: false,
+      media: q,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
     })) as unknown as typeof window.matchMedia;
   }
 });
@@ -47,18 +62,22 @@ describe("PasswordlessVerify — no auto-submit (Safe-Links defense)", () => {
   beforeEach(() => vi.clearAllMocks());
 
   it("does NOT consume the token on mount", async () => {
-    renderAt("/login/verify?token=raw-link-token");
+    renderAt("/login/verify#token=raw-link-token");
     // Give any (forbidden) effect a chance to fire.
     await new Promise((r) => setTimeout(r, 20));
     expect(completeSignIn).not.toHaveBeenCalled();
     // The explicit affordance is present instead.
-    expect(screen.getByRole("button", { name: /complete sign-in/i })).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: /complete sign-in/i }),
+    ).toBeTruthy();
   });
 
   it("consumes the token ONLY when the human clicks the button", async () => {
-    renderAt("/login/verify?token=raw-link-token");
+    renderAt("/login/verify#token=raw-link-token");
     fireEvent.click(screen.getByRole("button", { name: /complete sign-in/i }));
-    await waitFor(() => expect(completeSignIn).toHaveBeenCalledWith({ token: "raw-link-token" }));
+    await waitFor(() =>
+      expect(completeSignIn).toHaveBeenCalledWith({ token: "raw-link-token" }),
+    );
     expect(completeSignIn).toHaveBeenCalledTimes(1);
   });
 
@@ -67,6 +86,52 @@ describe("PasswordlessVerify — no auto-submit (Safe-Links defense)", () => {
     await new Promise((r) => setTimeout(r, 20));
     expect(completeSignIn).not.toHaveBeenCalled();
     expect(screen.getByRole("alert")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: /complete sign-in/i })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /complete sign-in/i }),
+    ).toBeNull();
+  });
+});
+
+describe("PasswordlessVerify — the token comes from the FRAGMENT only (issue #319)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    window.history.replaceState(null, "", "/");
+  });
+
+  it("IGNORES a ?token= query string — no query-string fallback exists", async () => {
+    // Put the query on BOTH readable surfaces: the router entry (what `useSearchParams` /
+    // `useLocation().search` see) and jsdom's own address bar (what `window.location.search` sees).
+    // Either one alone leaves the other fallback shape undetected — a vacuous guard.
+    window.history.replaceState(null, "", "/login/verify?token=raw-link-token");
+    renderAt("/login/verify?token=raw-link-token");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(completeSignIn).not.toHaveBeenCalled();
+    // Same branch as a missing token: the notice, and no affordance to redeem.
+    expect(screen.getByRole("alert")).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: /complete sign-in/i }),
+    ).toBeNull();
+  });
+
+  it("reads the token when a query string is ALSO present (fragment wins, query is inert)", async () => {
+    renderAt("/login/verify?next=%2Fhome#token=raw-link-token");
+    fireEvent.click(screen.getByRole("button", { name: /complete sign-in/i }));
+    await waitFor(() =>
+      expect(completeSignIn).toHaveBeenCalledWith({ token: "raw-link-token" }),
+    );
+  });
+
+  it("drops the fragment from the address bar when the human redeems it", async () => {
+    const replaceState = vi.spyOn(window.history, "replaceState");
+    renderAt("/login/verify#token=raw-link-token");
+    // Not on mount: until the click this URL is the only copy the user holds, and a reload must work.
+    expect(replaceState).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: /complete sign-in/i }));
+    await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
+    expect(replaceState).toHaveBeenCalled();
+    const url = String(replaceState.mock.calls[0][2]);
+    expect(url).not.toContain("token");
+    expect(url).not.toContain("#");
+    replaceState.mockRestore();
   });
 });

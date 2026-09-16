@@ -172,16 +172,22 @@ export function isUserDisabled(user: {
   return !!(user.deactivatedAt || user.deletedAt);
 }
 
-const SENSITIVE_URL_PREFIXES = ['/api/sso/'];
-
+/**
+ * CCC (#319): strip the query string from EVERY logged URL, not just an allow-list of prefixes.
+ *
+ * Upstream redacted only `/api/sso/` URLs, which is a deny-list dressed as an allow-list: it fails open for
+ * every path nobody remembered to add. This deployment routes several credential-bearing query strings
+ * through the same Fastify instance — the `/v1` attachment media ticket (`?t=<signed>`) and Docmost's own
+ * public-share attachment token (`?jwt=<signed>`) — and `LOG_HTTP` is one environment variable away from
+ * writing all of them into a CloudWatch log group. A query string is never worth its logging risk: the PATH
+ * answers "what was called", which is the whole reason the serializer logs a URL at all.
+ *
+ * Latent-risk removal, not a live fix: `autoLogging` is off (LOG_HTTP unset) in every environment today.
+ */
 export function redactSensitiveUrl(url: string): string {
-  if (url && SENSITIVE_URL_PREFIXES.some((prefix) => url.includes(prefix))) {
-    const qsIndex = url.indexOf('?');
-    if (qsIndex !== -1) {
-      return url.substring(0, qsIndex);
-    }
-  }
-  return url;
+  if (!url) return url;
+  const qsIndex = url.indexOf('?');
+  return qsIndex === -1 ? url : url.substring(0, qsIndex);
 }
 
 export function createByteCountingStream(source: Readable) {

@@ -8,6 +8,10 @@ import { CoreModule } from './core/core.module';
 import { EnvironmentModule } from './integrations/environment/environment.module';
 import { CollaborationModule } from './collaboration/collaboration.module';
 import { CollabDisconnectModule } from './authz/collab/collab-disconnect.module';
+// CCC seam (#319, #62): installs the response security headers (Referrer-Policy) on EVERY response,
+// including the static SPA documents an interceptor would miss. main.ts is upstream-owned, so the hook is
+// registered from a CCC module instead.
+import { ResponseHeadersModule } from './authz/http-headers/response-headers.module';
 import { WsModule } from './ws/ws.module';
 import { DatabaseModule } from '@docmost/db/database.module';
 import { StorageModule } from './integrations/storage/storage.module';
@@ -74,6 +78,7 @@ try {
     }),
     CollaborationModule,
     CollabDisconnectModule,
+    ResponseHeadersModule,
     WsModule,
     QueueModule,
     StaticModule,

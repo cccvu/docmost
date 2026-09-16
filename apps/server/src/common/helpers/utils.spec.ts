@@ -1,4 +1,4 @@
-import { parseRedisUrl, sanitizeFileName } from './utils';
+import { parseRedisUrl, redactSensitiveUrl, sanitizeFileName } from './utils';
 
 describe('sanitizeFileName', () => {
   describe('default (storage-safe)', () => {
@@ -66,15 +66,15 @@ describe('sanitizeFileName', () => {
 
   describe('preserveSpaces option', () => {
     it('keeps spaces and # untouched', () => {
-      expect(
-        sanitizeFileName('My Page #1.md', { preserveSpaces: true }),
-      ).toBe('My Page #1.md');
+      expect(sanitizeFileName('My Page #1.md', { preserveSpaces: true })).toBe(
+        'My Page #1.md',
+      );
     });
 
     it('still strips illegal chars and decodes percent-encoding', () => {
-      expect(
-        sanitizeFileName('../my page.svg', { preserveSpaces: true }),
-      ).toBe('..my page.svg');
+      expect(sanitizeFileName('../my page.svg', { preserveSpaces: true })).toBe(
+        '..my page.svg',
+      );
       expect(
         sanitizeFileName('..%2Fmy page.svg', { preserveSpaces: true }),
       ).toBe('..my page.svg');
@@ -93,7 +93,9 @@ describe('sanitizeFileName', () => {
 // clients talk plaintext against a transit-encryption-required ElastiCache endpoint and fail at connect.
 describe('parseRedisUrl — #267 TLS + AUTH', () => {
   it('emits tls ({}) for a rediss:// URL and extracts the AUTH token as password', () => {
-    const cfg = parseRedisUrl('rediss://:s3cr3t-token@my-rg.abc.ng.0001.use1.cache.amazonaws.com:6379');
+    const cfg = parseRedisUrl(
+      'rediss://:s3cr3t-token@my-rg.abc.ng.0001.use1.cache.amazonaws.com:6379',
+    );
     expect(cfg.tls).toEqual({});
     expect(cfg.password).toBe('s3cr3t-token');
     expect(cfg.host).toBe('my-rg.abc.ng.0001.use1.cache.amazonaws.com');
@@ -112,5 +114,37 @@ describe('parseRedisUrl — #267 TLS + AUTH', () => {
     expect(cfg.port).toBe(6380);
     expect(cfg.db).toBe(3);
     expect(cfg.family).toBe(6);
+  });
+});
+
+/**
+ * CCC (#319). The serializer must never persist a query string, whatever the path. Upstream redacted only
+ * `/api/sso/`; the credential-bearing query strings this deployment actually carries (`?t=` media tickets,
+ * `?jwt=` public-share attachment tokens) were not on that list, which is the fail-open shape this replaces.
+ */
+describe('redactSensitiveUrl', () => {
+  it.each([
+    ['/login/verify?token=live-session-minting-token', '/login/verify'],
+    ['/v1/attachments/abc/media?t=signed-ticket', '/v1/attachments/abc/media'],
+    [
+      '/api/files/public/abc/x.png?jwt=signed-share-token',
+      '/api/files/public/abc/x.png',
+    ],
+    ['/api/sso/callback?code=abc', '/api/sso/callback'],
+    ['/p/page-slug?a=1&b=2', '/p/page-slug'],
+  ])('strips the query from "%s"', (input, expected) => {
+    expect(redactSensitiveUrl(input)).toBe(expected);
+  });
+
+  it.each([
+    ['/api/pages/info', '/api/pages/info'],
+    ['/', '/'],
+    ['', ''],
+  ])('leaves a query-less URL "%s" untouched', (input, expected) => {
+    expect(redactSensitiveUrl(input)).toBe(expected);
+  });
+
+  it('tolerates a nullish url the way the pino serializer can hand it one', () => {
+    expect(redactSensitiveUrl(undefined as unknown as string)).toBeUndefined();
   });
 });
