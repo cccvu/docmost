@@ -1,0 +1,151 @@
+{
+  "$comment": "Regression fixture for the conditional page write's content digest (#282, ADR 0019). The settle issues a digest of the live document and the conditional write re-derives one from it, so a change to this transform silently invalidates every in-flight digest and produces a round of surprise 412s. Pinning it here turns that into a red test. Regenerate deliberately, never to make a test pass.",
+  "algorithm": "sha256(stableStringify(value)) — recursive key sort, cycles to null, hex digest",
+  "vectors": [
+    {
+      "name": "null content",
+      "value": null,
+      "digest": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"
+    },
+    {
+      "name": "empty doc",
+      "value": {
+        "type": "doc",
+        "content": []
+      },
+      "digest": "d220121877b265dcfe2d77fc13d31575a60fa3a663129c23d978f706979d5477"
+    },
+    {
+      "name": "a paragraph",
+      "value": {
+        "type": "doc",
+        "content": [
+          {
+            "type": "paragraph",
+            "content": [
+              {
+                "type": "text",
+                "text": "hello"
+              }
+            ]
+          }
+        ]
+      },
+      "digest": "b1cf2d153ebd04880d02c4e0cd3f5cdc1a0c9356cbc9e4211aee04e2f8436edd"
+    },
+    {
+      "name": "key order must not matter (a)",
+      "value": {
+        "type": "doc",
+        "attrs": {
+          "id": "x"
+        },
+        "content": []
+      },
+      "digest": "e3bb1e001f90c917fbe00b461a55a404a923f1e950c5effd5251fe1895af5f28"
+    },
+    {
+      "name": "key order must not matter (b, same document, keys reversed)",
+      "value": {
+        "content": [],
+        "attrs": {
+          "id": "x"
+        },
+        "type": "doc"
+      },
+      "digest": "e3bb1e001f90c917fbe00b461a55a404a923f1e950c5effd5251fe1895af5f28"
+    },
+    {
+      "name": "null-valued attrs are significant (ProseMirror fills defaults)",
+      "value": {
+        "type": "paragraph",
+        "attrs": {
+          "id": null,
+          "textAlign": null
+        }
+      },
+      "digest": "ee1206fb9250a2da5c38dd6b1f2cdac1a792ae232d1b55cca236081102744ed9"
+    },
+    {
+      "name": "attrs absent is NOT the same as attrs present-and-null",
+      "value": {
+        "type": "paragraph"
+      },
+      "digest": "dc12ef9abf86947f26d9911226920fdbfa07c76275f546b8c0750ca587cb2f19"
+    },
+    {
+      "name": "nested marks",
+      "value": {
+        "type": "text",
+        "text": "x",
+        "marks": [
+          {
+            "type": "bold"
+          },
+          {
+            "type": "italic",
+            "attrs": {
+              "a": 1
+            }
+          }
+        ]
+      },
+      "digest": "cd6bd2bb3c552ed78af849760a5aa6bb9e91dafcdb6a8f45717c314aa1ac7eaa"
+    },
+    {
+      "name": "unicode + emoji text",
+      "value": {
+        "type": "text",
+        "text": "héllo — 🔧 “quoted”"
+      },
+      "digest": "6380e44c5a7bea676edd16464bac51c91ef10e9b8409b6cf0b31447731ffafc7"
+    },
+    {
+      "name": "numbers keep their JSON form",
+      "value": {
+        "a": 1,
+        "b": 1.5,
+        "c": -0.25,
+        "d": 0
+      },
+      "digest": "430440d3e26e3ce3849eb8767ffd715ede4ef7f08659c5e8f3efe18a93fb7067"
+    },
+    {
+      "name": "booleans and empty string",
+      "value": {
+        "a": true,
+        "b": false,
+        "c": ""
+      },
+      "digest": "3096afd1b039e6d18b2c5e47d001fde9983b28929ec0897e6e0b9964c0b4879e"
+    },
+    {
+      "name": "deep nesting",
+      "value": {
+        "type": "doc",
+        "content": [
+          {
+            "type": "bulletList",
+            "content": [
+              {
+                "type": "listItem",
+                "content": [
+                  {
+                    "type": "paragraph",
+                    "content": [
+                      {
+                        "type": "text",
+                        "text": "deep"
+                      }
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "digest": "84ee68891d881933ffd76e79f8d7f8872fffde128ef798e2b15a78e327eba8c8"
+    }
+  ]
+}

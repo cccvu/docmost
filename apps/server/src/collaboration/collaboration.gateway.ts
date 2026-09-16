@@ -155,6 +155,37 @@ export class CollaborationGateway {
     return this.handleYjsEvent('forceDisconnect', `page.${pageId}`, { userId });
   }
 
+  /**
+   * CCC integration seam (UPSTREAM_MODIFICATIONS.md): settle a page's live collaborative document by
+   * running its pending debounced store NOW, routed to the doc-owning node via RedisSync. Thin
+   * pass-through — the handler carries no policy and the caller (authz/) owns the authorization.
+   * Returns `undefined` when RedisSync is disabled (COLLAB_DISABLE_REDIS), which the caller treats as
+   * "not flushed".
+   */
+  flushPageContent(
+    pageId: string,
+    payload?: Parameters<CollabEventHandlers['flushPageContent']>[1],
+  ) {
+    return this.handleYjsEvent('flushPageContent', `page.${pageId}`, payload);
+  }
+
+  /**
+   * CCC integration seam (UPSTREAM_MODIFICATIONS.md): a compare-and-swap content write (#282) — apply the
+   * content only if the live document still hashes to `expectedContentHash`. Thin pass-through; the handler
+   * carries no policy and the caller (authz/) owns the authorization. Returns `undefined` when RedisSync is
+   * disabled (COLLAB_DISABLE_REDIS), which the caller treats as "not applied".
+   */
+  conditionalUpdatePageContent(
+    pageId: string,
+    payload: Parameters<CollabEventHandlers['conditionalUpdatePageContent']>[1],
+  ) {
+    return this.handleYjsEvent(
+      'conditionalUpdatePageContent',
+      `page.${pageId}`,
+      payload,
+    );
+  }
+
   openDirectConnection(documentName: string, context?: any) {
     return this.hocuspocus.openDirectConnection(documentName, context);
   }
