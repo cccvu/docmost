@@ -63,10 +63,13 @@ export class PlatformAuditClient {
         body: JSON.stringify({ events }),
       });
       if (!res.ok) {
-        this.logger.warn(`audit ingest -> HTTP ${res.status} (${events.length} event(s) dropped)`);
+        // AUDIT_FORWARD_FAILED opens the line so the drop is greppable and alarmable. Without a token this
+        // failure is invisible: the forward is fire-and-forget, so a systematic rejection (a contract
+        // mismatch, say) would drop EVERY event while the request path stays perfectly healthy.
+        this.logger.warn(`AUDIT_FORWARD_FAILED http status=${res.status} dropped=${events.length}`);
       }
     } catch (e) {
-      this.logger.warn(`audit ingest failed: ${(e as Error).message} (${events.length} event(s) dropped)`);
+      this.logger.warn(`AUDIT_FORWARD_FAILED transport error=${(e as Error).message} dropped=${events.length}`);
     }
   }
 }

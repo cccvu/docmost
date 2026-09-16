@@ -3,7 +3,7 @@ import { NestFactory } from '@nestjs/core';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { CLS_REQ } from 'nestjs-cls';
+import { CLS_REQ, ClsModule, ClsService } from 'nestjs-cls';
 import fastifyIp from 'fastify-ip';
 import { PlatformAuditService } from './platform-audit.service';
 
@@ -23,6 +23,14 @@ import { PlatformAuditService } from './platform-audit.service';
  * Because middie wins, middleware-time `request.ip` is Fastify's own `trustProxy: true` result: the
  * leftmost X-Forwarded-For token, NOT parsed as an address. fastify-ip's very different answer (an
  * `x-client-ip`-first scan) only lands at handler time. Both are client-controlled; neither is evidence.
+ *
+ * WHAT EACH HALF OF THIS FILE ACTUALLY GUARDS — they are not interchangeable:
+ *   - The `main.ts` source pins are what catch a REORDERING or a changed `trustProxy` value. The boot
+ *     block below constructs its own adapter and registers fastify-ip itself, so it does NOT observe
+ *     main.ts; editing main.ts alone reds the pins, not the boot.
+ *   - The boot block is the DEPENDENCY canary. It asserts the framework semantics the pins take for
+ *     granted, so a Nest/Fastify/fastify-ip upgrade that silently changed hook order or `trustProxy`
+ *     behaviour fails here even though every source pin still matches.
  */
 describe('audit client-IP wiring (#320)', () => {
   const PEER = '172.31.20.10'; // the socket peer: in production always the ALB or the platform's loopback relay
@@ -107,6 +115,69 @@ describe('audit client-IP wiring (#320)', () => {
     });
   });
 
+  /**
+   * The two preconditions that make `CLS_REQ` readable at all (#320 review round 1).
+   *
+   * Reading the request from CLS is what lets the fix live entirely in CCC-owned code and keeps
+   * `common/middlewares/audit-context.middleware.ts` byte-identical to upstream. The trade is that the
+   * fix now depends on upstream *configuration* (`app.module.ts` mounting `ClsModule`) and on a
+   * third-party *default* (`saveReq`), neither of which the forwarder controls.
+   *
+   * Both were previously asserted only by a code comment, and every other test here injects a FAKE
+   * `ClsService`. So if either lapsed, `clientEvidence()` would return `undefined` on every event, the
+   * sink would fall back to the forgeable legacy `ipAddress`, and the whole suite would stay green —
+   * the exact silent-regression shape this change exists to remove. Pinned here instead.
+   */
+  describe('the preconditions that make CLS_REQ readable', () => {
+    it('app.module.ts still mounts ClsModule as middleware', () => {
+      const appModuleSrc = readFileSync(join(__dirname, '..', '..', 'app.module.ts'), 'utf8');
+      expect(appModuleSrc).toMatch(/ClsModule\.forRoot\(/);
+      expect(appModuleSrc).toMatch(/middleware:\s*\{[^}]*mount:\s*true/s);
+    });
+
+    it('never disables saveReq, which is what puts the request in CLS', () => {
+      const appModuleSrc = readFileSync(join(__dirname, '..', '..', 'app.module.ts'), 'utf8');
+      expect(appModuleSrc).not.toMatch(/saveReq:\s*false/);
+    });
+
+    it('actually populates CLS_REQ with the raw request, socket and headers intact', async () => {
+      // The behavioural half: proves the library default still does what the comment claims, so a
+      // nestjs-cls upgrade that flipped `saveReq` would red here rather than silently disarm the fix.
+      let fromCls: unknown;
+
+      @Module({ imports: [ClsModule.forRoot({ global: true, middleware: { mount: true } })] })
+      class ClsProbeModule {
+        constructor(private readonly cls: ClsService) {}
+        configure(consumer: MiddlewareConsumer): void {
+          consumer
+            .apply((_req: unknown, _res: unknown, next: () => void) => {
+              fromCls = this.cls.get(CLS_REQ);
+              next();
+            })
+            .forRoutes('*');
+        }
+      }
+
+      const probeAdapter = new FastifyAdapter({ trustProxy: true });
+      const probe = await NestFactory.create<NestFastifyApplication>(ClsProbeModule, probeAdapter, {
+        logger: false,
+      });
+      await probe.init();
+      try {
+        await probeAdapter
+          .getInstance()
+          .inject({ method: 'GET', url: '/any', remoteAddress: PEER, headers: { 'x-forwarded-for': CLIENT } });
+      } finally {
+        await probe.close();
+      }
+
+      const req = fromCls as { socket?: { remoteAddress?: string }; headers?: Record<string, unknown> };
+      expect(req).toBeDefined();
+      expect(req.socket?.remoteAddress).toBe(PEER);
+      expect(req.headers?.['x-forwarded-for']).toBe(CLIENT);
+    });
+  });
+
   describe('the evidence the forwarder builds', () => {
     const makeService = (req: unknown) => {
       const cls = { get: (key: unknown) => (key === CLS_REQ ? req : undefined) };
@@ -163,6 +234,31 @@ describe('audit client-IP wiring (#320)', () => {
       const { service, client } = makeService(req);
       service.log(payload);
       expect(forwarded(client).clientEvidence.forwardedFor).toBe(`${CLIENT}, ${PROXY}`);
+    });
+
+    it('does NOT attach ambient evidence to a caller-supplied context', () => {
+      // logWithContext/logBatchWithContext mean "I am telling you the context". Mixing in whatever
+      // request happens to be on the stack would take the actor from the caller and the network origin
+      // from somewhere else, then hash-chain the result. Today the only caller is the queue-backed
+      // import worker, but IAuditService is upstream-owned and a future caller could run mid-request.
+      const req = { socket: { remoteAddress: PEER }, headers: { 'x-forwarded-for': CLIENT } };
+      const { service, client } = makeService(req);
+      const explicit = { workspaceId: 'w1', actorId: 'u1', actorType: 'user' as const, ipAddress: '9.9.9.9' };
+
+      service.logWithContext(payload, explicit);
+      expect(forwarded(client).clientEvidence).toBeUndefined();
+      expect(forwarded(client).ipAddress).toBe('9.9.9.9');
+
+      client.forward.mockClear();
+      service.logBatchWithContext([payload], explicit);
+      expect(forwarded(client).clientEvidence).toBeUndefined();
+    });
+
+    it('attaches evidence to updateRetention, which is a real in-request admin action', () => {
+      const req = { socket: { remoteAddress: PEER }, headers: { 'x-forwarded-for': CLIENT } };
+      const { service, client } = makeService(req);
+      service.updateRetention('ws-1', 90);
+      expect(forwarded(client).clientEvidence).toEqual({ socketPeer: PEER, forwardedFor: CLIENT });
     });
 
     it('still sends the legacy ipAddress, so an older platform build keeps working', () => {

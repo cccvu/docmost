@@ -321,7 +321,11 @@
                     "resourceId": "pg-1",
                     "actorId": "d-1",
                     "actorType": "user",
-                    "workspaceId": "ws-1"
+                    "workspaceId": "ws-1",
+                    "clientEvidence": {
+                      "socketPeer": "172.31.20.10",
+                      "forwardedFor": "198.51.100.7, 107.22.62.237"
+                    }
                   }
                 ]
               }
@@ -422,7 +426,8 @@
       "AuditClientEvidence": {
         "type": "object",
         "additionalProperties": false,
-        "description": "Raw transport evidence for one event — data, never an address. The sink resolves it against its own trusted-proxy predicate instead of believing an address the forwarder computed. Send both fields together or omit the object: a supplied clientEvidence is authoritative, so forwardedFor without a usable socketPeer is recorded as a refusal.",
+        "required": ["socketPeer"],
+        "description": "Raw transport evidence for one event — data, never an address. The sink resolves it against its own trusted-proxy predicate instead of believing an address the forwarder computed. socketPeer is REQUIRED: a supplied clientEvidence is authoritative, so the sink records a refusal rather than guessing when it cannot resolve a peer. Omit the whole object if no peer is available — do not send a peerless one. forwardedFor is optional and absent when the request carried no such header.",
         "properties": {
           "socketPeer": { "type": "string", "description": "Peer address of the socket the forwarder served the request on — the chain's hop 0." },
           "forwardedFor": { "type": "string", "description": "The raw X-Forwarded-For header, comma-separated, exactly as received. Not parsed by the forwarder." }

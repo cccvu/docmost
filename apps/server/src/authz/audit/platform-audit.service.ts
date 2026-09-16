@@ -30,8 +30,18 @@ export class PlatformAuditService implements IAuditService {
     private readonly client: PlatformAuditClient,
   ) {}
 
+  /**
+   * Evidence rides ONLY with the CLS-derived context, never with a caller-supplied one.
+   *
+   * `logWithContext` / `logBatchWithContext` exist so a caller can state the context explicitly — today
+   * that is the import worker, which runs on a queue with no request in scope. If those paths also read
+   * ambient CLS, an event's actor would come from the caller while its network origin came from whatever
+   * request happened to be on the stack: two halves of one provenance claim from different sources,
+   * written into a hash-chained log. Benign now, but `IAuditService` is an upstream-owned interface, so a
+   * future upstream caller could invoke it mid-request and silently attribute the wrong socket peer.
+   */
   log(payload: AuditLogPayload): void {
-    void this.client.forward([this.toEvent(payload, this.currentContext())]);
+    void this.client.forward([this.toEvent(payload, this.currentContext(), this.clientEvidence())]);
   }
 
   logWithContext(payload: AuditLogPayload, context: AuditLogContext): void {
@@ -116,7 +126,11 @@ export class PlatformAuditService implements IAuditService {
     return forwardedFor ? { socketPeer, forwardedFor } : { socketPeer };
   }
 
-  private toEvent(payload: AuditLogPayload, context?: ForwardContext): AuditIngestEvent {
+  private toEvent(
+    payload: AuditLogPayload,
+    context?: ForwardContext,
+    clientEvidence?: AuditClientEvidence,
+  ): AuditIngestEvent {
     return {
       event: payload.event,
       resourceType: payload.resourceType,
@@ -128,7 +142,7 @@ export class PlatformAuditService implements IAuditService {
       actorType: context?.actorType,
       workspaceId: context?.workspaceId,
       ipAddress: context?.ipAddress,
-      clientEvidence: this.clientEvidence(),
+      clientEvidence,
       userAgent: context?.userAgent,
     };
   }
