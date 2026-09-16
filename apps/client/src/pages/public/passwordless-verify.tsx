@@ -56,25 +56,53 @@ export default function PasswordlessVerify() {
   const { completeSignIn, isVerifying } = usePasswordless();
   const [error, setError] = useState<string | null>(null);
 
-  async function onComplete() {
-    setError(null);
-    // Drop the live token from the address bar and from this history entry at the moment the user commits
-    // to redeeming it. NOT on mount: a reload before the click must still work, and until the click this
-    // URL is the only copy the user holds. (History is synced across devices by some browsers, so a
-    // consumed token left in the bar outlives the tab.)
+  /**
+   * Drop the live token from the address bar and from this history entry at the moment the user commits
+   * to redeeming it. NOT on mount: a reload before the click must still work, and until the click this
+   * URL is the only copy the user holds. (History is synced across devices by some browsers, so a
+   * consumed token left in the bar outlives the tab.)
+   *
+   * Returns the fragment it removed so a FAILED redeem can put it back — see onComplete. Never throws:
+   * `replaceState` can reject in sandboxed/opaque-origin contexts, and this is a cosmetic cleanup, so a
+   * failure here must not be allowed to prevent the sign-in it precedes.
+   */
+  function stripFragment(): string {
     if (
-      typeof window !== "undefined" &&
-      typeof window.history?.replaceState === "function"
+      typeof window === "undefined" ||
+      typeof window.history?.replaceState !== "function"
     ) {
+      return "";
+    }
+    const previous = window.location.hash;
+    try {
       window.history.replaceState(
         null,
         "",
         window.location.pathname + window.location.search,
       );
+    } catch {
+      return "";
     }
+    return previous;
+  }
+
+  async function onComplete() {
+    setError(null);
+    const removed = stripFragment();
     try {
       await completeSignIn({ token });
     } catch (err) {
+      // The redeem did not succeed, so the token may well still be LIVE (a 5xx or a dropped connection
+      // consumes nothing). We just deleted the user's only copy of it, so put it back: before this PR a
+      // reload after a failed attempt still worked, and silently breaking that would turn a transient
+      // network blip into "this sign-in link is invalid". Restoring a token that IS dead is harmless.
+      if (removed) {
+        try {
+          window.history.replaceState(null, "", removed);
+        } catch {
+          /* cosmetic only — `token` is still in React state, so the retry button works regardless */
+        }
+      }
       // The link was valid but the session bridge failed → say so, don't cry "invalid link".
       const bridge = (err as { stage?: string })?.stage === "bridge";
       setError(
@@ -105,13 +133,20 @@ export default function PasswordlessVerify() {
 
           {!token ? (
             <Alert color="yellow" title={t("Link incomplete")} role="alert">
+              {/*
+                This names the EXACT affordance on the sign-in page ("I already have a code"), because
+                the obvious path there — type your email, press the button — issues a fresh token and
+                supersedes the very code this notice is sending the user to type (#319 review).
+              */}
               {t(
-                "This sign-in link is missing its token. The same email also contains a 6-digit code — enter that on the sign-in page instead, or ",
+                "This sign-in link is missing its token. The same email also contains a 6-digit code that still works: open the ",
               )}
               <Anchor component={Link} to={APP_ROUTE.AUTH.LOGIN}>
-                {t("request a new one")}
+                {t("sign-in page")}
               </Anchor>
-              .
+              {t(
+                ', enter your email address, and choose "I already have a code".',
+              )}
             </Alert>
           ) : (
             <>

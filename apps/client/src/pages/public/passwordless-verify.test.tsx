@@ -84,7 +84,11 @@ function renderWithFragmentNav(url: string, next: string) {
 }
 
 describe("PasswordlessVerify — no auto-submit (Safe-Links defense)", () => {
-  beforeEach(() => vi.clearAllMocks());
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // Tests below deliberately seed the real address bar; reset it so a fragment cannot leak sideways.
+    window.history.replaceState(null, "", "/");
+  });
 
   it("does NOT consume the token on mount", async () => {
     renderAt("/login/verify#token=raw-link-token");
@@ -179,6 +183,13 @@ describe("PasswordlessVerify — the token comes from the FRAGMENT only (issue #
   });
 
   it("drops the fragment from the address bar when the human redeems it", async () => {
+    // SEED jsdom's REAL address bar first. Without this it is "/" with no fragment, so an implementation
+    // mutated to write `window.location.href` straight back would ALSO produce a token-free, "#"-free
+    // string and this test would pass while the fragment survived. It did exactly that until the seed was
+    // added (#319 review) — the assertions below are only meaningful once the bar actually holds a token.
+    window.history.replaceState(null, "", "/login/verify#token=raw-link-token");
+    expect(window.location.hash).toBe("#token=raw-link-token");
+
     const replaceState = vi.spyOn(window.history, "replaceState");
     renderAt("/login/verify#token=raw-link-token");
     // Not on mount: until the click this URL is the only copy the user holds, and a reload must work.
@@ -189,6 +200,46 @@ describe("PasswordlessVerify — the token comes from the FRAGMENT only (issue #
     const url = String(replaceState.mock.calls[0][2]);
     expect(url).not.toContain("token");
     expect(url).not.toContain("#");
+    // Assert the OUTCOME, not just the argument we passed — this is what the user's browser ends up with.
+    expect(window.location.hash).toBe("");
+    expect(window.location.pathname).toBe("/login/verify");
     replaceState.mockRestore();
+  });
+
+  it("PUTS THE FRAGMENT BACK when the redeem fails — a failed attempt consumes nothing", async () => {
+    // A 5xx or a dropped connection leaves the token LIVE. Stripping it at click time and not restoring
+    // it would destroy the user's only copy, so a reload after a transient blip would say "Link
+    // incomplete" about a perfectly good link. That worked before this PR; it must keep working.
+    window.history.replaceState(null, "", "/login/verify#token=raw-link-token");
+    completeSignIn.mockRejectedValueOnce(new Error("network"));
+
+    renderAt("/login/verify#token=raw-link-token");
+    fireEvent.click(screen.getByRole("button", { name: /complete sign-in/i }));
+    await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
+
+    await waitFor(() =>
+      expect(window.location.hash).toBe("#token=raw-link-token"),
+    );
+    // ...and the page is still usable: the retry button is there, because `token` lives in React state.
+    expect(
+      screen.getByRole("button", { name: /complete sign-in/i }),
+    ).toBeTruthy();
+  });
+
+  it("NEVER CLEARS a captured token when a later navigation has no fragment", async () => {
+    // The re-read effect guards on `next &&` precisely so onComplete's own fragment blanking cannot race
+    // it to zero. Drop that guard and this test fails: the button disappears mid-flow and the user is
+    // told their link is incomplete while holding a live token.
+    renderWithFragmentNav(
+      "/login/verify#token=raw-link-token",
+      "/login/verify",
+    );
+    fireEvent.click(screen.getByRole("button", { name: /open another link/i }));
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(screen.queryByText(/Link incomplete/i)).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /complete sign-in/i }));
+    await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
+    expect(completeSignIn).toHaveBeenCalledWith({ token: "raw-link-token" });
   });
 });

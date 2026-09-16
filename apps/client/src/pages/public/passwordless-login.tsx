@@ -20,17 +20,30 @@ import APP_ROUTE from "@/lib/app-route.ts";
 import { getAppName } from "@/lib/config.ts";
 
 /**
- * Passwordless sign-in (magic link + OTP). Two states:
+ * Passwordless sign-in (magic link + OTP). Two steps, reachable two ways:
  *   1. enter email → request a sign-in email (response is always generic — no account disclosure);
- *   2. "check your email" → click the emailed link OR type the 6-digit code here.
- * There is no password field anywhere.
+ *   2. the code step → click the emailed link OR type the 6-digit code here.
+ *
+ * Step 2 is ALSO reachable WITHOUT requesting anything, via "I already have a code" (#319 review).
+ * That path is load-bearing, not a convenience: issuing supersedes every prior live token for the
+ * address (`issuePasswordlessToken` → `invalidateOutstanding`), so if the only way to reach this
+ * field were `requestEmail`, then a user holding a perfectly good code — the one the magic-link
+ * page tells them to fall back to, and the one `admin:login-link` break-glass prints — would have
+ * to destroy it in order to type it. The OTP is the documented recovery path for a link whose
+ * fragment a mail rewriter dropped (ADR 0018); a recovery path that invalidates the credential it
+ * recovers is not one. Reaching this step is a pure client-side state change: it discloses nothing
+ * and costs nothing, because the code itself is still verified server-side.
  */
 export default function PasswordlessLogin() {
   const { t } = useTranslation();
-  const { requestEmail, completeSignIn, isRequesting, isVerifying } = usePasswordless();
+  const { requestEmail, completeSignIn, isRequesting, isVerifying } =
+    usePasswordless();
   const [email, setEmail] = useState("");
   const [otp, setOtp] = useState("");
   const [sent, setSent] = useState(false);
+  // Arrived at the code step holding a code we did NOT just issue (see the docblock). Kept separate
+  // from `sent` so the copy can stay truthful: "check your email" is a lie if we sent nothing.
+  const [haveCode, setHaveCode] = useState(false);
 
   async function onRequest(e: FormEvent) {
     e.preventDefault();
@@ -50,8 +63,12 @@ export default function PasswordlessLogin() {
       notifications.show({
         color: "red",
         message: bridge
-          ? t("You're verified, but we couldn't open your workspace session. Please try again.")
-          : t("That code is invalid, expired, or already used. Request a new one."),
+          ? t(
+              "You're verified, but we couldn't open your workspace session. Please try again.",
+            )
+          : t(
+              "That code is invalid, expired, or already used. Request a new one.",
+            ),
       });
       if (!bridge) setOtp("");
     }
@@ -71,10 +88,12 @@ export default function PasswordlessLogin() {
             {t("Sign in")}
           </Title>
 
-          {!sent ? (
+          {!sent && !haveCode ? (
             <>
               <Text c="dimmed" ta="center" mb="lg">
-                {t("Enter your email and we'll send you a sign-in link and a one-time code.")}
+                {t(
+                  "Enter your email and we'll send you a sign-in link and a one-time code.",
+                )}
               </Text>
               <form onSubmit={onRequest}>
                 <TextInput
@@ -97,14 +116,35 @@ export default function PasswordlessLogin() {
                   {t("Request access")}
                 </Anchor>
               </Text>
+              {/*
+                Reaching the code step WITHOUT issuing a new token — see the docblock. Requesting
+                would supersede the code the user is holding, so this must not call requestEmail.
+                Needs the address because completeSignIn verifies { email, otp } as a pair.
+              */}
+              <Text ta="center" mt="xs" size="sm" c="dimmed">
+                <Anchor
+                  component="button"
+                  type="button"
+                  disabled={!email.trim()}
+                  onClick={() => {
+                    if (email.trim()) setHaveCode(true);
+                  }}
+                >
+                  {t("I already have a code")}
+                </Anchor>
+              </Text>
             </>
           ) : (
             <>
               {/* role="status" announces the step change to screen readers when we swap email→code. */}
               <Text c="dimmed" ta="center" mb="lg" role="status">
-                {t(
-                  "Check your email. Open the sign-in link, or enter the 6-digit code below. Both expire shortly and can be used once.",
-                )}
+                {sent
+                  ? t(
+                      "Check your email. Open the sign-in link, or enter the 6-digit code below. Both expire shortly and can be used once.",
+                    )
+                  : t(
+                      "Enter the 6-digit code from your sign-in email. It expires shortly and can be used once.",
+                    )}
               </Text>
               <form onSubmit={onVerify}>
                 <Stack align="center" gap="md">
@@ -118,13 +158,30 @@ export default function PasswordlessLogin() {
                     onChange={setOtp}
                     aria-label={t("One-time code")}
                   />
-                  <Button type="submit" fullWidth loading={isVerifying} disabled={otp.length < 6}>
+                  <Button
+                    type="submit"
+                    fullWidth
+                    loading={isVerifying}
+                    disabled={otp.length < 6}
+                  >
                     {t("Sign in with code")}
                   </Button>
                 </Stack>
               </form>
               <Group justify="center" mt="md" gap="xs">
-                <Button variant="subtle" size="xs" onClick={() => requestEmail(email.trim())} loading={isRequesting}>
+                {/* Resending issues a NEW token, which supersedes the code shown above — only the
+                    newest code ever works. That is why it is a deliberate button and not the only
+                    way to reach this step. */}
+                <Button
+                  variant="subtle"
+                  size="xs"
+                  onClick={() => {
+                    setOtp("");
+                    setSent(true);
+                    void requestEmail(email.trim());
+                  }}
+                  loading={isRequesting}
+                >
                   {t("Resend email")}
                 </Button>
                 <Button
@@ -132,6 +189,7 @@ export default function PasswordlessLogin() {
                   size="xs"
                   onClick={() => {
                     setSent(false);
+                    setHaveCode(false);
                     setOtp("");
                   }}
                 >
