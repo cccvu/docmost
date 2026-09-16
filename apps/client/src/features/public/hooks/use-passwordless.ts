@@ -50,10 +50,34 @@ export function usePasswordless() {
     args: { token: string } | { email: string; otp: string },
   ): Promise<void> {
     setIsVerifying(true);
+    // On the resume branch we hand off to a FULL-PAGE navigation, which does not tear the page down
+    // synchronously — so clearing `isVerifying` in `finally` would re-enable the sign-in button mid-navigation
+    // and invite a double-submit that re-verifies an already-consumed OTP/token (a confusing "invalid code"
+    // flash). Keep the spinner up through the redirect, matching use-auth.ts (#302 review, Frontend).
+    let redirecting = false;
     try {
-      await verifyPasswordless(args); // throws => invalid / expired / already-used code or link
-      // Two-step: establish the Docmost session before navigating; roll back the platform session on
-      // failure so a half-authenticated state never persists.
+      const res = await verifyPasswordless(args); // throws => invalid / expired / already-used code or link
+
+      // OAuth resume (#302): this browser began an MCP OAuth flow before signing in. The pending
+      // /oauth/authorize request is parked server-side; we must return to it with a FULL-PAGE navigation
+      // (it is a platform route, not an SPA route — React-Router navigate() would 404). Establish the Docmost
+      // session best-effort so any later same-browser wiki use works, but a bridge failure here is NON-FATAL:
+      // OAuth consent needs only the platform session, and rolling back (logout) would wipe the very session
+      // the resume depends on. So on resume we never call logout() on a bridge failure.
+      if (res?.resume) {
+        try {
+          await openDocmostSession();
+        } catch {
+          // non-fatal on the resume path — the platform session alone satisfies /oauth/authorize + consent.
+        }
+        redirecting = true;
+        window.location.assign("/oauth/authorize");
+        return;
+      }
+
+      // Normal path: the app is about to mount the wiki SPA, so a missing Docmost session must fail closed —
+      // establish it before navigating, and roll back the platform session on failure so a half-authenticated
+      // state (live platform cookie but 401ing Docmost /api/*) never persists.
       try {
         await openDocmostSession();
       } catch {
@@ -62,7 +86,9 @@ export function usePasswordless() {
       }
       navigate(getPostLoginRedirect());
     } finally {
-      setIsVerifying(false);
+      // Leave the spinner up when a full-page redirect is under way (see above); only clear it for in-SPA
+      // outcomes and for any thrown/error path, where the page stays and the button must return to idle.
+      if (!redirecting) setIsVerifying(false);
     }
   }
 

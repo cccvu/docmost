@@ -92,6 +92,18 @@ export default defineConfig(({ mode }) => {
           target: PLATFORM_URL || "http://localhost:4000",
           changeOrigin: true,
         },
+        // OAuth 2.1 AS + RFC 9728/8414 discovery live on the platform (#226). In prod the ALB routes /oauth
+        // and /.well-known to the platform; mirror that here so the MCP OAuth flow — including the post-login
+        // resume of /oauth/authorize (#302, a full-page navigation back to a platform route) — is reachable at
+        // the dev single origin. Without these, /oauth/* falls through to the SPA fallback (index.html) in dev.
+        "/oauth": {
+          target: PLATFORM_URL || "http://localhost:4000",
+          changeOrigin: true,
+        },
+        "/.well-known": {
+          target: PLATFORM_URL || "http://localhost:4000",
+          changeOrigin: true,
+        },
         "/socket.io": {
           target: APP_URL,
           ws: true,
