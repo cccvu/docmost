@@ -20,7 +20,14 @@ jest.mock('ioredis', () => ({
   default: jest.fn().mockImplementation(() => ({})),
 }));
 jest.mock('msgpackr', () => ({ pack: jest.fn(), unpack: jest.fn() }));
-jest.mock('nanoid', () => ({ nanoid: () => 'test' }));
+// Provide BOTH `nanoid` and `customAlphabet`: the gateway imports `nanoid`, but its (unmocked) import
+// graph reaches `common/helpers/nanoid.utils.ts`, which calls `customAlphabet(...)` at module TOP LEVEL.
+// A mock missing `customAlphabet` throws "customAlphabet is not a function" at load. `customAlphabet`
+// returns a generator function, so the mock returns a function that returns an id.
+jest.mock('nanoid', () => ({
+  nanoid: () => 'test',
+  customAlphabet: () => () => 'test',
+}));
 jest.mock('../../common/helpers', () => ({
   createRetryStrategy: jest.fn(),
   parseRedisUrl: jest.fn(() => ({ host: 'h', port: 6379, password: '', db: 0 })),
