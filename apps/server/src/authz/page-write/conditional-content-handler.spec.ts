@@ -2,10 +2,11 @@
 // value-imports; `@hocuspocus/server` is type-only here and is elided by ts-jest. TiptapTransformer is
 // stubbed with a controllable serializer so we can drive the digest comparison deterministically.
 const fromYdoc = jest.fn();
+const toYdoc = jest.fn((..._a: unknown[]) => ({}) as unknown);
 jest.mock('@hocuspocus/transformer', () => ({
   TiptapTransformer: {
     fromYdoc: (...a: unknown[]) => fromYdoc(...a),
-    toYdoc: jest.fn(() => ({})),
+    toYdoc: (...a: unknown[]) => toYdoc(...a),
   },
 }));
 jest.mock('yjs', () => ({
@@ -258,5 +259,71 @@ describe('CollaborationHandler.conditionalUpdatePageContent (#282)', () => {
     const { handler, connection } = build({ resident: false });
     await handler(DOC, payload(stableHash({ different: true })));
     expect(connection.disconnect).toHaveBeenCalledTimes(1);
+  });
+});
+
+/**
+ * Build-before-delete for a content `replace` (#342).
+ *
+ * `applyContentOperation` used to empty the Yjs fragment and THEN build the new document from the request
+ * body. When that build throws (content that passed `jsonToNode` but that `TiptapTransformer.toYdoc`
+ * rejects), the empty fragment is what the connection's closing `disconnect()` store persists — the page
+ * is silently WIPED while the request also fails. The fix builds first, so a conversion failure aborts
+ * before any mutation and the original content survives. Exercised through the ordinary `updatePageContent`
+ * handler, which shares the same `applyContentOperation`.
+ */
+describe('CollaborationHandler.updatePageContent — build-before-delete (#342)', () => {
+  const DOC = 'page.33333333-3333-4333-8333-333333333333';
+  const USER = { id: 'user-1' };
+
+  const build = () => {
+    const ops: string[] = [];
+    const fragment = {
+      length: 3,
+      delete: jest.fn(() => ops.push('delete')),
+      insert: jest.fn(() => ops.push('insert')),
+    };
+    const doc = { getXmlFragment: jest.fn(() => fragment) };
+    const connection = {
+      transact: jest.fn(async (fn: (d: unknown) => void) => fn(doc)),
+      disconnect: jest.fn(async () => undefined),
+    };
+    const hocuspocus = { openDirectConnection: jest.fn(async () => connection) };
+    const handler = new CollaborationHandler().getHandlers(
+      hocuspocus as never,
+    ).updatePageContent;
+    return { handler, fragment, connection, ops };
+  };
+
+  const payload = () => ({
+    prosemirrorJson: { type: 'doc', content: [] },
+    operation: 'replace',
+    user: USER as never,
+  });
+
+  beforeEach(() => {
+    toYdoc.mockReset();
+    toYdoc.mockReturnValue({});
+  });
+
+  it('does NOT delete the fragment when building the new document throws (page not wiped)', async () => {
+    toYdoc.mockImplementationOnce(() => {
+      throw new Error('unconvertible content');
+    });
+    const { handler, fragment, connection } = build();
+
+    await expect(handler(DOC, payload())).rejects.toThrow('unconvertible content');
+
+    // The fragment is intact — the closing store re-persists the original content, not an empty document.
+    expect(fragment.delete).not.toHaveBeenCalled();
+    // The connection is still released.
+    expect(connection.disconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it('deletes then applies when the build succeeds (the normal replace still works)', async () => {
+    const { handler, ops } = build();
+    await handler(DOC, payload());
+    // Build succeeded, so the swap runs: delete the old fragment, then apply the new state.
+    expect(ops).toContain('delete');
   });
 });

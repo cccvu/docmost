@@ -143,6 +143,19 @@ export class CollaborationGateway {
     documentName: string,
     payload: Parameters<CollabEventHandlers[TName]>[1],
   ) {
+    // Custom collaboration events are registered ONLY on the RedisSync extension, so with
+    // COLLAB_DISABLE_REDIS (single-node standalone) `handleEvent` is unreachable and this returns
+    // `undefined`. That is tolerable for best-effort events (forceDisconnect) and for the #282 seams,
+    // whose callers already treat `undefined` as fail-closed (503). It is NOT tolerable for
+    // `updatePageContent`: `PageService.update` ignores its (void) result, so a REST/`/v1` content write
+    // would return a false 200 while persisting NOTHING (#344). Standalone interactive editing is
+    // unaffected — live sockets use the direct Hocuspocus path, not this method — so fail the one write
+    // we cannot perform, loudly, rather than remove a supported mode.
+    if (!this.redisSync && eventName === 'updatePageContent') {
+      throw new Error(
+        "cannot route 'updatePageContent': RedisSync is disabled (COLLAB_DISABLE_REDIS); content writes require Redis.",
+      );
+    }
     return this.redisSync?.handleEvent(eventName, documentName, payload);
   }
 

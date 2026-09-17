@@ -271,16 +271,23 @@ export class CollaborationHandler {
     const fragment = doc.getXmlFragment('default');
 
     if (operation === 'replace') {
-      if (fragment.length > 0) {
-        fragment.delete(0, fragment.length);
-      }
-
+      // BUILD BEFORE DELETE (#342). `TiptapTransformer.toYdoc` throws on content it cannot convert
+      // (a body that passed `jsonToNode` but that the Yjs transformer rejects). If the fragment were
+      // emptied first, that throw would leave an empty document behind, and the connection's closing
+      // `disconnect()` store would persist it — silently WIPING the page while the request also fails.
+      // Encoding the new state first means a conversion failure aborts before any mutation, so the
+      // original content survives and the closing store re-persists it unchanged.
       const newDoc = TiptapTransformer.toYdoc(
         prosemirrorJson,
         'default',
         tiptapExtensions,
       );
-      Y.applyUpdate(doc, Y.encodeStateAsUpdate(newDoc));
+      const update = Y.encodeStateAsUpdate(newDoc);
+
+      if (fragment.length > 0) {
+        fragment.delete(0, fragment.length);
+      }
+      Y.applyUpdate(doc, update);
     } else {
       const newContent = prosemirrorJson.content || [];
       const yElements = newContent.map(prosemirrorNodeToYElement);
