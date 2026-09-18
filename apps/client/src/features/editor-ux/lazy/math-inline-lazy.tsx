@@ -3,11 +3,13 @@
 // node view would collapse the node and shift the surrounding line while the chunk loads, so we
 // render the raw LaTeX source inside a NodeViewWrapper span carrying the same class the real view
 // uses (tiptap's ReactNodeViewRenderer also requires the first element to be a NodeViewWrapper).
-import { lazy, Suspense } from "react";
+// Chunk-load failures reload the document once (see @/features/layout/lazy-with-reload.ts).
+import { Suspense } from "react";
+import { lazyWithReload } from "@/features/layout/lazy-with-reload";
 import { NodeViewProps, NodeViewWrapper } from "@tiptap/react";
 import classes from "@/features/editor/components/math/math.module.css";
 
-const MathInlineView = lazy(
+const MathInlineView = lazyWithReload(
   () => import("@/features/editor/components/math/math-inline.tsx"),
 );
 

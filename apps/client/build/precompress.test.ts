@@ -3,7 +3,7 @@
 // Unit tests for the fork-owned Vite build plugin (issue #309). They exercise the PURE helpers
 // (no Vite, no Rolldown) so the compression, initial-set and budget logic is proven on a synthetic
 // bundle and a temp dir — the real build wires the same functions through the plugin hooks.
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { randomBytes } from "node:crypto";
 import {
   existsSync,
@@ -19,10 +19,12 @@ import { join } from "node:path";
 import { brotliDecompressSync, gunzipSync } from "node:zlib";
 
 import {
+  brotliBytes,
   brotliSize,
   checkBudget,
   compressSiblings,
   findLazyViolations,
+  gzipBytes,
   gzipSize,
   initialSet,
   precompressAndBudget,
@@ -311,5 +313,238 @@ describe("precompressAndBudget (plugin factory)", () => {
     expect(plugin.apply).toBe("build");
     expect(typeof plugin.generateBundle).toBe("function");
     expect(typeof plugin.closeBundle).toBe("function");
+  });
+});
+
+// ── Plugin hooks driven directly (no Vite) ───────────────────────────────────────────────────────
+
+/** The slice of Rollup's PluginContext the hooks call. `error` throws like the real one does. */
+type HookCtx = {
+  warn: ReturnType<typeof vi.fn>;
+  error: ReturnType<typeof vi.fn>;
+};
+const hookCtx = (): HookCtx => ({
+  warn: vi.fn(),
+  error: vi.fn((m: unknown) => {
+    throw new Error(String(m));
+  }),
+});
+
+/** The hooks with `this` bound to our context. Vite may wrap a hook as `{ handler }`; unwrap either. */
+function pluginHooks(plugin: ReturnType<typeof precompressAndBudget>) {
+  const unwrap = (h: unknown): unknown =>
+    typeof h === "function" ? h : (h as { handler?: unknown } | undefined)?.handler;
+  return {
+    configResolved: unwrap(plugin.configResolved) as (
+      this: HookCtx,
+      config: unknown,
+    ) => void,
+    generateBundle: unwrap(plugin.generateBundle) as (
+      this: HookCtx,
+      options: unknown,
+      bundle: BundleLike,
+    ) => void,
+    closeBundle: unwrap(plugin.closeBundle) as (
+      this: HookCtx,
+      error?: Error,
+    ) => void,
+  };
+}
+
+/** The fields of ResolvedConfig the plugin reads, with a silent logger so the size table stays out of the test log. */
+const fakeConfig = (root: string, outDir = "dist") => ({
+  root,
+  build: { outDir, write: true },
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+});
+
+const entryCode =
+  "export const s = " + JSON.stringify("hello world ".repeat(4000)) + ";\n";
+/** One entry chunk, compressible, no CSS — brotli lands well above 1 B and well below 1 MB. */
+const oneEntryBundle = (): BundleLike => ({
+  "assets/index-abc.js": chunk({
+    fileName: "assets/index-abc.js",
+    isEntry: true,
+    code: entryCode,
+    moduleIds: ["/repo/src/main.tsx"],
+    viteMetadata: { importedCss: new Set() },
+  }),
+});
+const TINY_BUDGET = { initialJsBrotli: 1, initialCssBrotli: 1 };
+const ROOMY_BUDGET = { initialJsBrotli: 1_000_000, initialCssBrotli: 1_000_000 };
+
+describe("precompressAndBudget strict mode", () => {
+  let root: string;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "ccc-precompress-strict-"));
+    // Neither env may leak in from the developer's shell: the plugin reads both.
+    vi.stubEnv("BUNDLE_BUDGET_STRICT", undefined);
+    vi.stubEnv("BUNDLE_REPORT_PATH", undefined);
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  /** Run configResolved + generateBundle on a fresh plugin; returns the ctx and what generateBundle threw. */
+  function runGenerate(opts: Parameters<typeof precompressAndBudget>[0]) {
+    const plugin = precompressAndBudget(opts);
+    const hooks = pluginHooks(plugin);
+    const ctx = hookCtx();
+    hooks.configResolved.call(ctx, fakeConfig(root));
+    let thrown: unknown;
+    try {
+      hooks.generateBundle.call(ctx, {}, oneEntryBundle());
+    } catch (e) {
+      thrown = e;
+    }
+    return { hooks, ctx, thrown };
+  }
+
+  it("strict: true — a budget violation fails the build via this.error, naming the budget", () => {
+    const { ctx, thrown } = runGenerate({ strict: true, budget: TINY_BUDGET });
+    expect(thrown).toBeInstanceOf(Error);
+    expect(ctx.error).toHaveBeenCalledTimes(1);
+    const message = String(ctx.error.mock.calls[0][0]);
+    expect(message).toMatch(/bundle invariant violation/);
+    expect(message).toMatch(/initial JS [\d,]+ brotli exceeds the budget of 1 /);
+    expect(ctx.warn).not.toHaveBeenCalled();
+  });
+
+  it("strict: false — the same violation only warns and tells you how to make it fail", () => {
+    const { ctx, thrown } = runGenerate({ strict: false, budget: TINY_BUDGET });
+    expect(thrown).toBeUndefined();
+    expect(ctx.warn).toHaveBeenCalledTimes(1);
+    const message = String(ctx.warn.mock.calls[0][0]);
+    expect(message).toMatch(/exceeds the budget of 1 /);
+    expect(message).toContain("BUNDLE_BUDGET_STRICT=1");
+    expect(ctx.error).not.toHaveBeenCalled();
+  });
+
+  it("strict omitted + BUNDLE_BUDGET_STRICT=1 — the env alone selects the error path", () => {
+    vi.stubEnv("BUNDLE_BUDGET_STRICT", "1");
+    const { ctx, thrown } = runGenerate({ budget: TINY_BUDGET });
+    expect(thrown).toBeInstanceOf(Error);
+    expect(ctx.error).toHaveBeenCalledTimes(1);
+    expect(ctx.warn).not.toHaveBeenCalled();
+  });
+
+  it("strict omitted + env unset — warns only (the default is advisory)", () => {
+    const { ctx, thrown } = runGenerate({ budget: TINY_BUDGET });
+    expect(thrown).toBeUndefined();
+    expect(ctx.warn).toHaveBeenCalledTimes(1);
+    expect(ctx.error).not.toHaveBeenCalled();
+  });
+
+  it("a passing budget neither warns nor errors, in either mode", () => {
+    for (const strict of [true, false]) {
+      const { ctx, thrown } = runGenerate({ strict, budget: ROOMY_BUDGET });
+      expect(thrown, `strict=${strict}`).toBeUndefined();
+      expect(ctx.warn, `strict=${strict}`).not.toHaveBeenCalled();
+      expect(ctx.error, `strict=${strict}`).not.toHaveBeenCalled();
+    }
+  });
+
+  describe("closeBundle after generateBundle", () => {
+    // Vite runs closeBundle even after a failed build, and `dist` already holds the copied public/
+    // files by then: a failed build must not be decorated with siblings.
+    const appJs = () => join(root, "dist", "assets", "app-abc.js");
+    beforeEach(() => {
+      mkdirSync(join(root, "dist", "assets"), { recursive: true });
+      writeFileSync(appJs(), "export const a = " + JSON.stringify("app ".repeat(2000)) + ";\n");
+    });
+
+    it("writes NO .br/.gz siblings after a strict-mode failure", () => {
+      const { hooks, ctx, thrown } = runGenerate({ strict: true, budget: TINY_BUDGET });
+      expect(thrown).toBeInstanceOf(Error);
+      hooks.closeBundle.call(ctx, undefined);
+      expect(existsSync(appJs() + ".br")).toBe(false);
+      expect(existsSync(appJs() + ".gz")).toBe(false);
+    });
+
+    it("writes NO siblings when Vite hands closeBundle a build error", () => {
+      const { hooks, ctx, thrown } = runGenerate({ strict: true, budget: ROOMY_BUDGET });
+      expect(thrown).toBeUndefined();
+      hooks.closeBundle.call(ctx, new Error("some other plugin failed"));
+      expect(existsSync(appJs() + ".br")).toBe(false);
+      expect(existsSync(appJs() + ".gz")).toBe(false);
+    });
+
+    it("control: the same flow with a passing budget DOES write the siblings", () => {
+      const { hooks, ctx, thrown } = runGenerate({ strict: true, budget: ROOMY_BUDGET });
+      expect(thrown).toBeUndefined();
+      hooks.closeBundle.call(ctx, undefined);
+      expect(existsSync(appJs() + ".br")).toBe(true);
+      expect(existsSync(appJs() + ".gz")).toBe(true);
+      expect(brotliDecompressSync(readFileSync(appJs() + ".br")).toString()).toBe(
+        readFileSync(appJs(), "utf8"),
+      );
+    });
+
+    it("control: a NON-strict violation still writes the siblings (the build did not fail)", () => {
+      const { hooks, ctx, thrown } = runGenerate({ strict: false, budget: TINY_BUDGET });
+      expect(thrown).toBeUndefined();
+      hooks.closeBundle.call(ctx, undefined);
+      expect(existsSync(appJs() + ".br")).toBe(true);
+      expect(existsSync(appJs() + ".gz")).toBe(true);
+    });
+  });
+});
+
+describe("compressSiblings cache", () => {
+  type Cache = NonNullable<Parameters<typeof compressSiblings>[1]>;
+  let dir: string;
+  const rel = "assets/index-abc.js";
+  const source =
+    "export const s = " + JSON.stringify("on-disk source ".repeat(4000)) + ";\n";
+  // A DIFFERENT, still-compressible payload: if its bytes end up on disk, the cache was used.
+  const sentinel = "cached sentinel content ".repeat(2000);
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "ccc-precompress-cache-"));
+    mkdirSync(join(dir, "assets"), { recursive: true });
+    writeFileSync(join(dir, rel), source);
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  const js = () => join(dir, rel);
+
+  it("uses the cached .br/.gz when the cached raw equals the on-disk source", () => {
+    const cache: Cache = new Map([
+      [rel, { raw: Buffer.from(source), br: brotliBytes(sentinel), gz: gzipBytes(sentinel) }],
+    ]);
+    const result = compressSiblings(dir, cache);
+    expect(result.written).toEqual([rel + ".br", rel + ".gz"]);
+    // valid streams, but they decompress to the SENTINEL, not the source: the cache was used
+    expect(brotliDecompressSync(readFileSync(js() + ".br")).toString()).toBe(sentinel);
+    expect(gunzipSync(readFileSync(js() + ".gz")).toString()).toBe(sentinel);
+    expect(result.brBytes).toBe(brotliBytes(sentinel).length);
+  });
+
+  it("ignores a cache entry whose raw differs from the on-disk source (a later plugin rewrote the file)", () => {
+    const cache: Cache = new Map([
+      [
+        rel,
+        {
+          raw: Buffer.from(source + "// rewritten after generateBundle\n"),
+          br: brotliBytes(sentinel),
+          gz: gzipBytes(sentinel),
+        },
+      ],
+    ]);
+    compressSiblings(dir, cache);
+    expect(brotliDecompressSync(readFileSync(js() + ".br")).toString()).toBe(source);
+    expect(gunzipSync(readFileSync(js() + ".gz")).toString()).toBe(source);
+  });
+
+  it("ignores a cache entry keyed under a different path", () => {
+    const cache: Cache = new Map([
+      [
+        "assets/other-abc.js",
+        { raw: Buffer.from(source), br: brotliBytes(sentinel), gz: gzipBytes(sentinel) },
+      ],
+    ]);
+    compressSiblings(dir, cache);
+    expect(brotliDecompressSync(readFileSync(js() + ".br")).toString()).toBe(source);
   });
 });

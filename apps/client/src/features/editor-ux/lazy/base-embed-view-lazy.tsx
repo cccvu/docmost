@@ -4,10 +4,12 @@
 // (tiptap's ReactNodeViewRenderer requires the first element to be one) and deliberately imports
 // nothing from @/ee/base — that would pull the grid straight back in. The export stays NAMED
 // `BaseEmbedView` so extensions.ts's `ReactNodeViewRenderer(BaseEmbedView)` is untouched.
-import { lazy, Suspense } from "react";
+// Chunk-load failures reload the document once (see @/features/layout/lazy-with-reload.ts).
+import { Suspense } from "react";
+import { lazyWithReload } from "@/features/layout/lazy-with-reload";
 import { NodeViewProps, NodeViewWrapper } from "@tiptap/react";
 
-const BaseEmbedViewImpl = lazy(() =>
+const BaseEmbedViewImpl = lazyWithReload(() =>
   import("@/features/editor/components/base-embed/base-embed-view.tsx").then(
     (m) => ({ default: m.BaseEmbedView }),
   ),

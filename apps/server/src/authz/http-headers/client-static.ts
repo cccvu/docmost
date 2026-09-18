@@ -83,9 +83,10 @@ export function mergeVary(
  *
  * `Vary: Accept-Encoding` is NOT set in `setHeaders`: any plugin that sets Vary through the reply store
  * (`@fastify/cors` does, with `Vary: Origin`) would clobber a raw one, because Fastify writes reply-store
- * headers over raw ones. It is instead append-merged (`mergeVary`) in an `onSend` hook that runs ONLY for
- * @fastify/static's per-file routes — recognised by the `config.file` it stamps on each route it registers
- * (`setUpHeadAndGet`) — never for API routes or the `*` fallback. The hook is added BEFORE the plugin is
+ * headers over raw ones. It is instead append-merged (`mergeVary`) in an `onSend` hook on the instance the
+ * seam passes in (Docmost's root, so it RUNS for every response, a sub-microsecond property test) that ACTS
+ * only for @fastify/static's per-file routes — recognised by the `config.file` it stamps on each route it
+ * registers (`setUpHeadAndGet`) — never for API routes or the `*` fallback. The hook is added BEFORE the plugin is
  * registered on purpose: a route context snapshots the instance hooks when avvio runs its `after`, and
  * although in the Nest boot that happens at `ready()` (so the order is not load-bearing today — the
  * spec's mutation check confirms both orders pass), adding it first keeps the guarantee independent of
