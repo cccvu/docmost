@@ -57,6 +57,8 @@ import { generateHTML, generateJSON } from '../common/helpers/prosemirror/html';
 import { Node, Schema } from '@tiptap/pm/model';
 import * as Y from 'yjs';
 import { Logger } from '@nestjs/common';
+// #392: fork-owned (boundary-excluded) backfill logic; this seam only wires it into htmlToJson.
+import { backfillAttachmentIds } from '../editor-compat/attachment-id-backfill';
 
 export const tiptapExtensions = [
   StarterKit.configure({
@@ -127,6 +129,12 @@ export function jsonToHtml(tiptapJson: any) {
 
 export function htmlToJson(html: string) {
   const pmJson = generateJSON(html, tiptapExtensions);
+
+  // #392: rebuild attachment linkage before anything downstream reads it. Mutates in place so the
+  // fill survives even if `addUniqueIdsToDoc` throws and we fall back to `pmJson`. A separate pass from
+  // `addUniqueIdsToDoc` (both O(n) over a page-sized doc, off the collab hot path — the doubled walk is
+  // an accepted tradeoff vs. conflating this into the shared editor-ext helper). (#396 perf review)
+  backfillAttachmentIds(pmJson);
 
   try {
     return addUniqueIdsToDoc(pmJson, tiptapExtensions);

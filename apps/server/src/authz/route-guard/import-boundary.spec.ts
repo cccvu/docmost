@@ -57,6 +57,7 @@ const SEAM_ALLOWLIST = new Set<string>([
   'core/auth/auth.controller.ts', // seam #87 — NativeAuthModeGuard + @SessionScopedRoute() allowlist (collab-token/logout)
   'core/workspace/controllers/workspace.controller.ts', // seam #87/#88 — native-auth gate on the session-mint route
   'collaboration/collaboration.handler.ts', // seam #2 — conditional content write compares via authz/page-write/stable-hash (#282); flushPageContent reads authz/page-write/store-failure-registry (#390)
+  'collaboration/collaboration.util.ts', // seam #61 — htmlToJson imports the #392 attachmentId backfill from editor-compat/
   'collaboration/extensions/persistence.extension.ts', // seam #390 — reconcile-before-store + store-failure signal via authz/page-write/{reconcile-store,store-failure-registry}
 ]);
 
