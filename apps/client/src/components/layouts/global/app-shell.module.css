@@ -24,6 +24,14 @@
 /* CCC (issue: UI polish): drag handle to resize the navbar. Rendered on the right edge of
    the navbar, desktop + non-rail only (global-app-shell.tsx). A thin hit target that widens
    and tints on hover/active. */
+/* When the sidebar is expanded (resizable), reserve a small right gutter so the sidebar's scroll bar
+   and the row action menus sit clear of the resize handle. The handle is absolutely positioned against
+   the navbar's padding box, so it stays pinned at the true right edge while only the CONTENT insets —
+   removing the overlap where a scrollbar drag or a right-edge menu click could hit the handle instead. */
+.navbarResizable {
+  padding-inline-end: 6px;
+}
+
 .resizeHandle {
   width: 4px;
   cursor: col-resize;

@@ -6,6 +6,7 @@ import SettingsSidebar from "@/components/settings/settings-sidebar.tsx";
 import { useAtom } from "jotai";
 import {
   asideStateAtom,
+  clampSidebarWidth,
   desktopSidebarAtom,
   mobileSidebarAtom,
   sidebarWidthAtom,
@@ -48,20 +49,41 @@ export default function GlobalAppShell({
   // clamps to [MIN, MAX] on write, so the drag handler can pass the raw pointer position.
   const [sidebarWidth, setSidebarWidth] = useAtom(sidebarWidthAtom);
   const [isResizing, setIsResizing] = useState(false);
+  // Transient width during a drag: tracked in local state and committed to the persisted (localStorage-
+  // backed) atom ONCE on mouseup, so a drag is not a synchronous localStorage write + full navbar re-render
+  // on every mousemove.
+  const [dragWidth, setDragWidth] = useState<number | null>(null);
   const navbarRef = useRef<HTMLDivElement>(null);
+  const navbarLeftRef = useRef(0);
+  const liveWidthRef = useRef(sidebarWidth);
+  // What the shell renders: the live drag value while resizing, else the persisted width.
+  const displayWidth = dragWidth ?? sidebarWidth;
 
-  const startResizing = useCallback((e: React.MouseEvent) => {
-    e.preventDefault();
-    setIsResizing(true);
-  }, []);
+  const startResizing = useCallback(
+    (e: React.MouseEvent) => {
+      e.preventDefault();
+      // Capture the navbar's left edge ONCE — invariant during the drag (avoids a forced reflow from
+      // getBoundingClientRect() every mousemove).
+      navbarLeftRef.current = navbarRef.current?.getBoundingClientRect().left ?? 0;
+      liveWidthRef.current = sidebarWidth;
+      setDragWidth(sidebarWidth);
+      setIsResizing(true);
+    },
+    [sidebarWidth],
+  );
 
   useEffect(() => {
     if (!isResizing) return;
     const handleMove = (e: MouseEvent) => {
-      const left = navbarRef.current?.getBoundingClientRect().left ?? 0;
-      setSidebarWidth(e.clientX - left);
+      const w = clampSidebarWidth(e.clientX - navbarLeftRef.current);
+      liveWidthRef.current = w;
+      setDragWidth(w); // transient only — not persisted mid-drag
     };
-    const stop = () => setIsResizing(false);
+    const stop = () => {
+      setIsResizing(false);
+      setSidebarWidth(liveWidthRef.current); // the single persisted write, on release
+      setDragWidth(null);
+    };
     // Suppress text selection / show the resize cursor for the whole document while dragging.
     document.body.style.userSelect = "none";
     document.body.style.cursor = "col-resize";
@@ -112,7 +134,7 @@ export default function GlobalAppShell({
         // resized width.
         width: {
           base: SIDEBAR_WIDTH,
-          sm: isRail ? RAIL_WIDTH : sidebarWidth,
+          sm: isRail ? RAIL_WIDTH : displayWidth,
         },
         breakpoint: NAVBAR_BREAKPOINT,
         collapsed: {
@@ -136,7 +158,10 @@ export default function GlobalAppShell({
       </AppShell.Header>
       <AppShell.Navbar
         ref={navbarRef}
-        className={classes.navbar}
+        // When expanded (non-rail), reserve a small right gutter so the sidebar's scrollbar and the
+        // row action menus sit clear of the absolutely-positioned resize handle at the navbar's right
+        // edge (the handle stays at the edge; only the content insets). No gutter when railed.
+        className={`${classes.navbar}${!isRail ? ` ${classes.navbarResizable}` : ""}`}
         withBorder={false}
         aria-label={
           isSpaceRoute
@@ -172,7 +197,7 @@ export default function GlobalAppShell({
             role="separator"
             aria-orientation="vertical"
             aria-label={t("Resize sidebar")}
-            aria-valuenow={sidebarWidth}
+            aria-valuenow={displayWidth}
             aria-valuemin={SIDEBAR_MIN_WIDTH}
             aria-valuemax={SIDEBAR_MAX_WIDTH}
             tabIndex={0}
