@@ -1,0 +1,19 @@
+{
+  // Fork-owned build tooling (issue #309). `apps/client/tsconfig.json` includes only `src`, so this dir
+  // is typechecked separately: `npx tsc -p apps/client/build/tsconfig.json --noEmit` (CI runs it).
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "isolatedModules": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "noEmit": true
+  },
+  "include": ["./*.ts"]
+}

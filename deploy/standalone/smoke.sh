@@ -6,7 +6,9 @@
 #   2. native credential auth works (first-run setup + native login),
 #   3. native authorization is really ENFORCED, not allow-all: a second user is DENIED (403) a page in a
 #      space they were never made a member of, while the owner reads it (200),
-#   4. no CCC services (platform / spicedb) are present.
+#   4. no CCC services (platform / spicedb) are present,
+#   5. the SPA build is delivered precompressed (br / gzip negotiated on Accept-Encoding) with an immutable
+#      Cache-Control on the content-hashed bundle and a revalidate policy on index.html (#309).
 #
 # Run from anywhere; the script cds to the fork root. Requires docker (compose v2), curl, jq.
 #   docmost/deploy/standalone/smoke.sh
@@ -182,6 +184,76 @@ if echo "$services" | grep -qiE 'platform|spicedb'; then
   bad "a CCC service is present in the standalone stack: $services"
 else
   pass "only OSS services present ($services)"
+fi
+
+# --- 5. SPA asset delivery: negotiated precompression + cache policy (#309) -------------------------
+# Curl-only. Every probe reads the STATUS CODE and lower-cased headers explicitly: never `curl -f`, always
+# `--max-redirs 0`, so a 3xx can never pass for a 200 (AGENTS.md: a redirect is never a pass). curl prints
+# its own `000` on a transport failure, so the `|| true` only keeps `set -e` from aborting the run.
+log "SPA asset delivery: precompressed siblings + immutable hashed bundle (#309)"
+# hdr <dump-file> <name>: the value of that response header, lower-cased, CR stripped ("" when absent)
+hdr() { tr -d '\r' < "$1" | tr 'A-Z' 'a-z' | awk -v h="$2:" 'index($0, h)==1 {sub(/^[^:]*:[ \t]*/, ""); v=$0} END{print v}'; }
+# probe <url> <accept-encoding|-> <dump-prefix>: writes <prefix>.h / <prefix>.body, prints the status code
+probe() {
+  if [ "$2" = "-" ]; then
+    curl -sS --max-redirs 0 -o "$3.body" -D "$3.h" -w '%{http_code}' "$1" || true
+  else
+    curl -sS --max-redirs 0 -o "$3.body" -D "$3.h" -w '%{http_code}' -H "Accept-Encoding: $2" "$1" || true
+  fi
+}
+
+# discover the entry script from the SPA shell (identity fetch so the HTML is greppable as-is)
+shell_code="$(probe "${BASE}/" - "$TMP/shell")"
+asset_path="$(grep -o '<script[^>]*src="/assets/[^"]*"' "$TMP/shell.body" | head -1 | sed 's/.*src="\([^"]*\)".*/\1/' || true)"
+if [ "$shell_code" = "200" ] && [ -n "$asset_path" ]; then
+  pass "SPA shell served (200) and names its entry script (${asset_path})"
+  ASSET="${BASE}${asset_path}"
+
+  br_code="$(probe "$ASSET" 'gzip, deflate, br' "$TMP/asset_br")"
+  [ "$br_code" = "200" ] && [ "$(hdr "$TMP/asset_br.h" content-encoding)" = "br" ] \
+    && pass "entry script with br accepted -> 200 content-encoding: br" \
+    || bad "entry script with br accepted: HTTP $br_code content-encoding='$(hdr "$TMP/asset_br.h" content-encoding)' (expected 200 + br)"
+
+  gz_code="$(probe "$ASSET" 'gzip' "$TMP/asset_gz")"
+  [ "$gz_code" = "200" ] && [ "$(hdr "$TMP/asset_gz.h" content-encoding)" = "gzip" ] \
+    && pass "entry script with gzip accepted -> 200 content-encoding: gzip" \
+    || bad "entry script with gzip accepted: HTTP $gz_code content-encoding='$(hdr "$TMP/asset_gz.h" content-encoding)' (expected 200 + gzip)"
+
+  id_code="$(probe "$ASSET" - "$TMP/asset_id")"
+  [ "$id_code" = "200" ] && [ -z "$(hdr "$TMP/asset_id.h" content-encoding)" ] \
+    && pass "entry script with no Accept-Encoding -> 200 identity (no content-encoding)" \
+    || bad "entry script with no Accept-Encoding: HTTP $id_code content-encoding='$(hdr "$TMP/asset_id.h" content-encoding)' (expected 200, none)"
+
+  cc="$(hdr "$TMP/asset_br.h" cache-control)"
+  [ "$cc" = "public, max-age=31536000, immutable" ] \
+    && pass "entry script cache-control is exactly 'public, max-age=31536000, immutable'" \
+    || bad "entry script cache-control='$cc' (expected exactly 'public, max-age=31536000, immutable')"
+
+  vary="$(hdr "$TMP/asset_br.h" vary)"
+  case "$vary" in
+    *accept-encoding*) pass "entry script vary contains accept-encoding ('$vary')" ;;
+    *) bad "entry script vary='$vary' does not contain accept-encoding" ;;
+  esac
+
+  [ -n "$(hdr "$TMP/asset_br.h" etag)" ] && pass "entry script carries an etag" || bad "entry script has no etag"
+else
+  bad "could not discover the entry script from GET / (HTTP $shell_code, asset='${asset_path}'); asset probes skipped"
+fi
+
+# index.html: served with the window.CONFIG injection (an encoded body would be a stale pre-injection sibling)
+# and a REVALIDATE policy, never the immutable one — a deploy must not leave users on the old shell.
+idx_code="$(probe "${BASE}/index.html" 'gzip, deflate, br' "$TMP/index")"
+idx_cc="$(hdr "$TMP/index.h" cache-control)"
+if [ "$idx_code" = "200" ]; then
+  case "$idx_cc" in
+    *immutable*) bad "index.html cache-control='$idx_cc' contains immutable (must revalidate)" ;;
+    *) pass "index.html -> 200 with a revalidate cache-control ('$idx_cc', no immutable)" ;;
+  esac
+  [ -z "$(hdr "$TMP/index.h" content-encoding)" ] && grep -q 'window.CONFIG=' "$TMP/index.body" \
+    && pass "index.html is the injected shell (identity body carries window.CONFIG, no stale precompressed sibling)" \
+    || bad "index.html content-encoding='$(hdr "$TMP/index.h" content-encoding)' / window.CONFIG present: $(grep -c 'window.CONFIG=' "$TMP/index.body" || true) (expected identity + injected)"
+else
+  bad "GET /index.html -> HTTP $idx_code (expected 200)"
 fi
 
 log "RESULT"
