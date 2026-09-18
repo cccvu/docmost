@@ -16,6 +16,8 @@ import {
   ConditionalUpdateOutcome,
   FlushPageContentOutcome,
 } from '../authz/page-write/collab-outcomes';
+// #390: the settle must report failure (not a false success) when the store it just ran failed to persist.
+import { hasStoreFailure } from '../authz/page-write/store-failure-registry';
 
 export type CollabEventHandlers = ReturnType<
   CollaborationHandler['getHandlers']
@@ -72,6 +74,12 @@ export class CollaborationHandler {
           }
           // Drain a store that was already executing when we arrived.
           await doc.saveMutex.runExclusive(async () => undefined);
+          // #390: if the store we just forced (or drained) FAILED to persist, the row does not hold what this
+          // document contains — reporting success here would let a guarded /v1 write trust a version the row
+          // never received. `reason: 'error'` fails the guarded write closed (503), same as a thrown settle.
+          if (hasStoreFailure(doc)) {
+            return { flushed: false, reason: 'error' };
+          }
           // Serializing + hashing a whole document is not free and it runs on the event loop every live
           // editor on this node shares, so only do it when the caller is going to use the digest. A read
           // settle (`GET ?settle=true`) wants the store, never the version.

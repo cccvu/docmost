@@ -33,6 +33,21 @@ import {
   HISTORY_INTERVAL,
 } from '../constants';
 import { TransclusionService } from '../../core/page/transclusion/transclusion.service';
+// CCC integration seam (UPSTREAM_MODIFICATIONS.md + authz/route-guard/import-boundary.spec.ts): #390 folds
+// the fork-owned symmetric stale-doc guard (reconcile-before-store) and the store-failure signal into the
+// upstream persistence hook. The policy/CRDT logic lives in authz/page-write/; this file only calls it.
+import { reconcileRowIntoDoc } from '../../authz/page-write/reconcile-store';
+import { shouldRefuseBlankClobber } from '../../authz/page-write/blank-clobber-guard';
+import {
+  recordStoreFailure,
+  clearStoreFailure,
+} from '../../authz/page-write/store-failure-registry';
+// The alarm tokens (COLLAB_STALE_RECONCILE / COLLAB_STORE_FAILED) are emitted from authz/ — the only fork
+// subtree scripts/check-infra-config.mjs §14 scans for a monitoring.tf filter's emitter.
+import {
+  logStaleReconcile,
+  logStoreFailure,
+} from '../../authz/page-write/collab-drift-log';
 
 @Injectable()
 export class PersistenceExtension implements Extension {
@@ -100,16 +115,13 @@ export class PersistenceExtension implements Extension {
 
     const pageId = getPageId(documentName);
 
-    const tiptapJson = TiptapTransformer.fromYdoc(document, 'default');
-    const ydocState = Buffer.from(Y.encodeStateAsUpdate(document));
-
-    let textContent = null;
-
-    try {
-      textContent = jsonToText(tiptapJson);
-    } catch (err) {
-      this.logger.warn('jsonToText' + err?.['message']);
-    }
+    // #390: serialization is deferred to INSIDE the row's FOR UPDATE transaction, AFTER the reconcile, so the
+    // persisted payload is always a snapshot of `document` taken under the lock — hence a superset of the
+    // locked row and never a stale subset that could clobber an out-of-band write. Declared here because the
+    // post-write side effects below also read the final values.
+    let tiptapJson: any = null;
+    let ydocState: Buffer = null;
+    let textContent: string = null;
 
     let page: Page = null;
     const editingUserIds = this.consumeContributors(documentName);
@@ -119,11 +131,49 @@ export class PersistenceExtension implements Extension {
         page = await this.pageRepo.findById(pageId, {
           withLock: true,
           includeContent: true,
+          includeYdoc: true, // #390: the row's ydoc for the reconcile diff, read under the SAME lock
           trx,
         });
 
         if (!page) {
           this.logger.error(`Page with id ${pageId} not found`);
+          return;
+        }
+
+        // #390 — SYMMETRIC guard. Fold any row content this resident doc is MISSING back in (lossless Yjs
+        // union) BEFORE serializing, so a stale resident copy cannot revert an out-of-band write. No-op in
+        // normal operation (the resident is a superset of the row). Runs inside the lock; the merge also
+        // updates the in-memory doc, so connected editors converge too.
+        if (page.ydoc) {
+          const { merged } = reconcileRowIntoDoc(document, page.ydoc);
+          if (merged) {
+            logStaleReconcile(
+              this.logger,
+              `folded out-of-band row content into the resident doc before store: ${pageId}`,
+            );
+          }
+        }
+
+        // Serialize AFTER the reconcile, under the lock (see #390 TOCTOU note above).
+        tiptapJson = TiptapTransformer.fromYdoc(document, 'default');
+        ydocState = Buffer.from(Y.encodeStateAsUpdate(document));
+        try {
+          textContent = jsonToText(tiptapJson);
+        } catch (err) {
+          this.logger.warn('jsonToText' + err?.['message']);
+        }
+
+        // #390 null-ydoc defensive fallback (dormant: verified no LIVE write path omits ydoc). Without a
+        // shared ydoc lineage the CRDT reconcile cannot run, so refuse the clobber shape — a blank resident
+        // doc overwriting a row that still holds real content — via the pure structural guard, while letting
+        // a genuine edit proceed. A non-blank-over-non-blank clobber is NOT defensible here without lineage;
+        // that residual is why the dormancy claim (all live writers co-write ydoc) is load-bearing (#390).
+        if (!page.ydoc && shouldRefuseBlankClobber(page.content, tiptapJson)) {
+          logStaleReconcile(
+            this.logger,
+            `refused to overwrite non-empty row content with a blank resident doc (no ydoc lineage): ${pageId}`,
+          );
+          page = null;
           return;
         }
 
@@ -160,8 +210,16 @@ export class PersistenceExtension implements Extension {
 
         this.logger.debug(`Page updated: ${pageId} - SlugId: ${page.slugId}`);
       });
+      // #390: a completed store (write or no-op) clears any prior failure so the settle stops failing closed.
+      clearStoreFailure(document);
     } catch (err) {
-      this.logger.error(`Failed to update page ${pageId}`, err);
+      // #390: do NOT re-throw (an unhandled rejection on the setTimeout debounce path could crash the
+      // process). Record the failure so the settle (flushPageContent) reports {reason:'error'} → the platform
+      // fail-closes the guarded write instead of trusting a version the row never received (ADR 0019). Also
+      // drop `page` so the post-store side effects do not fire for a write that rolled back.
+      logStoreFailure(this.logger, pageId, err);
+      recordStoreFailure(document);
+      page = null;
     }
 
     if (page) {
