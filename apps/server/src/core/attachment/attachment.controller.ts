@@ -10,6 +10,7 @@ import {
   Logger,
   NotFoundException,
   Param,
+  PayloadTooLargeException,
   Post,
   Query,
   Req,
@@ -98,7 +99,8 @@ export class AttachmentController {
     } catch (err: any) {
       this.logger.error(err.message);
       if (err?.statusCode === 413) {
-        throw new BadRequestException(
+        // CCC #308: keep the real 413 (was BadRequestException → 400).
+        throw new PayloadTooLargeException(
           `File too large. Exceeds the ${this.environmentService.getFileUploadSizeLimit()} limit`,
         );
       }
@@ -153,10 +155,15 @@ export class AttachmentController {
 
       return res.send(fileResponse);
     } catch (err: any) {
-      if (err?.statusCode === 413) {
+      // CCC #308: keep the real 413 (was BadRequestException → 400) so a truncated/oversize upload
+      // surfaces as Payload Too Large, matching the platform /v1 contract. The service's truncation guard
+      // throws a NestJS `PayloadTooLargeException` (status via getStatus(), NO `.statusCode` property), so
+      // match BOTH that and a raw fastify 413 (`.statusCode`) — a `.statusCode`-only check silently let the
+      // service 413 fall through to the 400 below.
+      if (err instanceof PayloadTooLargeException || err?.statusCode === 413) {
         const errMessage = `File too large. Exceeds the ${this.environmentService.getFileUploadSizeLimit()} limit`;
         this.logger.error(errMessage);
-        throw new BadRequestException(errMessage);
+        throw new PayloadTooLargeException(errMessage);
       }
       this.logger.error(err);
       throw new BadRequestException('Error processing file upload.');
