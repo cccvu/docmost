@@ -17,6 +17,10 @@ jest.mock('../../collaboration/yjs.util', () => ({
 
 import { CollaborationHandler } from '../../collaboration/collaboration.handler';
 import { stableHash } from '../page-write/stable-hash';
+import {
+  recordStoreFailure,
+  clearStoreFailure,
+} from '../page-write/store-failure-registry';
 
 /**
  * CCC integration test (part of the fork's compatibility suite) for the CONTENT SETTLE seam, issue 282.
@@ -245,6 +249,30 @@ describe('CollaborationHandler.flushPageContent (content settle, issue 282)', ()
     await expect(
       flushOf(hocuspocus)(DOC, { withDigest: true }),
     ).resolves.toEqual({ flushed: false, reason: 'error' });
+  });
+
+  // #390: onStoreDocument cannot re-throw a swallowed DB error (an unhandled rejection on the setTimeout
+  // debounce path could crash the process), so it RECORDS the failure. The settle, which just ran that
+  // store, must read the flag and fail closed — a false `flushed: true` + digest would let a guarded /v1
+  // write trust a version the row never received.
+  it('fails closed with reason:error when the store it ran failed to persist (#390)', async () => {
+    const { doc } = makeDoc();
+    const hocuspocus = makeHocuspocus(doc, {
+      isDebounced: jest.fn(() => true),
+      executeNow: jest.fn(async () => {
+        recordStoreFailure(doc); // onStoreDocument recorded a swallowed DB failure during this store
+      }),
+    });
+
+    try {
+      await expect(
+        flushOf(hocuspocus)(DOC, { withDigest: true }),
+      ).resolves.toEqual({ flushed: false, reason: 'error' });
+      // must NOT serialize/hash a digest for a row that was never written
+      expect(fromYdoc).not.toHaveBeenCalled();
+    } finally {
+      clearStoreFailure(doc); // WeakMap is module-global; keep tests isolated
+    }
   });
 
   it('reports an ERROR outcome instead of throwing when the mutex drain rejects', async () => {

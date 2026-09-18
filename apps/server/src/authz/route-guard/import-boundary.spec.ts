@@ -56,7 +56,8 @@ const SEAM_ALLOWLIST = new Set<string>([
   'integrations/static/static.module.ts', // seam #86 — client capability injection (NATIVE_AUTH_ENABLED, reads authz mode)
   'core/auth/auth.controller.ts', // seam #87 — NativeAuthModeGuard + @SessionScopedRoute() allowlist (collab-token/logout)
   'core/workspace/controllers/workspace.controller.ts', // seam #87/#88 — native-auth gate on the session-mint route
-  'collaboration/collaboration.handler.ts', // seam #2 — conditional content write compares via authz/page-write/stable-hash (#282)
+  'collaboration/collaboration.handler.ts', // seam #2 — conditional content write compares via authz/page-write/stable-hash (#282); flushPageContent reads authz/page-write/store-failure-registry (#390)
+  'collaboration/extensions/persistence.extension.ts', // seam #390 — reconcile-before-store + store-failure signal via authz/page-write/{reconcile-store,store-failure-registry}
 ]);
 
 const posix = (p: string) => p.split(sep).join('/');
