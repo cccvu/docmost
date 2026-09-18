@@ -3,6 +3,7 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  PayloadTooLargeException,
 } from '@nestjs/common';
 import { Readable } from 'stream';
 import { StorageService } from '../../../integrations/storage/storage.service';
@@ -88,7 +89,35 @@ export class AttachmentService {
       preparedFile.multiPartFile.file,
     );
 
-    await this.uploadToDrive(filePath, stream);
+    try {
+      await this.uploadToDrive(filePath, stream);
+    } catch (err) {
+      // CCC #308: a mid-stream abort (the platform relay tearing down on its own 413, or a client
+      // disconnect) can leave a partial object in storage — remove it, then rethrow. ONLY for a FRESH
+      // upload: on the overwrite path (`isUpdate`) `filePath` is the EXISTING attachment's object, whose
+      // row still points at it, and an aborted/failed write leaves that object intact (S3 PutObject is
+      // atomic), so deleting it would destroy a good attachment — a data-loss regression. Delete only what
+      // this call created.
+      if (!isUpdate) {
+        await this.deletePartialObject(filePath, 'aborted upload');
+      }
+      throw err;
+    }
+
+    // CCC #308: fail CLOSED on truncation. @fastify/multipart caps the inbound at `fileSize` and
+    // sets `.truncated` WITHOUT erroring the stream (throwFileSizeLimit only surfaces via
+    // `.toBuffer()`, which the streaming path bypasses via `skipBuffer`). Upstream never checks it,
+    // so a >limit upload was silently stored at exactly the cap and returned 200 with the truncated
+    // size. Reject with 413, and delete the truncated object only on the FRESH path (no DB row exists
+    // yet). On the overwrite path we must NOT delete — the existing row would be left pointing at a
+    // deleted object; the platform `/v1` edge prevents truncated bytes from ever reaching an overwrite
+    // (it aborts the relay before the closing boundary → the branch above, original intact).
+    if ((preparedFile.multiPartFile.file as { truncated?: boolean }).truncated) {
+      if (!isUpdate) {
+        await this.deletePartialObject(filePath, 'truncated upload');
+      }
+      throw new PayloadTooLargeException('File too large');
+    }
 
     // Update fileSize from the consumed stream
     preparedFile.fileSize = getBytesRead();
@@ -246,6 +275,20 @@ export class AttachmentService {
     } catch (err) {
       this.logger.error('Error uploading file to drive:', err);
       throw new BadRequestException('Error uploading file to drive');
+    }
+  }
+
+  // CCC #308: best-effort cleanup of an object this call created (a partial write from an abort, or a
+  // truncated object on the fresh path). A failed delete is non-fatal — the caller still rethrows the
+  // upload error / 413 — but is logged rather than swallowed so an orphaned object (storage cost / leak)
+  // leaves an operator signal instead of being silently invisible.
+  private async deletePartialObject(filePath: string, reason: string): Promise<void> {
+    try {
+      await this.storageService.delete(filePath);
+    } catch (err) {
+      this.logger.warn(
+        `Failed to clean up ${reason} at ${filePath}: ${err instanceof Error ? err.message : err}`,
+      );
     }
   }
 

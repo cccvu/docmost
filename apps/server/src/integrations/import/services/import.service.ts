@@ -1,4 +1,9 @@
-import { BadRequestException, Injectable, Logger } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  PayloadTooLargeException,
+} from '@nestjs/common';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { MultipartFile } from '@fastify/multipart';
 import * as path from 'path';
@@ -336,7 +341,22 @@ export class ImportService {
     // upload file
     const { stream, getBytesRead } = createByteCountingStream(file.file);
 
-    await this.storageService.upload(filePath, stream);
+    try {
+      await this.storageService.upload(filePath, stream);
+    } catch (err) {
+      // CCC #308: remove any partial object left by a mid-stream abort, then rethrow. `filePath` is a
+      // FRESH `fileTaskId` path (never an overwrite), so the object is always one this call created.
+      await this.deletePartialImport(filePath, 'aborted import');
+      throw err;
+    }
+
+    // CCC #308: fail CLOSED on truncation (same class as the attachment upload path). busboy caps
+    // the inbound at `fileSize` and sets `.truncated` without erroring the stream, so a >limit import
+    // was silently stored at exactly the cap. Delete the truncated object (no fileTasks row yet) and reject.
+    if ((file.file as { truncated?: boolean }).truncated) {
+      await this.deletePartialImport(filePath, 'truncated import');
+      throw new PayloadTooLargeException('File too large');
+    }
 
     const fileSize = getBytesRead();
 
@@ -363,5 +383,18 @@ export class ImportService {
     });
 
     return fileTask;
+  }
+
+  // CCC #308: best-effort cleanup of the import object this call created (a partial write from an abort,
+  // or a truncated object). Non-fatal — the caller still rethrows — but logged rather than swallowed so an
+  // orphaned object leaves an operator signal instead of being silently invisible.
+  private async deletePartialImport(filePath: string, reason: string): Promise<void> {
+    try {
+      await this.storageService.delete(filePath);
+    } catch (err) {
+      this.logger.warn(
+        `Failed to clean up ${reason} at ${filePath}: ${err instanceof Error ? err.message : err}`,
+      );
+    }
   }
 }
