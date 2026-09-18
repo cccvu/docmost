@@ -82,4 +82,72 @@ describe('AttachmentService — #308 oversize upload fails closed (413), never t
     expect(attachmentRepo.insertAttachment).not.toHaveBeenCalled();
     expect(attachmentQueue.add).not.toHaveBeenCalled();
   });
+
+  /**
+   * CCC #308 review (Correctness, P4): on the OVERWRITE path (`attachmentId` set, e.g. a diagram re-save or
+   * a `/v1` upload with `?attachmentId=`), `filePath` resolves to the EXISTING attachment's object and
+   * `updateAttachment` never changes it. Deleting that object on truncation/abort would leave the surviving
+   * row pointing at a deleted file — data loss. The cleanup must fire ONLY for a fresh upload (`!isUpdate`).
+   */
+  function existingBinAttachment() {
+    return { id: 'att-1', pageId: 'page-1', fileExt: '.bin', workspaceId: 'ws-1' };
+  }
+
+  it('on OVERWRITE, a truncated upload throws 413 but NEVER deletes the existing object or updates the row', async () => {
+    const storageService = {
+      upload: jest.fn().mockResolvedValue(undefined),
+      delete: jest.fn().mockResolvedValue(undefined),
+    };
+    const attachmentRepo = {
+      insertAttachment: jest.fn(),
+      updateAttachment: jest.fn(),
+      findById: jest.fn().mockResolvedValue(existingBinAttachment()),
+    };
+    const attachmentQueue = { add: jest.fn() };
+    const service = makeService(storageService, attachmentRepo, attachmentQueue);
+
+    await expect(
+      service.uploadFile({
+        filePromise: Promise.resolve(truncatedFile() as any),
+        pageId: 'page-1',
+        userId: 'user-1',
+        spaceId: 'space-1',
+        workspaceId: 'ws-1',
+        attachmentId: 'att-1',
+      }),
+    ).rejects.toBeInstanceOf(PayloadTooLargeException);
+
+    // The existing object survives (no delete of the overwrite target) and the row is untouched.
+    expect(storageService.delete).not.toHaveBeenCalled();
+    expect(attachmentRepo.updateAttachment).not.toHaveBeenCalled();
+    expect(attachmentQueue.add).not.toHaveBeenCalled();
+  });
+
+  it('on OVERWRITE, a mid-stream storage failure rethrows but NEVER deletes the existing object', async () => {
+    const storageService = {
+      upload: jest.fn().mockRejectedValue(new Error('connection reset')),
+      delete: jest.fn().mockResolvedValue(undefined),
+    };
+    const attachmentRepo = {
+      insertAttachment: jest.fn(),
+      updateAttachment: jest.fn(),
+      findById: jest.fn().mockResolvedValue(existingBinAttachment()),
+    };
+    const attachmentQueue = { add: jest.fn() };
+    const service = makeService(storageService, attachmentRepo, attachmentQueue);
+
+    await expect(
+      service.uploadFile({
+        filePromise: Promise.resolve(truncatedFile() as any),
+        pageId: 'page-1',
+        userId: 'user-1',
+        spaceId: 'space-1',
+        workspaceId: 'ws-1',
+        attachmentId: 'att-1',
+      }),
+    ).rejects.toThrow();
+
+    expect(storageService.delete).not.toHaveBeenCalled();
+    expect(attachmentRepo.updateAttachment).not.toHaveBeenCalled();
+  });
 });
