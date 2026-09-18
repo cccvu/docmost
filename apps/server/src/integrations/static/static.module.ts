@@ -2,12 +2,13 @@ import { Inject, Module, OnModuleInit } from '@nestjs/common';
 import { HttpAdapterHost } from '@nestjs/core';
 import { join } from 'path';
 import * as fs from 'node:fs';
-import fastifyStatic from '@fastify/static';
 import { EnvironmentService } from '../environment/environment.service';
 // --- CCC standalone-mode seam (see /UPSTREAM_MODIFICATIONS.md). The SERVER is the source of truth for
 // the authorization mode; it exposes a derived UI *capability* (NATIVE_AUTH_ENABLED) to the client, never
 // the raw AUTHZ_MODE. The client only reflects the capability (which login to render).
 import { AUTHZ_MODE, AuthzMode } from '../../authz/mode/authz-mode';
+// CCC #309 seam: precompressed + immutable-hashed asset delivery (policy lives in authz/http-headers/).
+import { registerClientStatic } from '../../authz/http-headers/client-static';
 
 @Module({})
 export class StaticModule implements OnModuleInit {
@@ -74,10 +75,7 @@ export class StaticModule implements OnModuleInit {
 
       const RENDER_PATH = '*';
 
-      await app.register(fastifyStatic, {
-        root: clientDistPath,
-        wildcard: false,
-      });
+      await registerClientStatic(app, clientDistPath);
 
       app.get(RENDER_PATH, (req: any, res: any) => {
         const stream = fs.createReadStream(indexFilePath);

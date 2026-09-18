@@ -14,7 +14,8 @@ import { IconAlertTriangle, IconFileOff } from "@tabler/icons-react";
 import { Button } from "@mantine/core";
 import { Link } from "react-router-dom";
 import { ErrorBoundary } from "react-error-boundary";
-import { BaseView } from "@/ee/base/components/base-view";
+// CCC #309: BaseView (react-table + ee/base) loads on demand via the fork-owned Suspense wrapper.
+import { BaseView } from "@/features/layout/lazy-pages";
 import { useHasFeature } from "@/ee/hooks/use-feature";
 import { Feature } from "@/ee/features";
 import { getPageTitle } from "@/features/page/page.utils";

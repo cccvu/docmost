@@ -1,8 +1,34 @@
 import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 import * as path from "path";
+import { precompressAndBudget } from "./build/precompress";
 
 const envPath = path.resolve(process.cwd(), "..", "..");
+
+// Asset delivery (#309). Vendor code is split off the entry into a few stable, cacheable chunks so an
+// app-only change does not invalidate the React/Mantine/editor bytes, and the fork-owned plugin
+// (apps/client/build/precompress.ts) measures the initial set, enforces the lazy-loading invariants and
+// writes .br/.gz siblings that @fastify/static serves via `preCompressed`. Every group carries the
+// `$initial` tag: only modules already on the eager static-import graph are captured, so a catch-all
+// can never drag a lazy-only dependency (mermaid, excalidraw, …) into an eagerly preloaded chunk.
+const NODE_MODULES = "[\\\\/]node_modules[\\\\/]"; // pnpm: node_modules/.pnpm/<pkg>@<ver>/node_modules/<pkg>/
+// A package spec is an exact name (`react`, `@tanstack/react-query`) or a prefix with a trailing `*`
+// (`@mantine/*`, `prosemirror-*`). Matching is anchored on the package-name segment, so `react` does not
+// capture `react-i18next` and `mermaid` would not capture `mermaid-foo`.
+// Order matters: the `/` -> `[\\/]` rewrite must run BEFORE `*` expands to a class containing `/`.
+const pkgPattern = (spec: string) =>
+  spec
+    .replace(/[.+?^${}()|[\]\\]/g, "\\$&")
+    .replace(/\//g, "[\\\\/]")
+    .replace(/\*/g, "[^\\\\/]*");
+const vendorGroup = (name: string, priority: number, packages: string[]) => ({
+  name,
+  priority,
+  tags: ["$initial" as const],
+  test: new RegExp(
+    `${NODE_MODULES}(?:${packages.map(pkgPattern).join("|")})[\\\\/]`,
+  ),
+});
 
 export default defineConfig(({ mode }) => {
   const {
@@ -35,15 +61,66 @@ export default defineConfig(({ mode }) => {
       },
       APP_VERSION: JSON.stringify(process.env.npm_package_version),
     },
-    plugins: [react()],
+    plugins: [
+      react(),
+      precompressAndBudget({
+        // Budgets (#309): the post-split initial set measured 790,161 B brotli JS / 48,435 B CSS on
+        // 2026-09-18 (from 918,146 / 61,228 before). ~9% headroom; raising it is a deliberate PR decision.
+        budget: { initialJsBrotli: 860_000, initialCssBrotli: 60_000 },
+        mustStayLazy: [
+          "mermaid",
+          "@mermaid-js",
+          "@excalidraw",
+          "@slidoapp",
+          "katex",
+          "@tanstack/react-table",
+        ],
+      }),
+    ],
     build: {
       rolldownOptions: {
         output: {
-          advancedChunks: {
+          // Rolldown `codeSplitting` (the successor of the deprecated `advancedChunks`, same shape).
+          // Higher priority wins; a module captured by one group is removed from the others.
+          codeSplitting: {
             groups: [
+              vendorGroup("vendor-react", 60, [
+                "react",
+                "react-dom",
+                "scheduler",
+                "react-router",
+                "react-router-dom",
+                "@tanstack/react-query",
+                "@tanstack/query-core",
+                "jotai",
+              ]),
+              vendorGroup("vendor-mantine", 50, [
+                "@mantine/*",
+                "@floating-ui/*",
+              ]),
+              vendorGroup("vendor-editor", 40, [
+                "@tiptap/*",
+                "prosemirror-*",
+                "yjs",
+                "y-prosemirror",
+                "y-indexeddb",
+                "lib0",
+                "@hocuspocus/*",
+              ]),
+              vendorGroup("vendor-icons", 30, ["@tabler/icons-react"]),
+              vendorGroup("vendor-hljs", 20, [
+                "highlight.js",
+                "lowlight",
+                "highlightjs-sap-abap",
+              ]),
               {
-                name: "vendor-mantine",
-                test: /[\\/]node_modules[\\/]@mantine[\\/]/,
+                // Everything else from node_modules that is on the eager graph — `$initial` keeps
+                // lazy-only deps out; minSize avoids a chunk for a handful of tiny helpers.
+                name: "vendor",
+                priority: 10,
+                tags: ["$initial" as const],
+                test: new RegExp(NODE_MODULES),
+                minSize: 20_000,
               },
             ],
           },

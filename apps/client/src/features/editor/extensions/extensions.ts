@@ -78,8 +78,9 @@ import {
   createResizeHandle,
   buildResizeClasses,
 } from "@/features/editor/components/common/node-resize-handles.ts";
-import MathInlineView from "@/features/editor/components/math/math-inline.tsx";
-import MathBlockView from "@/features/editor/components/math/math-block.tsx";
+// CCC #309: katex (+ its CSS) loads on demand; fork-owned lazy wrappers keep the identifiers.
+import MathInlineView from "@/features/editor-ux/lazy/math-inline-lazy.tsx";
+import MathBlockView from "@/features/editor-ux/lazy/math-block-lazy.tsx";
 import ImageView from "@/features/editor/components/image/image-view.tsx";
 import CalloutView from "@/features/editor/components/callout/callout-view.tsx";
 import StatusView from "@/features/editor/components/status/status-view.tsx";
@@ -94,7 +95,8 @@ import PdfView from "@/features/editor/components/pdf/pdf-view.tsx";
 import SubpagesView from "@/features/editor/components/subpages/subpages-view.tsx";
 import TransclusionView from "@/features/editor/components/transclusion/transclusion-view.tsx";
 import TransclusionReferenceView from "@/features/editor/components/transclusion/transclusion-reference-view.tsx";
-import { BaseEmbedView } from "@/features/editor/components/base-embed/base-embed-view.tsx";
+// CCC #309: the Bases embed (react-table + ee/base) loads on demand; fork-owned wrapper keeps the name.
+import { BaseEmbedView } from "@/features/editor-ux/lazy/base-embed-view-lazy.tsx";
 import { common, createLowlight } from "lowlight";
 import plaintext from "highlight.js/lib/languages/plaintext";
 import powershell from "highlight.js/lib/languages/powershell";

@@ -1,5 +1,4 @@
 import { Route, Routes } from "react-router-dom";
-import SetupWorkspace from "@/pages/auth/setup-workspace.tsx";
 import RootGate from "@/features/public/components/root-gate.tsx";
 import RequestAccess from "@/pages/public/request-access.tsx";
 // CCC passwordless auth (issue #4): in remote/integrated mode the platform login is passwordless (magic
@@ -12,48 +11,53 @@ import NativeLogin from "@/features/auth-native/pages/native-login.tsx";
 import { isNativeAuthEnabled } from "@/features/auth-native/lib/auth-mode.ts";
 import Home from "@/pages/dashboard/home";
 import Page from "@/pages/page/page";
-import AccountSettings from "@/pages/settings/account/account-settings";
-import WorkspaceMembers from "@/pages/settings/workspace/workspace-members";
-import WorkspaceSettings from "@/pages/settings/workspace/workspace-settings";
-import Groups from "@/pages/settings/group/groups";
-import GroupInfo from "./pages/settings/group/group-info";
-import Spaces from "@/pages/settings/space/spaces.tsx";
 import { Error404 } from "@/components/ui/error-404.tsx";
-import AccountPreferences from "@/pages/settings/account/account-preferences.tsx";
 import SpaceHome from "@/pages/space/space-home.tsx";
 import PageRedirect from "@/pages/page/page-redirect.tsx";
 import Layout from "@/components/layouts/global/layout.tsx";
-import InviteSignup from "@/pages/auth/invite-signup.tsx";
-import Billing from "@/ee/billing/pages/billing.tsx";
-import CloudLogin from "@/ee/pages/cloud-login.tsx";
-import CreateWorkspace from "@/ee/pages/create-workspace.tsx";
 import { isCloud } from "@/lib/config.ts";
 import { useTranslation } from "react-i18next";
-import Security from "@/ee/security/pages/security.tsx";
-import License from "@/ee/licence/pages/license.tsx";
 import { useRedirectToCloudSelect } from "@/ee/hooks/use-redirect-to-cloud-select.tsx";
-import SharedPage from "@/pages/share/shared-page.tsx";
-import PdfRenderPage from "@/ee/pdf-export/pdf-render-page.tsx";
-import Shares from "@/pages/settings/shares/shares.tsx";
-import ShareLayout from "@/features/share/components/share-layout.tsx";
-import ShareRedirect from "@/pages/share/share-redirect.tsx";
 import { useTrackOrigin } from "@/hooks/use-track-origin";
 import SpacesPage from "@/pages/spaces/spaces.tsx";
-import { MfaChallengePage } from "@/ee/mfa/pages/mfa-challenge-page";
-import { MfaSetupRequiredPage } from "@/ee/mfa/pages/mfa-setup-required-page";
-import SpaceTrash from "@/pages/space/space-trash.tsx";
-import UserApiKeys from "@/ee/api-key/pages/user-api-keys";
-import WorkspaceApiKeys from "@/ee/api-key/pages/workspace-api-keys";
-import AiSettings from "@/ee/ai/pages/ai-settings.tsx";
-import BasePage from "@/ee/base/pages/base-page.tsx";
-import AuditLogs from "@/ee/audit/pages/audit-logs.tsx";
-import VerifiedPages from "@/ee/page-verification/pages/verified-pages.tsx";
-import TemplateList from "@/ee/template/pages/template-list";
-import TemplateEditor from "@/ee/template/pages/template-editor";
 import FavoritesPage from "@/pages/favorites/favorites-page";
-import AiChat from "@/ee/ai-chat/pages/ai-chat.tsx";
-import VerifyEmail from "@/ee/pages/verify-email.tsx";
 import LabelPage from "@/pages/label/label-page";
+// CCC #309: rarely-visited routes load on demand (fork-owned lazy-pages.ts)
+import { Suspense } from "react";
+import {
+  AccountPreferences,
+  AccountSettings,
+  AiChat,
+  AiSettings,
+  AuditLogs,
+  BasePage,
+  Billing,
+  CloudLogin,
+  CreateWorkspace,
+  GroupInfo,
+  Groups,
+  InviteSignup,
+  License,
+  MfaChallengePage,
+  MfaSetupRequiredPage,
+  PdfRenderPage,
+  Security,
+  SetupWorkspace,
+  ShareLayout,
+  ShareRedirect,
+  SharedPage,
+  Shares,
+  SpaceTrash,
+  Spaces,
+  TemplateEditor,
+  TemplateList,
+  UserApiKeys,
+  VerifiedPages,
+  VerifyEmail,
+  WorkspaceApiKeys,
+  WorkspaceMembers,
+  WorkspaceSettings,
+} from "@/features/layout/lazy-pages";
 
 export default function App() {
   const { t } = useTranslation();
@@ -61,7 +65,7 @@ export default function App() {
   useTrackOrigin();
 
   return (
-    <>
+    <Suspense fallback={null}>
       <Routes>
         <Route index element={<RootGate />} />
         {/* Mode-aware sign-in: native (standalone) → Docmost login; remote → platform passwordless. */}
@@ -147,6 +151,6 @@ export default function App() {
 
         <Route path="*" element={<Error404 />} />
       </Routes>
-    </>
+    </Suspense>
   );
 }
