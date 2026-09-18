@@ -82,8 +82,17 @@ describe('#392 htmlToJson back-fills attachmentId from a same-origin file URL', 
       ).toBeNull();
     });
 
-    it('rejects a non-UUID first segment', () => {
-      expect(attachmentIdOf('<img src="/api/files/not-a-valid-uuid-000000000000/x.png">', 'image') ?? null).toBeNull();
+    it('rejects a segment the character-class cannot match (contains non-hex letters)', () => {
+      expect(attachmentIdOf('<img src="/api/files/not-a-uuid/x.png">', 'image') ?? null).toBeNull();
+    });
+
+    it('rejects a 36-char [0-9a-f-] segment that is NOT a valid UUID (proves isValidUUID is load-bearing)', () => {
+      // 36 hex chars, no dashes: matches the ATTACHMENT_FILE_URL_ID `{36}` class but fails isValidUUID —
+      // so if the isValidUUID gate were dropped, this would wrongly backfill. The char-class case above
+      // never reaches isValidUUID, so this case is what actually pins the gate.
+      const notAUuid = '0123456789abcdef0123456789abcdef0123'; // 36 hex chars
+      expect(notAUuid.length).toBe(36);
+      expect(attachmentIdOf(`<img src="/api/files/${notAUuid}/x.png">`, 'image') ?? null).toBeNull();
     });
   });
 
