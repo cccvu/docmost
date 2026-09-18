@@ -169,25 +169,42 @@ describe('ServiceBridgeService.provisionShadowUser', () => {
   // T-030 (issue #50 + companion P5/F3): the takeover boundary IS the conflict target. Only a row the fork
   // owns can match (reserved synthetic domain + same workspace). The conflict update SELF-HEALS to the
   // "plain, live member" shape provisioning promises — resurrect (deletedAt:null), de-escalate
-  // (role:'member'), refresh name + emailVerifiedAt — but must NEVER rewrite the password or the email.
-  // Note vs the branch's original pin: `role` is now PRESENT in the update but pinned to the literal
-  // 'member'. That STRENGTHENS no-escalation (the upsert can only ever write plain-member — the value is
-  // never caller-supplied) rather than weakening it; it also matches the sibling `space_members` upsert
-  // (service-space.service.ts) which resets role + deleted_at the same way.
-  it('T-030: the upsert conflicts on (email, workspaceId) and self-heals to plain-member (never password/email, never an elevated role)', async () => {
+  // (role:'member'), refresh emailVerifiedAt — but must NEVER rewrite the password or the email.
+  // `role` is PRESENT in the update but pinned to the literal 'member', which STRENGTHENS no-escalation
+  // (the upsert can only ever write plain-member) and matches the sibling `space_members` upsert.
+  //
+  // CCC (real names): `name` is now updated ONLY when the caller supplied one. A NAMELESS re-provision —
+  // the space control-plane path (service-space.service.ts), which knows only the externalId — must NOT
+  // clobber an existing good name back to the UUID, so `name` is ABSENT from the conflict update here.
+  it('T-030: nameless re-provision self-heals to plain-member and does NOT rewrite name (no clobber); never password/email/role-escalation', async () => {
     const { svc, captured } = makeService(shadow());
 
     await svc.provisionShadowUser({ externalId: EXTERNAL_ID } as any);
 
     expect(captured.conflictColumns).toEqual(['email', 'workspaceId']);
     const update = captured.conflictUpdate as Record<string, unknown>;
+    expect(update).not.toHaveProperty('name'); // the load-bearing no-clobber assertion
     expect(new Set(Object.keys(update))).toEqual(
-      new Set(['name', 'emailVerifiedAt', 'deletedAt', 'role']),
+      new Set(['emailVerifiedAt', 'deletedAt', 'role']),
     );
     expect(update.role).toBe('member'); // only ever the plain-member literal — no escalation vector
     expect(update.deletedAt).toBeNull();
     expect(update).not.toHaveProperty('password'); // a credential swap must never ride a re-provision
     expect(update).not.toHaveProperty('email');
+  });
+
+  // CCC (real names): a NAMED re-provision (login path with the platform display name, or an admin
+  // rename write-through) DOES refresh `name` — trimmed — so the wiki reflects the current name.
+  it('a named re-provision writes the trimmed name in the conflict update (rename propagation)', async () => {
+    const { svc, captured } = makeService(shadow());
+
+    await svc.provisionShadowUser({ externalId: EXTERNAL_ID, name: '  Alice Ng  ' } as any);
+
+    const update = captured.conflictUpdate as Record<string, unknown>;
+    expect(update.name).toBe('Alice Ng');
+    expect(new Set(Object.keys(update))).toEqual(
+      new Set(['name', 'emailVerifiedAt', 'deletedAt', 'role']),
+    );
   });
 
   // T-031 (issue #50): the no-workspace guard fires BEFORE any write — never create a shadow user in an

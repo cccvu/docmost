@@ -72,15 +72,14 @@ export default function FavoritesPage() {
                           )}
                         >
                           <Group wrap="nowrap">
-                            {fav.page.icon || (
-                              <ThemeIcon
-                                variant="transparent"
-                                color="gray"
-                                size={18}
-                              >
-                                <IconFileDescription size={18} />
-                              </ThemeIcon>
-                            )}
+                            {/* CCC (issue: UI polish): single default page icon — no emoji. */}
+                            <ThemeIcon
+                              variant="transparent"
+                              color="gray"
+                              size={18}
+                            >
+                              <IconFileDescription size={18} />
+                            </ThemeIcon>
                             <Text fw={500} size="md" lineClamp={1}>
                               {getPageTitle(fav.page.title, undefined, t)}
                             </Text>

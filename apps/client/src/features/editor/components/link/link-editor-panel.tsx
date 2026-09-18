@@ -181,7 +181,8 @@ export const LinkEditorPanel = ({
                 >
                   <Group gap={10} wrap="nowrap" align="flex-start">
                     <span className={classes.pageIcon}>
-                      {page.icon || <IconFileDescription size={18} stroke={1.5} />}
+                      {/* CCC (issue: UI polish): single default page icon — no emoji. */}
+                      <IconFileDescription size={18} stroke={1.5} />
                     </span>
 
                     <div style={{ flex: 1, minWidth: 0 }}>

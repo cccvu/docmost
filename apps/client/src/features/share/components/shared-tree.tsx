@@ -20,7 +20,6 @@ import { extractPageSlugId } from "@/lib";
 import classes from "@/features/page/tree/styles/tree.module.css";
 import styles from "./share.module.css";
 import { mobileSidebarAtom } from "@/components/layouts/global/hooks/atoms/sidebar-atom.ts";
-import EmojiPicker from "@/components/ui/emoji-picker.tsx";
 import {
   DocTree,
   type DocTreeApi,
@@ -148,21 +147,17 @@ function SharedTreeRow({
         hasChildren={hasChildren}
         onToggle={toggleOpen}
       />
-      <div style={{ marginRight: "4px" }}>
-        <EmojiPicker
-          onEmojiSelect={() => {}}
-          icon={
-            node.icon ? (
-              node.icon
-            ) : (
-              <IconFileDescription size="18" />
-            )
-          }
-          readOnly={true}
-          removeEmojiAction={() => {}}
-          actionIconProps={{ tabIndex: -1 }}
-        />
-      </div>
+      {/* CCC (issue: UI polish): single default page icon — no emoji. */}
+      <span
+        aria-hidden
+        style={{
+          marginRight: "4px",
+          display: "inline-flex",
+          alignItems: "center",
+        }}
+      >
+        <IconFileDescription size={18} />
+      </span>
       <span className={classes.text}>{node.name || t("untitled")}</span>
     </Box>
   );

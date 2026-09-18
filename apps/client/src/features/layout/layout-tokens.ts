@@ -18,9 +18,23 @@ export const HEADER_HEIGHT = 56;
 /** Collapsed icon-rail width (px). Every navbar sidebar rails to this on collapse. */
 export const RAIL_WIDTH = 52;
 
-/** Expanded navigation-sidebar width (px) — a FIXED width shared by every sidebar
- *  (home / space page-tree / settings / AI). Not resizable: all views read identically. */
+/** Default navigation-sidebar width (px) — the starting width shared by every sidebar
+ *  (home / space page-tree / settings / AI). The user can drag-resize from here; the chosen
+ *  width is persisted and applied uniformly to every sidebar, so views still read identically
+ *  to each other at whatever width is chosen (a single global width, never per-view). */
 export const SIDEBAR_WIDTH = 260;
+
+/** Sidebar resize bounds (px). The persisted width is clamped to this range on read and
+ *  write, so a corrupt or out-of-range stored value can never break the layout. */
+export const SIDEBAR_MIN_WIDTH = 220;
+export const SIDEBAR_MAX_WIDTH = 600;
+
+/** localStorage key holding the user's chosen sidebar width (px). Shared SAME-ORIGIN with
+ *  the standalone admin console (services/admin-ui) so a resize survives navigation between
+ *  the wiki and the console. The two apps must NOT import each other (AGPL boundary), so
+ *  each reads/writes this same key independently. KEEP IN SYNC with the console
+ *  layout-tokens.ts copy (drift guard, services/admin-ui/src/layout-sync.test.ts). */
+export const SIDEBAR_WIDTH_STORAGE_KEY = "sidebarWidth";
 
 /** Right-hand aside (comments / TOC / details) width (px). */
 export const ASIDE_WIDTH = 350;

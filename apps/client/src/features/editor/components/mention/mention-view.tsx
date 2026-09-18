@@ -120,19 +120,16 @@ export default function MentionView(props: NodeViewProps) {
           underline="never"
           className={classes.pageMentionLink}
         >
-          {page?.icon ? (
-            <span style={{ marginRight: "4px" }}>{page.icon}</span>
-          ) : (
-            <ActionIcon
-              variant="transparent"
-              color="gray"
-              component="span"
-              size={18}
-              style={{ verticalAlign: "text-bottom" }}
-            >
-              <IconFileDescription size={18} />
-            </ActionIcon>
-          )}
+          {/* CCC (issue: UI polish): single default page icon — no emoji. */}
+          <ActionIcon
+            variant="transparent"
+            color="gray"
+            component="span"
+            size={18}
+            style={{ verticalAlign: "text-bottom" }}
+          >
+            <IconFileDescription size={18} />
+          </ActionIcon>
 
           <span className={classes.pageMentionText}>
             {page?.title || label}
