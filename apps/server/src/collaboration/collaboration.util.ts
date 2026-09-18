@@ -57,6 +57,10 @@ import { generateHTML, generateJSON } from '../common/helpers/prosemirror/html';
 import { Node, Schema } from '@tiptap/pm/model';
 import * as Y from 'yjs';
 import { Logger } from '@nestjs/common';
+import { validate as isValidUUID } from 'uuid';
+// Leaf helper (no imports of its own) → safe to import here; `prosemirror/utils.ts` imports FROM this
+// file, so importing `isAttachmentNode` from there instead would be circular. (#392)
+import { isAttachmentNode } from '../common/helpers/prosemirror/attachment-node-types';
 
 export const tiptapExtensions = [
   StarterKit.configure({
@@ -125,8 +129,55 @@ export function jsonToHtml(tiptapJson: any) {
   return generateHTML(tiptapJson, tiptapExtensions);
 }
 
+// #392: a same-origin attachment file URL is uniform across every attachment node type —
+// `/api/files/<uuid>/<name>` or `/files/<uuid>/<name>`, optionally `/api/files/public/<uuid>/...`
+// (share) and optionally a `?t=`/`?jwt=` query. Anchored to a LEADING SLASH so an external
+// `https://evil.example/api/files/<uuid>/x` can never match. The `{36}` group is a loose extractor;
+// `isValidUUID` (the same version-agnostic validator `getAttachmentIds` uses — Docmost mints uuidv7,
+// so a v4-only regex would silently no-op) is the precise gate.
+const ATTACHMENT_FILE_URL_ID = /^\/(?:api\/)?files\/(?:public\/)?([0-9a-f-]{36})(?:[/?#]|$)/i;
+
+function attachmentIdFromFileUrl(url: unknown): string | undefined {
+  if (typeof url !== 'string') return undefined;
+  const match = ATTACHMENT_FILE_URL_ID.exec(url);
+  if (!match) return undefined;
+  return isValidUUID(match[1]) ? match[1] : undefined;
+}
+
+/**
+ * #392: back-fill `attachmentId` from a node's file URL when it is missing.
+ *
+ * Every attachment node type (`image`/`video`/`audio`/`pdf`/`attachment`/`excalidraw`/`drawio`)
+ * parses `attachmentId` ONLY from a `data-attachment-id` HTML attribute, so an agent authoring the
+ * natural `<img src="/api/files/<uuid>/x.png">` (or `<video src>`/`<audio src>`) over the `/v1` API
+ * gets `attachmentId: null` — the image renders (the view uses `src` alone) but the page↔attachment
+ * linkage is lost, orphaning the file to `getAttachmentIds` (export / share / duplicate all key on it).
+ * The URL lives in `attrs.src` for every type except `attachment`, which uses `attrs.url`; both are
+ * handled. An EXPLICIT `data-attachment-id` always wins (we only fill an absent one). Runs after
+ * `generateJSON` (the server HTML→JSON + markdown-import path); mutates `pmJson` in place.
+ */
+function backfillAttachmentIds(node: any): void {
+  if (!node || typeof node !== 'object') return;
+  if (
+    typeof node.type === 'string' &&
+    isAttachmentNode(node.type) &&
+    node.attrs &&
+    !node.attrs.attachmentId
+  ) {
+    const id = attachmentIdFromFileUrl(node.attrs.src ?? node.attrs.url);
+    if (id) node.attrs.attachmentId = id;
+  }
+  if (Array.isArray(node.content)) {
+    for (const child of node.content) backfillAttachmentIds(child);
+  }
+}
+
 export function htmlToJson(html: string) {
   const pmJson = generateJSON(html, tiptapExtensions);
+
+  // #392: rebuild attachment linkage before anything downstream reads it. Mutates in place so the
+  // fill survives even if `addUniqueIdsToDoc` throws and we fall back to `pmJson`.
+  backfillAttachmentIds(pmJson);
 
   try {
     return addUniqueIdsToDoc(pmJson, tiptapExtensions);
