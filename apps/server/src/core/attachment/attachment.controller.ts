@@ -10,6 +10,7 @@ import {
   Logger,
   NotFoundException,
   Param,
+  PayloadTooLargeException,
   Post,
   Query,
   Req,
@@ -98,7 +99,8 @@ export class AttachmentController {
     } catch (err: any) {
       this.logger.error(err.message);
       if (err?.statusCode === 413) {
-        throw new BadRequestException(
+        // CCC #308: keep the real 413 (was BadRequestException → 400).
+        throw new PayloadTooLargeException(
           `File too large. Exceeds the ${this.environmentService.getFileUploadSizeLimit()} limit`,
         );
       }
@@ -156,7 +158,9 @@ export class AttachmentController {
       if (err?.statusCode === 413) {
         const errMessage = `File too large. Exceeds the ${this.environmentService.getFileUploadSizeLimit()} limit`;
         this.logger.error(errMessage);
-        throw new BadRequestException(errMessage);
+        // CCC #308: keep the real 413 (was BadRequestException → 400) so a truncated/oversize
+        // upload surfaces as Payload Too Large, matching the platform /v1 contract.
+        throw new PayloadTooLargeException(errMessage);
       }
       this.logger.error(err);
       throw new BadRequestException('Error processing file upload.');

@@ -3,6 +3,7 @@ import {
   Injectable,
   Logger,
   NotFoundException,
+  PayloadTooLargeException,
 } from '@nestjs/common';
 import { Readable } from 'stream';
 import { StorageService } from '../../../integrations/storage/storage.service';
@@ -88,7 +89,24 @@ export class AttachmentService {
       preparedFile.multiPartFile.file,
     );
 
-    await this.uploadToDrive(filePath, stream);
+    try {
+      await this.uploadToDrive(filePath, stream);
+    } catch (err) {
+      // CCC #308: a mid-stream abort (the platform relay tearing down on its own 413, or a client
+      // disconnect) can leave a partial object in storage — remove it, then rethrow.
+      await this.storageService.delete(filePath).catch(() => {});
+      throw err;
+    }
+
+    // CCC #308: fail CLOSED on truncation. @fastify/multipart caps the inbound at `fileSize` and
+    // sets `.truncated` WITHOUT erroring the stream (throwFileSizeLimit only surfaces via
+    // `.toBuffer()`, which the streaming path bypasses via `skipBuffer`). Upstream never checks it,
+    // so a >limit upload was silently stored at exactly the cap and returned 200 with the truncated
+    // size. Delete the truncated object (no DB row exists yet) and reject.
+    if ((preparedFile.multiPartFile.file as { truncated?: boolean }).truncated) {
+      await this.storageService.delete(filePath).catch(() => {});
+      throw new PayloadTooLargeException('File too large');
+    }
 
     // Update fileSize from the consumed stream
     preparedFile.fileSize = getBytesRead();

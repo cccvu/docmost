@@ -1,4 +1,9 @@
-import { BadRequestException, Injectable, Logger } from '@nestjs/common';
+import {
+  BadRequestException,
+  Injectable,
+  Logger,
+  PayloadTooLargeException,
+} from '@nestjs/common';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { MultipartFile } from '@fastify/multipart';
 import * as path from 'path';
@@ -336,7 +341,21 @@ export class ImportService {
     // upload file
     const { stream, getBytesRead } = createByteCountingStream(file.file);
 
-    await this.storageService.upload(filePath, stream);
+    try {
+      await this.storageService.upload(filePath, stream);
+    } catch (err) {
+      // CCC #308: remove any partial object left by a mid-stream abort, then rethrow.
+      await this.storageService.delete(filePath).catch(() => {});
+      throw err;
+    }
+
+    // CCC #308: fail CLOSED on truncation (same class as the attachment upload path). busboy caps
+    // the inbound at `fileSize` and sets `.truncated` without erroring the stream, so a >limit import
+    // was silently stored at exactly the cap. Delete the truncated object (no fileTasks row yet) and reject.
+    if ((file.file as { truncated?: boolean }).truncated) {
+      await this.storageService.delete(filePath).catch(() => {});
+      throw new PayloadTooLargeException('File too large');
+    }
 
     const fileSize = getBytesRead();
 
