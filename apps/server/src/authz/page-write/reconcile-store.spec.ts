@@ -77,6 +77,25 @@ describe('reconcileRowIntoDoc (#390 stale-doc clobber guard)', () => {
     expect(text).toContain('api-out-of-band');
   });
 
+  it('divergent lineage DUPLICATES rather than loses content (bounded edge, alarmed; #390 doc note)', () => {
+    // A content-without-ydoc page loaded independently on two nodes → each built its doc from `content` with
+    // a FRESH clientID. Node A stored (its lineage became the row's ydoc); node B is the stale resident.
+    const nodeA = docWith(['same one', 'same two']); // row ydoc lineage
+    const nodeB = docWith(['same one', 'same two']); // stale resident, different lineage, SAME content
+    const before = len(nodeB);
+
+    const { merged } = reconcileRowIntoDoc(nodeB, rowBytesOf(nodeA));
+
+    // Different lineage ⇒ the row's ops look "missing" to B ⇒ it folds them in. Content is DUPLICATED, NOT
+    // lost — strictly better than the pre-#390 clobber; alarmed via COLLAB_STALE_RECONCILE. The routing fix
+    // (#395) is the real cure.
+    expect(merged).toBe(true);
+    expect(len(nodeB)).toBe(before * 2);
+    const txt = nodeB.getXmlFragment('default').toString();
+    expect(txt).toContain('same one');
+    expect(txt).toContain('same two'); // nothing lost
+  });
+
   it('is a no-op when the row has no ydoc (null/undefined/empty)', () => {
     const resident = docWith(['x']);
     const before = Buffer.from(Y.encodeStateVector(resident));

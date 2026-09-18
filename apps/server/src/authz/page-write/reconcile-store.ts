@@ -24,6 +24,15 @@ import * as Y from 'yjs';
  * operation (a resident that is the source of truth is always a superset of the row, so the diff is empty).
  * A delete-only out-of-band divergence (content the resident would *resurrect*) is a different, non-data-loss
  * case and is intentionally out of scope here.
+ *
+ * BOUNDED EDGE (divergent lineage → duplication, not loss): if a page that had NO stored ydoc was loaded
+ * independently on two nodes during a rollout, each built its Y.Doc from `content` with a FRESH clientID, so
+ * once one node stores, the other's row-vs-resident diff sees the *same* content as "missing" (different
+ * lineage) and folds it in — DUPLICATING it rather than losing it. This is strictly better than the pre-#390
+ * clobber, it is alarmed (`COLLAB_STALE_RECONCILE`), and it is only reachable multi-node + for a legacy
+ * content-without-ydoc row (verified absent from every live write path). The real cure is the RedisSync
+ * routing fix (follow-up #395) that prevents the second resident copy; a content-level dedup here would cost
+ * a full serialize+compare on the hot path and is not worth it for this edge. Pinned by test.
  */
 export function reconcileRowIntoDoc(
   document: Y.Doc,

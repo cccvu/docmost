@@ -37,6 +37,7 @@ import { TransclusionService } from '../../core/page/transclusion/transclusion.s
 // the fork-owned symmetric stale-doc guard (reconcile-before-store) and the store-failure signal into the
 // upstream persistence hook. The policy/CRDT logic lives in authz/page-write/; this file only calls it.
 import { reconcileRowIntoDoc } from '../../authz/page-write/reconcile-store';
+import { shouldRefuseBlankClobber } from '../../authz/page-write/blank-clobber-guard';
 import {
   recordStoreFailure,
   clearStoreFailure,
@@ -163,24 +164,17 @@ export class PersistenceExtension implements Extension {
         }
 
         // #390 null-ydoc defensive fallback (dormant: verified no LIVE write path omits ydoc). Without a
-        // shared ydoc lineage the CRDT reconcile cannot run, so refuse the exact clobber shape — overwriting
-        // a row that has real text with a blank resident doc — while letting a genuine edit proceed.
-        if (!page.ydoc) {
-          let rowText = '';
-          try {
-            rowText = jsonToText(page.content as any);
-          } catch {
-            // treat unparseable row content as non-blank (fail safe: do not overwrite it blindly)
-            rowText = ' ';
-          }
-          if (rowText.trim() !== '' && (textContent ?? '').trim() === '') {
-            logStaleReconcile(
-              this.logger,
-              `refused to overwrite non-empty row content with a blank resident doc (no ydoc lineage): ${pageId}`,
-            );
-            page = null;
-            return;
-          }
+        // shared ydoc lineage the CRDT reconcile cannot run, so refuse the clobber shape — a blank resident
+        // doc overwriting a row that still holds real content — via the pure structural guard, while letting
+        // a genuine edit proceed. A non-blank-over-non-blank clobber is NOT defensible here without lineage;
+        // that residual is why the dormancy claim (all live writers co-write ydoc) is load-bearing (#390).
+        if (!page.ydoc && shouldRefuseBlankClobber(page.content, tiptapJson)) {
+          logStaleReconcile(
+            this.logger,
+            `refused to overwrite non-empty row content with a blank resident doc (no ydoc lineage): ${pageId}`,
+          );
+          page = null;
+          return;
         }
 
         if (isDeepStrictEqual(tiptapJson, page.content)) {
