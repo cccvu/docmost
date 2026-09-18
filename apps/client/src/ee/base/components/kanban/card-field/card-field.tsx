@@ -245,11 +245,8 @@ function PageField({
         onClick={(e) => e.stopPropagation()}
         onDoubleClick={(e) => e.stopPropagation()}
       >
-        {resolvedPage.icon ? (
-          <span className={cellClasses.pagePillIcon}>{resolvedPage.icon}</span>
-        ) : (
-          <IconFileDescription size={14} className={cellClasses.pagePillIconFallback} />
-        )}
+        {/* CCC (issue: UI polish): single default page icon — no emoji. */}
+        <IconFileDescription size={14} className={cellClasses.pagePillIconFallback} />
         <span className={cellClasses.pagePillText}>{title}</span>
       </Link>
     </Tooltip>

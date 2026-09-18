@@ -81,18 +81,15 @@ export function PageRow({
         )}
 
         <div className={classes.iconWrapper}>
-          {page.icon ? (
-            page.icon
-          ) : (
-            <ActionIcon
-              component="div"
-              variant="transparent"
-              c="gray"
-              size={22}
-            >
-              <IconFileDescription size={18} />
-            </ActionIcon>
-          )}
+          {/* CCC (issue: UI polish): single default page icon — no emoji. */}
+          <ActionIcon
+            component="div"
+            variant="transparent"
+            c="gray"
+            size={22}
+          >
+            <IconFileDescription size={18} />
+          </ActionIcon>
         </div>
 
         <div className={classes.pageTitle}>

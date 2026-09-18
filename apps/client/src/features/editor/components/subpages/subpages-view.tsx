@@ -95,19 +95,16 @@ export default function SubpagesView(props: NodeViewProps) {
               className={styles.pageMentionLink}
               draggable={false}
             >
-              {page?.icon ? (
-                <span style={{ marginRight: "4px" }}>{page.icon}</span>
-              ) : (
-                <ActionIcon
-                  variant="transparent"
-                  color="gray"
-                  component="span"
-                  size={18}
-                  style={{ verticalAlign: "text-bottom" }}
-                >
-                  <IconFileDescription size={18} />
-                </ActionIcon>
-              )}
+              {/* CCC (issue: UI polish): single default page icon — no emoji. */}
+              <ActionIcon
+                variant="transparent"
+                color="gray"
+                component="span"
+                size={18}
+                style={{ verticalAlign: "text-bottom" }}
+              >
+                <IconFileDescription size={18} />
+              </ActionIcon>
 
               <span className={styles.pageMentionText}>
                 {page?.title || t("untitled")}

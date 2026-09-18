@@ -14,9 +14,14 @@ import NoTableResults from "@/components/common/no-table-results.tsx";
 import { usePaginateAndSearch } from "@/hooks/use-paginate-and-search.tsx";
 import rowClasses from "@/components/ui/clickable-table-row.module.css";
 import GroupActionMenu from "@/features/group/components/group-action-menu.tsx";
+import useUserRole from "@/hooks/use-user-role.tsx";
 
 export default function GroupList() {
   const { t } = useTranslation();
+  // CCC (issue: UI polish): the Edit/Delete action menu is admin-only server-side, and the
+  // group detail page already gates it on `isAdmin`. Gate the list row the same way so a
+  // non-admin doesn't see a dead three-dots menu (every action still 403s server-side).
+  const { isAdmin } = useUserRole();
   const { search, cursor, goNext, goPrev, handleSearch } = usePaginateAndSearch();
   const { data, isLoading } = useGetGroupsQuery({ cursor, query: search });
 
@@ -87,7 +92,7 @@ export default function GroupList() {
                   </Anchor>
                 </Table.Td>
                 <Table.Td>
-                  <GroupActionMenu group={group} />
+                  {isAdmin && <GroupActionMenu group={group} />}
                 </Table.Td>
               </Table.Tr>
             ))

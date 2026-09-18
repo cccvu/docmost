@@ -428,9 +428,8 @@ const MentionList = forwardRef<any, MentionListProps>((props, ref) => {
                     color="gray"
                     size="sm"
                   >
-                    {item.icon || (
-                      <IconFileDescription size={18} stroke={1.5} />
-                    )}
+                    {/* CCC (issue: UI polish): single default page icon — no emoji. */}
+                    <IconFileDescription size={18} stroke={1.5} />
                   </ActionIcon>
 
                   <div style={{ flex: 1, minWidth: 0 }}>

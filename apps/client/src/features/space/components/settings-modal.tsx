@@ -1,4 +1,14 @@
-import { Modal, Tabs, rem, Group, ScrollArea, Text } from "@mantine/core";
+import {
+  Modal,
+  Tabs,
+  rem,
+  Group,
+  ScrollArea,
+  Text,
+  Alert,
+  Anchor,
+} from "@mantine/core";
+import { IconInfoCircle } from "@tabler/icons-react";
 import SpaceMembersList from "@/features/space/components/space-members.tsx";
 import AddSpaceMembersModal from "@/features/space/components/add-space-members-modal.tsx";
 import React from "react";
@@ -12,6 +22,7 @@ import {
 } from "@/features/space/permissions/permissions.type.ts";
 import { useTranslation } from "react-i18next";
 import { useSpaceSecurityAvailable } from "@/features/feature-availability/feature-gate.tsx";
+import { isNativeAuthEnabled } from "@/features/auth-native/lib/auth-mode.ts";
 
 interface SpaceSettingsModalProps {
   spaceId: string;
@@ -40,6 +51,13 @@ export default function SpaceSettingsModal({
     SpaceCaslSubject.Settings,
   );
   const showSecurityTab = canManageSettings && hasSpaceSecurity;
+
+  // CCC (issue: UI polish): in remote (platform) mode, space membership is owned by the
+  // Admin Console — roles flow platform → SpiceDB → Docmost — so the native "Add space
+  // members" / role / remove controls would write to the wrong place. Gate on the same
+  // server-injected capability the native sign-in UI uses; in native/standalone mode the
+  // native membership management is the source of truth and stays fully editable.
+  const membershipManagedExternally = !isNativeAuthEnabled();
 
   return (
     <>
@@ -94,19 +112,42 @@ export default function SpaceSettingsModal({
                 </Tabs.Panel>
 
                 <Tabs.Panel value="members">
-                  <Group my="md" justify="flex-end">
-                    {spaceAbility.can(
-                      SpaceCaslAction.Manage,
-                      SpaceCaslSubject.Member,
-                    ) && <AddSpaceMembersModal spaceId={space?.id} />}
-                  </Group>
+                  {membershipManagedExternally ? (
+                    <Alert
+                      variant="light"
+                      color="gray"
+                      icon={<IconInfoCircle size={18} />}
+                      my="md"
+                    >
+                      {t(
+                        "Space membership is managed in the Admin Console. To add or remove members, or change their roles, open the Admin Console.",
+                      )}{" "}
+                      <Anchor
+                        href="/console"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        {t("Open the Admin Console")}
+                      </Anchor>
+                    </Alert>
+                  ) : (
+                    <Group my="md" justify="flex-end">
+                      {spaceAbility.can(
+                        SpaceCaslAction.Manage,
+                        SpaceCaslSubject.Member,
+                      ) && <AddSpaceMembersModal spaceId={space?.id} />}
+                    </Group>
+                  )}
 
                   <SpaceMembersList
                     spaceId={space?.id}
-                    readOnly={spaceAbility.cannot(
-                      SpaceCaslAction.Manage,
-                      SpaceCaslSubject.Member,
-                    )}
+                    readOnly={
+                      membershipManagedExternally ||
+                      spaceAbility.cannot(
+                        SpaceCaslAction.Manage,
+                        SpaceCaslSubject.Member,
+                      )
+                    }
                   />
                 </Tabs.Panel>
 

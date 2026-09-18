@@ -121,11 +121,8 @@ function PagePill({ page }: { page: PillPage }) {
         onClick={(e) => e.stopPropagation()}
         onDoubleClick={(e) => e.stopPropagation()}
       >
-        {page.icon ? (
-          <span className={cellClasses.pagePillIcon}>{page.icon}</span>
-        ) : (
-          <IconFileDescription size={14} className={cellClasses.pagePillIconFallback} />
-        )}
+        {/* CCC (issue: UI polish): single default page icon — no emoji. */}
+        <IconFileDescription size={14} className={cellClasses.pagePillIconFallback} />
         <span className={cellClasses.pagePillText}>{title}</span>
       </Link>
     </Tooltip>
@@ -248,14 +245,11 @@ function PagePicker({
         <div className={cellClasses.personTagArea}>
           {pageId && resolvedPage && (
             <span className={cellClasses.personTag}>
-              {resolvedPage.icon ? (
-                <span>{resolvedPage.icon}</span>
-              ) : (
-                <IconFileDescription
-                  size={14}
-                  color="var(--mantine-color-dimmed)"
-                />
-              )}
+              {/* CCC (issue: UI polish): single default page icon — no emoji. */}
+              <IconFileDescription
+                size={14}
+                color="var(--mantine-color-dimmed)"
+              />
               <span className={cellClasses.personTagName}>
                 {getPageTitle(resolvedPage.title, undefined, t)}
               </span>
@@ -309,14 +303,11 @@ function PagePicker({
                 onMouseEnter={() => setActiveIndex(idx)}
                 onClick={() => handleSelect(page.id)}
               >
-                {page.icon ? (
-                  <span>{page.icon}</span>
-                ) : (
-                  <IconFileDescription
-                    size={14}
-                    color="var(--mantine-color-dimmed)"
-                  />
-                )}
+                {/* CCC (issue: UI polish): single default page icon — no emoji. */}
+                <IconFileDescription
+                  size={14}
+                  color="var(--mantine-color-dimmed)"
+                />
                 <div className={cellClasses.pageOptionText}>
                   <span className={cellClasses.personOptionName}>
                     {getPageTitle(page.title, undefined, t)}
