@@ -2,7 +2,7 @@ import { useRef } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useAtom } from "jotai";
 import { useTranslation } from "react-i18next";
-import { ActionIcon, rem } from "@mantine/core";
+import { ActionIcon, rem, Tooltip } from "@mantine/core";
 import {
   IconChevronDown,
   IconChevronRight,
@@ -12,27 +12,22 @@ import {
   IconTable,
 } from "@tabler/icons-react";
 
-import EmojiPicker from "@/components/ui/emoji-picker.tsx";
 import { queryClient } from "@/main.tsx";
 import { buildPageUrl } from "@/features/page/page.utils.ts";
 import { getPageTitle } from "@/features/page/page.utils";
 import { getPageById } from "@/features/page/services/page-service.ts";
-import {
-  useUpdatePageMutation,
-  fetchAllAncestorChildren,
-} from "@/features/page/queries/page-query.ts";
-import { useQueryEmit } from "@/features/websocket/use-query-emit.ts";
+import { fetchAllAncestorChildren } from "@/features/page/queries/page-query.ts";
 import { mobileSidebarAtom } from "@/components/layouts/global/hooks/atoms/sidebar-atom.ts";
 import { useToggleSidebar } from "@/components/layouts/global/hooks/hooks/use-toggle-sidebar.ts";
 
 import { treeDataAtom } from "@/features/page/tree/atoms/tree-data-atom.ts";
 import { treeModel } from "@/features/page/tree/model/tree-model";
 import { useTreeMutation } from "@/features/page/tree/hooks/use-tree-mutation.ts";
+import { useIsTruncated } from "@/features/layout/use-is-truncated.ts";
 import type { SpaceTreeNode } from "@/features/page/tree/types.ts";
 import type { RenderRowProps } from "./doc-tree";
 import { NodeMenu } from "./space-tree-node-menu";
 import classes from "@/features/page/tree/styles/tree.module.css";
-import { updateTreeNodeIcon } from "@/features/page/tree/utils/utils.ts";
 
 type SpaceTreeRowProps = RenderRowProps<SpaceTreeNode> & {
   readOnly: boolean;
@@ -50,15 +45,22 @@ export function SpaceTreeRow({
 }: SpaceTreeRowProps) {
   const { t } = useTranslation();
   const { spaceSlug } = useParams();
-  const updatePageMutation = useUpdatePageMutation();
   const [, setTreeData] = useAtom(treeDataAtom);
-  const emit = useQueryEmit();
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [mobileSidebarOpened] = useAtom(mobileSidebarAtom);
   const toggleMobileSidebar = useToggleSidebar(mobileSidebarAtom);
 
+  // CCC: reveal the full page title on hover, but only when the row actually truncates
+  // it — a title that already fits shows no redundant tooltip (shared useIsTruncated hook).
+  const {
+    ref: titleRef,
+    isTruncated: isTitleTruncated,
+    measure: measureTitle,
+  } = useIsTruncated<HTMLSpanElement>();
+
   const canEdit = !readOnly && node.canEdit !== false;
   const pageUrl = buildPageUrl(spaceSlug, node.slugId, node.name);
+  const title = getPageTitle(node.name, node.isBase, t);
 
   const prefetchPage = () => {
     timerRef.current = setTimeout(async () => {
@@ -78,49 +80,6 @@ export function SpaceTreeRow({
       window.clearTimeout(timerRef.current);
       timerRef.current = null;
     }
-  };
-
-  const handleUpdateNodeIcon = (nodeId: string, newIcon: string | null) => {
-    setTreeData((prev) =>
-      updateTreeNodeIcon(prev, nodeId, newIcon),
-    );
-  };
-
-  const handleEmojiIconClick = (e: React.MouseEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-  };
-
-  const handleEmojiSelect = (emoji: { native: string }) => {
-    handleUpdateNodeIcon(node.id, emoji.native);
-    updatePageMutation
-      .mutateAsync({ pageId: node.id, icon: emoji.native })
-      .then((data) => {
-        setTimeout(() => {
-          emit({
-            operation: "updateOne",
-            spaceId: node.spaceId,
-            entity: ["pages"],
-            id: node.id,
-            payload: { icon: emoji.native, parentPageId: data.parentPageId },
-          });
-        }, 50);
-      });
-  };
-
-  const handleRemoveEmoji = () => {
-    handleUpdateNodeIcon(node.id, null);
-    updatePageMutation.mutateAsync({ pageId: node.id, icon: null });
-
-    setTimeout(() => {
-      emit({
-        operation: "updateOne",
-        spaceId: node.spaceId,
-        entity: ["pages"],
-        id: node.id,
-        payload: { icon: null },
-      });
-    }, 50);
   };
 
   const handleLoadChildren = async () => {
@@ -159,25 +118,39 @@ export function SpaceTreeRow({
         onToggle={toggleOpen}
       />
 
-      <div onClick={handleEmojiIconClick} style={{ marginRight: "4px" }}>
-        <EmojiPicker
-          onEmojiSelect={handleEmojiSelect}
-          icon={
-            node.icon ? (
-              node.icon
-            ) : node.isBase ? (
-              <IconTable size={18} />
-            ) : (
-              <IconFileDescription size="18" />
-            )
-          }
-          readOnly={!canEdit}
-          removeEmojiAction={handleRemoveEmoji}
-          actionIconProps={{ tabIndex: -1 }}
-        />
-      </div>
+      {/* CCC: the page icon is a single default document/table glyph — the emoji picker was
+          removed for a consistent, professional look (issue: UI polish). */}
+      <span
+        aria-hidden
+        style={{
+          marginRight: "4px",
+          display: "inline-flex",
+          alignItems: "center",
+        }}
+      >
+        {node.isBase ? (
+          <IconTable size={18} />
+        ) : (
+          <IconFileDescription size={18} />
+        )}
+      </span>
 
-      <span className={classes.text}>{getPageTitle(node.name, node.isBase, t)}</span>
+      <Tooltip
+        label={title}
+        disabled={!isTitleTruncated}
+        openDelay={500}
+        position="top-start"
+        withinPortal
+        multiline
+      >
+        <span
+          ref={titleRef}
+          className={classes.text}
+          onMouseEnter={measureTitle}
+        >
+          {title}
+        </span>
+      </Tooltip>
 
       <div className={classes.actions}>
         <NodeMenu node={node} canEdit={canEdit} />

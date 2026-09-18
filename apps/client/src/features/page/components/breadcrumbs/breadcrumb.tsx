@@ -23,11 +23,9 @@ import { useMediaQuery } from "@mantine/hooks";
 import { useTranslation } from "react-i18next";
 
 function getTitle(node: SpaceTreeNode, t: TFunction) {
-  const name = getPageTitle(node.name, node.isBase, t);
-  if (node.icon) {
-    return `${node.icon} ${name}`;
-  }
-  return name;
+  // CCC (issue: UI polish): breadcrumb shows the page name only — a stored emoji is no
+  // longer prefixed to the title.
+  return getPageTitle(node.name, node.isBase, t);
 }
 
 export default function Breadcrumb() {

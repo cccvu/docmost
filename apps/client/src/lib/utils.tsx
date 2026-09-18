@@ -83,15 +83,16 @@ export function capitalizeFirstChar(string: string) {
   return string.charAt(0).toUpperCase() + string.slice(1);
 }
 
-export function getPageIcon(icon: string, size = 18): string | ReactNode {
+export function getPageIcon(_icon?: string, size = 18): ReactNode {
+  // CCC (issue: UI polish): page icons are a single default glyph everywhere — a stored
+  // emoji is no longer rendered as a page icon. The `_icon` param is kept so the many
+  // call sites need no change.
   return (
-    icon || (
-      <IconFileDescription
-        size={size}
-        color="var(--mantine-color-gray-6)"
-        aria-hidden="true"
-      />
-    )
+    <IconFileDescription
+      size={size}
+      color="var(--mantine-color-gray-6)"
+      aria-hidden="true"
+    />
   );
 }
 

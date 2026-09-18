@@ -44,7 +44,14 @@ export class ServiceBridgeService {
   ): Promise<{ userId: string; workspaceId: string }> {
     const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
     const email = shadowEmailFor(dto.externalId);
-    const name = dto.name?.trim() || dto.externalId;
+    // CCC (real names): the platform owns the user's display name and passes it here. When a
+    // name IS provided we (re)write it; when it is NOT — e.g. the space control-plane
+    // re-provision, which knows only the externalId — we must NOT clobber an existing good
+    // name with the UUID fallback, so `name` is included in the on-conflict update only when
+    // the caller actually supplied one. On the first INSERT we still need a non-null value,
+    // so fall back to the externalId there (a later named provision then heals it).
+    const providedName = dto.name?.trim() || null;
+    const insertName = providedName ?? dto.externalId;
     // Unusable password: sessions are minted (not password-logged-in), and native login is disabled in
     // remote mode anyway — so a random hash that no one holds is purely to satisfy the column shape.
     const password = await hashPassword(randomBytes(24).toString('base64url'));
@@ -52,7 +59,7 @@ export class ServiceBridgeService {
     const row = await this.db
       .insertInto('users')
       .values({
-        name,
+        name: insertName,
         email,
         password,
         role: 'member',
@@ -68,13 +75,15 @@ export class ServiceBridgeService {
       //     member (the literal is never caller-supplied, so this STRENGTHENS the no-escalation property:
       //     the upsert can only ever write `'member'`, never a privileged role — the sibling `space_members`
       //     upsert resets `role` the same way);
-      //   - refreshes `name` and `emailVerifiedAt`.
+      //   - refreshes `emailVerifiedAt`;
+      //   - refreshes `name` ONLY when the caller supplied one (see the `providedName` note above) — a
+      //     nameless re-provision preserves the existing name rather than resetting it to the UUID.
       // It deliberately does NOT touch `password` (never rewritten by an upsert). NOTE: it does NOT clear
       // `deactivatedAt` — a deliberate admin deactivation is not undone by a re-provision (and `disqualify`
       // still refuses a deactivated user via `isUserDisabled`).
       .onConflict((oc) =>
         oc.columns(['email', 'workspaceId']).doUpdateSet({
-          name,
+          ...(providedName ? { name: providedName } : {}),
           emailVerifiedAt: new Date(),
           deletedAt: null,
           role: 'member',

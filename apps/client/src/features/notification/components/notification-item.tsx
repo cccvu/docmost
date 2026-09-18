@@ -131,17 +131,12 @@ export function NotificationItem({
 
           {notification.page && (
             <Group gap={4} mt={2} wrap="nowrap">
-              {notification.page.icon ? (
-                <Text size="xs" style={{ flexShrink: 0 }}>
-                  {notification.page.icon}
-                </Text>
-              ) : (
-                <IconFileDescription
-                  size={14}
-                  stroke={1.5}
-                  style={{ flexShrink: 0, color: "var(--mantine-color-dimmed)" }}
-                />
-              )}
+              {/* CCC (issue: UI polish): single default page icon — no emoji. */}
+              <IconFileDescription
+                size={14}
+                stroke={1.5}
+                style={{ flexShrink: 0, color: "var(--mantine-color-dimmed)" }}
+              />
               <Text size="xs" c="dimmed" lineClamp={1}>
                 {getPageTitle(notification.page.title, undefined, t)}
               </Text>

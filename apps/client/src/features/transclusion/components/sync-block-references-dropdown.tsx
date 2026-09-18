@@ -152,13 +152,10 @@ export default function SyncBlockReferencesDropdown({
                       className={classes.row}
                       onClick={() => handleOpenChange(false)}
                     >
-                      {page.icon ? (
-                        <span className={classes.rowEmoji}>{page.icon}</span>
-                      ) : (
-                        <span className={classes.rowIcon}>
-                          <IconFile size={16} stroke={1.6} />
-                        </span>
-                      )}
+                      {/* CCC (issue: UI polish): single default page icon — no emoji. */}
+                      <span className={classes.rowIcon}>
+                        <IconFile size={16} stroke={1.6} />
+                      </span>
                       <span className={classes.rowTitle} title={title}>
                         {title}
                       </span>

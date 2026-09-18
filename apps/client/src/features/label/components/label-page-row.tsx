@@ -31,13 +31,10 @@ export function LabelPageRow({ page, currentLabelName }: LabelPageRowProps) {
     >
       <div className={classes.rowMain}>
         <div className={classes.rowIcon}>
-          {page.icon ? (
-            <span style={{ fontSize: 16, lineHeight: 1 }}>{page.icon}</span>
-          ) : (
-            <ThemeIcon variant="transparent" color="gray" size={18}>
-              <IconFileDescription size={18} />
-            </ThemeIcon>
-          )}
+          {/* CCC (issue: UI polish): single default page icon — no emoji. */}
+          <ThemeIcon variant="transparent" color="gray" size={18}>
+            <IconFileDescription size={18} />
+          </ThemeIcon>
         </div>
         <div className={classes.rowBody}>
           <div className={classes.rowTitle}>
