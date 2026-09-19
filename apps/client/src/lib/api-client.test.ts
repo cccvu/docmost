@@ -103,6 +103,24 @@ describe("api-client 401 self-heal (#310)", () => {
     expect(window.location.href).toContain("/login");
   });
 
+  it("re-mint failure: openDocmostSession rejects → one attempt, no retry, falls to the login wall", async () => {
+    // The self-heal `catch` (api-client.ts): when the re-mint itself throws/401s (the platform session is
+    // truly gone), swallow it and hit the login wall — never retry the original request. Without the
+    // try/catch the rejection would propagate and `redirectToLogin()` would never fire, so this pins it.
+    openDocmostSession.mockRejectedValueOnce(new Error("re-mint failed"));
+    let calls = 0;
+    setAdapter(async (config) => {
+      calls += 1;
+      return unauthorized(config);
+    });
+
+    await expect(api.get("/pages/info")).rejects.toBeTruthy();
+
+    expect(openDocmostSession).toHaveBeenCalledTimes(1); // attempted exactly once
+    expect(calls).toBe(1); // the re-mint threw BEFORE `return api(config)`, so the original ran only once
+    expect(window.location.href).toContain("/login"); // fell through to the wall (the catch path)
+  });
+
   it("native mode: never re-mints (there is no platform session to lean on)", async () => {
     isNativeAuthEnabled.mockReturnValue(true);
     let calls = 0;
