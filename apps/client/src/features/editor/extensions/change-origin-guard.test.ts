@@ -12,6 +12,10 @@ import { ySyncPluginKey } from "@tiptap/y-tiptap";
 import { isChangeOrigin } from "@tiptap/extension-collaboration";
 import { TrailingNode, Indent } from "@docmost/editor-ext";
 import AutoJoiner from "./autojoiner";
+// Vite `?raw` returns the file's SOURCE TEXT without evaluating it (so the mainExtensions barrel — which
+// throws under jsdom — is never run), and it is resolved by Vite, not fs/URL (import.meta.url is not a
+// file:// URL under Vitest). Used only by the source-level wiring regression below.
+import extensionsSource from "./extensions.ts?raw";
 
 const guard = (t: any) => !isChangeOrigin(t);
 
@@ -185,4 +189,44 @@ describe("Indent normalizer change-origin guard (#345)", () => {
     setIllegalIndent(false);
     expect(paragraphIndent()).toBe(0); // reset to min
   });
+});
+
+// Regression guard for the PRODUCTION wiring (#345). The behavioral tests above configure their OWN
+// `filterTransaction`, so they would stay GREEN even if extensions.ts lost the guard on an upstream merge —
+// silently reintroducing the #345 content-rewrite bug with CI green. So assert the real wiring at the source
+// level (mirroring the repo's other call-site invariants): deleting a `.configure({ filterTransaction })`
+// wrapper reds CI. AutoJoiner is not here because it self-wires the guard inside autojoiner.ts and is covered
+// behaviorally above with the real extension; UniqueID is upstream/pre-#345.
+describe("extensions.ts wires the change-origin guard into the reactive mutators (#345 regression)", () => {
+  const stripComments = (src: string) =>
+    src
+      .replace(/\/\*[\s\S]*?\*\//g, "") // block comments
+      .replace(/(^|[^:])\/\/.*$/gm, "$1"); // line comments (but not the // in a URL like https://)
+
+  // Return the balanced argument text of `<extName>.configure( ... )`, or "" if that call is absent.
+  const configureArg = (src: string, extName: string): string => {
+    const m = new RegExp(`\\b${extName}\\.configure\\(`).exec(src);
+    if (!m) return "";
+    const from = m.index + m[0].length;
+    let depth = 1;
+    let i = from;
+    for (; i < src.length && depth > 0; i++) {
+      if (src[i] === "(") depth++;
+      else if (src[i] === ")") depth--;
+    }
+    return src.slice(from, i - 1);
+  };
+
+  const source = stripComments(extensionsSource);
+
+  for (const ext of ["TrailingNode", "Indent"] as const) {
+    it(`${ext} is .configure()'d with a change-origin filterTransaction`, () => {
+      const arg = configureArg(source, ext);
+      expect(arg, `${ext}.configure(...) missing from extensions.ts`).not.toBe(
+        "",
+      );
+      expect(arg).toContain("filterTransaction");
+      expect(arg).toMatch(/!\s*isChangeOrigin\s*\(/);
+    });
+  }
 });

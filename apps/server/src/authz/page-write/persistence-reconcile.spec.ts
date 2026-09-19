@@ -55,9 +55,11 @@ jest.mock('./store-failure-registry', () => ({
 }));
 const logStaleReconcile = jest.fn();
 const logStoreFailure = jest.fn();
+const logPostStoreFailure = jest.fn();
 jest.mock('./collab-drift-log', () => ({
   logStaleReconcile: (...a: unknown[]) => logStaleReconcile(...(a as [])),
   logStoreFailure: (...a: unknown[]) => logStoreFailure(...(a as [])),
+  logPostStoreFailure: (...a: unknown[]) => logPostStoreFailure(...(a as [])),
 }));
 // blank-clobber-guard is left REAL (pure JSON, no heavy imports) so the null-ydoc tests exercise its
 // actual structural classifier.
@@ -244,6 +246,9 @@ describe('PersistenceExtension.onStoreDocument post-store side-effect isolation 
     // The row committed BEFORE the side effect threw — the store itself succeeded.
     expect(clearStoreFailure).toHaveBeenCalledWith(document);
     expect(recordStoreFailure).not.toHaveBeenCalled();
+    // The swallowed failure is surfaced via the alarm token (COLLAB_POST_STORE_FAILED), named by side effect.
+    expect(logPostStoreFailure).toHaveBeenCalledTimes(1);
+    expect(logPostStoreFailure.mock.calls[0][1]).toBe('ai-queue');
   });
 
   it('one failing post-commit side effect does not skip the others', async () => {
@@ -252,6 +257,8 @@ describe('PersistenceExtension.onStoreDocument post-store side-effect isolation 
     await expect(run(ext)).resolves.toBeUndefined();
     expect(aiQueue.add).toHaveBeenCalledTimes(1); // ran despite the earlier failure
     expect(historyQueue.add).toHaveBeenCalledTimes(1); // ran despite the earlier failure
+    expect(logPostStoreFailure).toHaveBeenCalledTimes(1);
+    expect(logPostStoreFailure.mock.calls[0][1]).toBe('contributors');
   });
 
   it('a throwing broadcast does not reject the hook', async () => {
@@ -260,5 +267,7 @@ describe('PersistenceExtension.onStoreDocument post-store side-effect isolation 
       throw new Error('socket gone');
     });
     await expect(run(ext)).resolves.toBeUndefined();
+    expect(logPostStoreFailure).toHaveBeenCalledTimes(1);
+    expect(logPostStoreFailure.mock.calls[0][1]).toBe('broadcast');
   });
 });
