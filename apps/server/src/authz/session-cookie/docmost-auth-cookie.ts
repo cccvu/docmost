@@ -7,50 +7,59 @@ import type { FastifyReply } from 'fastify';
  * agrees. It closes the cookie-shadowing / login-CSRF vector: the wiki now shares a registrable parent
  * domain with sibling institutional sites, so any same-site sibling origin could plant
  * `authToken=<its JWT>; Domain=<shared-parent-domain>; Path=/api`, which the browser sends first (longer
- * Path) and `@fastify/cookie` keeps — the server cannot
- * tell the two apart because the `Cookie:` header carries no Path/Domain. The only robust defense is the
- * browser-enforced `__Host-` prefix: a browser refuses a `__Host-`-named cookie unless it is Secure,
- * host-only (no Domain) and Path=/, so a sibling origin can never set one that lands on the wiki host.
+ * Path) and `@fastify/cookie` keeps — the server cannot tell the two apart because the `Cookie:` header
+ * carries no Path/Domain. The only robust defense is the browser-enforced `__Host-` prefix: a browser
+ * refuses a `__Host-`-named cookie unless it is Secure, host-only (no Domain) and Path=/, so a sibling
+ * origin can never set one that lands on the wiki host.
  *
- * SECURITY POSTURE IS GATED ON `NODE_ENV === 'production'`, the repo's canonical security-posture authority
- * (mirrors services/platform's `__Host-wiki_session` + validate-production-config.ts) — deliberately NOT on
- * `isHttps()`/`APP_URL`. Deriving the prefix from a config string means a prod deploy with `APP_URL=http`
- * misconfigured would SILENTLY fall back to the shadowable, non-Secure `authToken` (fail-open, unnoticed
- * because login still works). By reading `isProduction()`, the prefix and the `Secure` flag share ONE
- * authority so `prefix ⟺ Secure` holds by construction (no `__Host-`-without-Secure lockout, #313; no
- * name-override env var, #379), and any APP_URL/NODE_ENV incoherence is caught at boot by
- * validate-cookie-posture.ts (fail-fast) rather than downgrading protection at runtime.
+ * SECURITY POSTURE IS GATED ON `isHttps()` (the APP_URL scheme), matching upstream Docmost's own
+ * `secure: isHttps()` choice — because the `__Host-` prefix REQUIRES a Secure/https context to work at all:
+ * a browser silently drops a `__Host-`/Secure cookie sent over http, so deriving the prefix from anything
+ * other than the actual https edge would break login on every legitimate http deployment (the documented
+ * standalone self-host runs `NODE_ENV=production` over `http://localhost:3000`; the fork CI smokes boot over
+ * http). The name and the `secure` flag share this ONE authority, so `prefix ⟺ Secure` holds by
+ * construction (no `__Host-`-without-Secure lockout, #313; no name-override env var, #379).
  *
- * In dev/test (`NODE_ENV !== 'production'`) the name is the un-prefixed `authToken` and `secure` is false,
- * because over `http://localhost` a Secure `__Host-` cookie would be dropped — matching the platform's dev
- * posture, and safe because localhost has no sibling origin to shadow it.
+ * FAIL-CLOSED FOR THE CCC PRODUCTION DEPLOYMENT IS ENFORCED AT THE PLATFORM, not here. A fork boot check
+ * cannot tell the real CCC https deployment apart from a legitimate http deployment — both run
+ * `NODE_ENV=production`, and the AUTHZ_MODE=remote contract smoke legitimately boots a remote fork over http
+ * — so any fork-side "must be https" guard would refuse to boot valid configs. Instead the platform
+ * (services/platform), which authoritatively knows it is production and observes the fork's real Set-Cookie
+ * when it mints a Docmost session, REJECTS a non-`__Host-` fork session cookie in production posture
+ * (bff/docmost.client.ts). So a fork misconfigured to an http APP_URL in the CCC deployment fails login
+ * closed at the platform rather than silently shipping a shadowable cookie (wiki-v2 #310).
+ *
+ * Over http (`isHttps()` false) the name is the un-prefixed `authToken` and `secure` is false, because a
+ * Secure `__Host-` cookie would be dropped by the browser — this is the legitimate self-host / dev posture,
+ * and safe because an http deployment on a private host/LAN is not the shared-parent-domain threat model.
  */
 
-/** The un-prefixed cookie name used in dev/test AND the legacy name evicted on logout after migration. */
+/** The un-prefixed cookie name used over http AND the legacy name evicted on logout after migration. */
 export const AUTH_COOKIE_BASENAME = 'authToken';
-/** The production cookie name: the `__Host-` prefix is browser-enforced host-only + Secure + Path=/. */
+/** The https cookie name: the `__Host-` prefix is browser-enforced host-only + Secure + Path=/. */
 export const AUTH_COOKIE_HOST_PREFIXED = '__Host-authToken';
 
 /** The subset of EnvironmentService the auth-cookie helpers need (keeps them unit-testable). */
 export interface AuthCookieEnv {
-  getNodeEnv(): string;
+  isHttps(): boolean;
   getCookieExpiresIn(): Date;
 }
 
 /**
- * The single canonical "secure cookie posture required" predicate (wiki-v2 #310). Derived from
- * `NODE_ENV === 'production'` (the repo's security-posture authority) — deliberately NOT from
- * `isHttps()`/`APP_URL`, so a misconfigured APP_URL cannot silently downgrade the cookie. Reused by
- * validate-cookie-posture.ts, which asserts this stays coherent with the edge at boot. Kept as a free
- * function (not a method on EnvironmentService) so the fork's upstream files stay unmodified.
+ * The single canonical "use the `__Host-` prefixed, Secure cookie" predicate (wiki-v2 #310). Derived from
+ * `isHttps()` (the APP_URL scheme) — the ONLY signal under which a `__Host-`/Secure cookie actually works,
+ * and the same authority upstream uses for `secure`. Both the name and the `secure` flag read it, so
+ * `prefix ⟺ Secure` holds by construction. Kept as a free function (not a method on EnvironmentService) so
+ * the fork's upstream files stay unmodified. Fail-closed enforcement that the CCC production deployment
+ * actually resolves to `__Host-` lives at the platform (see the file header), never at fork boot.
  */
-export function isProductionPosture(env: { getNodeEnv(): string }): boolean {
-  return env.getNodeEnv() === 'production';
+export function useHostPrefixedCookie(env: { isHttps(): boolean }): boolean {
+  return env.isHttps();
 }
 
 /**
  * Cookie attributes for the session cookie. Literal types make any divergence between the set and clear
- * paths (or from the `__Host-` requirements) a COMPILE error. `secure` shares the `isProduction()` authority
+ * paths (or from the `__Host-` requirements) a COMPILE error. `secure` shares the `isHttps()` authority
  * with the name, and there is deliberately NO `domain` (host-only is a `__Host-` requirement).
  */
 export interface DocmostAuthCookieSetOptions {
@@ -66,7 +75,7 @@ export type DocmostAuthCookieClearOptions = Omit<DocmostAuthCookieSetOptions, 'e
 
 /** The resolved cookie name for the current environment. */
 export function docmostAuthCookieName(env: AuthCookieEnv): string {
-  return isProductionPosture(env) ? AUTH_COOKIE_HOST_PREFIXED : AUTH_COOKIE_BASENAME;
+  return useHostPrefixedCookie(env) ? AUTH_COOKIE_HOST_PREFIXED : AUTH_COOKIE_BASENAME;
 }
 
 /** Attributes for SETTING the session cookie. */
@@ -77,7 +86,7 @@ export function docmostAuthCookieSetOptions(
     httpOnly: true,
     sameSite: 'lax',
     path: '/',
-    secure: isProductionPosture(env),
+    secure: useHostPrefixedCookie(env),
     expires: env.getCookieExpiresIn(),
   };
 }
@@ -101,12 +110,12 @@ export function setDocmostAuthCookie(
 }
 
 /**
- * Clear the session cookie, and (in production only) evict the legacy un-prefixed `authToken` that a
- * browser may still hold from before the `__Host-` migration. The legacy eviction is COSMETIC — the reader
- * ignores the un-prefixed name in production, so a stale/attacker `authToken` is never read — but it keeps
- * browser jars clean. It is skipped in dev, where the resolved name IS `authToken` and clearing it again
- * would be redundant. Emitted on LOGOUT only (never on the mint path, so the east-west relay never caches
- * an empty-value pair).
+ * Clear the session cookie, and (over https only) evict the legacy un-prefixed `authToken` that a browser
+ * may still hold from before the `__Host-` migration. The legacy eviction is COSMETIC — the reader ignores
+ * the un-prefixed name over https, so a stale/attacker `authToken` is never read — but it keeps browser jars
+ * clean. It is skipped over http, where the resolved name IS `authToken` and clearing it again would be
+ * redundant. Emitted on LOGOUT only (never on the mint path, so the east-west relay never caches an
+ * empty-value pair).
  */
 export function clearDocmostAuthCookie(res: FastifyReply, env: AuthCookieEnv): void {
   res.clearCookie(docmostAuthCookieName(env), docmostAuthCookieClearOptions(env));
@@ -117,7 +126,7 @@ export function clearDocmostAuthCookie(res: FastifyReply, env: AuthCookieEnv): v
 
 /**
  * Read the session token from parsed cookies under the RESOLVED name ONLY. There is deliberately no
- * fallback to the un-prefixed `authToken` in production: a fallback would let a sibling-planted plain
+ * fallback to the un-prefixed `authToken` over https: a fallback would let a sibling-planted plain
  * `authToken` be read, reopening the exact vector this fix closes.
  */
 export function readDocmostAuthCookie(

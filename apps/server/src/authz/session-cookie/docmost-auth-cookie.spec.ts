@@ -8,22 +8,25 @@ import {
   docmostAuthCookieSetOptions,
   readDocmostAuthCookie,
   setDocmostAuthCookie,
+  useHostPrefixedCookie,
 } from './docmost-auth-cookie';
 
 /**
- * #310 — the session cookie must be `__Host-authToken` + Secure in production so a sibling
- * sibling same-site origin cannot shadow it, and the reader must NEVER fall back to the un-prefixed name.
- * These assertions are only meaningful at PRODUCTION posture (isProduction:true) — a dev-only assertion is
- * vacuous (#313), so both postures are pinned explicitly.
+ * #310 — over an https edge the session cookie must be `__Host-authToken` + Secure so a sibling same-site
+ * origin cannot shadow it, and the reader must NEVER fall back to the un-prefixed name. Posture is gated on
+ * `isHttps()` (the APP_URL scheme), matching upstream's `secure: isHttps()`; the `__Host-` outcome for the
+ * CCC production deployment is enforced fail-closed at the PLATFORM, not here. These assertions are only
+ * meaningful at the https posture (isHttps:true) — an http-only assertion is vacuous (#313), so both
+ * postures are pinned explicitly.
  */
 
 const EXPIRES = new Date('2030-01-01T00:00:00.000Z');
-const prodEnv: AuthCookieEnv = {
-  getNodeEnv: () => 'production',
+const httpsEnv: AuthCookieEnv = {
+  isHttps: () => true,
   getCookieExpiresIn: () => EXPIRES,
 };
-const devEnv: AuthCookieEnv = {
-  getNodeEnv: () => 'development',
+const httpEnv: AuthCookieEnv = {
+  isHttps: () => false,
   getCookieExpiresIn: () => EXPIRES,
 };
 
@@ -44,14 +47,19 @@ function replyStub() {
   return { reply, set, clear };
 }
 
-describe('docmost-auth-cookie — production posture (__Host- + Secure)', () => {
+describe('docmost-auth-cookie — https posture (__Host- + Secure)', () => {
+  it('the prefix and Secure share the single isHttps() authority', () => {
+    expect(useHostPrefixedCookie(httpsEnv)).toBe(true);
+    expect(useHostPrefixedCookie(httpEnv)).toBe(false);
+  });
+
   it('resolves the __Host- prefixed name', () => {
-    expect(docmostAuthCookieName(prodEnv)).toBe('__Host-authToken');
+    expect(docmostAuthCookieName(httpsEnv)).toBe('__Host-authToken');
     expect(AUTH_COOKIE_HOST_PREFIXED).toBe('__Host-authToken');
   });
 
   it('set options are Secure + host-only (no domain) + Path=/ (the __Host- requirements)', () => {
-    const opts = docmostAuthCookieSetOptions(prodEnv);
+    const opts = docmostAuthCookieSetOptions(httpsEnv);
     expect(opts).toEqual({
       httpOnly: true,
       sameSite: 'lax',
@@ -63,8 +71,8 @@ describe('docmost-auth-cookie — production posture (__Host- + Secure)', () => 
   });
 
   it('clear options repeat the set attributes minus the lifetime (accepted __Host- removal, #313)', () => {
-    const set = docmostAuthCookieSetOptions(prodEnv);
-    const clear = docmostAuthCookieClearOptions(prodEnv);
+    const set = docmostAuthCookieSetOptions(httpsEnv);
+    const clear = docmostAuthCookieClearOptions(httpsEnv);
     expect(clear).toEqual({ httpOnly: true, sameSite: 'lax', path: '/', secure: true });
     expect('expires' in clear).toBe(false);
     expect('domain' in clear).toBe(false);
@@ -75,7 +83,7 @@ describe('docmost-auth-cookie — production posture (__Host- + Secure)', () => 
 
   it('setDocmostAuthCookie writes the prefixed cookie with the correct attributes', () => {
     const { reply, set } = replyStub();
-    setDocmostAuthCookie(reply, 'jwt-value', prodEnv);
+    setDocmostAuthCookie(reply, 'jwt-value', httpsEnv);
     expect(set).toHaveLength(1);
     expect(set[0].name).toBe('__Host-authToken');
     expect(set[0].value).toBe('jwt-value');
@@ -85,7 +93,7 @@ describe('docmost-auth-cookie — production posture (__Host- + Secure)', () => 
 
   it('clearDocmostAuthCookie evicts BOTH the prefixed cookie and the legacy un-prefixed authToken', () => {
     const { reply, clear } = replyStub();
-    clearDocmostAuthCookie(reply, prodEnv);
+    clearDocmostAuthCookie(reply, httpsEnv);
     expect(clear.map((c) => c.name).sort()).toEqual(['__Host-authToken', 'authToken']);
     // both removals repeat Secure/Path=/ so the __Host- removal is accepted and identities match
     for (const c of clear) {
@@ -98,28 +106,28 @@ describe('docmost-auth-cookie — production posture (__Host- + Secure)', () => 
   it('reads ONLY the prefixed name and IGNORES a shadow un-prefixed authToken (vuln closed)', () => {
     // A sibling origin plants a plain authToken; the legitimate value is under __Host-.
     const jar = { '__Host-authToken': 'legit', authToken: 'attacker' };
-    expect(readDocmostAuthCookie(jar, prodEnv)).toBe('legit');
+    expect(readDocmostAuthCookie(jar, httpsEnv)).toBe('legit');
     // With ONLY the planted plain authToken present, the reader returns nothing — it is never honored.
-    expect(readDocmostAuthCookie({ authToken: 'attacker' }, prodEnv)).toBeUndefined();
-    expect(readDocmostAuthCookie(undefined, prodEnv)).toBeUndefined();
+    expect(readDocmostAuthCookie({ authToken: 'attacker' }, httpsEnv)).toBeUndefined();
+    expect(readDocmostAuthCookie(undefined, httpsEnv)).toBeUndefined();
   });
 });
 
-describe('docmost-auth-cookie — dev/test posture (un-prefixed, non-Secure)', () => {
+describe('docmost-auth-cookie — http posture (un-prefixed, non-Secure)', () => {
   it('resolves the un-prefixed name and secure:false', () => {
-    expect(docmostAuthCookieName(devEnv)).toBe('authToken');
+    expect(docmostAuthCookieName(httpEnv)).toBe('authToken');
     expect(AUTH_COOKIE_BASENAME).toBe('authToken');
-    expect(docmostAuthCookieSetOptions(devEnv).secure).toBe(false);
+    expect(docmostAuthCookieSetOptions(httpEnv).secure).toBe(false);
   });
 
   it('clear does NOT emit a second (legacy) removal — the resolved name IS authToken', () => {
     const { reply, clear } = replyStub();
-    clearDocmostAuthCookie(reply, devEnv);
+    clearDocmostAuthCookie(reply, httpEnv);
     expect(clear).toHaveLength(1);
     expect(clear[0].name).toBe('authToken');
   });
 
-  it('reads the un-prefixed name in dev', () => {
-    expect(readDocmostAuthCookie({ authToken: 'legit' }, devEnv)).toBe('legit');
+  it('reads the un-prefixed name over http', () => {
+    expect(readDocmostAuthCookie({ authToken: 'legit' }, httpEnv)).toBe('legit');
   });
 });

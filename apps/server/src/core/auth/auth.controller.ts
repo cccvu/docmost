@@ -44,8 +44,8 @@ import {
 // new unmarked route here is denied in remote. Inert in native mode. Logic lives in authz/mode/.
 import { NativeAuthModeGuard } from '../../authz/mode/native-auth-mode.guard';
 import { SessionScopedRoute } from '../../authz/mode/native-auth-mode.decorator';
-// CCC seam (UPSTREAM_MODIFICATIONS.md #87, wiki-v2 #310): the session cookie is `__Host-authToken` + Secure
-// in production (browser-enforced host-only, un-shadowable by a sibling same-site origin). All
+// CCC seam (UPSTREAM_MODIFICATIONS.md #87, wiki-v2 #310): over an https edge the session cookie is
+// `__Host-authToken` + Secure (browser-enforced host-only, un-shadowable by a sibling same-site origin). All
 // name/attribute policy lives in authz/session-cookie/ — this file only calls the seam.
 import {
   setDocmostAuthCookie,

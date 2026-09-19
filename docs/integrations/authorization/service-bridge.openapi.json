@@ -77,7 +77,7 @@
         "operationId": "mintSession",
         "tags": ["service-bridge"],
         "summary": "Mint a Docmost session cookie for a fork-owned shadow member.",
-        "description": "Look up the shadow user by the email derived from externalId, verify it is a mintable shadow member (shadow namespace, role=member, not deleted), and mint a Docmost session. Returns { ok: true } and sets the session cookie: in production `__Host-authToken` (httpOnly, sameSite=lax, path=/, Secure, host-only — see wiki-v2 #310), or the un-prefixed `authToken` in dev/test. Scope: session:mint. There is NO generic impersonation: a non-shadow / non-member / deleted / unknown subject is 403.",
+        "description": "Look up the shadow user by the email derived from externalId, verify it is a mintable shadow member (shadow namespace, role=member, not deleted), and mint a Docmost session. Returns { ok: true } and sets the session cookie: over an https edge `__Host-authToken` (httpOnly, sameSite=lax, path=/, Secure, host-only — see wiki-v2 #310), or the un-prefixed `authToken` over http. The platform rejects a non-`__Host-` fork cookie in production posture (fail-closed). Scope: session:mint. There is NO generic impersonation: a non-shadow / non-member / deleted / unknown subject is 403.",
         "requestBody": { "required": true, "content": { "application/json": {
           "schema": { "$ref": "#/components/schemas/MintSessionRequest" },
           "example": { "externalId": "ext-abc123" }
@@ -85,7 +85,7 @@
         "responses": {
           "200": {
             "description": "Session minted; the session cookie is set via Set-Cookie.",
-            "headers": { "Set-Cookie": { "description": "In production: __Host-authToken=<jwt>; HttpOnly; SameSite=Lax; Path=/; Secure (host-only, #310). In dev/test: authToken=<jwt>; HttpOnly; SameSite=Lax; Path=/.", "schema": { "type": "string" } } },
+            "headers": { "Set-Cookie": { "description": "Over https: __Host-authToken=<jwt>; HttpOnly; SameSite=Lax; Path=/; Secure (host-only, #310). Over http: authToken=<jwt>; HttpOnly; SameSite=Lax; Path=/.", "schema": { "type": "string" } } },
             "content": { "application/json": { "schema": { "type": "object", "required": ["ok"], "properties": { "ok": { "type": "boolean" } } }, "example": { "ok": true } } }
           },
           "400": { "$ref": "#/components/responses/BadRequest" },

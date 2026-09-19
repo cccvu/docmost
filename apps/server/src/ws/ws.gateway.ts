@@ -18,7 +18,7 @@ import { BaseRealtimeBridge } from './base-realtime.bridge';
 import * as cookie from 'cookie';
 import { EnvironmentService } from '../integrations/environment/environment.service';
 // CCC seam (UPSTREAM_MODIFICATIONS.md #310): the socket.io handshake authenticates with the session cookie,
-// so it must read the resolved name (`__Host-authToken` in production), never the shadowable un-prefixed one.
+// so it must read the resolved name (`__Host-authToken` over https), never the shadowable un-prefixed one.
 import { readDocmostAuthCookie } from '../authz/session-cookie/docmost-auth-cookie';
 
 @WebSocketGateway({

@@ -11,7 +11,7 @@ import { FastifyRequest } from 'fastify';
 import { extractBearerTokenFromHeader, isUserDisabled } from '../../../common/helpers';
 import { ModuleRef } from '@nestjs/core';
 // CCC seam (UPSTREAM_MODIFICATIONS.md #310): read the session cookie under its resolved name
-// (`__Host-authToken` in production) — never the shadowable un-prefixed name. Bearer fallback is unchanged.
+// (`__Host-authToken` over https) — never the shadowable un-prefixed name. Bearer fallback is unchanged.
 import { readDocmostAuthCookie } from '../../../authz/session-cookie/docmost-auth-cookie';
 
 @Injectable()

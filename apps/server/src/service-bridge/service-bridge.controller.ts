@@ -70,7 +70,7 @@ export class ServiceBridgeController {
   ) {
     const authToken = await this.service.mintSession(dto.externalId);
     // Mirror AuthController.setAuthCookie so the caller can relay the Set-Cookie to the browser exactly as it
-    // did for native login: in production `__Host-authToken` + Secure + host-only + Path=/ (#310), scoped to
+    // did for native login: over https `__Host-authToken` + Secure + host-only + Path=/ (#310), scoped to
     // the workspace's configured session lifetime. No legacy-cookie eviction here — the mint response is also
     // consumed east-west by the relay, and an extra deletion Set-Cookie would pollute its reconstructed jar.
     setDocmostAuthCookie(res, authToken, this.environmentService);
