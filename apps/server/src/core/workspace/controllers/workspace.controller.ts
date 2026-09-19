@@ -40,6 +40,12 @@ import { WorkspaceRepo } from '@docmost/db/repos/workspace/workspace.repo';
 // which mints a native session outside AuthController. It carries NO @SessionScopedRoute() marker, so the
 // method-level NativeAuthModeGuard 404s it by default in AUTHZ_MODE=remote. Logic lives in authz/mode/.
 import { NativeAuthModeGuard } from '../../../authz/mode/native-auth-mode.guard';
+// CCC seam (UPSTREAM_MODIFICATIONS.md #88, wiki-v2 #310): session cookie is `__Host-authToken` + Secure in
+// production. Name/attribute policy lives in authz/session-cookie/ — this file only calls the seam.
+import {
+  setDocmostAuthCookie,
+  clearDocmostAuthCookie,
+} from '../../../authz/session-cookie/docmost-auth-cookie';
 
 @UseGuards(JwtAuthGuard)
 @Controller('workspace')
@@ -109,7 +115,7 @@ export class WorkspaceController {
       workspace.hostname !== updatedWorkspace.hostname
     ) {
       // log user out of old hostname
-      res.clearCookie('authToken');
+      clearDocmostAuthCookie(res, this.environmentService);
     }
 
     return updatedWorkspace;
@@ -317,12 +323,7 @@ export class WorkspaceController {
       };
     }
 
-    res.setCookie('authToken', result.authToken, {
-      httpOnly: true,
-      path: '/',
-      expires: this.environmentService.getCookieExpiresIn(),
-      secure: this.environmentService.isHttps(),
-    });
+    setDocmostAuthCookie(res, result.authToken, this.environmentService);
 
     return {
       requiresLogin: false,

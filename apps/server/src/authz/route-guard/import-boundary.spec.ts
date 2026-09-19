@@ -54,8 +54,10 @@ const SEAM_ALLOWLIST = new Set<string>([
   'app.module.ts', // seam #4 — CollabDisconnectModule + ConditionalPageModule + PlatformAuditModule + PlatformAuthorizationGuard + ResponseHeadersModule
   'core/search/search.module.ts', // seam #5 — PDP-gated search provider
   'integrations/static/static.module.ts', // seam #86 — client capability injection (NATIVE_AUTH_ENABLED, reads authz mode)
-  'core/auth/auth.controller.ts', // seam #87 — NativeAuthModeGuard + @SessionScopedRoute() allowlist (collab-token/logout)
-  'core/workspace/controllers/workspace.controller.ts', // seam #87/#88 — native-auth gate on the session-mint route
+  'core/auth/auth.controller.ts', // seam #87 — NativeAuthModeGuard + @SessionScopedRoute() allowlist (collab-token/logout); + #310 session-cookie set/clear via authz/session-cookie
+  'core/workspace/controllers/workspace.controller.ts', // seam #87/#88 — native-auth gate on the session-mint route; + #310 session-cookie set/clear
+  'core/auth/strategies/jwt.strategy.ts', // seam #310 — reads the session cookie under its resolved (__Host-) name via authz/session-cookie
+  'ws/ws.gateway.ts', // seam #310 — socket.io handshake reads the session cookie under its resolved (__Host-) name via authz/session-cookie
   'collaboration/collaboration.handler.ts', // seam #2 — conditional content write compares via authz/page-write/stable-hash (#282); flushPageContent reads authz/page-write/store-failure-registry (#390)
   'collaboration/collaboration.util.ts', // seam #61 — htmlToJson imports the #392 attachmentId backfill from editor-compat/
   'collaboration/extensions/persistence.extension.ts', // seam #390 — reconcile-before-store + store-failure signal via authz/page-write/{reconcile-store,store-failure-registry}
