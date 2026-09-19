@@ -11,7 +11,11 @@ import {
 } from "./auth-query";
 
 // useCollabToken imports getCollabToken; mock it so the wiring test can mount the hook without a network.
-vi.mock("../services/auth-service", () => ({ getCollabToken: vi.fn() }));
+// Resolve a valid token (not undefined) so React Query doesn't treat the query as errored and schedule a
+// background retry during the wiring test.
+vi.mock("../services/auth-service", () => ({
+  getCollabToken: vi.fn().mockResolvedValue({ token: "test-token" }),
+}));
 
 // axios's isAxiosError() only checks `payload.isAxiosError === true`, so plain objects are enough here.
 // networkError = the shape the old predicate threw on: isAxiosError true, but NO `response`.
@@ -118,6 +122,18 @@ describe("collabTokenRetryDelay (#385)", () => {
   it("caps the backoff at 30s for large failure counts", () => {
     expect(collabTokenRetryDelay(20, httpError(503))).toBe(30_000);
     expect(collabTokenRetryDelay(20, networkError())).toBe(30_000);
+  });
+
+  it("treats a finite non-positive or non-numeric Retry-After as unusable (pins the `> 0` guard)", () => {
+    // Retry-After must be a POSITIVE finite number of seconds to be honored; a zero, negative, or HTTP-date
+    // value must fall back to the capped backoff — never a zero/negative/immediate delay. Deleting the
+    // `> 0` sub-condition would make "0"/"-5" honor a jittered (0) or negative delay, so these assertions
+    // pin it. HTTP-date form is intentionally unsupported (delta-seconds only) and must degrade to backoff.
+    expect(collabTokenRetryDelay(0, httpError(429, { "retry-after": "0" }))).toBe(1_000);
+    expect(collabTokenRetryDelay(0, httpError(429, { "retry-after": "-5" }))).toBe(1_000);
+    expect(
+      collabTokenRetryDelay(0, httpError(503, { "retry-after": "Wed, 21 Oct 2026 07:28:00 GMT" })),
+    ).toBe(1_000);
   });
 });
 
