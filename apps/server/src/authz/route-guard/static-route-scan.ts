@@ -52,13 +52,17 @@ export interface StaticRoute {
   mintsNativeSession: boolean;
 }
 
-// Text tell that a handler body establishes a native session. Matches the `authToken` cookie set
-// (`setCookie('authToken'` / `setCookie("authToken"`), the `setAuthCookie(` helper, and the
-// `createSessionAndToken(` session-token factory that every current mint funnels through. A HEURISTIC (see
-// the mintsNativeSession doc): it over-reports on purpose but cannot see a session minted via an
-// unrecognized indirection — widen it if session issuance grows a new shape.
-const NATIVE_SESSION_MINT_RE =
-  /setCookie\(\s*['"]authToken['"]|setAuthCookie\s*\(|createSessionAndToken\s*\(/;
+// Text tell that a handler body establishes a native session. Matches the session-cookie set — the raw
+// `setCookie('authToken'` / `setCookie("__Host-authToken"` literal (either name, #310), the AuthController
+// `setAuthCookie(` helper, the CCC `setDocmostAuthCookie(` / `docmostAuthCookieSetOptions(` seam (#310), and
+// the `createSessionAndToken(` session-token factory every current mint funnels through. It keys on the
+// SET-options/wrapper, NOT the shared name helper `docmostAuthCookieName(` — that also appears in CLEAR
+// sites (logout, hostname-change), and flagging the @SessionScopedRoute logout as a minter would red
+// native-credential-routes.spec.ts. A HEURISTIC (see the mintsNativeSession doc): it over-reports on purpose
+// but cannot see a session minted via an unrecognized indirection — widen it if session issuance grows a new
+// shape. Exported so native-credential-routes.spec.ts can exercise the CLASSIFIER directly (not just the walk).
+export const NATIVE_SESSION_MINT_RE =
+  /setCookie\(\s*['"](?:__Host-)?authToken['"]|setAuthCookie\s*\(|setDocmostAuthCookie\s*\(|docmostAuthCookieSetOptions\s*\(|createSessionAndToken\s*\(/;
 
 const ROUTE_DECORATORS = new Set(['Get', 'Post', 'Put', 'Patch', 'Delete', 'Options', 'Head', 'All', 'Search']);
 const PUBLIC_DECORATORS = new Set(['Public', 'PlatformPublic']);

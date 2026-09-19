@@ -13,6 +13,9 @@ import { ConditionalPageModule } from './authz/page-write/conditional-page.modul
 // including the static SPA documents an interceptor would miss. main.ts is upstream-owned, so the hook is
 // registered from a CCC module instead.
 import { ResponseHeadersModule } from './authz/http-headers/response-headers.module';
+// CCC seam (#310): fail-fast boot check that the session-cookie posture (__Host- + Secure in production) is
+// coherent with the edge BEFORE the port binds. main.ts is upstream-owned, so it runs from a CCC module.
+import { SessionCookieModule } from './authz/session-cookie/session-cookie.module';
 import { WsModule } from './ws/ws.module';
 import { DatabaseModule } from '@docmost/db/database.module';
 import { StorageModule } from './integrations/storage/storage.module';
@@ -81,6 +84,7 @@ try {
     CollabDisconnectModule,
     ConditionalPageModule,
     ResponseHeadersModule,
+    SessionCookieModule,
     WsModule,
     QueueModule,
     StaticModule,

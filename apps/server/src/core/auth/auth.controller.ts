@@ -44,6 +44,13 @@ import {
 // new unmarked route here is denied in remote. Inert in native mode. Logic lives in authz/mode/.
 import { NativeAuthModeGuard } from '../../authz/mode/native-auth-mode.guard';
 import { SessionScopedRoute } from '../../authz/mode/native-auth-mode.decorator';
+// CCC seam (UPSTREAM_MODIFICATIONS.md #87, wiki-v2 #310): the session cookie is `__Host-authToken` + Secure
+// in production (browser-enforced host-only, un-shadowable by a sibling same-site origin). All
+// name/attribute policy lives in authz/session-cookie/ — this file only calls the seam.
+import {
+  setDocmostAuthCookie,
+  clearDocmostAuthCookie,
+} from '../../authz/session-cookie/docmost-auth-cookie';
 
 @SkipThrottle({ [AI_CHAT_THROTTLER]: true })
 @UseGuards(ThrottlerGuard, NativeAuthModeGuard)
@@ -219,7 +226,7 @@ export class AuthController {
       );
     }
 
-    res.clearCookie('authToken');
+    clearDocmostAuthCookie(res, this.environmentService);
 
     this.auditService.log({
       event: AuditEvent.USER_LOGOUT,
@@ -229,12 +236,6 @@ export class AuthController {
   }
 
   setAuthCookie(res: FastifyReply, token: string) {
-    res.setCookie('authToken', token, {
-      httpOnly: true,
-      sameSite: 'lax',
-      path: '/',
-      expires: this.environmentService.getCookieExpiresIn(),
-      secure: this.environmentService.isHttps(),
-    });
+    setDocmostAuthCookie(res, token, this.environmentService);
   }
 }

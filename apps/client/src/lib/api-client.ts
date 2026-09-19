@@ -1,6 +1,7 @@
-import axios, { AxiosInstance } from "axios";
+import axios, { AxiosInstance, InternalAxiosRequestConfig } from "axios";
 import APP_ROUTE, { isPublicRoutePath } from "@/lib/app-route.ts";
 import { isCloud } from "@/lib/config.ts";
+import { isNativeAuthEnabled } from "@/features/auth-native/lib/auth-mode.ts";
 
 const api: AxiosInstance = axios.create({
   baseURL: "/api",
@@ -25,13 +26,41 @@ api.interceptors.response.use(
 
     return response.data;
   },
-  (error) => {
+  async (error) => {
     if (error.response) {
       switch (error.response.status) {
         case 401: {
           const url = new URL(error.request.responseURL)?.pathname;
           if (url === "/api/auth/collab-token") return;
           if (window.location.pathname.startsWith("/share/")) return;
+
+          // #310 self-heal: in remote (platform-integrated) mode the relayed Docmost session cookie
+          // (`__Host-authToken`) can be stale/absent while the platform identity (`__Host-wiki_session`)
+          // is still valid — most visibly right after the cookie-rename deploy, when every browser still
+          // holds the old un-prefixed `authToken`. Re-mint the Docmost session ONCE and retry, instead of
+          // bouncing an authenticated user to /login. `openDocmostSession` is imported dynamically to avoid
+          // a static import cycle (auth-service imports this module). Loop-guarded via `_docmostRetry`;
+          // falls through to the login wall if the re-mint also fails (the platform session is truly gone).
+          const config = error.config as
+            | (InternalAxiosRequestConfig & { _docmostRetry?: boolean })
+            | undefined;
+          if (
+            !isNativeAuthEnabled() &&
+            !isPublicRoutePath(window.location.pathname) &&
+            config &&
+            !config._docmostRetry
+          ) {
+            config._docmostRetry = true;
+            try {
+              const { openDocmostSession } = await import(
+                "@/features/auth/services/auth-service.ts"
+              );
+              await openDocmostSession();
+              return api(config);
+            } catch {
+              // re-mint failed → fall through to the login wall below
+            }
+          }
 
           // On a public route (front page / request-access), a 401 from an optional probe (e.g. the
           // anonymous `/users/me` auth check) must NOT hard-redirect to /login — let it reject so the
