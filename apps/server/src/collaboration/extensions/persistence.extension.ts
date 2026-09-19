@@ -42,11 +42,13 @@ import {
   recordStoreFailure,
   clearStoreFailure,
 } from '../../authz/page-write/store-failure-registry';
-// The alarm tokens (COLLAB_STALE_RECONCILE / COLLAB_STORE_FAILED) are emitted from authz/ — the only fork
-// subtree scripts/check-infra-config.mjs §14 scans for a monitoring.tf filter's emitter.
+// The alarm tokens (COLLAB_STALE_RECONCILE / COLLAB_STORE_FAILED / COLLAB_POST_STORE_FAILED) are emitted from
+// authz/ — the CCC-owned fork subtree scripts/check-infra-config.mjs §14 scans for a monitoring.tf filter's
+// emitter (and it keeps the alarm-token policy out of this upstream-owned file).
 import {
   logStaleReconcile,
   logStoreFailure,
+  logPostStoreFailure,
 } from '../../authz/page-write/collab-drift-log';
 
 @Injectable()
@@ -222,56 +224,113 @@ export class PersistenceExtension implements Extension {
       page = null;
     }
 
+    // #345: EVERYTHING below runs AFTER the row has committed. A throw here must NEVER reject onStoreDocument.
+    // Hocuspocus re-throws hook errors and its debouncer leaves the rejected store resident in
+    // `runningExecutions`, so a single post-commit blip (a Redis/BullMQ enqueue, the contributors DB write, a
+    // broadcast to a dead socket) would permanently wedge persistence for THIS document until process restart
+    // — every later edit silently lost — and on the settle/flush path (`flushPageContent` → `executeNow`)
+    // return a false 503 for a write that actually committed. Each side effect is best-effort and independent,
+    // so it is isolated: a failure is logged and never propagates, and one failing effect never skips the rest.
     if (page) {
-      document.broadcastStateless(
-        JSON.stringify({
-          type: 'page.updated',
-          updatedAt: new Date().toISOString(),
-          lastUpdatedById: context?.user?.id,
-          lastUpdatedBy: context?.user
-            ? {
-                id: context.user?.id,
-                name: context.user?.name,
-                avatarUrl: context.user?.avatarUrl,
-              }
-            : undefined,
-        }),
-      );
+      const persisted = page;
 
-      await this.syncTransclusion(pageId, page.workspaceId, tiptapJson);
-    }
+      // #345: an outer backstop so the "onStoreDocument never rejects post-commit" invariant is STRUCTURAL,
+      // not merely per-callsite. Each effect below is already individually isolated (so one failure never
+      // skips the rest), but this guard also catches a throw from `syncTransclusion`'s own handler or from any
+      // FUTURE unwrapped await added to this block — the exact regression that would silently re-poison the
+      // debouncer. The row is already committed, so swallowing here can only lose a derived-data effect, never
+      // content; the failure is logged + alarmed via COLLAB_POST_STORE_FAILED.
+      try {
+        await this.runPostStoreSideEffect('broadcast', pageId, () =>
+          document.broadcastStateless(
+            JSON.stringify({
+              type: 'page.updated',
+              updatedAt: new Date().toISOString(),
+              lastUpdatedById: context?.user?.id,
+              lastUpdatedBy: context?.user
+                ? {
+                    id: context.user?.id,
+                    name: context.user?.name,
+                    avatarUrl: context.user?.avatarUrl,
+                  }
+                : undefined,
+            }),
+          ),
+        );
 
-    if (page) {
-      await this.collabHistory.addContributors(pageId, editingUserIds);
+        // syncTransclusion already isolates its own failures (per-call try/catch); the outer guard is a backstop.
+        await this.syncTransclusion(pageId, persisted.workspaceId, tiptapJson);
 
-      const mentions = extractMentions(tiptapJson);
+        await this.runPostStoreSideEffect('contributors', pageId, () =>
+          this.collabHistory.addContributors(pageId, editingUserIds),
+        );
 
-      const userMentions = extractUserMentions(mentions);
-      const oldMentions = page.content ? extractMentions(page.content) : [];
-      const oldMentionedUserIds = extractUserMentions(oldMentions).map(
-        (m) => m.entityId,
-      );
-
-      if (userMentions.length > 0) {
-        await this.notificationQueue.add(QueueJob.PAGE_MENTION_NOTIFICATION, {
-          userMentions: userMentions.map((m) => ({
-            userId: m.entityId,
-            mentionId: m.id,
-            creatorId: m.creatorId,
-          })),
-          oldMentionedUserIds,
+        await this.runPostStoreSideEffect(
+          'mention-notification',
           pageId,
-          spaceId: page.spaceId,
-          workspaceId: page.workspaceId,
-        } as IPageMentionNotificationJob);
+          async () => {
+            const mentions = extractMentions(tiptapJson);
+            const userMentions = extractUserMentions(mentions);
+            if (userMentions.length === 0) return;
+            const oldMentions = persisted.content
+              ? extractMentions(persisted.content)
+              : [];
+            const oldMentionedUserIds = extractUserMentions(oldMentions).map(
+              (m) => m.entityId,
+            );
+            await this.notificationQueue.add(
+              QueueJob.PAGE_MENTION_NOTIFICATION,
+              {
+                userMentions: userMentions.map((m) => ({
+                  userId: m.entityId,
+                  mentionId: m.id,
+                  creatorId: m.creatorId,
+                })),
+                oldMentionedUserIds,
+                pageId,
+                spaceId: persisted.spaceId,
+                workspaceId: persisted.workspaceId,
+              } as IPageMentionNotificationJob,
+            );
+          },
+        );
+
+        await this.runPostStoreSideEffect('ai-queue', pageId, () =>
+          this.aiQueue.add(QueueJob.PAGE_CONTENT_UPDATED, {
+            pageIds: [pageId],
+            workspaceId: persisted.workspaceId,
+          }),
+        );
+
+        await this.runPostStoreSideEffect('history', pageId, () =>
+          this.enqueuePageHistory(persisted),
+        );
+      } catch (err) {
+        // The per-effect wrappers above never throw, so reaching here means an UNwrapped post-commit await
+        // (syncTransclusion's guard, or a future addition) threw. Content is already durable; never re-throw.
+        logPostStoreFailure(this.logger, 'post-store-block', pageId, err);
       }
+    }
+  }
 
-      await this.aiQueue.add(QueueJob.PAGE_CONTENT_UPDATED, {
-        pageIds: [pageId],
-        workspaceId: page.workspaceId,
-      });
-
-      await this.enqueuePageHistory(page);
+  /**
+   * Run a best-effort POST-STORE side effect in isolation (#345). These run after the row has committed, so a
+   * throw must never reject `onStoreDocument`: Hocuspocus's debouncer would otherwise leave the rejected store
+   * resident and wedge all future persistence for this document until restart. Mirrors the isolation
+   * `syncTransclusion` already applies to its own calls. Never re-throws; the page content is already durable.
+   */
+  private async runPostStoreSideEffect(
+    label: string,
+    pageId: string,
+    fn: () => unknown | Promise<unknown>,
+  ): Promise<void> {
+    try {
+      await fn();
+    } catch (err) {
+      // #345: emit the alarm token (COLLAB_POST_STORE_FAILED, via the fork's authz/ tree) instead of a plain
+      // error, so a systematic post-store failure is surfaced by CloudWatch (monitoring.tf) rather than only
+      // logged. Never re-throws — a rejected onStoreDocument would poison Hocuspocus's debouncer.
+      logPostStoreFailure(this.logger, label, pageId, err);
     }
   }
 

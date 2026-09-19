@@ -28,3 +28,24 @@ export function logStoreFailure(
 ): void {
   logger.error(`COLLAB_STORE_FAILED failed to persist page ${pageId}`, err);
 }
+
+/**
+ * A best-effort POST-STORE side effect failed AFTER the page row committed (#345). The content IS durable;
+ * only a derived-data / notification effect (broadcast, transclusion sync, contributors, mention/AI/history
+ * enqueue) did not complete. `onStoreDocument` still resolves — re-throwing would leave the store resident in
+ * Hocuspocus's debouncer and wedge all future persistence for the document — so this is otherwise SILENT.
+ * Emitting the token gives it a CloudWatch alarm (monitoring.tf), mirroring COLLAB_STORE_FAILED, so a
+ * systematic post-store failure (a wedged Redis/BullMQ, a broken queue) pages someone instead of only landing
+ * in the logs. Content-safe, so distinct from COLLAB_STORE_FAILED (which is fail-closed data-durability).
+ */
+export function logPostStoreFailure(
+  logger: LoggerLike,
+  sideEffect: string,
+  pageId: string,
+  err: unknown,
+): void {
+  logger.error(
+    `COLLAB_POST_STORE_FAILED post-store side effect '${sideEffect}' failed for page ${pageId} (content already persisted)`,
+    err,
+  );
+}

@@ -217,7 +217,11 @@ export const mainExtensions = [
     showOnlyWhenEditable: true,
   }),
   TextAlign.configure({ types: ["heading", "paragraph"] }),
-  Indent,
+  // #345: skip normalizing indent on collaboration change-origin transactions (mirrors UniqueID) so an open
+  // browser doesn't rewrite the indent of nodes authored elsewhere (API/MCP/another client).
+  Indent.configure({
+    filterTransaction: (transaction) => !isChangeOrigin(transaction),
+  }),
   TaskList,
   TaskItem.configure({
     nested: true,
@@ -235,7 +239,11 @@ export const mainExtensions = [
     multicolor: true,
   }),
   Typography,
-  TrailingNode,
+  // #345: skip appending a trailing paragraph on collaboration change-origin transactions (mirrors UniqueID)
+  // so an open browser doesn't rewrite API/MCP-authored content that ends in a non-paragraph node.
+  TrailingNode.configure({
+    filterTransaction: (transaction) => !isChangeOrigin(transaction),
+  }),
   GlobalDragHandle.configure({
     customNodes: ["transclusionSource", "transclusionReference"],
     atomNodes: ["base"],
