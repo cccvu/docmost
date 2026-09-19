@@ -1,9 +1,14 @@
 import { Extension } from '@tiptap/core'
-import { PluginKey, Plugin } from '@tiptap/pm/state';
+import { PluginKey, Plugin, type Transaction } from '@tiptap/pm/state';
 
 export interface TrailingNodeExtensionOptions {
   node: string,
   notAfter: string[],
+  // #345: return false to skip inserting the trailing node for a transaction. The client injects
+  // `(t) => !isChangeOrigin(t)` so an open browser never appends a trailing paragraph in reaction to content
+  // that arrived over the collaboration sync (API/MCP/another client) — which would rewrite that content and
+  // rotate its version anchor. Mirrors the guard on UniqueID. Undefined (default) preserves prior behavior.
+  filterTransaction?: (tr: Transaction) => boolean,
 }
 
 function nodeEqualsType({ types, node }: { types: any, node: any }) {
@@ -33,17 +38,25 @@ export const TrailingNode = Extension.create<TrailingNodeExtensionOptions>({
     const disabledNodes = Object.entries(this.editor.schema.nodes)
       .map(([, value]) => value)
       .filter(node => this.options.notAfter.includes(node.name))
+    const passes = this.options.filterTransaction ?? (() => true)
 
     return [
       new Plugin({
         key: plugin,
-        appendTransaction: (_, __, state) => {
+        appendTransaction: (transactions, __, state) => {
           const { doc, tr, schema } = state;
           const shouldInsertNodeAtEnd = plugin.getState(state);
           const endPosition = doc.content.size;
           const type = schema.nodes[this.options.node]
 
           if (!shouldInsertNodeAtEnd) {
+            return;
+          }
+
+          // #345: append only when a LOCAL doc change drove this batch. A purely remote/sync (change-origin)
+          // change — or a mere click/selection on a page nobody is editing — must not rewrite content
+          // authored elsewhere by appending a trailing paragraph and re-persisting it.
+          if (!transactions.some((t) => t.docChanged && passes(t))) {
             return;
           }
 

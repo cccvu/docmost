@@ -222,56 +222,98 @@ export class PersistenceExtension implements Extension {
       page = null;
     }
 
+    // #345: EVERYTHING below runs AFTER the row has committed. A throw here must NEVER reject onStoreDocument.
+    // Hocuspocus re-throws hook errors and its debouncer leaves the rejected store resident in
+    // `runningExecutions`, so a single post-commit blip (a Redis/BullMQ enqueue, the contributors DB write, a
+    // broadcast to a dead socket) would permanently wedge persistence for THIS document until process restart
+    // — every later edit silently lost — and on the settle/flush path (`flushPageContent` → `executeNow`)
+    // return a false 503 for a write that actually committed. Each side effect is best-effort and independent,
+    // so it is isolated: a failure is logged and never propagates, and one failing effect never skips the rest.
     if (page) {
-      document.broadcastStateless(
-        JSON.stringify({
-          type: 'page.updated',
-          updatedAt: new Date().toISOString(),
-          lastUpdatedById: context?.user?.id,
-          lastUpdatedBy: context?.user
-            ? {
-                id: context.user?.id,
-                name: context.user?.name,
-                avatarUrl: context.user?.avatarUrl,
-              }
-            : undefined,
+      const persisted = page;
+
+      await this.runPostStoreSideEffect('broadcast', pageId, () =>
+        document.broadcastStateless(
+          JSON.stringify({
+            type: 'page.updated',
+            updatedAt: new Date().toISOString(),
+            lastUpdatedById: context?.user?.id,
+            lastUpdatedBy: context?.user
+              ? {
+                  id: context.user?.id,
+                  name: context.user?.name,
+                  avatarUrl: context.user?.avatarUrl,
+                }
+              : undefined,
+          }),
+        ),
+      );
+
+      // syncTransclusion already isolates its own failures (per-call try/catch), so a direct await is safe.
+      await this.syncTransclusion(pageId, persisted.workspaceId, tiptapJson);
+
+      await this.runPostStoreSideEffect('contributors', pageId, () =>
+        this.collabHistory.addContributors(pageId, editingUserIds),
+      );
+
+      await this.runPostStoreSideEffect(
+        'mention-notification',
+        pageId,
+        async () => {
+          const mentions = extractMentions(tiptapJson);
+          const userMentions = extractUserMentions(mentions);
+          if (userMentions.length === 0) return;
+          const oldMentions = persisted.content
+            ? extractMentions(persisted.content)
+            : [];
+          const oldMentionedUserIds = extractUserMentions(oldMentions).map(
+            (m) => m.entityId,
+          );
+          await this.notificationQueue.add(QueueJob.PAGE_MENTION_NOTIFICATION, {
+            userMentions: userMentions.map((m) => ({
+              userId: m.entityId,
+              mentionId: m.id,
+              creatorId: m.creatorId,
+            })),
+            oldMentionedUserIds,
+            pageId,
+            spaceId: persisted.spaceId,
+            workspaceId: persisted.workspaceId,
+          } as IPageMentionNotificationJob);
+        },
+      );
+
+      await this.runPostStoreSideEffect('ai-queue', pageId, () =>
+        this.aiQueue.add(QueueJob.PAGE_CONTENT_UPDATED, {
+          pageIds: [pageId],
+          workspaceId: persisted.workspaceId,
         }),
       );
 
-      await this.syncTransclusion(pageId, page.workspaceId, tiptapJson);
-    }
-
-    if (page) {
-      await this.collabHistory.addContributors(pageId, editingUserIds);
-
-      const mentions = extractMentions(tiptapJson);
-
-      const userMentions = extractUserMentions(mentions);
-      const oldMentions = page.content ? extractMentions(page.content) : [];
-      const oldMentionedUserIds = extractUserMentions(oldMentions).map(
-        (m) => m.entityId,
+      await this.runPostStoreSideEffect('history', pageId, () =>
+        this.enqueuePageHistory(persisted),
       );
+    }
+  }
 
-      if (userMentions.length > 0) {
-        await this.notificationQueue.add(QueueJob.PAGE_MENTION_NOTIFICATION, {
-          userMentions: userMentions.map((m) => ({
-            userId: m.entityId,
-            mentionId: m.id,
-            creatorId: m.creatorId,
-          })),
-          oldMentionedUserIds,
-          pageId,
-          spaceId: page.spaceId,
-          workspaceId: page.workspaceId,
-        } as IPageMentionNotificationJob);
-      }
-
-      await this.aiQueue.add(QueueJob.PAGE_CONTENT_UPDATED, {
-        pageIds: [pageId],
-        workspaceId: page.workspaceId,
-      });
-
-      await this.enqueuePageHistory(page);
+  /**
+   * Run a best-effort POST-STORE side effect in isolation (#345). These run after the row has committed, so a
+   * throw must never reject `onStoreDocument`: Hocuspocus's debouncer would otherwise leave the rejected store
+   * resident and wedge all future persistence for this document until restart. Mirrors the isolation
+   * `syncTransclusion` already applies to its own calls. Never re-throws; the page content is already durable.
+   */
+  private async runPostStoreSideEffect(
+    label: string,
+    pageId: string,
+    fn: () => unknown | Promise<unknown>,
+  ): Promise<void> {
+    try {
+      await fn();
+    } catch (err) {
+      this.logger.error(
+        { err, pageId, sideEffect: label },
+        'post-store side effect failed (page already persisted)',
+      );
     }
   }
 

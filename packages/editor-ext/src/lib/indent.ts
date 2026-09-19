@@ -10,6 +10,10 @@ export type IndentOptions = {
   types: string[];
   min: number;
   max: number;
+  // #345: return false to skip normalizing a transaction. The client injects `(t) => !isChangeOrigin(t)` so
+  // this extension never rewrites the `indent` attribute of nodes that arrived over the collaboration sync
+  // (API/MCP/another client) — mirrors the guard on UniqueID. Undefined (the default) means "normalize all".
+  filterTransaction?: (tr: Transaction) => boolean;
 };
 
 declare module '@tiptap/core' {
@@ -148,11 +152,15 @@ export const Indent = Extension.create<IndentOptions>({
     const types = new Set(this.options.types);
     const min = this.options.min;
 
+    const passes = this.options.filterTransaction ?? (() => true);
+
     return [
       new Plugin({
         key: new PluginKey('indentNormalizer'),
         appendTransaction: (transactions, _oldState, newState) => {
-          if (!transactions.some((tr) => tr.docChanged)) return null;
+          // #345: act only when a LOCAL doc change drove this batch. A purely remote/sync (change-origin)
+          // change must not trigger a rewrite of nodes authored elsewhere.
+          if (!transactions.some((tr) => tr.docChanged && passes(tr))) return null;
 
           const tr = newState.tr;
           let modified = false;
