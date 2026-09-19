@@ -55,9 +55,11 @@ jest.mock('./store-failure-registry', () => ({
 }));
 const logStaleReconcile = jest.fn();
 const logStoreFailure = jest.fn();
+const logPostStoreFailure = jest.fn();
 jest.mock('./collab-drift-log', () => ({
   logStaleReconcile: (...a: unknown[]) => logStaleReconcile(...(a as [])),
   logStoreFailure: (...a: unknown[]) => logStoreFailure(...(a as [])),
+  logPostStoreFailure: (...a: unknown[]) => logPostStoreFailure(...(a as [])),
 }));
 // blank-clobber-guard is left REAL (pure JSON, no heavy imports) so the null-ydoc tests exercise its
 // actual structural classifier.
@@ -176,5 +178,96 @@ describe('PersistenceExtension.onStoreDocument reconcile seam (#390)', () => {
 
     expect(updatePage).toHaveBeenCalledTimes(1); // genuine edit persists
     expect(logStaleReconcile).not.toHaveBeenCalled();
+  });
+});
+
+// #345 defect 2 — the post-commit side effects run AFTER the row commits and are best-effort. A throw there
+// must NEVER reject onStoreDocument: Hocuspocus's debouncer leaves a rejected store resident and wedges ALL
+// future persistence for the document (silent data loss), and returns a false 503 on the settle/flush path.
+// These pin the "never rejects" property (which is exactly what denies the debouncer its poison) with DISTINCT
+// queue mocks so per-effect isolation is observable.
+describe('PersistenceExtension.onStoreDocument post-store side-effect isolation (#345)', () => {
+  const document = { broadcastStateless: jest.fn() };
+  const context = { user: { id: 'u1' } };
+  const page = {
+    id: 'page-1',
+    slugId: 's',
+    content: { type: 'doc', content: [] },
+    ydoc: Buffer.from([9]),
+    workspaceId: 'w1',
+    spaceId: 'sp1',
+    creatorId: 'c1',
+    createdAt: new Date('2020-01-01').toISOString(),
+  };
+
+  const build = () => {
+    const findById = jest.fn(async () => page);
+    const updatePage = jest.fn(async () => undefined);
+    const pageRepo = { findById, updatePage } as any;
+    const aiQueue = { add: jest.fn(async () => undefined) } as any;
+    const historyQueue = { add: jest.fn(async () => undefined) } as any;
+    const notificationQueue = { add: jest.fn(async () => undefined) } as any;
+    const collabHistory = { addContributors: jest.fn(async () => undefined) } as any;
+    const transclusion = {
+      syncPageTransclusions: jest.fn(async () => undefined),
+      syncPageReferences: jest.fn(async () => undefined),
+    } as any;
+    // constructor order: pageRepo, db, aiQueue, historyQueue, notificationQueue, collabHistory, transclusion
+    const ext = new PersistenceExtension(
+      pageRepo,
+      {} as any,
+      aiQueue,
+      historyQueue,
+      notificationQueue,
+      collabHistory,
+      transclusion,
+    );
+    return { ext, updatePage, aiQueue, historyQueue, collabHistory };
+  };
+
+  const run = (ext: PersistenceExtension) =>
+    ext.onStoreDocument({ documentName: 'page.1', document, context } as any);
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    // Serialized doc must DIFFER from page.content so the write proceeds (not the isDeepStrictEqual no-op).
+    fromYdoc.mockReturnValue({
+      type: 'doc',
+      content: [{ type: 'paragraph' }, { type: 'paragraph' }],
+    });
+    jsonToText.mockReturnValue('text');
+    reconcileRowIntoDoc.mockReturnValue({ merged: false });
+  });
+
+  it('a throwing post-commit side effect does NOT reject onStoreDocument (denies the debouncer its poison)', async () => {
+    const { ext, aiQueue } = build();
+    aiQueue.add.mockRejectedValueOnce(new Error('redis blip'));
+    await expect(run(ext)).resolves.toBeUndefined();
+    // The row committed BEFORE the side effect threw — the store itself succeeded.
+    expect(clearStoreFailure).toHaveBeenCalledWith(document);
+    expect(recordStoreFailure).not.toHaveBeenCalled();
+    // The swallowed failure is surfaced via the alarm token (COLLAB_POST_STORE_FAILED), named by side effect.
+    expect(logPostStoreFailure).toHaveBeenCalledTimes(1);
+    expect(logPostStoreFailure.mock.calls[0][1]).toBe('ai-queue');
+  });
+
+  it('one failing post-commit side effect does not skip the others', async () => {
+    const { ext, aiQueue, historyQueue, collabHistory } = build();
+    collabHistory.addContributors.mockRejectedValueOnce(new Error('db blip'));
+    await expect(run(ext)).resolves.toBeUndefined();
+    expect(aiQueue.add).toHaveBeenCalledTimes(1); // ran despite the earlier failure
+    expect(historyQueue.add).toHaveBeenCalledTimes(1); // ran despite the earlier failure
+    expect(logPostStoreFailure).toHaveBeenCalledTimes(1);
+    expect(logPostStoreFailure.mock.calls[0][1]).toBe('contributors');
+  });
+
+  it('a throwing broadcast does not reject the hook', async () => {
+    const { ext } = build();
+    document.broadcastStateless.mockImplementationOnce(() => {
+      throw new Error('socket gone');
+    });
+    await expect(run(ext)).resolves.toBeUndefined();
+    expect(logPostStoreFailure).toHaveBeenCalledTimes(1);
+    expect(logPostStoreFailure.mock.calls[0][1]).toBe('broadcast');
   });
 });

@@ -1,4 +1,8 @@
-import { logStaleReconcile, logStoreFailure } from './collab-drift-log';
+import {
+  logStaleReconcile,
+  logStoreFailure,
+  logPostStoreFailure,
+} from './collab-drift-log';
 
 // #390: these two alarm tokens are wired to CloudWatch metric-filter alarms in infra/terraform/monitoring.tf
 // and pinned by scripts/check-infra-config.mjs §14 (LOG_TOKENS.fork). The emitters MUST live under the fork's
@@ -21,6 +25,20 @@ describe('collab-drift-log (#390 alarm tokens)', () => {
     expect(logger.error).toHaveBeenCalledTimes(1);
     expect(logger.error.mock.calls[0][0]).toMatch(/^COLLAB_STORE_FAILED\b/);
     expect(logger.error.mock.calls[0][0]).toContain('page-456');
+    expect(logger.error.mock.calls[0][1]).toBe(err);
+  });
+
+  // #345: a post-store (post-commit) best-effort side effect failed. Content is durable, so this is a DISTINCT
+  // token from COLLAB_STORE_FAILED (data-durability) — but it still pages, else a systematic enqueue/broadcast
+  // failure is silent (onStoreDocument never re-throws it, to avoid poisoning the debouncer).
+  it('logPostStoreFailure emits the COLLAB_POST_STORE_FAILED token, names the side effect, and forwards the cause', () => {
+    const logger = { warn: jest.fn(), error: jest.fn() };
+    const err = new Error('redis down');
+    logPostStoreFailure(logger, 'ai-queue', 'page-789', err);
+    expect(logger.error).toHaveBeenCalledTimes(1);
+    expect(logger.error.mock.calls[0][0]).toMatch(/^COLLAB_POST_STORE_FAILED\b/);
+    expect(logger.error.mock.calls[0][0]).toContain('ai-queue');
+    expect(logger.error.mock.calls[0][0]).toContain('page-789');
     expect(logger.error.mock.calls[0][1]).toBe(err);
   });
 });

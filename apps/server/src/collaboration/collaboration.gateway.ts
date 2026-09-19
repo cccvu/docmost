@@ -48,7 +48,15 @@ export class CollaborationGateway {
     this.hocuspocus = new Hocuspocus({
       debounce: 10000,
       maxDebounce: 45000,
-      unloadImmediately: false,
+      // #345: MUST stay true. On the last client disconnect, Hocuspocus only runs a pending debounced store
+      // immediately when this is true (`executeNow` in its onClose); with `false` it does neither flush nor
+      // unload and waits out the 10s/45s timer, so a restart in that window (rolling deploy / scale-in /
+      // crash) loses the person's unsaved edits. `true` also drains graceful shutdown correctly
+      // (closeConnections → onClose → executeNow → store → unload). Unload still only fires AFTER the store
+      // completes (Hocuspocus `shouldUnloadDocument` gates on pending/executing/saveMutex), so the settle's
+      // "not resident ⇒ row authoritative" invariant holds, and RedisSync releases the doc lock on unload as
+      // designed. See UPSTREAM_MODIFICATIONS.md. (Upstream default is true; Docmost had set it to false.)
+      unloadImmediately: true,
       extensions: [
         this.authenticationExtension,
         this.persistenceExtension,

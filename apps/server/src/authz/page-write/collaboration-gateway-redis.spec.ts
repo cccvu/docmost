@@ -85,4 +85,21 @@ describe('CollaborationGateway.handleYjsEvent routing guard (#344)', () => {
       expect(handleEvent).toHaveBeenCalledWith('updatePageContent', 'page.1', {});
     });
   });
+
+  // #345 defect 3 — pin the durability config. Hocuspocus only flushes a PENDING debounced store on the last
+  // client disconnect when `unloadImmediately` is true (its onClose calls `executeNow`); with `false` it waits
+  // out the 10s/45s timer, so a restart in that window loses unsaved edits. This locks the value so a future
+  // edit can't silently flip it back to the (lossy) upstream override. The flush-on-disconnect behavior itself
+  // is upstream Hocuspocus and is covered there.
+  describe('persistence durability config (#345)', () => {
+    it('constructs Hocuspocus with unloadImmediately:true', () => {
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      const { Hocuspocus } = require('@hocuspocus/server');
+      (Hocuspocus as jest.Mock).mockClear();
+      makeGateway(true);
+      const calls = (Hocuspocus as jest.Mock).mock.calls;
+      const cfg = calls[calls.length - 1][0];
+      expect(cfg).toMatchObject({ unloadImmediately: true });
+    });
+  });
 });

@@ -5,6 +5,7 @@ import { canJoin } from "@tiptap/pm/transform";
 import { getNodeType } from "@tiptap/react";
 import { NodeType } from "@tiptap/pm/model";
 import { Transaction } from "@tiptap/pm/state";
+import { isChangeOrigin } from "@tiptap/extension-collaboration";
 
 // https://discuss.prosemirror.net/t/how-to-autojoin-all-the-time/2957/4
 // Adapted from prosemirror-commands wrapDispatchForJoin
@@ -92,6 +93,12 @@ const AutoJoiner = Extension.create<AutoJoinerOptions>({
       new Plugin({
         key: plugin,
         appendTransaction(transactions, _, newState) {
+          // #345: auto-join only when a LOCAL doc change drove this batch. A purely remote/sync
+          // (change-origin) change must not merge lists authored elsewhere (API/MCP/another client) and
+          // re-persist the mutation from a browser nobody is editing in.
+          if (!transactions.some((t) => t.docChanged && !isChangeOrigin(t))) {
+            return;
+          }
           let newTr = newState.tr;
           if (autoJoin(transactions, newTr, joinableNodes as NodeType[])) {
             return newTr;
