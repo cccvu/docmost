@@ -10,6 +10,9 @@ import { SessionActivityService } from '../../session/session-activity.service';
 import { FastifyRequest } from 'fastify';
 import { extractBearerTokenFromHeader, isUserDisabled } from '../../../common/helpers';
 import { ModuleRef } from '@nestjs/core';
+// CCC seam (UPSTREAM_MODIFICATIONS.md #310): read the session cookie under its resolved name
+// (`__Host-authToken` over https) — never the shadowable un-prefixed name. Bearer fallback is unchanged.
+import { readDocmostAuthCookie } from '../../../authz/session-cookie/docmost-auth-cookie';
 
 @Injectable()
 export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
@@ -25,7 +28,10 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
   ) {
     super({
       jwtFromRequest: (req: FastifyRequest) => {
-        return req.cookies?.authToken || extractBearerTokenFromHeader(req);
+        return (
+          readDocmostAuthCookie(req.cookies, environmentService) ||
+          extractBearerTokenFromHeader(req)
+        );
       },
       ignoreExpiration: false,
       secretOrKey: environmentService.getAppSecret(),

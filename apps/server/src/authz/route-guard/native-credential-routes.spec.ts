@@ -1,5 +1,5 @@
 import { join } from 'path';
-import { scanRoutes } from './static-route-scan';
+import { scanRoutes, NATIVE_SESSION_MINT_RE } from './static-route-scan';
 
 /**
  * Native-auth fail-closed ALLOWLIST fitness test — NOT upstream Docmost code (seams #87/#88).
@@ -84,5 +84,37 @@ describe('native-auth fail-closed allowlist — @SessionScopedRoute() coverage (
     );
     expect(accept?.guardNames).toContain('NativeAuthModeGuard');
     expect(accept?.isSessionScopedRoute).toBe(false);
+  });
+});
+
+// The minter heuristic is only as good as NATIVE_SESSION_MINT_RE. This exercises the CLASSIFIER directly
+// (not just the walk) so the #310 __Host- rename cannot silently narrow detection: every mint SHAPE the
+// fix introduces must still match, and — critically — the CLEAR shapes must NOT, or the @SessionScopedRoute
+// logout would be flagged as a minter and red the allowlist assertion above.
+describe('NATIVE_SESSION_MINT_RE recognizes every mint shape and no clear shape (meta-guard, #310)', () => {
+  it('matches native-session MINT shapes', () => {
+    // legacy + prod cookie-name literals
+    expect(NATIVE_SESSION_MINT_RE.test(`res.setCookie('authToken', token, opts)`)).toBe(true);
+    expect(NATIVE_SESSION_MINT_RE.test(`res.setCookie("__Host-authToken", token, opts)`)).toBe(true);
+    // the AuthController helper + the CCC session-cookie seam (wrapper and inline options)
+    expect(NATIVE_SESSION_MINT_RE.test(`this.setAuthCookie(res, token)`)).toBe(true);
+    expect(NATIVE_SESSION_MINT_RE.test(`setDocmostAuthCookie(res, token, env)`)).toBe(true);
+    expect(
+      NATIVE_SESSION_MINT_RE.test(
+        `res.setCookie(docmostAuthCookieName(env), token, docmostAuthCookieSetOptions(env))`,
+      ),
+    ).toBe(true);
+    // the session-token factory
+    expect(NATIVE_SESSION_MINT_RE.test(`await createSessionAndToken(user, workspace)`)).toBe(true);
+  });
+
+  it('does NOT match session CLEAR shapes (so @SessionScopedRoute logout is not a false minter)', () => {
+    expect(NATIVE_SESSION_MINT_RE.test(`clearDocmostAuthCookie(res, env)`)).toBe(false);
+    expect(
+      NATIVE_SESSION_MINT_RE.test(
+        `res.clearCookie(docmostAuthCookieName(env), docmostAuthCookieClearOptions(env))`,
+      ),
+    ).toBe(false);
+    expect(NATIVE_SESSION_MINT_RE.test(`res.clearCookie('authToken')`)).toBe(false);
   });
 });

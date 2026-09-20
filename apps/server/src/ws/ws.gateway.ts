@@ -16,6 +16,10 @@ import { WsService } from './ws.service';
 import { getSpaceRoomName, getUserRoomName } from './ws.utils';
 import { BaseRealtimeBridge } from './base-realtime.bridge';
 import * as cookie from 'cookie';
+import { EnvironmentService } from '../integrations/environment/environment.service';
+// CCC seam (UPSTREAM_MODIFICATIONS.md #310): the socket.io handshake authenticates with the session cookie,
+// so it must read the resolved name (`__Host-authToken` over https), never the shadowable un-prefixed one.
+import { readDocmostAuthCookie } from '../authz/session-cookie/docmost-auth-cookie';
 
 @WebSocketGateway({
   cors: { origin: '*' },
@@ -36,6 +40,7 @@ export class WsGateway
     private spaceMemberRepo: SpaceMemberRepo,
     private wsService: WsService,
     private baseRealtime: BaseRealtimeBridge,
+    private environmentService: EnvironmentService,
   ) {}
 
   afterInit(server: Server): void {
@@ -47,7 +52,7 @@ export class WsGateway
     try {
       const cookies = cookie.parse(client.handshake.headers.cookie);
       const token: JwtPayload = await this.tokenService.verifyJwt(
-        cookies['authToken'],
+        readDocmostAuthCookie(cookies, this.environmentService),
         JwtType.ACCESS,
       );
 
