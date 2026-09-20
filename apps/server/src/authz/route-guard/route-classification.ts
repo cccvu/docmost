@@ -79,6 +79,23 @@ function readGuardNames(target: object): string[] {
  * Runtime adapter (used by PlatformAuthorizationGuard): build RouteFacts from live metadata via reflection,
  * then classify. `ledgerKeys` is the set of `Controller.handler` keys from the intentional-unguarded ledger.
  */
+/**
+ * The single source of truth for "is this route anonymously reachable": `@Public()` (Docmost) OR the fork's
+ * `@PlatformPublic()`, on the handler or its controller class. Both the classifier here and the
+ * @Public-surface rate limiter (authz/route-guard/public-surface-throttler.guard.ts) consume this, so the two
+ * can never drift on what "public" means (#29 review).
+ */
+export function isPublicRoute(
+  reflector: Reflector,
+  // the same target shape Nest's getAllAndOverride accepts (handler + controller class)
+  targets: Parameters<Reflector['getAllAndOverride']>[1],
+): boolean {
+  return (
+    !!reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, targets) ||
+    !!reflector.getAllAndOverride<boolean>(PLATFORM_PUBLIC_KEY, targets)
+  );
+}
+
 export function classifyFromContext(
   handler: Function,
   controllerClass: NewableFunction,
@@ -87,9 +104,7 @@ export function classifyFromContext(
 ): RouteClass {
   const targets: (Function | NewableFunction)[] = [handler, controllerClass];
   const facts: RouteFacts = {
-    isPublic:
-      !!reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, targets) ||
-      !!reflector.getAllAndOverride<boolean>(PLATFORM_PUBLIC_KEY, targets),
+    isPublic: isPublicRoute(reflector, targets),
     isForkAuthz: !!reflector.getAllAndOverride(PLATFORM_AUTHZ_KEY, targets),
     hasAuthGuard: guardsAuthenticate([...readGuardNames(controllerClass), ...readGuardNames(handler)]),
     isLedgered: ledgerKeys.has(`${controllerClass.name}.${handler.name}`),

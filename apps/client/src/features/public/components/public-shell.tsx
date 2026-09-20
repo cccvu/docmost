@@ -1,5 +1,5 @@
 import { type ReactNode } from "react";
-import { AppShell, Group, Text } from "@mantine/core";
+import { AppShell, Box, Group, Text } from "@mantine/core";
 import { Link } from "react-router-dom";
 import { ThemeToggle } from "@/components/theme-toggle.tsx";
 import { MAIN_CONTENT_ID, SkipToMain } from "@/components/ui/skip-to-main.tsx";
@@ -67,8 +67,10 @@ export function PublicShell({
       </AppShell>
 
       {/* Rendered OUTSIDE <AppShell> (whose grid places its own sections) and outside <main>, so a
-          <footer> passed here is exposed as a page-level `contentinfo` landmark (#29). */}
-      {footer}
+          <footer> passed here is exposed as a page-level `contentinfo` landmark (#29). Mirror
+          AppShell.Main's horizontal `padding="md"` gutter (the CSS var isn't in scope out here) so the
+          footer's content column stays aligned with the content above it on narrow viewports (#29 review). */}
+      {footer && <Box px="md">{footer}</Box>}
     </>
   );
 }
