@@ -9,7 +9,7 @@ import {
   ServiceUnavailableException,
   UseGuards,
 } from '@nestjs/common';
-import { IsOptional, IsString } from 'class-validator';
+import { IsOptional, IsString, MaxLength } from 'class-validator';
 import { AuthUser } from '../../common/decorators/auth-user.decorator';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { User } from '@docmost/db/types/entity.types';
@@ -37,6 +37,18 @@ export class ConditionalUpdatePageDto extends UpdatePageDto {
    * It must NEVER be derived from stored content — see the note in stable-hash.ts.
    */
   @IsOptional() @IsString() expectedContentHash?: string;
+
+  /**
+   * Optional idempotency key for a CONTENT write (#429). When present, the fork records it on the live
+   * document atomically with the content and treats a repeat within the retention window (~1h) as a no-op
+   * that returns the current page — so a client/agent retry of a non-idempotent `append`/`prepend` after a
+   * timeout cannot double-apply. Bounded, not unconditional exactly-once (see authz/page-write/write-idem.ts).
+   * Must be unique per logical operation; the platform forwards its `Idempotency-Key` header here.
+   * Bounded (#429 security review S2): the key is recorded on the live doc and persists in `pages.ydoc`, so
+   * an over-long value would bloat the snapshot; 255 chars is generous for a UUID/opaque token. The platform
+   * edge also rejects an over-long header, so this is the fork-side half of a two-layer bound.
+   */
+  @IsOptional() @IsString() @MaxLength(255) idempotencyKey?: string;
 }
 
 /**
@@ -89,6 +101,29 @@ export class ConditionalPageController {
       user,
     );
 
+    // The metadata to apply alongside/after the content. `content`/`operation`/`format` are removed ON
+    // PURPOSE, so PageService.update's content branch (guarded on all three) cannot run a second time, while
+    // its row bump, lastUpdatedById, contributorIds and watcher enqueue stay identical to the ordinary
+    // update path. `expectedContentHash`/`idempotencyKey` are transport concerns, not page columns — and the
+    // key MUST NOT leak into PageService.update (correctness review). Everything else is forwarded by
+    // SUBTRACTION rather than re-listed, so a field added to UpdatePageDto keeps working here instead of
+    // being silently dropped on this route alone. Computed BEFORE the content branch so the duplicate path
+    // below can tell whether there is metadata still to (re)apply.
+    const {
+      content: _content,
+      operation: _operation,
+      format: _format,
+      expectedContentHash: _expectedContentHash,
+      idempotencyKey: _idempotencyKey,
+      ...rest
+    } = dto;
+    const metadataOnly: UpdatePageDto = { ...rest, pageId: page.id };
+    // Does this request carry an actual metadata edit (title/icon/parent/…)? `rest` is `dto` minus the
+    // content + transport fields; `pageId` only addresses the row, it is not an edit.
+    const hasMetadata = Object.keys(rest).some(
+      (k) => k !== 'pageId' && (rest as Record<string, unknown>)[k] !== undefined,
+    );
+
     // TRUTHINESS, matching upstream `PageService.update` (`updatePageDto.content && …`). A falsy
     // `content` ("" / null) is "no content supplied" there, so treating it as supplied here would make
     // the same request wipe the page on this route while no-opping on the ordinary one — a difference
@@ -108,11 +143,27 @@ export class ConditionalPageController {
         operation: dto.operation ?? 'replace',
         user,
         expectedContentHash: dto.expectedContentHash,
+        idempotencyKey: dto.idempotencyKey,
         // Typed from the handler's own return shape: `reason` is a literal union there, so renaming a
         // discriminator fails to compile at BOTH ends instead of silently changing what this branches on.
       })) as ConditionalUpdateOutcome | undefined;
 
-      if (result?.applied !== true) {
+      if (result?.reason === 'duplicate') {
+        // #429: this exact content already applied within the idempotency window → a SUCCESSFUL retry, not
+        // a conflict. Do NOT re-apply the non-idempotent append/prepend. But the SAME request may ALSO carry
+        // metadata, applied AFTER the content by PageService.update below; if that second write failed on
+        // the first attempt (content committed + key recorded, metadata not), returning here unconditionally
+        // would SILENTLY DROP the metadata on every retry (architecture review F1). Metadata is idempotent,
+        // so when it is present we fall through and (re)apply it; a content-ONLY retry stays a genuine inert
+        // no-op — the current page, no row bump, no reattribution, no broadcast.
+        if (!hasMetadata) {
+          const current = await this.pageRepo.findById(page.id, {
+            includeContent: true,
+          });
+          return { ...current, permissions: { canEdit: true, hasRestriction } };
+        }
+        // else: fall through to the metadata write (the content was already applied by the first request).
+      } else if (result?.applied !== true) {
         if (result?.reason === 'precondition') {
           throw new PreconditionFailedException('page content changed');
         }
@@ -125,19 +176,9 @@ export class ConditionalPageController {
       }
     }
 
-    // Metadata only. `content`/`operation`/`format` are removed ON PURPOSE, so PageService.update's
-    // content branch (guarded on all three) cannot run a second time, while its row bump,
-    // lastUpdatedById, contributorIds and watcher enqueue stay identical to the ordinary update path.
-    // Everything else is forwarded by SUBTRACTION rather than re-listed, so a field added to
-    // UpdatePageDto keeps working here instead of being silently dropped on this route alone.
-    const {
-      content: _content,
-      operation: _operation,
-      format: _format,
-      expectedContentHash: _expectedContentHash,
-      ...rest
-    } = dto;
-    const metadataOnly: UpdatePageDto = { ...rest, pageId: page.id };
+    // Runs for an applied content write (its row bump), a metadata-only write, AND a deduped content write
+    // that still carries metadata (the F1 re-apply above). Content was stripped from `metadataOnly`, so
+    // PageService.update's content branch cannot run here.
     const updatedPage = await this.pageService.update(page, metadataOnly, user);
 
     return { ...updatedPage, permissions: { canEdit: true, hasRestriction } };

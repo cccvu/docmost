@@ -24,6 +24,7 @@ jest.mock('../../collaboration/yjs.util', () => ({
 
 import { CollaborationHandler } from '../../collaboration/collaboration.handler';
 import { stableHash } from './stable-hash';
+import { scopedWriteKey } from './write-idem';
 
 /**
  * Compare-and-swap content write (#282, ADR 0019).
@@ -325,5 +326,211 @@ describe('CollaborationHandler.updatePageContent — build-before-delete (#342)'
     await handler(DOC, payload());
     // Build succeeded, so the swap runs: delete the old fragment, then apply the new state.
     expect(ops).toContain('delete');
+  });
+});
+
+/**
+ * Bounded idempotency for keyed content writes (#429, ADR 0019).
+ *
+ * The regression #429 exists for: a non-idempotent `append`/`prepend` that the fork COMMITS but the platform
+ * then 504s must not double-apply on a client/agent retry. The fix records the caller's key on the LIVE doc
+ * INSIDE the same transaction as the content, and a repeat within the window is a no-op that mutates nothing
+ * (so the closing store deep-equal-skips). Ledger mechanics/pruning are unit-tested in write-idem.spec.ts;
+ * these pin the HANDLER wiring: check-before-apply, record-on-apply, duplicate → `reason:'duplicate'`.
+ */
+describe('CollaborationHandler.conditionalUpdatePageContent — idempotency (#429)', () => {
+  const DOC = 'page.44444444-4444-4444-8444-444444444444';
+  const USER = { id: 'user-1' };
+
+  // The ledger is shared across invocations to simulate the ONE resident Y.Doc a page's writes serialize on
+  // (a native Map stands in for the top-level Y.Map: write-idem uses only .has/.set/.delete/.size/.entries).
+  const build = () => {
+    const ledger = new Map<string, number>();
+    const opsLog: string[][] = [];
+    const openDirectConnection = jest.fn(async () => {
+      const ops: string[] = [];
+      opsLog.push(ops);
+      const fragment = {
+        length: 1,
+        delete: jest.fn(() => ops.push('delete')),
+        insert: jest.fn(() => ops.push('insert')),
+      };
+      const doc = {
+        getXmlFragment: jest.fn(() => fragment),
+        getMap: jest.fn(() => ledger),
+      };
+      return {
+        transact: jest.fn(async (fn: (d: unknown) => void) => {
+          ops.push('transact');
+          fn(doc);
+        }),
+        disconnect: jest.fn(async () => undefined),
+      };
+    });
+    const hocuspocus = {
+      documents: { get: jest.fn(() => undefined), has: jest.fn(() => false) },
+      openDirectConnection,
+    };
+    const handler = new CollaborationHandler().getHandlers(
+      hocuspocus as never,
+    ).conditionalUpdatePageContent;
+    return { handler, ledger, opsLog };
+  };
+
+  // Append, NO expectedContentHash — the exact vulnerable path (a keyed append with no If-Match).
+  const payload = (idempotencyKey?: string, operation = 'append') => ({
+    prosemirrorJson: { type: 'doc', content: [{ type: 'paragraph' }] },
+    operation,
+    user: USER as never,
+    idempotencyKey,
+  });
+
+  // The ledger key is namespaced by the acting user (scopedWriteKey), so assertions look it up scoped.
+  const scoped = (key: string) => scopedWriteKey(USER.id, key);
+
+  it('applies and records the (user-scoped) key on first sight', async () => {
+    const { handler, ledger, opsLog } = build();
+    await expect(handler(DOC, payload('K1'))).resolves.toEqual({ applied: true });
+    expect(ledger.has(scoped('K1'))).toBe(true);
+    expect(opsLog[0]).toContain('insert'); // the append actually ran
+  });
+
+  // THE regression: a retry with the same key does not re-apply.
+  it('is a no-op DUPLICATE on a same-key retry — content not applied twice', async () => {
+    const { handler, ledger, opsLog } = build();
+    await handler(DOC, payload('K1')); // first — applies
+    await expect(handler(DOC, payload('K1'))).resolves.toEqual({
+      applied: false,
+      reason: 'duplicate',
+    });
+    expect(ledger.size).toBe(1); // key recorded once
+    expect(opsLog[1]).not.toContain('insert'); // the retry mutated nothing (benign no-op store)
+  });
+
+  it('applies independently for a DIFFERENT key on the same page', async () => {
+    const { handler, ledger } = build();
+    await handler(DOC, payload('K1'));
+    await expect(handler(DOC, payload('K2'))).resolves.toEqual({ applied: true });
+    expect(ledger.has(scoped('K1'))).toBe(true);
+    expect(ledger.has(scoped('K2'))).toBe(true);
+  });
+
+  // #429 security review (S1): the ledger is per-page but the key is caller-chosen, so it MUST be scoped by
+  // identity — otherwise user B's genuine write with a key user A already used is silently swallowed as a
+  // duplicate (a cross-user lost update returning success). Two users, same key string, both must apply.
+  it('scopes per user — a different user with the SAME key still applies (no cross-user suppression)', async () => {
+    const { handler, ledger, opsLog } = build();
+    await handler(DOC, payload('SHARED')); // user-1 applies + records
+    const userB = { id: 'user-2' } as never;
+    await expect(
+      handler(DOC, { ...payload('SHARED'), user: userB }),
+    ).resolves.toEqual({ applied: true }); // NOT suppressed
+    expect(opsLog[1]).toContain('insert'); // user-2's write actually ran
+    expect(ledger.has(scopedWriteKey('user-1', 'SHARED'))).toBe(true);
+    expect(ledger.has(scopedWriteKey('user-2', 'SHARED'))).toBe(true);
+  });
+
+  it('leaves unkeyed writes unchanged (no key ⇒ no ledger entry, always applies)', async () => {
+    const { handler, ledger, opsLog } = build();
+    await expect(handler(DOC, payload(undefined))).resolves.toEqual({ applied: true });
+    await expect(handler(DOC, payload(undefined))).resolves.toEqual({ applied: true });
+    expect(ledger.size).toBe(0);
+    expect(opsLog[0]).toContain('insert');
+    expect(opsLog[1]).toContain('insert'); // both applied — no dedup without a key
+  });
+});
+
+/**
+ * #429 testing review (T1) — the ORDER of the two in-transaction guards is load-bearing and was untested:
+ *   (a) dedup runs BEFORE the CAS, so a retry of a committed keyed write dedups instead of 412-ing on the
+ *       digest its OWN first apply moved; and
+ *   (b) the key is recorded ONLY on an actual apply (after the CAS), so a write that FAILS the precondition
+ *       does not poison the ledger and silently swallow the caller's corrected retry (a lost update).
+ * Swapping the blocks, or hoisting recordWriteKey above the precondition return, would leave the rest of the
+ * suite green — these pin it. The platform routes a keyed write WITH an If-Match through exactly this path.
+ */
+describe('CollaborationHandler.conditionalUpdatePageContent — key × CAS ordering (#429)', () => {
+  const DOC = 'page.55555555-5555-4555-8555-555555555555';
+  const USER = { id: 'user-1' };
+  const LIVE = { type: 'doc', content: [{ type: 'paragraph' }] };
+
+  // Shared ledger across invocations = the one resident Y.Doc a page's writes serialize on. NOT resident at
+  // the pre-check (documents.get → undefined) so we always reach the transaction where dedup + the
+  // authoritative in-tx CAS run; `fromYdoc` is mocked to LIVE so `stableHash(fromYdoc(doc))` is deterministic.
+  const build = () => {
+    const ledger = new Map<string, number>();
+    const opsLog: string[][] = [];
+    const openDirectConnection = jest.fn(async () => {
+      const ops: string[] = [];
+      opsLog.push(ops);
+      const fragment = {
+        length: 1,
+        delete: jest.fn(() => ops.push('delete')),
+        insert: jest.fn(() => ops.push('insert')),
+      };
+      const doc = {
+        getXmlFragment: jest.fn(() => fragment),
+        getMap: jest.fn(() => ledger),
+      };
+      return {
+        transact: jest.fn(async (fn: (d: unknown) => void) => {
+          ops.push('transact');
+          fn(doc);
+        }),
+        disconnect: jest.fn(async () => undefined),
+      };
+    });
+    const hocuspocus = {
+      documents: { get: jest.fn(() => undefined), has: jest.fn(() => false) },
+      openDirectConnection,
+    };
+    const handler = new CollaborationHandler().getHandlers(
+      hocuspocus as never,
+    ).conditionalUpdatePageContent;
+    return { handler, ledger, opsLog };
+  };
+
+  beforeEach(() => {
+    fromYdoc.mockReset();
+    fromYdoc.mockReturnValue(LIVE);
+  });
+
+  const keyed = (idempotencyKey: string, expectedContentHash: string) => ({
+    prosemirrorJson: { type: 'doc', content: [{ type: 'paragraph' }] },
+    operation: 'append',
+    user: USER as never,
+    expectedContentHash,
+    idempotencyKey,
+  });
+
+  // (a) dedup BEFORE the CAS: a retry of a committed keyed conditional write must dedup, NOT 412 — its own
+  // first apply moved the content, so the digest it carried no longer matches. If the CAS ran first this
+  // would return `precondition`; it must return `duplicate`.
+  it('dedups a same-key retry even when the digest no longer matches (dedup precedes the CAS)', async () => {
+    const { handler, ledger } = build();
+    await expect(handler(DOC, keyed('K1', stableHash(LIVE)))).resolves.toEqual({
+      applied: true,
+    });
+    await expect(
+      handler(DOC, keyed('K1', stableHash({ moved: 'since' }))),
+    ).resolves.toEqual({ applied: false, reason: 'duplicate' });
+    expect(ledger.size).toBe(1);
+  });
+
+  // (b) record ONLY on apply (after the CAS): a keyed write that fails the precondition must NOT record its
+  // key, or the caller's corrected retry is silently swallowed as a duplicate — a lost update.
+  it('does NOT record the key when the CAS refuses, so a corrected retry still applies', async () => {
+    const { handler, ledger, opsLog } = build();
+    // First: digest mismatch on first sight → precondition, key NOT recorded, nothing mutated.
+    await expect(
+      handler(DOC, keyed('K1', stableHash({ different: true }))),
+    ).resolves.toEqual({ applied: false, reason: 'precondition' });
+    expect(ledger.has(scopedWriteKey('user-1', 'K1'))).toBe(false);
+    expect(opsLog[0]).not.toContain('insert');
+    // The corrected retry (matching digest now) APPLIES — proof the key was not poisoned by the refusal.
+    await expect(handler(DOC, keyed('K1', stableHash(LIVE)))).resolves.toEqual({
+      applied: true,
+    });
+    expect(ledger.has(scopedWriteKey('user-1', 'K1'))).toBe(true);
   });
 });
