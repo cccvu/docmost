@@ -1,5 +1,5 @@
 import { type ReactNode } from "react";
-import { AppShell, Group, Text } from "@mantine/core";
+import { AppShell, Box, Group, Text } from "@mantine/core";
 import { Link } from "react-router-dom";
 import { ThemeToggle } from "@/components/theme-toggle.tsx";
 import { MAIN_CONTENT_ID, SkipToMain } from "@/components/ui/skip-to-main.tsx";
@@ -14,7 +14,16 @@ import { HEADER_HEIGHT } from "@/features/layout/layout-tokens.ts";
  * Kept separate from ShareShell (which carries share-specific tree/TOC machinery). Brand is pulled
  * from the `@Public` workspace data, falling back to the app name so the header never flashes empty.
  */
-export function PublicShell({ children }: { children: ReactNode }) {
+export function PublicShell({
+  children,
+  footer,
+}: {
+  children: ReactNode;
+  // Rendered as a SIBLING of <AppShell.Main> (outside <main>) so a <footer> here is exposed as a
+  // `contentinfo` landmark rather than a generic element nested in main (#29). Optional — the
+  // request-access page passes none.
+  footer?: ReactNode;
+}) {
   const { data: workspace } = useWorkspacePublicDataQuery();
   const name = workspace?.name || getAppName();
 
@@ -56,6 +65,12 @@ export function PublicShell({ children }: { children: ReactNode }) {
           {children}
         </AppShell.Main>
       </AppShell>
+
+      {/* Rendered OUTSIDE <AppShell> (whose grid places its own sections) and outside <main>, so a
+          <footer> passed here is exposed as a page-level `contentinfo` landmark (#29). Mirror
+          AppShell.Main's horizontal `padding="md"` gutter (the CSS var isn't in scope out here) so the
+          footer's content column stays aligned with the content above it on narrow viewports (#29 review). */}
+      {footer && <Box px="md">{footer}</Box>}
     </>
   );
 }

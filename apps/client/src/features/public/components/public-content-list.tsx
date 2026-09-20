@@ -21,10 +21,10 @@ export function PublicContentList() {
   const { t } = useTranslation();
   const { data, isLoading, isError } = usePublicContentQuery();
 
-  // Discovery is an enhancement layered on the hero: if the endpoint errors, hide the section rather
-  // than block the page. (It never leaks — the endpoint lists only explicitly-public pages.)
-  if (isError) return null;
-
+  // Discovery is an enhancement layered on the hero. Even on error, keep the section wrapper (id="browse"
+  // + heading) mounted so the hero's "Browse public content" CTA (an in-page #browse link) still has a
+  // target and never dead-clicks; only the inner body degrades to a short message (#29). It never leaks —
+  // the endpoint lists only explicitly-public pages.
   return (
     <Container size="lg" pb={{ base: 48, sm: 80 }} id="browse">
       <Stack gap="lg">
@@ -32,7 +32,11 @@ export function PublicContentList() {
           {t("Explore public pages")}
         </Title>
 
-        {isLoading ? (
+        {isError ? (
+          <Text c="dimmed">
+            {t("We couldn't load public pages right now. Please try again later.")}
+          </Text>
+        ) : isLoading ? (
           <SimpleGrid cols={{ base: 1, sm: 2, md: 3 }} spacing="md">
             {Array.from({ length: 6 }).map((_, i) => (
               <Skeleton key={i} height={110} radius="md" />

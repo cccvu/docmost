@@ -19,14 +19,15 @@ import { executeWithCursorPagination } from '@docmost/db/pagination/cursor-pagin
  * and the whole query is hard-scoped to a single tenant by `workspaceId`.
  */
 export interface PublicPageListRow {
-  id: string; // share row id — cursor key only; not exposed in the API response
+  // share row id — the pagination cursor key. Surfaced ONLY base64url-encoded inside `meta.nextCursor`
+  // (an opaque, random share-row UUID), never as a bare `items[]` field. #29: comment corrected.
+  id: string;
   shareKey: string;
   pageId: string;
   slugId: string;
   title: string | null;
   icon: string | null;
   spaceName: string | null;
-  spaceSlug: string | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -86,7 +87,9 @@ export class PublicDiscoveryRepo {
         'pages.title as title',
         'pages.icon as icon',
         'spaces.name as spaceName',
-        'spaces.slug as spaceSlug',
+        // #29 (data minimization): spaceSlug is NOT projected — the UI never uses it, and leaking a
+        // space's internal slug is reconnaissance against /s/:spaceSlug. The `spaces` join stays: it
+        // still supplies spaceName and the isSharingAllowed gate on spaces.settings below.
       ])
       .where('shares.workspaceId', '=', workspaceId)
       .where('shares.deletedAt', 'is', null)
