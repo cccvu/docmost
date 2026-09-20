@@ -3,6 +3,7 @@ import {
   WRITE_IDEM_MAP,
   isDuplicateWriteKey,
   recordWriteKey,
+  scopedWriteKey,
 } from './write-idem';
 
 /**
@@ -81,5 +82,29 @@ describe('write-idem (#429 bounded idempotency ledger)', () => {
     const reloaded = new Y.Doc();
     Y.applyUpdate(reloaded, stored);
     expect(isDuplicateWriteKey(reloaded, 'k1')).toBe(true); // dedup holds after reload
+  });
+});
+
+/**
+ * #429 security review (S1) — the ledger key is NAMESPACED by the acting user, so a caller-chosen key can
+ * only ever dedup a retry from the SAME identity, never suppress a different user's genuine write.
+ */
+describe('scopedWriteKey (#429 per-user ledger scoping, S1)', () => {
+  const NOW = 1_000_000_000_000;
+
+  it('a shared key under two different users does NOT collide (no cross-user suppression)', () => {
+    const doc = new Y.Doc();
+    // User A records the key first.
+    recordWriteKey(doc, scopedWriteKey('user-a', 'SHARED'), NOW);
+    // User B's write with the SAME caller key is NOT seen as a duplicate.
+    expect(isDuplicateWriteKey(doc, scopedWriteKey('user-b', 'SHARED'))).toBe(false);
+    // A's own retry still dedups.
+    expect(isDuplicateWriteKey(doc, scopedWriteKey('user-a', 'SHARED'))).toBe(true);
+  });
+
+  it('is injective — distinct (userId, key) pairs never map to the same entry', () => {
+    // The NUL separator cannot occur in a UUID id or an HTTP header value, so no two distinct pairs collide.
+    expect(scopedWriteKey('u1', 'k')).not.toBe(scopedWriteKey('u1', '\u0000k')); // hypothetical, still distinct
+    expect(scopedWriteKey('u1', 'a')).not.toBe(scopedWriteKey('u', '1a')); // the "u1:a" vs "u:1a" ambiguity, closed
   });
 });

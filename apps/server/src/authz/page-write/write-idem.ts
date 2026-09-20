@@ -45,9 +45,25 @@ export const WRITE_IDEM_MAX_ENTRIES = ((): number => {
 })();
 
 /**
- * Is this idempotency key already recorded on the live document? PURE — never mutates the doc (see the file
- * header: a duplicate must leave the doc untouched so the closing store is a genuine no-op). Call inside the
- * transaction, BEFORE applying content; on `true` the caller returns a no-op outcome without mutating.
+ * Namespace a caller-chosen idempotency key by the ACTING USER's id before it enters the per-page ledger
+ * (#429 security review, S1). The key comes from the client (the `/v1` `Idempotency-Key` header) and the
+ * ledger is shared per page, so WITHOUT this scoping two different users could pick the same string and user
+ * B's genuine write would be silently swallowed as a "duplicate" of user A's — a cross-user lost update that
+ * returns 200, exactly the class ADR 0019 / #282 exist to prevent. Scoping per identity mirrors the platform
+ * interceptor's per-subject record (`v1:idem:${subject}:…`), so dedup only ever applies WITHIN one identity
+ * while a same-user retry still dedups. The separator is a NUL, which cannot occur in a UUID user id nor in an
+ * HTTP header value, so distinct `(userId, key)` pairs never collide onto one entry (the composite is only
+ * ever compared whole, never parsed back).
+ */
+export function scopedWriteKey(userId: string, key: string): string {
+  return `${userId}\u0000${key}`;
+}
+
+/**
+ * Is this (already user-scoped, see scopedWriteKey) idempotency key recorded on the live document? PURE —
+ * never mutates the doc (see the file header: a duplicate must leave the doc untouched so the closing store
+ * is a genuine no-op). Call inside the transaction, BEFORE applying content; on `true` the caller returns a
+ * no-op outcome without mutating.
  */
 export function isDuplicateWriteKey(doc: Y.Doc, key: string): boolean {
   return doc.getMap(WRITE_IDEM_MAP).has(key);

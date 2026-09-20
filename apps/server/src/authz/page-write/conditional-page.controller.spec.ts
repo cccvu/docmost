@@ -218,23 +218,22 @@ describe('ConditionalPageController.conditionalUpdate', () => {
   });
 
   // #429: a keyed write already applied within the idempotency window is a SUCCESSFUL retry (`duplicate`),
-  // NOT a 412/503. It returns the CURRENT page as a 2xx no-op and re-applies NOTHING — not the content
-  // (the fork deduped it), not the metadata (the first request applied it). This is the bounded-idempotency
-  // guarantee: a non-idempotent append/prepend is not double-applied on a timeout retry.
-  it('returns the current page as a no-op on a duplicate keyed write (no re-apply)', async () => {
+  // NOT a 412/503. A CONTENT-ONLY duplicate returns the CURRENT page as a 2xx no-op and re-applies NOTHING
+  // — not the content (the fork deduped it), and there is no metadata — so it is genuinely inert (no row
+  // bump, no reattribution, no broadcast). This is the bounded-idempotency guarantee: a non-idempotent
+  // append/prepend is not double-applied on a timeout retry.
+  it('returns the current page as an inert no-op on a duplicate CONTENT-ONLY keyed write', async () => {
     const { controller, calls, gateway, pageService } = build({
       apply: { applied: false, reason: 'duplicate' },
     });
-    const out = await controller.conditionalUpdate(
-      dto({ title: 'New title', idempotencyKey: 'K1' }),
-      USER,
-    );
+    // `dto()` carries content but NO metadata field.
+    const out = await controller.conditionalUpdate(dto({ idempotencyKey: 'K1' }), USER);
     // The key was forwarded to the collab layer…
     expect(gateway.conditionalUpdatePageContent).toHaveBeenCalledWith(
       'page-uuid-1',
       expect.objectContaining({ idempotencyKey: 'K1' }),
     );
-    // …content was NOT re-applied to a fresh doc, metadata was NOT re-written…
+    // …content was NOT re-applied and there is no metadata, so PageService.update never runs (inert)…
     expect(pageService.update).not.toHaveBeenCalled();
     expect(calls).not.toContain('update');
     // …and the response is the current page (re-read) + permissions, same shape as the success path.
@@ -244,6 +243,42 @@ describe('ConditionalPageController.conditionalUpdate', () => {
     });
     // findById ran twice: the initial lookup + the no-op re-read.
     expect(calls.filter((c) => c === 'findById')).toHaveLength(2);
+  });
+
+  // #429 architecture review (F1): a duplicate content write that ALSO carried metadata must still (re)apply
+  // the metadata. The content dedup only guards the non-idempotent append/prepend; the metadata is applied
+  // by a SEPARATE PageService.update, and if that step failed on the first attempt (content committed + key
+  // recorded, metadata not), a blanket no-op here would SILENTLY DROP the title/icon/parent change on every
+  // retry. Metadata is idempotent, so re-applying it on the duplicate branch is safe and correct.
+  it('re-applies metadata on a duplicate keyed write that carried metadata (no silent drop, F1)', async () => {
+    const { controller, calls, gateway, pageService } = build({
+      apply: { applied: false, reason: 'duplicate' },
+    });
+    const out = await controller.conditionalUpdate(
+      dto({ title: 'New title', idempotencyKey: 'K1' }),
+      USER,
+    );
+    // The content was deduped (a single conditionalApply, never re-applied to a fresh doc)…
+    expect(gateway.conditionalUpdatePageContent).toHaveBeenCalledTimes(1);
+    // …but the metadata WAS (re)written, with content stripped so the content branch cannot run.
+    expect(pageService.update).toHaveBeenCalledTimes(1);
+    const metadataDto = pageService.update.mock.calls[0][1] as Record<string, unknown>;
+    expect(metadataDto).not.toHaveProperty('content');
+    expect(metadataDto.title).toBe('New title');
+    // Response is PageService.update's page + permissions, exactly like the applied path.
+    expect(out).toEqual({
+      id: 'page-uuid-1',
+      title: 'T',
+      content: { type: 'doc' },
+      permissions: { canEdit: true, hasRestriction: false },
+    });
+    expect(calls).toEqual([
+      'findById',
+      'validateCanEdit',
+      'parse',
+      'conditionalApply',
+      'update',
+    ]);
   });
 
   // The fork half of the falsy-content agreement. Upstream `PageService.update` gates its content branch
@@ -313,10 +348,15 @@ describe('ConditionalPageController.conditionalUpdate', () => {
   // flowing through this route instead of being silently stripped on it alone (whitelist: true, no
   // forbidNonWhitelisted) — which would make the same PATCH behave differently depending on whether
   // someone has the page open.
-  it('forwards inherited metadata fields and strips only content/operation/format/digest', async () => {
+  it('forwards inherited metadata fields and strips content/operation/format/digest/idempotencyKey', async () => {
     const { controller, pageService } = build({});
     await controller.conditionalUpdate(
-      dto({ title: 'T2', icon: '\u2b50', parentPageId: 'parent-1' }),
+      dto({
+        title: 'T2',
+        icon: '\u2b50',
+        parentPageId: 'parent-1',
+        idempotencyKey: 'K9',
+      }),
       USER,
     );
     const metadataDto = pageService.update.mock.calls[0][1] as Record<
@@ -329,11 +369,14 @@ describe('ConditionalPageController.conditionalUpdate', () => {
       icon: '\u2b50',
       parentPageId: 'parent-1',
     });
+    // idempotencyKey is a transport concern, not a page column \u2014 it must NOT leak into PageService.update
+    // (correctness review), alongside the content/CAS fields.
     for (const stripped of [
       'content',
       'operation',
       'format',
       'expectedContentHash',
+      'idempotencyKey',
     ]) {
       expect(metadataDto).not.toHaveProperty(stripped);
     }
@@ -380,6 +423,24 @@ describe('ConditionalPageController.conditionalUpdate', () => {
         plainToInstance(ConditionalUpdatePageDto, {
           pageId: 'p',
           idempotencyKey: 123 as never,
+        }),
+      ),
+    ).not.toHaveLength(0);
+    // #429 security review (S2): the key is bounded (@MaxLength 255) so an over-long value cannot bloat the
+    // on-doc ledger. 255 chars validate; 256 do not.
+    expect(
+      await validate(
+        plainToInstance(ConditionalUpdatePageDto, {
+          pageId: 'p',
+          idempotencyKey: 'x'.repeat(255),
+        }),
+      ),
+    ).toHaveLength(0);
+    expect(
+      await validate(
+        plainToInstance(ConditionalUpdatePageDto, {
+          pageId: 'p',
+          idempotencyKey: 'x'.repeat(256),
         }),
       ),
     ).not.toHaveLength(0);
