@@ -7,7 +7,9 @@ export interface TrailingNodeExtensionOptions {
   // #345: return false to skip inserting the trailing node for a transaction. The client injects
   // `(t) => !isChangeOrigin(t)` so an open browser never appends a trailing paragraph in reaction to content
   // that arrived over the collaboration sync (API/MCP/another client) — which would rewrite that content and
-  // rotate its version anchor. Mirrors the guard on UniqueID. Undefined (default) preserves prior behavior.
+  // rotate its version anchor. Mirrors the guard on UniqueID. Undefined (the default) is a pass-all filter,
+  // NOT the full pre-#345 behavior: the insert also now requires a `docChanged` transaction in the batch
+  // (see appendTransaction), so a selection-only transaction no longer triggers it even with no filter.
   filterTransaction?: (tr: Transaction) => boolean,
 }
 

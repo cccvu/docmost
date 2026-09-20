@@ -12,7 +12,9 @@ export type IndentOptions = {
   max: number;
   // #345: return false to skip normalizing a transaction. The client injects `(t) => !isChangeOrigin(t)` so
   // this extension never rewrites the `indent` attribute of nodes that arrived over the collaboration sync
-  // (API/MCP/another client) — mirrors the guard on UniqueID. Undefined (the default) means "normalize all".
+  // (API/MCP/another client) — mirrors the guard on UniqueID. Undefined (the default) is a pass-all filter,
+  // NOT "normalize on every batch": appendTransaction still requires a `docChanged` transaction in the batch
+  // (see below), so a selection-only batch is skipped even with no filter.
   filterTransaction?: (tr: Transaction) => boolean;
 };
 

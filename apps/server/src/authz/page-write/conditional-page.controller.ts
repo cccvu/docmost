@@ -37,6 +37,15 @@ export class ConditionalUpdatePageDto extends UpdatePageDto {
    * It must NEVER be derived from stored content — see the note in stable-hash.ts.
    */
   @IsOptional() @IsString() expectedContentHash?: string;
+
+  /**
+   * Optional idempotency key for a CONTENT write (#429). When present, the fork records it on the live
+   * document atomically with the content and treats a repeat within the retention window (~1h) as a no-op
+   * that returns the current page — so a client/agent retry of a non-idempotent `append`/`prepend` after a
+   * timeout cannot double-apply. Bounded, not unconditional exactly-once (see authz/page-write/write-idem.ts).
+   * Must be unique per logical operation; the platform forwards its `Idempotency-Key` header here.
+   */
+  @IsOptional() @IsString() idempotencyKey?: string;
 }
 
 /**
@@ -108,9 +117,24 @@ export class ConditionalPageController {
         operation: dto.operation ?? 'replace',
         user,
         expectedContentHash: dto.expectedContentHash,
+        idempotencyKey: dto.idempotencyKey,
         // Typed from the handler's own return shape: `reason` is a literal union there, so renaming a
         // discriminator fails to compile at BOTH ends instead of silently changing what this branches on.
       })) as ConditionalUpdateOutcome | undefined;
+
+      // #429: a keyed write already applied within the idempotency window → a SUCCESSFUL retry, not a
+      // conflict. Return the CURRENT page as a 2xx no-op WITHOUT re-applying content OR metadata (the first
+      // request applied both). This is the bounded-idempotency guarantee: the non-idempotent append/prepend
+      // is not double-applied on a timeout retry.
+      if (result?.reason === 'duplicate') {
+        const current = await this.pageRepo.findById(page.id, {
+          includeContent: true,
+        });
+        return {
+          ...current,
+          permissions: { canEdit: true, hasRestriction },
+        };
+      }
 
       if (result?.applied !== true) {
         if (result?.reason === 'precondition') {

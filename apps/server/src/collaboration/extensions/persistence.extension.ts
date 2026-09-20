@@ -241,73 +241,85 @@ export class PersistenceExtension implements Extension {
       // debouncer. The row is already committed, so swallowing here can only lose a derived-data effect, never
       // content; the failure is logged + alarmed via COLLAB_POST_STORE_FAILED.
       try {
-        await this.runPostStoreSideEffect('broadcast', pageId, () =>
-          document.broadcastStateless(
-            JSON.stringify({
-              type: 'page.updated',
-              updatedAt: new Date().toISOString(),
-              lastUpdatedById: context?.user?.id,
-              lastUpdatedBy: context?.user
-                ? {
-                    id: context.user?.id,
-                    name: context.user?.name,
-                    avatarUrl: context.user?.avatarUrl,
-                  }
-                : undefined,
+        // #345/#429: the post-commit side effects are best-effort, INDEPENDENT (none reads another's
+        // output), and each `runPostStoreSideEffect` swallows its own errors — so run them CONCURRENTLY.
+        // `Promise.allSettled` never rejects and the wrappers never reject, so the row's commit is never at
+        // risk; the outer try remains a structural backstop for any FUTURE unwrapped await. Concurrency
+        // shrinks `onStoreDocument`'s tail latency on the settle→write path — the same path #429's
+        // content-write timeout bounds — so a slow store is less likely to trip a false 504 (and the retry
+        // it invites). `syncTransclusion` self-isolates internally, but is wrapped here too so every effect
+        // is uniformly isolated and the never-reject invariant is structural, not per-callsite.
+        await Promise.allSettled([
+          this.runPostStoreSideEffect('broadcast', pageId, () =>
+            document.broadcastStateless(
+              JSON.stringify({
+                type: 'page.updated',
+                updatedAt: new Date().toISOString(),
+                lastUpdatedById: context?.user?.id,
+                lastUpdatedBy: context?.user
+                  ? {
+                      id: context.user?.id,
+                      name: context.user?.name,
+                      avatarUrl: context.user?.avatarUrl,
+                    }
+                  : undefined,
+              }),
+            ),
+          ),
+
+          this.runPostStoreSideEffect('transclusion', pageId, () =>
+            this.syncTransclusion(pageId, persisted.workspaceId, tiptapJson),
+          ),
+
+          this.runPostStoreSideEffect('contributors', pageId, () =>
+            this.collabHistory.addContributors(pageId, editingUserIds),
+          ),
+
+          this.runPostStoreSideEffect(
+            'mention-notification',
+            pageId,
+            async () => {
+              const mentions = extractMentions(tiptapJson);
+              const userMentions = extractUserMentions(mentions);
+              if (userMentions.length === 0) return;
+              const oldMentions = persisted.content
+                ? extractMentions(persisted.content)
+                : [];
+              const oldMentionedUserIds = extractUserMentions(oldMentions).map(
+                (m) => m.entityId,
+              );
+              await this.notificationQueue.add(
+                QueueJob.PAGE_MENTION_NOTIFICATION,
+                {
+                  userMentions: userMentions.map((m) => ({
+                    userId: m.entityId,
+                    mentionId: m.id,
+                    creatorId: m.creatorId,
+                  })),
+                  oldMentionedUserIds,
+                  pageId,
+                  spaceId: persisted.spaceId,
+                  workspaceId: persisted.workspaceId,
+                } as IPageMentionNotificationJob,
+              );
+            },
+          ),
+
+          this.runPostStoreSideEffect('ai-queue', pageId, () =>
+            this.aiQueue.add(QueueJob.PAGE_CONTENT_UPDATED, {
+              pageIds: [pageId],
+              workspaceId: persisted.workspaceId,
             }),
           ),
-        );
 
-        // syncTransclusion already isolates its own failures (per-call try/catch); the outer guard is a backstop.
-        await this.syncTransclusion(pageId, persisted.workspaceId, tiptapJson);
-
-        await this.runPostStoreSideEffect('contributors', pageId, () =>
-          this.collabHistory.addContributors(pageId, editingUserIds),
-        );
-
-        await this.runPostStoreSideEffect(
-          'mention-notification',
-          pageId,
-          async () => {
-            const mentions = extractMentions(tiptapJson);
-            const userMentions = extractUserMentions(mentions);
-            if (userMentions.length === 0) return;
-            const oldMentions = persisted.content
-              ? extractMentions(persisted.content)
-              : [];
-            const oldMentionedUserIds = extractUserMentions(oldMentions).map(
-              (m) => m.entityId,
-            );
-            await this.notificationQueue.add(
-              QueueJob.PAGE_MENTION_NOTIFICATION,
-              {
-                userMentions: userMentions.map((m) => ({
-                  userId: m.entityId,
-                  mentionId: m.id,
-                  creatorId: m.creatorId,
-                })),
-                oldMentionedUserIds,
-                pageId,
-                spaceId: persisted.spaceId,
-                workspaceId: persisted.workspaceId,
-              } as IPageMentionNotificationJob,
-            );
-          },
-        );
-
-        await this.runPostStoreSideEffect('ai-queue', pageId, () =>
-          this.aiQueue.add(QueueJob.PAGE_CONTENT_UPDATED, {
-            pageIds: [pageId],
-            workspaceId: persisted.workspaceId,
-          }),
-        );
-
-        await this.runPostStoreSideEffect('history', pageId, () =>
-          this.enqueuePageHistory(persisted),
-        );
+          this.runPostStoreSideEffect('history', pageId, () =>
+            this.enqueuePageHistory(persisted),
+          ),
+        ]);
       } catch (err) {
-        // The per-effect wrappers above never throw, so reaching here means an UNwrapped post-commit await
-        // (syncTransclusion's guard, or a future addition) threw. Content is already durable; never re-throw.
+        // The per-effect wrappers never throw and allSettled never rejects, so reaching here would require a
+        // FUTURE unwrapped post-commit await added outside the array. Content is already durable; never
+        // re-throw (a rejected onStoreDocument poisons Hocuspocus's debouncer — #345).
         logPostStoreFailure(this.logger, 'post-store-block', pageId, err);
       }
     }

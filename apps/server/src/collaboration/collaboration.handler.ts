@@ -18,6 +18,9 @@ import {
 } from '../authz/page-write/collab-outcomes';
 // #390: the settle must report failure (not a false success) when the store it just ran failed to persist.
 import { hasStoreFailure } from '../authz/page-write/store-failure-registry';
+// #429: bounded idempotency for keyed content writes — check/record a caller key on the LIVE doc inside the
+// same transaction as the mutation (atomic CRDT op). Policy lives in authz/; this is a thin call-out.
+import { isDuplicateWriteKey, recordWriteKey } from '../authz/page-write/write-idem';
 
 export type CollabEventHandlers = ReturnType<
   CollaborationHandler['getHandlers']
@@ -203,10 +206,18 @@ export class CollaborationHandler {
           operation: string;
           user: User;
           expectedContentHash?: string;
+          // #429: optional caller idempotency key. When present, a repeat within the retention window is a
+          // no-op (`reason:'duplicate'`); recorded on the live doc atomically with the content it applies.
+          idempotencyKey?: string;
         },
       ): Promise<ConditionalUpdateOutcome> => {
-        const { prosemirrorJson, operation, user, expectedContentHash } =
-          payload;
+        const {
+          prosemirrorJson,
+          operation,
+          user,
+          expectedContentHash,
+          idempotencyKey,
+        } = payload;
         let outcome: ConditionalUpdateOutcome = {
           applied: false,
           reason: 'unknown',
@@ -240,6 +251,16 @@ export class CollaborationHandler {
             documentName,
             { user },
             (doc) => {
+              // #429: idempotency dedup FIRST — a retry of an already-applied keyed write is a no-op
+              // success regardless of the CAS (the KEY, not the version, is the retry's identity; a
+              // version compare would 412 the retry of a write whose own apply moved the content). PURE
+              // read: on a duplicate we return WITHOUT mutating, so the closing `disconnect()` store finds
+              // unchanged content and hits persistence.extension's `isDeepStrictEqual` no-op skip — no row
+              // write, no reattribution, no broadcast.
+              if (idempotencyKey && isDuplicateWriteKey(doc, idempotencyKey)) {
+                outcome = { applied: false, reason: 'duplicate' };
+                return;
+              }
               // The authoritative compare: inside the transaction, so an edit cannot land between it and
               // the mutation. The pre-check above is an optimization, not a substitute — it cannot see an
               // edit that arrives while the connection is opening.
@@ -252,6 +273,11 @@ export class CollaborationHandler {
                 return;
               }
               this.applyContentOperation(doc, prosemirrorJson, operation);
+              // #429: record the key in the SAME transaction as the content it applies — one atomic CRDT
+              // mutation, so the key rides the persisted ydoc with the append (both commit or neither).
+              // Only on an actual apply: a content-neutral write is dropped by the deep-equal skip and has
+              // nothing to dedup anyway.
+              if (idempotencyKey) recordWriteKey(doc, idempotencyKey, Date.now());
               outcome = { applied: true };
             },
           );

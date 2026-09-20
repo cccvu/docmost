@@ -327,3 +327,96 @@ describe('CollaborationHandler.updatePageContent — build-before-delete (#342)'
     expect(ops).toContain('delete');
   });
 });
+
+/**
+ * Bounded idempotency for keyed content writes (#429, ADR 0019).
+ *
+ * The regression #429 exists for: a non-idempotent `append`/`prepend` that the fork COMMITS but the platform
+ * then 504s must not double-apply on a client/agent retry. The fix records the caller's key on the LIVE doc
+ * INSIDE the same transaction as the content, and a repeat within the window is a no-op that mutates nothing
+ * (so the closing store deep-equal-skips). Ledger mechanics/pruning are unit-tested in write-idem.spec.ts;
+ * these pin the HANDLER wiring: check-before-apply, record-on-apply, duplicate → `reason:'duplicate'`.
+ */
+describe('CollaborationHandler.conditionalUpdatePageContent — idempotency (#429)', () => {
+  const DOC = 'page.44444444-4444-4444-8444-444444444444';
+  const USER = { id: 'user-1' };
+
+  // The ledger is shared across invocations to simulate the ONE resident Y.Doc a page's writes serialize on
+  // (a native Map stands in for the top-level Y.Map: write-idem uses only .has/.set/.delete/.size/.entries).
+  const build = () => {
+    const ledger = new Map<string, number>();
+    const opsLog: string[][] = [];
+    const openDirectConnection = jest.fn(async () => {
+      const ops: string[] = [];
+      opsLog.push(ops);
+      const fragment = {
+        length: 1,
+        delete: jest.fn(() => ops.push('delete')),
+        insert: jest.fn(() => ops.push('insert')),
+      };
+      const doc = {
+        getXmlFragment: jest.fn(() => fragment),
+        getMap: jest.fn(() => ledger),
+      };
+      return {
+        transact: jest.fn(async (fn: (d: unknown) => void) => {
+          ops.push('transact');
+          fn(doc);
+        }),
+        disconnect: jest.fn(async () => undefined),
+      };
+    });
+    const hocuspocus = {
+      documents: { get: jest.fn(() => undefined), has: jest.fn(() => false) },
+      openDirectConnection,
+    };
+    const handler = new CollaborationHandler().getHandlers(
+      hocuspocus as never,
+    ).conditionalUpdatePageContent;
+    return { handler, ledger, opsLog };
+  };
+
+  // Append, NO expectedContentHash — the exact vulnerable path (a keyed append with no If-Match).
+  const payload = (idempotencyKey?: string, operation = 'append') => ({
+    prosemirrorJson: { type: 'doc', content: [{ type: 'paragraph' }] },
+    operation,
+    user: USER as never,
+    idempotencyKey,
+  });
+
+  it('applies and records the key on first sight', async () => {
+    const { handler, ledger, opsLog } = build();
+    await expect(handler(DOC, payload('K1'))).resolves.toEqual({ applied: true });
+    expect(ledger.has('K1')).toBe(true);
+    expect(opsLog[0]).toContain('insert'); // the append actually ran
+  });
+
+  // THE regression: a retry with the same key does not re-apply.
+  it('is a no-op DUPLICATE on a same-key retry — content not applied twice', async () => {
+    const { handler, ledger, opsLog } = build();
+    await handler(DOC, payload('K1')); // first — applies
+    await expect(handler(DOC, payload('K1'))).resolves.toEqual({
+      applied: false,
+      reason: 'duplicate',
+    });
+    expect(ledger.size).toBe(1); // key recorded once
+    expect(opsLog[1]).not.toContain('insert'); // the retry mutated nothing (benign no-op store)
+  });
+
+  it('applies independently for a DIFFERENT key on the same page', async () => {
+    const { handler, ledger } = build();
+    await handler(DOC, payload('K1'));
+    await expect(handler(DOC, payload('K2'))).resolves.toEqual({ applied: true });
+    expect(ledger.has('K1')).toBe(true);
+    expect(ledger.has('K2')).toBe(true);
+  });
+
+  it('leaves unkeyed writes unchanged (no key ⇒ no ledger entry, always applies)', async () => {
+    const { handler, ledger, opsLog } = build();
+    await expect(handler(DOC, payload(undefined))).resolves.toEqual({ applied: true });
+    await expect(handler(DOC, payload(undefined))).resolves.toEqual({ applied: true });
+    expect(ledger.size).toBe(0);
+    expect(opsLog[0]).toContain('insert');
+    expect(opsLog[1]).toContain('insert'); // both applied — no dedup without a key
+  });
+});

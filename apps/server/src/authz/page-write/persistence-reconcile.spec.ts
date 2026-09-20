@@ -25,9 +25,13 @@ jest.mock('../../collaboration/collaboration.util', () => ({
   jsonToText: (...a: unknown[]) => jsonToText(...(a as [])),
   tiptapExtensions: [],
 }));
+// Captured (lazy arrow refs, like fromYdoc above) so a test can drive the mention side effect: by default
+// they return [] (mention effect early-returns), overridden in the #345 mention-isolation case.
+const extractMentions = jest.fn((..._a: unknown[]) => [] as unknown[]);
+const extractUserMentions = jest.fn((..._a: unknown[]) => [] as unknown[]);
 jest.mock('../../common/helpers/prosemirror/utils', () => ({
-  extractMentions: jest.fn(() => []),
-  extractUserMentions: jest.fn(() => []),
+  extractMentions: (...a: unknown[]) => extractMentions(...(a as [])),
+  extractUserMentions: (...a: unknown[]) => extractUserMentions(...(a as [])),
 }));
 // Track whether we are inside the executeTx callback when the write payload is serialized (TOCTOU pin #3).
 const mockTx = { inside: false, serializeSawInside: undefined as boolean | undefined };
@@ -222,7 +226,15 @@ describe('PersistenceExtension.onStoreDocument post-store side-effect isolation 
       collabHistory,
       transclusion,
     );
-    return { ext, updatePage, aiQueue, historyQueue, collabHistory };
+    return {
+      ext,
+      updatePage,
+      aiQueue,
+      historyQueue,
+      notificationQueue,
+      collabHistory,
+      transclusion,
+    };
   };
 
   const run = (ext: PersistenceExtension) =>
@@ -237,6 +249,8 @@ describe('PersistenceExtension.onStoreDocument post-store side-effect isolation 
     });
     jsonToText.mockReturnValue('text');
     reconcileRowIntoDoc.mockReturnValue({ merged: false });
+    extractMentions.mockReturnValue([]);
+    extractUserMentions.mockReturnValue([]);
   });
 
   it('a throwing post-commit side effect does NOT reject onStoreDocument (denies the debouncer its poison)', async () => {
@@ -269,5 +283,59 @@ describe('PersistenceExtension.onStoreDocument post-store side-effect isolation 
     await expect(run(ext)).resolves.toBeUndefined();
     expect(logPostStoreFailure).toHaveBeenCalledTimes(1);
     expect(logPostStoreFailure.mock.calls[0][1]).toBe('broadcast');
+  });
+
+  // #429 review: pin the three effects the original isolation block did not cover per-effect.
+
+  it('a throwing history enqueue is isolated and alarmed (label "history")', async () => {
+    const { ext, historyQueue } = build();
+    historyQueue.add.mockRejectedValueOnce(new Error('history queue down'));
+    await expect(run(ext)).resolves.toBeUndefined();
+    expect(clearStoreFailure).toHaveBeenCalledWith(document); // the row still committed
+    expect(logPostStoreFailure).toHaveBeenCalledTimes(1);
+    expect(logPostStoreFailure.mock.calls[0][1]).toBe('history');
+  });
+
+  it('a throwing mention→notificationQueue enqueue is isolated and alarmed (label "mention-notification")', async () => {
+    // Drive the mention branch past its early return, then make the enqueue throw.
+    extractMentions.mockReturnValue([
+      { id: 'm1', entityId: 'u2', creatorId: 'c1' },
+    ]);
+    extractUserMentions.mockReturnValue([
+      { id: 'm1', entityId: 'u2', creatorId: 'c1' },
+    ]);
+    const { ext, notificationQueue } = build();
+    notificationQueue.add.mockRejectedValueOnce(new Error('notif queue down'));
+    await expect(run(ext)).resolves.toBeUndefined();
+    expect(logPostStoreFailure).toHaveBeenCalledTimes(1);
+    expect(logPostStoreFailure.mock.calls[0][1]).toBe('mention-notification');
+  });
+
+  it('a failing transclusion sync is isolated — the hook resolves, other effects still run, outer backstop never fires', async () => {
+    // syncTransclusion self-isolates (its own per-call try/catch), so a rejected syncPageTransclusions is
+    // swallowed there and never rejects the hook. The meaningful protection: it does not skip the other
+    // concurrent effects, and it never reaches the whole-block backstop ('post-store-block').
+    const { ext, transclusion, aiQueue, historyQueue } = build();
+    transclusion.syncPageTransclusions.mockRejectedValueOnce(
+      new Error('transclusion sync down'),
+    );
+    await expect(run(ext)).resolves.toBeUndefined();
+    expect(clearStoreFailure).toHaveBeenCalledWith(document); // row committed
+    expect(aiQueue.add).toHaveBeenCalledTimes(1); // sibling effects unaffected
+    expect(historyQueue.add).toHaveBeenCalledTimes(1);
+    expect(
+      logPostStoreFailure.mock.calls.map((c) => c[1]),
+    ).not.toContain('post-store-block'); // the outer backstop did not fire
+  });
+
+  it('all post-commit side effects run (concurrently) on a normal store', async () => {
+    const { ext, aiQueue, historyQueue, collabHistory, transclusion } = build();
+    await expect(run(ext)).resolves.toBeUndefined();
+    expect(document.broadcastStateless).toHaveBeenCalledTimes(1);
+    expect(transclusion.syncPageTransclusions).toHaveBeenCalledTimes(1);
+    expect(collabHistory.addContributors).toHaveBeenCalledTimes(1);
+    expect(aiQueue.add).toHaveBeenCalledTimes(1);
+    expect(historyQueue.add).toHaveBeenCalledTimes(1);
+    expect(logPostStoreFailure).not.toHaveBeenCalled();
   });
 });

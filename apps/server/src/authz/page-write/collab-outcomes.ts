@@ -36,8 +36,11 @@ export type FlushPageContentOutcome = {
 export type ConditionalUpdateOutcome = {
   applied: boolean;
   /**
-   * `'precondition'` is the caller's own concurrency answer (→ 412). Anything else means we could not
-   * establish the precondition at all (→ 503); neither may ever be read as "applied".
+   * `'precondition'` is the caller's own concurrency answer (→ 412). `'duplicate'` (#429) means a keyed
+   * write was already applied within the idempotency window, so the caller returns the CURRENT page as a
+   * 2xx no-op (NOT a 412/503) — it is a successful retry, not a conflict or a failure. Anything else means
+   * we could not establish the precondition at all (→ 503); only `'duplicate'` and `applied:true` are
+   * successes, and `'precondition'`/`'error'`/`'unknown'` may never be read as "applied".
    */
-  reason?: 'precondition' | 'error' | 'unknown';
+  reason?: 'precondition' | 'error' | 'unknown' | 'duplicate';
 };

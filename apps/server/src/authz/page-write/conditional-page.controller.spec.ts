@@ -217,6 +217,35 @@ describe('ConditionalPageController.conditionalUpdate', () => {
     }
   });
 
+  // #429: a keyed write already applied within the idempotency window is a SUCCESSFUL retry (`duplicate`),
+  // NOT a 412/503. It returns the CURRENT page as a 2xx no-op and re-applies NOTHING — not the content
+  // (the fork deduped it), not the metadata (the first request applied it). This is the bounded-idempotency
+  // guarantee: a non-idempotent append/prepend is not double-applied on a timeout retry.
+  it('returns the current page as a no-op on a duplicate keyed write (no re-apply)', async () => {
+    const { controller, calls, gateway, pageService } = build({
+      apply: { applied: false, reason: 'duplicate' },
+    });
+    const out = await controller.conditionalUpdate(
+      dto({ title: 'New title', idempotencyKey: 'K1' }),
+      USER,
+    );
+    // The key was forwarded to the collab layer…
+    expect(gateway.conditionalUpdatePageContent).toHaveBeenCalledWith(
+      'page-uuid-1',
+      expect.objectContaining({ idempotencyKey: 'K1' }),
+    );
+    // …content was NOT re-applied to a fresh doc, metadata was NOT re-written…
+    expect(pageService.update).not.toHaveBeenCalled();
+    expect(calls).not.toContain('update');
+    // …and the response is the current page (re-read) + permissions, same shape as the success path.
+    expect(out).toEqual({
+      ...PAGE,
+      permissions: { canEdit: true, hasRestriction: false },
+    });
+    // findById ran twice: the initial lookup + the no-op re-read.
+    expect(calls.filter((c) => c === 'findById')).toHaveLength(2);
+  });
+
   // The fork half of the falsy-content agreement. Upstream `PageService.update` gates its content branch
   // on TRUTHINESS (`updatePageDto.content && …`), so `content: ""` is "no content supplied" there. If this
   // route treated it as supplied, `htmlToJson('')` would produce a valid EMPTY document and the same
@@ -337,5 +366,22 @@ describe('ConditionalPageController.conditionalUpdate', () => {
         }),
       ),
     ).toHaveLength(0);
+    // #429: idempotencyKey is an OPTIONAL string; a present string validates, a non-string does not.
+    expect(
+      await validate(
+        plainToInstance(ConditionalUpdatePageDto, {
+          pageId: 'p',
+          idempotencyKey: 'op-abc-123',
+        }),
+      ),
+    ).toHaveLength(0);
+    expect(
+      await validate(
+        plainToInstance(ConditionalUpdatePageDto, {
+          pageId: 'p',
+          idempotencyKey: 123 as never,
+        }),
+      ),
+    ).not.toHaveLength(0);
   });
 });
