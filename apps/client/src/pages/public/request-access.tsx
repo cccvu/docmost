@@ -1,7 +1,7 @@
 import { z } from "zod/v4";
 import { useForm } from "@mantine/form";
 import { zod4Resolver } from "mantine-form-zod-resolver";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import {
   Alert,
   Button,
@@ -13,7 +13,6 @@ import {
 import { Helmet } from "react-helmet-async";
 import { useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
-import { notifications } from "@mantine/notifications";
 import { PublicShell } from "@/features/public/components/public-shell.tsx";
 import { requestAccess } from "@/features/public/services/public-service.ts";
 import APP_ROUTE from "@/lib/app-route.ts";
@@ -30,26 +29,35 @@ export default function RequestAccess() {
   const navigate = useNavigate();
   const [submitting, setSubmitting] = useState(false);
   const [done, setDone] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
 
   const form = useForm<FormValues>({
     validate: zod4Resolver(formSchema),
     initialValues: { email: "" },
   });
 
+  // After a successful request, redirect to sign-in. Held in an effect so the timer is cleared if the
+  // visitor navigates away within the window — no navigate() on an unmounted component (#29).
+  useEffect(() => {
+    if (!done) return;
+    const id = window.setTimeout(() => navigate(APP_ROUTE.AUTH.LOGIN), 2500);
+    return () => window.clearTimeout(id);
+  }, [done, navigate]);
+
   async function onSubmit(values: FormValues) {
     setSubmitting(true);
+    setError(null);
     try {
       const res = await requestAccess(values);
       setDone(res.message);
-      notifications.show({ message: res.message });
-      setTimeout(() => navigate(APP_ROUTE.AUTH.LOGIN), 2500);
     } catch {
-      notifications.show({
-        color: "red",
-        message: t(
+      // Inline, form-associated alert (role="alert") so submit failures reach screen readers — mirrors
+      // the success Alert (role="status"). No toast: one accessible feedback channel per state (#29).
+      setError(
+        t(
           "We couldn't submit your request right now. Please try again later or contact an administrator.",
         ),
-      });
+      );
     } finally {
       setSubmitting(false);
     }
@@ -87,6 +95,11 @@ export default function RequestAccess() {
             </Alert>
           ) : (
             <form onSubmit={form.onSubmit(onSubmit, handleValidationFailure)}>
+              {error && (
+                <Alert color="red" role="alert" mb="md">
+                  {error}
+                </Alert>
+              )}
               <TextInput
                 id="email"
                 type="email"

@@ -36,7 +36,6 @@ function makeRow(over: Partial<PublicPageListRow> = {}): PublicPageListRow {
     title: 'Public Handbook',
     icon: null,
     spaceName: 'Docs',
-    spaceSlug: 'docs',
     createdAt: new Date('2026-01-01T00:00:00.000Z'),
     updatedAt: new Date('2026-02-01T00:00:00.000Z'),
     ...over,
@@ -78,15 +77,15 @@ describe('PublicDiscoveryService.listPublicPages', () => {
     });
   });
 
-  it('projects ONLY public-safe fields — never the share row id, page content, creator, or comments', async () => {
+  it('projects ONLY public-safe fields — never the share row id, page content, creator, comments, or spaceSlug', async () => {
     const { service } = makeService([makeRow()]);
     const res = await service.listPublicPages({}, WS_ID);
     const item = res.items[0] as Record<string, unknown>;
     expect(Object.keys(item).sort()).toEqual(
-      ['createdAt', 'icon', 'pageId', 'shareKey', 'slugId', 'spaceName', 'spaceSlug', 'title', 'updatedAt'].sort(),
+      ['createdAt', 'icon', 'pageId', 'shareKey', 'slugId', 'spaceName', 'title', 'updatedAt'].sort(),
     );
-    // explicit belt-and-suspenders: no internal / sensitive keys leak
-    for (const forbidden of ['id', 'content', 'textContent', 'creatorId', 'creator', 'email']) {
+    // explicit belt-and-suspenders: no internal / sensitive keys leak (spaceSlug dropped in #29)
+    for (const forbidden of ['id', 'content', 'textContent', 'creatorId', 'creator', 'email', 'spaceSlug']) {
       expect(item).not.toHaveProperty(forbidden);
     }
     expect(res.meta).toEqual({ hasNextPage: false, nextCursor: null });
@@ -135,6 +134,14 @@ describe('PublicDiscoveryRepo — the authorization filter is present in the SQL
   it('hard-scopes the query to a single tenant (workspace_id parameter)', () => {
     expect(sql).toContain('workspace_id');
     expect(compiled.parameters).toContain(WS_ID);
+  });
+
+  it('does NOT select the space slug (#29 data minimization) while keeping the space join for spaceName', () => {
+    // the projected column is aliased `... as space_slug`; its absence proves the slug is not selected
+    expect(sql).not.toContain('space_slug');
+    // the spaces join + name are still present (needed for spaceName and the isSharingAllowed gate)
+    expect(sql).toContain('space_name');
+    expect(sql).toContain('inner join "spaces"');
   });
 });
 

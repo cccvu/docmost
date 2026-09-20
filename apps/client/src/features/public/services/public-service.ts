@@ -7,7 +7,6 @@ export interface IPublicPage {
   title: string | null;
   icon: string | null;
   spaceName: string | null;
-  spaceSlug: string | null;
   shareKey: string;
   createdAt: string;
   updatedAt: string;

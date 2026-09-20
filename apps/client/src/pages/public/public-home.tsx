@@ -58,7 +58,7 @@ export default function PublicHome() {
         <title>{title}</title>
       </Helmet>
 
-      <PublicShell>
+      <PublicShell footer={<PublicFooter year={year} />}>
         <PublicHero workspaceName={name} />
 
         <Container size="lg" pb={{ base: 32, sm: 48 }}>
@@ -88,8 +88,6 @@ export default function PublicHome() {
         </Container>
 
         <PublicContentList />
-
-        <PublicFooter year={year} />
       </PublicShell>
     </>
   );

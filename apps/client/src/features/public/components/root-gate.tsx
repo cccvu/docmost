@@ -1,5 +1,6 @@
 import { Navigate } from "react-router-dom";
 import { Center, Loader } from "@mantine/core";
+import { useTranslation } from "react-i18next";
 import useCurrentUser from "@/features/user/hooks/use-current-user.ts";
 import APP_ROUTE from "@/lib/app-route.ts";
 import PublicHome from "@/pages/public/public-home.tsx";
@@ -12,12 +13,13 @@ import PublicHome from "@/pages/public/public-home.tsx";
  *    render the public landing.
  */
 export default function RootGate() {
+  const { t } = useTranslation();
   const { data, isLoading } = useCurrentUser();
 
   if (isLoading) {
     return (
       <Center h="100vh">
-        <Loader aria-label="Loading" />
+        <Loader aria-label={t("Loading")} />
       </Center>
     );
   }

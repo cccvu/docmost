@@ -47,7 +47,6 @@ const item = {
   title: "Public Handbook",
   icon: null,
   spaceName: "Docs",
-  spaceSlug: "docs",
   shareKey: "abc123",
   createdAt: "2026-01-01",
   updatedAt: "2026-02-01",
@@ -76,9 +75,16 @@ describe("PublicContentList", () => {
     ).toBeTruthy();
   });
 
-  it("hides the whole section on error (enhancement, non-blocking)", () => {
+  it("keeps the section + #browse target mounted on error so the hero CTA still resolves (#29)", () => {
     mockQuery.mockReturnValue({ isLoading: false, isError: true, data: undefined });
-    renderList();
-    expect(screen.queryByText("Explore public pages")).toBeNull();
+    const { container } = renderList();
+    // heading + the #browse anchor the hero links to both persist (no dead-click)
+    expect(screen.getByText("Explore public pages")).toBeTruthy();
+    expect(container.querySelector("#browse")).not.toBeNull();
+    // inner body degrades to a short message; no card links render
+    expect(
+      screen.getByText(/We couldn't load public pages right now/i),
+    ).toBeTruthy();
+    expect(screen.queryByRole("link")).toBeNull();
   });
 });

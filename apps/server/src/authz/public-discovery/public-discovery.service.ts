@@ -33,7 +33,6 @@ export class PublicDiscoveryService {
         title: row.title,
         icon: row.icon,
         spaceName: row.spaceName,
-        spaceSlug: row.spaceSlug,
         shareKey: row.shareKey,
         createdAt: row.createdAt,
         updatedAt: row.updatedAt,
