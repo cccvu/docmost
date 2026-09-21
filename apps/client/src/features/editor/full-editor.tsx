@@ -148,7 +148,8 @@ type PageBylineProps = {
   readOnly?: boolean;
 };
 
-function PageByline({
+// Exported for the fork-owned byline test (features/editor-ux/page-byline.test.tsx).
+export function PageByline({
   creator,
   contributors,
   lastUpdatedBy,
@@ -158,14 +159,24 @@ function PageByline({
   const { t } = useTranslation();
   const detailsTriggerProps = useAsideTriggerProps("details");
 
-  const otherContributors = (contributors ?? []).filter(
-    (c) => c.id !== creator?.id,
-  );
-
   // CCC: the byline reports the last editor (who touched the page most
   // recently) and when, falling back to the creator for a never-edited page.
   const editor = lastUpdatedBy ?? creator;
   const updatedAtLabel = updatedAt ? formatCentralDateTime(updatedAt) : "";
+  // One source for BOTH the visible byline and the trigger's accessible name,
+  // so the accessible name always carries the timestamp too (WCAG 2.5.3
+  // Label-in-Name: the accessible name must contain the visible text).
+  const bylineLabel = editor
+    ? updatedAtLabel
+      ? `${t("Updated by {{name}}", { name: editor.name })} · ${updatedAtLabel}`
+      : t("Updated by {{name}}", { name: editor.name })
+    : "";
+
+  // The popover already names the creator (Owner) and the last editor (header
+  // row), so drop both from the Contributors list to avoid repeating a person.
+  const otherContributors = (contributors ?? []).filter(
+    (c) => c.id !== creator?.id && c.id !== editor?.id,
+  );
 
   return (
     <Group
@@ -177,9 +188,7 @@ function PageByline({
       {editor && (
         <Popover position="bottom-start" shadow="md" width={280} withArrow>
           <Popover.Target>
-            <UnstyledButton
-              aria-label={t("Last updated by {{name}}", { name: editor.name })}
-            >
+            <UnstyledButton aria-label={bylineLabel}>
               <Group gap={6}>
                 <CustomAvatar
                   avatarUrl={editor.avatarUrl}
@@ -187,33 +196,50 @@ function PageByline({
                   size={22}
                 />
                 <Text size="sm" c="dimmed">
-                  {updatedAtLabel
-                    ? `${t("Updated by {{name}}", { name: editor.name })} · ${updatedAtLabel}`
-                    : t("Updated by {{name}}", { name: editor.name })}
+                  {bylineLabel}
                 </Text>
               </Group>
             </UnstyledButton>
           </Popover.Target>
           <Popover.Dropdown>
             <Stack gap="xs">
-              {creator && (
-                <Group gap="sm">
-                  <CustomAvatar
-                    avatarUrl={creator.avatarUrl}
-                    name={creator.name}
-                    size={36}
-                  />
-                  <div>
-                    <Text size="sm" fw={500}>
-                      {creator.name}
-                    </Text>
-                    <Text size="xs" c="dimmed">
-                      {otherContributors.length === 0
-                        ? t("Owner, no contributors")
-                        : t("Owner")}
-                    </Text>
-                  </div>
-                </Group>
+              {/* The person the byline names: the last editor + when. */}
+              <Group gap="sm">
+                <CustomAvatar
+                  avatarUrl={editor.avatarUrl}
+                  name={editor.name}
+                  size={36}
+                />
+                <div>
+                  <Text size="sm" fw={500}>
+                    {editor.name}
+                  </Text>
+                  <Text size="xs" c="dimmed">
+                    {updatedAtLabel
+                      ? `${t("Last updated")} · ${updatedAtLabel}`
+                      : t("Last updated")}
+                  </Text>
+                </div>
+              </Group>
+
+              {/* The creator (Owner), only when they aren't the last editor. */}
+              {creator && creator.id !== editor.id && (
+                <>
+                  <Divider />
+                  <Group gap="sm">
+                    <CustomAvatar
+                      avatarUrl={creator.avatarUrl}
+                      name={creator.name}
+                      size={28}
+                    />
+                    <div>
+                      <Text size="sm">{creator.name}</Text>
+                      <Text size="xs" c="dimmed">
+                        {t("Owner")}
+                      </Text>
+                    </div>
+                  </Group>
+                </>
               )}
 
               {otherContributors.length > 0 && (

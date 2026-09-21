@@ -1001,6 +1001,7 @@
   "Saved": "Saved",
   "Save failed. Retry": "Save failed. Retry",
   "By {{name}}": "By {{name}}",
+  "Updated by {{name}}": "Updated by {{name}}",
   "Updated {{time}}": "Updated {{time}}",
   "Choose destination": "Choose destination",
   "Search pages and spaces...": "Search pages and spaces...",
