@@ -40,7 +40,6 @@ import {
   prefetchAuditLogs,
   prefetchVerifiedPages,
 } from "@/components/settings/settings-queries.tsx";
-import AppVersion from "@/components/settings/app-version.tsx";
 import { mobileSidebarAtom } from "@/components/layouts/global/hooks/atoms/sidebar-atom.ts";
 import { useToggleSidebar } from "@/components/layouts/global/hooks/hooks/use-toggle-sidebar.ts";
 import { useSettingsNavigation } from "@/hooks/use-settings-navigation";
@@ -305,13 +304,13 @@ export default function SettingsSidebar({
 
       <ScrollArea w="100%">{menuItems}</ScrollArea>
 
-      {/* CCC: always rendered; the rail hides it via CSS at sm+ (railHidden),
-          never a JS `collapsed` gate — so the mobile overlay keeps the footer. */}
-      {!isCloud() && (
-        <div className={classes.railHidden}>
-          <AppVersion />
-        </div>
-      )}
+      {/* CCC: the Docmost version + "New update" footer is intentionally NOT
+          rendered. We run a version-pinned fork, so the upstream release-nag is
+          misleading (admins must not "upgrade" to stock Docmost), and dropping
+          the <AppVersion/> render also stops its hourly GitHub update check
+          (the useAppVersion hook only runs inside that component). The
+          app-version.tsx module is left in place, unused, to keep upstream diff
+          surface minimal. */}
 
       {isCloud() && (
         <div className={classes.text}>

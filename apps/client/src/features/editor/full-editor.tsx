@@ -32,6 +32,7 @@ import { currentPageEditModeAtom } from "@/features/editor/atoms/editor-atoms.ts
 import { resolvePageEditMode } from "@/features/editor/resolve-page-edit-mode.ts";
 import { EmptyPageGetStarted } from "@/features/editor/components/empty-page/empty-page-get-started";
 import { resolveEditorToolbarPref } from "@/features/editor-ux/prefs/editor-toolbar-pref";
+import { formatCentralDateTime } from "@/features/editor-ux/format-central-datetime";
 
 const MemoizedTitleEditor = React.memo(TitleEditor);
 const MemoizedPageEditor = React.memo(PageEditor);
@@ -57,6 +58,9 @@ export interface FullEditorProps {
   editable: boolean;
   creator?: PageUser;
   contributors?: IContributor[];
+  // CCC: the byline surfaces the last editor + when, falling back to the creator.
+  lastUpdatedBy?: PageUser;
+  updatedAt?: Date;
   canComment?: boolean;
 }
 
@@ -69,6 +73,8 @@ export function FullEditor({
   editable,
   creator,
   contributors,
+  lastUpdatedBy,
+  updatedAt,
   canComment,
 }: FullEditorProps) {
   const [user] = useAtom(userAtom);
@@ -119,6 +125,8 @@ export function FullEditor({
       <PageByline
         creator={creator}
         contributors={contributors}
+        lastUpdatedBy={lastUpdatedBy}
+        updatedAt={updatedAt}
         readOnly={!editable}
       />
       <MemoizedPageEditor
@@ -135,16 +143,29 @@ export function FullEditor({
 type PageBylineProps = {
   creator?: PageUser;
   contributors?: IContributor[];
+  lastUpdatedBy?: PageUser;
+  updatedAt?: Date;
   readOnly?: boolean;
 };
 
-function PageByline({ creator, contributors, readOnly }: PageBylineProps) {
+function PageByline({
+  creator,
+  contributors,
+  lastUpdatedBy,
+  updatedAt,
+  readOnly,
+}: PageBylineProps) {
   const { t } = useTranslation();
   const detailsTriggerProps = useAsideTriggerProps("details");
 
   const otherContributors = (contributors ?? []).filter(
     (c) => c.id !== creator?.id,
   );
+
+  // CCC: the byline reports the last editor (who touched the page most
+  // recently) and when, falling back to the creator for a never-edited page.
+  const editor = lastUpdatedBy ?? creator;
+  const updatedAtLabel = updatedAt ? formatCentralDateTime(updatedAt) : "";
 
   return (
     <Group
@@ -153,43 +174,47 @@ function PageByline({ creator, contributors, readOnly }: PageBylineProps) {
       className={clsx("print-hide", classes.byline)}
       style={{ marginTop: "-0.5em" }}
     >
-      {creator && (
+      {editor && (
         <Popover position="bottom-start" shadow="md" width={280} withArrow>
           <Popover.Target>
             <UnstyledButton
-              aria-label={t("Created by {{name}}", { name: creator.name })}
+              aria-label={t("Last updated by {{name}}", { name: editor.name })}
             >
               <Group gap={6}>
                 <CustomAvatar
-                  avatarUrl={creator.avatarUrl}
-                  name={creator.name}
+                  avatarUrl={editor.avatarUrl}
+                  name={editor.name}
                   size={22}
                 />
                 <Text size="sm" c="dimmed">
-                  {t("By {{name}}", { name: creator.name })}
+                  {updatedAtLabel
+                    ? `${t("Updated by {{name}}", { name: editor.name })} · ${updatedAtLabel}`
+                    : t("Updated by {{name}}", { name: editor.name })}
                 </Text>
               </Group>
             </UnstyledButton>
           </Popover.Target>
           <Popover.Dropdown>
             <Stack gap="xs">
-              <Group gap="sm">
-                <CustomAvatar
-                  avatarUrl={creator.avatarUrl}
-                  name={creator.name}
-                  size={36}
-                />
-                <div>
-                  <Text size="sm" fw={500}>
-                    {creator.name}
-                  </Text>
-                  <Text size="xs" c="dimmed">
-                    {otherContributors.length === 0
-                      ? t("Owner, no contributors")
-                      : t("Owner")}
-                  </Text>
-                </div>
-              </Group>
+              {creator && (
+                <Group gap="sm">
+                  <CustomAvatar
+                    avatarUrl={creator.avatarUrl}
+                    name={creator.name}
+                    size={36}
+                  />
+                  <div>
+                    <Text size="sm" fw={500}>
+                      {creator.name}
+                    </Text>
+                    <Text size="xs" c="dimmed">
+                      {otherContributors.length === 0
+                        ? t("Owner, no contributors")
+                        : t("Owner")}
+                    </Text>
+                  </div>
+                </Group>
+              )}
 
               {otherContributors.length > 0 && (
                 <>
