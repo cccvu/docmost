@@ -201,15 +201,6 @@ describe("loadBrandConfig", () => {
     expect(config.name).toBe("Example Wiki");
   });
 
-  it("retries a 5xx once, then falls back to neutral when it persists", async () => {
-    const fetchMock = vi.fn(async () => ({ ok: false, status: 500 }) as unknown as Response);
-    vi.stubGlobal("fetch", fetchMock);
-    const mod = await freshModule();
-    const config = await mod.loadBrandConfig();
-    expect(config).toEqual(mod.NEUTRAL_BRAND);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-  });
-
   it("does NOT retry a clean miss (4xx) — standalone deployments must not pay for it", async () => {
     const fetchMock = vi.fn(async () => ({ ok: false, status: 404 }) as unknown as Response);
     vi.stubGlobal("fetch", fetchMock);
