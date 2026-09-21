@@ -61,6 +61,7 @@ const SEAM_ALLOWLIST = new Set<string>([
   'collaboration/collaboration.handler.ts', // seam #2 — conditional content write compares via authz/page-write/stable-hash (#282); flushPageContent reads authz/page-write/store-failure-registry (#390); the keyed content write checks/records via authz/page-write/write-idem (#429)
   'collaboration/collaboration.util.ts', // seam #61 — htmlToJson imports the #392 attachmentId backfill from editor-compat/
   'collaboration/extensions/persistence.extension.ts', // seam #390 — reconcile-before-store + store-failure signal via authz/page-write/{reconcile-store,store-failure-registry}
+  'collaboration/server/collaboration.controller.ts', // seam #163 — CollabServiceSecretGuard on GET /collab/stats in the separate CollabAppModule process (#80)
 ]);
 
 const posix = (p: string) => p.split(sep).join('/');
