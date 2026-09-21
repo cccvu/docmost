@@ -37,8 +37,13 @@ export const NEUTRAL_BRAND: BrandConfig = { name: "Wiki", assets: {} };
 /** Same-origin path served by the platform (services/platform/assets/brand). */
 const BRAND_MANIFEST_URL = "/brand/manifest.json";
 const BRAND_ASSET_PREFIX = "/brand/";
-/** Per-request deadline (manifest, retry, wordmark each re-arm it), so a single hung request cannot
- *  poison the others and a transient stall is survivable instead of silently dropping the brand. */
+/** Per-request deadline (manifest attempt, manifest retry, wordmark each re-arm it), so a single hung
+ *  request cannot poison the others and a transient stall is survivable instead of silently dropping
+ *  the brand. There is deliberately NO aggregate cap: the documented worst-case first-paint bound is
+ *  ~3 s when /brand/manifest.json hangs (two 1.5 s attempts) and ~4.5 s composed with a hung wordmark —
+ *  accepted because a hung /brand is a broken deployment anyway, and the healthy path stays ~ms.
+ *  (The old single shared 1.5 s deadline bounded total paint tightly but let one stale abort silently
+ *  downgrade a completed 200 manifest into the neutral identity — the CI run-35550624904 failure.) */
 const LOAD_TIMEOUT_MS = 1500;
 
 let brand: BrandConfig = NEUTRAL_BRAND;
@@ -67,8 +72,9 @@ export function setBrandConfigForTest(next: BrandConfig): void {
  * OWN deadline, and a transient failure of the manifest request (network error, abort — e.g. a body
  * read that stalls past the deadline on a cold box —, or a JSON parse hiccup) is retried ONCE with a
  * fresh clock. A completed 200 response must not be silently downgraded to the neutral identity by an
- * abort that lands between the headers and the body read; the only cases that fall back without a
- * retry are CLEAN misses (non-2xx, non-JSON), which cost nothing in a standalone deployment.
+ * abort that lands between the headers and the body read; the cases that fall back WITHOUT a retry
+ * are definitive misses (4xx, non-JSON — a standalone deployment answers 404 on every boot), while
+ * 5xx and network/abort/parse failures are treated as transient and retried once.
  * `main.tsx` awaits this before the first render so every `getAppName()` title is correct immediately.
  */
 export function loadBrandConfig(): Promise<BrandConfig> {
@@ -90,7 +96,11 @@ async function fetchBrandConfig(): Promise<BrandConfig> {
   const first = await fetchBrandConfigAttempt();
   if (first !== null) return first;
   const retried = await fetchBrandConfigAttempt();
-  return retried ?? NEUTRAL_BRAND;
+  if (retried !== null) return retried;
+  console.warn(
+    "[brand] /brand manifest unreachable after one retry (transient fetch/abort/parse failure) — rendering the neutral identity",
+  );
+  return NEUTRAL_BRAND;
 }
 
 /** `null` = transient failure (retryable); a BrandConfig = definitive result (incl. a clean miss). */
@@ -100,7 +110,11 @@ async function fetchBrandConfigAttempt(): Promise<BrandConfig | null> {
       headers: { accept: "application/json" },
       signal: timeoutSignal(LOAD_TIMEOUT_MS),
     });
-    if (!response.ok) return NEUTRAL_BRAND;
+    if (!response.ok) {
+      // A 5xx is as transient as a network error (the platform hiccuped, not the bundle);
+      // 4xx is a definitive miss — a standalone deployment answers 404 on every boot.
+      return response.status >= 500 ? null : NEUTRAL_BRAND;
+    }
     const contentType = response.headers.get("content-type") ?? "";
     if (!contentType.includes("application/json")) return NEUTRAL_BRAND;
     return normalizeBrandConfig((await response.json()) as Partial<BrandConfig>);
