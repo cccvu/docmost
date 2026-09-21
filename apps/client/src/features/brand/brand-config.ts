@@ -37,7 +37,8 @@ export const NEUTRAL_BRAND: BrandConfig = { name: "Wiki", assets: {} };
 /** Same-origin path served by the platform (services/platform/assets/brand). */
 const BRAND_MANIFEST_URL = "/brand/manifest.json";
 const BRAND_ASSET_PREFIX = "/brand/";
-/** Shared deadline for the whole boot load (manifest + wordmark), so first paint is bounded overall. */
+/** Per-request deadline (manifest, retry, wordmark each re-arm it), so a single hung request cannot
+ *  poison the others and a transient stall is survivable instead of silently dropping the brand. */
 const LOAD_TIMEOUT_MS = 1500;
 
 let brand: BrandConfig = NEUTRAL_BRAND;
@@ -62,17 +63,20 @@ export function setBrandConfigForTest(next: BrandConfig): void {
 }
 
 /**
- * Fetch the manifest and the wordmark artwork once, then install the config. ONE shared deadline
- * ({@link LOAD_TIMEOUT_MS}) covers BOTH requests, so `main.tsx` bounds first paint at ~1.5 s TOTAL — not
- * 1.5 s per request (a per-request timeout could stack to ~3 s when `/brand` hangs). `main.tsx` awaits
- * this before the first render so every `getAppName()` title is correct immediately.
+ * Fetch the manifest and the wordmark artwork once, then install the config. Each request carries its
+ * OWN deadline, and a transient failure of the manifest request (network error, abort — e.g. a body
+ * read that stalls past the deadline on a cold box —, or a JSON parse hiccup) is retried ONCE with a
+ * fresh clock. A completed 200 response must not be silently downgraded to the neutral identity by an
+ * abort that lands between the headers and the body read; the only cases that fall back without a
+ * retry are CLEAN misses (non-2xx, non-JSON), which cost nothing in a standalone deployment.
+ * `main.tsx` awaits this before the first render so every `getAppName()` title is correct immediately.
  */
 export function loadBrandConfig(): Promise<BrandConfig> {
   loadPromise ??= (async () => {
-    const signal = timeoutSignal(LOAD_TIMEOUT_MS);
-    const config = await fetchBrandConfig(signal);
+    const config = await fetchBrandConfig();
     if (config.assets.wordmarkSvg) {
-      config.wordmarkSvg = (await fetchWordmarkSvg(config.assets.wordmarkSvg, signal)) ?? undefined;
+      config.wordmarkSvg =
+        (await fetchWordmarkSvg(config.assets.wordmarkSvg)) ?? undefined;
     }
     brand = config;
     listeners.forEach((listener) => listener());
@@ -82,18 +86,26 @@ export function loadBrandConfig(): Promise<BrandConfig> {
   return loadPromise;
 }
 
-async function fetchBrandConfig(signal: AbortSignal): Promise<BrandConfig> {
+async function fetchBrandConfig(): Promise<BrandConfig> {
+  const first = await fetchBrandConfigAttempt();
+  if (first !== null) return first;
+  const retried = await fetchBrandConfigAttempt();
+  return retried ?? NEUTRAL_BRAND;
+}
+
+/** `null` = transient failure (retryable); a BrandConfig = definitive result (incl. a clean miss). */
+async function fetchBrandConfigAttempt(): Promise<BrandConfig | null> {
   try {
     const response = await fetch(BRAND_MANIFEST_URL, {
       headers: { accept: "application/json" },
-      signal,
+      signal: timeoutSignal(LOAD_TIMEOUT_MS),
     });
     if (!response.ok) return NEUTRAL_BRAND;
     const contentType = response.headers.get("content-type") ?? "";
     if (!contentType.includes("application/json")) return NEUTRAL_BRAND;
     return normalizeBrandConfig((await response.json()) as Partial<BrandConfig>);
   } catch {
-    return NEUTRAL_BRAND;
+    return null;
   }
 }
 
@@ -125,9 +137,9 @@ export function sanitizeBrandAssetUrl(url: unknown): string | undefined {
   return url;
 }
 
-async function fetchWordmarkSvg(url: string, signal: AbortSignal): Promise<string | null> {
+async function fetchWordmarkSvg(url: string): Promise<string | null> {
   try {
-    const response = await fetch(url, { signal });
+    const response = await fetch(url, { signal: timeoutSignal(LOAD_TIMEOUT_MS) });
     if (!response.ok) return null;
     const markup = (await response.text()).trim();
     return markup.startsWith("<svg") ? markup : null;

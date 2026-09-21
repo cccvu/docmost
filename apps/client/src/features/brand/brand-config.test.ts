@@ -78,12 +78,13 @@ describe("loadBrandConfig", () => {
     expect(config.webManifest).toBe("/brand/site.webmanifest");
     expect((config.assets as Record<string, string>).injected).toBeUndefined();
 
-    // One shared deadline: manifest + wordmark use the SAME AbortSignal, so a hung /brand cannot stack
-    // two 1.5s timeouts into ~3s of blocked first paint.
+    // Each request carries its OWN deadline signal — a stale abort from one request can never poison
+    // another (a shared signal let an abort land between a 200 manifest's headers and its body read).
     const manifestCall = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
     const wordmarkCall = fetchMock.mock.calls[1] as unknown as [string, RequestInit];
     expect(manifestCall[1].signal).toBeDefined();
-    expect(wordmarkCall[1].signal).toBe(manifestCall[1].signal);
+    expect(wordmarkCall[1].signal).toBeDefined();
+    expect(wordmarkCall[1].signal).not.toBe(manifestCall[1].signal);
 
     // Memoized: a second call reuses the first load (no extra fetches).
     await mod.loadBrandConfig();
@@ -144,6 +145,39 @@ describe("loadBrandConfig", () => {
     const mod = await freshModule();
     const config = await mod.loadBrandConfig();
     expect(config).toEqual(mod.NEUTRAL_BRAND);
+  });
+
+  it("retries a transient manifest failure once with a fresh clock, then loads the bundle", async () => {
+    let manifestCalls = 0;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input) === "/brand/manifest.json") {
+        manifestCalls += 1;
+        // First attempt: headers arrive (200) but the body read stalls past the deadline and the
+        // abort surfaces as a rejected json() — the CI cold-boot failure signature (run 35550624904).
+        if (manifestCalls === 1) {
+          throw Object.assign(new Error("The operation was aborted."), {
+            name: "AbortError",
+          });
+        }
+        return jsonResponse({ name: "Example Wiki", assets: {} });
+      }
+      return { ok: false, status: 404 } as unknown as Response;
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const mod = await freshModule();
+    const config = await mod.loadBrandConfig();
+    expect(manifestCalls).toBe(2);
+    expect(config.name).toBe("Example Wiki");
+    expect(document.title).toBe("Example Wiki");
+  });
+
+  it("does NOT retry a clean miss (non-2xx) — standalone deployments must not pay for it", async () => {
+    const fetchMock = vi.fn(async () => ({ ok: false, status: 404 }) as unknown as Response);
+    vi.stubGlobal("fetch", fetchMock);
+    const mod = await freshModule();
+    const config = await mod.loadBrandConfig();
+    expect(config).toEqual(mod.NEUTRAL_BRAND);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("keeps the branded identity when only the wordmark fetch fails", async () => {
