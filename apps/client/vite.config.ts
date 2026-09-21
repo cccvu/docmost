@@ -64,9 +64,11 @@ export default defineConfig(({ mode }) => {
     plugins: [
       react(),
       precompressAndBudget({
-        // Budgets (#309): the post-split initial set measured 790,161 B brotli JS / 48,435 B CSS on
-        // 2026-09-18 (from 918,146 / 61,228 before). ~9% headroom; raising it is a deliberate PR decision.
-        budget: { initialJsBrotli: 860_000, initialCssBrotli: 60_000 },
+        // Budgets (#309): the post-split initial set measured 789,788 B brotli JS / 48,435 B CSS on 2026-09-18.
+        // #406 (lazy posthog-js) + #408 (lazy date-fns locales) cut it to 722,673 B JS / 48,435 B CSS on
+        // 2026-09-21, so the JS ceiling is tightened to 790,000 (~9% over the measured set). Raising it is a
+        // deliberate PR decision; a dependency bump that crosses it is a conversation, not a number to bump.
+        budget: { initialJsBrotli: 790_000, initialCssBrotli: 60_000 },
         mustStayLazy: [
           "mermaid",
           "@mermaid-js",
@@ -74,6 +76,10 @@ export default defineConfig(({ mode }) => {
           "@slidoapp",
           "katex",
           "@tanstack/react-table",
+          // #406: posthog-js (incl. its posthog-js/react subpath) is loaded via a runtime dynamic import,
+          // gated on isCloud() — a self-hosted visitor never downloads it. Guards against a future eager
+          // re-import silently re-inflating first paint (matches both core and /react under node_modules/).
+          "posthog-js",
         ],
       }),
     ],
