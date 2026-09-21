@@ -59,6 +59,18 @@ export async function preloadDateFnsLocale(language?: string): Promise<void> {
   await pending;
 }
 
+// Switch the app language, loading its date-fns locale FIRST so every synchronous getDateFnsLocale() consumer
+// (including the non-hook utils lib/time.ts and features/label/utils/format-label-date.ts) renders the correct
+// locale on its first render for the new language — no flash, no store, no re-render trigger. This is the ONLY
+// supported way to change the app language: call it instead of i18n.changeLanguage() directly. The
+// preload-before-switch ordering is load-bearing (a concurrent load would let a translation-namespace fetch win
+// the race and strand non-hook date consumers on en-US), and it is enforced by date-locale.test.ts, which fails
+// if any non-test client file calls i18n.changeLanguage() outside this module. Preload failures fall back to en-US.
+export async function changeAppLanguage(language: string): Promise<void> {
+  await preloadDateFnsLocale(language);
+  await i18n.changeLanguage(language);
+}
+
 export function getDateFnsLocale(language?: string): Locale {
   return cache.get(resolveCode(language)) ?? enUS;
 }

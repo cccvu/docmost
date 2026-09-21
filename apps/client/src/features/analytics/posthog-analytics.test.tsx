@@ -9,8 +9,10 @@ vi.mock("@/lib/config.ts", () => ({
   isPostHogEnabled: () => isPostHogEnabled(),
 }));
 
-// The lazy posthog-init chunk is spied so we can assert whether posthog is ever loaded/initialized. If this
-// mock is hit, the dynamic import fired; if not, posthog-js stayed unloaded (the #406 self-hosted guarantee).
+// The lazy posthog-init chunk is spied so we can assert whether the runtime gate loads/initializes posthog.
+// This proves the isCloud()/isPostHogEnabled() EFFECT gate (a self-hosted visitor never triggers the dynamic
+// import); the separate "posthog-js is off the eager import graph" guarantee is enforced by the mustStayLazy
+// budget lane (build/precompress.ts), not here.
 const initPostHog = vi.fn();
 vi.mock("./posthog-init.ts", () => ({ initPostHog }));
 

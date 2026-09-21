@@ -13,7 +13,7 @@ import { useCollabToken } from "@/features/auth/queries/auth-query.tsx";
 import { Error404 } from "@/components/ui/error-404.tsx";
 import { useEntitlements } from "@/ee/entitlement/use-entitlements";
 import { entitlementAtom } from "@/ee/entitlement/entitlement-atom";
-import { preloadDateFnsLocale } from "@/lib/date-locale.ts";
+import { changeAppLanguage } from "@/lib/date-locale.ts";
 
 export function UserProvider({ children }: React.PropsWithChildren) {
   const [, setCurrentUser] = useAtom(currentUserAtom);
@@ -56,9 +56,10 @@ export function UserProvider({ children }: React.PropsWithChildren) {
     if (data && data.user && data.workspace) {
       setCurrentUser(data);
       const lng = data.user.locale === "en" ? "en-US" : data.user.locale;
-      // #408: load the date-fns locale before switching language so date-showing components render the
-      // correct locale on their first render for `lng` (getDateFnsLocale stays synchronous, zero flash).
-      void preloadDateFnsLocale(lng).then(() => i18n.changeLanguage(lng));
+      // #408: changeAppLanguage loads the date-fns locale BEFORE switching language, so date-showing
+      // components render the correct locale on their first render for `lng` (getDateFnsLocale stays
+      // synchronous, zero flash). Never call i18n.changeLanguage directly here.
+      void changeAppLanguage(lng);
     }
   }, [data, isLoading]);
 

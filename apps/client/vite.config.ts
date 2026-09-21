@@ -64,10 +64,10 @@ export default defineConfig(({ mode }) => {
     plugins: [
       react(),
       precompressAndBudget({
-        // Budgets (#309): the post-split initial set measured 790,161 B brotli JS / 48,435 B CSS on 2026-09-18.
+        // Budgets (#309): the post-split initial set measured 789,788 B brotli JS / 48,435 B CSS on 2026-09-18.
         // #406 (lazy posthog-js) + #408 (lazy date-fns locales) cut it to 722,673 B JS / 48,435 B CSS on
-        // 2026-09-21, so the JS ceiling is tightened to 790,000 (~9% headroom). Raising it is a deliberate PR
-        // decision; a dependency bump that crosses it is a conversation, not a number to bump.
+        // 2026-09-21, so the JS ceiling is tightened to 790,000 (~9% over the measured set). Raising it is a
+        // deliberate PR decision; a dependency bump that crosses it is a conversation, not a number to bump.
         budget: { initialJsBrotli: 790_000, initialCssBrotli: 60_000 },
         mustStayLazy: [
           "mermaid",
