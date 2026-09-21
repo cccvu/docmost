@@ -13,6 +13,7 @@ import { useCollabToken } from "@/features/auth/queries/auth-query.tsx";
 import { Error404 } from "@/components/ui/error-404.tsx";
 import { useEntitlements } from "@/ee/entitlement/use-entitlements";
 import { entitlementAtom } from "@/ee/entitlement/entitlement-atom";
+import { preloadDateFnsLocale } from "@/lib/date-locale.ts";
 
 export function UserProvider({ children }: React.PropsWithChildren) {
   const [, setCurrentUser] = useAtom(currentUserAtom);
@@ -54,9 +55,10 @@ export function UserProvider({ children }: React.PropsWithChildren) {
   useEffect(() => {
     if (data && data.user && data.workspace) {
       setCurrentUser(data);
-      i18n.changeLanguage(
-        data.user.locale === "en" ? "en-US" : data.user.locale,
-      );
+      const lng = data.user.locale === "en" ? "en-US" : data.user.locale;
+      // #408: load the date-fns locale before switching language so date-showing components render the
+      // correct locale on their first render for `lng` (getDateFnsLocale stays synchronous, zero flash).
+      void preloadDateFnsLocale(lng).then(() => i18n.changeLanguage(lng));
     }
   }, [data, isLoading]);
 

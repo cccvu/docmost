@@ -1,39 +1,66 @@
 import { format as dateFnsFormat, type Locale } from "date-fns";
-import {
-  de,
-  enUS,
-  es,
-  fr,
-  it,
-  ja,
-  ko,
-  nl,
-  ptBR,
-  ru,
-  uk,
-  zhCN,
-} from "date-fns/locale";
+import { enUS } from "date-fns/locale/en-US";
 import { useTranslation } from "react-i18next";
 import i18n from "@/i18n.ts";
 
-const LOCALE_MAP: Record<string, Locale> = {
-  "de-DE": de,
-  "en-US": enUS,
-  "es-ES": es,
-  "fr-FR": fr,
-  "it-IT": it,
-  "ja-JP": ja,
-  "ko-KR": ko,
-  "nl-NL": nl,
-  "pt-BR": ptBR,
-  "ru-RU": ru,
-  "uk-UA": uk,
-  "zh-CN": zhCN,
+// #408: only the active locale enters the bundle. en-US is the static default + fallback (it is the app's
+// fallbackLng and needed synchronously everywhere); every other locale is a lazy chunk loaded on demand.
+// preloadDateFnsLocale() is awaited immediately before i18n.changeLanguage() at the two language-set points
+// (features/user/user-provider.tsx and features/user/components/account-language.tsx), so by the time any
+// component renders for a new language its Locale is already cached and getDateFnsLocale() stays a pure
+// synchronous getter with zero flash. Loaders use LITERAL import() specifiers so Rolldown emits one chunk per
+// locale — a computed `import(`date-fns/locale/${code}`)` would glob-bundle every date-fns locale. i18n codes
+// map to date-fns subpaths, which differ (de-DE -> de, pt-BR -> pt-BR, uk-UA -> uk, …).
+const LOADERS: Record<string, () => Promise<Locale>> = {
+  "de-DE": () => import("date-fns/locale/de").then((m) => m.de),
+  "es-ES": () => import("date-fns/locale/es").then((m) => m.es),
+  "fr-FR": () => import("date-fns/locale/fr").then((m) => m.fr),
+  "it-IT": () => import("date-fns/locale/it").then((m) => m.it),
+  "ja-JP": () => import("date-fns/locale/ja").then((m) => m.ja),
+  "ko-KR": () => import("date-fns/locale/ko").then((m) => m.ko),
+  "nl-NL": () => import("date-fns/locale/nl").then((m) => m.nl),
+  "pt-BR": () => import("date-fns/locale/pt-BR").then((m) => m.ptBR),
+  "ru-RU": () => import("date-fns/locale/ru").then((m) => m.ru),
+  "uk-UA": () => import("date-fns/locale/uk").then((m) => m.uk),
+  "zh-CN": () => import("date-fns/locale/zh-CN").then((m) => m.zhCN),
 };
 
-export function getDateFnsLocale(language?: string): Locale {
+const cache = new Map<string, Locale>([["en-US", enUS]]);
+const inFlight = new Map<string, Promise<void>>();
+
+// i18n.language is always one of the 12 region-qualified codes (or "en-US"): match it exactly, else fall back
+// to en-US — the same result the previous LOCALE_MAP lookup produced (its base-language branch never matched a
+// region-qualified key).
+function resolveCode(language?: string): string {
   const lang = language ?? i18n.language ?? "en-US";
-  return LOCALE_MAP[lang] ?? LOCALE_MAP[lang.split("-")[0]] ?? enUS;
+  return lang === "en-US" || LOADERS[lang] ? lang : "en-US";
+}
+
+// Load the date-fns locale for `language` into the cache so getDateFnsLocale() can return it synchronously.
+// Best-effort: a failed load leaves en-US as the fallback and the promise still resolves (callers gate a
+// language switch on it, so it must always settle). Concurrent calls for the same code share one load.
+export async function preloadDateFnsLocale(language?: string): Promise<void> {
+  const code = resolveCode(language);
+  if (cache.has(code)) return;
+  let pending = inFlight.get(code);
+  if (!pending) {
+    pending = LOADERS[code]()
+      .then((locale) => {
+        cache.set(code, locale);
+      })
+      .catch(() => {
+        // keep en-US as the fallback
+      })
+      .finally(() => {
+        inFlight.delete(code);
+      });
+    inFlight.set(code, pending);
+  }
+  await pending;
+}
+
+export function getDateFnsLocale(language?: string): Locale {
+  return cache.get(resolveCode(language)) ?? enUS;
 }
 
 export function useDateFnsLocale(): Locale {
