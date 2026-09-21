@@ -43,13 +43,19 @@ function ValueCard({
   );
 }
 
+export function publicHomeTitle(
+  workspaceName: string | undefined,
+  appName: string,
+): string {
+  if (!workspaceName || workspaceName === appName) return appName;
+  return `${workspaceName} — ${appName}`;
+}
+
 export default function PublicHome() {
   const { t } = useTranslation();
   const { data: workspace } = useWorkspacePublicDataQuery();
   const name = workspace?.name || getAppName();
-  const title = workspace?.name
-    ? `${workspace.name} — ${getAppName()}`
-    : getAppName();
+  const title = publicHomeTitle(workspace?.name, getAppName());
   const year = new Date().getFullYear();
 
   return (
