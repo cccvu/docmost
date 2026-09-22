@@ -8,6 +8,13 @@
  */
 export enum ServiceScope {
   SessionMint = 'session:mint',
+  // #455 fork-side instant revocation. `session:revoke` deactivates the shadow user (sets `deactivatedAt`
+  // + revokes its live `user_sessions` + force-disconnects its live collab sockets) so a disabled platform
+  // identity cannot keep reading/writing wiki content through an already-issued fork credential; the paired
+  // `session:restore` clears `deactivatedAt` on re-enable. Distinct scopes so a future least-privilege
+  // credential can be granted revoke without restore (or vice-versa).
+  SessionRevoke = 'session:revoke',
+  SessionRestore = 'session:restore',
   UsersProvision = 'users:provision',
   // Phase C reverse-coupling: the platform stops reaching into Docmost's DB and instead calls these
   // scoped, service-secret-guarded endpoints. Reads and writes are distinct scopes so a future

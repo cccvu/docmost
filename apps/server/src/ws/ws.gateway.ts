@@ -12,6 +12,8 @@ import { TokenService } from '../core/auth/services/token.service';
 import { JwtPayload, JwtType } from '../core/auth/dto/jwt-payload';
 import { OnModuleDestroy } from '@nestjs/common';
 import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
+import { UserRepo } from '@docmost/db/repos/user/user.repo';
+import { UserSessionRepo } from '@docmost/db/repos/session/user-session.repo';
 import { WsService } from './ws.service';
 import { getSpaceRoomName, getUserRoomName } from './ws.utils';
 import { BaseRealtimeBridge } from './base-realtime.bridge';
@@ -20,6 +22,9 @@ import { EnvironmentService } from '../integrations/environment/environment.serv
 // CCC seam (UPSTREAM_MODIFICATIONS.md #310): the socket.io handshake authenticates with the session cookie,
 // so it must read the resolved name (`__Host-authToken` over https), never the shadowable un-prefixed one.
 import { readDocmostAuthCookie } from '../authz/session-cookie/docmost-auth-cookie';
+// CCC seam (UPSTREAM_MODIFICATIONS.md, #455): re-check user-disabled + session liveness at connect, so a
+// revoked/disabled identity cannot keep opening notifications sockets on the lingering authToken cookie.
+import { isWsConnectionLive } from '../authz/ws-connection/ws-connection-live';
 
 @WebSocketGateway({
   cors: { origin: '*' },
@@ -41,6 +46,9 @@ export class WsGateway
     private wsService: WsService,
     private baseRealtime: BaseRealtimeBridge,
     private environmentService: EnvironmentService,
+    // #455: @Global DatabaseModule repos, used only by the CCC liveness seam below (policy in authz/).
+    private userRepo: UserRepo,
+    private userSessionRepo: UserSessionRepo,
   ) {}
 
   afterInit(server: Server): void {
@@ -55,6 +63,15 @@ export class WsGateway
         readDocmostAuthCookie(cookies, this.environmentService),
         JwtType.ACCESS,
       );
+
+      // CCC seam (#455): the JWT is only signature-valid — re-check the identity is still live (not
+      // disabled, session not revoked) exactly as jwt.strategy does for `/api/*`, so account disable /
+      // session revocation cuts the notifications plane too. Throws → the catch below `disconnect()`s.
+      if (
+        !(await isWsConnectionLive(this.userRepo, this.userSessionRepo, token))
+      ) {
+        throw new Error('connection not live');
+      }
 
       const userId = token.sub;
       const workspaceId = token.workspaceId;

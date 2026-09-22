@@ -96,6 +96,82 @@
         }
       }
     },
+    "/api/service/session/revoke": {
+      "post": {
+        "operationId": "revokeSession",
+        "tags": ["service-bridge"],
+        "summary": "Deactivate a shadow user + revoke its live sessions and collab sockets (#455).",
+        "description": "Fork-side instant revocation for account disable. Look up the shadow user by the email derived from externalId; if present, set deactivatedAt (the isUserDisabled predicate every fork auth entrypoint enforces) and revoke its live user_sessions in one transaction, then force-disconnect its live collab sockets. So a disabled platform identity can no longer read/write wiki content through an already-issued fork credential: /api/* is cut on the next request, new collab connections are refused, and re-mint is refused. Idempotent; a never-provisioned identity is a benign no-op success ({ deactivated: false }). Scope: session:revoke.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/MintSessionRequest" },
+              "example": { "externalId": "ext-abc123" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Deactivation applied (or a no-op for a never-provisioned identity).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["userId", "deactivated", "sessionsRevoked"],
+                  "properties": {
+                    "userId": { "type": ["string", "null"], "description": "The resolved fork shadow-user id (null for a never-provisioned identity). The caller passes it to /api/collab/force-disconnect-user." },
+                    "deactivated": { "type": "boolean" },
+                    "sessionsRevoked": { "type": "integer" }
+                  }
+                },
+                "example": { "userId": "018f...", "deactivated": true, "sessionsRevoked": 2 }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
+    "/api/service/session/restore": {
+      "post": {
+        "operationId": "restoreSession",
+        "tags": ["service-bridge"],
+        "summary": "Reactivate a shadow user on account re-enable (#455).",
+        "description": "Paired with session/revoke: clear deactivatedAt for the shadow user derived from externalId so a re-enabled identity can sign in and edit again (the mint path otherwise refuses a still-deactivated shadow user forever). Touches only deactivatedAt (never deletedAt) and revives no sessions/keys/tokens (those are terminally revoked platform-side, #117). Idempotent; a no-op ({ reactivated: false }) when there is no shadow user or it is already active. Scope: session:restore.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/MintSessionRequest" },
+              "example": { "externalId": "ext-abc123" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Reactivation applied (or a no-op if already active / no shadow user).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["reactivated"],
+                  "properties": { "reactivated": { "type": "boolean" } }
+                },
+                "example": { "reactivated": true }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
     "/api/service/workspace/default": {
       "get": {
         "operationId": "getDefaultWorkspace",
@@ -535,6 +611,24 @@
         } } },
         "responses": {
           "200": { "description": "Whether the user was disconnected (false if a re-check shows they still have access).", "content": { "application/json": { "schema": { "type": "object", "required": ["disconnected"], "properties": { "disconnected": { "type": "boolean" } } }, "example": { "disconnected": true } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
+    "/api/collab/force-disconnect-user": {
+      "post": {
+        "operationId": "forceDisconnectUser",
+        "tags": ["collab"],
+        "summary": "Force-disconnect ALL of a user's live collab sockets (account disable, #455).",
+        "description": "Close every live collaboration connection for a user, across all documents (node-local). UNLIKE the per-page force-disconnect, this does NOT re-check page access: it is invoked only after the platform has deactivated the shadow user via /api/service/session/revoke, a precise whole-identity signal. Gated by the x-authz-service-secret header (no per-route scope) plus RemoteOnlyGuard.",
+        "requestBody": { "required": true, "content": { "application/json": {
+          "schema": { "type": "object", "additionalProperties": false, "required": ["userId"], "properties": { "userId": { "type": "string", "format": "uuid" } } },
+          "example": { "userId": "11111111-1111-1111-1111-111111111111" }
+        } } },
+        "responses": {
+          "200": { "description": "The user's live collab sockets were force-closed.", "content": { "application/json": { "schema": { "type": "object", "required": ["disconnected"], "properties": { "disconnected": { "type": "boolean" } } }, "example": { "disconnected": true } } } },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "503": { "$ref": "#/components/responses/Unconfigured" }

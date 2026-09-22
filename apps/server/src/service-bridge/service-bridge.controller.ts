@@ -15,6 +15,7 @@ import { ServiceBridgeService } from './service-bridge.service';
 import { RequireServiceScope, ServiceAuthGuard } from './service-auth.guard';
 import { ServiceScope } from './service-scope';
 import { MintSessionDto } from './dto/mint-session.dto';
+import { SessionExternalIdDto } from './dto/session-external-id.dto';
 import { ProvisionUserDto } from './dto/provision-user.dto';
 import { ResolveUserDto } from './dto/resolve-user.dto';
 import { WorkspaceResolver } from './workspace-resolver';
@@ -75,5 +76,40 @@ export class ServiceBridgeController {
     // consumed east-west by the relay, and an extra deletion Set-Cookie would pollute its reconstructed jar.
     setDocmostAuthCookie(res, authToken, this.environmentService);
     return { ok: true };
+  }
+
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
+  @Post('session/revoke')
+  @HttpCode(HttpStatus.OK)
+  @RequireServiceScope(ServiceScope.SessionRevoke)
+  async revokeSession(
+    @Body() dto: SessionExternalIdDto,
+  ): Promise<{
+    userId: string | null;
+    deactivated: boolean;
+    sessionsRevoked: number;
+  }> {
+    // #455: deactivate the shadow user (deactivatedAt + revoke live user_sessions) so the disabled
+    // identity's `/api/*` is cut on the next request, no NEW collab connection can authenticate, and re-mint
+    // is refused. The resolved fork `userId` is returned so the caller can force-close ALREADY-OPEN collab
+    // sockets via `POST /api/collab/force-disconnect-user` (that endpoint lives in the ESM-isolated
+    // CollabDisconnectModule — the collab/lib0 graph must NOT enter this module's jest-loadable import
+    // chain). `userId` is null for a never-provisioned identity (a benign no-op).
+    return this.service.deactivateShadowUser(dto.externalId);
+  }
+
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
+  @Post('session/restore')
+  @HttpCode(HttpStatus.OK)
+  @RequireServiceScope(ServiceScope.SessionRestore)
+  async restoreSession(
+    @Body() dto: SessionExternalIdDto,
+  ): Promise<{ reactivated: boolean }> {
+    // #455: clear `deactivatedAt` on re-enable so the identity can sign in + edit again (the mint path
+    // would otherwise refuse a still-deactivated shadow user forever).
+    const result = await this.service.reactivateShadowUser(dto.externalId);
+    return { reactivated: result.reactivated };
   }
 }

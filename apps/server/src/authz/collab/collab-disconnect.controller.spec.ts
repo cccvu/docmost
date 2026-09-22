@@ -17,6 +17,7 @@ jest.mock('../../collaboration/collaboration.gateway', () => ({
 import {
   CollabDisconnectController,
   ForceDisconnectDto,
+  ForceDisconnectUserDto,
 } from './collab-disconnect.controller';
 import { CollabServiceSecretGuard } from './service-secret.guard';
 import { SKIP_TRANSFORM_KEY } from '../../common/decorators/skip-transform.decorator';
@@ -187,6 +188,63 @@ describe('CollabDisconnectController.forceDisconnect (fail-safe PDP re-check)', 
     await controller.forceDisconnect({ userId: USER, pageId: PAGE });
 
     expect(order).toEqual(['recheck', 'gateway']);
+  });
+});
+
+describe('CollabDisconnectController.forceDisconnectUser (#455 — account-disable, all pages)', () => {
+  const USER = '11111111-1111-4111-8111-111111111111';
+
+  const build = () => {
+    const forceDisconnectUser = jest.fn();
+    const canUserAccessPage = jest.fn();
+    const controller = new CollabDisconnectController(
+      { forceDisconnectUser } as any,
+      { canUserAccessPage } as any,
+    );
+    return { controller, forceDisconnectUser, canUserAccessPage };
+  };
+
+  // Unlike the per-page force-disconnect, this is a whole-identity signal (the platform already deactivated
+  // the shadow user), so it closes UNCONDITIONALLY — no page-access re-check, no pageId.
+  it('unconditionally force-disconnects the user across all pages and returns {disconnected:true}', async () => {
+    const { controller, forceDisconnectUser, canUserAccessPage } = build();
+
+    const result = await controller.forceDisconnectUser({ userId: USER });
+
+    expect(result).toEqual({ disconnected: true });
+    expect(forceDisconnectUser).toHaveBeenCalledTimes(1);
+    expect(forceDisconnectUser).toHaveBeenCalledWith(USER);
+    // No PDP page re-check — there is no page; the deactivate already happened.
+    expect(canUserAccessPage).not.toHaveBeenCalled();
+  });
+
+  it('carries @SkipTransform() so the body is bare per the spec', () => {
+    expect(
+      Reflect.getMetadata(
+        SKIP_TRANSFORM_KEY,
+        CollabDisconnectController.prototype.forceDisconnectUser,
+      ),
+    ).toBe(true);
+  });
+});
+
+describe('ForceDisconnectUserDto validation (userId is a UUID)', () => {
+  const UUID = '33333333-3333-4333-8333-333333333333';
+  const errorsFor = (obj: Record<string, unknown>) =>
+    validate(plainToInstance(ForceDisconnectUserDto, obj));
+
+  it('accepts a valid UUID userId', async () => {
+    expect(await errorsFor({ userId: UUID })).toHaveLength(0);
+  });
+
+  it('rejects a non-UUID userId', async () => {
+    const errors = await errorsFor({ userId: 'nope' });
+    expect(errors.map((e) => e.property)).toContain('userId');
+  });
+
+  it('rejects a missing userId (no empty disconnect payload)', async () => {
+    const errors = await errorsFor({});
+    expect(errors.map((e) => e.property)).toContain('userId');
   });
 });
 

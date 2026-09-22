@@ -11,6 +11,11 @@ export class ForceDisconnectDto {
   @IsUUID() pageId!: string;
 }
 
+/** #455 — the whole-identity (all-pages) variant, for account disable. Only a userId: there is no page. */
+export class ForceDisconnectUserDto {
+  @IsUUID() userId!: string;
+}
+
 /**
  * CCC authorization integration — NOT upstream Docmost code.
  *
@@ -36,6 +41,26 @@ export class CollabDisconnectController {
     const canAccess = await this.pagePermissionRepo.canUserAccessPage(dto.userId, dto.pageId);
     if (canAccess) return { disconnected: false }; // still authorized — the signal was stale/coarse
     this.gateway.forceDisconnectUserFromPage(dto.pageId, dto.userId);
+    return { disconnected: true };
+  }
+
+  /**
+   * #455 — account-disable per-user disconnect: force-close EVERY live collab socket for a user across all
+   * documents (node-local). Invoked by the platform ONLY after `/api/service/session/revoke` has set the
+   * shadow user's `deactivatedAt` — a precise, whole-identity signal — so, UNLIKE the per-page
+   * `forceDisconnect` above (whose PagePermissionChanged signal can be coarse and therefore re-checks page
+   * access), this closes the sockets unconditionally: the residual it targets is a continuously-open editor
+   * with no per-message re-auth. Service-secret gated; an erroneous call only forces a transient reconnect
+   * that an active user re-authenticates fine. See collaboration.gateway.ts `forceDisconnectUser` for the
+   * single-node scope.
+   */
+  @HttpCode(HttpStatus.OK)
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+  @Post('force-disconnect-user')
+  async forceDisconnectUser(
+    @Body() dto: ForceDisconnectUserDto,
+  ): Promise<{ disconnected: boolean }> {
+    this.gateway.forceDisconnectUser(dto.userId);
     return { disconnected: true };
   }
 }

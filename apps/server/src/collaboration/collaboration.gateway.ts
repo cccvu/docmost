@@ -177,6 +177,33 @@ export class CollaborationGateway {
   }
 
   /**
+   * CCC integration seam (UPSTREAM_MODIFICATIONS.md): force-disconnect a user's LIVE collab sockets across
+   * EVERY document, for #455 account-disable. The per-page `forceDisconnectUserFromPage` above needs a
+   * pageId and routes to one doc-owning node; account disable has no single page and must reach all of the
+   * user's open editors at once.
+   *
+   * NODE-LOCAL by design: iterate THIS node's resident documents and close every connection whose
+   * authenticated user matches. It does NOT route through RedisSync, so it works with
+   * `COLLAB_DISABLE_REDIS` too, and — because the fork runs a SINGLE collab node (ECS `desired_count=1`,
+   * the fork process hosts Hocuspocus in-process) — it closes ALL of the user's sockets. A multi-node
+   * collab deployment would additionally need an all-nodes RedisSync broadcast (a documented follow-up);
+   * that is out of scope while `desired_count=1`.
+   *
+   * Safe to run even for an already-active user (it just closes their live sockets), but the caller only
+   * invokes it AFTER `deactivateShadowUser` has set `deactivatedAt`, so every reconnect then re-runs
+   * `onAuthenticate` → `isUserDisabled` → rejected, and the socket cannot come back.
+   */
+  forceDisconnectUser(userId: string): void {
+    for (const doc of this.hocuspocus.documents.values()) {
+      for (const connection of doc.getConnections()) {
+        if (connection.context?.user?.id === userId) {
+          connection.close();
+        }
+      }
+    }
+  }
+
+  /**
    * CCC integration seam (UPSTREAM_MODIFICATIONS.md): settle a page's live collaborative document by
    * running its pending debounced store NOW, routed to the doc-owning node via RedisSync. Thin
    * pass-through — the handler carries no policy and the caller (authz/) owns the authorization.

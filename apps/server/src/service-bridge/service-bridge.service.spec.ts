@@ -56,9 +56,25 @@ function makeDb(opts: { insertedId?: string } = {}) {
   return { db, captured, insertInto: db.insertInto };
 }
 
-function makeService(user: unknown, opts: { workspaceId?: string | null } = {}) {
+function makeService(
+  user: unknown,
+  opts: { workspaceId?: string | null; activeSessions?: number } = {},
+) {
   const { db, captured, insertInto } = makeDb();
-  const userRepo = { findByEmail: jest.fn(async () => user) } as any;
+  // executeTx(db, cb) → db.transaction().execute(cb); the repo mocks ignore the trx arg, so a passthrough
+  // trx is enough to exercise deactivateShadowUser's transactional deactivate + revoke (#455).
+  db.transaction = jest.fn(() => ({
+    execute: (fn: (trx: unknown) => unknown) => fn({}),
+  }));
+  const userRepo = {
+    findByEmail: jest.fn(async () => user),
+    updateUser: jest.fn(async () => undefined),
+  } as any;
+  const activeSessions = Array.from({ length: opts.activeSessions ?? 0 }, () => ({}));
+  const userSessionRepo = {
+    findActiveByUser: jest.fn(async () => activeSessions),
+    revokeByUserId: jest.fn(async () => undefined),
+  } as any;
   const sessionService = {
     createSessionAndToken: jest.fn(async () => 'authtoken-xyz'),
   } as any;
@@ -71,8 +87,22 @@ function makeService(user: unknown, opts: { workspaceId?: string | null } = {}) 
       return workspaceId;
     }),
   } as any;
-  const svc = new ServiceBridgeService(db, userRepo, sessionService, workspaces);
-  return { svc, sessionService, userRepo, captured, insertInto, workspaces };
+  const svc = new ServiceBridgeService(
+    db,
+    userRepo,
+    userSessionRepo,
+    sessionService,
+    workspaces,
+  );
+  return {
+    svc,
+    sessionService,
+    userRepo,
+    userSessionRepo,
+    captured,
+    insertInto,
+    workspaces,
+  };
 }
 
 describe('ServiceBridgeService.mintSession — no direct identity selection', () => {
@@ -241,5 +271,99 @@ describe('ServiceBridgeService.provisionShadowUser', () => {
     await svc.provisionShadowUser({ externalId: EXTERNAL_ID } as any);
 
     expect(captured.conflictUpdate).toMatchObject({ deletedAt: null });
+  });
+});
+
+// #455 — fork-side instant revocation. Deactivating the shadow user is the single lever that closes EVERY
+// fork content entrypoint (isUserDisabled is checked by jwt.strategy, onAuthenticate, and mintSession), so
+// disable() can stop a disabled identity reading/writing wiki content through an already-issued fork
+// credential. Real-Postgres mirror + the end-to-end mint/jwt refusal live in service-bridge.pg.spec.ts.
+describe('ServiceBridgeService.deactivateShadowUser (#455)', () => {
+  it('sets deactivatedAt AND revokes the shadow user’s live sessions, in one transaction', async () => {
+    const { svc, userRepo, userSessionRepo } = makeService(shadow(), {
+      activeSessions: 3,
+    });
+
+    const res = await svc.deactivateShadowUser(EXTERNAL_ID);
+
+    expect(res).toEqual({ userId: 'u1', deactivated: true, sessionsRevoked: 3 });
+    expect(userRepo.findByEmail).toHaveBeenCalledWith(
+      shadowEmailFor(EXTERNAL_ID),
+      'ws1',
+    );
+    // deactivatedAt set (NEVER deletedAt — disable is reversible), sessions revoked, both scoped to the id+ws.
+    expect(userRepo.updateUser).toHaveBeenCalledTimes(1);
+    const [patch, id, ws] = userRepo.updateUser.mock.calls[0];
+    expect(patch.deactivatedAt).toBeInstanceOf(Date);
+    expect(patch).not.toHaveProperty('deletedAt');
+    expect([id, ws]).toEqual(['u1', 'ws1']);
+    expect(userSessionRepo.revokeByUserId).toHaveBeenCalledWith(
+      'u1',
+      'ws1',
+      expect.anything(), // the transaction handle
+    );
+  });
+
+  it('is a benign no-op success for a never-provisioned identity (no shadow user)', async () => {
+    const { svc, userRepo, userSessionRepo } = makeService(undefined);
+
+    const res = await svc.deactivateShadowUser(EXTERNAL_ID);
+
+    expect(res).toEqual({ userId: null, deactivated: false, sessionsRevoked: 0 });
+    expect(userRepo.updateUser).not.toHaveBeenCalled();
+    expect(userSessionRepo.revokeByUserId).not.toHaveBeenCalled();
+  });
+
+  it('is idempotent — re-deactivating an already-deactivated shadow user still succeeds (retry-before-enable)', async () => {
+    const { svc, userRepo } = makeService(
+      shadow({ deactivatedAt: new Date(), deletedAt: null }),
+      { activeSessions: 0 },
+    );
+
+    const res = await svc.deactivateShadowUser(EXTERNAL_ID);
+
+    expect(res).toMatchObject({ userId: 'u1', deactivated: true });
+    // No "already deactivated" throw (unlike native deactivateUser) — the sweep just re-runs harmlessly.
+    expect(userRepo.updateUser).toHaveBeenCalledTimes(1);
+  });
+
+  it('503s when the fork has no workspace provisioned yet (never a silent wrong workspace)', async () => {
+    const { svc } = makeService(shadow(), { workspaceId: null });
+    await expect(svc.deactivateShadowUser(EXTERNAL_ID)).rejects.toBeInstanceOf(
+      ServiceUnavailableException,
+    );
+  });
+});
+
+describe('ServiceBridgeService.reactivateShadowUser (#455)', () => {
+  it('clears deactivatedAt (only) for a deactivated shadow user', async () => {
+    const { svc, userRepo } = makeService(
+      shadow({ deactivatedAt: new Date(), deletedAt: null }),
+    );
+
+    const res = await svc.reactivateShadowUser(EXTERNAL_ID);
+
+    expect(res).toEqual({ userId: 'u1', reactivated: true });
+    const [patch, id, ws] = userRepo.updateUser.mock.calls[0];
+    expect(patch).toEqual({ deactivatedAt: null }); // touches ONLY deactivatedAt, never deletedAt
+    expect([id, ws]).toEqual(['u1', 'ws1']);
+  });
+
+  it('is a no-op for an already-active shadow user (idempotent)', async () => {
+    const { svc, userRepo } = makeService(shadow({ deactivatedAt: null }));
+
+    const res = await svc.reactivateShadowUser(EXTERNAL_ID);
+
+    expect(res).toEqual({ userId: 'u1', reactivated: false });
+    expect(userRepo.updateUser).not.toHaveBeenCalled();
+  });
+
+  it('is a no-op for a never-provisioned identity', async () => {
+    const { svc, userRepo } = makeService(undefined);
+
+    const res = await svc.reactivateShadowUser(EXTERNAL_ID);
+
+    expect(res).toEqual({ userId: null, reactivated: false });
+    expect(userRepo.updateUser).not.toHaveBeenCalled();
   });
 });

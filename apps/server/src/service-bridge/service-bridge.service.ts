@@ -2,8 +2,10 @@ import { ForbiddenException, Injectable, Logger } from '@nestjs/common';
 import { InjectKysely } from 'nestjs-kysely';
 import { randomBytes } from 'crypto';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
+import { executeTx } from '@docmost/db/utils';
 import { User } from '@docmost/db/types/entity.types';
 import { UserRepo } from '@docmost/db/repos/user/user.repo';
+import { UserSessionRepo } from '@docmost/db/repos/session/user-session.repo';
 import { hashPassword, isUserDisabled } from '../common/helpers';
 import { SessionService } from '../core/session/session.service';
 import { ProvisionUserDto } from './dto/provision-user.dto';
@@ -28,6 +30,7 @@ export class ServiceBridgeService {
   constructor(
     @InjectKysely() private readonly db: KyselyDB,
     private readonly userRepo: UserRepo,
+    private readonly userSessionRepo: UserSessionRepo,
     private readonly sessionService: SessionService,
     private readonly workspaces: WorkspaceResolver,
   ) {}
@@ -120,6 +123,88 @@ export class ServiceBridgeService {
     const authToken = await this.sessionService.createSessionAndToken(user);
     this.logger.log(`minted session for shadow member ${user.id} ws=${workspaceId}`);
     return authToken;
+  }
+
+  /**
+   * #455 — fork-side instant revocation. Deactivate a fork-owned shadow user so a disabled platform
+   * identity can no longer read/write wiki content through an already-issued fork credential: set
+   * `deactivatedAt` (the platform-wide `isUserDisabled` predicate every fork auth entrypoint enforces —
+   * `jwt.strategy` on `/api/*`, `onAuthenticate` on new collab connections, and `mintSession.disqualify`
+   * on re-mint) AND revoke its live `user_sessions` (so `/api/*` is cut on the very next request). The
+   * caller (platform `disable()`) additionally force-disconnects the user's LIVE collab sockets via the
+   * gateway — see the controller.
+   *
+   * Keyed only on the caller's opaque `externalId`; the fork derives the shadow email + resolves the
+   * workspace, so a caller can only ever deactivate a shadow-namespace subject. IDEMPOTENT (re-stamping
+   * `deactivatedAt` and re-revoking already-revoked sessions are both no-ops) so it composes with
+   * `disable()`'s non-atomic retry-before-enable teardown. A never-provisioned identity (no shadow user)
+   * is a benign no-op success. Sets `deactivatedAt`, NEVER `deletedAt` (disable is reversible; soft-delete
+   * is a different, one-way lifecycle). We deliberately do NOT call the native `deactivateUser`
+   * (workspace.service.ts): it is upstream, requires an admin `authUser` context, and throws
+   * "already deactivated" — incompatible with idempotent retry.
+   */
+  async deactivateShadowUser(externalId: string): Promise<{
+    userId: string | null;
+    deactivated: boolean;
+    sessionsRevoked: number;
+  }> {
+    const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
+    const email = shadowEmailFor(externalId);
+    const user = await this.userRepo.findByEmail(email, workspaceId);
+    if (!user) {
+      // Never-logged-in identity: nothing to deactivate. A benign no-op, not an error — the platform kill
+      // is already complete on its side and there is no fork credential to revoke.
+      return { userId: null, deactivated: false, sessionsRevoked: 0 };
+    }
+    // Count active sessions for the audit trail BEFORE the sweep (an informational number; a session
+    // racing in between is irrelevant to the security outcome, which `deactivatedAt` enforces regardless).
+    const active = await this.userSessionRepo.findActiveByUser(
+      user.id,
+      workspaceId,
+    );
+    await executeTx(this.db, async (trx) => {
+      await this.userRepo.updateUser(
+        { deactivatedAt: new Date() },
+        user.id,
+        workspaceId,
+        trx,
+      );
+      await this.userSessionRepo.revokeByUserId(user.id, workspaceId, trx);
+    });
+    this.logger.log(
+      `deactivated shadow user ${user.id} (externalId=${externalId} ws=${workspaceId} sessionsRevoked=${active.length})`,
+    );
+    return { userId: user.id, deactivated: true, sessionsRevoked: active.length };
+  }
+
+  /**
+   * #455 — paired with {@link deactivateShadowUser}: clear `deactivatedAt` so a re-enabled platform
+   * identity can sign in and use the wiki again. The provision upsert deliberately does NOT clear
+   * `deactivatedAt` (a re-provision must not silently undo an admin deactivation), so this explicit restore
+   * is the ONLY path back. IDEMPOTENT: a no-op success when there is no shadow user or it is already
+   * active. Revives NO sessions/keys/tokens (those are terminally revoked platform-side, #117) — re-enable
+   * forces a fresh login. Touches ONLY `deactivatedAt`, never `deletedAt`.
+   */
+  async reactivateShadowUser(externalId: string): Promise<{
+    userId: string | null;
+    reactivated: boolean;
+  }> {
+    const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
+    const email = shadowEmailFor(externalId);
+    const user = await this.userRepo.findByEmail(email, workspaceId);
+    if (!user || !user.deactivatedAt) {
+      // No shadow user yet, or already active — nothing to clear. Benign no-op.
+      return { userId: user?.id ?? null, reactivated: false };
+    }
+    await this.userRepo.updateUser(
+      { deactivatedAt: null },
+      user.id,
+      workspaceId,
+    );
+    this.logger.log(
+      `reactivated shadow user ${user.id} (externalId=${externalId} ws=${workspaceId})`,
+    );
+    return { userId: user.id, reactivated: true };
   }
 
   private disqualify(user?: User): string | null {
