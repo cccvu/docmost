@@ -378,6 +378,11 @@ describe('ServiceSpaceService member mutations — rule M, no self-raising write
       expect(ran(spy, 'from group_users')).toBe(false);
     });
 
+    it('an unrecognized stored role (even a prototype key) ranks as none, so any raise of it is refused', async () => {
+      const { svc } = make(respondTo({ member: { role: 'toString', userId: ME } }));
+      await expectSelfGrant(svc.changeMemberRole('sp1', 'm1', 'reader', 'ext-me'));
+    });
+
     it('a missing row is a 404, never judged as "not self"', async () => {
       const { svc } = make(respondTo({ member: null }));
       await expect(svc.changeMemberRole('sp1', 'm1', 'admin', 'ext-me')).rejects.toBeInstanceOf(NotFoundException);

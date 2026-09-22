@@ -11,6 +11,7 @@ import { KyselyDB, KyselyTransaction } from '@docmost/db/types/kysely.types';
 import {
   AddSpaceMemberDto,
   CreateSpaceDto,
+  SPACE_ROLES,
   SpaceMemberRole,
   UpdateSpaceDto,
 } from './dto/space-admin.dto';
@@ -65,7 +66,7 @@ const LAST_ADMIN =
 /** Rule M (#486) ranks: a missing or soft-deleted row is 0 (the upsert revives a soft-deleted row). */
 const ROLE_RANK: Record<SpaceMemberRole, number> = { reader: 1, writer: 2, admin: 3 };
 const rank = (role: string | null | undefined): number =>
-  role && role in ROLE_RANK ? ROLE_RANK[role as SpaceMemberRole] : 0;
+  (SPACE_ROLES as readonly unknown[]).includes(role) ? ROLE_RANK[role as SpaceMemberRole] : 0;
 
 /** The 403 body carries a machine-readable `code` the platform maps to its `self_grant` problem. */
 const selfGrant = () =>
