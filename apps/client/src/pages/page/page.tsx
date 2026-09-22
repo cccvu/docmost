@@ -176,6 +176,8 @@ function PageContent({ pageSlug }: { pageSlug: string | undefined }) {
           editable={canEdit}
           creator={page.creator}
           contributors={page.contributors}
+          lastUpdatedBy={page.lastUpdatedBy}
+          updatedAt={page.updatedAt}
           canComment={canComment}
         />
         <MemoizedHistoryModal pageId={page.id} />
