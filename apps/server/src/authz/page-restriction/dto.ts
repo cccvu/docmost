@@ -1,4 +1,4 @@
-import { ArrayMaxSize, IsArray, IsIn, IsOptional, IsString, IsUUID } from 'class-validator';
+import { ArrayMaxSize, IsArray, IsBoolean, IsIn, IsOptional, IsString, IsUUID } from 'class-validator';
 
 /** Page permission role vocabulary (schema: reader → #viewer, writer → #editor). */
 export type PageGrantRole = 'reader' | 'writer';
@@ -12,6 +12,15 @@ export const MAX_PAGE_GRANTEES = 256;
 
 export class RestrictPageDto {
   @IsUUID() pageId!: string;
+}
+
+/**
+ * #486 (A3): `requireActorCoverage` makes unrestrict refuse unless the actor can edit the page and no direct
+ * sub-page would be exposed. The platform relay always sends it (the agent path); the native UI omits it. The
+ * flag can only TIGHTEN — omitting it is today's behaviour.
+ */
+export class RemoveRestrictionDto extends RestrictPageDto {
+  @IsOptional() @IsBoolean() requireActorCoverage?: boolean;
 }
 
 export class AddPagePermissionDto {
