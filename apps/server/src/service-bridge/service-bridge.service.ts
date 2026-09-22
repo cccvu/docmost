@@ -109,6 +109,20 @@ export class ServiceBridgeService {
   }
 
   /**
+   * #486 — the shadow user id for a platform identity WITHOUT provisioning one. For identities that are only
+   * COMPARED, never written (the actor of a member re-role, rule M): a never-provisioned identity has no Docmost
+   * user, so it cannot be — or be in a group that is — the subject of any membership row, and creating a user
+   * just to compare would be a side effect. Same derivation + lookup as mint/deactivate: the lower-cased shadow
+   * email (so an id's case variants resolve to ONE user), soft-deleted rows included (a membership row can still
+   * reference one).
+   */
+  async findShadowUserId(externalId: string): Promise<string | null> {
+    const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
+    const user = await this.userRepo.findByEmail(shadowEmailFor(externalId), workspaceId);
+    return user?.id ?? null;
+  }
+
+  /**
    * Mint a Docmost session for a fork-owned shadow user, named only by the caller's `externalId`. This is
    * DELIBERATELY NOT a "log in as anyone" primitive: the fork wraps `externalId` into the shadow namespace
    * itself, so the caller cannot select an arbitrary Docmost identity — and, as retained defense-in-depth,

@@ -6,6 +6,7 @@ import { ContentCursorDto, ContentListDto, ContentSortDto } from './content-read
 import { MintSessionDto } from './mint-session.dto';
 import { ProvisionUserDto } from './provision-user.dto';
 import { SessionExternalIdDto } from './session-external-id.dto';
+import { UpdateSpaceMemberDto } from './space-admin.dto';
 
 /**
  * These DTOs' class-validator decorators are the load-bearing input guard for the new service-bridge ops (the
@@ -179,6 +180,24 @@ describe('service-bridge DTO validation (constraints are load-bearing)', () => {
         expect(await errCount(SessionExternalIdDto, { externalId })).toBeGreaterThan(0);
       }
       expect(await errCount(SessionExternalIdDto, {})).toBeGreaterThan(0); // missing
+    });
+  });
+
+  /**
+   * #486 rule M: the member re-role must name its actor so the fork can refuse a self-raising write. The field
+   * is REQUIRED (fail closed): a caller that omits it gets a 400, never an unchecked write.
+   */
+  describe('UpdateSpaceMemberDto (actorExternalId is required — rule M fails closed)', () => {
+    it('accepts a role plus a well-formed actorExternalId', async () => {
+      expect(await errCount(UpdateSpaceMemberDto, { role: 'writer', actorExternalId: UUID })).toBe(0);
+    });
+
+    it('rejects a missing, empty or hostile actorExternalId, and an unknown role', async () => {
+      expect(await errCount(UpdateSpaceMemberDto, { role: 'writer' })).toBeGreaterThan(0);
+      for (const actorExternalId of ['', 'a@b', 'a b', 'a'.repeat(129)]) {
+        expect(await errCount(UpdateSpaceMemberDto, { role: 'writer', actorExternalId })).toBeGreaterThan(0);
+      }
+      expect(await errCount(UpdateSpaceMemberDto, { role: 'owner', actorExternalId: UUID })).toBeGreaterThan(0);
     });
   });
 });

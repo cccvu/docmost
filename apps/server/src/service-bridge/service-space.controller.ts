@@ -33,7 +33,8 @@ import { parseSubCollectionQuery } from './dto/sub-collection-page.dto';
  * CCC service-bridge — NOT upstream Docmost code.
  *
  * The space + membership control plane the platform calls (it authorizes `space#administer` first; these
- * carry no authorization policy — the service enforces only the last-admin DATA invariant, as a 409).
+ * carry no authorization policy — the service enforces the last-admin DATA invariant (409) and refuses a
+ * self-raising membership write (403 `self_grant`), both under the space row lock).
  * `RemoteOnlyGuard` 404s the surface unless AUTHZ_MODE=remote; the scoped ServiceAuthGuard
  * enforces least privilege (read vs write scopes). The fork owns the schema + the transactional create.
  */
@@ -136,7 +137,7 @@ export class ServiceSpaceController {
     @Param('memberId', ParseUUIDPipe) memberId: string,
     @Body() dto: UpdateSpaceMemberDto,
   ): Promise<{ ok: true }> {
-    await this.service.changeMemberRole(spaceId, memberId, dto.role);
+    await this.service.changeMemberRole(spaceId, memberId, dto.role, dto.actorExternalId);
     return { ok: true };
   }
 

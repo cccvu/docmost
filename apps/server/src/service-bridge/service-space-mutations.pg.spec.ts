@@ -1,6 +1,6 @@
 import * as postgres from 'postgres';
 import { Kysely } from 'kysely';
-import { ConflictException, NotFoundException } from '@nestjs/common';
+import { ConflictException, ForbiddenException, NotFoundException } from '@nestjs/common';
 import { UserRepo } from '@docmost/db/repos/user/user.repo';
 import { ServiceSpaceService } from './service-space.service';
 import { ServiceBridgeService } from './service-bridge.service';
@@ -23,7 +23,10 @@ import {
  *   - last-admin: a sole live admin cannot be demoted, removed or upsert-demoted; a group admin row counts; a
  *     soft-deleted admin does not; the guard holds on an archived space; a foreign-space memberId is a 404;
  *   - the space lock: FOR NO KEY UPDATE makes a second mutation WAIT (observed in pg_stat_activity, not by
- *     wall-clock) without blocking an FK insert, and a concurrent demote pair leaves exactly one admin.
+ *     wall-clock) without blocking an FK insert, and a concurrent demote pair leaves exactly one admin;
+ *   - rule M: no self-add, no raising a row that covers the actor (own row or a group they are in), case
+ *     variants of either id included; narrowing and removal stay allowed. (A re-role WITHOUT its actor is a
+ *     400 at the ValidationPipe — pinned in dto-validation.spec.ts and the wire spec, not reachable here.)
  *
  * Shadow users go through the REAL `ServiceBridgeService.provisionShadowUser` (the lower-cased shadow-email
  * upsert), so id canonicalization is the production code path. The testkit is reused unedited; the DDL it lacks
@@ -46,6 +49,7 @@ const WS = uuid(100);
 const S = uuid(1); // the space under test
 const S_OTHER = uuid(2); // another space (cross-space memberId)
 const GROUP = uuid(60);
+const ACTOR = 'ops-admin'; // the acting identity where rule M is not under test (never covered by a row)
 
 d('ServiceSpaceService member mutations on real Postgres (#486)', () => {
   jest.setTimeout(30_000); // provisioning bcrypt-hashes an unusable password per new shadow user
@@ -132,6 +136,13 @@ d('ServiceSpaceService member mutations on real Postgres (#486)', () => {
         deleted_at timestamptz,
         constraint users_email_workspace_id_unique unique (email, workspace_id)
       )`;
+    // Rule M's group coverage reads group_users (faithful to 20240324T085700-groups.ts minus the FKs).
+    await pg`
+      create table group_users (
+        id uuid primary key default gen_random_uuid(), user_id uuid not null, group_id uuid not null,
+        created_at timestamptz not null default now(), updated_at timestamptz not null default now(),
+        constraint group_users_group_id_user_id_unique unique (group_id, user_id)
+      )`;
     // A child table with an FK to spaces: proves the space lock does not block FK KEY SHARE.
     await pg`create table fk_probe (id serial primary key, space_id uuid not null references spaces(id))`;
 
@@ -148,6 +159,7 @@ d('ServiceSpaceService member mutations on real Postgres (#486)', () => {
 
   beforeEach(async () => {
     await pg`delete from fk_probe`;
+    await pg`delete from group_users`;
     await pg`delete from space_members`;
     await pg`delete from spaces`;
     await pg`delete from users`;
@@ -161,7 +173,7 @@ d('ServiceSpaceService member mutations on real Postgres (#486)', () => {
       const m = await member(S, { userId: alice }, 'admin');
       await member(S, { userId: await shadow('bob') }, 'writer');
 
-      await expect(svc.changeMemberRole(S, m, 'writer')).rejects.toBeInstanceOf(ConflictException);
+      await expect(svc.changeMemberRole(S, m, 'writer', ACTOR)).rejects.toBeInstanceOf(ConflictException);
       await expect(svc.removeMember(S, m)).rejects.toBeInstanceOf(ConflictException);
       await expect(
         svc.addMember(S, { externalId: 'alice', role: 'reader', addedByExternalId: 'bob' }),
@@ -173,7 +185,7 @@ d('ServiceSpaceService member mutations on real Postgres (#486)', () => {
       const alice = await shadow('alice');
       const m = await member(S, { userId: alice }, 'admin');
       await member(S, { groupId: GROUP }, 'admin');
-      await expect(svc.changeMemberRole(S, m, 'reader')).resolves.toBeUndefined();
+      await expect(svc.changeMemberRole(S, m, 'reader', ACTOR)).resolves.toBeUndefined();
       expect(await roleOf(m)).toBe('reader');
       await expect(svc.removeMember(S, m)).resolves.toBeUndefined();
       expect(await roleOf(m)).toBeUndefined();
@@ -182,7 +194,7 @@ d('ServiceSpaceService member mutations on real Postgres (#486)', () => {
     it('a SOFT-DELETED admin row does not count as another admin', async () => {
       const m = await member(S, { userId: await shadow('alice') }, 'admin');
       await member(S, { userId: await shadow('bob') }, 'admin', { deleted: true });
-      await expect(svc.changeMemberRole(S, m, 'writer')).rejects.toBeInstanceOf(ConflictException);
+      await expect(svc.changeMemberRole(S, m, 'writer', ACTOR)).rejects.toBeInstanceOf(ConflictException);
       await expect(svc.removeMember(S, m)).rejects.toBeInstanceOf(ConflictException);
     });
 
@@ -196,7 +208,7 @@ d('ServiceSpaceService member mutations on real Postgres (#486)', () => {
 
     it('a memberId from ANOTHER space is a 404 for change and remove (never a cross-space write)', async () => {
       const foreign = await member(S_OTHER, { userId: await shadow('alice') }, 'writer');
-      await expect(svc.changeMemberRole(S, foreign, 'admin')).rejects.toBeInstanceOf(NotFoundException);
+      await expect(svc.changeMemberRole(S, foreign, 'admin', ACTOR)).rejects.toBeInstanceOf(NotFoundException);
       await expect(svc.removeMember(S, foreign)).rejects.toBeInstanceOf(NotFoundException);
       expect(await roleOf(foreign)).toBe('writer');
     });
@@ -209,7 +221,7 @@ d('ServiceSpaceService member mutations on real Postgres (#486)', () => {
       const holder = await holdSpaceLock(S);
 
       let settled = false;
-      const change = svc.changeMemberRole(S, m, 'reader').finally(() => (settled = true));
+      const change = svc.changeMemberRole(S, m, 'reader', ACTOR).finally(() => (settled = true));
       await waitForLockWaiters(1); // the bridge transaction is blocked on the space row, observed in the engine
       expect(settled).toBe(false);
       // NO KEY UPDATE is compatible with the FOR KEY SHARE an FK check takes: content writes are not held up.
@@ -225,7 +237,7 @@ d('ServiceSpaceService member mutations on real Postgres (#486)', () => {
       const a = await member(S, { userId: await shadow('alice') }, 'admin');
       const b = await member(S, { userId: await shadow('bob') }, 'admin');
       const holder = await holdSpaceLock(S);
-      const both = Promise.allSettled([svc.changeMemberRole(S, a, 'writer'), svc.changeMemberRole(S, b, 'writer')]);
+      const both = Promise.allSettled([svc.changeMemberRole(S, a, 'writer', ACTOR), svc.changeMemberRole(S, b, 'writer', ACTOR)]);
       await waitForLockWaiters(2); // both are genuinely in flight at once, queued behind the holder
       holder.release();
       await holder.done;
@@ -236,6 +248,103 @@ d('ServiceSpaceService member mutations on real Postgres (#486)', () => {
       expect(rejected).toHaveLength(1);
       expect(rejected[0].reason).toBeInstanceOf(ConflictException);
       expect(await liveAdmins(S)).toBe(1);
+    });
+  });
+  describe('rule M — no self-raising membership writes', () => {
+    const selfGrant = async (p: Promise<unknown>) => {
+      const err = await p.then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+      expect(err).toBeInstanceOf(ForbiddenException);
+      expect((err as ForbiddenException).getResponse()).toMatchObject({ code: 'self_grant' });
+    };
+    const memberCount = async (): Promise<number> =>
+      (await pg<{ n: number }[]>`select count(*)::int as n from space_members where space_id = ${S}`)[0].n;
+
+    it.each(['reader', 'writer', 'admin'] as const)('refuses adding yourself as %s (nothing written)', async (role) => {
+      await member(S, { userId: await shadow('boss') }, 'admin');
+      await selfGrant(svc.addMember(S, { externalId: 'alice', role, addedByExternalId: 'alice' }));
+      expect(await memberCount()).toBe(1);
+    });
+
+    it('refuses a case variant of your own externalId (both resolve to ONE shadow user)', async () => {
+      await selfGrant(svc.addMember(S, { externalId: 'ALICE', role: 'reader', addedByExternalId: 'alice' }));
+      expect(await memberCount()).toBe(0);
+    });
+
+    it('refuses an upsert raising your own row; allows the upsert that demotes it', async () => {
+      const alice = await shadow('alice');
+      const own = await member(S, { userId: alice }, 'reader');
+      await member(S, { userId: await shadow('boss') }, 'admin');
+      await selfGrant(svc.addMember(S, { externalId: 'alice', role: 'admin', addedByExternalId: 'alice' }));
+      expect(await roleOf(own)).toBe('reader');
+
+      await pg`update space_members set role = 'admin' where id = ${own}`;
+      await expect(
+        svc.addMember(S, { externalId: 'alice', role: 'reader', addedByExternalId: 'alice' }),
+      ).resolves.toMatchObject({ memberId: own });
+      expect(await roleOf(own)).toBe('reader');
+    });
+
+    it('refuses reviving your own SOFT-DELETED row (it ranks as no membership)', async () => {
+      const own = await member(S, { userId: await shadow('alice') }, 'admin', { deleted: true });
+      await selfGrant(svc.addMember(S, { externalId: 'alice', role: 'reader', addedByExternalId: 'alice' }));
+      const rows = await pg<{ deletedAt: Date | null }[]>`select deleted_at from space_members where id = ${own}`;
+      expect(rows[0].deletedAt).not.toBeNull();
+    });
+
+    it('PATCH: refuses raising your own row (also via an upper-cased memberId or actor id); allows demoting it', async () => {
+      const own = await member(S, { userId: await shadow('alice') }, 'writer');
+      await member(S, { userId: await shadow('boss') }, 'admin');
+      await selfGrant(svc.changeMemberRole(S, own, 'admin', 'alice'));
+      await selfGrant(svc.changeMemberRole(S, own.toUpperCase(), 'admin', 'alice'));
+      await selfGrant(svc.changeMemberRole(S, own, 'admin', 'ALICE'));
+      expect(await roleOf(own)).toBe('writer');
+
+      await expect(svc.changeMemberRole(S, own, 'reader', 'alice')).resolves.toBeUndefined();
+      expect(await roleOf(own)).toBe('reader');
+    });
+
+    it('PATCH: a group row the actor belongs to cannot be raised, but can be demoted', async () => {
+      const alice = await shadow('alice');
+      await pg`insert into group_users (user_id, group_id) values (${alice}, ${GROUP})`;
+      const grp = await member(S, { groupId: GROUP }, 'reader');
+      await member(S, { userId: await shadow('boss') }, 'admin');
+      await selfGrant(svc.changeMemberRole(S, grp, 'writer', 'alice'));
+      expect(await roleOf(grp)).toBe('reader');
+
+      await pg`update space_members set role = 'admin' where id = ${grp}`;
+      await expect(svc.changeMemberRole(S, grp, 'reader', 'alice')).resolves.toBeUndefined();
+      expect(await roleOf(grp)).toBe('reader');
+    });
+
+    it("PATCH: raising a group row the actor is NOT in (or another user's row) is allowed", async () => {
+      await shadow('alice');
+      await pg`insert into group_users (user_id, group_id) values (${await shadow('carol')}, ${GROUP})`;
+      const grp = await member(S, { groupId: GROUP }, 'reader');
+      const bob = await member(S, { userId: await shadow('bob') }, 'reader');
+      await expect(svc.changeMemberRole(S, grp, 'admin', 'alice')).resolves.toBeUndefined();
+      await expect(svc.changeMemberRole(S, bob, 'writer', 'alice')).resolves.toBeUndefined();
+      expect([await roleOf(grp), await roleOf(bob)]).toEqual(['admin', 'writer']);
+    });
+
+    it('PATCH: an actor that was never provisioned is covered by nothing, and is not created', async () => {
+      const grp = await member(S, { groupId: GROUP }, 'reader');
+      await expect(svc.changeMemberRole(S, grp, 'writer', 'nobody')).resolves.toBeUndefined();
+      const rows = await pg`select 1 from users where email = ${shadowEmailFor('nobody')}`;
+      expect(rows).toHaveLength(0);
+    });
+
+    it('removing yourself, or a group you belong to, stays allowed', async () => {
+      const alice = await shadow('alice');
+      await pg`insert into group_users (user_id, group_id) values (${alice}, ${GROUP})`;
+      await member(S, { userId: await shadow('boss') }, 'admin');
+      const own = await member(S, { userId: alice }, 'admin');
+      const grp = await member(S, { groupId: GROUP }, 'writer');
+      await expect(svc.removeMember(S, own)).resolves.toBeUndefined();
+      await expect(svc.removeMember(S, grp)).resolves.toBeUndefined();
+      expect(await memberCount()).toBe(1);
     });
   });
 });

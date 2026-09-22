@@ -1,6 +1,7 @@
 import {
   BadRequestException,
   ConflictException,
+  ForbiddenException,
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
@@ -61,6 +62,19 @@ const iso = (d: Date | string): string =>
 const LAST_ADMIN =
   'a space must keep at least one admin — promote another member to admin before demoting or removing this one';
 
+/** Rule M (#486) ranks: a missing or soft-deleted row is 0 (the upsert revives a soft-deleted row). */
+const ROLE_RANK: Record<SpaceMemberRole, number> = { reader: 1, writer: 2, admin: 3 };
+const rank = (role: string | null | undefined): number =>
+  role && role in ROLE_RANK ? ROLE_RANK[role as SpaceMemberRole] : 0;
+
+/** The 403 body carries a machine-readable `code` the platform maps to its `self_grant` problem. */
+const selfGrant = () =>
+  new ForbiddenException({
+    code: 'self_grant',
+    message:
+      'you cannot add yourself or raise a membership that includes you; another administrator must do this',
+  });
+
 /**
  * CCC service-bridge — NOT upstream Docmost code.
  *
@@ -83,6 +97,12 @@ const LAST_ADMIN =
  * a fresh snapshot, so the admin count sees whatever the previously serialized transaction committed.
  * Residual: the native `/api/spaces/members/*` path (upstream SpaceMemberService) takes no such lock, so a
  * native change racing a bridge change can still orphan a space (a workspace admin recovers via the cascade).
+ *
+ * Rule M (#486, self-dealing): inside that same transaction, a write that sets a role on a membership row the
+ * ACTOR is covered by (their own user row, or a group row they are in) is refused (403 `self_grant`) when the
+ * new role outranks the row's current live role. Narrowing (self-demote, removing yourself or your group)
+ * stays allowed, subject to the last-admin guard. Both sides of every comparison are Docmost user ids read from
+ * this database (shadow users derive from the lower-cased externalId), so an id's case variants cannot slip by.
  */
 @Injectable()
 export class ServiceSpaceService {
@@ -281,6 +301,8 @@ export class ServiceSpaceService {
         for update
       `.execute(trx);
       const row = cur.rows[0];
+      // Rule M: adding yourself, or raising your own row (a soft-deleted one ranks 0), is refused.
+      if (memberUserId === addedById && rank(dto.role) > rank(row?.role)) throw selfGrant();
       if (row?.role === 'admin' && dto.role !== 'admin') await this.assertAnotherAdmin(trx, spaceId, row.id);
       const res = await sql<{ id: string }>`
         insert into space_members (user_id, space_id, role, added_by_id)
@@ -292,18 +314,29 @@ export class ServiceSpaceService {
     });
   }
 
-  async changeMemberRole(spaceId: string, memberId: string, role: SpaceMemberRole): Promise<void> {
+  async changeMemberRole(
+    spaceId: string,
+    memberId: string,
+    role: SpaceMemberRole,
+    actorExternalId: string,
+  ): Promise<void> {
     const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
+    // Looked up, never provisioned: an actor with no shadow user cannot be covered by any membership row.
+    const actorId = await this.bridge.findShadowUserId(actorExternalId);
     await this.db.transaction().execute(async (trx) => {
       await this.lockSpace(trx, workspaceId, spaceId, true);
-      // `id AND space_id`: a memberId from another space is a 404, never a cross-space write.
-      const cur = await sql<{ role: string }>`
-        select role from space_members
+      // `id AND space_id`: a memberId from another space is a 404 (never a cross-space write, and never
+      // "not self" — the row must be found before rule M can be judged).
+      const cur = await sql<{ userId: string | null; groupId: string | null; role: string }>`
+        select user_id, group_id, role from space_members
         where id = ${memberId} and space_id = ${spaceId} and deleted_at is null
         for update
       `.execute(trx);
       const row = cur.rows[0];
       if (!row) throw new NotFoundException('member not found');
+      if (rank(role) > rank(row.role) && actorId !== null && (await this.covers(trx, row, actorId))) {
+        throw selfGrant();
+      }
       if (row.role === 'admin' && role !== 'admin') await this.assertAnotherAdmin(trx, spaceId, memberId);
       await sql`
         update space_members set role = ${role}, updated_at = now()
@@ -328,6 +361,20 @@ export class ServiceSpaceService {
       if (row.role === 'admin' && row.deletedAt == null) await this.assertAnotherAdmin(trx, spaceId, memberId);
       await sql`delete from space_members where id = ${memberId} and space_id = ${spaceId}`.execute(trx);
     });
+  }
+
+  /** Rule M: the row is the actor's own user row, or a group row the actor is a member of (groups are flat). */
+  private async covers(
+    trx: KyselyTransaction,
+    row: { userId: string | null; groupId: string | null },
+    actorId: string,
+  ): Promise<boolean> {
+    if (row.userId !== null) return row.userId === actorId;
+    if (row.groupId === null) return false;
+    const res = await sql`
+      select 1 from group_users where group_id = ${row.groupId} and user_id = ${actorId}
+    `.execute(trx);
+    return res.rows.length > 0;
   }
 
   /**
