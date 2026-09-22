@@ -390,4 +390,16 @@ describe('ServiceSpaceService.unarchive', () => {
     const { svc } = make(() => []);
     await expect(svc.unarchive('sp1')).rejects.toBeInstanceOf(NotFoundException);
   });
+
+  it('maps a unique violation (the personal-space index) to 409, and rethrows any other error', async () => {
+    const unique = make(() => {
+      throw Object.assign(new Error('duplicate key'), { code: '23505' });
+    });
+    await expect(unique.svc.unarchive('sp1')).rejects.toBeInstanceOf(ConflictException);
+
+    const other = make(() => {
+      throw Object.assign(new Error('boom'), { code: '57014' });
+    });
+    await expect(other.svc.unarchive('sp1')).rejects.toThrow('boom');
+  });
 });

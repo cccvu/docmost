@@ -271,11 +271,22 @@ export class ServiceSpaceService {
 
   async unarchive(spaceId: string): Promise<void> {
     const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
-    const res = await sql<{ id: string }>`
-      update spaces set deleted_at = null, updated_at = now()
-      where id = ${spaceId} and workspace_id = ${workspaceId} and deleted_at is not null
-      returning id
-    `.execute(this.db);
+    let res: { rows: { id: string }[] };
+    try {
+      res = await sql<{ id: string }>`
+        update spaces set deleted_at = null, updated_at = now()
+        where id = ${spaceId} and workspace_id = ${workspaceId} and deleted_at is not null
+        returning id
+      `.execute(this.db);
+    } catch (e) {
+      // Only `spaces_personal_creator_unique` (partial on deleted_at IS NULL) can fire here: the owner of an
+      // archived PERSONAL space already has another live one. The slug index is not partial, so an archived
+      // space still holds its slug and reviving it cannot collide. The message deliberately names no owner.
+      if ((e as { code?: string })?.code === '23505') {
+        throw new ConflictException('cannot restore this space: its owner already has an active personal space');
+      }
+      throw e;
+    }
     if (res.rows.length === 0) throw new NotFoundException('space not found or not archived');
   }
 

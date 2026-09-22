@@ -24,6 +24,7 @@ import {
  *     soft-deleted admin does not; the guard holds on an archived space; a foreign-space memberId is a 404;
  *   - the space lock: FOR NO KEY UPDATE makes a second mutation WAIT (observed in pg_stat_activity, not by
  *     wall-clock) without blocking an FK insert, and a concurrent demote pair leaves exactly one admin;
+ *   - restore: reviving an archived PERSONAL space whose owner already has a live one is a 409, not a 500;
  *   - rule M: no self-add, no raising a row that covers the actor (own row or a group they are in), case
  *     variants of either id included; narrowing and removal stay allowed. (A re-role WITHOUT its actor is a
  *     400 at the ValidationPipe — pinned in dto-validation.spec.ts and the wire spec, not reachable here.)
@@ -136,6 +137,9 @@ d('ServiceSpaceService member mutations on real Postgres (#486)', () => {
         deleted_at timestamptz,
         constraint users_email_workspace_id_unique unique (email, workspace_id)
       )`;
+    await pg`
+      create unique index spaces_personal_creator_unique on spaces (creator_id)
+      where is_personal = true and deleted_at is null`; // 20260620T010047-personal-spaces.ts
     // Rule M's group coverage reads group_users (faithful to 20240324T085700-groups.ts minus the FKs).
     await pg`
       create table group_users (
@@ -250,6 +254,27 @@ d('ServiceSpaceService member mutations on real Postgres (#486)', () => {
       expect(await liveAdmins(S)).toBe(1);
     });
   });
+  describe('unarchive', () => {
+    const personal = (id: string, creatorId: string, archived: boolean) =>
+      pg`insert into spaces (id, name, slug, workspace_id, creator_id, is_personal, deleted_at)
+         values (${id}, 'p', ${'p-' + id.slice(-3)}, ${WS}, ${creatorId}, true, ${archived ? pg`now()` : null})`;
+
+    it("409s restoring a personal space whose owner already has a live one (it stays archived)", async () => {
+      const alice = await shadow('alice');
+      await personal(uuid(10), alice, true);
+      await personal(uuid(11), alice, false);
+      await expect(svc.unarchive(uuid(10))).rejects.toBeInstanceOf(ConflictException);
+      const rows = await pg<{ deletedAt: Date | null }[]>`select deleted_at from spaces where id = ${uuid(10)}`;
+      expect(rows[0].deletedAt).not.toBeNull();
+    });
+
+    it('restores an ordinary archived space', async () => {
+      await pg`update spaces set deleted_at = now() where id = ${S}`;
+      await expect(svc.unarchive(S)).resolves.toBeUndefined();
+      await expect(svc.unarchive(S)).rejects.toBeInstanceOf(NotFoundException); // no longer archived
+    });
+  });
+
   describe('rule M — no self-raising membership writes', () => {
     const selfGrant = async (p: Promise<unknown>) => {
       const err = await p.then(
