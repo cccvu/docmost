@@ -209,6 +209,8 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
 
   // The 5 inline (non-component) scalar bodies, tied to the CONTROLLER return types (a signature change reds).
   const MINT = keysOf<Awaited<ReturnType<ServiceBridgeController['mintSession']>>>({ ok: true });
+  const REVOKE = keysOf<Awaited<ReturnType<ServiceBridgeController['revokeSession']>>>({ userId: true, deactivated: true, sessionsRevoked: true });
+  const RESTORE = keysOf<Awaited<ReturnType<ServiceBridgeController['restoreSession']>>>({ reactivated: true });
   const DEFAULT_WS = keysOf<Awaited<ReturnType<ServiceWorkspaceController['getDefault']>>>({ workspaceId: true });
   const CREATE_SPACE = keysOf<Awaited<ReturnType<ServiceSpaceController['create']>>>({ id: true, slug: true, name: true });
   const ADD_MEMBER = keysOf<Awaited<ReturnType<ServiceSpaceController['addMember']>>>({ memberId: true, userId: true });
@@ -225,6 +227,8 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     { id: 'provisionShadowUser', method: 'post', path: '/api/service/users', expect: { kind: 'ref', name: 'ProvisionedUser' } },
     { id: 'resolveUser', method: 'post', path: '/api/service/users/resolve', expect: { kind: 'ref', name: 'ProvisionedUser' } },
     { id: 'mintSession', method: 'post', path: '/api/service/session', expect: { kind: 'inline', keys: MINT } },
+    { id: 'revokeSession', method: 'post', path: '/api/service/session/revoke', expect: { kind: 'inline', keys: REVOKE } },
+    { id: 'restoreSession', method: 'post', path: '/api/service/session/restore', expect: { kind: 'inline', keys: RESTORE } },
     { id: 'getDefaultWorkspace', method: 'get', path: '/api/service/workspace/default', expect: { kind: 'inline', keys: DEFAULT_WS } },
     { id: 'getWorkspaceSettings', method: 'get', path: '/api/service/workspace/settings', expect: { kind: 'ref', name: 'WorkspaceSettings' } },
     { id: 'updateWorkspaceSettings', method: 'patch', path: '/api/service/workspace/settings', expect: { kind: 'ref', name: 'WorkspaceSettings' } },

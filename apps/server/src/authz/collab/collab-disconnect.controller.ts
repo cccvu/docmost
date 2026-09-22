@@ -3,12 +3,18 @@ import { SkipTransform } from '../../common/decorators/skip-transform.decorator'
 import { IsUUID } from 'class-validator';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 import { CollaborationGateway } from '../../collaboration/collaboration.gateway';
+import { WsGateway } from '../../ws/ws.gateway';
 import { RemoteOnlyGuard } from '../mode/remote-only.guard';
 import { CollabServiceSecretGuard } from './service-secret.guard';
 
 export class ForceDisconnectDto {
   @IsUUID() userId!: string;
   @IsUUID() pageId!: string;
+}
+
+/** #455 — the whole-identity (all-pages) variant, for account disable. Only a userId: there is no page. */
+export class ForceDisconnectUserDto {
+  @IsUUID() userId!: string;
 }
 
 /**
@@ -27,6 +33,9 @@ export class CollabDisconnectController {
   constructor(
     private readonly gateway: CollaborationGateway,
     private readonly pagePermissionRepo: PagePermissionRepo,
+    // #455: the WsGateway (@Global) is the notifications/tree socket.io server — closing its live sockets
+    // for the disabled user is the second half of "cut EVERY realtime plane", alongside the collab kill.
+    private readonly wsGateway: WsGateway,
   ) {}
 
   @HttpCode(HttpStatus.OK)
@@ -36,6 +45,29 @@ export class CollabDisconnectController {
     const canAccess = await this.pagePermissionRepo.canUserAccessPage(dto.userId, dto.pageId);
     if (canAccess) return { disconnected: false }; // still authorized — the signal was stale/coarse
     this.gateway.forceDisconnectUserFromPage(dto.pageId, dto.userId);
+    return { disconnected: true };
+  }
+
+  /**
+   * #455 — account-disable per-user disconnect: force-close EVERY live REALTIME socket for a user
+   * (node-local), across BOTH planes — the collab editor sockets (Hocuspocus) AND the notifications/tree
+   * socket.io sockets. Invoked by the platform ONLY after `/api/service/session/revoke` has set the shadow
+   * user's `deactivatedAt` — a precise, whole-identity signal — so, UNLIKE the per-page `forceDisconnect`
+   * above (whose PagePermissionChanged signal can be coarse and therefore re-checks page access), this
+   * closes the sockets unconditionally: the residual it targets is a continuously-open socket with no
+   * per-message re-auth (a collab editor; a ping-kept-alive notifications feed of titles/renames/comments).
+   * Service-secret gated; an erroneous call only forces a transient reconnect that an active user
+   * re-authenticates fine. See collaboration.gateway.ts / ws.gateway.ts `forceDisconnectUser` for the
+   * single-node (`desired_count=1`) scope.
+   */
+  @HttpCode(HttpStatus.OK)
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+  @Post('force-disconnect-user')
+  async forceDisconnectUser(
+    @Body() dto: ForceDisconnectUserDto,
+  ): Promise<{ disconnected: boolean }> {
+    this.gateway.forceDisconnectUser(dto.userId); // collab editor sockets (Hocuspocus)
+    this.wsGateway.forceDisconnectUser(dto.userId); // notifications/tree sockets (socket.io)
     return { disconnected: true };
   }
 }
