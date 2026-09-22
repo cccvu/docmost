@@ -64,6 +64,18 @@ export class PlatformAuditClient {
   private readonly logger = new Logger(PlatformAuditClient.name);
   private readonly baseUrl = process.env.PLATFORM_AUTHZ_URL ?? 'http://platform:4000';
   private readonly secret = process.env.PLATFORM_AUTHZ_SERVICE_SECRET ?? '';
+  /**
+   * Per-forward wall-clock bound (env `PLATFORM_AUDIT_FORWARD_TIMEOUT_MS`, default 2000ms). undici's global
+   * `fetch` has no default timeout (~300s headers timeout), and #467 newly routes a PER-REQUEST `/api` access
+   * stream through here — so a slow-not-down sink under `/api` load would let in-flight forwards accumulate
+   * unbounded on the fork container. A timeout aborts the request; the abort surfaces as a transport error in
+   * the catch below (logged `AUDIT_FORWARD_FAILED`, the row dropped loudly) exactly like any other failure, so
+   * loss stays alarmed and the request path is never touched. NaN/≤0 env falls back to the 2000ms default.
+   */
+  private readonly forwardTimeoutMs = (() => {
+    const n = Number(process.env.PLATFORM_AUDIT_FORWARD_TIMEOUT_MS);
+    return Number.isFinite(n) && n > 0 ? n : 2000;
+  })();
 
   /** Forward a batch. Resolves regardless of outcome — callers do not await for correctness. */
   async forward(events: AuditIngestEvent[]): Promise<void> {
@@ -73,6 +85,7 @@ export class PlatformAuditClient {
         method: 'POST',
         headers: { 'content-type': 'application/json', 'x-authz-service-secret': this.secret },
         body: JSON.stringify({ events }),
+        signal: AbortSignal.timeout(this.forwardTimeoutMs),
       });
       if (!res.ok) {
         // AUDIT_FORWARD_FAILED opens the line so the drop is greppable and alarmable. Without a token this
