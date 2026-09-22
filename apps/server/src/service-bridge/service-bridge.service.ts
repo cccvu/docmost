@@ -29,6 +29,12 @@ import { WorkspaceResolver } from './workspace-resolver';
  * Both endpoints are keyed on the caller's opaque `externalId`; the fork — not the caller — derives the
  * shadow email and resolves the workspace, so the caller never handles Docmost-internal ids.
  */
+/** One entry of `POST /api/service/users/lookup` (#486): `userId` is null when no shadow user exists. */
+export interface ShadowUserLookup {
+  externalId: string;
+  userId: string | null;
+}
+
 @Injectable()
 export class ServiceBridgeService {
   private readonly logger = new Logger(ServiceBridgeService.name);
@@ -106,6 +112,30 @@ export class ServiceBridgeService {
       `provisioned shadow member ${row.id} (externalId=${dto.externalId} ws=${workspaceId})`,
     );
     return { userId: row.id, workspaceId };
+  }
+
+  /**
+   * #486 — the shadow user ids for a batch of platform identities, WITHOUT provisioning any. For a caller that
+   * must reach a grant the platform has no cached mapping for (a /v1 page-permission revoke or re-role): the
+   * mapping can be missing while the shadow user — and its grants — exist (a shadow created on the fork side,
+   * e.g. a member add's actor, or a cleared stale cache). Provisioning instead would be a side effect, and its
+   * upsert would resurrect a soft-deleted shadow. Same derivation and case-insensitive match as
+   * {@link findShadowUserId}, soft-deleted rows included (a grant can still reference one); one query.
+   */
+  async lookupShadowUserIds(externalIds: string[]): Promise<ShadowUserLookup[]> {
+    const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
+    const emails = [...new Set(externalIds.map((id) => shadowEmailFor(id)))];
+    const rows = await this.db
+      .selectFrom('users')
+      .select(['id', 'email'])
+      .where('workspaceId', '=', workspaceId)
+      .where((eb) => eb(eb.fn('lower', ['email']), 'in', emails))
+      .execute();
+    const byEmail = new Map(rows.map((r) => [r.email.toLowerCase(), r.id]));
+    return externalIds.map((externalId) => ({
+      externalId,
+      userId: byEmail.get(shadowEmailFor(externalId)) ?? null,
+    }));
   }
 
   /**

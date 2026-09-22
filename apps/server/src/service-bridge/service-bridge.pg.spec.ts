@@ -130,6 +130,27 @@ d('ServiceBridgeService.provisionShadowUser on real Postgres (no-takeover upsert
     expect(row.password).not.toContain('alice'); // ...never the input
   });
 
+  // #486: the lookup a /v1 revoke uses to reach a grant whose holder the platform has no cached mapping for.
+  it('lookupShadowUserIds resolves without provisioning: order kept, case-insensitive, soft-deleted included, other workspaces excluded', async () => {
+    const alice = await svc.provisionShadowUser({ externalId: 'alice' } as any);
+    const bob = await svc.provisionShadowUser({ externalId: 'bob' } as any);
+    await pg`update users set deleted_at = now() where id = ${bob.userId}`;
+    await pg`insert into workspaces (id, name) values (${FOREIGN_WS}, 'foreign')`;
+    await pg`insert into users (email, role, workspace_id) values (${shadowEmailFor('carol')}, 'member', ${FOREIGN_WS})`;
+    const before = await countUsers();
+
+    const res = await svc.lookupShadowUserIds(['ALICE', 'nobody', 'bob', 'carol']);
+
+    expect(res).toEqual([
+      { externalId: 'ALICE', userId: alice.userId },
+      { externalId: 'nobody', userId: null },
+      { externalId: 'bob', userId: bob.userId }, // a grant can still reference a soft-deleted shadow
+      { externalId: 'carol', userId: null }, // only the fork's own (default) workspace
+    ]);
+    expect(await countUsers()).toBe(before); // never provisions
+    expect((await pg`select deleted_at from users where id = ${bob.userId}`)[0].deleted_at).not.toBeNull(); // never revives
+  });
+
   it('T-041: the real ON CONFLICT upsert is idempotent — same id, one row', async () => {
     const first = await svc.provisionShadowUser({ externalId: 'alice' } as any);
     const second = await svc.provisionShadowUser({ externalId: 'alice' } as any);

@@ -6,6 +6,7 @@ import { ContentCursorDto, ContentListDto, ContentSortDto } from './content-read
 import { MintSessionDto } from './mint-session.dto';
 import { ProvisionUserDto } from './provision-user.dto';
 import { SessionExternalIdDto } from './session-external-id.dto';
+import { LookupUsersDto } from './lookup-users.dto';
 import { UpdateSpaceMemberDto } from './space-admin.dto';
 
 /**
@@ -180,6 +181,25 @@ describe('service-bridge DTO validation (constraints are load-bearing)', () => {
         expect(await errCount(SessionExternalIdDto, { externalId })).toBeGreaterThan(0);
       }
       expect(await errCount(SessionExternalIdDto, {})).toBeGreaterThan(0); // missing
+    });
+  });
+
+  // #486: `POST /api/service/users/lookup` derives a shadow email from EACH id, so the same charset guard applies
+  // element-wise; the batch is bounded (1..256, the /v1 revoke cap).
+  describe('LookupUsersDto (each externalId is the no-injection boundary; bounded batch)', () => {
+    it('accepts 1..256 well-formed ids', async () => {
+      expect(await errCount(LookupUsersDto, { externalIds: [UUID] })).toBe(0);
+      expect(await errCount(LookupUsersDto, { externalIds: Array.from({ length: 256 }, (_, i) => `id-${i}`) })).toBe(0);
+    });
+
+    it('rejects an empty, oversized, missing or hostile batch', async () => {
+      expect(await errCount(LookupUsersDto, { externalIds: [] })).toBeGreaterThan(0);
+      expect(await errCount(LookupUsersDto, { externalIds: Array.from({ length: 257 }, (_, i) => `id-${i}`) })).toBeGreaterThan(0);
+      expect(await errCount(LookupUsersDto, {})).toBeGreaterThan(0);
+      expect(await errCount(LookupUsersDto, { externalIds: 'alice' })).toBeGreaterThan(0);
+      for (const bad of ['a@b', 'a b', '', 'a@shadow.wiki-v2.internal', 'héllo']) {
+        expect(await errCount(LookupUsersDto, { externalIds: [UUID, bad] })).toBeGreaterThan(0);
+      }
     });
   });
 

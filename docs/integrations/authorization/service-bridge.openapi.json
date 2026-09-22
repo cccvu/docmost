@@ -72,6 +72,29 @@
         }
       }
     },
+    "/api/service/users/lookup": {
+      "post": {
+        "operationId": "lookupUsers",
+        "tags": ["service-bridge"],
+        "summary": "Look up the shadow user ids of platform identities, WITHOUT provisioning.",
+        "description": "Read-only (#486): one entry per requested externalId, in order; userId is null when no shadow user exists (soft-deleted shadow users included — a grant can still reference one). Never creates or revives a user. Used by the platform to reach a page grant whose holder it has no cached mapping for. Scope: users:resolve.",
+        "requestBody": { "required": true, "content": { "application/json": {
+          "schema": { "$ref": "#/components/schemas/LookupUsersRequest" },
+          "example": { "externalIds": ["ext-abc123", "ext-def456"] }
+        } } },
+        "responses": {
+          "200": { "description": "One entry per requested id.", "content": { "application/json": {
+            "schema": { "type": "object", "required": ["items"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/ShadowUserLookup" } } } },
+            "example": { "items": [{ "externalId": "ext-abc123", "userId": "9b1f0c2e-0000-4000-8000-000000000001" }, { "externalId": "ext-def456", "userId": null }] }
+          } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
     "/api/service/session": {
       "post": {
         "operationId": "mintSession",
@@ -713,6 +736,22 @@
         "properties": {
           "externalId": { "$ref": "#/components/schemas/ExternalId" },
           "name": { "type": "string", "maxLength": 255, "description": "Optional display name for the shadow user." }
+        }
+      },
+      "LookupUsersRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["externalIds"],
+        "properties": {
+          "externalIds": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "$ref": "#/components/schemas/ExternalId" } }
+        }
+      },
+      "ShadowUserLookup": {
+        "type": "object",
+        "required": ["externalId", "userId"],
+        "properties": {
+          "externalId": { "type": "string" },
+          "userId": { "type": ["string", "null"], "description": "The shadow user's Docmost id, or null when none exists." }
         }
       },
       "ResolveUserRequest": {

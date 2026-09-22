@@ -20,6 +20,7 @@ import { PublicSearchHit } from './service-search.service';
 import { PublicAttachmentSummary } from './service-attachment.service';
 import { SpaceView, RawSpaceMember } from './service-space.service';
 import { WorkspaceSettingsView } from './service-workspace.service';
+import { ShadowUserLookup } from './service-bridge.service';
 import { UpdateSpaceMemberDto } from './dto/space-admin.dto';
 
 /**
@@ -206,6 +207,7 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     RawPagePermission: keysOf<RawPagePermission>({ id: true, userId: true, groupId: true, role: true, createdAt: true }),
     PublicSearchHit: keysOf<PublicSearchHit>({ id: true, title: true, icon: true, parentPageId: true, space: true, highlight: true, createdAt: true, updatedAt: true }),
     PublicAttachmentSummary: keysOf<PublicAttachmentSummary>({ id: true, fileName: true, mimeType: true, fileSize: true, type: true, createdAt: true }),
+    ShadowUserLookup: keysOf<ShadowUserLookup>({ externalId: true, userId: true }),
   };
 
   // The 5 inline (non-component) scalar bodies, tied to the CONTROLLER return types (a signature change reds).
@@ -227,6 +229,7 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
   const OPS: Array<{ id: string; method: string; path: string; expect: OpExpect }> = [
     { id: 'provisionShadowUser', method: 'post', path: '/api/service/users', expect: { kind: 'ref', name: 'ProvisionedUser' } },
     { id: 'resolveUser', method: 'post', path: '/api/service/users/resolve', expect: { kind: 'ref', name: 'ProvisionedUser' } },
+    { id: 'lookupUsers', method: 'post', path: '/api/service/users/lookup', expect: { kind: 'items', name: 'ShadowUserLookup' } },
     { id: 'mintSession', method: 'post', path: '/api/service/session', expect: { kind: 'inline', keys: MINT } },
     { id: 'revokeSession', method: 'post', path: '/api/service/session/revoke', expect: { kind: 'inline', keys: REVOKE } },
     { id: 'restoreSession', method: 'post', path: '/api/service/session/restore', expect: { kind: 'inline', keys: RESTORE } },
