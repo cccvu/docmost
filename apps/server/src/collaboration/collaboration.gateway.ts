@@ -25,6 +25,9 @@ import {
   CollaborationHandler,
   CollabEventHandlers,
 } from './collaboration.handler';
+// CCC seam (UPSTREAM_MODIFICATIONS.md #3f): the account-disable force-disconnect predicate lives in authz/
+// (importless, so it is unit-testable outside the lib0 ESM graph); this method is a thin delegate.
+import { disconnectUserConnections } from '../authz/collab/disconnect-user-connections';
 
 @Injectable()
 export class CollaborationGateway {
@@ -192,15 +195,12 @@ export class CollaborationGateway {
    * Safe to run even for an already-active user (it just closes their live sockets), but the caller only
    * invokes it AFTER `deactivateShadowUser` has set `deactivatedAt`, so every reconnect then re-runs
    * `onAuthenticate` → `isUserDisabled` → rejected, and the socket cannot come back.
+   *
+   * The matching/closing loop is the CCC `disconnectUserConnections` helper (authz/), so the enforcement
+   * predicate is unit-tested there without loading this file's lib0 ESM graph.
    */
   forceDisconnectUser(userId: string): void {
-    for (const doc of this.hocuspocus.documents.values()) {
-      for (const connection of doc.getConnections()) {
-        if (connection.context?.user?.id === userId) {
-          connection.close();
-        }
-      }
-    }
+    disconnectUserConnections(this.hocuspocus.documents.values(), userId);
   }
 
   /**

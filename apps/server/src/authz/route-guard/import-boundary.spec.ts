@@ -58,6 +58,7 @@ const SEAM_ALLOWLIST = new Set<string>([
   'core/workspace/controllers/workspace.controller.ts', // seam #87/#88 — native-auth gate on the session-mint route; + #310 session-cookie set/clear
   'core/auth/strategies/jwt.strategy.ts', // seam #310 — reads the session cookie under its resolved (__Host-) name via authz/session-cookie
   'ws/ws.gateway.ts', // seam #310 — socket.io handshake reads the session cookie under its resolved (__Host-) name via authz/session-cookie
+  'collaboration/collaboration.gateway.ts', // seam #3f — account-disable force-disconnect delegates to authz/collab/disconnect-user-connections (importless predicate, unit-testable outside lib0 ESM) (#455)
   'collaboration/collaboration.handler.ts', // seam #2 — conditional content write compares via authz/page-write/stable-hash (#282); flushPageContent reads authz/page-write/store-failure-registry (#390); the keyed content write checks/records via authz/page-write/write-idem (#429)
   'collaboration/collaboration.util.ts', // seam #61 — htmlToJson imports the #392 attachmentId backfill from editor-compat/
   'collaboration/extensions/persistence.extension.ts', // seam #390 — reconcile-before-store + store-failure signal via authz/page-write/{reconcile-store,store-failure-registry}

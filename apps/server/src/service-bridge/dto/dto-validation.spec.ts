@@ -5,6 +5,7 @@ import { ContentSearchDto } from './content-search.dto';
 import { ContentCursorDto, ContentListDto, ContentSortDto } from './content-read.dto';
 import { MintSessionDto } from './mint-session.dto';
 import { ProvisionUserDto } from './provision-user.dto';
+import { SessionExternalIdDto } from './session-external-id.dto';
 
 /**
  * These DTOs' class-validator decorators are the load-bearing input guard for the new service-bridge ops (the
@@ -145,6 +146,39 @@ describe('service-bridge DTO validation (constraints are load-bearing)', () => {
       expect(await errCount(MintSessionDto, { externalId: UUID, clientIp: maxIpv6 })).toBe(0);
       // Over the 45-char IPv6-text bound → rejected.
       expect(await errCount(MintSessionDto, { externalId: UUID, clientIp: 'a'.repeat(46) })).toBeGreaterThan(0);
+    });
+  });
+
+  /*
+   * #455 — the session-lifecycle DTO for POST /api/service/session/{revoke,restore}. Same no-injection
+   * boundary as provisioning/minting: `externalId` is interpolated into the synthetic shadow email, so the
+   * charset guard is the security boundary that stops a caller from deactivating an arbitrary/real/privileged
+   * account. Only the wire/pg specs exercise these ops and they bypass the DTO (pg) or send clean input
+   * (client), so WITHOUT this block, dropping the @Matches guard would red nothing.
+   */
+  describe('SessionExternalIdDto (revoke/restore — externalId charset is the no-injection boundary)', () => {
+    it('T-035: accepts platform-style identity ids (uuid / opaque id charset)', async () => {
+      expect(await errCount(SessionExternalIdDto, { externalId: UUID })).toBe(0);
+      expect(await errCount(SessionExternalIdDto, { externalId: 'AbC-123_x.y+z' })).toBe(0);
+      expect(await errCount(SessionExternalIdDto, { externalId: 'a'.repeat(128) })).toBe(0);
+    });
+
+    it('T-035: rejects any externalId that could break out of the derived shadow-email local part', async () => {
+      const hostile = [
+        'a@b', // injects a domain boundary
+        'a b', // whitespace
+        'a/b',
+        'a\\b',
+        'a\nb',
+        'a@shadow.wiki-v2.internal', // a full address
+        '', // empty
+        'a'.repeat(129), // over the 128-char cap
+        'héllo', // non-ASCII
+      ];
+      for (const externalId of hostile) {
+        expect(await errCount(SessionExternalIdDto, { externalId })).toBeGreaterThan(0);
+      }
+      expect(await errCount(SessionExternalIdDto, {})).toBeGreaterThan(0); // missing
     });
   });
 });

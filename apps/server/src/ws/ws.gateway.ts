@@ -96,6 +96,25 @@ export class WsGateway
     await this.baseRealtime.handleDisconnect(client);
   }
 
+  /**
+   * CCC seam (UPSTREAM_MODIFICATIONS.md #161b, #455): force-close a user's LIVE notifications socket(s) on
+   * account disable. The connect-time `isWsConnectionLive` gate above only refuses NEW sockets; an
+   * ALREADY-OPEN socket.io connection is ping-kept-alive and keeps receiving its joined-room broadcasts
+   * (page titles, tree add/move/rename/delete, comment events) until it happens to reconnect — so disable
+   * must ALSO drop the live one, symmetric with the collab force-disconnect. Every client joins
+   * `getUserRoomName(userId)` on connect, so disconnecting that room reaches all of the user's sockets.
+   *
+   * NODE-LOCAL: this reaches only sockets on THIS socket.io server. Prod runs a single node
+   * (`desired_count=1`); a multi-node deployment would need an all-nodes broadcast (documented follow-up,
+   * shared with the collab force-disconnect). Invoked by the platform's `disable()` via the
+   * `/api/collab/force-disconnect-user` seam, AFTER `deactivatedAt` is set, so every reconnect then re-runs
+   * the connect gate → rejected and the socket cannot come back.
+   */
+  forceDisconnectUser(userId: string): void {
+    // `server` is unset until afterInit; a call before the gateway is live is a safe no-op.
+    this.server?.in(getUserRoomName(userId)).disconnectSockets(true);
+  }
+
   @SubscribeMessage('message')
   async handleMessage(client: Socket, data: any): Promise<void> {
     if (this.wsService.isTreeEvent(data)) {

@@ -13,6 +13,11 @@ import * as crypto from 'crypto';
 jest.mock('../../collaboration/collaboration.gateway', () => ({
   CollaborationGateway: class {},
 }));
+// Same DI-metadata reason for WsGateway (its runtime require pulls the socket.io/notifications stack).
+// Stub it; every test injects its own fake.
+jest.mock('../../ws/ws.gateway', () => ({
+  WsGateway: class {},
+}));
 
 import {
   CollabDisconnectController,
@@ -141,6 +146,7 @@ describe('CollabDisconnectController.forceDisconnect (fail-safe PDP re-check)', 
     const controller = new CollabDisconnectController(
       { forceDisconnectUserFromPage } as any,
       { canUserAccessPage } as any,
+      { forceDisconnectUser: jest.fn() } as any, // wsGateway — unused on the per-page path
     );
     return { controller, forceDisconnectUserFromPage, canUserAccessPage };
   };
@@ -183,6 +189,7 @@ describe('CollabDisconnectController.forceDisconnect (fail-safe PDP re-check)', 
     const controller = new CollabDisconnectController(
       { forceDisconnectUserFromPage } as any,
       { canUserAccessPage } as any,
+      { forceDisconnectUser: jest.fn() } as any, // wsGateway — unused on the per-page path
     );
 
     await controller.forceDisconnect({ userId: USER, pageId: PAGE });
@@ -195,25 +202,32 @@ describe('CollabDisconnectController.forceDisconnectUser (#455 — account-disab
   const USER = '11111111-1111-4111-8111-111111111111';
 
   const build = () => {
-    const forceDisconnectUser = jest.fn();
+    const forceDisconnectUser = jest.fn(); // collab gateway (Hocuspocus)
+    const wsForceDisconnectUser = jest.fn(); // ws gateway (socket.io notifications/tree)
     const canUserAccessPage = jest.fn();
     const controller = new CollabDisconnectController(
       { forceDisconnectUser } as any,
       { canUserAccessPage } as any,
+      { forceDisconnectUser: wsForceDisconnectUser } as any,
     );
-    return { controller, forceDisconnectUser, canUserAccessPage };
+    return { controller, forceDisconnectUser, wsForceDisconnectUser, canUserAccessPage };
   };
 
   // Unlike the per-page force-disconnect, this is a whole-identity signal (the platform already deactivated
-  // the shadow user), so it closes UNCONDITIONALLY — no page-access re-check, no pageId.
-  it('unconditionally force-disconnects the user across all pages and returns {disconnected:true}', async () => {
-    const { controller, forceDisconnectUser, canUserAccessPage } = build();
+  // the shadow user), so it closes UNCONDITIONALLY — no page-access re-check, no pageId — across BOTH the
+  // collab editor sockets AND the notifications/tree sockets (the #455 residual the ws gate alone can't cut,
+  // since it only refuses NEW connections).
+  it('unconditionally force-disconnects the user across BOTH realtime planes and returns {disconnected:true}', async () => {
+    const { controller, forceDisconnectUser, wsForceDisconnectUser, canUserAccessPage } = build();
 
     const result = await controller.forceDisconnectUser({ userId: USER });
 
     expect(result).toEqual({ disconnected: true });
     expect(forceDisconnectUser).toHaveBeenCalledTimes(1);
     expect(forceDisconnectUser).toHaveBeenCalledWith(USER);
+    // The notifications/tree socket.io plane is also force-closed (not just the collab editor).
+    expect(wsForceDisconnectUser).toHaveBeenCalledTimes(1);
+    expect(wsForceDisconnectUser).toHaveBeenCalledWith(USER);
     // No PDP page re-check — there is no page; the deactivate already happened.
     expect(canUserAccessPage).not.toHaveBeenCalled();
   });
