@@ -6,6 +6,8 @@ import { ContentCursorDto, ContentListDto, ContentSortDto } from './content-read
 import { MintSessionDto } from './mint-session.dto';
 import { ProvisionUserDto } from './provision-user.dto';
 import { SessionExternalIdDto } from './session-external-id.dto';
+import { LookupUsersDto } from './lookup-users.dto';
+import { UpdateSpaceMemberDto } from './space-admin.dto';
 
 /**
  * These DTOs' class-validator decorators are the load-bearing input guard for the new service-bridge ops (the
@@ -179,6 +181,43 @@ describe('service-bridge DTO validation (constraints are load-bearing)', () => {
         expect(await errCount(SessionExternalIdDto, { externalId })).toBeGreaterThan(0);
       }
       expect(await errCount(SessionExternalIdDto, {})).toBeGreaterThan(0); // missing
+    });
+  });
+
+  // #486: `POST /api/service/users/lookup` derives a shadow email from EACH id, so the same charset guard applies
+  // element-wise; the batch is bounded (1..256, the /v1 revoke cap).
+  describe('LookupUsersDto (each externalId is the no-injection boundary; bounded batch)', () => {
+    it('accepts 1..256 well-formed ids', async () => {
+      expect(await errCount(LookupUsersDto, { externalIds: [UUID] })).toBe(0);
+      expect(await errCount(LookupUsersDto, { externalIds: Array.from({ length: 256 }, (_, i) => `id-${i}`) })).toBe(0);
+    });
+
+    it('rejects an empty, oversized, missing or hostile batch', async () => {
+      expect(await errCount(LookupUsersDto, { externalIds: [] })).toBeGreaterThan(0);
+      expect(await errCount(LookupUsersDto, { externalIds: Array.from({ length: 257 }, (_, i) => `id-${i}`) })).toBeGreaterThan(0);
+      expect(await errCount(LookupUsersDto, {})).toBeGreaterThan(0);
+      expect(await errCount(LookupUsersDto, { externalIds: 'alice' })).toBeGreaterThan(0);
+      for (const bad of ['a@b', 'a b', '', 'a@shadow.wiki-v2.internal', 'héllo']) {
+        expect(await errCount(LookupUsersDto, { externalIds: [UUID, bad] })).toBeGreaterThan(0);
+      }
+    });
+  });
+
+  /**
+   * #486 rule M: the member re-role must name its actor so the fork can refuse a self-raising write. The field
+   * is REQUIRED (fail closed): a caller that omits it gets a 400, never an unchecked write.
+   */
+  describe('UpdateSpaceMemberDto (actorExternalId is required — rule M fails closed)', () => {
+    it('accepts a role plus a well-formed actorExternalId', async () => {
+      expect(await errCount(UpdateSpaceMemberDto, { role: 'writer', actorExternalId: UUID })).toBe(0);
+    });
+
+    it('rejects a missing, empty or hostile actorExternalId, and an unknown role', async () => {
+      expect(await errCount(UpdateSpaceMemberDto, { role: 'writer' })).toBeGreaterThan(0);
+      for (const actorExternalId of ['', 'a@b', 'a b', 'a'.repeat(129)]) {
+        expect(await errCount(UpdateSpaceMemberDto, { role: 'writer', actorExternalId })).toBeGreaterThan(0);
+      }
+      expect(await errCount(UpdateSpaceMemberDto, { role: 'owner', actorExternalId: UUID })).toBeGreaterThan(0);
     });
   });
 });

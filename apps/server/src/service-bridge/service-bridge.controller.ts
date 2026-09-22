@@ -11,13 +11,14 @@ import { SkipTransform } from '../common/decorators/skip-transform.decorator';
 import { FastifyReply } from 'fastify';
 import { EnvironmentService } from '../integrations/environment/environment.service';
 import { RemoteOnlyGuard } from '../authz/mode/remote-only.guard';
-import { ServiceBridgeService } from './service-bridge.service';
+import { ServiceBridgeService, ShadowUserLookup } from './service-bridge.service';
 import { RequireServiceScope, ServiceAuthGuard } from './service-auth.guard';
 import { ServiceScope } from './service-scope';
 import { MintSessionDto } from './dto/mint-session.dto';
 import { SessionExternalIdDto } from './dto/session-external-id.dto';
 import { ProvisionUserDto } from './dto/provision-user.dto';
 import { ResolveUserDto } from './dto/resolve-user.dto';
+import { LookupUsersDto } from './dto/lookup-users.dto';
 import { WorkspaceResolver } from './workspace-resolver';
 import { setDocmostAuthCookie } from '../authz/session-cookie/docmost-auth-cookie';
 
@@ -58,6 +59,17 @@ export class ServiceBridgeController {
     // Read-only existence + workspace lookup for a Docmost-native user the platform has no mapping for.
     const workspaceId = await this.workspaces.resolveUserWorkspaceId(dto.userId);
     return { userId: dto.userId, workspaceId };
+  }
+
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
+  @Post('users/lookup')
+  @HttpCode(HttpStatus.OK)
+  @RequireServiceScope(ServiceScope.UsersResolve)
+  async lookupUsers(@Body() dto: LookupUsersDto): Promise<{ items: ShadowUserLookup[] }> {
+    // #486: read-only, never provisions — one entry per requested id, in order; `userId` null when there is no
+    // shadow user. The platform uses it to reach a page grant whose holder it has no cached mapping for.
+    return { items: await this.service.lookupShadowUserIds(dto.externalIds) };
   }
 
   @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)

@@ -74,4 +74,12 @@ export class AddSpaceMemberDto {
 export class UpdateSpaceMemberDto {
   @IsIn(SPACE_ROLES)
   role!: SpaceMemberRole;
+
+  /**
+   * The acting identity's externalId (#486, rule M) — REQUIRED, so a caller that omits it is refused (400)
+   * rather than skipping the self-raise check. Compared against the member row, never written.
+   */
+  @IsString()
+  @Matches(EXTERNAL_ID, { message: 'actorExternalId must be 1-128 chars of [A-Za-z0-9._+-]' })
+  actorExternalId!: string;
 }

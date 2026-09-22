@@ -43,6 +43,7 @@ const routeMethods = (ctrl: any): string[] =>
 const EXPECTED_SCOPE: Record<string, ServiceScope> = {
   'ServiceBridgeController.provisionUser': ServiceScope.UsersProvision,
   'ServiceBridgeController.resolveUser': ServiceScope.UsersResolve,
+  'ServiceBridgeController.lookupUsers': ServiceScope.UsersResolve, // #486 read-only, never provisions
   'ServiceBridgeController.mintSession': ServiceScope.SessionMint,
   'ServiceBridgeController.revokeSession': ServiceScope.SessionRevoke,
   'ServiceBridgeController.restoreSession': ServiceScope.SessionRestore,
