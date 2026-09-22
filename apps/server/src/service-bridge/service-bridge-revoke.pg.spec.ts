@@ -99,12 +99,16 @@ d('ServiceBridgeService.deactivateShadowUser / reactivateShadowUser on real Post
     // mintSession refuses BEFORE createSessionAndToken for a deactivated user, so a token stub suffices; the
     // reactivate→mint-succeeds case only needs it to return a value.
     const sessionService = { createSessionAndToken: async () => 'minted-token' } as any;
+    // #330: mintSession now writes the resolved client IP into the CLS audit context; this spec passes no
+    // clientIp, so a no-op CLS stub keeps applyClientIp a benign no-op.
+    const cls = { get: () => undefined, set: () => undefined } as any;
     svc = new ServiceBridgeService(
       db,
       userRepo,
       userSessionRepo,
       sessionService,
       new WorkspaceResolver(db),
+      cls,
     );
   });
 

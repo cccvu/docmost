@@ -69,7 +69,7 @@ export class ServiceBridgeController {
     @Body() dto: MintSessionDto,
     @Res({ passthrough: true }) res: FastifyReply,
   ) {
-    const authToken = await this.service.mintSession(dto.externalId);
+    const authToken = await this.service.mintSession(dto.externalId, dto.clientIp);
     // Mirror AuthController.setAuthCookie so the caller can relay the Set-Cookie to the browser exactly as it
     // did for native login: over https `__Host-authToken` + Secure + host-only + Path=/ (#310), scoped to
     // the workspace's configured session lifetime. No legacy-cookie eviction here — the mint response is also

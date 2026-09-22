@@ -128,5 +128,23 @@ describe('service-bridge DTO validation (constraints are load-bearing)', () => {
       expect(await errCount(MintSessionDto, { externalId: 'a'.repeat(129) })).toBeGreaterThan(0);
       expect(await errCount(MintSessionDto, {})).toBeGreaterThan(0);
     });
+
+    // #330: clientIp is OPTIONAL and deliberately NOT @IsIP-validated at the DTO — a malformed value must not
+    // 400 a sign-in (the service degrades it to NULL). Only the length bound is enforced here, so an abusive
+    // value can't reach the row; syntactic IP validation is the service's job (trustedClientIp).
+    it('#330: clientIp is optional, tolerates non-IP strings, but is length-bounded at 45', async () => {
+      expect(await errCount(MintSessionDto, { externalId: UUID })).toBe(0); // omitted is fine
+      expect(await errCount(MintSessionDto, { externalId: UUID, clientIp: '203.0.113.7' })).toBe(0);
+      expect(await errCount(MintSessionDto, { externalId: UUID, clientIp: '2001:db8::1' })).toBe(0);
+      // A non-address string still validates at the DTO (the service maps it to NULL, never a 400/500).
+      expect(await errCount(MintSessionDto, { externalId: UUID, clientIp: 'not-an-ip' })).toBe(0);
+      // At-limit VALID case: the longest legal IPv6 text (IPv4-mapped) is exactly 45 chars and MUST pass —
+      // pins @MaxLength(45) so nobody tightens it below 45 and starts 400-ing long-IPv6 sign-ins undetected.
+      const maxIpv6 = '0000:0000:0000:0000:0000:ffff:255.255.255.255';
+      expect(maxIpv6.length).toBe(45);
+      expect(await errCount(MintSessionDto, { externalId: UUID, clientIp: maxIpv6 })).toBe(0);
+      // Over the 45-char IPv6-text bound → rejected.
+      expect(await errCount(MintSessionDto, { externalId: UUID, clientIp: 'a'.repeat(46) })).toBeGreaterThan(0);
+    });
   });
 });

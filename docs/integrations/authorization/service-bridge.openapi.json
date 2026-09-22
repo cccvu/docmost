@@ -80,7 +80,7 @@
         "description": "Look up the shadow user by the email derived from externalId, verify it is a mintable shadow member (shadow namespace, role=member, not deleted), and mint a Docmost session. Returns { ok: true } and sets the session cookie: over an https edge `__Host-authToken` (httpOnly, sameSite=lax, path=/, Secure, host-only — see wiki-v2 #310), or the un-prefixed `authToken` over http. The platform rejects a non-`__Host-` fork cookie in production posture (fail-closed). Scope: session:mint. There is NO generic impersonation: a non-shadow / non-member / deleted / unknown subject is 403.",
         "requestBody": { "required": true, "content": { "application/json": {
           "schema": { "$ref": "#/components/schemas/MintSessionRequest" },
-          "example": { "externalId": "ext-abc123" }
+          "example": { "externalId": "ext-abc123", "clientIp": "203.0.113.7" }
         } } },
         "responses": {
           "200": {
@@ -685,6 +685,11 @@
         "pattern": "^[A-Za-z0-9._+-]{1,128}$",
         "description": "The caller's opaque stable identity id; the fork derives the shadow email from it."
       },
+      "ClientIp": {
+        "type": "string",
+        "maxLength": 45,
+        "description": "OPTIONAL platform-resolved client IP (wiki-v2 #330). The caller (platform) resolves the real client address from its own trusted-proxy predicate and passes it so the minted session records where the user signed in from, not the loopback relay peer Docmost sees on this east-west hop. Not validated as an address on the wire (a malformed value must not 400 a sign-in); the fork re-validates with a syntactic IP check and stores NULL for anything absent, malformed, loopback, or unspecified."
+      },
       "SpaceMemberRole": { "type": "string", "enum": ["admin", "writer", "reader"] },
       "ProvisionUserRequest": {
         "type": "object",
@@ -705,7 +710,10 @@
         "type": "object",
         "additionalProperties": false,
         "required": ["externalId"],
-        "properties": { "externalId": { "$ref": "#/components/schemas/ExternalId" } }
+        "properties": {
+          "externalId": { "$ref": "#/components/schemas/ExternalId" },
+          "clientIp": { "$ref": "#/components/schemas/ClientIp" }
+        }
       },
       "ProvisionedUser": {
         "type": "object",
