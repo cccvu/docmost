@@ -1,11 +1,17 @@
 import { ForbiddenException, Injectable, Logger } from '@nestjs/common';
 import { InjectKysely } from 'nestjs-kysely';
 import { randomBytes } from 'crypto';
+import { isIP } from 'node:net';
+import { ClsService } from 'nestjs-cls';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
 import { User } from '@docmost/db/types/entity.types';
 import { UserRepo } from '@docmost/db/repos/user/user.repo';
 import { hashPassword, isUserDisabled } from '../common/helpers';
 import { SessionService } from '../core/session/session.service';
+import {
+  AuditContext,
+  AUDIT_CONTEXT_KEY,
+} from '../common/middlewares/audit-context.middleware';
 import { ProvisionUserDto } from './dto/provision-user.dto';
 import { isShadowEmail, shadowEmailFor } from './shadow-user';
 import { WorkspaceResolver } from './workspace-resolver';
@@ -30,6 +36,7 @@ export class ServiceBridgeService {
     private readonly userRepo: UserRepo,
     private readonly sessionService: SessionService,
     private readonly workspaces: WorkspaceResolver,
+    private readonly cls: ClsService,
   ) {}
 
   /**
@@ -106,7 +113,7 @@ export class ServiceBridgeService {
    * a row be tampered/mis-provisioned) outside the shadow namespace. Refusals are a uniform 403 (no
    * enumeration); the specific reason is logged, not returned.
    */
-  async mintSession(externalId: string): Promise<string> {
+  async mintSession(externalId: string, clientIp?: string): Promise<string> {
     const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
     const email = shadowEmailFor(externalId);
     const user = await this.userRepo.findByEmail(email, workspaceId);
@@ -117,9 +124,54 @@ export class ServiceBridgeService {
       );
       throw new ForbiddenException('not a mintable shadow user');
     }
+    // #330: record the PLATFORM-resolved client IP on the new session, not the loopback relay peer Docmost
+    // observes on this east-west hop. MUST run before createSessionAndToken, which reads `ipAddress` from
+    // the CLS audit context (session.service.ts).
+    this.applyClientIp(clientIp);
     const authToken = await this.sessionService.createSessionAndToken(user);
     this.logger.log(`minted session for shadow member ${user.id} ws=${workspaceId}`);
     return authToken;
+  }
+
+  /**
+   * #330 — overwrite the CLS audit context's `ipAddress` with the platform-resolved client IP so the minted
+   * session records where the human actually signed in from. `AuditContextMiddleware` already ran on this
+   * loopback `/api/service/session` request and set `ipAddress` to the relay peer (`127.0.0.1`), so we
+   * ALWAYS overwrite — never leave it — or the session would persist that confidently-wrong value (the bug
+   * this fixes). A valid non-loopback address is stored; anything else (absent / junk / loopback /
+   * unspecified) becomes NULL: the honest "not known", and the only value safe for the `inet` column (a
+   * non-address would 500 the INSERT). Mirrors PlatformAuditService.setActorId's get→mutate→set.
+   */
+  private applyClientIp(clientIp?: string): void {
+    const resolved = this.trustedClientIp(clientIp);
+    const ctx = this.cls.get<AuditContext>(AUDIT_CONTEXT_KEY);
+    if (ctx) {
+      ctx.ipAddress = resolved;
+      this.cls.set(AUDIT_CONTEXT_KEY, ctx);
+    }
+    // No context (a mint outside the request middleware — none exists today): session.service.ts defaults
+    // ipAddress to null, so there is nothing unsafe to record.
+  }
+
+  /**
+   * A syntactically valid, non-loopback/unspecified client IP, else null. The platform is the trust source
+   * (it resolved this from its own trusted-proxy predicate) — this is a defensive scalar check so a junk or
+   * relay-peer value can never reach the `inet` `ip_address` column. Loopback in the spellings that reach us
+   * (`::1`, `127.0.0.0/8`, dual-stack `::ffff:127.*`) and the unspecified address are "not a client".
+   */
+  private trustedClientIp(clientIp?: string): string | null {
+    const ip = clientIp?.trim();
+    if (!ip || isIP(ip) === 0) return null;
+    // A scoped/zoned IPv6 literal (`fe80::1%eth0`) passes `net.isIP` (→ 6) but Postgres `inet` REJECTS the
+    // `%zone` suffix, so storing it would 500 the INSERT — the exact non-address crash this check exists to
+    // stop. A zoned address is link-local and never a real remote client anyway, so → null.
+    if (ip.includes('%')) return null;
+    const v = ip.toLowerCase();
+    const v4 = v.startsWith('::ffff:') ? v.slice('::ffff:'.length) : v;
+    if (v === '::1' || v === '::' || v4.startsWith('127.') || v4 === '0.0.0.0') {
+      return null;
+    }
+    return ip;
   }
 
   private disqualify(user?: User): string | null {

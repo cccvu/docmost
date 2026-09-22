@@ -1,4 +1,4 @@
-import { IsString, Matches } from 'class-validator';
+import { IsOptional, IsString, Matches, MaxLength } from 'class-validator';
 
 /** CCC service-bridge — NOT upstream Docmost code. Input for `POST /api/service/session`. */
 export class MintSessionDto {
@@ -14,4 +14,22 @@ export class MintSessionDto {
     message: 'externalId must be 1-128 chars of [A-Za-z0-9._+-]',
   })
   externalId: string;
+
+  /**
+   * OPTIONAL platform-resolved client IP (#330). This endpoint is reached ONLY over the loopback service
+   * bridge, so Docmost's own `request.ip` here is the relay peer (`127.0.0.1`), never the human's address —
+   * and the client IP simply is not present on this hop for the fork to recover. The platform, which DOES
+   * know it (it resolves its own `request.ip` against the trusted-proxy predicate in
+   * `services/platform/src/boot/trust-proxy.ts`), passes it here so the minted session records where the
+   * user actually signed in from.
+   *
+   * Deliberately NOT `@IsIP`: minting a session IS a sign-in, so a malformed value must degrade to
+   * "unknown" (the service stores NULL), never 400 the whole login. The service re-validates with
+   * `net.isIP` before the value can reach the `inet` `ip_address` column (a non-address would otherwise
+   * 500 the INSERT). Bounded to 45 chars (max IPv6 text length) so an abusive value can't bloat the row.
+   */
+  @IsOptional()
+  @IsString()
+  @MaxLength(45)
+  clientIp?: string;
 }

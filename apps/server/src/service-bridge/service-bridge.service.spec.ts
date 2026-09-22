@@ -1,8 +1,33 @@
 import { ForbiddenException, ServiceUnavailableException } from '@nestjs/common';
 import { ServiceBridgeService } from './service-bridge.service';
 import { shadowEmailFor } from './shadow-user';
+import {
+  AuditContext,
+  AUDIT_CONTEXT_KEY,
+} from '../common/middlewares/audit-context.middleware';
 
 const EXTERNAL_ID = 'id-123';
+
+/** The audit context the upstream middleware has already put in CLS on the loopback bridge request: its
+ *  ipAddress is the relay peer (127.0.0.1), the value #330 must NOT let reach the session row. */
+const middlewareCtx = (): AuditContext => ({
+  workspaceId: null,
+  actorId: null,
+  actorType: 'user',
+  ipAddress: '127.0.0.1',
+  userAgent: 'ua',
+});
+
+/** Minimal CLS stand-in backed by a Map (nestjs-cls get/set semantics). Pass `undefined` for "no context in
+ *  scope" (a default param can't be used here — it would mask an explicit `undefined`). */
+function makeCls(ctx: AuditContext | undefined) {
+  const store = new Map<string, unknown>();
+  if (ctx !== undefined) store.set(AUDIT_CONTEXT_KEY, ctx);
+  return {
+    get: <T>(k: string): T => store.get(k) as T,
+    set: (k: string, v: unknown) => void store.set(k, v),
+  } as any;
+}
 
 const shadow = (over: Record<string, unknown> = {}) => ({
   id: 'u1',
@@ -56,11 +81,22 @@ function makeDb(opts: { insertedId?: string } = {}) {
   return { db, captured, insertInto: db.insertInto };
 }
 
-function makeService(user: unknown, opts: { workspaceId?: string | null } = {}) {
+function makeService(
+  user: unknown,
+  opts: { workspaceId?: string | null; auditCtx?: AuditContext | undefined } = {},
+) {
   const { db, captured, insertInto } = makeDb();
   const userRepo = { findByEmail: jest.fn(async () => user) } as any;
+  const cls = makeCls('auditCtx' in opts ? opts.auditCtx : middlewareCtx());
+  // Capture the session ipAddress the way the REAL session.service does — read from CLS at mint time — so a
+  // test proves the value was set BEFORE createSessionAndToken ran (order is load-bearing for #330).
+  const sessionIp: { value: unknown } = { value: 'unset' };
   const sessionService = {
-    createSessionAndToken: jest.fn(async () => 'authtoken-xyz'),
+    createSessionAndToken: jest.fn(async () => {
+      sessionIp.value =
+        (cls.get(AUDIT_CONTEXT_KEY) as AuditContext | undefined)?.ipAddress ?? null;
+      return 'authtoken-xyz';
+    }),
   } as any;
   const workspaceId = 'workspaceId' in opts ? opts.workspaceId : 'ws1';
   const workspaces = {
@@ -71,8 +107,8 @@ function makeService(user: unknown, opts: { workspaceId?: string | null } = {}) 
       return workspaceId;
     }),
   } as any;
-  const svc = new ServiceBridgeService(db, userRepo, sessionService, workspaces);
-  return { svc, sessionService, userRepo, captured, insertInto, workspaces };
+  const svc = new ServiceBridgeService(db, userRepo, sessionService, workspaces, cls);
+  return { svc, sessionService, userRepo, captured, insertInto, workspaces, cls, sessionIp };
 }
 
 describe('ServiceBridgeService.mintSession — no direct identity selection', () => {
@@ -148,6 +184,68 @@ describe('ServiceBridgeService.mintSession — no direct identity selection', ()
       observed.push({ status: err.getStatus?.(), message: err.message });
     }
     expect(new Set(observed.map((o) => JSON.stringify(o))).size).toBe(1); // one shape for all reasons
+  });
+});
+
+describe('ServiceBridgeService.mintSession — #330 client IP into the session', () => {
+  it('records the platform-passed public IP on the session (not the relay peer)', async () => {
+    const { svc, sessionIp, cls } = makeService(shadow());
+    await svc.mintSession(EXTERNAL_ID, '203.0.113.7');
+    expect(sessionIp.value).toBe('203.0.113.7'); // seen at mint time — set BEFORE createSessionAndToken
+    expect((cls.get(AUDIT_CONTEXT_KEY) as AuditContext | undefined)?.ipAddress).toBe('203.0.113.7');
+  });
+
+  it('records a valid IPv6 address', async () => {
+    const { svc, sessionIp } = makeService(shadow());
+    await svc.mintSession(EXTERNAL_ID, '2001:db8::1');
+    expect(sessionIp.value).toBe('2001:db8::1');
+  });
+
+  it('ALWAYS overwrites the middleware loopback value — absent clientIp records NULL, never 127.0.0.1', async () => {
+    const { svc, sessionIp, cls } = makeService(shadow());
+    // Precondition: the middleware left 127.0.0.1 in the context.
+    expect((cls.get(AUDIT_CONTEXT_KEY) as AuditContext | undefined)?.ipAddress).toBe('127.0.0.1');
+    await svc.mintSession(EXTERNAL_ID); // old platform build sends no clientIp
+    expect(sessionIp.value).toBeNull(); // the confidently-wrong loopback value is gone
+  });
+
+  it('maps junk / loopback / unspecified spellings to NULL (never a non-address to the inet column)', async () => {
+    for (const bad of [
+      'not-an-ip',
+      '127.0.0.1',
+      '127.9.9.9',
+      '::1',
+      '::ffff:127.0.0.1',
+      '::ffff:127.9.9.9', // IPv4-mapped loopback range
+      '::FFFF:127.0.0.1', // uppercase spelling (the check lower-cases first)
+      '0.0.0.0',
+      '::',
+      // A zoned/link-local IPv6 passes net.isIP (→6) but Postgres `inet` rejects the `%zone` suffix — it
+      // MUST map to NULL, or it would 500 the session INSERT (the exact non-address crash the check stops).
+      'fe80::1%eth0',
+      'FE80::1%ETH0',
+      '',
+      '   ',
+    ]) {
+      const { svc, sessionIp } = makeService(shadow());
+      await svc.mintSession(EXTERNAL_ID, bad);
+      expect(sessionIp.value).toBeNull();
+    }
+  });
+
+  it('derives the stored IP ONLY from the passed clientIp — never falls back to the context/req.ip value', async () => {
+    // The context arrives with a forgeable-looking value; with no clientIp it must NOT be trusted/kept.
+    const { svc, sessionIp } = makeService(shadow(), {
+      auditCtx: { ...middlewareCtx(), ipAddress: '9.9.9.9' },
+    });
+    await svc.mintSession(EXTERNAL_ID); // no clientIp
+    expect(sessionIp.value).toBeNull(); // 9.9.9.9 (Docmost's req.ip) is never used
+  });
+
+  it('does not throw when no audit context exists (mint outside request middleware) — records null', async () => {
+    const { svc, sessionIp } = makeService(shadow(), { auditCtx: undefined });
+    await expect(svc.mintSession(EXTERNAL_ID, '203.0.113.7')).resolves.toBe('authtoken-xyz');
+    expect(sessionIp.value).toBeNull(); // no context to carry it → session.service defaults to null
   });
 });
 

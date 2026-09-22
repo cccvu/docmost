@@ -112,6 +112,23 @@ describe('service-bridge.openapi.json is the canonical inbound contract (provide
     expect(req.limit.maximum).toBe(CONTENT_LIST_MAX_LIMIT);
   });
 
+  // #330: the mint request carries the platform-resolved client IP. The endpoint accepts an undeclared body
+  // field silently (whitelist strips it), so without pinning the schema the contract could quietly forbid the
+  // field the fork now reads (the #320 step-6b "prose to CI" trap). Assert the schema declares it (closed set)
+  // AND the request example exercises it within the DTO's bound.
+  it('#330: MintSessionRequest declares the optional clientIp and the example exercises it', () => {
+    const schema = SPEC.components.schemas.MintSessionRequest;
+    expect(schema.additionalProperties).toBe(false);
+    expect(Object.keys(schema.properties).sort()).toEqual(['clientIp', 'externalId']);
+    expect(schema.required).toEqual(['externalId']); // clientIp is optional
+    expect(SPEC.components.schemas.ClientIp.maxLength).toBe(45); // matches MintSessionDto @MaxLength(45)
+    const example = (SPEC.paths['/api/service/session'] as any).post.requestBody.content[
+      'application/json'
+    ].example;
+    expect(typeof example.clientIp).toBe('string');
+    expect(example.clientIp.length).toBeLessThanOrEqual(45);
+  });
+
   // ---- Feed-schema tether, provider half (issue #179) -----------------------------------------------------
   // The fork's typed change feed (every `AuthzChangeEvent` variant, and `ChangesResult` / `SnapshotResult` as
   // the controller returns them) vs what this document DECLARES in `components.schemas`. The key maps are typed
