@@ -469,3 +469,21 @@ describe('ServiceBridgeService.reactivateShadowUser (#455)', () => {
     expect(userRepo.updateUser).not.toHaveBeenCalled();
   });
 });
+
+describe('ServiceBridgeService.findShadowUserId (#486 rule-M actor lookup)', () => {
+  it('resolves the shadow user by the derived (lower-cased) email, without provisioning', async () => {
+    const { svc, userRepo, insertInto } = makeService(shadow());
+
+    await expect(svc.findShadowUserId('ID-123')).resolves.toBe('u1');
+
+    expect(userRepo.findByEmail).toHaveBeenCalledWith(shadowEmailFor('id-123'), 'ws1');
+    expect(insertInto).not.toHaveBeenCalled(); // a lookup, never an upsert
+  });
+
+  it('is null for a never-provisioned identity (nothing is created)', async () => {
+    const { svc, insertInto } = makeService(undefined);
+
+    await expect(svc.findShadowUserId(EXTERNAL_ID)).resolves.toBeNull();
+    expect(insertInto).not.toHaveBeenCalled();
+  });
+});

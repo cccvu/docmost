@@ -20,6 +20,8 @@ import { PublicSearchHit } from './service-search.service';
 import { PublicAttachmentSummary } from './service-attachment.service';
 import { SpaceView, RawSpaceMember } from './service-space.service';
 import { WorkspaceSettingsView } from './service-workspace.service';
+import { ShadowUserLookup } from './service-bridge.service';
+import { UpdateSpaceMemberDto } from './dto/space-admin.dto';
 
 /**
  * Provider-side contract test: the routes the fork actually implements MUST equal the operations declared in
@@ -205,6 +207,7 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     RawPagePermission: keysOf<RawPagePermission>({ id: true, userId: true, groupId: true, role: true, createdAt: true }),
     PublicSearchHit: keysOf<PublicSearchHit>({ id: true, title: true, icon: true, parentPageId: true, space: true, highlight: true, createdAt: true, updatedAt: true }),
     PublicAttachmentSummary: keysOf<PublicAttachmentSummary>({ id: true, fileName: true, mimeType: true, fileSize: true, type: true, createdAt: true }),
+    ShadowUserLookup: keysOf<ShadowUserLookup>({ externalId: true, userId: true }),
   };
 
   // The 5 inline (non-component) scalar bodies, tied to the CONTROLLER return types (a signature change reds).
@@ -226,6 +229,7 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
   const OPS: Array<{ id: string; method: string; path: string; expect: OpExpect }> = [
     { id: 'provisionShadowUser', method: 'post', path: '/api/service/users', expect: { kind: 'ref', name: 'ProvisionedUser' } },
     { id: 'resolveUser', method: 'post', path: '/api/service/users/resolve', expect: { kind: 'ref', name: 'ProvisionedUser' } },
+    { id: 'lookupUsers', method: 'post', path: '/api/service/users/lookup', expect: { kind: 'items', name: 'ShadowUserLookup' } },
     { id: 'mintSession', method: 'post', path: '/api/service/session', expect: { kind: 'inline', keys: MINT } },
     { id: 'revokeSession', method: 'post', path: '/api/service/session/revoke', expect: { kind: 'inline', keys: REVOKE } },
     { id: 'restoreSession', method: 'post', path: '/api/service/session/restore', expect: { kind: 'inline', keys: RESTORE } },
@@ -280,5 +284,46 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
       expect(sortedKeys(schema.properties)).toEqual(exp.keys);
       if (schema.required) expect([...schema.required].sort()).toEqual(exp.keys);
     }
+  });
+});
+
+/**
+ * #486 — the member-mutation refusals are part of the wire contract the platform maps by status + body: the
+ * last-admin 409 on add/re-role/remove, the restore 409, the rule-M 403 whose body carries `code: self_grant`
+ * (the only error `code` the document makes contractual), and the re-role's REQUIRED actor. The request key
+ * set is typed against the fork DTO, so a field added on either side fails from both directions.
+ */
+describe('service-bridge.openapi.json member-mutation refusals (#486)', () => {
+  const op = (path: string, method: string): any => (SPEC.paths as any)[path][method];
+  const responses = (SPEC as any).components.responses;
+  const refName = (r: any): string => String(r?.$ref ?? '').split('/').pop()!;
+  const MEMBERS = '/api/service/spaces/{spaceId}/members';
+  const MEMBER = '/api/service/spaces/{spaceId}/members/{memberId}';
+
+  it('declares a 409 on add / re-role / remove member (last admin) and on unarchive (personal space)', () => {
+    expect(refName(op(MEMBERS, 'post').responses['409'])).toBe('LastAdmin');
+    expect(refName(op(MEMBER, 'patch').responses['409'])).toBe('LastAdmin');
+    expect(refName(op(MEMBER, 'delete').responses['409'])).toBe('LastAdmin');
+    expect(refName(op('/api/service/spaces/{spaceId}/unarchive', 'post').responses['409'])).toBe('Conflict');
+    expect(responses.LastAdmin).toBeDefined();
+  });
+
+  it('the add / re-role 403 admits the self_grant body (and still the scope-denial body)', () => {
+    for (const o of [op(MEMBERS, 'post'), op(MEMBER, 'patch')]) {
+      expect(refName(o.responses['403'])).toBe('MemberWriteForbidden');
+    }
+    const branches = responses.MemberWriteForbidden.content['application/json'].schema.anyOf.map(refName);
+    expect(branches.sort()).toEqual(['Error', 'SelfGrantError']);
+    const selfGrant = SPEC.components.schemas.SelfGrantError;
+    expect(selfGrant.properties.code.const).toBe('self_grant');
+    expect([...selfGrant.required].sort()).toEqual(['code', 'message']);
+  });
+
+  it('UpdateSpaceMemberRequest requires exactly the DTO keys — actorExternalId included (rule M fails closed)', () => {
+    const keys = Object.keys({ role: true, actorExternalId: true } satisfies Record<keyof UpdateSpaceMemberDto, true>).sort();
+    const schema = SPEC.components.schemas.UpdateSpaceMemberRequest;
+    expect(schema.additionalProperties).toBe(false);
+    expect(Object.keys(schema.properties).sort()).toEqual(keys);
+    expect([...schema.required].sort()).toEqual(keys);
   });
 });

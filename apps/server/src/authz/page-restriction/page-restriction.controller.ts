@@ -6,6 +6,7 @@ import { PageRestrictionService } from './page-restriction.service';
 import {
   AddPagePermissionDto,
   RemovePagePermissionDto,
+  RemoveRestrictionDto,
   RestrictPageDto,
   UpdatePagePermissionDto,
 } from './dto';
@@ -32,8 +33,8 @@ export class PageRestrictionController {
 
   @HttpCode(HttpStatus.OK)
   @Post('remove-restriction')
-  async removeRestriction(@Body() dto: RestrictPageDto, @AuthUser() user: User) {
-    await this.restriction.unrestrict(dto.pageId, user);
+  async removeRestriction(@Body() dto: RemoveRestrictionDto, @AuthUser() user: User) {
+    await this.restriction.unrestrict(dto.pageId, user, { requireActorCoverage: dto.requireActorCoverage === true });
     return { restricted: false };
   }
 

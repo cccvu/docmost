@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Docmost Service Bridge (east-west)",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "summary": "The east-west endpoints this Docmost fork EXPOSES to an integrating platform.",
     "description": "These are the machine-to-machine endpoints the fork hosts for an integrating platform (the inverse direction of authorization-service.openapi.json, which the fork calls). They exist so an external identity/session broker can provision a fork-local shadow user and mint a Docmost session for it, force-disconnect a live collab session after a revocation, and (Phase C) administer workspace settings + spaces and read the content model WITHOUT the platform reaching into Docmost's database directly. They are NOT part of the public north-south API and are not browser-facing.\n\nMode: the whole surface is 404 unless the fork runs with AUTHZ_MODE=remote (RemoteOnlyGuard, checked BEFORE the secret). In AUTHZ_MODE=native there is no integrating platform and every route below returns 404 for all callers.\n\nAuth: every request carries a shared service secret in the x-authz-service-secret header (PLATFORM_AUTHZ_SERVICE_SECRET). Each /api/service/* route additionally requires exactly one least-privilege scope: session:mint, users:provision, users:resolve, workspace:read, workspace:settings:write, spaces:read, spaces:write, pages:read, content:read, content:search, attachments:read, changes:read. Today a single full-scope secret is issued; per-scope credentials can be added later with no contract change.\n\nSecurity properties an integrator must understand:\n  - Identity-mutating endpoints are keyed ONLY on the caller's opaque externalId. The fork derives the shadow email (externalId@shadow.wiki-v2.internal) and resolves its own default workspace, so a caller can never select an arbitrary Docmost identity, name a real/privileged/native account, or supply a workspace id. This is a strong narrowing, not impersonation.\n  - The platform is the authorization authority: it performs the PDP decision (space/workspace administer, or the filter-then-retrieve authorized-id set) BEFORE calling these endpoints. The content read endpoints are a PRIVILEGED DATA PLANE, not a second gate: they return metadata for exactly the supplied ids and do NOT re-authorize. The security of the caller's /v1 surface rests entirely on it passing an authorized id set.\n  - Fail-closed: not remote -> 404; unconfigured secret -> 503; missing/wrong secret -> 401; wrong scope -> 403; over the per-credential rate limit -> 429; invalid body -> 400.\n\nResponse shape (incident #181): every 2xx body is EXACTLY the schema declared for its operation. The fork's global { data, success, status } response envelope (upstream TransformHttpResponseInterceptor) is skipped on this whole surface via per-handler @SkipTransform(); an integrator that receives an envelope is talking to a mis-built fork. Bring-up precondition: until Docmost first-run setup (POST /api/auth/setup) has created a workspace row, EVERY operation answers HTTP 404 with message exactly \"Workspace not found\" (an upstream pre-handler that runs before the service-bridge guards). That status + message pair is the ONLY response a consumer may treat as \"no workspace provisioned yet\"; any other 404 (e.g. the bare \"Not Found\" the fork answers when not in AUTHZ_MODE=remote) is a configuration error, and any 2xx body that does not match its declared schema is a contract violation the consumer must fail closed on.",
     "license": { "name": "AGPL-3.0-only", "identifier": "AGPL-3.0-only" },
@@ -67,6 +67,29 @@
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
+    "/api/service/users/lookup": {
+      "post": {
+        "operationId": "lookupUsers",
+        "tags": ["service-bridge"],
+        "summary": "Look up the shadow user ids of platform identities, WITHOUT provisioning.",
+        "description": "Read-only (#486): one entry per requested externalId, in order; userId is null when no shadow user exists (soft-deleted shadow users included — a grant can still reference one). Never creates or revives a user. Used by the platform to reach a page grant whose holder it has no cached mapping for. Scope: users:resolve.",
+        "requestBody": { "required": true, "content": { "application/json": {
+          "schema": { "$ref": "#/components/schemas/LookupUsersRequest" },
+          "example": { "externalIds": ["ext-abc123", "ext-def456"] }
+        } } },
+        "responses": {
+          "200": { "description": "One entry per requested id.", "content": { "application/json": {
+            "schema": { "type": "object", "required": ["items"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/ShadowUserLookup" } } } },
+            "example": { "items": [{ "externalId": "ext-abc123", "userId": "9b1f0c2e-0000-4000-8000-000000000001" }, { "externalId": "ext-def456", "userId": null }] }
+          } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "429": { "$ref": "#/components/responses/RateLimited" },
           "503": { "$ref": "#/components/responses/Unconfigured" }
         }
@@ -312,12 +335,13 @@
         "operationId": "unarchiveSpace",
         "tags": ["spaces"],
         "summary": "Restore an archived space.",
-        "description": "Scope: spaces:write.",
+        "description": "409 when the space is a personal space whose owner already has an active personal space (one live personal space per owner); the message names no owner. Scope: spaces:write.",
         "responses": {
           "200": { "$ref": "#/components/responses/Ok" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/Conflict" },
           "429": { "$ref": "#/components/responses/RateLimited" },
           "503": { "$ref": "#/components/responses/Unconfigured" }
         }
@@ -348,7 +372,7 @@
         "operationId": "addSpaceMember",
         "tags": ["spaces"],
         "summary": "Add (or re-add / re-role) a shadow user as a space member.",
-        "description": "The member + adder are resolved from their externalIds. Scope: spaces:write.",
+        "description": "The member + adder are resolved from their externalIds. An UPSERT: an existing member (a soft-deleted one included) is re-roled, so this can also demote. It runs under the space row lock and refuses (403, code `self_grant`) adding yourself or raising your own membership (member == adder; a soft-deleted row ranks as none), and (409) demoting the last live admin. Scope: spaces:write.",
         "requestBody": { "required": true, "content": { "application/json": {
           "schema": { "$ref": "#/components/schemas/AddSpaceMemberRequest" },
           "example": { "externalId": "ext-def456", "role": "writer", "addedByExternalId": "ext-abc123" }
@@ -357,8 +381,9 @@
           "200": { "description": "The upserted member.", "content": { "application/json": { "schema": { "type": "object", "required": ["memberId", "userId"], "properties": { "memberId": { "type": "string", "format": "uuid" }, "userId": { "type": "string", "format": "uuid" } } } } } },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
-          "403": { "$ref": "#/components/responses/Forbidden" },
+          "403": { "$ref": "#/components/responses/MemberWriteForbidden" },
           "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/LastAdmin" },
           "429": { "$ref": "#/components/responses/RateLimited" },
           "503": { "$ref": "#/components/responses/Unconfigured" }
         }
@@ -373,14 +398,18 @@
         "operationId": "changeSpaceMemberRole",
         "tags": ["spaces"],
         "summary": "Change a member's space role.",
-        "description": "Scope: spaces:write.",
-        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateSpaceMemberRequest" } } } },
+        "description": "The acting identity (actorExternalId) is REQUIRED — a request without it is a 400. Under the space row lock: 404 when memberId is not a live member of THIS space; 403 (code `self_grant`) when the row covers the actor (their own user row, or a group row they belong to) and the new role outranks its current one — narrowing is allowed; 409 when it would demote the last live admin. Scope: spaces:write.",
+        "requestBody": { "required": true, "content": { "application/json": {
+          "schema": { "$ref": "#/components/schemas/UpdateSpaceMemberRequest" },
+          "example": { "role": "reader", "actorExternalId": "ext-abc123" }
+        } } },
         "responses": {
           "200": { "$ref": "#/components/responses/Ok" },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
-          "403": { "$ref": "#/components/responses/Forbidden" },
+          "403": { "$ref": "#/components/responses/MemberWriteForbidden" },
           "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/LastAdmin" },
           "429": { "$ref": "#/components/responses/RateLimited" },
           "503": { "$ref": "#/components/responses/Unconfigured" }
         }
@@ -389,12 +418,13 @@
         "operationId": "removeSpaceMember",
         "tags": ["spaces"],
         "summary": "Remove a member from a space.",
-        "description": "Scope: spaces:write.",
+        "description": "Allowed on an archived space too. Removing yourself or a group you belong to is allowed. 409 when the member is the last live admin — on an archived space as well, where a direct admin row is the only administer path left. Scope: spaces:write.",
         "responses": {
           "200": { "$ref": "#/components/responses/Ok" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/LastAdmin" },
           "429": { "$ref": "#/components/responses/RateLimited" },
           "503": { "$ref": "#/components/responses/Unconfigured" }
         }
@@ -667,8 +697,16 @@
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
       },
       "Conflict": {
-        "description": "A uniqueness constraint (e.g. the space slug) is already taken.",
+        "description": "A uniqueness constraint is already taken (the space slug on create; on restore, the owner's one live personal space).",
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "LastAdmin": {
+        "description": "The write would leave the space with no live admin (user AND group admin rows count; soft-deleted rows do not). Promote another member to admin first.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "MemberWriteForbidden": {
+        "description": "Either the credential lacks the required per-route scope, OR the write would add the actor or raise a membership that covers the actor (wiki-v2 #486, rule M) — then the body is a SelfGrantError carrying code `self_grant`; another administrator must make the change (a retry cannot succeed).",
+        "content": { "application/json": { "schema": { "anyOf": [{ "$ref": "#/components/schemas/Error" }, { "$ref": "#/components/schemas/SelfGrantError" }] } } }
       },
       "RateLimited": {
         "description": "Per-credential, per-scope rate limit exceeded.",
@@ -698,6 +736,22 @@
         "properties": {
           "externalId": { "$ref": "#/components/schemas/ExternalId" },
           "name": { "type": "string", "maxLength": 255, "description": "Optional display name for the shadow user." }
+        }
+      },
+      "LookupUsersRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["externalIds"],
+        "properties": {
+          "externalIds": { "type": "array", "minItems": 1, "maxItems": 256, "items": { "$ref": "#/components/schemas/ExternalId" } }
+        }
+      },
+      "ShadowUserLookup": {
+        "type": "object",
+        "required": ["externalId", "userId"],
+        "properties": {
+          "externalId": { "type": "string" },
+          "userId": { "type": ["string", "null"], "description": "The shadow user's Docmost id, or null when none exists." }
         }
       },
       "ResolveUserRequest": {
@@ -805,8 +859,11 @@
       "UpdateSpaceMemberRequest": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["role"],
-        "properties": { "role": { "$ref": "#/components/schemas/SpaceMemberRole" } }
+        "required": ["role", "actorExternalId"],
+        "properties": {
+          "role": { "$ref": "#/components/schemas/SpaceMemberRole" },
+          "actorExternalId": { "$ref": "#/components/schemas/ExternalId", "description": "The acting identity (wiki-v2 #486): compared against the member row to refuse a self-raising write; never written." }
+        }
       },
       "ResolvePageSpaceRequest": {
         "type": "object",
@@ -985,6 +1042,15 @@
           "events": { "type": "array", "items": { "$ref": "#/components/schemas/AuthzChangeEvent" } },
           "nextCursor": { "type": ["string", "null"], "description": "Opaque cursor for the next page, or null when the whole desired set has been streamed." },
           "baseline": { "type": ["string", "null"], "description": "ONLY on the first page (no incoming cursor): the change-feed cursor \"<pg_snapshot_xmin>.0\" captured at snapshot start; the platform persists this as its change cursor after a successful reconcile so an in-flight-at-baseline transaction is replayed by the live drain, not skipped. Null on later pages." }
+        }
+      },
+      "SelfGrantError": {
+        "type": "object",
+        "description": "The rule-M refusal body (wiki-v2 #486). Unlike Error, `code` IS contractual: the integrating platform maps it to its own `self_grant` problem.",
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "const": "self_grant" },
+          "message": { "type": "string" }
         }
       },
       "Error": {
