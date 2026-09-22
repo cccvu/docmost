@@ -89,9 +89,18 @@ d('ServiceBridgeService.provisionShadowUser on real Postgres (no-takeover upsert
       },
     } as any;
     const sessionService = { createSessionAndToken: async () => 'authtoken' } as any;
-    // These tests exercise provisionShadowUser only (no session mint), so a no-op CLS stub suffices.
+    // #455: provisioning tests never touch the session repo — a bare double keeps the constructor shape.
+    const userSessionRepo = {} as any;
+    // #330: these tests exercise provisionShadowUser only (no session mint), so a no-op CLS stub suffices.
     const cls = { get: () => undefined, set: () => undefined } as any;
-    svc = new ServiceBridgeService(db, userRepo, sessionService, new WorkspaceResolver(db), cls);
+    svc = new ServiceBridgeService(
+      db,
+      userRepo,
+      userSessionRepo,
+      sessionService,
+      new WorkspaceResolver(db),
+      cls,
+    );
   });
 
   afterAll(async () => {

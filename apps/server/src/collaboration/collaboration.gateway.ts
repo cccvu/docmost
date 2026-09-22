@@ -25,6 +25,9 @@ import {
   CollaborationHandler,
   CollabEventHandlers,
 } from './collaboration.handler';
+// CCC seam (UPSTREAM_MODIFICATIONS.md #3f): the account-disable force-disconnect predicate lives in authz/
+// (importless, so it is unit-testable outside the lib0 ESM graph); this method is a thin delegate.
+import { disconnectUserConnections } from '../authz/collab/disconnect-user-connections';
 
 @Injectable()
 export class CollaborationGateway {
@@ -174,6 +177,30 @@ export class CollaborationGateway {
    */
   forceDisconnectUserFromPage(pageId: string, userId: string) {
     return this.handleYjsEvent('forceDisconnect', `page.${pageId}`, { userId });
+  }
+
+  /**
+   * CCC integration seam (UPSTREAM_MODIFICATIONS.md): force-disconnect a user's LIVE collab sockets across
+   * EVERY document, for #455 account-disable. The per-page `forceDisconnectUserFromPage` above needs a
+   * pageId and routes to one doc-owning node; account disable has no single page and must reach all of the
+   * user's open editors at once.
+   *
+   * NODE-LOCAL by design: iterate THIS node's resident documents and close every connection whose
+   * authenticated user matches. It does NOT route through RedisSync, so it works with
+   * `COLLAB_DISABLE_REDIS` too, and — because the fork runs a SINGLE collab node (ECS `desired_count=1`,
+   * the fork process hosts Hocuspocus in-process) — it closes ALL of the user's sockets. A multi-node
+   * collab deployment would additionally need an all-nodes RedisSync broadcast (a documented follow-up);
+   * that is out of scope while `desired_count=1`.
+   *
+   * Safe to run even for an already-active user (it just closes their live sockets), but the caller only
+   * invokes it AFTER `deactivateShadowUser` has set `deactivatedAt`, so every reconnect then re-runs
+   * `onAuthenticate` → `isUserDisabled` → rejected, and the socket cannot come back.
+   *
+   * The matching/closing loop is the CCC `disconnectUserConnections` helper (authz/), so the enforcement
+   * predicate is unit-tested there without loading this file's lib0 ESM graph.
+   */
+  forceDisconnectUser(userId: string): void {
+    disconnectUserConnections(this.hocuspocus.documents.values(), userId);
   }
 
   /**
