@@ -21,6 +21,9 @@ export interface RemoteAuthzClient {
     resourceId: string,
   ): Promise<boolean>;
   checkBulk(subject: AuthzSubject, checks: AuthzCheckItem[]): Promise<boolean[]>;
+  /** `checkBulk` with failure reported as `null` (not all-false) — for checks where `false` relaxes access
+   *  (e.g. `locked`), so a failure can be treated as the most restrictive answer instead (#492). */
+  tryCheckBulk(subject: AuthzSubject, checks: AuthzCheckItem[]): Promise<boolean[] | null>;
   filterResources(
     subject: AuthzSubject,
     permission: string,

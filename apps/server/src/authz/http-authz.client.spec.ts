@@ -46,6 +46,35 @@ describe('HttpAuthzClient', () => {
     ])).toEqual([false, false]);
   });
 
+  describe('tryCheckBulk (#492 — failure is null, never all-false)', () => {
+    const checks = [
+      { permission: 'view', resourceType: 'page', resourceId: 'a' },
+      { permission: 'locked', resourceType: 'page', resourceId: 'a' },
+    ];
+
+    it('returns the strict boolean results on a well-formed 200', async () => {
+      fetchMock.mockResolvedValueOnce(ok({ results: [true, false] }));
+      expect(await client.tryCheckBulk({ principalId: 'p1' }, checks)).toEqual([true, false]);
+    });
+
+    it('returns [] for an empty batch without calling the platform', async () => {
+      expect(await client.tryCheckBulk({ principalId: 'p1' }, [])).toEqual([]);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it.each([
+      ['a network error', () => fetchMock.mockRejectedValueOnce(new Error('down'))],
+      ['a non-200', () => fetchMock.mockResolvedValueOnce({ ok: false, status: 500, json: async () => ({}) })],
+      ['a non-array results', () => fetchMock.mockResolvedValueOnce(ok({ results: 'nope' }))],
+      ['a wrong-length results', () => fetchMock.mockResolvedValueOnce(ok({ results: [true] }))],
+      // A Byzantine `locked: "yes"` must not be coerced to false (= "unrestricted") — the whole batch is unknown.
+      ['a non-boolean element', () => fetchMock.mockResolvedValueOnce(ok({ results: [true, 'yes'] }))],
+    ])('returns null on %s', async (_label, arrange) => {
+      arrange();
+      expect(await client.tryCheckBulk({ principalId: 'p1' }, checks)).toBeNull();
+    });
+  });
+
   it('filterResources returns none on error and skips the call when empty', async () => {
     expect(await client.filterResources({ principalId: 'p1' }, 'view', 'page', [])).toEqual([]);
     expect(fetchMock).not.toHaveBeenCalled();

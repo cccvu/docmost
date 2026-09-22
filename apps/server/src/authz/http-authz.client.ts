@@ -76,14 +76,41 @@ export class HttpAuthzClient {
     return r?.allowed === true;
   }
 
+  /** POST `/authz/check-bulk`; the raw `results` when the envelope is well-formed (an array of exactly the
+   *  requested length), else null. Element types are validated by the two public callers below. */
+  private async bulkResults(subject: AuthzSubject, checks: AuthzCheckItem[]): Promise<unknown[] | null> {
+    const r = await this.post<{ results: unknown }>('/authz/check-bulk', { subject, checks });
+    if (Array.isArray(r?.results) && r.results.length === checks.length) return r.results;
+    if (r) this.logger.error('authz /authz/check-bulk -> malformed results envelope');
+    return null;
+  }
+
   async checkBulk(subject: AuthzSubject, checks: AuthzCheckItem[]): Promise<boolean[]> {
     if (checks.length === 0) return [];
-    const r = await this.post<{ results: boolean[] }>('/authz/check-bulk', { subject, checks });
+    const results = await this.bulkResults(subject, checks);
     // Fail-closed on a MALFORMED 200 (a buggy/Byzantine platform): a non-array or wrong-length `results`
     // must not flow downstream as boolean[]. Deny the whole batch, and coerce each element to a strict
     // boolean so a truthy non-boolean (e.g. 1, "yes") can never read as an allow.
-    if (!Array.isArray(r?.results) || r.results.length !== checks.length) return checks.map(() => false);
-    return r.results.map((x) => x === true);
+    if (!results) return checks.map(() => false);
+    return results.map((x) => x === true);
+  }
+
+  /**
+   * {@link checkBulk} that reports FAILURE distinctly — `null` — instead of collapsing it into all-`false`.
+   * Required wherever `false` is NOT a deny: `locked` is false for an UNRESTRICTED page, so a failed batch
+   * read as `locked=false` would make a restricted page look open (#492). `null` covers a transport error,
+   * timeout, non-2xx, a malformed envelope, AND any non-boolean element (a Byzantine `locked: "yes"` must not
+   * read as unrestricted either).
+   */
+  async tryCheckBulk(subject: AuthzSubject, checks: AuthzCheckItem[]): Promise<boolean[] | null> {
+    if (checks.length === 0) return [];
+    const results = await this.bulkResults(subject, checks);
+    if (!results) return null;
+    if (!results.every((x): x is boolean => typeof x === 'boolean')) {
+      this.logger.error('authz /authz/check-bulk -> non-boolean result element');
+      return null;
+    }
+    return results;
   }
 
   async filterResources(
