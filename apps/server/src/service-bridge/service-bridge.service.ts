@@ -162,6 +162,10 @@ export class ServiceBridgeService {
   private trustedClientIp(clientIp?: string): string | null {
     const ip = clientIp?.trim();
     if (!ip || isIP(ip) === 0) return null;
+    // A scoped/zoned IPv6 literal (`fe80::1%eth0`) passes `net.isIP` (→ 6) but Postgres `inet` REJECTS the
+    // `%zone` suffix, so storing it would 500 the INSERT — the exact non-address crash this check exists to
+    // stop. A zoned address is link-local and never a real remote client anyway, so → null.
+    if (ip.includes('%')) return null;
     const v = ip.toLowerCase();
     const v4 = v.startsWith('::ffff:') ? v.slice('::ffff:'.length) : v;
     if (v === '::1' || v === '::' || v4.startsWith('127.') || v4 === '0.0.0.0') {

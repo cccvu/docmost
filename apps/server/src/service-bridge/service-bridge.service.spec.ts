@@ -216,8 +216,14 @@ describe('ServiceBridgeService.mintSession — #330 client IP into the session',
       '127.9.9.9',
       '::1',
       '::ffff:127.0.0.1',
+      '::ffff:127.9.9.9', // IPv4-mapped loopback range
+      '::FFFF:127.0.0.1', // uppercase spelling (the check lower-cases first)
       '0.0.0.0',
       '::',
+      // A zoned/link-local IPv6 passes net.isIP (→6) but Postgres `inet` rejects the `%zone` suffix — it
+      // MUST map to NULL, or it would 500 the session INSERT (the exact non-address crash the check stops).
+      'fe80::1%eth0',
+      'FE80::1%ETH0',
       '',
       '   ',
     ]) {
