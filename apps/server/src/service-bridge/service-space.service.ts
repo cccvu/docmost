@@ -6,7 +6,7 @@ import {
 } from '@nestjs/common';
 import { InjectKysely } from 'nestjs-kysely';
 import { sql } from 'kysely';
-import { KyselyDB } from '@docmost/db/types/kysely.types';
+import { KyselyDB, KyselyTransaction } from '@docmost/db/types/kysely.types';
 import {
   AddSpaceMemberDto,
   CreateSpaceDto,
@@ -58,6 +58,9 @@ interface SpaceRow {
 const iso = (d: Date | string): string =>
   d instanceof Date ? d.toISOString() : new Date(d).toISOString();
 
+const LAST_ADMIN =
+  'a space must keep at least one admin — promote another member to admin before demoting or removing this one';
+
 /**
  * CCC service-bridge — NOT upstream Docmost code.
  *
@@ -72,6 +75,14 @@ const iso = (d: Date | string): string =>
  * simple member count) via `sql` templates — deliberately NOT the fork's own SpaceRepo/SpaceMemberRepo,
  * which hard-delete and emit SPACE_DELETED events (different semantics that would drift the outbox and break
  * archive reversibility). No `users.role` is ever touched: a space `admin` is a per-space role only.
+ *
+ * It carries no AUTHORIZATION policy, but it does enforce one DATA invariant, per upstream parity
+ * (`SpaceMemberService.validateLastAdmin`): a member mutation may not leave the space without a live admin
+ * (#486). Every member mutation runs in ONE transaction that first locks the space row (`lockSpace`), so two
+ * concurrent bridge mutations on one space serialize; under READ COMMITTED each statement after the lock takes
+ * a fresh snapshot, so the admin count sees whatever the previously serialized transaction committed.
+ * Residual: the native `/api/spaces/members/*` path (upstream SpaceMemberService) takes no such lock, so a
+ * native change racing a bridge change can still orphan a space (a workspace admin recovers via the cascade).
  */
 @Injectable()
 export class ServiceSpaceService {
@@ -253,36 +264,109 @@ export class ServiceSpaceService {
     spaceId: string,
     dto: AddSpaceMemberDto,
   ): Promise<{ memberId: string; userId: string }> {
+    // Fast 404/400 BEFORE provisioning (no shadow user is created for a dead space); everything slow — the
+    // workspace + both shadow users — is resolved before the transaction so the space lock is held briefly.
     await this.loadSpace(spaceId, { activeOnly: true });
     const { userId: memberUserId } = await this.bridge.provisionShadowUser({ externalId: dto.externalId });
     const { userId: addedById } = await this.bridge.provisionShadowUser({
       externalId: dto.addedByExternalId,
     });
-    const res = await sql<{ id: string }>`
-      insert into space_members (user_id, space_id, role, added_by_id)
-      values (${memberUserId}, ${spaceId}, ${dto.role}, ${addedById})
-      on conflict (space_id, user_id) do update set role = excluded.role, deleted_at = null, updated_at = now()
-      returning id
-    `.execute(this.db);
-    return { memberId: res.rows[0].id, userId: memberUserId };
+    const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
+    return this.db.transaction().execute(async (trx) => {
+      await this.lockSpace(trx, workspaceId, spaceId, true);
+      // The upsert re-roles an existing LIVE row, so it can demote the last admin like a PATCH can.
+      const cur = await sql<{ id: string; role: string }>`
+        select id, role from space_members
+        where space_id = ${spaceId} and user_id = ${memberUserId} and deleted_at is null
+        for update
+      `.execute(trx);
+      const row = cur.rows[0];
+      if (row?.role === 'admin' && dto.role !== 'admin') await this.assertAnotherAdmin(trx, spaceId, row.id);
+      const res = await sql<{ id: string }>`
+        insert into space_members (user_id, space_id, role, added_by_id)
+        values (${memberUserId}, ${spaceId}, ${dto.role}, ${addedById})
+        on conflict (space_id, user_id) do update set role = excluded.role, deleted_at = null, updated_at = now()
+        returning id
+      `.execute(trx);
+      return { memberId: res.rows[0].id, userId: memberUserId };
+    });
   }
 
   async changeMemberRole(spaceId: string, memberId: string, role: SpaceMemberRole): Promise<void> {
-    await this.loadSpace(spaceId, { activeOnly: true });
-    const res = await sql<{ id: string }>`
-      update space_members set role = ${role}, updated_at = now()
-      where id = ${memberId} and space_id = ${spaceId} and deleted_at is null
-      returning id
-    `.execute(this.db);
-    if (res.rows.length === 0) throw new NotFoundException('member not found');
+    const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
+    await this.db.transaction().execute(async (trx) => {
+      await this.lockSpace(trx, workspaceId, spaceId, true);
+      // `id AND space_id`: a memberId from another space is a 404, never a cross-space write.
+      const cur = await sql<{ role: string }>`
+        select role from space_members
+        where id = ${memberId} and space_id = ${spaceId} and deleted_at is null
+        for update
+      `.execute(trx);
+      const row = cur.rows[0];
+      if (!row) throw new NotFoundException('member not found');
+      if (row.role === 'admin' && role !== 'admin') await this.assertAnotherAdmin(trx, spaceId, memberId);
+      await sql`
+        update space_members set role = ${role}, updated_at = now()
+        where id = ${memberId} and space_id = ${spaceId}
+      `.execute(trx);
+    });
   }
 
+  /** Remove a member. Allowed on an ARCHIVED space too (as before) — and still guarded: there a direct admin
+   *  row is the only administer path left (the workspace cascade is severed), so orphaning it is worse. */
   async removeMember(spaceId: string, memberId: string): Promise<void> {
-    await this.loadSpace(spaceId);
-    const res = await sql<{ id: string }>`
-      delete from space_members where id = ${memberId} and space_id = ${spaceId} returning id
-    `.execute(this.db);
-    if (res.rows.length === 0) throw new NotFoundException('member not found');
+    const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
+    await this.db.transaction().execute(async (trx) => {
+      await this.lockSpace(trx, workspaceId, spaceId, false);
+      const cur = await sql<{ role: string; deletedAt: Date | null }>`
+        select role, deleted_at from space_members
+        where id = ${memberId} and space_id = ${spaceId}
+        for update
+      `.execute(trx);
+      const row = cur.rows[0];
+      if (!row) throw new NotFoundException('member not found');
+      if (row.role === 'admin' && row.deletedAt == null) await this.assertAnotherAdmin(trx, spaceId, memberId);
+      await sql`delete from space_members where id = ${memberId} and space_id = ${spaceId}`.execute(trx);
+    });
+  }
+
+  /**
+   * Lock the space row for this transaction (404 if absent / wrong tenant; 400 if archived when activeOnly).
+   * FOR NO KEY UPDATE, not FOR UPDATE: two NO KEY UPDATE locks conflict (so this space's bridge member
+   * mutations — and archive/unarchive — serialize), but it does not block the FOR KEY SHARE that FK checks take,
+   * so page / page_access / space_members inserts referencing this space are never held up.
+   */
+  private async lockSpace(
+    trx: KyselyTransaction,
+    workspaceId: string,
+    spaceId: string,
+    activeOnly: boolean,
+  ): Promise<void> {
+    const res = await sql<{ id: string; deletedAt: Date | null }>`
+      select id, deleted_at from spaces where id = ${spaceId} and workspace_id = ${workspaceId}
+      for no key update
+    `.execute(trx);
+    const row = res.rows[0];
+    if (!row) throw new NotFoundException('space not found');
+    if (activeOnly && row.deletedAt != null) throw new BadRequestException('space is archived');
+  }
+
+  /**
+   * Upstream `validateLastAdmin` parity: at least one LIVE admin row (user OR group — a group admin row is a
+   * real PDP admin path) must remain once `excludingMemberId` stops being one. The `deleted_at` filter is our
+   * deviation: the outbox projects a soft-deleted row as removed, so it is no admin in the PDP. Called only
+   * when the target IS a live admin, so a space that already has no admin never becomes unmanageable.
+   */
+  private async assertAnotherAdmin(
+    trx: KyselyTransaction,
+    spaceId: string,
+    excludingMemberId: string,
+  ): Promise<void> {
+    const res = await sql<{ n: number }>`
+      select count(*)::int as n from space_members
+      where space_id = ${spaceId} and role = 'admin' and deleted_at is null and id <> ${excludingMemberId}
+    `.execute(trx);
+    if ((res.rows[0]?.n ?? 0) === 0) throw new ConflictException(LAST_ADMIN);
   }
 
   /** Load a space scoped to the default workspace (404 if absent / wrong tenant / archived when activeOnly). */

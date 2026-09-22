@@ -1,4 +1,4 @@
-import { ConflictException, NotFoundException } from '@nestjs/common';
+import { BadRequestException, ConflictException, NotFoundException } from '@nestjs/common';
 import { ServiceSpaceService } from './service-space.service';
 import { spyKysely, SpyQuery } from './kysely-spy.testkit';
 
@@ -110,5 +110,156 @@ describe('ServiceSpaceService.listMembers — opt-in keyset paging (backward-com
     expect(sql).toContain('id::text asc');
     expect(sql).toContain('> (');
     expect(call.parameters).toContainEqual(26); // limit + 1
+  });
+});
+
+describe('ServiceSpaceService member mutations — last-admin invariant (#486)', () => {
+  // A scripted world for the spy: the space lock row, the target member row, and how many OTHER live admins the
+  // count query sees. `loadSpace` (addMember's fast pre-check) reads `from spaces s`.
+  type World = {
+    space?: 'live' | 'archived' | 'missing';
+    member?: { id?: string; role: string; deletedAt?: Date | null } | null;
+    otherAdmins?: number;
+  };
+  const respondTo = (w: World) => (query: SpyQuery) => {
+    const s = q(query.sql);
+    const space = w.space ?? 'live';
+    if (s.includes('for no key update')) {
+      return space === 'missing' ? [] : [{ id: 'sp1', deletedAt: space === 'archived' ? new Date() : null }];
+    }
+    if (s.includes('from spaces s')) {
+      return space === 'missing'
+        ? []
+        : [{ id: 'sp1', name: 'S', slug: 's', description: null, visibility: 'private', createdAt: new Date(),
+             deletedAt: space === 'archived' ? new Date() : null, memberCount: '1' }];
+    }
+    if (s.includes('from space_members') && s.includes('for update')) {
+      return w.member ? [{ id: 'm1', deletedAt: null, ...w.member }] : [];
+    }
+    if (s.includes('count(*)::int as n')) return [{ n: w.otherAdmins ?? 0 }];
+    if (s.includes('insert into space_members')) return [{ id: 'm1' }];
+    return [];
+  };
+  const idx = (spy: { calls: SpyQuery[] }, needle: string) => spy.calls.findIndex((c) => q(c.sql).includes(needle));
+  const ran = (spy: { calls: SpyQuery[] }, needle: string) => idx(spy, needle) !== -1;
+
+  describe('changeMemberRole', () => {
+    it('locks the space row FOR NO KEY UPDATE first, then loads the member by id AND space_id', async () => {
+      const { svc, spy } = make(respondTo({ member: { role: 'writer' } }));
+      await svc.changeMemberRole('sp1', 'm1', 'reader');
+      expect(spy.tx).toEqual(['begin', 'commit']);
+      const lock = idx(spy, 'for no key update');
+      expect(lock).toBe(0); // the first statement of the transaction (the workspace resolver is a stub)
+      expect(idx(spy, 'from space_members')).toBeGreaterThan(lock);
+      const load = spy.calls[idx(spy, 'from space_members')];
+      expect(q(load.sql)).toContain('space_id =');
+      expect(load.parameters).toEqual(expect.arrayContaining(['m1', 'sp1']));
+      expect(ran(spy, 'count(*)::int')).toBe(false); // demoting a non-admin never counts admins
+    });
+
+    it('409s demoting the sole live admin (rolled back, no UPDATE)', async () => {
+      const { svc, spy } = make(respondTo({ member: { role: 'admin' }, otherAdmins: 0 }));
+      await expect(svc.changeMemberRole('sp1', 'm1', 'writer')).rejects.toBeInstanceOf(ConflictException);
+      expect(spy.tx).toEqual(['begin', 'rollback']);
+      expect(ran(spy, 'update space_members')).toBe(false);
+      // The count excludes the target and filters soft-deleted rows (user AND group rows both count).
+      const count = spy.calls[idx(spy, 'count(*)::int')];
+      expect(q(count.sql)).toContain("role = 'admin'");
+      expect(q(count.sql)).toContain('deleted_at is null');
+      expect(q(count.sql)).not.toContain('user_id');
+      expect(count.parameters).toContain('m1');
+    });
+
+    it('commits the demotion when another live admin remains', async () => {
+      const { svc, spy } = make(respondTo({ member: { role: 'admin' }, otherAdmins: 1 }));
+      await expect(svc.changeMemberRole('sp1', 'm1', 'reader')).resolves.toBeUndefined();
+      expect(spy.tx).toEqual(['begin', 'commit']);
+      expect(ran(spy, 'update space_members')).toBe(true);
+    });
+
+    it('does not count admins for an admin→admin write (not a demotion)', async () => {
+      const { svc, spy } = make(respondTo({ member: { role: 'admin' }, otherAdmins: 0 }));
+      await expect(svc.changeMemberRole('sp1', 'm1', 'admin')).resolves.toBeUndefined();
+      expect(ran(spy, 'count(*)::int')).toBe(false);
+    });
+
+    it('400s on an archived space and 404s a missing space or member (all before any write)', async () => {
+      const archived = make(respondTo({ space: 'archived', member: { role: 'writer' } }));
+      await expect(archived.svc.changeMemberRole('sp1', 'm1', 'reader')).rejects.toBeInstanceOf(BadRequestException);
+      const noSpace = make(respondTo({ space: 'missing' }));
+      await expect(noSpace.svc.changeMemberRole('sp1', 'm1', 'reader')).rejects.toBeInstanceOf(NotFoundException);
+      const noMember = make(respondTo({ member: null }));
+      await expect(noMember.svc.changeMemberRole('sp1', 'm1', 'reader')).rejects.toBeInstanceOf(NotFoundException);
+      for (const { spy } of [archived, noSpace, noMember]) {
+        expect(spy.tx).toEqual(['begin', 'rollback']);
+        expect(ran(spy, 'update space_members')).toBe(false);
+      }
+    });
+  });
+
+  describe('removeMember', () => {
+    it('409s removing the sole live admin (rolled back, no DELETE)', async () => {
+      const { svc, spy } = make(respondTo({ member: { role: 'admin' }, otherAdmins: 0 }));
+      await expect(svc.removeMember('sp1', 'm1')).rejects.toBeInstanceOf(ConflictException);
+      expect(spy.tx).toEqual(['begin', 'rollback']);
+      expect(ran(spy, 'delete from space_members')).toBe(false);
+      expect(q(spy.calls[0].sql)).toContain('for no key update');
+    });
+
+    it('stays allowed on an ARCHIVED space, but is still guarded there', async () => {
+      const guarded = make(respondTo({ space: 'archived', member: { role: 'admin' }, otherAdmins: 0 }));
+      await expect(guarded.svc.removeMember('sp1', 'm1')).rejects.toBeInstanceOf(ConflictException);
+      const ok = make(respondTo({ space: 'archived', member: { role: 'writer' } }));
+      await expect(ok.svc.removeMember('sp1', 'm1')).resolves.toBeUndefined();
+      expect(ok.spy.tx).toEqual(['begin', 'commit']);
+      expect(ran(ok.spy, 'delete from space_members')).toBe(true);
+    });
+
+    it('a soft-deleted admin row is not a live admin: removing it needs no other admin', async () => {
+      const { svc, spy } = make(respondTo({ member: { role: 'admin', deletedAt: new Date() }, otherAdmins: 0 }));
+      await expect(svc.removeMember('sp1', 'm1')).resolves.toBeUndefined();
+      expect(ran(spy, 'count(*)::int')).toBe(false);
+      expect(ran(spy, 'delete from space_members')).toBe(true);
+    });
+
+    it('404s a member that is not in this space', async () => {
+      const { svc, spy } = make(respondTo({ member: null }));
+      await expect(svc.removeMember('sp1', 'm1')).rejects.toBeInstanceOf(NotFoundException);
+      expect(ran(spy, 'delete from space_members')).toBe(false);
+    });
+  });
+
+  describe('addMember (the upsert can re-role an existing live row)', () => {
+    const dto = (role: 'admin' | 'writer' | 'reader') =>
+      ({ externalId: 'ext-m', role, addedByExternalId: 'ext-a' }) as any;
+
+    it('409s an upsert that would demote the sole live admin (no INSERT reaches the table)', async () => {
+      const { svc, spy } = make(respondTo({ member: { role: 'admin' }, otherAdmins: 0 }));
+      await expect(svc.addMember('sp1', dto('writer'))).rejects.toBeInstanceOf(ConflictException);
+      expect(spy.tx).toEqual(['begin', 'rollback']);
+      expect(ran(spy, 'insert into space_members')).toBe(false);
+    });
+
+    it('locks inside the transaction AFTER the pre-check and provisioning, then upserts on commit', async () => {
+      const { svc, spy } = make(respondTo({ member: null }));
+      await expect(svc.addMember('sp1', dto('writer'))).resolves.toEqual({ memberId: 'm1', userId: 'docmost-ext-m' });
+      expect(spy.tx).toEqual(['begin', 'commit']);
+      expect(idx(spy, 'from spaces s')).toBeLessThan(idx(spy, 'for no key update')); // fast pre-check first
+      expect(idx(spy, 'for no key update')).toBeLessThan(idx(spy, 'insert into space_members'));
+      expect(ran(spy, 'count(*)::int')).toBe(false);
+    });
+
+    it('400s an archived space before provisioning anyone (no transaction opened)', async () => {
+      const { svc, spy } = make(respondTo({ space: 'archived' }));
+      await expect(svc.addMember('sp1', dto('reader'))).rejects.toBeInstanceOf(BadRequestException);
+      expect(spy.tx).toEqual([]);
+    });
+  });
+});
+
+describe('ServiceSpaceService.unarchive', () => {
+  it('404s a space that is missing or not archived', async () => {
+    const { svc } = make(() => []);
+    await expect(svc.unarchive('sp1')).rejects.toBeInstanceOf(NotFoundException);
   });
 });

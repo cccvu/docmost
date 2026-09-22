@@ -33,7 +33,8 @@ import { parseSubCollectionQuery } from './dto/sub-collection-page.dto';
  * CCC service-bridge — NOT upstream Docmost code.
  *
  * The space + membership control plane the platform calls (it authorizes `space#administer` first; these
- * carry no policy). `RemoteOnlyGuard` 404s the surface unless AUTHZ_MODE=remote; the scoped ServiceAuthGuard
+ * carry no authorization policy — the service enforces only the last-admin DATA invariant, as a 409).
+ * `RemoteOnlyGuard` 404s the surface unless AUTHZ_MODE=remote; the scoped ServiceAuthGuard
  * enforces least privilege (read vs write scopes). The fork owns the schema + the transactional create.
  */
 @Controller('service/spaces')
