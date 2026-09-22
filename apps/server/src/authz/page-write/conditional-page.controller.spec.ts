@@ -33,7 +33,7 @@ import {
 describe('ConditionalPageController.conditionalUpdate', () => {
   // `id` deliberately DIFFERS from the `pageId` callers send (see the slug test below): a fixture where
   // they are equal cannot tell `dto.pageId` and `page.id` apart, and that blindness hid a real defect.
-  const PAGE = { id: 'page-uuid-1', spaceId: 'space-1' };
+  const PAGE = { id: 'page-uuid-1', spaceId: 'space-1', title: 'Current title' };
   const USER = { id: 'user-1' } as never;
   const DIGEST = 'a'.repeat(64);
 
@@ -42,12 +42,21 @@ describe('ConditionalPageController.conditionalUpdate', () => {
     canEdit?: 'ok' | 'deny';
     apply?: unknown;
     updateThrows?: boolean;
+    /** #485: the row content at snapshot time and the newest history version's content. */
+    current?: unknown;
+    lastHistory?: { id: string; title?: string | null; content: unknown } | null;
   }) => {
     const calls: string[] = [];
     const pageRepo = {
-      findById: jest.fn(
-        async () => (calls.push('findById'), 'page' in opts ? opts.page : PAGE),
-      ),
+      findById: jest.fn(async (_id: string, o?: { includeContent?: boolean }) => {
+        calls.push('findById');
+        if (o?.includeContent && 'current' in opts) return { ...PAGE, content: opts.current, contributorIds: ['u9'] };
+        return 'page' in opts ? opts.page : PAGE;
+      }),
+    };
+    const pageHistoryRepo = {
+      findPageLastHistory: jest.fn(async () => (calls.push('lastHistory'), opts.lastHistory ?? null)),
+      insertPageHistory: jest.fn(async () => (calls.push('saveHistory'), { id: 'hist-new' })),
     };
     const pageAccessService = {
       validateCanEdit: jest.fn(async () => {
@@ -79,10 +88,12 @@ describe('ConditionalPageController.conditionalUpdate', () => {
       pageService as never,
       pageAccessService as never,
       gateway as never,
+      pageHistoryRepo as never,
     );
     return {
       controller,
       calls,
+      pageHistoryRepo,
       pageRepo,
       pageAccessService,
       pageService,
@@ -444,5 +455,104 @@ describe('ConditionalPageController.conditionalUpdate', () => {
         }),
       ),
     ).not.toHaveLength(0);
+  });
+
+  // #485: reversible version restore — the current content is saved BEFORE a replace, once.
+  describe('snapshotBefore (#485)', () => {
+    const OLD = { type: 'doc', content: [{ type: 'paragraph' }] };
+    const NEW = { type: 'doc', content: [] };
+
+    it('saves the current content as a version AFTER the edit check and parse, BEFORE the apply', async () => {
+      const t = build({ current: OLD, lastHistory: null });
+      const out = (await t.controller.conditionalUpdate(
+        dto({ content: NEW as never, format: 'json', snapshotBefore: true }),
+        USER,
+      )) as { snapshot?: unknown };
+      expect(out.snapshot).toEqual({ status: 'saved', historyId: 'hist-new' });
+      expect(t.calls.indexOf('validateCanEdit')).toBeLessThan(t.calls.indexOf('saveHistory'));
+      expect(t.calls.indexOf('parse')).toBeLessThan(t.calls.indexOf('saveHistory'));
+      expect(t.calls.indexOf('saveHistory')).toBeLessThan(t.calls.indexOf('conditionalApply'));
+      expect(t.pageHistoryRepo.insertPageHistory).toHaveBeenCalledWith(
+        expect.objectContaining({ pageId: PAGE.id, content: OLD, contributorIds: ['u9'] }),
+      );
+    });
+
+    it('reports unchanged (no new version) when the current content already equals the newest version', async () => {
+      const t = build({
+        current: OLD,
+        lastHistory: { id: 'hist-7', title: PAGE.title, content: { content: [{ type: 'paragraph' }], type: 'doc' } },
+      });
+      const out = (await t.controller.conditionalUpdate(
+        dto({ content: NEW as never, format: 'json', snapshotBefore: true }),
+        USER,
+      )) as { snapshot?: unknown };
+      expect(out.snapshot).toEqual({ status: 'unchanged', historyId: 'hist-7' });
+      expect(t.pageHistoryRepo.insertPageHistory).not.toHaveBeenCalled();
+    });
+
+    it('reports unchanged when the incoming content equals the current content', async () => {
+      const t = build({ current: NEW, lastHistory: null });
+      const out = (await t.controller.conditionalUpdate(
+        dto({ content: NEW as never, format: 'json', snapshotBefore: true }),
+        USER,
+      )) as { snapshot?: unknown };
+      expect(out.snapshot).toEqual({ status: 'unchanged', historyId: null });
+      expect(t.pageHistoryRepo.insertPageHistory).not.toHaveBeenCalled();
+    });
+
+    it('saves a version when the newest one has the same content but a different title', async () => {
+      const t = build({ current: OLD, lastHistory: { id: 'hist-7', title: 'an older title', content: OLD } });
+      const out = (await t.controller.conditionalUpdate(
+        dto({ content: NEW as never, format: 'json', snapshotBefore: true }),
+        USER,
+      )) as { snapshot?: unknown };
+      expect(out.snapshot).toEqual({ status: 'saved', historyId: 'hist-new' });
+    });
+
+    it('saves a version when only the TITLE would change (a version restore of equal content is still undoable)', async () => {
+      const t = build({ current: NEW, lastHistory: null });
+      const out = (await t.controller.conditionalUpdate(
+        dto({ title: 'the restored title', content: NEW as never, format: 'json', snapshotBefore: true }),
+        USER,
+      )) as { snapshot?: unknown };
+      expect(out.snapshot).toEqual({ status: 'saved', historyId: 'hist-new' });
+      expect(t.pageHistoryRepo.insertPageHistory).toHaveBeenCalledWith(expect.objectContaining({ title: PAGE.title }));
+    });
+
+    it('reports unchanged when the incoming title AND content equal the current ones', async () => {
+      const t = build({ current: NEW, lastHistory: null });
+      const out = (await t.controller.conditionalUpdate(
+        dto({ title: PAGE.title as never, content: NEW as never, format: 'json', snapshotBefore: true }),
+        USER,
+      )) as { snapshot?: unknown };
+      expect(out.snapshot).toEqual({ status: 'unchanged', historyId: null });
+    });
+
+    it('saves nothing when the edit check refuses', async () => {
+      const t = build({ current: OLD, canEdit: 'deny' });
+      await expect(
+        t.controller.conditionalUpdate(dto({ content: NEW as never, format: 'json', snapshotBefore: true }), USER),
+      ).rejects.toBeInstanceOf(ForbiddenException);
+      expect(t.pageHistoryRepo.insertPageHistory).not.toHaveBeenCalled();
+    });
+
+    it('does not snapshot an append, or when the flag is absent (response carries no snapshot)', async () => {
+      const t = build({ current: OLD });
+      await t.controller.conditionalUpdate(dto({ operation: 'append', snapshotBefore: true }), USER);
+      const plain = (await t.controller.conditionalUpdate(dto(), USER)) as { snapshot?: unknown };
+      expect(t.pageHistoryRepo.insertPageHistory).not.toHaveBeenCalled();
+      expect(plain.snapshot).toBeUndefined();
+    });
+
+    it('never forwards snapshotBefore into PageService.update (not a page column)', async () => {
+      const t = build({ current: OLD });
+      await t.controller.conditionalUpdate(dto({ content: NEW as never, format: 'json', snapshotBefore: true }), USER);
+      expect(t.pageService.update.mock.calls[0][1]).not.toHaveProperty('snapshotBefore');
+    });
+
+    it('validates snapshotBefore as a boolean', async () => {
+      const bad = plainToInstance(ConditionalUpdatePageDto, { pageId: 'p', snapshotBefore: 'yes' });
+      expect((await validate(bad)).map((e) => e.property)).toContain('snapshotBefore');
+    });
   });
 });
