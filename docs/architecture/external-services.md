@@ -26,7 +26,9 @@ Configuration:
 Behavior you must design around:
 
 - **Fail-closed.** A non-2xx, a timeout, a dropped connection, or a malformed body is treated as deny/empty.
-  Returning `5xx` on your own errors is safe: it degrades to deny, never to allow.
+  Returning `5xx` on your own errors is safe: it degrades to deny, never to allow. This includes the page
+  `locked` check, where `false` means *unrestricted*: a failed or malformed `check-bulk` carrying `locked` is
+  treated as **restricted with no access**. It never falls back to the space role.
 - **Constant-time secret check.** Compare `x-authz-service-secret` in constant time; `401` on mismatch, `503`
   if you have no secret configured.
 - **Respond within the timeout.** The fork aborts the request at `PLATFORM_AUTHZ_TIMEOUT_MS`.

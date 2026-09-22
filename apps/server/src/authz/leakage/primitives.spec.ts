@@ -1,5 +1,7 @@
 import { PdpPagePermissionRepo } from '../pdp-page-permission.repo';
 import { PdpSpaceMemberRepo } from '../pdp-space-member.repo';
+import { ForbiddenException } from '@nestjs/common';
+import { PageAccessService } from '../../core/page/page-access/page-access.service';
 
 /**
  * CCC authorization integration test (fork compatibility suite) — the leakage backbone.
@@ -23,16 +25,18 @@ describe('PDP repo primitives — deny propagation (leakage backbone)', () => {
   const denies = (rt: string, rid: string) =>
     (rt === 'page' && rid === CONF_PAGE) || (rt === 'space' && rid === CONF_SPACE);
 
+  const decide = (checks: Array<{ permission: string; resourceType: string; resourceId: string }>) =>
+    checks.map((c) => {
+      if (c.permission === 'locked') return c.resourceId === LOCKED_PAGE; // only LOCKED_PAGE is restricted
+      if (denies(c.resourceType, c.resourceId)) return false;
+      if (c.permission === 'edit' && c.resourceId === READONLY_PAGE) return false;
+      return true;
+    });
+
   const authz = {
     check: jest.fn(async (_s: any, _p: string, rt: string, rid: string) => !denies(rt, rid)),
-    checkBulk: jest.fn(async (_s: any, checks: Array<{ permission: string; resourceType: string; resourceId: string }>) =>
-      checks.map((c) => {
-        if (c.permission === 'locked') return c.resourceId === LOCKED_PAGE; // only LOCKED_PAGE is restricted
-        if (denies(c.resourceType, c.resourceId)) return false;
-        if (c.permission === 'edit' && c.resourceId === READONLY_PAGE) return false;
-        return true;
-      }),
-    ),
+    checkBulk: jest.fn(async (_s: any, checks: Parameters<typeof decide>[0]) => decide(checks)),
+    tryCheckBulk: jest.fn(async (_s: any, checks: Parameters<typeof decide>[0]) => decide(checks)),
     filterResources: jest.fn(async (_s: any, _p: string, _rt: string, ids: string[]) =>
       ids.filter((id) => id !== CONF_PAGE),
     ),
@@ -109,6 +113,7 @@ describe('PDP repo primitives — deny propagation (leakage backbone)', () => {
     const down = {
       check: jest.fn(async () => false),
       checkBulk: jest.fn(async (_s: any, checks: any[]) => checks.map(() => false)),
+      tryCheckBulk: jest.fn(async () => null), // #492: a failed bulk call is reported as UNKNOWN, not all-false
       filterResources: jest.fn(async () => []),
       lookupResources: jest.fn(async () => []),
       filterSubjects: jest.fn(async () => []),
@@ -121,9 +126,48 @@ describe('PDP repo primitives — deny propagation (leakage backbone)', () => {
       expect(await page.filterAccessiblePageIdsWithPermissions(['a', 'b'], 'u1')).toEqual([]);
       expect(await page.getUserIdsWithPageAccess('p', ['u1', 'u2'])).toEqual([]);
       expect(await page.canUserAccessPage('u1', 'p')).toBe(false);
+      // #492: an unknown `locked` must read as RESTRICTED (never the relaxing `false`), so upstream trusts the
+      // (deny) page decision instead of falling back to a space role fetched by a separate, possibly-healthy call.
+      expect(await page.canUserEditPage('u1', 'p')).toEqual({
+        hasAnyRestriction: true,
+        canAccess: false,
+        canEdit: false,
+      });
       expect([...(await space.getUserIdsWithSpaceAccess(['u1'], 's'))]).toEqual([]);
       expect(await space.getUserSpaceIds('u1')).toEqual([]);
       expect(await space.getUserSpaceRoles('u1', 's')).toBeUndefined();
+    });
+  });
+  describe('#492 — a failed page check denies even when the space role (a separate call) allows', () => {
+    // The exact fail-open precondition: PageAccessService takes the space role from ONE call (SpaceAbilityFactory →
+    // PdpSpaceMemberRepo) and `locked` from ANOTHER (canUserEditPage). If only the page call fails, a restricted
+    // page must still be denied — it must not fall through to the (healthy) space role.
+    const spaceMember = { createForUser: jest.fn(async () => ({ can: () => true, cannot: () => false })) };
+    const pageDown = {
+      check: jest.fn(async () => false),
+      checkBulk: jest.fn(async (_s: any, checks: any[]) => checks.map(() => false)),
+      tryCheckBulk: jest.fn(async () => null),
+    };
+    const access = new PageAccessService(
+      new PdpPagePermissionRepo({} as any, {} as any, {} as any, pageDown as any),
+      spaceMember as any,
+      {} as any,
+    );
+    const page = { id: 'restricted-page', spaceId: 's1' } as any;
+    const user = { id: 'u1' } as any;
+
+    it('validateCanEdit and validateCanViewWithPermissions deny', async () => {
+      await expect(access.validateCanEdit(page, user)).rejects.toBeInstanceOf(ForbiddenException);
+      await expect(access.validateCanViewWithPermissions(page, user)).rejects.toBeInstanceOf(ForbiddenException);
+    });
+
+    it('control: the pre-fix all-false reading WOULD have fallen through to the space role (the test is not vacuous)', async () => {
+      const legacy = new PageAccessService(
+        { canUserEditPage: async () => ({ hasAnyRestriction: false, canAccess: false, canEdit: false }) } as any,
+        spaceMember as any,
+        {} as any,
+      );
+      await expect(legacy.validateCanEdit(page, user)).resolves.toEqual({ hasRestriction: false });
     });
   });
 });

@@ -41,11 +41,17 @@ export class PdpPagePermissionRepo extends PagePermissionRepo {
     // `locked` (schema: restricted + parent->locked) tells upstream whether to trust the PDP's page
     // decision (restricted page) or fall back to space CASL (unrestricted). The PDP's view/edit
     // already fold restriction in, so canAccess/canEdit are correct either way.
-    const [canAccess, canEdit, locked] = await this.authz.checkBulk(this.subject(userId), [
+    const results = await this.authz.tryCheckBulk(this.subject(userId), [
       { permission: 'view', resourceType: 'page', resourceId: pageId },
       { permission: 'edit', resourceType: 'page', resourceId: pageId },
       { permission: 'locked', resourceType: 'page', resourceId: pageId },
     ]);
+    // #492 FAIL CLOSED on an UNKNOWN restriction state. `locked=false` RELAXES access (upstream then falls back
+    // to the space role, which comes from a SEPARATE call that may well have succeeded), so reading a failed
+    // batch as all-false would open a restricted page to every space member during a PDP error. Unknown ⇒
+    // restricted with no access: upstream then trusts this decision and denies.
+    if (!results) return { hasAnyRestriction: true, canAccess: false, canEdit: false };
+    const [canAccess, canEdit, locked] = results;
     return { hasAnyRestriction: locked, canAccess, canEdit };
   }
 
