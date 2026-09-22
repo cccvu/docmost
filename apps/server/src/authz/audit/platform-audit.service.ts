@@ -5,6 +5,7 @@ import { AuditContext, AUDIT_CONTEXT_KEY } from '../../common/middlewares/audit-
 import { AuditLogContext, IAuditService } from '../../integrations/audit/audit.service';
 import { ActorType, AuditLogPayload } from '../../common/events/audit-events';
 import { AuditClientEvidence, AuditIngestEvent, PlatformAuditClient } from './platform-audit.client';
+import { buildClientEvidenceFromReq } from './request-evidence';
 
 /**
  * CCC audit integration — NOT upstream Docmost code.
@@ -112,18 +113,10 @@ export class PlatformAuditService implements IAuditService {
    * modifying a single upstream file.
    */
   private clientEvidence(): AuditClientEvidence | undefined {
-    const req = this.cls.get<IncomingMessage | undefined>(CLS_REQ);
-    // No request in scope (a background job, or a route outside the CLS middleware) — nothing to claim.
-    const socketPeer = req?.socket?.remoteAddress;
-    // Together-or-neither: the platform treats supplied evidence as authoritative and records a refusal
-    // when it cannot resolve a peer, so sending `forwardedFor` alone would mislabel a torn-down socket as
-    // a forgery attempt. With no peer we send nothing and let the platform fall back to the legacy field.
-    if (!socketPeer) return undefined;
-    const raw = req?.headers?.['x-forwarded-for'];
-    // Typed `string | string[]` because IncomingHttpHeaders has no declared key for it. Node comma-joins
-    // repeated header lines, so the array branch is unreachable in practice — narrowed, not cast away.
-    const forwardedFor = Array.isArray(raw) ? raw.join(', ') : raw;
-    return forwardedFor ? { socketPeer, forwardedFor } : { socketPeer };
+    // Read the UNTOUCHED node request from CLS and delegate to the shared builder, so the domain-event
+    // forwarder and the /api access interceptor produce identical, #320-clean evidence (see request-evidence.ts).
+    // No request in scope (a background job, or a route outside the CLS middleware) yields `undefined`.
+    return buildClientEvidenceFromReq(this.cls.get<IncomingMessage | undefined>(CLS_REQ));
   }
 
   private toEvent(

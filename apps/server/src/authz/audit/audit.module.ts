@@ -34,6 +34,8 @@ import { PlatformAuditService } from './platform-audit.service';
           : new NoopAuditService(),
     },
   ],
-  exports: [AUDIT_SERVICE],
+  // PlatformAuditClient is exported (#467) so the per-request `/api` access-audit path (ApiAccessAuditService)
+  // can reuse the same fire-and-forget forwarder without re-wiring the base URL / service secret.
+  exports: [AUDIT_SERVICE, PlatformAuditClient],
 })
 export class PlatformAuditModule {}
