@@ -16,6 +16,8 @@ import { ServiceAttachmentService } from './service-attachment.service';
 import { AuthzChangeController } from './authz-change.controller';
 import { AuthzChangeFeedService } from './authz-change-feed.service';
 import { AuthzSnapshotService } from './authz-snapshot.service';
+import { ServicePageLifecycleService } from './service-page-lifecycle.service';
+import { PageCycleGuardInstaller } from './page-cycle-guard.installer';
 import { AuthzOutboxInstaller } from './authz-outbox.installer';
 // Seam #5 (see UPSTREAM_MODIFICATIONS.md): SearchModule binds the SearchService token to PdpSearchService in
 // AUTHZ_MODE=remote. Importing it here lets ServiceSearchService inject that PDP-gated search — the binding
@@ -58,6 +60,8 @@ import { SearchModule } from '../core/search/search.module';
     AuthzOutboxInstaller,
     WorkspaceResolver,
     ServiceAuthGuard,
+    ServicePageLifecycleService, // #485 (appended)
+    PageCycleGuardInstaller, // #485 (appended)
   ],
 })
 export class ServiceBridgeModule {}

@@ -20,6 +20,7 @@ import { PublicSearchHit } from './service-search.service';
 import { PublicAttachmentSummary } from './service-attachment.service';
 import { SpaceView, RawSpaceMember } from './service-space.service';
 import { WorkspaceSettingsView } from './service-workspace.service';
+import { DescendantFacts, LifecycleTarget, PageLifecycleState, TrashedPageRow } from './service-page-lifecycle.service';
 
 /**
  * Provider-side contract test: the routes the fork actually implements MUST equal the operations declared in
@@ -205,6 +206,9 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     RawPagePermission: keysOf<RawPagePermission>({ id: true, userId: true, groupId: true, role: true, createdAt: true }),
     PublicSearchHit: keysOf<PublicSearchHit>({ id: true, title: true, icon: true, parentPageId: true, space: true, highlight: true, createdAt: true, updatedAt: true }),
     PublicAttachmentSummary: keysOf<PublicAttachmentSummary>({ id: true, fileName: true, mimeType: true, fileSize: true, type: true, createdAt: true }),
+    // #485 lifecycle facts. (PageLifecycleState itself has one OPTIONAL key, so it is pinned separately below.)
+    PageLifecycleTarget: keysOf<LifecycleTarget>({ parentPageId: true, exists: true, spaceId: true, deletedAt: true, restrictedLineageIds: true, lineageComplete: true, isSelfOrDescendant: true, nextPosition: true }),
+    TrashedPage: keysOf<TrashedPageRow>({ id: true, title: true, icon: true, parentPageId: true, deletedAt: true, deletedBy: true }),
   };
 
   // The 5 inline (non-component) scalar bodies, tied to the CONTROLLER return types (a signature change reds).
@@ -245,7 +249,21 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     { id: 'searchContent', method: 'post', path: '/api/service/content/search', expect: { kind: 'items', name: 'PublicSearchHit' } },
     { id: 'resolveAttachmentPage', method: 'get', path: '/api/service/attachments/{attachmentId}/page', expect: { kind: 'inline', keys: RESOLVE_ATTACHMENT_PAGE } },
     { id: 'listPageAttachments', method: 'get', path: '/api/service/attachments/by-page/{pageId}', expect: { kind: 'items', name: 'PublicAttachmentSummary' } },
+    { id: 'pageLifecycleState', method: 'post', path: '/api/service/pages/lifecycle-state', expect: { kind: 'ref', name: 'PageLifecycleState' } },
+    { id: 'listTrashedPages', method: 'post', path: '/api/service/pages/trash', expect: { kind: 'items', name: 'TrashedPage' } },
   ];
+
+  // #485: `target` is present only when the request named one, so it is the one non-required key.
+  it('PageLifecycleState has exactly the fork type’s keys, all required but the optional `target`', () => {
+    const schema = SPEC.components.schemas.PageLifecycleState;
+    const keys = keysOf<PageLifecycleState>({ pageId: true, spaceId: true, parentPageId: true, deletedAt: true, parent: true, restrictedAncestorIds: true, ancestorsComplete: true, selfRestricted: true, descendants: true, target: true });
+    expect(sortedKeys(schema.properties)).toEqual(keys);
+    expect([...schema.required].sort()).toEqual(keys.filter((k) => k !== 'target'));
+    expect(sortedKeys(schema.properties.descendants.properties)).toEqual(
+      keysOf<DescendantFacts>({ restricted: true, trashed: true, crossSpace: true, complete: true }),
+    );
+    expect(refName(schema.properties.target)).toBe('PageLifecycleTarget');
+  });
 
   const refName = (s: any): string | null => (s && typeof s.$ref === 'string' ? s.$ref.split('/').pop()! : null);
   const body2xx = (method: string, path: string): any => {

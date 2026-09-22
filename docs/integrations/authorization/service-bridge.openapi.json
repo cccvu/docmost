@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Docmost Service Bridge (east-west)",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "summary": "The east-west endpoints this Docmost fork EXPOSES to an integrating platform.",
     "description": "These are the machine-to-machine endpoints the fork hosts for an integrating platform (the inverse direction of authorization-service.openapi.json, which the fork calls). They exist so an external identity/session broker can provision a fork-local shadow user and mint a Docmost session for it, force-disconnect a live collab session after a revocation, and (Phase C) administer workspace settings + spaces and read the content model WITHOUT the platform reaching into Docmost's database directly. They are NOT part of the public north-south API and are not browser-facing.\n\nMode: the whole surface is 404 unless the fork runs with AUTHZ_MODE=remote (RemoteOnlyGuard, checked BEFORE the secret). In AUTHZ_MODE=native there is no integrating platform and every route below returns 404 for all callers.\n\nAuth: every request carries a shared service secret in the x-authz-service-secret header (PLATFORM_AUTHZ_SERVICE_SECRET). Each /api/service/* route additionally requires exactly one least-privilege scope: session:mint, users:provision, users:resolve, workspace:read, workspace:settings:write, spaces:read, spaces:write, pages:read, content:read, content:search, attachments:read, changes:read. Today a single full-scope secret is issued; per-scope credentials can be added later with no contract change.\n\nSecurity properties an integrator must understand:\n  - Identity-mutating endpoints are keyed ONLY on the caller's opaque externalId. The fork derives the shadow email (externalId@shadow.wiki-v2.internal) and resolves its own default workspace, so a caller can never select an arbitrary Docmost identity, name a real/privileged/native account, or supply a workspace id. This is a strong narrowing, not impersonation.\n  - The platform is the authorization authority: it performs the PDP decision (space/workspace administer, or the filter-then-retrieve authorized-id set) BEFORE calling these endpoints. The content read endpoints are a PRIVILEGED DATA PLANE, not a second gate: they return metadata for exactly the supplied ids and do NOT re-authorize. The security of the caller's /v1 surface rests entirely on it passing an authorized id set.\n  - Fail-closed: not remote -> 404; unconfigured secret -> 503; missing/wrong secret -> 401; wrong scope -> 403; over the per-credential rate limit -> 429; invalid body -> 400.\n\nResponse shape (incident #181): every 2xx body is EXACTLY the schema declared for its operation. The fork's global { data, success, status } response envelope (upstream TransformHttpResponseInterceptor) is skipped on this whole surface via per-handler @SkipTransform(); an integrator that receives an envelope is talking to a mis-built fork. Bring-up precondition: until Docmost first-run setup (POST /api/auth/setup) has created a workspace row, EVERY operation answers HTTP 404 with message exactly \"Workspace not found\" (an upstream pre-handler that runs before the service-bridge guards). That status + message pair is the ONLY response a consumer may treat as \"no workspace provisioned yet\"; any other 404 (e.g. the bare \"Not Found\" the fork answers when not in AUTHZ_MODE=remote) is a configuration error, and any 2xx body that does not match its declared schema is a contract violation the consumer must fail closed on.",
     "license": { "name": "AGPL-3.0-only", "identifier": "AGPL-3.0-only" },
@@ -421,6 +421,47 @@
         }
       }
     },
+    "/api/service/pages/lifecycle-state": {
+      "post": {
+        "operationId": "pageLifecycleState",
+        "tags": ["pages"],
+        "summary": "Tree facts for a page-lifecycle decision (#485): restriction lineage, descendants, and an optional target parent.",
+        "description": "FACTS only; the platform decides. Workspace-scoped; includes trashed rows. Every walk is cycle-safe and bounded, and reports incompleteness (`ancestorsComplete`, `descendants.complete`, `target.lineageComplete`) instead of guessing; an incomplete descendant walk sets every descendant flag true. `targetParentPageId`: omitted = no target facts, null = the space root, a uuid = that page. Fail-closed 404 when the page is not in the workspace. Scope: pages:read.",
+        "requestBody": { "required": true, "content": { "application/json": {
+          "schema": { "$ref": "#/components/schemas/PageLifecycleStateRequest" },
+          "example": { "pageId": "33333333-3333-3333-3333-333333333333", "targetParentPageId": null }
+        } } },
+        "responses": {
+          "200": { "description": "The page's lifecycle facts.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PageLifecycleState" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
+    "/api/service/pages/trash": {
+      "post": {
+        "operationId": "listTrashedPages",
+        "tags": ["pages"],
+        "summary": "The roots of trashed subtrees in a space, newest first (#485).",
+        "description": "A trashed page is a root when its parent is live, missing, in another space, or absent. A root whose lineage carries a restriction, or whose lineage walk cannot finish, is excluded in SQL before the limit. Keyset on (deletedAt truncated to ms, id::text), descending; returns up to limit+1 rows (the extra row signals more). `deletedBy` is a display name, never a user id. Scope: content:read.",
+        "requestBody": { "required": true, "content": { "application/json": {
+          "schema": { "$ref": "#/components/schemas/TrashListRequest" },
+          "example": { "spaceId": "22222222-2222-2222-2222-222222222222", "limit": 20 }
+        } } },
+        "responses": {
+          "200": { "description": "One page of trashed roots.", "content": { "application/json": { "schema": { "type": "object", "required": ["items"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/TrashedPage" } } } } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
     "/api/service/pages/{pageId}/permissions": {
       "parameters": [{ "name": "pageId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
       "get": {
@@ -815,6 +856,67 @@
         "properties": {
           "pageId": { "type": "string", "format": "uuid" },
           "includeDeleted": { "type": "boolean" }
+        }
+      },
+      "PageLifecycleStateRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pageId"],
+        "properties": {
+          "pageId": { "type": "string", "format": "uuid" },
+          "targetParentPageId": { "type": ["string", "null"], "format": "uuid" }
+        }
+      },
+      "PageLifecycleState": {
+        "type": "object",
+        "required": ["pageId", "spaceId", "parentPageId", "deletedAt", "parent", "restrictedAncestorIds", "ancestorsComplete", "selfRestricted", "descendants"],
+        "properties": {
+          "pageId": { "type": "string", "format": "uuid" },
+          "spaceId": { "type": "string", "format": "uuid" },
+          "parentPageId": { "type": ["string", "null"], "format": "uuid" },
+          "deletedAt": { "type": ["string", "null"], "format": "date-time" },
+          "parent": { "type": ["object", "null"], "required": ["spaceId", "deletedAt"], "properties": { "spaceId": { "type": "string", "format": "uuid" }, "deletedAt": { "type": ["string", "null"], "format": "date-time" } } },
+          "restrictedAncestorIds": { "type": "array", "items": { "type": "string", "format": "uuid" } },
+          "ancestorsComplete": { "type": "boolean" },
+          "selfRestricted": { "type": "boolean" },
+          "descendants": { "type": "object", "required": ["restricted", "trashed", "crossSpace", "complete"], "properties": { "restricted": { "type": "boolean" }, "trashed": { "type": "boolean" }, "crossSpace": { "type": "boolean" }, "complete": { "type": "boolean" } } },
+          "target": { "$ref": "#/components/schemas/PageLifecycleTarget" }
+        }
+      },
+      "PageLifecycleTarget": {
+        "type": "object",
+        "required": ["parentPageId", "exists", "spaceId", "deletedAt", "restrictedLineageIds", "lineageComplete", "isSelfOrDescendant", "nextPosition"],
+        "properties": {
+          "parentPageId": { "type": ["string", "null"], "format": "uuid" },
+          "exists": { "type": "boolean" },
+          "spaceId": { "type": ["string", "null"], "format": "uuid" },
+          "deletedAt": { "type": ["string", "null"], "format": "date-time" },
+          "restrictedLineageIds": { "type": "array", "items": { "type": "string", "format": "uuid" } },
+          "lineageComplete": { "type": "boolean" },
+          "isSelfOrDescendant": { "type": "boolean" },
+          "nextPosition": { "type": ["string", "null"] }
+        }
+      },
+      "TrashListRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["spaceId", "limit"],
+        "properties": {
+          "spaceId": { "type": "string", "format": "uuid" },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+          "before": { "type": "object", "additionalProperties": false, "required": ["deletedAt", "id"], "properties": { "deletedAt": { "type": "string", "format": "date-time" }, "id": { "type": "string", "format": "uuid" } } }
+        }
+      },
+      "TrashedPage": {
+        "type": "object",
+        "required": ["id", "title", "icon", "parentPageId", "deletedAt", "deletedBy"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "title": { "type": ["string", "null"] },
+          "icon": { "type": ["string", "null"] },
+          "parentPageId": { "type": ["string", "null"], "format": "uuid" },
+          "deletedAt": { "type": "string", "format": "date-time" },
+          "deletedBy": { "type": ["string", "null"] }
         }
       },
       "ContentListRequest": {
