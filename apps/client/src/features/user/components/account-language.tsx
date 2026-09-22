@@ -4,6 +4,7 @@ import { updateUser } from "../services/user-service";
 import { useAtom } from "jotai";
 import { userAtom } from "../atoms/current-user-atom";
 import { useState } from "react";
+import { changeAppLanguage } from "@/lib/date-locale.ts";
 
 export default function AccountLanguage() {
   const { t } = useTranslation();
@@ -22,7 +23,7 @@ export default function AccountLanguage() {
 }
 
 function LanguageSwitcher() {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
   const [user, setUser] = useAtom(userAtom);
   const [language, setLanguage] = useState(
     user?.locale === "en" ? "en-US" : user?.locale,
@@ -34,7 +35,9 @@ function LanguageSwitcher() {
     setLanguage(value);
     setUser(updatedUser);
 
-    i18n.changeLanguage(value);
+    // #408: changeAppLanguage loads the date-fns locale before switching so dates render in the new locale
+    // immediately (getDateFnsLocale stays synchronous). Never call i18n.changeLanguage directly here.
+    await changeAppLanguage(value);
   };
 
   return (

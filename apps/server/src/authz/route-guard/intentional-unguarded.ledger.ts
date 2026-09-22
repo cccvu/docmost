@@ -112,18 +112,6 @@ export const INTENTIONAL_UNGUARDED: readonly UnguardedRoute[] = [
     mode: 'workspace-asset',
     reason: 'GET /attachments/img/:type/:fileName — workspace-scoped public branding asset (logo/avatar).',
   },
-
-  // --- known gaps (accepted for now, tracked) ---
-  {
-    controller: 'CollaborationController',
-    handler: 'getStats',
-    mode: 'known-gap',
-    reason:
-      'GET /collab/stats leaks aggregate connection/document counts unauthenticated. Low severity: it lives ' +
-      'in the SEPARATE CollabAppModule process (unreachable by the main-app global guard) and is env-gated ' +
-      'behind COLLAB_SHOW_STATS (off by default), returning only counts. Real fix tracked in the issue.',
-    issue: 'https://github.com/cccvu/wiki-v2/issues/80',
-  },
 ];
 
 export const ledgerKey = (r: Pick<UnguardedRoute, 'controller' | 'handler'>): string =>

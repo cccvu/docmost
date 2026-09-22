@@ -131,6 +131,7 @@ describe("lazy-pages (issue #309)", () => {
     "../editor-ux/lazy/base-embed-view-lazy.tsx",
     "../editor-ux/lazy/math-block-lazy.tsx",
     "../editor-ux/lazy/math-inline-lazy.tsx",
+    "../analytics/posthog-analytics.tsx",
   ];
 
   it.each(LAZY_SOURCES)("%s goes through lazyWithReload, never a bare lazy()", (file) => {
