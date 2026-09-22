@@ -11,11 +11,13 @@ import SpaceAbilityFactory from '../../core/casl/abilities/space-ability.factory
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import {
   AddPagePermissionDto,
+  MAX_PAGE_GRANTEES,
   RemovePagePermissionDto,
   RestrictPageDto,
   UpdatePagePermissionDto,
 } from './dto';
 import { User } from '@docmost/db/types/entity.types';
+import { spyKysely, SpyQuery } from '../../service-bridge/kysely-spy.testkit';
 
 /**
  * CCC authorization integration test (fork compatibility suite) — the page-restriction WRITE surface.
@@ -57,6 +59,8 @@ function makeService(opts: {
   role?: Role;
   page?: { id: string; spaceId: string; workspaceId: string } | undefined;
   accessSeq?: (undefined | { id: string })[];
+  /** The grant row `updatePermission` locks (`select … from page_permissions … for update`); none by default. */
+  grant?: { id: string };
 }) {
   const page =
     opts.page === undefined && !('page' in opts)
@@ -89,15 +93,20 @@ function makeService(opts: {
     deletePageAccess: jest.fn(async () => undefined),
     deletePagePermissionsByUserIds: jest.fn(async () => undefined),
     deletePagePermissionsByGroupIds: jest.fn(async () => undefined),
-    updatePagePermissionRole: jest.fn(async () => undefined),
   };
 
+  // The service's own Kysely reads/writes (the grant lookup + update-by-id) go through the compiling spy.
+  const spy = spyKysely((q: SpyQuery) =>
+    q.sql.includes('from "page_permissions"') && opts.grant ? [opts.grant] : [],
+  );
+
   const service = new PageRestrictionService(
+    spy.db,
     pageRepo as any,
     pagePermissionRepo as any,
     spaceAbility,
   );
-  return { service, pageRepo, pagePermissionRepo, getUserSpaceRoles };
+  return { service, pageRepo, pagePermissionRepo, getUserSpaceRoles, spy };
 }
 
 describe('PageRestrictionService — who may restrict a page (space-admin gate)', () => {
@@ -326,11 +335,13 @@ describe('PageRestrictionService — who may grant/revoke/update a page permissi
     expect(pagePermissionRepo.deletePagePermissionsByUserIds).not.toHaveBeenCalled();
   });
 
-  // Invariant: only a space admin may change a subject's role; a reader is Forbidden.
-  it('lets a space admin update a permission role', async () => {
-    const { service, pagePermissionRepo } = makeService({
+  // Invariant: only a space admin may change a subject's role; a reader is Forbidden. The existing grant is
+  // locked (FOR UPDATE) in one transaction and updated by its row id (#486).
+  it('lets a space admin update a permission role (lock the grant, update it by id, commit)', async () => {
+    const { service, spy } = makeService({
       role: 'admin',
       accessSeq: [{ id: ACCESS_ID }],
+      grant: { id: 'perm-1' },
     });
 
     await expect(
@@ -339,17 +350,74 @@ describe('PageRestrictionService — who may grant/revoke/update a page permissi
         userOf(ADMIN_ID),
       ),
     ).resolves.toBeUndefined();
-    expect(pagePermissionRepo.updatePagePermissionRole).toHaveBeenCalledWith(
-      ACCESS_ID,
-      'writer',
-      { userId: TARGET_USER, groupId: undefined },
+    expect(spy.tx).toEqual(['begin', 'commit']);
+    const [select, update] = spy.calls;
+    expect(select.sql).toContain('from "page_permissions"');
+    expect(select.sql).toContain('"user_id" =');
+    expect(select.sql).toContain('for update');
+    expect(select.parameters).toEqual([ACCESS_ID, TARGET_USER]);
+    expect(update.sql).toMatch(/^update "page_permissions" set "role" = \$1, "updated_at" = \$2 where "id" = \$3$/);
+    expect(update.parameters[0]).toBe('writer');
+    expect(update.parameters[2]).toBe('perm-1');
+  });
+
+  it('keys a group grant on group_id', async () => {
+    const { service, spy } = makeService({
+      role: 'admin',
+      accessSeq: [{ id: ACCESS_ID }],
+      grant: { id: 'perm-2' },
+    });
+    await service.updatePermission(
+      { pageId: PAGE_ID, role: 'reader', groupId: TARGET_GROUP } as UpdatePagePermissionDto,
+      userOf(ADMIN_ID),
     );
+    expect(spy.calls[0].sql).toContain('"group_id" =');
+    expect(spy.calls[0].sql).not.toContain('"user_id"');
+    expect(spy.calls[0].parameters).toEqual([ACCESS_ID, TARGET_GROUP]);
+  });
+
+  // #486: upstream's updatePagePermissionRole returns void, so a PATCH for a non-grantee used to "succeed".
+  it('404s when the subject holds no grant on the page (rolled back, no UPDATE)', async () => {
+    const { service, spy } = makeService({ role: 'admin', accessSeq: [{ id: ACCESS_ID }] });
+    await expect(
+      service.updatePermission(
+        { pageId: PAGE_ID, role: 'writer', userId: TARGET_USER } as UpdatePagePermissionDto,
+        userOf(ADMIN_ID),
+      ),
+    ).rejects.toThrow(NotFoundException);
+    expect(spy.tx).toEqual(['begin', 'rollback']);
+    expect(spy.calls.some((c) => c.sql.startsWith('update'))).toBe(false);
+  });
+
+  it('400s a page that is not restricted', async () => {
+    const { service, spy } = makeService({ role: 'admin', accessSeq: [undefined] });
+    await expect(
+      service.updatePermission(
+        { pageId: PAGE_ID, role: 'writer', userId: TARGET_USER } as UpdatePagePermissionDto,
+        userOf(ADMIN_ID),
+      ),
+    ).rejects.toThrow(BadRequestException);
+    expect(spy.calls).toEqual([]);
+  });
+
+  // #486: exactly one subject — neither is ambiguous, and both would silently update only the user grant.
+  it.each([
+    ['neither', {}],
+    ['both', { userId: TARGET_USER, groupId: TARGET_GROUP }],
+  ])('400s when %s of userId/groupId is given (before any read or write)', async (_label, ids) => {
+    const { service, spy, pageRepo } = makeService({ role: 'admin', accessSeq: [{ id: ACCESS_ID }], grant: { id: 'p' } });
+    await expect(
+      service.updatePermission({ pageId: PAGE_ID, role: 'writer', ...ids } as UpdatePagePermissionDto, userOf(ADMIN_ID)),
+    ).rejects.toThrow(BadRequestException);
+    expect(pageRepo.findById).not.toHaveBeenCalled();
+    expect(spy.calls).toEqual([]);
   });
 
   it('denies a plain space reader from updating a permission role (Forbidden, no update)', async () => {
-    const { service, pagePermissionRepo } = makeService({
+    const { service, spy } = makeService({
       role: 'reader',
       accessSeq: [{ id: ACCESS_ID }],
+      grant: { id: 'perm-1' },
     });
 
     await expect(
@@ -358,7 +426,7 @@ describe('PageRestrictionService — who may grant/revoke/update a page permissi
         userOf(READER_ID),
       ),
     ).rejects.toThrow(ForbiddenException);
-    expect(pagePermissionRepo.updatePagePermissionRole).not.toHaveBeenCalled();
+    expect(spy.calls).toEqual([]);
   });
 });
 
@@ -422,6 +490,21 @@ describe('page-restriction DTO validation (class-validator rejects malformed bod
       }),
     );
     expect(props(errs)).toContain('role');
+  });
+
+  // #486: the grantee batch is capped (the platform relay's 256) on every add/remove id list.
+  it.each([
+    ['AddPagePermissionDto', AddPagePermissionDto, 'userIds'],
+    ['AddPagePermissionDto', AddPagePermissionDto, 'groupIds'],
+    ['RemovePagePermissionDto', RemovePagePermissionDto, 'userIds'],
+    ['RemovePagePermissionDto', RemovePagePermissionDto, 'groupIds'],
+  ] as const)('%s caps %s at MAX_PAGE_GRANTEES (256 ok, 257 rejected)', async (_n, cls, field) => {
+    const ids = (n: number) =>
+      Array.from({ length: n }, (_, i) => `00000000-0000-4000-8000-${String(i).padStart(12, '0')}`);
+    const body = (n: number) => ({ pageId: PAGE_ID, role: 'reader', [field]: ids(n) });
+    expect(MAX_PAGE_GRANTEES).toBe(256);
+    expect(await validate(plainToInstance(cls as any, body(MAX_PAGE_GRANTEES)))).toHaveLength(0);
+    expect(props(await validate(plainToInstance(cls as any, body(MAX_PAGE_GRANTEES + 1))))).toContain(field);
   });
 
   it('RemovePagePermissionDto rejects a malformed uuid inside groupIds', async () => {

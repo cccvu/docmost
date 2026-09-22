@@ -4,6 +4,9 @@ import {
   Injectable,
   NotFoundException,
 } from '@nestjs/common';
+import { InjectKysely } from 'nestjs-kysely';
+import { KyselyDB } from '@docmost/db/types/kysely.types';
+import { executeTx } from '@docmost/db/utils';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 import { InsertablePagePermission, Page, User } from '@docmost/db/types/entity.types';
@@ -30,6 +33,7 @@ import {
 @Injectable()
 export class PageRestrictionService {
   constructor(
+    @InjectKysely() private readonly db: KyselyDB,
     private readonly pageRepo: PageRepo,
     private readonly pagePermissionRepo: PagePermissionRepo,
     private readonly spaceAbility: SpaceAbilityFactory,
@@ -104,14 +108,33 @@ export class PageRestrictionService {
     if (dto.groupIds?.length) await this.pagePermissionRepo.deletePagePermissionsByGroupIds(accessId, dto.groupIds);
   }
 
-  /** Change a subject's role (reader ↔ writer) on a restricted page. */
+  /**
+   * Change a subject's role (reader ↔ writer) on a restricted page. #486: 404 when the subject holds no grant
+   * here — upstream's `updatePagePermissionRole` returns void and cannot tell, so a PATCH for a non-grantee used
+   * to answer success. The grant row is found and locked in this transaction, then updated by its id.
+   */
   async updatePermission(dto: UpdatePagePermissionDto, user: User): Promise<void> {
+    if (!dto.userId === !dto.groupId) {
+      throw new BadRequestException('exactly one of userId or groupId is required');
+    }
     await this.authorize(dto.pageId, user);
-    const accessId = await this.requireAccessId(dto.pageId);
-    if (!dto.userId && !dto.groupId) throw new BadRequestException('userId or groupId required');
-    await this.pagePermissionRepo.updatePagePermissionRole(accessId, dto.role, {
-      userId: dto.userId,
-      groupId: dto.groupId,
+    await executeTx(this.db, async (trx) => {
+      const access = await this.pagePermissionRepo.findPageAccessByPageId(dto.pageId, trx);
+      if (!access) throw new BadRequestException('page is not restricted');
+      const grant = await trx
+        .selectFrom('pagePermissions')
+        .select('id')
+        .where('pageAccessId', '=', access.id)
+        .$if(!!dto.userId, (q) => q.where('userId', '=', dto.userId!))
+        .$if(!!dto.groupId, (q) => q.where('groupId', '=', dto.groupId!))
+        .forUpdate()
+        .executeTakeFirst();
+      if (!grant) throw new NotFoundException('no permission for this user or group on the page');
+      await trx
+        .updateTable('pagePermissions')
+        .set({ role: dto.role, updatedAt: new Date() })
+        .where('id', '=', grant.id)
+        .execute();
     });
   }
 }

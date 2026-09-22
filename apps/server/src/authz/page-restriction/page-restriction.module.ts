@@ -5,9 +5,9 @@ import { PageRestrictionService } from './page-restriction.service';
 /**
  * CCC authorization integration — NOT upstream Docmost code.
  *
- * The page-restriction write feature. Its deps (PageRepo, PagePermissionRepo, SpaceAbilityFactory)
- * are provided by the @Global DatabaseModule + CaslModule, so this module imports nothing and can be
- * mounted from AuthzModule without an upstream edit or an import cycle.
+ * The page-restriction write feature. Its deps (Kysely, PageRepo, PagePermissionRepo, SpaceAbilityFactory)
+ * are provided by the @Global KyselyModule, DatabaseModule + CaslModule, so this module imports nothing and can
+ * be mounted from AuthzModule without an upstream edit or an import cycle.
  */
 @Module({
   controllers: [PageRestrictionController],
