@@ -39,6 +39,11 @@ import { PlatformAuthorizationGuard } from './authz/route-guard/platform-authori
 // CCC seam (GitHub #29): per-IP rate limiter for the entire unauthenticated @Public surface. Registered as a
 // global guard here (the one composition point); all logic + its isolated throttler config live in authz/.
 import { PublicSurfaceThrottlerGuard } from './authz/route-guard/public-surface-throttler.guard';
+// CCC seam (GitHub #467): per-request central audit + per-principal rate limit for authenticated /api traffic.
+// Both are global interceptors (they need the post-JwtAuthGuard req.user); logic lives in authz/request-controls/.
+import { ApiAccessAuditService } from './authz/request-controls/api-access-audit.service';
+import { ApiAccessAuditInterceptor } from './authz/request-controls/api-access-audit.interceptor';
+import { PrincipalRateLimitInterceptor } from './authz/request-controls/principal-rate-limit.interceptor';
 
 const enterpriseModules = [];
 try {
@@ -124,6 +129,22 @@ try {
     {
       provide: APP_INTERCEPTOR,
       useClass: AuditActorInterceptor,
+    },
+    // CCC seam (GitHub #467): authenticated /api gets a uniform per-request central-audit row AND a
+    // per-principal rate limit. These are INTERCEPTORS (not guards) because the controller-scoped
+    // JwtAuthGuard runs AFTER the global guards but BEFORE interceptors, so req.user is resolved here.
+    // ORDER MATTERS and is load-bearing (see UPSTREAM_MODIFICATIONS.md seam #4): AuditActorInterceptor
+    // (above) stamps the CLS actor first; ApiAccessAuditInterceptor wraps the request so it records the
+    // final outcome INCLUDING a 429 the rate limiter raises; PrincipalRateLimitInterceptor is innermost so
+    // it rejects before the handler runs. Do not reorder.
+    ApiAccessAuditService,
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: ApiAccessAuditInterceptor,
+    },
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: PrincipalRateLimitInterceptor,
     },
   ],
 })

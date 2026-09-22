@@ -32,6 +32,16 @@ export interface AuditClientEvidence {
 export interface AuditIngestEvent {
   event: string;
   resourceType: string;
+  /**
+   * Audit stream (#467). Omit (⇒ 'domain' on the sink) for the ~70 Docmost domain events; the per-request
+   * `/api` access interceptor sends 'access'. Kept a distinct, higher-volume, lower-value-per-row stream.
+   */
+  eventCategory?: 'domain' | 'access';
+  /**
+   * Sink shedding class (#467). Omit (⇒ 'normal') for everything security-relevant. The access interceptor
+   * sends 'low' for READ requests so, under overload, reads are dropped before mutations/denials.
+   */
+  priority?: 'low' | 'normal';
   resourceId?: string;
   spaceId?: string;
   changes?: Record<string, unknown>;
