@@ -33,7 +33,8 @@ Behavior you must design around:
   `locked=false` for a page (as a PDP does for a page it has no placement for: trashed, or not yet synced), the
   fork walks that page's restriction lineage in its own database: the page itself and every ancestor, trashed
   ones included. The space role decides only if that walk reaches a root and finds no restriction. Anything
-  else is **restricted with no access**.
+  else is **restricted with no access**. Live collab connections are re-checked by the same rule (#501); there a
+  failed lineage read counts as unknown, like a failed `check-bulk`.
 - **Constant-time secret check.** Compare `x-authz-service-secret` in constant time; `401` on mismatch, `503`
   if you have no secret configured.
 - **Respond within the timeout.** The fork aborts the request at `PLATFORM_AUTHZ_TIMEOUT_MS`.

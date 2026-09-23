@@ -5,8 +5,8 @@ import { KyselyDB } from '@docmost/db/types/kysely.types';
  * CCC service-bridge — NOT upstream Docmost code (#485, #524).
  *
  * The ONE restriction-lineage walk over the fork's own rows, shared by the `/v1` lifecycle facts
- * (`ServicePageLifecycleService`) and the PEP (`PdpPagePermissionRepo`, #524) so the two can never disagree about
- * which pages sit in a restricted section. It reads `pages`/`page_access` directly because the PDP cannot answer
+ * (`ServicePageLifecycleService`), the PEP (`PdpPagePermissionRepo`, #524) and the live-connection revalidator
+ * (`LiveAccessRevalidator`, #501) so none of them can disagree about which pages sit in a restricted section. It reads `pages`/`page_access` directly because the PDP cannot answer
  * this for a page it has not placed: trashing reaps a page's `#space`/`#parent` edges, and a new, restored or
  * re-parented page has none until the relay projects it.
  */
@@ -74,4 +74,13 @@ export async function readPageLineage(
       .map((r) => r.id),
     complete: !!last && last.parentPageId === null,
   };
+}
+
+/**
+ * #524: may a page the PDP has not placed NOT fall back to the space role? True unless the walk reached a root with
+ * no restriction on it — so a restricted lineage, a walk that stopped early and a page with no row all deny. The ONE
+ * rule, shared by the connect-time PEP and the live-connection revalidator so the two can never disagree.
+ */
+export function lineageRestricted(l: Lineage): boolean {
+  return !l.complete || l.restrictedIds.length > 0;
 }

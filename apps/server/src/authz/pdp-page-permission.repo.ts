@@ -6,7 +6,7 @@ import { KyselyDB } from '@docmost/db/types/kysely.types';
 import { GroupRepo } from '@docmost/db/repos/group/group.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 import { HttpAuthzClient } from './http-authz.client';
-import { readPageLineage } from '../service-bridge/page-lineage';
+import { lineageRestricted, readPageLineage } from '../service-bridge/page-lineage';
 
 /** The decision upstream must trust as a DENY: restricted, so it never falls back to the space role. */
 const restrictedNoAccess = () => ({ hasAnyRestriction: true, canAccess: false, canEdit: false });
@@ -82,13 +82,13 @@ export class PdpPagePermissionRepo extends PagePermissionRepo {
    *  could not finish (a cycle, the depth bound, a parent it cannot read) or begin (no row), and a failed read. */
   private async lineageDenies(pageId: string): Promise<boolean> {
     try {
-      const { chain, restrictedIds, complete } = await readPageLineage(this.lineageDb, pageId, { includeSelf: true });
-      if (chain.length > 0 && !complete) {
+      const lineage = await readPageLineage(this.lineageDb, pageId, { includeSelf: true });
+      if (lineage.chain.length > 0 && !lineage.complete) {
         this.logger.warn(
           `PAGE_LINEAGE_INCOMPLETE page=${pageId}: its ancestor walk stopped early (a cycle, the depth bound or an unreadable parent); denied (#524)`,
         );
       }
-      return !complete || restrictedIds.length > 0;
+      return lineageRestricted(lineage);
     } catch (err) {
       this.logger.error(
         `PAGE_LINEAGE_READ_FAILED page=${pageId}: could not read its restriction lineage; denied (#524): ${(err as Error).message}`,

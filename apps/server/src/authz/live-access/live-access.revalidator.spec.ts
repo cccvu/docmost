@@ -9,6 +9,7 @@ jest.mock('../../collaboration/collaboration.gateway', () => ({
 jest.mock('../../ws/ws.gateway', () => ({ WsGateway: class {} }));
 
 import { Logger } from '@nestjs/common';
+import { spyKysely } from '../../service-bridge/kysely-spy.testkit';
 import {
   LiveAccessRevalidator,
   UNKNOWN_CAP,
@@ -23,7 +24,8 @@ import {
  *   - socket.io: a space room whose `view` is now false is left; a missing/disabled user is disconnected;
  *   - a PDP/DB failure is `unknown` → no action, until UNKNOWN_CAP consecutive unknowns spanning
  *     UNKNOWN_GRACE_MS, then it narrows and logs LIVE_ACCESS_REVALIDATE_FAILED;
- *   - it never sets `readOnly = false` and never joins a room.
+ *   - it never sets `readOnly = false` and never joins a room;
+ *   - #524: a page the PDP has not placed (no view, not locked) is judged by the fork's own lineage, like connect.
  */
 
 const U1 = 'u1';
@@ -88,6 +90,8 @@ function build(opts: {
   pdpFail?: boolean;
   user?: Record<string, unknown> | null | 'throw';
   pages?: Record<string, Record<string, unknown> | null>;
+  /** #524: the fork's own lineage for every page (default: an unrestricted root). */
+  lineage?: 'open' | 'restricted' | 'throw';
 }) {
   const collab = { getResidentDocuments: () => (opts.docs ?? []).values() };
   const ws = {
@@ -113,6 +117,17 @@ function build(opts: {
     ),
   };
   const authz = pdp(opts.grants ?? {}, { fail: opts.pdpFail });
+  const lineageDb = spyKysely((q) => {
+    if (opts.lineage === 'throw') throw new Error('db down');
+    return [
+      {
+        id: q.parameters[0],
+        parent_page_id: null,
+        depth: 0,
+        restricted: opts.lineage === 'restricted',
+      },
+    ];
+  });
   const svc = new LiveAccessRevalidator(
     collab as any,
     ws as any,
@@ -120,8 +135,9 @@ function build(opts: {
     pageRepo as any,
     authz as any,
     'remote',
+    lineageDb.db,
   );
-  return { svc, authz, userRepo, pageRepo };
+  return { svc, authz, userRepo, pageRepo, lineageDb };
 }
 
 /** A controllable clock: the unknown cap is time-bounded. */
@@ -137,6 +153,84 @@ const writer = (pageId: string) => ({
   [`space:${S1}:view`]: true,
   [`page:${pageId}:view`]: true,
   [`page:${pageId}:edit`]: true,
+});
+
+/** A space writer on a page the PDP has not placed: no page view, not locked (trashed, or not projected yet). */
+const unplacedWriter = {
+  [`space:${S1}:edit`]: true,
+  [`space:${S1}:view`]: true,
+};
+const trashed = { p1: { id: 'p1', spaceId: S1, deletedAt: new Date() } };
+
+describe('LiveAccessRevalidator — #524 pages the PDP has not placed', () => {
+  it('closes even a READ-ONLY connection on a trashed page in a restricted section', async () => {
+    const c = conn(true);
+    const { svc, lineageDb } = build({
+      docs: [doc('p1', [c])],
+      grants: unplacedWriter,
+      pages: trashed,
+      lineage: 'restricted',
+    });
+    const s = await svc.request('signal');
+    expect(c.close).toHaveBeenCalledTimes(1);
+    expect(s).toMatchObject({ checked: 1, closed: 1, unknown: 0 });
+    expect(lineageDb.calls).toHaveLength(1);
+  });
+
+  it('closes a writable connection on a live page not projected yet under a restriction', async () => {
+    const c = conn(false);
+    const { svc } = build({
+      docs: [doc('p1', [c])],
+      grants: unplacedWriter,
+      lineage: 'restricted',
+    });
+    await svc.request('signal');
+    expect(c.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('control: leaves a read-only connection on a trashed page with an unrestricted lineage alone', async () => {
+    const c = conn(true);
+    const { svc } = build({
+      docs: [doc('p1', [c])],
+      grants: unplacedWriter,
+      pages: trashed,
+      lineage: 'open',
+    });
+    const s = await svc.request('signal');
+    expect(c.close).not.toHaveBeenCalled();
+    expect(s.unknown).toBe(0);
+  });
+
+  it('a failed lineage read is unknown (no action this pass), never a deny', async () => {
+    const c = conn(true);
+    const { svc } = build({
+      docs: [doc('p1', [c])],
+      grants: unplacedWriter,
+      pages: trashed,
+      lineage: 'throw',
+    });
+    const s = await svc.request('signal');
+    expect(c.close).not.toHaveBeenCalled();
+    expect(s.unknown).toBe(1);
+  });
+
+  it('never reads the lineage for a page the PDP places, and reads it once per page per pass', async () => {
+    const placed = build({
+      docs: [doc('p1', [conn(false)])],
+      grants: writer('p1'),
+      lineage: 'throw',
+    });
+    expect((await placed.svc.request('signal')).unknown).toBe(0);
+    expect(placed.lineageDb.calls).toHaveLength(0);
+
+    const shared = build({
+      docs: [doc('p1', [conn(true, 'u1'), conn(true, 'u2')])],
+      grants: unplacedWriter,
+      pages: trashed,
+    });
+    await shared.svc.request('signal');
+    expect(shared.lineageDb.calls).toHaveLength(1);
+  });
 });
 
 describe('LiveAccessRevalidator — collab plane', () => {
@@ -361,6 +455,7 @@ describe('LiveAccessRevalidator — scheduling', () => {
       { findById: async (id: string) => ({ id, spaceId: S1 }) } as any,
       pdp(writer('p1')) as any,
       'remote',
+      {} as any,
     );
     const first = svc.request('signal');
     const second = svc.request('signal');
@@ -379,6 +474,7 @@ describe('LiveAccessRevalidator — scheduling', () => {
       {} as any,
       {} as any,
       'native',
+      {} as any,
     );
     native.onModuleInit();
     expect((native as any).sweepTimer).toBeNull();
