@@ -156,8 +156,8 @@ export class CollaborationGateway {
   ) {
     // Custom collaboration events are registered ONLY on the RedisSync extension, so with
     // COLLAB_DISABLE_REDIS (single-node standalone) `handleEvent` is unreachable and this returns
-    // `undefined`. That is tolerable for best-effort events (forceDisconnect) and for the #282 seams,
-    // whose callers already treat `undefined` as fail-closed (503). It is NOT tolerable for
+    // `undefined`. That is tolerable for the #282 seams, whose callers already treat `undefined` as
+    // fail-closed (503). It is NOT tolerable for
     // `updatePageContent`: `PageService.update` ignores its (void) result, so a REST/`/v1` content write
     // would return a false 200 while persisting NOTHING (#344). Standalone interactive editing is
     // unaffected — live sockets use the direct Hocuspocus path, not this method — so fail the one write
@@ -171,18 +171,8 @@ export class CollaborationGateway {
   }
 
   /**
-   * CCC integration seam (UPSTREAM_MODIFICATIONS.md): force-disconnect a user's live sessions on a
-   * page, routed to the doc-owning node via RedisSync. Thin pass-through — the caller (authz/) owns
-   * the authorization decision (a PDP re-check) before invoking this.
-   */
-  forceDisconnectUserFromPage(pageId: string, userId: string) {
-    return this.handleYjsEvent('forceDisconnect', `page.${pageId}`, { userId });
-  }
-
-  /**
    * CCC integration seam (UPSTREAM_MODIFICATIONS.md): force-disconnect a user's LIVE collab sockets across
-   * EVERY document, for #455 account-disable. The per-page `forceDisconnectUserFromPage` above needs a
-   * pageId and routes to one doc-owning node; account disable has no single page and must reach all of the
+   * EVERY document, for #455 account-disable. Account disable has no single page and must reach all of the
    * user's open editors at once.
    *
    * NODE-LOCAL by design: iterate THIS node's resident documents and close every connection whose
@@ -201,6 +191,15 @@ export class CollaborationGateway {
    */
   forceDisconnectUser(userId: string): void {
     disconnectUserConnections(this.hocuspocus.documents.values(), userId);
+  }
+
+  /**
+   * CCC integration seam (UPSTREAM_MODIFICATIONS.md #3g, #501): this node's resident documents, for the
+   * live-access revalidator (authz/live-access/), which re-checks every open connection after a narrowing
+   * access change. A read-only accessor — the decision and the close live in authz/.
+   */
+  getResidentDocuments() {
+    return this.hocuspocus.documents.values();
   }
 
   /**

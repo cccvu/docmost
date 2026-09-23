@@ -165,6 +165,75 @@ describe('AuthzChangeFeedService (R2 commit-safe cursor)', () => {
   });
 });
 
+describe('AuthzChangeFeedService long-poll wakeups (#501)', () => {
+  /** A responder that can run a hook while the FIRST gated read is being answered, and whose withheld probe
+   *  answers from `state.withheld` (the probe is routed BEFORE the generic outbox branch). */
+  function harness(state: { rows: unknown[]; withheld: boolean; onFirstRead?: () => void }) {
+    let reads = 0;
+    const spy = spyKysely((q: SpyQuery) => {
+      if (q.sql.includes('authz_outbox_gc')) return [{ stale: false }];
+      if (q.sql.includes('age_ms')) return [{ age_ms: null }];
+      if (q.sql.includes('as withheld')) return [{ withheld: state.withheld }];
+      if (q.sql.includes('order by xact_id desc')) return [{ xact_id: '50', id: '6' }];
+      if (q.sql.includes('from authz_outbox')) {
+        reads++;
+        if (reads === 1) {
+          const rows = state.rows;
+          state.onFirstRead?.();
+          return rows; // the snapshot the first read saw
+        }
+        return state.rows;
+      }
+      return [];
+    });
+    return new AuthzChangeFeedService(spy.db, {} as any, 'remote' as any);
+  }
+
+  it('a NOTIFY that lands DURING the first read is not lost: the call re-reads instead of parking for the full wait', async () => {
+    // The row commits (and its NOTIFY fires) after the first read took its snapshot, before any waiter is
+    // registered. Without the wake counter the call slept the whole wait.
+    const state: { rows: unknown[]; withheld: boolean; onFirstRead?: () => void } = { rows: [], withheld: false };
+    const svc = harness(state);
+    state.onFirstRead = () => {
+      state.rows = [memberRow(6, '50')];
+      (svc as unknown as { wakeAll(): void }).wakeAll(); // no waiter registered yet
+    };
+    const t0 = Date.now();
+    const res = await svc.getChanges('49.0', 10_000, 500);
+    expect(Date.now() - t0).toBeLessThan(2_000);
+    expect(res.events).toHaveLength(1);
+    expect(res.nextCursor).toBe('50.6');
+  });
+
+  it('re-polls on a short interval while committed rows are withheld by the xmin gate (no NOTIFY when the blocker ends)', async () => {
+    const state: { rows: unknown[]; withheld: boolean; onFirstRead?: () => void } = { rows: [], withheld: true };
+    const svc = harness(state);
+    // The blocking transaction ends ~300ms in: the row becomes servable, and NO wake is sent.
+    setTimeout(() => {
+      state.rows = [memberRow(6, '50')];
+      state.withheld = false;
+    }, 300).unref?.();
+    const t0 = Date.now();
+    const res = await svc.getChanges('49.0', 10_000, 500);
+    expect(Date.now() - t0).toBeLessThan(2_000); // not the 10s wait
+    expect(res.events).toHaveLength(1);
+  });
+
+  it('with nothing withheld it still parks for the whole wait (no busy polling at idle)', async () => {
+    const state: { rows: unknown[]; withheld: boolean; onFirstRead?: () => void } = { rows: [], withheld: false };
+    const svc = harness(state);
+    const probes: number[] = [];
+    const orig = (svc as any).hasRowsAfter.bind(svc);
+    (svc as any).hasRowsAfter = async (c: unknown) => {
+      probes.push(Date.now());
+      return orig(c);
+    };
+    const res = await svc.getChanges('49.0', 300, 500);
+    expect(res.events).toEqual([]);
+    expect(probes).toHaveLength(1); // one probe, then one park until the deadline
+  });
+});
+
 /** The same env reading as the service (module-load constant, default 7). */
 const RETENTION_DAYS = (() => {
   const n = Number.parseInt(process.env.AUTHZ_OUTBOX_RETENTION_DAYS ?? '', 10);

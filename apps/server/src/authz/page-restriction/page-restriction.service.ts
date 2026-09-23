@@ -5,6 +5,7 @@ import {
   Inject,
   Injectable,
   NotFoundException,
+  Optional,
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { InjectKysely } from 'nestjs-kysely';
@@ -20,6 +21,7 @@ import {
 } from '../../core/casl/interfaces/space-ability.type';
 import { AUTHZ_MODE, AuthzMode } from '../mode/authz-mode';
 import { HttpAuthzClient } from '../http-authz.client';
+import { WsService } from '../../ws/ws.service';
 import {
   AddPagePermissionDto,
   PageGrantRole,
@@ -64,6 +66,11 @@ export class PageRestrictionService {
     private readonly spaceAbility: SpaceAbilityFactory,
     @Inject(AUTHZ_MODE) private readonly mode: AuthzMode,
     private readonly authz: HttpAuthzClient,
+    // #501: the socket.io plane caches "does this space have ANY restriction" (Redis, 30 s) to decide whether
+    // a tree/comment event may go to the whole space room. A space's FIRST restriction must drop that entry,
+    // or the newly restricted page's titles and comment bodies keep going to every member for up to 30 s.
+    // Optional only so the unit specs can omit it; the @Global WsModule always provides it in the app.
+    @Optional() private readonly wsService?: WsService,
   ) {}
 
   private subject(user: User) {
@@ -159,6 +166,7 @@ export class PageRestrictionService {
       accessLevel: 'members',
       creatorId: user.id,
     });
+    await this.wsService?.invalidateSpaceRestrictionCache(page.spaceId).catch(() => undefined);
     if (!retained) return;
     const access = await this.pagePermissionRepo.findPageAccessByPageId(pageId);
     if (access) {

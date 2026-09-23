@@ -17,6 +17,10 @@ import { AuthzChangeEvent, mapOutboxRow, OutboxRow, isExpectedSkip } from './aut
 
 const NOTIFY_CHANNEL = 'authz_outbox';
 const MAX_WAIT_MS = 25_000;
+/** While committed rows exist after the cursor but are WITHHELD by the xmin gate (an older transaction on the
+ *  shared instance is still open), their NOTIFY has already fired and the blocker's commit may send none, so
+ *  the long-poll re-reads on this short interval instead of sleeping the whole wait (#501). */
+const WITHHELD_POLL_MS = 250;
 const MAX_LIMIT = 1000;
 const GC_INTERVAL_MS = 60 * 60 * 1000; // hourly retention sweep
 
@@ -129,6 +133,10 @@ export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
   private listenHandle: { unlisten: () => Promise<void> } | null = null;
   private gcTimer: ReturnType<typeof setInterval> | null = null;
   private readonly waiters = new Set<() => void>();
+  /** Bumped by every wake. `getChanges` captures it BEFORE its first read, so a NOTIFY that lands while the
+   *  read is in flight (a commit the read's snapshot could not see) is never lost: the call re-reads instead of
+   *  parking for the full wait (#501 lost-wakeup fix). */
+  private wakeSeq = 0;
 
   constructor(
     @InjectKysely() private readonly db: KyselyDB,
@@ -167,7 +175,14 @@ export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
         max: 1,
         onnotice: () => {},
       });
-      this.listenHandle = await this.listenSql.listen(NOTIFY_CHANNEL, () => this.wakeAll());
+      // `onlisten` fires on the first subscribe AND on every postgres.js re-subscribe after a reconnect, so a
+      // NOTIFY dropped while the LISTEN connection was down re-wakes blocked long-polls instead of costing a
+      // full wait.
+      this.listenHandle = await this.listenSql.listen(
+        NOTIFY_CHANNEL,
+        () => this.wakeAll(),
+        () => this.wakeAll(),
+      );
       this.logger.log(`authz change feed listening on channel ${NOTIFY_CHANNEL}`);
     } catch (e) {
       this.logger.warn(
@@ -177,6 +192,7 @@ export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
   }
 
   private wakeAll(): void {
+    this.wakeSeq++;
     const woken = [...this.waiters];
     this.waiters.clear();
     for (const w of woken) w();
@@ -208,10 +224,10 @@ export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
     const head = await this.head();
     await this.assertNotStale(cursor, head);
 
+    const seq0 = this.wakeSeq; // BEFORE the read: a wake for a commit the read cannot see is never lost
     let raw = await this.readRawAfter(cursor, cappedLimit);
     if (raw.length === 0 && cappedWait > 0) {
-      await this.waitForWake(cappedWait);
-      raw = await this.readRawAfter(cursor, cappedLimit);
+      raw = await this.awaitRows(cursor, cappedLimit, cappedWait, seq0);
     }
 
     const events: AuthzChangeEvent[] = [];
@@ -235,6 +251,44 @@ export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
     const nextCursor = last ? formatCursor(last.xactId, last.id) : formatCursor(cursor.xactId, cursor.id);
     const oldestPendingAgeMs = await this.oldestPendingAgeMs(parseCursor(nextCursor));
     return { events, nextCursor, head, oldestPendingAgeMs };
+  }
+
+  /** The long-poll wait after an empty gated read. Parks until a wake or the deadline, EXCEPT that (a) a wake
+   *  that already happened since `seq0` skips the park (lost-wakeup fix), and (b) while committed rows exist
+   *  after the cursor but the xmin gate withholds them, it re-reads every WITHHELD_POLL_MS: those rows' NOTIFY
+   *  has already fired, and the blocking transaction's commit sends none unless it wrote an authz table, so a
+   *  plain park would add up to the full wait of latency to every narrowing change behind it (#501). */
+  private async awaitRows(
+    cursor: Cursor,
+    limit: number,
+    waitMs: number,
+    seq0: number,
+  ): Promise<{ row: OutboxRow; xactId: string; id: string }[]> {
+    const deadline = Date.now() + waitMs;
+    let seq = seq0;
+    for (;;) {
+      const withheld = await this.hasRowsAfter(cursor);
+      const remaining = deadline - Date.now();
+      if (remaining > 0 && this.wakeSeq === seq) {
+        await this.waitForWake(withheld ? Math.min(WITHHELD_POLL_MS, remaining) : remaining);
+      }
+      seq = this.wakeSeq;
+      const raw = await this.readRawAfter(cursor, limit);
+      if (raw.length > 0 || !withheld || Date.now() >= deadline) return raw;
+    }
+  }
+
+  /** Whether ANY committed row follows `cursor`, ignoring the xmin gate. Called only after a gated read came
+   *  back empty, so `true` means rows are committed but withheld (or committed a moment ago). One index seek on
+   *  `(xact_id, id)`. */
+  private async hasRowsAfter(cursor: Cursor): Promise<boolean> {
+    const res = await sql<{ withheld: boolean }>`
+      select exists(
+        select 1 from authz_outbox
+        where (xact_id, id) > (${cursor.xactId}::xid8, ${cursor.id}::bigint)
+      ) as withheld
+    `.execute(this.db);
+    return res.rows[0]?.withheld === true;
   }
 
   private async readRawAfter(

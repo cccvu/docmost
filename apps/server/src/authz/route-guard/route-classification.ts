@@ -21,7 +21,7 @@ import { PLATFORM_AUTHZ_KEY, PLATFORM_PUBLIC_KEY } from './platform-authz.decora
 /**
  * The security-sensitive allow-list of guard NAMES that constitute an AUTHENTICATION decision:
  *  - JwtAuthGuard: the standard human-session authentication (honors @Public).
- *  - CollabServiceSecretGuard: service-to-service auth for the fork-owned collab force-disconnect route.
+ *  - CollabServiceSecretGuard: service-to-service auth for the fork-owned collab revalidate / force-disconnect routes.
  *  - ServiceAuthGuard: scoped service-to-service auth for the fork-owned `/api/service/*` endpoints
  *    (session brokerage + provisioning) — fail-closed, constant-time, per-route-scope (see service-bridge/).
  * NOT ThrottlerGuard / SetupGuard (rate-limit / one-time-bootstrap gates — those routes are pre-auth public

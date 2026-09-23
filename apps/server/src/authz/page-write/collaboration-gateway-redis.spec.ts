@@ -73,8 +73,9 @@ describe('CollaborationGateway.handleYjsEvent routing guard (#344)', () => {
 
     it('does NOT throw for a best-effort event — standalone mode is preserved', () => {
       const gw = makeGateway(true);
-      // forceDisconnect returns undefined (redisSync is null) and must not become a hard error.
-      expect(gw.handleYjsEvent('forceDisconnect', 'page.1', { userId: 'u1' } as never)).toBeUndefined();
+      // flushPageContent returns undefined (redisSync is null) and must not become a hard error; its caller
+      // reads undefined as "not flushed".
+      expect(gw.handleYjsEvent('flushPageContent', 'page.1', {} as never)).toBeUndefined();
     });
   });
 
