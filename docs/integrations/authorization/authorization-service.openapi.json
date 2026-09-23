@@ -2,9 +2,9 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Docmost Remote Authorization Service",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "summary": "The contract a third party implements to run this Docmost fork with AUTHZ_MODE=remote.",
-    "description": "When this Docmost fork runs with AUTHZ_MODE=remote, it delegates EVERY fine-grained authorization decision, and forwards domain audit, to an external HTTP service over this contract. Implement these six endpoints and point the fork at your service via PLATFORM_AUTHZ_URL (base URL, no path prefix) and PLATFORM_AUTHZ_SERVICE_SECRET (the shared secret sent in the x-authz-service-secret header) to run the fork without the CCC platform.\n\nThis document is the CANONICAL source of truth for the PEP to PDP + audit boundary. It supersedes the retired contract/pep-pdp.contract.json fixture; the fork consumer contract test and the reference implementation's provider contract test both derive their canonical request/response bodies and array caps from this file.\n\nSecurity model (non-negotiable, enforced by the fork, not by your service):\n  - The mode is a server-controlled boundary fixed at fork startup, never inferred from availability, and there is NO fallback to native decisions. If your service is unreachable, slow, or returns a non-2xx or malformed body, the fork FAILS CLOSED (deny / empty result). A platform outage must never silently grant access, so your service returning 5xx is safe by construction.\n  - The fork calls with a per-request AbortController timeout (PLATFORM_AUTHZ_TIMEOUT_MS, default 1500 ms, clamped to [250, 60000]); respond well within it or the call is treated as a denial.\n  - Subjects always arrive as { provider: \"docmost\", externalId: <docmost user id> }. The { principalId } shape is part of the schema for completeness but is not emitted by this fork.\n  - The reference implementation additionally rejects unknown request keys with 400 and enforces the array caps below; a faithful implementation should do the same, but the fork itself never sends unknown keys or over-cap arrays.",
+    "description": "When this Docmost fork runs with AUTHZ_MODE=remote, it delegates EVERY fine-grained authorization decision, and forwards domain audit, to an external HTTP service over this contract. Implement these six endpoints (plus, optionally, /sync/settle — 1.1.0) and point the fork at your service via PLATFORM_AUTHZ_URL (base URL, no path prefix) and PLATFORM_AUTHZ_SERVICE_SECRET (the shared secret sent in the x-authz-service-secret header) to run the fork without the CCC platform.\n\nThis document is the CANONICAL source of truth for the PEP to PDP + audit boundary. It supersedes the retired contract/pep-pdp.contract.json fixture; the fork consumer contract test and the reference implementation's provider contract test both derive their canonical request/response bodies and array caps from this file.\n\nSecurity model (non-negotiable, enforced by the fork, not by your service):\n  - The mode is a server-controlled boundary fixed at fork startup, never inferred from availability, and there is NO fallback to native decisions. If your service is unreachable, slow, or returns a non-2xx or malformed body, the fork FAILS CLOSED (deny / empty result). A platform outage must never silently grant access, so your service returning 5xx is safe by construction.\n  - The fork calls with a per-request AbortController timeout (PLATFORM_AUTHZ_TIMEOUT_MS, default 1500 ms, clamped to [250, 60000]); respond well within it or the call is treated as a denial.\n  - Subjects always arrive as { provider: \"docmost\", externalId: <docmost user id> }. The { principalId } shape is part of the schema for completeness but is not emitted by this fork.\n  - The reference implementation additionally rejects unknown request keys with 400 and enforces the array caps below; a faithful implementation should do the same, but the fork itself never sends unknown keys or over-cap arrays.",
     "license": { "name": "AGPL-3.0-only", "identifier": "AGPL-3.0-only" },
     "x-canonical": true
   },
@@ -288,6 +288,53 @@
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
+    "/sync/settle": {
+      "post": {
+        "operationId": "settleProjection",
+        "tags": ["sync"],
+        "summary": "OPTIONAL (1.1.0, #501): has every access change up to this outbox position reached your decisions?",
+        "description": "Called by the fork after a request that can TAKE ACCESS AWAY succeeds (restrict, grant removal or downgrade, member removal or demotion, archive, move), before it responds. `position` is the fork's MAX COMMITTED authz outbox position `<xact_id>.<id>` at that moment (a global fence: it covers that request's changes and every earlier one). Answer `confirmed` ONLY once every outbox change up to and including `position` is reflected in your decisions (for a relay: your durable cursor is at or past it, nothing at or before it was skipped, and your decision caches cannot serve an older answer); otherwise `pending` with a reason, within `timeoutMs` (you may clamp it). The fork relays the verdict to its caller as the `Authz-Propagation` response header; it never changes the request's outcome. OPTIONAL: an implementation without this route (404), or one that times out or answers anything but a well-formed `confirmed`, makes every narrowing response say `pending` — safe, just not confirmed. The fork's deadline is timeoutMs + 500 ms.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["position"],
+                "properties": {
+                  "position": { "type": "string", "pattern": "^\\d{1,20}\\.\\d{1,20}$" },
+                  "timeoutMs": { "type": "integer", "minimum": 0, "maximum": 60000 }
+                }
+              },
+              "example": { "position": "48213.907", "timeoutMs": 3000 }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The verdict. `pending` is an answer, not an error.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["status"],
+                  "properties": {
+                    "status": { "type": "string", "enum": ["confirmed", "pending"] },
+                    "reason": { "type": "string", "description": "pending only, e.g. timeout, relay-degraded, unbaselined, dead-letter, watermark" },
+                    "cursor": { "type": ["string", "null"] },
+                    "waitedMs": { "type": "integer" }
+                  }
+                },
+                "example": { "status": "confirmed", "cursor": "48214.2", "waitedMs": 180 }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "description": "Not implemented — the fork treats it as `pending`." }
         }
       }
     },

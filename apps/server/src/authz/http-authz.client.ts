@@ -23,6 +23,8 @@ const FILTER_CHUNK = 1000;
 /** Bounded per-request timeout (ms) so a slow/hung platform cannot hang the wiki request; on timeout the
  *  call aborts and resolves fail-closed. Overridable via PLATFORM_AUTHZ_TIMEOUT_MS. */
 const DEFAULT_TIMEOUT_MS = 1500;
+/** How much longer than the platform's own settle wait the fork's request may take (network + the confirm step). */
+const SETTLE_MARGIN_MS = 500;
 
 /**
  * Parse PLATFORM_AUTHZ_TIMEOUT_MS defensively. A bare `Number(env ?? default)` is a footgun: `Number('')` is
@@ -168,5 +170,37 @@ export class HttpAuthzClient {
       for (const s of r.subjects) if (s && typeof s.externalId === 'string') allowed.add(s.externalId);
     }
     return [...allowed];
+  }
+
+  /**
+   * #501 Part B: ask the platform whether its relay has projected every outbox row up to `position` into the PDP
+   * (`POST /sync/settle`), waiting at most `waitMs` there. Resolves `confirmed` ONLY on a well-formed 200 that says
+   * so; anything else — a platform without the route (404), a timeout, a transport error, a malformed body — is
+   * `pending` (an unproven change must never read as enforced). Never throws. Its own deadline (the platform's
+   * wait plus a margin), not the 1.5 s decision timeout.
+   */
+  async settleProjection(
+    position: string,
+    waitMs: number,
+  ): Promise<{ status: 'confirmed' } | { status: 'pending'; reason: string }> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), waitMs + SETTLE_MARGIN_MS);
+    (timer as unknown as { unref?: () => void }).unref?.();
+    try {
+      const res = await fetch(`${this.baseUrl}/sync/settle`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-authz-service-secret': this.secret },
+        body: JSON.stringify({ position, timeoutMs: waitMs }),
+        signal: controller.signal,
+      });
+      if (!res.ok) return { status: 'pending', reason: `settle-http-${res.status}` };
+      const body = (await res.json()) as { status?: unknown; reason?: unknown } | null;
+      if (body?.status === 'confirmed') return { status: 'confirmed' };
+      return { status: 'pending', reason: typeof body?.reason === 'string' ? body.reason : 'settle-malformed' };
+    } catch {
+      return { status: 'pending', reason: controller.signal.aborted ? 'settle-timeout' : 'settle-unreachable' };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }

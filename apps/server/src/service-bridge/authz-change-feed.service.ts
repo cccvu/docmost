@@ -51,6 +51,23 @@ function formatCursor(xactId: string, id: string): string {
   return `${xactId}.${id}`;
 }
 
+/**
+ * The MAX COMMITTED outbox position `(xact_id, id)`, or the zero cursor when the outbox is empty — the #501 Part B
+ * settle FENCE, read right after a narrowing request's handler succeeded. Deliberately UNGATED (no xmin filter):
+ * the request's own rows are committed and visible to this read, so the fence is at or past every one of them
+ * (and past every earlier commit). NEVER `head()`: head is gated by the oldest open transaction, so while any
+ * unrelated transaction is open it sits BEFORE the rows this request just committed, and a settle fenced there
+ * would report `confirmed` for a change the relay has not projected. One backward seek on the `(xact_id, id)`
+ * index.
+ */
+export async function maxCommittedPosition(db: KyselyDB): Promise<string> {
+  const res = await sql<{ xactId: string; id: string }>`
+    select xact_id, id from authz_outbox order by xact_id desc, id desc limit 1
+  `.execute(db);
+  const row = res.rows[0];
+  return row ? formatCursor(String(row.xactId), String(row.id)) : ZERO_CURSOR;
+}
+
 /** Tuple compare `a > b` on (xact_id, id), both as decimal strings (xid8 can exceed 2^53, so use BigInt). */
 function tupleGt(a: Cursor, b: Cursor): boolean {
   const ax = BigInt(a.xactId);

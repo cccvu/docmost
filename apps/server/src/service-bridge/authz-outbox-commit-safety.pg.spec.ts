@@ -1,7 +1,7 @@
 import * as postgres from 'postgres';
 import { CamelCasePlugin, Kysely } from 'kysely';
 import { PostgresJSDialect } from 'kysely-postgres-js';
-import { AuthzChangeFeedService } from './authz-change-feed.service';
+import { AuthzChangeFeedService, maxCommittedPosition } from './authz-change-feed.service';
 
 /**
  * Real-Postgres two-connection proof of the R2 commit-safe watermark (Group D, issue #171) — the security
@@ -177,6 +177,38 @@ d('AuthzChangeFeedService — real-Postgres commit-safety (Group D R2)', () => {
     const res = await pending;
     expect(res.events.map((e: any) => e.spaceId)).toEqual(['sB']);
     expect(Date.now() - t0).toBeLessThan(2_000); // not the 10 s wait
+  });
+
+  it('#501 Part B: the settle fence covers a just-committed write that head() still withholds', async () => {
+    // Another, OLDER transaction is open (it pins xmin). "Our" narrowing request then commits its outbox row. The
+    // settle fence must be at or past that row, or the platform could answer `confirmed` before the relay has
+    // projected it (a false confirmed = access still wide). head() is xmin-gated and sits BEFORE the row.
+    const pos = (p: string) => p.split('.').map((n) => BigInt(n)) as [bigint, bigint];
+    const atOrPast = (a: string, b: string) => {
+      const [ax, ai] = pos(a);
+      const [bx, bi] = pos(b);
+      return ax > bx || (ax === bx && ai >= bi);
+    };
+    await a`begin`;
+    await a`select pg_current_xact_id()`;
+    await insertMember(admin, 'sOurs');
+    const [ours] = await admin`select xact_id::text as x, id::text as i from authz_outbox where payload->>'space_id' = 'sOurs'`;
+    const oursPos = `${ours.x}.${ours.i}`;
+
+    const fence = await maxCommittedPosition(db as any);
+    expect(atOrPast(fence, oursPos)).toBe(true);
+    expect(atOrPast(await feed.head(), oursPos)).toBe(false); // why the fence must never be head()
+
+    // Conservative by design: an unrelated change committed after ours is inside a later fence too (over-wait,
+    // never under-wait).
+    await insertMember(admin, 'sLater');
+    const [later] = await admin`select xact_id::text as x, id::text as i from authz_outbox where payload->>'space_id' = 'sLater'`;
+    expect(atOrPast(await maxCommittedPosition(db as any), `${later.x}.${later.i}`)).toBe(true);
+    await a`commit`;
+  });
+
+  it('#501 Part B: the settle fence of an empty outbox is the zero cursor', async () => {
+    expect(await maxCommittedPosition(db as any)).toBe('0.0');
   });
 
   it('rollback: an aborted row is never delivered and never blocks the frontier', async () => {

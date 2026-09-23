@@ -72,6 +72,7 @@ const _filterResources = op('filterResources');
 const _lookupResources = op('lookupResources');
 const _filterSubjects = op('filterSubjects');
 const _auditIngest = op('auditIngest');
+const _settleProjection = op('settleProjection'); // OPTIONAL op (1.1.0, #501)
 
 const CONTRACT = {
   check: { ..._check, expected: _check.response.allowed === true },
@@ -176,6 +177,27 @@ describe('PEP↔PDP consumer contract — real clients over a loopback PDP (#13)
     expect(CONTRACT.filterSubjects.response).toHaveProperty('subjects');
     expect(Array.isArray(CONTRACT.filterSubjects.response.subjects)).toBe(true);
     expect(CONTRACT.filterSubjects.response.subjects[0]).toHaveProperty('externalId');
+  });
+
+  // ---------------------------------------------------------------------------------------------
+  // settleProjection() — the OPTIONAL /sync/settle op (#501 Part B)
+  // ---------------------------------------------------------------------------------------------
+  describe('settleProjection() (optional)', () => {
+    const F = _settleProjection;
+
+    it('POSTs the canonical /sync/settle request and reads a canonical confirmed', async () => {
+      expect(F.response.status).toBe('confirmed');
+      nextResponse = { status: 200, body: F.response };
+      const out = await authz.settleProjection(F.request.position, F.request.timeoutMs);
+      expect(out).toEqual({ status: 'confirmed' });
+      expectEnvelope(F.path);
+      expect(captured!.body).toEqual(F.request);
+    });
+
+    it('an implementation without the route (404) reads as pending, never as an error', async () => {
+      nextResponse = { status: 404, body: { error: 'not found' } };
+      expect((await authz.settleProjection('1.1', 0)).status).toBe('pending');
+    });
   });
 
   // ---------------------------------------------------------------------------------------------

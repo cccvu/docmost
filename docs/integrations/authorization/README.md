@@ -26,6 +26,15 @@ matter only for `AUTHZ_MODE=remote`.
 - `/authz/filter-subjects` (<= 1000 candidates) -> `{ subjects }` (passing subjects, echoed verbatim)
 - `/audit/ingest` (<= 500 events) -> `202 { accepted, persisted }` (fire-and-forget on the fork side)
 
+And one OPTIONAL endpoint (1.1.0, #501):
+
+- `/sync/settle` `{ position, timeoutMs }` -> `{ status: "confirmed" | "pending", reason? }`. After a request that
+  takes access away succeeds, the fork asks whether every access change up to its outbox position `position` is
+  already reflected in your decisions, and reports the answer to its caller as the `Authz-Propagation` response
+  header. Answer `confirmed` only when that is true. Without this route (404), every such response says
+  `pending`: safe, never a failure. `AUTHZ_NARROWING_SETTLE_TIMEOUT_MS` (default 3000, max 5000, `0` = off) is
+  how long the fork lets you wait.
+
 Point the fork at your service with two environment variables:
 
 ```
@@ -90,6 +99,12 @@ You only implement a *caller* for these; the fork is the server. They fall into 
 - **Collab** (`collab`): `POST /api/collab/revalidate` (re-check every live realtime connection after a
   narrowing access change and narrow the ones that lost access, #501; it replaced the per-page
   `force-disconnect` in 1.5.0) and `POST /api/collab/force-disconnect-user` (account disable, #455).
+
+**Access-narrowing propagation (1.6.0, #501).** A successful response from a route that can take access away
+(`archive`, the member `POST` upsert, `PATCH` and `DELETE` here, and the native restrict/grant/move/member routes
+a platform relays) carries `Authz-Propagation: confirmed | pending` — whether the change is already enforced by the
+authorization service (via the optional outbound `/sync/settle` above). It never changes the status or the body.
+An absent header means unknown, never confirmed.
 
 Three properties bind the whole surface:
 
