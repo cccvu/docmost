@@ -29,6 +29,11 @@ Behavior you must design around:
   Returning `5xx` on your own errors is safe: it degrades to deny, never to allow. This includes the page
   `locked` check, where `false` means *unrestricted*: a failed or malformed `check-bulk` carrying `locked` is
   treated as **restricted with no access**. It never falls back to the space role.
+- **"No view, not locked" is checked against the fork's own rows.** When you answer `view=false` AND
+  `locked=false` for a page (as a PDP does for a page it has no placement for: trashed, or not yet synced), the
+  fork walks that page's restriction lineage in its own database: the page itself and every ancestor, trashed
+  ones included. The space role decides only if that walk reaches a root and finds no restriction. Anything
+  else is **restricted with no access**.
 - **Constant-time secret check.** Compare `x-authz-service-secret` in constant time; `401` on mismatch, `503`
   if you have no secret configured.
 - **Respond within the timeout.** The fork aborts the request at `PLATFORM_AUTHZ_TIMEOUT_MS`.
