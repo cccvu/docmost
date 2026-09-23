@@ -19,9 +19,13 @@ jest.mock('../../ws/ws.gateway', () => ({
   WsGateway: class {},
 }));
 
+// Same reason for the revalidator: its runtime require pulls the gateways. Stub it; tests inject a fake.
+jest.mock('../live-access/live-access.revalidator', () => ({
+  LiveAccessRevalidator: class {},
+}));
+
 import {
   CollabDisconnectController,
-  ForceDisconnectDto,
   ForceDisconnectUserDto,
 } from './collab-disconnect.controller';
 import { CollabServiceSecretGuard } from './service-secret.guard';
@@ -34,9 +38,10 @@ import { SKIP_TRANSFORM_KEY } from '../../common/decorators/skip-transform.decor
  * doc-comments + CLAUDE.md's deny-by-default / fail-closed rules:
  *   - service-secret.guard.ts: verify `x-authz-service-secret` with a CONSTANT-TIME compare
  *     (timingSafeEqual), and FAIL CLOSED when the secret is unconfigured;
- *   - collab-disconnect.controller.ts: FAIL-SAFE re-check — "never disconnect a user who still has
- *     access" (re-run the rebound PDP repo before routing a force-disconnect);
- *   - ForceDisconnectDto: userId/pageId are UUIDs.
+ *   - collab-disconnect.controller.ts: `revalidate` hands off to the live-access revalidator (which re-checks
+ *     every live connection and only narrows) and answers with the pass summary, or `{pending:true}` if the
+ *     pass outlives the bound; `force-disconnect-user` closes one identity's sockets on both planes;
+ *   - ForceDisconnectUserDto: userId is a UUID.
  *
  * Pure unit specs (no Nest app, no Docker), instantiating the classes directly — mirroring
  * authz/audit/platform-audit.service.spec.ts and authz/search/pdp-search.service.spec.ts.
@@ -136,65 +141,39 @@ describe('CollabServiceSecretGuard (x-authz-service-secret verification)', () =>
   });
 });
 
-describe('CollabDisconnectController.forceDisconnect (fail-safe PDP re-check)', () => {
-  const USER = '11111111-1111-4111-8111-111111111111';
-  const PAGE = '22222222-2222-4222-8222-222222222222';
+describe('CollabDisconnectController.revalidate (#501 — narrow every live connection after a revocation)', () => {
+  const summary = { checked: 3, closed: 1, left: 1, disconnected: 0, unknown: 0, unknownClosed: 0 };
 
-  const build = (canAccess: boolean) => {
-    const forceDisconnectUserFromPage = jest.fn();
-    const canUserAccessPage = jest.fn(async () => canAccess);
-    const controller = new CollabDisconnectController(
-      { forceDisconnectUserFromPage } as any,
-      { canUserAccessPage } as any,
-      { forceDisconnectUser: jest.fn() } as any, // wsGateway — unused on the per-page path
-    );
-    return { controller, forceDisconnectUserFromPage, canUserAccessPage };
-  };
-
-  // Invariant (b): fail-safe — if the user is STILL authorized on the page, do NOT disconnect.
-  // "never disconnect a user who still has access" (controller doc-comment). The stale/coarse signal
-  // must not sever a live, still-permitted session.
-  it('does NOT disconnect and returns {disconnected:false} when the user is STILL authorized', async () => {
-    const { controller, forceDisconnectUserFromPage, canUserAccessPage } = build(true);
-
-    const result = await controller.forceDisconnect({ userId: USER, pageId: PAGE });
-
-    expect(result).toEqual({ disconnected: false });
-    expect(forceDisconnectUserFromPage).not.toHaveBeenCalled();
-    // The re-check must actually be performed (not skipped) with the DTO's user+page.
-    expect(canUserAccessPage).toHaveBeenCalledWith(USER, PAGE);
+  it('hands off to the revalidator as a fast-path signal and returns the pass summary', async () => {
+    const signal = jest.fn(async () => summary);
+    const controller = new CollabDisconnectController({} as any, {} as any, { signal } as any);
+    await expect(controller.revalidate()).resolves.toEqual(summary);
+    expect(signal).toHaveBeenCalledWith('signal');
   });
 
-  // Invariant (b): when access is revoked (re-check false), route the force-disconnect and report true.
-  it('routes the force-disconnect and returns {disconnected:true} when the user is NO LONGER authorized', async () => {
-    const { controller, forceDisconnectUserFromPage, canUserAccessPage } = build(false);
-
-    const result = await controller.forceDisconnect({ userId: USER, pageId: PAGE });
-
-    expect(result).toEqual({ disconnected: true });
-    expect(canUserAccessPage).toHaveBeenCalledWith(USER, PAGE);
-    // Gateway signature is (pageId, userId) — assert the order the seam expects.
-    expect(forceDisconnectUserFromPage).toHaveBeenCalledTimes(1);
-    expect(forceDisconnectUserFromPage).toHaveBeenCalledWith(PAGE, USER);
+  it('answers {pending:true} when the pass outlives the 5s bound (the sweep still covers it)', async () => {
+    jest.useFakeTimers();
+    try {
+      const signal = jest.fn(() => new Promise(() => undefined)); // never settles
+      const controller = new CollabDisconnectController({} as any, {} as any, { signal } as any);
+      const p = controller.revalidate();
+      await jest.advanceTimersByTimeAsync(5000);
+      await expect(p).resolves.toEqual({ pending: true });
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
-  // Invariant (b): the re-check gates the disconnect — it is consulted BEFORE the gateway is touched.
-  it('consults the PDP re-check before invoking the gateway (re-check gates the action)', async () => {
-    const order: string[] = [];
-    const forceDisconnectUserFromPage = jest.fn(() => order.push('gateway'));
-    const canUserAccessPage = jest.fn(async () => {
-      order.push('recheck');
-      return false;
+  it('propagates a failed pass as an error (the platform logs it; the sweep retries)', async () => {
+    const signal = jest.fn(async () => {
+      throw new Error('pdp down');
     });
-    const controller = new CollabDisconnectController(
-      { forceDisconnectUserFromPage } as any,
-      { canUserAccessPage } as any,
-      { forceDisconnectUser: jest.fn() } as any, // wsGateway — unused on the per-page path
-    );
+    const controller = new CollabDisconnectController({} as any, {} as any, { signal } as any);
+    await expect(controller.revalidate()).rejects.toThrow('pdp down');
+  });
 
-    await controller.forceDisconnect({ userId: USER, pageId: PAGE });
-
-    expect(order).toEqual(['recheck', 'gateway']);
+  it('the per-page force-disconnect route is gone (replaced by revalidate)', () => {
+    expect((CollabDisconnectController.prototype as any).forceDisconnect).toBeUndefined();
   });
 });
 
@@ -204,13 +183,13 @@ describe('CollabDisconnectController.forceDisconnectUser (#455 — account-disab
   const build = () => {
     const forceDisconnectUser = jest.fn(); // collab gateway (Hocuspocus)
     const wsForceDisconnectUser = jest.fn(); // ws gateway (socket.io notifications/tree)
-    const canUserAccessPage = jest.fn();
+    const signal = jest.fn();
     const controller = new CollabDisconnectController(
       { forceDisconnectUser } as any,
-      { canUserAccessPage } as any,
       { forceDisconnectUser: wsForceDisconnectUser } as any,
+      { signal } as any,
     );
-    return { controller, forceDisconnectUser, wsForceDisconnectUser, canUserAccessPage };
+    return { controller, forceDisconnectUser, wsForceDisconnectUser, signal };
   };
 
   // Unlike the per-page force-disconnect, this is a whole-identity signal (the platform already deactivated
@@ -218,7 +197,7 @@ describe('CollabDisconnectController.forceDisconnectUser (#455 — account-disab
   // collab editor sockets AND the notifications/tree sockets (the #455 residual the ws gate alone can't cut,
   // since it only refuses NEW connections).
   it('unconditionally force-disconnects the user across BOTH realtime planes and returns {disconnected:true}', async () => {
-    const { controller, forceDisconnectUser, wsForceDisconnectUser, canUserAccessPage } = build();
+    const { controller, forceDisconnectUser, wsForceDisconnectUser, signal } = build();
 
     const result = await controller.forceDisconnectUser({ userId: USER });
 
@@ -228,8 +207,8 @@ describe('CollabDisconnectController.forceDisconnectUser (#455 — account-disab
     // The notifications/tree socket.io plane is also force-closed (not just the collab editor).
     expect(wsForceDisconnectUser).toHaveBeenCalledTimes(1);
     expect(wsForceDisconnectUser).toHaveBeenCalledWith(USER);
-    // No PDP page re-check — there is no page; the deactivate already happened.
-    expect(canUserAccessPage).not.toHaveBeenCalled();
+    // No PDP re-check — the deactivate already happened; this is not a revalidation.
+    expect(signal).not.toHaveBeenCalled();
   });
 
   it('carries @SkipTransform() so the body is bare per the spec', () => {
@@ -262,43 +241,10 @@ describe('ForceDisconnectUserDto validation (userId is a UUID)', () => {
   });
 });
 
-describe('ForceDisconnectDto validation (userId/pageId are UUIDs)', () => {
-  const UUID = '33333333-3333-4333-8333-333333333333';
-
-  const errorsFor = (obj: Record<string, unknown>) =>
-    validate(plainToInstance(ForceDisconnectDto, obj));
-
-  // Invariant (c): well-formed UUIDs pass.
-  it('accepts a payload with valid UUID userId and pageId', async () => {
-    const errors = await errorsFor({ userId: UUID, pageId: UUID });
-    expect(errors).toHaveLength(0);
-  });
-
-  // Invariant (c): a non-UUID userId is rejected.
-  it('rejects a non-UUID userId', async () => {
-    const errors = await errorsFor({ userId: 'not-a-uuid', pageId: UUID });
-    expect(errors.map((e) => e.property)).toContain('userId');
-  });
-
-  // Invariant (c): a non-UUID pageId is rejected.
-  it('rejects a non-UUID pageId', async () => {
-    const errors = await errorsFor({ userId: UUID, pageId: '42' });
-    expect(errors.map((e) => e.property)).toContain('pageId');
-  });
-
-  // Invariant (c): missing fields are rejected (no unauthenticated/empty disconnect payloads).
-  it('rejects a payload missing both fields', async () => {
-    const errors = await errorsFor({});
-    const props = errors.map((e) => e.property);
-    expect(props).toContain('userId');
-    expect(props).toContain('pageId');
-  });
-});
-
 describe('CollabDisconnectController wire shape (incident #181)', () => {
-  it('forceDisconnect carries @SkipTransform() so the body is bare per service-bridge.openapi.json', () => {
+  it('revalidate carries @SkipTransform() so the body is bare per service-bridge.openapi.json', () => {
     expect(
-      Reflect.getMetadata(SKIP_TRANSFORM_KEY, CollabDisconnectController.prototype.forceDisconnect),
+      Reflect.getMetadata(SKIP_TRANSFORM_KEY, CollabDisconnectController.prototype.revalidate),
     ).toBe(true);
   });
 });

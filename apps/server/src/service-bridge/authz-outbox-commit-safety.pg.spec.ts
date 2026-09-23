@@ -163,6 +163,22 @@ d('AuthzChangeFeedService — real-Postgres commit-safety (Group D R2)', () => {
     expect(tail.events).toHaveLength(0);
   });
 
+  it('#501: a row withheld by the xmin gate is delivered within ~250 ms after the blocker ends, with NO notify', async () => {
+    // A pins a LOW xid and writes nothing an authz trigger would see; B's row commits but is withheld behind
+    // A. When A commits there is no NOTIFY (A wrote no outbox row, and this feed's LISTEN is not even started),
+    // so before the fix the long-poll parked for its whole wait. It must now re-poll and return promptly.
+    await a`begin`;
+    await a`select pg_current_xact_id()`;
+    await insertMember(admin, 'sB'); // autocommit, higher xid, withheld while A is open
+    const t0 = Date.now();
+    const pending = feed.getChanges('0.0', 10_000, 100);
+    await new Promise((r) => setTimeout(r, 400));
+    await a`commit`;
+    const res = await pending;
+    expect(res.events.map((e: any) => e.spaceId)).toEqual(['sB']);
+    expect(Date.now() - t0).toBeLessThan(2_000); // not the 10 s wait
+  });
+
   it('rollback: an aborted row is never delivered and never blocks the frontier', async () => {
     await a`begin`;
     await a`select pg_current_xact_id()`; // A: low xid

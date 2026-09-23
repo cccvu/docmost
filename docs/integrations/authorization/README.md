@@ -87,7 +87,9 @@ You only implement a *caller* for these; the fork is the server. They fall into 
   a cursor at/below the retention high-water mark returns `409 {stale, head}` so the platform rebaselines
   (reconcile, then reset its cursor to the snapshot `baseline`) rather than skipping. This replaces the
   platform reaching directly into Docmost's database, so it needs no Docmost DB credentials.
-- **Collab** (`collab`): `POST /api/collab/force-disconnect`.
+- **Collab** (`collab`): `POST /api/collab/revalidate` (re-check every live realtime connection after a
+  narrowing access change and narrow the ones that lost access, #501; it replaced the per-page
+  `force-disconnect` in 1.5.0) and `POST /api/collab/force-disconnect-user` (account disable, #455).
 
 Three properties bind the whole surface:
 
@@ -111,7 +113,7 @@ They supersede the retired `contract/pep-pdp.contract.json` fixture.
 
 ## Response shape on the east-west surface (incident #181)
 
-Every `/api/service/*` operation and `POST /api/collab/force-disconnect` returns EXACTLY the body its
+Every `/api/service/*` operation and every `/api/collab/*` operation returns EXACTLY the body its
 OpenAPI schema declares. Docmost's global `{ data, success, status }` response envelope (the upstream
 `TransformHttpResponseInterceptor` registered in `main.ts`) is skipped on this surface via the upstream
 per-handler `@SkipTransform()` decorator on every east-west handler. Two fork specs keep that true:
