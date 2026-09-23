@@ -3,6 +3,7 @@ import { Kysely } from 'kysely';
 import { NotFoundException } from '@nestjs/common';
 import { ServicePageLifecycleService } from './service-page-lifecycle.service';
 import { PageCycleGuardInstaller } from './page-cycle-guard.installer';
+import { readPageLineage } from './page-lineage';
 import { PG_URL, uuid, fakeWorkspaceResolver, mkReadModelPg, bootstrapSchema, mkReadModelDb } from './read-model-pg.testkit';
 
 /**
@@ -165,6 +166,35 @@ d('ServicePageLifecycleService + PageCycleGuardInstaller on real Postgres', () =
     it('404s a page outside the workspace', async () => {
       await page(uuid(7), null, { ws: FOREIGN_WS });
       await expect(svc.lifecycleState({ pageId: uuid(7) })).rejects.toBeInstanceOf(NotFoundException);
+    });
+  });
+
+  describe('readPageLineage (shared with the fork PEP, #524)', () => {
+    it('without a workspace it walks the start page\'s own workspace and answers exactly as with one', async () => {
+      await page(uuid(1), null, { deleted: '2026-01-01T00:00:00Z' });
+      await page(uuid(2), uuid(1), { deleted: '2026-01-01T00:00:00Z' });
+      await page(uuid(3), uuid(2));
+      await restrict(uuid(1));
+      const scoped = await readPageLineage(db as never, uuid(3), { includeSelf: false, workspaceId: WS });
+      const derived = await readPageLineage(db as never, uuid(3), { includeSelf: false });
+      expect(derived).toEqual(scoped);
+      expect(derived).toEqual({ chain: [uuid(3), uuid(2), uuid(1)], restrictedIds: [uuid(1)], complete: true });
+      expect((await readPageLineage(db as never, uuid(1), { includeSelf: true })).restrictedIds).toEqual([uuid(1)]);
+    });
+
+    it('never follows a parent into another workspace: the walk ends early, which reads as restricted', async () => {
+      await page(uuid(1), null);
+      await page(uuid(7), uuid(1), { ws: FOREIGN_WS });
+      expect(await readPageLineage(db as never, uuid(7), { includeSelf: true, workspaceId: WS })).toEqual({
+        chain: [],
+        restrictedIds: [],
+        complete: false,
+      });
+      expect(await readPageLineage(db as never, uuid(7), { includeSelf: true })).toEqual({
+        chain: [uuid(7)],
+        restrictedIds: [],
+        complete: false,
+      });
     });
   });
 

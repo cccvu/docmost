@@ -12,7 +12,8 @@ import { isUserDisabled } from '../../common/helpers';
  * extension, so a connection is never closed for a reason the connect path would not also refuse (a
  * close → reconnect → close loop). The ONE deliberate difference is a PDP failure: on connect it fails closed
  * (the repos turn an error into "no role" / "restricted, no access"); here it is `unknown`, so a PDP blip
- * does not mass-evict every editor. The revalidator caps consecutive unknowns and then closes.
+ * does not mass-evict every editor. The revalidator caps consecutive unknowns and then closes. The same holds for
+ * the #524 lineage read: on connect a failed read denies, here it is `unknown`.
  */
 export type CollabAccess = 'deny' | 'read' | 'write' | 'unknown';
 
@@ -40,6 +41,11 @@ export interface CollabAccessFacts {
   page: { deletedAt?: Date | null } | null | undefined;
   space: SpacePermissions | null;
   pagePerms: PagePermissions | null;
+  /**
+   * #524: for a page the PDP has not placed (no view, not locked), whether the fork's own lineage restricts it
+   * (`lineageRestricted`). Read only in that case; null/undefined there = the read failed or was not made.
+   */
+  lineageRestricted?: boolean | null;
 }
 
 export function decideCollabAccess(f: CollabAccessFacts): CollabAccess {
@@ -59,8 +65,17 @@ export function decideCollabAccess(f: CollabAccessFacts): CollabAccess {
         : null;
   if (!role) return 'deny';
 
+  // #524: "no view, not locked" is a page the PDP has not placed (trashed, or not projected yet) — never evidence
+  // of "unrestricted". Mirrors PdpPagePermissionRepo.canUserEditPage: only a lineage the fork walked to its root
+  // with no restriction on it may fall back to the space role.
+  let restricted = f.pagePerms.locked;
+  if (!f.pagePerms.view && !f.pagePerms.locked) {
+    if (f.lineageRestricted == null) return 'unknown';
+    restricted = f.lineageRestricted;
+  }
+
   let readOnly: boolean;
-  if (f.pagePerms.locked) {
+  if (restricted) {
     // Restricted page (or restricted ancestor): the PDP's page decision rules.
     if (!f.pagePerms.view) return 'deny';
     readOnly = !f.pagePerms.edit;

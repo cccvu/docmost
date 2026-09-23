@@ -5,23 +5,7 @@ import { KyselyDB } from '@docmost/db/types/kysely.types';
 import { generateJitteredKeyBetween } from 'fractional-indexing-jittered';
 import { WorkspaceResolver } from './workspace-resolver';
 import { PageLifecycleStateDto, TrashListDto } from './dto/page-lifecycle.dto';
-
-/**
- * Bound on every tree walk. Real page trees are a handful of levels deep; a walk that reaches this bound — or
- * meets a cycle, or a parent it cannot read — is reported as INCOMPLETE, and the platform treats an incomplete
- * lineage as restricted (fail closed). Nothing here ever reports "unrestricted" for a lineage it did not finish.
- */
-export const LIFECYCLE_MAX_DEPTH = 256;
-
-/** A page's restriction lineage: the restricted ids on the walk, and whether the walk reached a root. */
-export interface Lineage {
-  /** Every page id on the walk, nearest first (the start page first when it was included). */
-  chain: string[];
-  /** The ids on the walk that carry a restriction (a `page_access` row). */
-  restrictedIds: string[];
-  /** False when the walk stopped early: depth bound, a cycle, or an unreadable parent. */
-  complete: boolean;
-}
+import { LIFECYCLE_MAX_DEPTH, Lineage, readPageLineage } from './page-lineage';
 
 export interface DescendantFacts {
   restricted: boolean;
@@ -199,34 +183,9 @@ export class ServicePageLifecycleService {
     return !!res.rows[0]?.r;
   }
 
-  /**
-   * Walk UP from `startId` (trashed pages included — a trashed ancestor's restriction still governs), cycle-safe
-   * and bounded. `includeSelf` decides whether the start page counts toward `restrictedIds`. The walk is complete
-   * only when it ends at a page with no parent; a cycle, the depth bound, or an unreadable parent end it early.
-   */
+  /** The shared restriction-lineage walk (`page-lineage.ts`), pinned to the workspace these facts are served for. */
   async lineage(ws: string, startId: string, includeSelf: boolean): Promise<Lineage> {
-    const res = await sql<{ id: string; parentPageId: string | null; depth: number; restricted: boolean }>`
-      with recursive anc(id, parent_page_id, depth, path) as (
-        select p.id, p.parent_page_id, 0, array[p.id]
-        from pages p where p.id = ${startId} and p.workspace_id = ${ws}
-        union all
-        select q.id, q.parent_page_id, a.depth + 1, a.path || q.id
-        from anc a
-        join pages q on q.id = a.parent_page_id and q.workspace_id = ${ws}
-        where a.depth < ${LIFECYCLE_MAX_DEPTH} and not (q.id = any(a.path))
-      )
-      select a.id, a.parent_page_id, a.depth,
-             exists (select 1 from page_access pa where pa.page_id = a.id) as restricted
-      from anc a
-      order by a.depth
-    `.execute(this.db);
-    const rows = res.rows;
-    const last = rows[rows.length - 1];
-    return {
-      chain: rows.map((r) => r.id),
-      restrictedIds: rows.filter((r) => r.restricted && (includeSelf || Number(r.depth) > 0)).map((r) => r.id),
-      complete: !!last && last.parentPageId === null,
-    };
+    return readPageLineage(this.db, startId, { includeSelf, workspaceId: ws });
   }
 
   /** Walk DOWN from `rootId` over every child (trashed included), cycle-safe and bounded. */

@@ -93,6 +93,11 @@ describe('Indirect-leakage vectors — §8 coverage matrix (every vector maps to
     { vector: 'sidebar tree (with canEdit)',          repo: 'page',  primitive: 'filterAccessiblePageIdsWithPermissions' },
     { vector: 'page history / revisions',             repo: 'page',  primitive: 'canUserAccessPage' },
     { vector: 'attachments (download / RAG / export)', repo: 'page', primitive: 'canUserAccessPage' },
+    // #524: everything that asks "restricted, and can this user view/edit it?" — then falls back to the space role
+    // when the answer is "unrestricted". A trashed or unprojected page in a restricted section must not read as that.
+    { vector: 'page read/edit (info by id or slug, update, restore, move, move-to-space)', repo: 'page', primitive: 'canUserEditPage' },
+    { vector: 'collab websocket connect',              repo: 'page',  primitive: 'canUserEditPage' },
+    { vector: 'comment edit/delete, attachment upload, share create', repo: 'page', primitive: 'canUserEditPage' },
     { vector: 'mention/comment/update notifications', repo: 'page',  primitive: 'getUserIdsWithPageAccess' },
     { vector: 'favorites (space)',                     repo: 'space', primitive: 'getUserSpaceIds' },
     { vector: 'digest/verification notifications',     repo: 'space', primitive: 'getUserIdsWithSpaceAccess' },
@@ -105,9 +110,10 @@ describe('Indirect-leakage vectors — §8 coverage matrix (every vector maps to
 
   it('documents the full mapping (no silent gaps)', () => {
     const distinct = new Set(COVERAGE.map((c) => `${c.repo}.${c.primitive}`));
-    // The whole indirect backbone reduces to these seven PDP-overridden primitives.
+    // The whole indirect backbone reduces to these eight PDP-overridden primitives.
     expect([...distinct].sort()).toEqual([
       'page.canUserAccessPage',
+      'page.canUserEditPage',
       'page.filterAccessiblePageIds',
       'page.filterAccessiblePageIdsWithPermissions',
       'page.getUserIdsWithPageAccess',
