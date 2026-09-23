@@ -2,9 +2,9 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Docmost Service Bridge (east-west)",
-    "version": "1.6.0",
+    "version": "1.7.0",
     "summary": "The east-west endpoints this Docmost fork EXPOSES to an integrating platform.",
-    "description": "These are the machine-to-machine endpoints the fork hosts for an integrating platform (the inverse direction of authorization-service.openapi.json, which the fork calls). They exist so an external identity/session broker can provision a fork-local shadow user and mint a Docmost session for it, re-check (and narrow) live realtime connections after a revocation, and (Phase C) administer workspace settings + spaces and read the content model WITHOUT the platform reaching into Docmost's database directly. They are NOT part of the public north-south API and are not browser-facing.\n\nMode: the whole surface is 404 unless the fork runs with AUTHZ_MODE=remote (RemoteOnlyGuard, checked BEFORE the secret). In AUTHZ_MODE=native there is no integrating platform and every route below returns 404 for all callers.\n\nAuth: every request carries a shared service secret in the x-authz-service-secret header (PLATFORM_AUTHZ_SERVICE_SECRET). Each /api/service/* route additionally requires exactly one least-privilege scope: session:mint, users:provision, users:resolve, workspace:read, workspace:settings:write, spaces:read, spaces:write, pages:read, content:read, content:search, attachments:read, changes:read. Today a single full-scope secret is issued; per-scope credentials can be added later with no contract change.\n\nSecurity properties an integrator must understand:\n  - Identity-mutating endpoints are keyed ONLY on the caller's opaque externalId. The fork derives the shadow email (externalId@shadow.wiki-v2.internal) and resolves its own default workspace, so a caller can never select an arbitrary Docmost identity, name a real/privileged/native account, or supply a workspace id. This is a strong narrowing, not impersonation.\n  - The platform is the authorization authority: it performs the PDP decision (space/workspace administer, or the filter-then-retrieve authorized-id set) BEFORE calling these endpoints. The content read endpoints are a PRIVILEGED DATA PLANE, not a second gate: they return metadata for exactly the supplied ids and do NOT re-authorize. The security of the caller's /v1 surface rests entirely on it passing an authorized id set.\n  - Fail-closed: not remote -> 404; unconfigured secret -> 503; missing/wrong secret -> 401; wrong scope -> 403; over the per-credential rate limit -> 429; invalid body -> 400.\n\nResponse shape (incident #181): every 2xx body is EXACTLY the schema declared for its operation. The fork's global { data, success, status } response envelope (upstream TransformHttpResponseInterceptor) is skipped on this whole surface via per-handler @SkipTransform(); an integrator that receives an envelope is talking to a mis-built fork. Bring-up precondition: until Docmost first-run setup (POST /api/auth/setup) has created a workspace row, EVERY operation answers HTTP 404 with message exactly \"Workspace not found\" (an upstream pre-handler that runs before the service-bridge guards). That status + message pair is the ONLY response a consumer may treat as \"no workspace provisioned yet\"; any other 404 (e.g. the bare \"Not Found\" the fork answers when not in AUTHZ_MODE=remote) is a configuration error, and any 2xx body that does not match its declared schema is a contract violation the consumer must fail closed on.\n\nAccess-narrowing propagation (1.6.0, #501): a successful response from a route that can take access away (archiveSpace, addSpaceMember — an upsert can demote —, changeSpaceMemberRole, removeSpaceMember; and the native narrowing routes the integrator relays) carries `Authz-Propagation: confirmed | pending`. `confirmed` = the fork asked the integrator's OPTIONAL `POST /sync/settle` (authorization-service.openapi.json) and it answered that every access change committed up to this response is enforced; `pending` = the change is committed but could not be shown enforced within the bound (an integrator without /sync/settle always gets `pending`). The header never changes the status or the body, and it is absent in AUTHZ_MODE=native or when AUTHZ_NARROWING_SETTLE_TIMEOUT_MS=0. A consumer must treat an ABSENT header as unknown, never as confirmed.",
+    "description": "These are the machine-to-machine endpoints the fork hosts for an integrating platform (the inverse direction of authorization-service.openapi.json, which the fork calls). They exist so an external identity/session broker can provision a fork-local shadow user and mint a Docmost session for it, re-check (and narrow) live realtime connections after a revocation, and (Phase C) administer workspace settings + spaces and read the content model WITHOUT the platform reaching into Docmost's database directly. They are NOT part of the public north-south API and are not browser-facing.\n\nMode: the whole surface is 404 unless the fork runs with AUTHZ_MODE=remote (RemoteOnlyGuard, checked BEFORE the secret). In AUTHZ_MODE=native there is no integrating platform and every route below returns 404 for all callers.\n\nAuth: every request carries a shared service secret in the x-authz-service-secret header (PLATFORM_AUTHZ_SERVICE_SECRET). Each /api/service/* route additionally requires exactly one least-privilege scope: session:mint, users:provision, users:resolve, workspace:read, workspace:settings:write, spaces:read, spaces:write, pages:read, pages:authz:read, content:read, content:search, attachments:read, changes:read. Today a single full-scope secret is issued; per-scope credentials can be added later with no contract change.\n\nSecurity properties an integrator must understand:\n  - Identity-mutating endpoints are keyed ONLY on the caller's opaque externalId. The fork derives the shadow email (externalId@shadow.wiki-v2.internal) and resolves its own default workspace, so a caller can never select an arbitrary Docmost identity, name a real/privileged/native account, or supply a workspace id. This is a strong narrowing, not impersonation.\n  - The platform is the authorization authority: it performs the PDP decision (space/workspace administer, or the filter-then-retrieve authorized-id set) BEFORE calling these endpoints. The content read endpoints are a PRIVILEGED DATA PLANE, not a second gate: they return metadata for exactly the supplied ids and do NOT re-authorize. The security of the caller's /v1 surface rests entirely on it passing an authorized id set.\n  - Fail-closed: not remote -> 404; unconfigured secret -> 503; missing/wrong secret -> 401; wrong scope -> 403; over the per-credential rate limit -> 429; invalid body -> 400.\n\nResponse shape (incident #181): every 2xx body is EXACTLY the schema declared for its operation. The fork's global { data, success, status } response envelope (upstream TransformHttpResponseInterceptor) is skipped on this whole surface via per-handler @SkipTransform(); an integrator that receives an envelope is talking to a mis-built fork. Bring-up precondition: until Docmost first-run setup (POST /api/auth/setup) has created a workspace row, EVERY operation answers HTTP 404 with message exactly \"Workspace not found\" (an upstream pre-handler that runs before the service-bridge guards). That status + message pair is the ONLY response a consumer may treat as \"no workspace provisioned yet\"; any other 404 (e.g. the bare \"Not Found\" the fork answers when not in AUTHZ_MODE=remote) is a configuration error, and any 2xx body that does not match its declared schema is a contract violation the consumer must fail closed on.\n\nAccess-narrowing propagation (1.6.0, #501): a successful response from a route that can take access away (archiveSpace, addSpaceMember — an upsert can demote —, changeSpaceMemberRole, removeSpaceMember; and the native narrowing routes the integrator relays) carries `Authz-Propagation: confirmed | pending`. `confirmed` = the fork asked the integrator's OPTIONAL `POST /sync/settle` (authorization-service.openapi.json) and it answered that every access change committed up to this response is enforced; `pending` = the change is committed but could not be shown enforced within the bound (an integrator without /sync/settle always gets `pending`). The header never changes the status or the body, and it is absent in AUTHZ_MODE=native or when AUTHZ_NARROWING_SETTLE_TIMEOUT_MS=0. A consumer must treat an ABSENT header as unknown, never as confirmed.\n\nPage structure (1.7.0, wiki-v2 #493/#545): `POST /api/service/authz/pages/state` serves the CURRENT authorization structure of pages (placement, restriction, restriction lineage), so an integrator can project it level-triggered instead of trusting event payloads. And in AUTHZ_MODE=remote the fork installs database guards that refuse to take a restriction away by anything but an explicit unrestrict or a purge: a native move-to-space of a restricted page or of a page in a restricted section, and a re-parent or restore-detach that takes an unrestricted page out from under its last restricted ancestor. The native routes the integrator relays answer those refusals (and a move cycle) with `409 { message, code }`, `code` one of `ccc_page_no_cycle`, `ccc_page_restricted_space_move`, `ccc_page_restriction_strip`; the whole write is rolled back.",
     "license": { "name": "AGPL-3.0-only", "identifier": "AGPL-3.0-only" },
     "x-canonical": true
   },
@@ -670,6 +670,26 @@
         }
       }
     },
+    "/api/service/authz/pages/state": {
+      "post": {
+        "operationId": "getPageAuthzState",
+        "tags": ["changes"],
+        "summary": "The CURRENT authorization structure of pages (1.7.0, wiki-v2 #545): placement, restriction and restriction lineage.",
+        "description": "Facts only; the platform decides and writes. Exactly one mode: `pageIds` (every id answered, a missing one with `exists: false`), `subtreeRootId` + `limit` (+ `after`: the root's descendants, NOT the root, keyset on id) or `limit` (+ `after`: every page, trashed included, keyset on id). A mix, or neither `pageIds` nor `limit`, is a 400. Each response is ONE SQL statement, so every row describes one committed tree (a row's `parentPageId` and `lineageRestricted` never come from two different states). Walks follow `parent_page_id` through trashed and cross-space rows, stay inside the start page's workspace, are cycle-safe and bounded at 1024 steps (the cycle guard's bound), and never report an unfinished walk as unrestricted. Not workspace-scoped (like the snapshot). Scope: pages:authz:read (its own, larger rate window).",
+        "requestBody": { "required": true, "content": { "application/json": {
+          "schema": { "$ref": "#/components/schemas/PageAuthzStateRequest" },
+          "example": { "pageIds": ["33333333-3333-3333-3333-333333333333"] }
+        } } },
+        "responses": {
+          "200": { "description": "The pages' state, ordered by id.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PageAuthzStateResponse" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
     "/api/collab/revalidate": {
       "post": {
         "operationId": "revalidateLiveAccess",
@@ -1166,6 +1186,39 @@
           "events": { "type": "array", "items": { "$ref": "#/components/schemas/AuthzChangeEvent" } },
           "nextCursor": { "type": ["string", "null"], "description": "Opaque cursor for the next page, or null when the whole desired set has been streamed." },
           "baseline": { "type": ["string", "null"], "description": "ONLY on the first page (no incoming cursor): the change-feed cursor \"<pg_snapshot_xmin>.0\" captured at snapshot start; the platform persists this as its change cursor after a successful reconcile so an in-flight-at-baseline transaction is replayed by the live drain, not skipped. Null on later pages." }
+        }
+      },
+      "PageAuthzStateRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "Exactly one mode: `pageIds`; `subtreeRootId` + `limit` (+ `after`); or `limit` (+ `after`).",
+        "properties": {
+          "pageIds": { "type": "array", "minItems": 1, "maxItems": 500, "items": { "type": "string", "format": "uuid" } },
+          "subtreeRootId": { "type": "string", "format": "uuid" },
+          "after": { "type": "string", "format": "uuid", "description": "The previous response's `nextAfter`; omit for the first page." },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 500 }
+        }
+      },
+      "PageAuthzState": {
+        "type": "object",
+        "required": ["pageId", "exists", "spaceId", "parentPageId", "restricted", "lineageRestricted", "lineageComplete"],
+        "properties": {
+          "pageId": { "type": "string", "format": "uuid" },
+          "exists": { "type": "boolean", "description": "False when no row has this id (never created, or purged): the integrator removes everything it projected for the page. The other fields are then null / false / true / false." },
+          "spaceId": { "type": ["string", "null"], "format": "uuid" },
+          "parentPageId": { "type": ["string", "null"], "format": "uuid" },
+          "restricted": { "type": "boolean", "description": "The page itself carries a restriction." },
+          "lineageRestricted": { "type": "boolean", "description": "The page OR any ancestor (trashed ones included) is restricted, or the walk did not finish (cycle, unreadable or foreign-workspace parent, depth bound). An integrator projects it so a page's lock never depends on its ancestors' edges having been projected." },
+          "lineageComplete": { "type": "boolean", "description": "The walk reached a root. When false, `parentPageId` leads into a cycle or an unreadable row and should not be projected as an edge." }
+        }
+      },
+      "PageAuthzStateResponse": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pages", "nextAfter"],
+        "properties": {
+          "pages": { "type": "array", "items": { "$ref": "#/components/schemas/PageAuthzState" } },
+          "nextAfter": { "type": ["string", "null"], "format": "uuid", "description": "Pass as `after` for the next page of a subtree or keyset read; null when done (always null for `pageIds`)." }
         }
       },
       "SelfGrantError": {

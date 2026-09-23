@@ -14,6 +14,7 @@ import { ServiceContentService } from './service-content.service';
 import { ServiceSearchService } from './service-search.service';
 import { AuthzChangeFeedService } from './authz-change-feed.service';
 import { AuthzSnapshotService } from './authz-snapshot.service';
+import { PageAuthzStateService } from './page-authz-state.service';
 import { ServiceSpaceController } from './service-space.controller';
 import { ServiceSpaceService } from './service-space.service';
 import { spyKysely, SpyQuery } from './kysely-spy.testkit';
@@ -53,6 +54,7 @@ describe('service-bridge wire shape through the real response pipeline', () => {
         { provide: ServiceSearchService, useValue: { searchContent: async () => ({ items: [] }) } },
         { provide: AuthzChangeFeedService, useValue: {} },
         { provide: AuthzSnapshotService, useValue: { getSnapshot: async () => ({ events: [], nextCursor: null, baseline: '7.0' }) } },
+        { provide: PageAuthzStateService, useValue: { read: async () => ({ pages: [], nextAfter: null }) } },
       ],
     })
       .overrideGuard(RemoteOnlyGuard)
@@ -86,6 +88,12 @@ describe('service-bridge wire shape through the real response pipeline', () => {
     const res = await app.inject({ method: 'GET', url: '/api/service/authz/snapshot?limit=1' });
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ events: [], nextCursor: null, baseline: '7.0' });
+  });
+
+  it('POST /api/service/authz/pages/state answers the bare PageAuthzStateResponse with a 200 (#545)', async () => {
+    const res = await app.inject({ method: 'POST', url: '/api/service/authz/pages/state', payload: { pageIds: [PAGE] } });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ pages: [], nextAfter: null });
   });
 
   it('POST /api/service/content/spaces/list answers the bare { items } list', async () => {

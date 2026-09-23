@@ -52,15 +52,19 @@ export class ServiceAttachmentService {
   /**
    * Resolve an attachment to its owning page + space (workspace-scoped, active only). `pageId`/`spaceId` are
    * null for non-page attachments (avatars, workspace/space icons, chat uploads), so the platform denies them
-   * (no page to authorize view against). Unknown / cross-workspace / deleted → 404.
+   * (no page to authorize view against). Unknown / cross-workspace / deleted → 404, and so is an attachment whose
+   * page is TRASHED or gone (#493): a trashed page keeps its PDP decision (trash is lifecycle only), so page#view
+   * alone would still serve its files — `/v1` does not read trashed content.
    */
   async resolvePage(
     attachmentId: string,
   ): Promise<{ attachmentId: string; pageId: string | null; spaceId: string | null }> {
     const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
     const res = await sql<{ pageId: string | null; spaceId: string | null }>`
-      select page_id, space_id from attachments
-      where id = ${attachmentId} and workspace_id = ${workspaceId} and deleted_at is null
+      select a.page_id, a.space_id from attachments a
+      left join pages p on p.id = a.page_id
+      where a.id = ${attachmentId} and a.workspace_id = ${workspaceId} and a.deleted_at is null
+        and (a.page_id is null or (p.id is not null and p.deleted_at is null))
     `.execute(this.db);
     const row = res.rows[0];
     if (!row) throw new NotFoundException('attachment not found');

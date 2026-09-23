@@ -8,6 +8,7 @@ import { ProvisionUserDto } from './provision-user.dto';
 import { SessionExternalIdDto } from './session-external-id.dto';
 import { LookupUsersDto } from './lookup-users.dto';
 import { UpdateSpaceMemberDto } from './space-admin.dto';
+import { PageAuthzStateDto } from './page-authz-state.dto';
 
 /**
  * These DTOs' class-validator decorators are the load-bearing input guard for the new service-bridge ops (the
@@ -22,6 +23,25 @@ const errCount = async <T extends object>(cls: new () => T, obj: unknown): Promi
 const UUID = '00000000-0000-4000-8000-000000000001';
 
 describe('service-bridge DTO validation (constraints are load-bearing)', () => {
+  // #545: the page-state read. Mode exclusivity is the service's (a 400 there); these are the field constraints.
+  describe('PageAuthzStateDto', () => {
+    it('accepts 1..500 uuids, and a limit of 1..500 with an optional subtree root and keyset position', async () => {
+      expect(await errCount(PageAuthzStateDto, { pageIds: [UUID] })).toBe(0);
+      expect(await errCount(PageAuthzStateDto, { pageIds: Array.from({ length: 500 }, () => UUID) })).toBe(0);
+      expect(await errCount(PageAuthzStateDto, { limit: 500, subtreeRootId: UUID, after: UUID })).toBe(0);
+      expect(await errCount(PageAuthzStateDto, { limit: 1 })).toBe(0);
+    });
+    it('rejects an empty or over-500 id list, a non-uuid id / root / after, and an out-of-range limit', async () => {
+      expect(await errCount(PageAuthzStateDto, { pageIds: [] })).toBeGreaterThan(0);
+      expect(await errCount(PageAuthzStateDto, { pageIds: Array.from({ length: 501 }, () => UUID) })).toBeGreaterThan(0);
+      expect(await errCount(PageAuthzStateDto, { pageIds: ['nope'] })).toBeGreaterThan(0);
+      expect(await errCount(PageAuthzStateDto, { limit: 5, subtreeRootId: 'nope' })).toBeGreaterThan(0);
+      expect(await errCount(PageAuthzStateDto, { limit: 5, after: 'nope' })).toBeGreaterThan(0);
+      expect(await errCount(PageAuthzStateDto, { limit: 0 })).toBeGreaterThan(0);
+      expect(await errCount(PageAuthzStateDto, { limit: 501 })).toBeGreaterThan(0);
+    });
+  });
+
   describe('ContentSearchDto', () => {
     it('accepts a valid search request', async () => {
       expect(await errCount(ContentSearchDto, { userId: UUID, query: 'hello', limit: 25, offset: 0 })).toBe(0);

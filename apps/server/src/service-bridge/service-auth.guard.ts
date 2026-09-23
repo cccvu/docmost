@@ -26,10 +26,14 @@ interface ServiceCredential {
   scopes: ReadonlySet<ServiceScope>;
 }
 
-const RATE_LIMIT = (() => {
-  const n = Number.parseInt(process.env.SERVICE_BRIDGE_RATE_LIMIT ?? '', 10);
-  return Number.isFinite(n) && n > 0 ? n : 600;
-})();
+const envLimit = (name: string, def: number): number => {
+  const n = Number.parseInt(process.env[name] ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : def;
+};
+const RATE_LIMIT = envLimit('SERVICE_BRIDGE_RATE_LIMIT', 600);
+// #545: the platform's page projector reads `pages:authz:read` once per page event (plus fan-out and reconcile
+// chunks), so a bulk move or import would throttle projection at the shared 600/min. Its own, larger window.
+const PAGES_AUTHZ_RATE_LIMIT = envLimit('SERVICE_BRIDGE_PAGES_AUTHZ_RATE_LIMIT', 6000);
 
 /**
  * CCC service-bridge — NOT upstream Docmost code.
@@ -49,6 +53,7 @@ const RATE_LIMIT = (() => {
 export class ServiceAuthGuard implements CanActivate {
   private readonly credentials: ServiceCredential[];
   private readonly limiter = new FixedWindowRateLimiter(RATE_LIMIT, 60_000);
+  private readonly pagesAuthzLimiter = new FixedWindowRateLimiter(PAGES_AUTHZ_RATE_LIMIT, 60_000);
 
   constructor(private readonly reflector: Reflector) {
     const raw = process.env.PLATFORM_AUTHZ_SERVICE_SECRET ?? '';
@@ -94,7 +99,8 @@ export class ServiceAuthGuard implements CanActivate {
       throw new ForbiddenException(`service credential lacks scope ${required}`);
     }
 
-    if (!this.limiter.allow(`${cred.id}:${required}`)) {
+    const limiter = required === ServiceScope.PagesAuthzRead ? this.pagesAuthzLimiter : this.limiter;
+    if (!limiter.allow(`${cred.id}:${required}`)) {
       throw new HttpException(
         'service rate limit exceeded',
         HttpStatus.TOO_MANY_REQUESTS,

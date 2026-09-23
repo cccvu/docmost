@@ -23,6 +23,9 @@ describe('ServiceAttachmentService — page-scoped attachment reads (privileged 
     expect(sql).toContain('from attachments');
     expect(sql).toContain('workspace_id =');
     expect(sql).toContain('deleted_at is null');
+    // #493: the owning page must be live (a trashed page keeps page#view, so the join is the gate).
+    expect(sql).toContain('left join pages p on p.id = a.page_id');
+    expect(sql).toContain('p.deleted_at is null');
   });
 
   it('resolvePage returns null page/space for a non-page attachment (avatar / icon / chat)', async () => {

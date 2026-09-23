@@ -3,6 +3,7 @@ import { PdpSpaceMemberRepo } from '../pdp-space-member.repo';
 import { ForbiddenException } from '@nestjs/common';
 import { PageAccessService } from '../../core/page/page-access/page-access.service';
 import { spyKysely } from '../../service-bridge/kysely-spy.testkit';
+import { LIFECYCLE_MAX_DEPTH } from '../../service-bridge/page-lineage';
 
 /**
  * CCC authorization integration test (fork compatibility suite) — the leakage backbone.
@@ -278,7 +279,7 @@ describe('PDP repo primitives — deny propagation (leakage backbone)', () => {
       expect(spy.calls[0].sql).toContain('with recursive');
       expect(spy.calls[0].sql).toContain('not (q.id = any(a.path))');
       expect(spy.calls[0].sql).toContain('q.workspace_id = a.workspace_id');
-      expect(spy.calls[0].parameters).toEqual(['c', 256]);
+      expect(spy.calls[0].parameters).toEqual(['c', LIFECYCLE_MAX_DEPTH]);
     });
 
     it('control: the pre-fix pass-through WOULD have let a space writer in (the test is not vacuous)', async () => {
