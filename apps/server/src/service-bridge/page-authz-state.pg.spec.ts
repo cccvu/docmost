@@ -227,6 +227,11 @@ d('PageAuthzStateService on real Postgres', () => {
     await expect(svc.read({ pageIds: [uuid(1)], subtreeRootId: uuid(2) })).rejects.toBeInstanceOf(BadRequestException);
     await expect(svc.read({ subtreeRootId: uuid(2) })).rejects.toBeInstanceOf(BadRequestException);
     await expect(svc.read({})).rejects.toBeInstanceOf(BadRequestException);
+    // An explicit null (which @IsOptional lets through) is refused, never read as "absent" — that would widen a
+    // subtree read to every page, or drop the limit.
+    for (const body of [{ limit: null }, { subtreeRootId: null, limit: 5 }, { after: null, limit: 5 }, { pageIds: null, limit: 5 }]) {
+      await expect(svc.read(body as never)).rejects.toBeInstanceOf(BadRequestException);
+    }
   });
 
   it('never tears: under concurrent re-parenting every row’s parent and marker describe the SAME committed tree', async () => {

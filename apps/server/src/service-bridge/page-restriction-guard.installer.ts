@@ -40,14 +40,18 @@ language sql volatile as $fn$
 $fn$`;
 
 /**
- * g1 + g2 on `pages`. Only a REAL change of space or parent does anything; it then takes the per-workspace lock the
+ * g1 + g2 on `pages`, one function behind two triggers (`TG_ARGV[0]` says which). It takes the per-workspace lock the
  * cycle guard and g0 take (unconditionally — a lock skipped on an unlocked read would reopen the race), and only then
  * reads, so every check sees whatever a concurrent restrict or move committed first.
- *  - g1: a space change is refused for a page with its own restriction or under a restricted page (walked from its
- *    OLD parent; an unfinished walk counts as restricted). The engine's move-to-space deletes the moved pages'
- *    `page_access` rows and re-roots the page (#493 G2), so either would take a restriction away in the database.
- *  - g2: a parent change is refused when it takes a page with no restriction of its own out from under its last
- *    restricted ancestor (an unfinished walk counts as restricted before the move and as unrestricted after it).
+ *  - g1 (`'space'`, on EVERY row an UPDATE sets `space_id` on, changed or not): refused for a page with its own
+ *    restriction or under a restricted page (walked from its OLD parent; an unfinished walk counts as restricted).
+ *    Only the engine's move-to-space sets `space_id`, and it then deletes every moved page's `page_access` rows and
+ *    re-roots the page (#493 G2) — including a page whose `space_id` already equals the target (a descendant left
+ *    in that space by an earlier move that skipped it while trashed, then restored and restricted). So "the value
+ *    did not change" is no reason to skip the check.
+ *  - g2 (`'parent'`, only on a REAL parent change): refused when it takes a page with no restriction of its own out
+ *    from under its last restricted ancestor (an unfinished walk counts as restricted before the move and as
+ *    unrestricted after it).
  */
 const GUARD_FN = `
 create or replace function ccc_page_restriction_guard() returns trigger language plpgsql as $fn$
@@ -57,8 +61,10 @@ declare
   before_complete boolean := true;
   after_restricted boolean := false;
 begin
-  if new.space_id is not distinct from old.space_id
-     and new.parent_page_id is not distinct from old.parent_page_id then
+  -- g2 skips a space change: that row also fires the space trigger, and g1 refuses whatever g2 would (g1 passing
+  -- means no restriction on or above the page, so there is nothing to strip). One owner per row, one refusal code.
+  if tg_argv[0] = 'parent' and (new.parent_page_id is not distinct from old.parent_page_id
+                                or new.space_id is distinct from old.space_id) then
     return new;
   end if;
   perform pg_advisory_xact_lock(${CYCLE_LOCK_CLASS}, hashtext(new.workspace_id::text));
@@ -67,13 +73,14 @@ begin
     select f.found_restricted, f.complete into before_restricted, before_complete
       from ccc_page_lineage_facts(old.parent_page_id, new.workspace_id) f;
   end if;
-  if new.space_id is distinct from old.space_id
-     and (own or before_restricted or not before_complete) then
-    raise exception 'page % is restricted or in a restricted section and cannot move to another space', new.id
-      using errcode = 'check_violation', constraint = '${RESTRICTED_SPACE_MOVE}';
+  if tg_argv[0] = 'space' then
+    if own or before_restricted or not before_complete then
+      raise exception 'page % is restricted or in a restricted section and cannot move to another space', new.id
+        using errcode = 'check_violation', constraint = '${RESTRICTED_SPACE_MOVE}';
+    end if;
+    return new;
   end if;
-  if new.parent_page_id is distinct from old.parent_page_id
-     and not own and (before_restricted or not before_complete) then
+  if not own and (before_restricted or not before_complete) then
     if new.parent_page_id is not null then
       select f.found_restricted into after_restricted
         from ccc_page_lineage_facts(new.parent_page_id, new.workspace_id) f;
@@ -115,8 +122,13 @@ $fn$`;
 
 const GUARD_TRIGGER = `
 create trigger ccc_page_restriction_guard
-before update of space_id, parent_page_id on pages
-for each row execute function ccc_page_restriction_guard()`;
+before update of parent_page_id on pages
+for each row execute function ccc_page_restriction_guard('parent')`;
+
+const SPACE_TRIGGER = `
+create trigger ccc_page_space_guard
+before update of space_id on pages
+for each row execute function ccc_page_restriction_guard('space')`;
 
 const ACCESS_TRIGGER = `
 create trigger ccc_page_access_guard
@@ -125,7 +137,7 @@ for each row execute function ccc_page_access_guard()`;
 
 /** Changes whenever any DDL above does; stamped on the functions so an unchanged boot runs no DDL at all. */
 export const PAGE_RESTRICTION_GUARD_VERSION = `ccc:${createHash('sha256')
-  .update([LINEAGE_FN, GUARD_FN, ACCESS_FN, GUARD_TRIGGER, ACCESS_TRIGGER].join('\n'))
+  .update([LINEAGE_FN, GUARD_FN, ACCESS_FN, GUARD_TRIGGER, SPACE_TRIGGER, ACCESS_TRIGGER].join('\n'))
   .digest('hex')
   .slice(0, 16)}`;
 
@@ -142,9 +154,9 @@ export const PAGE_RESTRICTION_GUARD_VERSION = `ccc:${createHash('sha256')
  *
  * Same shape as `PageCycleGuardInstaller` — a boot installer in the excluded `service-bridge/` prefix (zero upstream
  * edits), remote-mode only, advisory-locked, FAIL-CLOSED (a remote boot that cannot establish the guard throws) —
- * and gentler on a live table: an unchanged guard (its version stamp matches and both triggers are enabled) runs no
- * DDL, and a changed one waits at most `lock_timeout` for the table lock before retrying, so a boot never queues
- * page traffic behind a long transaction.
+ * and gentler on a live table: an unchanged guard (its version stamp matches and all three triggers are enabled) runs no
+ * DDL, and a changed one waits at most `lock_timeout` (3s) for each table lock before retrying, so page traffic
+ * queues behind the install for at most that long per attempt, never behind a long transaction.
  */
 @Injectable()
 export class PageRestrictionGuardInstaller implements OnApplicationBootstrap {
@@ -182,7 +194,7 @@ export class PageRestrictionGuardInstaller implements OnApplicationBootstrap {
     }
   }
 
-  /** True when the installed guard is this version and both triggers are enabled. */
+  /** True when the installed guard is this version and all three triggers are enabled. */
   async isCurrent(): Promise<boolean> {
     const res = await sql<{ current: boolean }>`
       select coalesce(
@@ -192,6 +204,11 @@ export class PageRestrictionGuardInstaller implements OnApplicationBootstrap {
         and exists (
           select 1 from pg_trigger
           where tgname = 'ccc_page_restriction_guard' and tgrelid = to_regclass('pages')
+            and tgfoid = to_regprocedure('ccc_page_restriction_guard()') and tgenabled = 'O'
+        )
+        and exists (
+          select 1 from pg_trigger
+          where tgname = 'ccc_page_space_guard' and tgrelid = to_regclass('pages')
             and tgfoid = to_regprocedure('ccc_page_restriction_guard()') and tgenabled = 'O'
         )
         and exists (
@@ -211,10 +228,14 @@ export class PageRestrictionGuardInstaller implements OnApplicationBootstrap {
       await sql`select pg_advisory_xact_lock(${INSTALL_LOCK_KEY})`.execute(trx);
       await sql`set local lock_timeout = '3s'`.execute(trx);
       for (const ddl of [LINEAGE_FN, GUARD_FN, ACCESS_FN]) await sql.raw(ddl).execute(trx);
-      await sql`drop trigger if exists ccc_page_restriction_guard on pages`.execute(trx);
-      await sql.raw(GUARD_TRIGGER).execute(trx);
+      // page_access BEFORE pages: the same table-lock order as AuthzOutboxInstaller, whose boot DDL runs
+      // concurrently with this one — the opposite order can deadlock the two on a first boot.
       await sql`drop trigger if exists ccc_page_access_guard on page_access`.execute(trx);
       await sql.raw(ACCESS_TRIGGER).execute(trx);
+      await sql`drop trigger if exists ccc_page_restriction_guard on pages`.execute(trx);
+      await sql.raw(GUARD_TRIGGER).execute(trx);
+      await sql`drop trigger if exists ccc_page_space_guard on pages`.execute(trx);
+      await sql.raw(SPACE_TRIGGER).execute(trx);
       for (const fn of ['ccc_page_lineage_facts(uuid, uuid)', 'ccc_page_restriction_guard()', 'ccc_page_access_guard()']) {
         await sql.raw(`comment on function ${fn} is '${PAGE_RESTRICTION_GUARD_VERSION}'`).execute(trx);
       }

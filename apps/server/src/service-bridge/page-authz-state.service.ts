@@ -39,6 +39,11 @@ type Mode =
 
 /** Exactly one mode per request; any mix is a 400 rather than a guess. */
 export function parsePageAuthzStateMode(dto: PageAuthzStateDto): Mode {
+  // The DTO's @IsOptional() lets an explicit null through unvalidated; null is neither "absent" nor a value here — as
+  // "absent" it would silently widen `subtreeRootId: null` to a full scan (and `limit: null` to no limit at all).
+  for (const k of ['pageIds', 'subtreeRootId', 'after', 'limit'] as const) {
+    if (dto[k] === null) throw new BadRequestException(`${k} must not be null`);
+  }
   if (dto.pageIds !== undefined) {
     if (dto.subtreeRootId !== undefined || dto.after !== undefined || dto.limit !== undefined) {
       throw new BadRequestException('pageIds cannot be combined with subtreeRootId, after or limit');

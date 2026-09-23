@@ -26,7 +26,7 @@ export function toPageGuardConflict(err: unknown): ConflictException | null {
 /**
  * CCC service-bridge — NOT upstream Docmost code (#493, #545).
  *
- * The page guards (`ccc_page_cycle_guard`, `ccc_page_restriction_guard`) refuse inside the database, so the engine's
+ * The page guards (`ccc_page_cycle_guard`, `ccc_page_space_guard`, `ccc_page_restriction_guard`) refuse inside the database, so the engine's
  * own move/restore paths surface a raw driver error — a 500 today. This maps exactly those refusals to
  * `409 { message, code }` (the `code` is the constraint, which the platform forwards as its own problem code) and
  * passes every other error through untouched.

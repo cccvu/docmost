@@ -4,7 +4,7 @@ import { ConflictException } from '@nestjs/common';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 import { PageService } from '../core/page/services/page.service';
-import { PageCycleGuardInstaller } from './page-cycle-guard.installer';
+import { CYCLE_LOCK_CLASS, PageCycleGuardInstaller } from './page-cycle-guard.installer';
 import { AuthzOutboxInstaller } from './authz-outbox.installer';
 import {
   PageRestrictionGuardInstaller,
@@ -218,6 +218,24 @@ d('PageRestrictionGuardInstaller on real Postgres, through the real upstream wri
       }
     });
 
+    // The move-to-space's descendant UPDATE sets space_id to the target on every moved row — also on a row already
+    // IN the target space — and upstream then deletes every moved row's restriction. So g1 must hold on a row whose
+    // space_id "does not change". Reachable with native steps only: a move skips a trashed child, which stays behind
+    // under a parent now in another space; it is restored, restricted, and the parent is moved back.
+    it('refuses a restricted descendant ALREADY in the target space (a stranded child), keeping its restriction', async () => {
+      await page(uuid(1), null);
+      await page(uuid(2), uuid(1), { trashed: true });
+      expect(await outcome(moveToSpace(uuid(1), S2))).toBe('resolved');
+      expect(await row(uuid(2))).toMatchObject({ spaceId: S1, parentPageId: uuid(1) }); // skipped while trashed
+      await pageRepo.restorePage(uuid(2), WS);
+      expect(await row(uuid(2))).toMatchObject({ spaceId: S1, parentPageId: uuid(1), deletedAt: null });
+      await restrict(uuid(2));
+
+      expect(await outcome(moveToSpace(uuid(1), S1))).toBe(RESTRICTED_SPACE_MOVE);
+      expect(await row(uuid(1))).toMatchObject({ spaceId: S2 });
+      expect(await accessRows()).toEqual([{ pageId: uuid(2), spaceId: S1 }]);
+    });
+
     it('allows an unrestricted subtree, and one whose hidden restricted child is orphaned in place (it keeps its restriction)', async () => {
       await page(uuid(1), null);
       await page(uuid(2), uuid(1));
@@ -292,19 +310,42 @@ d('PageRestrictionGuardInstaller on real Postgres, through the real upstream wri
       expect(await row(uuid(2))).toMatchObject({ parentPageId: null, deletedAt: null });
     });
 
-    it('a write that changes neither space nor parent never takes the lock or walks (a reorder, a rename)', async () => {
-      await page(uuid(1), null);
-      await page(uuid(2), uuid(1));
-      await restrict(uuid(1));
+    // With the per-workspace lock held elsewhere, a write that takes it would wait; `lock_timeout` turns that wait
+    // into a failure (55P03) instead of a hung suite.
+    // `unsafe` (bound params): postgres.js's TransactionSql type loses the tagged-template call signature.
+    const underHeldLock = async (statement: string, params: string[]): Promise<string> => {
       const holder = await side.reserve();
       try {
         await holder`begin`;
-        await holder`select pg_advisory_xact_lock(485485, hashtext(${WS}::text))`;
-        await pg`update pages set parent_page_id = ${uuid(1)}, space_id = ${S1}, title = 'x' where id = ${uuid(2)}`;
+        await holder`select pg_advisory_xact_lock(${CYCLE_LOCK_CLASS}, hashtext(${WS}::text))`;
+        return await pg
+          .begin(async (tx) => {
+            await tx.unsafe(`set local lock_timeout = '500ms'`);
+            await tx.unsafe(statement, params);
+          })
+          .then(
+            () => 'no wait',
+            (e) => ((e as { code?: string }).code === '55P03' ? 'waited on the lock' : `unexpected: ${(e as Error).message}`),
+          );
       } finally {
         await holder`rollback`;
         holder.release();
       }
+    };
+
+    it('a write that sets neither space nor a new parent never takes the lock or walks (a reorder, a rename)', async () => {
+      await page(uuid(1), null);
+      await page(uuid(2), uuid(1));
+      await restrict(uuid(1));
+      expect(await underHeldLock(`update pages set position = 'b0', title = 'x' where id = $1`, [uuid(2)])).toBe('no wait');
+      expect(await underHeldLock('update pages set parent_page_id = $1 where id = $2', [uuid(1), uuid(2)])).toBe('no wait');
+      await pg`update pages set title = 'y' where id = ${uuid(2)}`;
+      expect(await row(uuid(2))).toMatchObject({ spaceId: S1, parentPageId: uuid(1) });
+    });
+
+    it('a write that SETS space_id takes the lock even when the value is unchanged (g1 guards every moved row)', async () => {
+      await page(uuid(1), null);
+      expect(await underHeldLock('update pages set space_id = $1 where id = $2', [S1, uuid(1)])).toBe('waited on the lock');
     });
   });
 
@@ -377,10 +418,10 @@ d('PageRestrictionGuardInstaller on real Postgres, through the real upstream wri
   });
 
   describe('installer', () => {
-    it('is idempotent and runs no DDL when current; a disabled trigger is re-established', async () => {
+    it.each(['ccc_page_restriction_guard', 'ccc_page_space_guard'])('is idempotent and runs no DDL when current; a disabled %s is re-established', async (trigger) => {
       expect(await installer.isCurrent()).toBe(true);
       expect(await installer.install()).toBe(false);
-      await pg`alter table pages disable trigger ccc_page_restriction_guard`;
+      await pg.unsafe(`alter table pages disable trigger ${trigger}`);
       expect(await installer.isCurrent()).toBe(false);
       expect(await installer.install()).toBe(true);
       expect(await installer.isCurrent()).toBe(true);

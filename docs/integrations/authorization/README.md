@@ -115,11 +115,15 @@ An absent header means unknown, never confirmed.
 
 **Page restriction guards (1.7.0, wiki-v2 #493/#545).** In `AUTHZ_MODE=remote` the fork installs database triggers
 that refuse to take a restriction away by anything but an explicit unrestrict or a purge: a native move-to-space of
-a restricted page or of a page in a restricted section (upstream deletes the moved pages' restrictions), and a
+a restricted page or of a page in a restricted section — checked on every page the move sets `space_id` on, even
+one already in the target space (upstream deletes every moved page's restrictions) — and a
 re-parent or restore-detach that takes an unrestricted page out from under its last restricted ancestor. A
 restriction written takes the same lock and its `space_id` from the page, so a restrict and a move serialize. The
 native routes answer a refusal — and a move cycle — with `409 { message, code }`, `code` one of
-`ccc_page_no_cycle`, `ccc_page_restricted_space_move`, `ccc_page_restriction_strip`, and the whole write rolls back.
+`ccc_page_no_cycle`, `ccc_page_restricted_space_move`, `ccc_page_restriction_strip`, and the refused statement's
+transaction rolls back. A move rolls back whole; upstream's restore is not transactional, so on a refused detach the
+un-trash has already committed and the page stays under its trashed, restricted parent (never declassified;
+wiki-v2 issue 556).
 
 Three properties bind the whole surface:
 
