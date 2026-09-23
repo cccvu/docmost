@@ -43,8 +43,11 @@ import {
  *     edits for the rest of the session.
  *   - socket.io: every joined `space-<id>` room is re-checked for space `view`; `false` leaves the room. A
  *     missing or disabled user is disconnected.
- *   - `unknown` (the PDP or the DB failed) does nothing, so a blip never mass-evicts; after
- *     UNKNOWN_CAP consecutive unknown passes the connection is narrowed anyway (fail closed, bounded).
+ *   - `unknown` (the PDP or the DB failed) does nothing, so a blip never mass-evicts. A connection that stays
+ *     unknown for at least UNKNOWN_CAP consecutive passes AND UNKNOWN_GRACE_MS is narrowed anyway (fail closed,
+ *     bounded) and `LIVE_ACCESS_REVALIDATE_FAILED` is logged. Both bounds are needed: fast-path passes run
+ *     250 ms to 2 s apart during a burst of signals, so a pass count alone would turn a few seconds of PDP
+ *     slowness into closing every editor on the node.
  *
  * It NEVER widens: it never sets `readOnly = false`, never joins a room (a static spec pins both). Only the
  * decision API that reports failure (`tryCheckBulk`) is used; the fail-closed repos would read a PDP error as
@@ -92,8 +95,11 @@ export type RevalidateSource = 'signal' | 'narrowing' | 'trailing' | 'sweep';
 
 /** The platform caps a bulk check at 256 items; stay well under it (issue 492 used 128 too). */
 const CHECK_CHUNK = 128;
-/** Consecutive unknown passes before a connection is narrowed anyway. */
+/** Consecutive unknown passes before a connection is narrowed anyway... */
 export const UNKNOWN_CAP = 3;
+/** ...and for at least this long since its first unknown (a pass count alone collapses to seconds under a
+ *  burst of fast-path signals). Two default sweep intervals. */
+export const UNKNOWN_GRACE_MS = 120_000;
 /** Minimum gap between two passes; bursts of signals collapse into the one queued pass. */
 const MIN_GAP_MS = 250;
 /** The trailing pass after a signal: covers a connection that authenticated before the projection landed. */
@@ -133,9 +139,13 @@ export class LiveAccessRevalidator implements OnModuleInit, OnModuleDestroy {
   private trailingTimer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
   private lastFailedLogAt = 0;
-  /** Consecutive unknown decisions, per collab connection / per socket+room. Weak: a closed connection frees it. */
-  private readonly unknownCollab = new WeakMap<object, number>();
-  private readonly unknownRooms = new WeakMap<object, Map<string, number>>();
+  /** Consecutive unknown decisions (and when the run began), per collab connection / per socket+room. Weak: a
+   *  closed connection frees it. */
+  private readonly unknownCollab = new WeakMap<object, UnknownRun>();
+  private readonly unknownRooms = new WeakMap<
+    object,
+    Map<string, UnknownRun>
+  >();
 
   constructor(
     private readonly collab: CollaborationGateway,
@@ -231,14 +241,17 @@ export class LiveAccessRevalidator implements OnModuleInit, OnModuleDestroy {
       await this.revalidateCollab(s, users);
       await this.revalidateSockets(s, users);
     } catch (e) {
-      const now = Date.now();
-      if (now - this.lastFailedLogAt >= FAILED_LOG_THROTTLE_MS) {
-        this.lastFailedLogAt = now;
-        this.logger.error(
-          `LIVE_ACCESS_REVALIDATE_FAILED source=${source} live connections were not re-checked this pass (the next signal or sweep retries): ${(e as Error).message}`,
-        );
-      }
+      this.logFailed(
+        `source=${source} live connections were not re-checked this pass (the next signal or sweep retries): ${(e as Error).message}`,
+      );
       throw e;
+    }
+    if (s.unknownClosed > 0) {
+      // The I/O failure path: the PDP or the fork DB did not answer for these connections for at least
+      // UNKNOWN_GRACE_MS, so they were narrowed without a decision (fail closed). Operator-worthy.
+      this.logFailed(
+        `source=${source} unknownClosed=${s.unknownClosed} unknown=${s.unknown} the PDP or the fork DB could not answer for these connections for ${UNKNOWN_GRACE_MS / 1000}s+; they were narrowed without a decision (fail closed)`,
+      );
     }
     if (s.closed + s.left + s.disconnected > 0) {
       this.logger.log(
@@ -246,6 +259,13 @@ export class LiveAccessRevalidator implements OnModuleInit, OnModuleDestroy {
       );
     }
     return s;
+  }
+
+  private logFailed(detail: string): void {
+    const now = Date.now();
+    if (now - this.lastFailedLogAt < FAILED_LOG_THROTTLE_MS) return;
+    this.lastFailedLogAt = now;
+    this.logger.error(`LIVE_ACCESS_REVALIDATE_FAILED ${detail}`);
   }
 
   // ── collab ────────────────────────────────────────────────────────────────────────────────────────
@@ -323,9 +343,9 @@ export class LiveAccessRevalidator implements OnModuleInit, OnModuleDestroy {
   ): void {
     if (decision === 'unknown') {
       s.unknown++;
-      const n = (this.unknownCollab.get(conn) ?? 0) + 1;
-      this.unknownCollab.set(conn, n);
-      if (n < UNKNOWN_CAP) return;
+      const run = bumpUnknown(this.unknownCollab.get(conn));
+      this.unknownCollab.set(conn, run);
+      if (!unknownExpired(run)) return;
       s.unknownClosed++;
     } else {
       this.unknownCollab.delete(conn);
@@ -410,9 +430,9 @@ export class LiveAccessRevalidator implements OnModuleInit, OnModuleDestroy {
     if (view === null) {
       s.unknown++;
       if (!counts) this.unknownRooms.set(socket, (counts = new Map()));
-      const n = (counts.get(spaceId) ?? 0) + 1;
-      counts.set(spaceId, n);
-      if (n < UNKNOWN_CAP) return;
+      const run = bumpUnknown(counts.get(spaceId));
+      counts.set(spaceId, run);
+      if (!unknownExpired(run)) return;
       s.unknownClosed++;
     }
     counts?.delete(spaceId);
@@ -422,6 +442,21 @@ export class LiveAccessRevalidator implements OnModuleInit, OnModuleDestroy {
 }
 
 // ── helpers ─────────────────────────────────────────────────────────────────────────────────────────
+
+/** A run of consecutive unknown decisions for one connection (or socket room). */
+interface UnknownRun {
+  count: number;
+  since: number;
+}
+
+const bumpUnknown = (run: UnknownRun | undefined): UnknownRun =>
+  run
+    ? { count: run.count + 1, since: run.since }
+    : { count: 1, since: Date.now() };
+
+/** Narrow only after BOTH bounds: enough passes, and enough time (see UNKNOWN_GRACE_MS). */
+const unknownExpired = (run: UnknownRun): boolean =>
+  run.count >= UNKNOWN_CAP && Date.now() - run.since >= UNKNOWN_GRACE_MS;
 
 type UserRow = Awaited<ReturnType<UserRepo['findById']>>;
 

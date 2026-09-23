@@ -57,6 +57,13 @@ import {
   handlePaste,
 } from "@/features/editor/components/common/editor-paste-handler.tsx";
 import ExcalidrawMenu from "./components/excalidraw/excalidraw-menu-lazy";
+import {
+  CollabAccessEvent,
+  CollabAccessState,
+  collabAllowsEditing,
+  initialCollabAccess,
+  nextCollabAccess,
+} from "@/features/editor-ux/collab-access";
 import DrawioMenu from "./components/drawio/drawio-menu";
 import { useCollabToken } from "@/features/auth/queries/auth-query.tsx";
 import SearchAndReplaceDialog from "@/features/editor/components/search-and-replace/search-and-replace-dialog.tsx";
@@ -130,6 +137,10 @@ export default function PageEditor({
     socket: HocuspocusProviderWebsocket;
   } | null>(null);
   const [providersReady, setProvidersReady] = useState(false);
+  // CCC (#501): the server can narrow this connection mid-session (see features/editor-ux/collab-access).
+  const [collabAccess, setCollabAccess] =
+    useState<CollabAccessState>(initialCollabAccess);
+  const collabAccessRef = useRef<CollabAccessState>(initialCollabAccess);
 
   useEffect(() => {
     if (!providersRef.current) {
@@ -166,10 +177,23 @@ export default function PageEditor({
           // ignore unrelated stateless messages
         }
       };
+      const onCollabAccess = (event: CollabAccessEvent) => {
+        const step = nextCollabAccess(collabAccessRef.current, event);
+        collabAccessRef.current = step.state;
+        setCollabAccess(step.state);
+        if (step.markDisconnected) {
+          setYjsConnectionStatus(WebSocketStatus.Disconnected);
+        }
+        if (step.reconnect) {
+          socket.disconnect();
+          setTimeout(() => socket.connect(), 100);
+        }
+      };
       const onAuthenticationFailedHandler = () => {
         const payload = jwtDecode(collabQuery?.token);
         const now = Date.now().valueOf() / 1000;
         const isTokenExpired = now >= payload.exp;
+        onCollabAccess({ kind: "auth-failed", tokenExpired: isTokenExpired });
         if (isTokenExpired) {
           refetchCollabToken().then((result) => {
             if (result.data?.token) {
@@ -188,12 +212,23 @@ export default function PageEditor({
         document: ydoc,
         token: collabQuery?.token,
         onAuthenticationFailed: onAuthenticationFailedHandler,
+        onAuthenticated: ({ scope }) =>
+          onCollabAccess({ kind: "authenticated", scope }),
+        // A server CLOSE for this document arrives while the socket stays open; a raw socket close has
+        // already set the status to disconnected (and the provider reconnects on its own).
+        onClose: () =>
+          onCollabAccess({
+            kind: "server-close",
+            socketConnected: socket.status === WebSocketStatus.Connected,
+          }),
         onStatus: onStatusHandler,
         onSynced: onSyncedHandler,
         onStateless: onStatelessHandler,
       });
 
       local.on("synced", onLocalSyncedHandler);
+      collabAccessRef.current = initialCollabAccess;
+      setCollabAccess(initialCollabAccess);
       providersRef.current = { socket, local, remote };
       setProvidersReady(true);
     } else {
@@ -399,8 +434,12 @@ export default function PageEditor({
   }, [yjsConnectionStatus, isSynced]);
   useEffect(() => {
     if (!editor) return;
-    editor.setEditable(editable && currentPageEditMode === PageEditMode.Edit);
-  }, [currentPageEditMode, editor, editable]);
+    editor.setEditable(
+      editable &&
+        currentPageEditMode === PageEditMode.Edit &&
+        collabAllowsEditing(collabAccess),
+    );
+  }, [currentPageEditMode, editor, editable, collabAccess]);
 
   const hasConnectedOnceRef = useRef(false);
   const [showStatic, setShowStatic] = useState(true);

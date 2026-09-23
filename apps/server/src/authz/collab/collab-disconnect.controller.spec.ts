@@ -164,12 +164,14 @@ describe('CollabDisconnectController.revalidate (#501 — narrow every live conn
     }
   });
 
-  it('propagates a failed pass as an error (the platform logs it; the sweep retries)', async () => {
+  // A PDP or fork-DB failure does NOT reach here: the revalidator reads it as `unknown` (see its spec). A pass
+  // only rejects on an unexpected fault (a code defect, a gateway throwing) — which must still surface.
+  it('propagates an unexpected pass failure as an error (the platform logs it; the sweep retries)', async () => {
     const signal = jest.fn(async () => {
-      throw new Error('pdp down');
+      throw new TypeError('gateway exploded');
     });
     const controller = new CollabDisconnectController({} as any, {} as any, { signal } as any);
-    await expect(controller.revalidate()).rejects.toThrow('pdp down');
+    await expect(controller.revalidate()).rejects.toThrow('gateway exploded');
   });
 
   it('the per-page force-disconnect route is gone (replaced by revalidate)', () => {

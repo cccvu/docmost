@@ -8,7 +8,12 @@ jest.mock('../../collaboration/collaboration.gateway', () => ({
 }));
 jest.mock('../../ws/ws.gateway', () => ({ WsGateway: class {} }));
 
-import { LiveAccessRevalidator, UNKNOWN_CAP } from './live-access.revalidator';
+import { Logger } from '@nestjs/common';
+import {
+  LiveAccessRevalidator,
+  UNKNOWN_CAP,
+  UNKNOWN_GRACE_MS,
+} from './live-access.revalidator';
 
 /**
  * CCC authorization integration test (#501).
@@ -16,7 +21,8 @@ import { LiveAccessRevalidator, UNKNOWN_CAP } from './live-access.revalidator';
  * The live-connection revalidator narrows every live connection that lost access, and ONLY narrows:
  *   - collab: `deny`, and `read` on a writable connection, close it; `write`/`read`-on-read-only are no-ops;
  *   - socket.io: a space room whose `view` is now false is left; a missing/disabled user is disconnected;
- *   - a PDP/DB failure is `unknown` → no action, until UNKNOWN_CAP consecutive unknowns, then it narrows;
+ *   - a PDP/DB failure is `unknown` → no action, until UNKNOWN_CAP consecutive unknowns spanning
+ *     UNKNOWN_GRACE_MS, then it narrows and logs LIVE_ACCESS_REVALIDATE_FAILED;
  *   - it never sets `readOnly = false` and never joins a room.
  */
 
@@ -118,6 +124,14 @@ function build(opts: {
   return { svc, authz, userRepo, pageRepo };
 }
 
+/** A controllable clock: the unknown cap is time-bounded. */
+let clock = 1_000_000;
+beforeEach(() => {
+  clock = 1_000_000;
+  jest.spyOn(Date, 'now').mockImplementation(() => clock);
+});
+afterEach(() => jest.restoreAllMocks());
+
 const writer = (pageId: string) => ({
   [`space:${S1}:edit`]: true,
   [`space:${S1}:view`]: true,
@@ -196,17 +210,59 @@ describe('LiveAccessRevalidator — collab plane', () => {
     expect(b.close).toHaveBeenCalled();
   });
 
-  it('does nothing on a PDP failure (unknown), then narrows after UNKNOWN_CAP consecutive unknowns', async () => {
+  it('does nothing on a PDP failure (unknown), then narrows after UNKNOWN_CAP passes spanning UNKNOWN_GRACE_MS, and alarms', async () => {
+    const error = jest.spyOn(Logger.prototype, 'error').mockImplementation();
     const c = conn(false);
     const { svc } = build({ docs: [doc('p1', [c])], pdpFail: true });
     for (let i = 1; i < UNKNOWN_CAP; i++) {
       const s = await svc.request('sweep');
       expect(s.unknown).toBe(1);
       expect(c.close).not.toHaveBeenCalled();
+      clock += UNKNOWN_GRACE_MS / 2;
     }
     const s = await svc.request('sweep');
     expect(c.close).toHaveBeenCalledTimes(1);
     expect(s.unknownClosed).toBe(1);
+    // The I/O failure path is what the LIVE_ACCESS_REVALIDATE_FAILED alarm is for (a pass never throws on it).
+    expect(error).toHaveBeenCalledWith(
+      expect.stringContaining('LIVE_ACCESS_REVALIDATE_FAILED'),
+    );
+  });
+
+  it('a burst of fast-path passes during a PDP blip never narrows before UNKNOWN_GRACE_MS (#501 review)', async () => {
+    const error = jest.spyOn(Logger.prototype, 'error').mockImplementation();
+    const c = conn(false);
+    const room = sock(U1, ['space-s1']);
+    const { svc } = build({
+      docs: [doc('p1', [c])],
+      sockets: [room],
+      pdpFail: true,
+    });
+    for (let i = 0; i < UNKNOWN_CAP * 4; i++) {
+      await svc.request('signal'); // passes ~250 ms to 2 s apart, far more than UNKNOWN_CAP of them
+      clock += 2000;
+    }
+    expect(c.close).not.toHaveBeenCalled();
+    expect(room.leave).not.toHaveBeenCalled();
+    expect(error).not.toHaveBeenCalled(); // and no alarm for a blip
+  });
+
+  it('a decided pass resets the unknown run (only CONSECUTIVE unknowns count)', async () => {
+    const c = conn(false);
+    const failing = build({ docs: [doc('p1', [c])], pdpFail: true });
+    const healthy = build({ docs: [doc('p1', [c])], grants: writer('p1') });
+    // Same revalidator instance must carry the run; swap its PDP between passes.
+    const svc = failing.svc as any;
+    await svc.request('sweep'); // unknown #1
+    clock += UNKNOWN_GRACE_MS;
+    svc.authz = healthy.authz; // the PDP recovers
+    await svc.request('sweep'); // decided: write → resets
+    svc.authz = failing.authz;
+    for (let i = 0; i < UNKNOWN_CAP - 1; i++) {
+      await svc.request('sweep');
+      clock += UNKNOWN_GRACE_MS;
+    }
+    expect(c.close).not.toHaveBeenCalled(); // UNKNOWN_CAP-1 new unknowns: not enough, even over a long time
   });
 
   it('a user-read failure is unknown, never a deny', async () => {
@@ -280,6 +336,7 @@ describe('LiveAccessRevalidator — socket.io plane', () => {
     for (let i = 1; i < UNKNOWN_CAP; i++) {
       await svc.request('sweep');
       expect(s1.leave).not.toHaveBeenCalled();
+      clock += UNKNOWN_GRACE_MS / 2;
     }
     await svc.request('sweep');
     expect(s1.leave).toHaveBeenCalledWith('space-s1');
