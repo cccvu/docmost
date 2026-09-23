@@ -48,7 +48,7 @@ swallows errors, so audit never blocks a user request. A faithful sink returns `
 ## 3. The service bridge (the platform calls the fork)
 
 In remote mode the fork also EXPOSES east-west endpoints an integrating platform uses to provision a shadow
-user and mint a Docmost session, and to force-disconnect a collab session. Contract:
+user and mint a Docmost session, and to re-check or cut live realtime connections after a revocation. Contract:
 `service-bridge.openapi.json`. These are gated by the same `x-authz-service-secret` header (plus per-route
 scopes on `/api/service/*`) and are keyed only on an opaque `externalId`, so a caller can never select an
 arbitrary Docmost identity. You implement a *caller* for these; the fork is the server.

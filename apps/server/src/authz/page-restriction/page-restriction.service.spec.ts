@@ -76,6 +76,8 @@ function makeService(opts: {
   darkChild?: boolean;
   /** The native repo's page-edit answer (A3 in native mode). */
   nativeEdit?: { hasAnyRestriction: boolean; canAccess: boolean; canEdit: boolean };
+  /** The socket.io WsService (#501 restriction-cache invalidation); omitted by default. */
+  ws?: { invalidateSpaceRestrictionCache: jest.Mock };
 }) {
   const page =
     opts.page === undefined && !('page' in opts)
@@ -136,6 +138,7 @@ function makeService(opts: {
     spaceAbility,
     opts.mode ?? 'native',
     authz as any,
+    opts.ws as any,
   );
   return { service, pageRepo, pagePermissionRepo, getUserSpaceRoles, spy, authz };
 }
@@ -816,5 +819,29 @@ describe('PageRestrictionController (auth guard + delegation)', () => {
         userOf(READER_ID),
       ),
     ).rejects.toThrow(ForbiddenException);
+  });
+});
+
+describe('PageRestrictionService — socket.io restriction cache (#501)', () => {
+  // The notifications plane caches "does this space have any restriction" for 30 s and sends tree/comment
+  // events to the WHOLE space room while it says no. A space's first restriction must drop that entry.
+  it('invalidates the space restriction cache when a page becomes restricted', async () => {
+    const ws = { invalidateSpaceRestrictionCache: jest.fn(async () => undefined) };
+    const { service } = makeService({ role: 'admin', accessSeq: [undefined, { id: ACCESS_ID }], ws });
+    await service.restrict(PAGE_ID, userOf(ADMIN_ID));
+    expect(ws.invalidateSpaceRestrictionCache).toHaveBeenCalledWith(SPACE_ID);
+  });
+
+  it('does not touch the cache when the page was already restricted (nothing written)', async () => {
+    const ws = { invalidateSpaceRestrictionCache: jest.fn(async () => undefined) };
+    const { service } = makeService({ role: 'admin', accessSeq: [{ id: ACCESS_ID }], ws });
+    await service.restrict(PAGE_ID, userOf(ADMIN_ID));
+    expect(ws.invalidateSpaceRestrictionCache).not.toHaveBeenCalled();
+  });
+
+  it('a cache failure never fails the restrict (the entry just expires in 30 s)', async () => {
+    const ws = { invalidateSpaceRestrictionCache: jest.fn(async () => { throw new Error('redis down'); }) };
+    const { service } = makeService({ role: 'admin', accessSeq: [undefined, { id: ACCESS_ID }], ws });
+    await expect(service.restrict(PAGE_ID, userOf(ADMIN_ID))).resolves.toBeUndefined();
   });
 });

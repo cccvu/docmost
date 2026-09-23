@@ -52,7 +52,8 @@ An integration talks to the fork over two documented contracts (both under
 - **Outbound** (`authorization-service.openapi.json`): what the fork CALLS in remote mode. A third party
   implements this to be the authorization + audit service.
 - **Inbound** (`service-bridge.openapi.json`): what the fork EXPOSES. An integrating platform calls these to
-  provision a shadow user and mint a session, and to force-disconnect a live collab session.
+  provision a shadow user and mint a session, and to re-check or cut live realtime connections after a
+  revocation.
 
 Because both directions are published contracts, an integrator never needs the fork's proprietary counterpart
 source, and the fork never needs the integrator's.
