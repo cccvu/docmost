@@ -8,7 +8,9 @@ import { Injectable, Logger } from '@nestjs/common';
  * client. FAIL-CLOSED: any transport error or non-200 resolves to "denied" (false / empty), so a
  * platform outage cannot silently grant access.
  */
-export type AuthzSubject = { principalId: string } | { provider: string; externalId: string };
+export type AuthzSubject =
+  | { principalId: string }
+  | { provider: string; externalId: string };
 
 export interface AuthzCheckItem {
   permission: string;
@@ -23,6 +25,13 @@ const FILTER_CHUNK = 1000;
 /** Bounded per-request timeout (ms) so a slow/hung platform cannot hang the wiki request; on timeout the
  *  call aborts and resolves fail-closed. Overridable via PLATFORM_AUTHZ_TIMEOUT_MS. */
 const DEFAULT_TIMEOUT_MS = 1500;
+/** How much longer than the platform's own settle wait the fork's request may take: network, plus the platform's
+ *  confirm step after the fence is reached (a dead-letter read, a fully consistent SpiceDB check with its own
+ *  1.2 s deadline, a Redis write). Equal to the interceptor's live-session reserve, so the request budget holds. */
+export const SETTLE_MARGIN_MS = 1500;
+/** A pending reason as the fork will log it: a short kebab-case word. Anything else from the authorization
+ *  service (a third party may implement /sync/settle) is replaced, so it cannot shape the fork's log lines. */
+const REASON_RE = /^[a-z][a-z-]{0,31}$/;
 
 /**
  * Parse PLATFORM_AUTHZ_TIMEOUT_MS defensively. A bare `Number(env ?? default)` is a footgun: `Number('')` is
@@ -32,7 +41,10 @@ const DEFAULT_TIMEOUT_MS = 1500;
  * clamped to [250ms, 60000ms]. Mirrors the platform's own config.sanitizeTimeoutMs — duplicated here because
  * the fork can't import platform code across the submodule boundary. (#14)
  */
-export function sanitizeAuthzTimeoutMs(raw: string | undefined, fallback: number): number {
+export function sanitizeAuthzTimeoutMs(
+  raw: string | undefined,
+  fallback: number,
+): number {
   const clamp = (ms: number): number => Math.min(Math.max(ms, 250), 60000);
   const n = Number(raw ?? fallback);
   return clamp(Number.isFinite(n) && n > 0 ? n : fallback);
@@ -41,9 +53,13 @@ export function sanitizeAuthzTimeoutMs(raw: string | undefined, fallback: number
 @Injectable()
 export class HttpAuthzClient {
   private readonly logger = new Logger(HttpAuthzClient.name);
-  private readonly baseUrl = process.env.PLATFORM_AUTHZ_URL ?? 'http://platform:4000';
+  private readonly baseUrl =
+    process.env.PLATFORM_AUTHZ_URL ?? 'http://platform:4000';
   private readonly secret = process.env.PLATFORM_AUTHZ_SERVICE_SECRET ?? '';
-  private readonly timeoutMs = sanitizeAuthzTimeoutMs(process.env.PLATFORM_AUTHZ_TIMEOUT_MS, DEFAULT_TIMEOUT_MS);
+  private readonly timeoutMs = sanitizeAuthzTimeoutMs(
+    process.env.PLATFORM_AUTHZ_TIMEOUT_MS,
+    DEFAULT_TIMEOUT_MS,
+  );
 
   private async post<T>(path: string, body: unknown): Promise<T | null> {
     // Bound the call: abort after `timeoutMs` so a hung platform can't hang the wiki request. The
@@ -54,7 +70,10 @@ export class HttpAuthzClient {
     try {
       const res = await fetch(`${this.baseUrl}${path}`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json', 'x-authz-service-secret': this.secret },
+        headers: {
+          'content-type': 'application/json',
+          'x-authz-service-secret': this.secret,
+        },
         body: JSON.stringify(body),
         signal: controller.signal,
       });
@@ -71,21 +90,44 @@ export class HttpAuthzClient {
     }
   }
 
-  async check(subject: AuthzSubject, permission: string, resourceType: string, resourceId: string): Promise<boolean> {
-    const r = await this.post<{ allowed: boolean }>('/authz/check', { subject, permission, resourceType, resourceId });
+  async check(
+    subject: AuthzSubject,
+    permission: string,
+    resourceType: string,
+    resourceId: string,
+  ): Promise<boolean> {
+    const r = await this.post<{ allowed: boolean }>('/authz/check', {
+      subject,
+      permission,
+      resourceType,
+      resourceId,
+    });
     return r?.allowed === true;
   }
 
   /** POST `/authz/check-bulk`; the raw `results` when the envelope is well-formed (an array of exactly the
    *  requested length), else null. Element types are validated by the two public callers below. */
-  private async bulkResults(subject: AuthzSubject, checks: AuthzCheckItem[]): Promise<unknown[] | null> {
-    const r = await this.post<{ results: unknown }>('/authz/check-bulk', { subject, checks });
-    if (Array.isArray(r?.results) && r.results.length === checks.length) return r.results;
-    if (r) this.logger.error('authz /authz/check-bulk -> malformed results envelope');
+  private async bulkResults(
+    subject: AuthzSubject,
+    checks: AuthzCheckItem[],
+  ): Promise<unknown[] | null> {
+    const r = await this.post<{ results: unknown }>('/authz/check-bulk', {
+      subject,
+      checks,
+    });
+    if (Array.isArray(r?.results) && r.results.length === checks.length)
+      return r.results;
+    if (r)
+      this.logger.error(
+        'authz /authz/check-bulk -> malformed results envelope',
+      );
     return null;
   }
 
-  async checkBulk(subject: AuthzSubject, checks: AuthzCheckItem[]): Promise<boolean[]> {
+  async checkBulk(
+    subject: AuthzSubject,
+    checks: AuthzCheckItem[],
+  ): Promise<boolean[]> {
     if (checks.length === 0) return [];
     const results = await this.bulkResults(subject, checks);
     // Fail-closed on a MALFORMED 200 (a buggy/Byzantine platform): a non-array or wrong-length `results`
@@ -102,12 +144,17 @@ export class HttpAuthzClient {
    * timeout, non-2xx, a malformed envelope, AND any non-boolean element (a Byzantine `locked: "yes"` must not
    * read as unrestricted either).
    */
-  async tryCheckBulk(subject: AuthzSubject, checks: AuthzCheckItem[]): Promise<boolean[] | null> {
+  async tryCheckBulk(
+    subject: AuthzSubject,
+    checks: AuthzCheckItem[],
+  ): Promise<boolean[] | null> {
     if (checks.length === 0) return [];
     const results = await this.bulkResults(subject, checks);
     if (!results) return null;
     if (!results.every((x): x is boolean => typeof x === 'boolean')) {
-      this.logger.error('authz /authz/check-bulk -> non-boolean result element');
+      this.logger.error(
+        'authz /authz/check-bulk -> non-boolean result element',
+      );
       return null;
     }
     return results;
@@ -125,18 +172,34 @@ export class HttpAuthzClient {
     const allowed = new Set<string>();
     for (let i = 0; i < candidateIds.length; i += FILTER_CHUNK) {
       const batch = candidateIds.slice(i, i + FILTER_CHUNK);
-      const r = await this.post<{ ids: string[] }>('/authz/filter-resources', { subject, permission, resourceType, candidateIds: batch });
+      const r = await this.post<{ ids: string[] }>('/authz/filter-resources', {
+        subject,
+        permission,
+        resourceType,
+        candidateIds: batch,
+      });
       // Fail-closed on a malformed 200: only union string ids from an actual array (a string `ids` would
       // otherwise iterate per-character; a non-array would throw).
-      if (Array.isArray(r?.ids)) for (const id of r.ids) if (typeof id === 'string') allowed.add(id);
+      if (Array.isArray(r?.ids))
+        for (const id of r.ids) if (typeof id === 'string') allowed.add(id);
     }
     return [...allowed];
   }
 
-  async lookupResources(subject: AuthzSubject, permission: string, resourceType: string): Promise<string[]> {
-    const r = await this.post<{ ids: string[] }>('/authz/lookup-resources', { subject, permission, resourceType });
+  async lookupResources(
+    subject: AuthzSubject,
+    permission: string,
+    resourceType: string,
+  ): Promise<string[]> {
+    const r = await this.post<{ ids: string[] }>('/authz/lookup-resources', {
+      subject,
+      permission,
+      resourceType,
+    });
     // Fail-closed on a malformed 200: a non-array (or non-string elements) yields the empty set.
-    return Array.isArray(r?.ids) ? r.ids.filter((id): id is string => typeof id === 'string') : [];
+    return Array.isArray(r?.ids)
+      ? r.ids.filter((id): id is string => typeof id === 'string')
+      : [];
   }
 
   /**
@@ -155,18 +218,83 @@ export class HttpAuthzClient {
     const allowed = new Set<string>();
     for (let i = 0; i < candidateUserIds.length; i += FILTER_CHUNK) {
       const batch = candidateUserIds.slice(i, i + FILTER_CHUNK);
-      const candidates = batch.map((externalId) => ({ provider: 'docmost', externalId }));
-      const r = await this.post<{ subjects: Array<{ externalId?: string }> }>('/authz/filter-subjects', {
-        permission,
-        resourceType,
-        resourceId,
-        candidates,
-      });
+      const candidates = batch.map((externalId) => ({
+        provider: 'docmost',
+        externalId,
+      }));
+      const r = await this.post<{ subjects: Array<{ externalId?: string }> }>(
+        '/authz/filter-subjects',
+        {
+          permission,
+          resourceType,
+          resourceId,
+          candidates,
+        },
+      );
       // Fail-closed on a malformed 200: skip the chunk unless `subjects` is an array of objects carrying a
       // string externalId (a non-array would throw; a bare string would iterate per-character).
       if (!Array.isArray(r?.subjects)) continue;
-      for (const s of r.subjects) if (s && typeof s.externalId === 'string') allowed.add(s.externalId);
+      for (const s of r.subjects)
+        if (s && typeof s.externalId === 'string') allowed.add(s.externalId);
     }
     return [...allowed];
+  }
+
+  /**
+   * #501 Part B: ask the platform whether its relay has projected every outbox row up to `position` into the PDP
+   * (`POST /sync/settle`), waiting at most `waitMs` there. Resolves `confirmed` ONLY on a well-formed 200 that says
+   * so; anything else — a platform without the route (404), a timeout, a transport error, a malformed body — is
+   * `pending` (an unproven change must never read as enforced). Never throws. Its own deadline (the platform's
+   * wait plus a margin), not the 1.5 s decision timeout. A `settle-*` reason means the platform gave NO verdict
+   * (so it logged nothing); any other reason is the platform's own, already logged and alarmed there.
+   */
+  async settleProjection(
+    position: string,
+    waitMs: number,
+  ): Promise<{ status: 'confirmed' } | { status: 'pending'; reason: string }> {
+    const controller = new AbortController();
+    const timer = setTimeout(
+      () => controller.abort(),
+      waitMs + SETTLE_MARGIN_MS,
+    );
+    (timer as unknown as { unref?: () => void }).unref?.();
+    try {
+      const res = await fetch(`${this.baseUrl}/sync/settle`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-authz-service-secret': this.secret,
+        },
+        body: JSON.stringify({ position, timeoutMs: waitMs }),
+        signal: controller.signal,
+      });
+      if (!res.ok)
+        return { status: 'pending', reason: `settle-http-${res.status}` };
+      const body = (await res.json()) as {
+        status?: unknown;
+        reason?: unknown;
+      } | null;
+      if (body?.status === 'confirmed') return { status: 'confirmed' };
+      if (body?.status !== 'pending')
+        return { status: 'pending', reason: 'settle-malformed' };
+      // A verdict from the platform: its own reason (never `settle-*`, which marks "no verdict" below).
+      const reason =
+        typeof body.reason === 'string' && REASON_RE.test(body.reason)
+          ? body.reason
+          : 'unrecognized';
+      return {
+        status: 'pending',
+        reason: reason.startsWith('settle-') ? 'unrecognized' : reason,
+      };
+    } catch {
+      return {
+        status: 'pending',
+        reason: controller.signal.aborted
+          ? 'settle-timeout'
+          : 'settle-unreachable',
+      };
+    } finally {
+      clearTimeout(timer);
+    }
   }
 }

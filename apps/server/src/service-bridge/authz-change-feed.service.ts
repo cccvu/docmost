@@ -51,6 +51,23 @@ function formatCursor(xactId: string, id: string): string {
   return `${xactId}.${id}`;
 }
 
+/**
+ * The MAX COMMITTED outbox position `(xact_id, id)`, or the zero cursor when the outbox is empty — the #501 Part B
+ * settle FENCE, read right after a narrowing request's handler succeeded. Deliberately UNGATED (no xmin filter):
+ * the request's own rows are committed and visible to this read, so the fence is at or past every one of them
+ * (and past every earlier commit). NEVER `head()`: head is gated by the oldest open transaction, so while any
+ * unrelated transaction is open it sits BEFORE the rows this request just committed, and a settle fenced there
+ * would report `confirmed` for a change the relay has not projected. One backward seek on the `(xact_id, id)`
+ * index.
+ */
+export async function maxCommittedPosition(db: KyselyDB): Promise<string> {
+  const res = await sql<{ xactId: string; id: string }>`
+    select xact_id, id from authz_outbox order by xact_id desc, id desc limit 1
+  `.execute(db);
+  const row = res.rows[0];
+  return row ? formatCursor(String(row.xactId), String(row.id)) : ZERO_CURSOR;
+}
+
 /** Tuple compare `a > b` on (xact_id, id), both as decimal strings (xid8 can exceed 2^53, so use BigInt). */
 function tupleGt(a: Cursor, b: Cursor): boolean {
   const ax = BigInt(a.xactId);
@@ -90,6 +107,10 @@ export interface ChangesResult {
   /** Age in ms of the OLDEST safe row still pending after `nextCursor` (null when caught up). Feeds the
    *  platform's oldest-unconsumed-age alarm without the platform ever querying Docmost. */
   oldestPendingAgeMs: number | null;
+  /** How many rows in this batch came from a table the mapper KNOWS yet mapped to nothing (a mapper/payload
+   *  defect, `AUTHZ_CHANGE_EVENT_DROPPED`). `nextCursor` still advances past them, so the platform records the
+   *  range as a dead letter: the change was never projected, and a settle must not report it enforced (#501). */
+  dropped: number;
 }
 
 /** Thrown when the requested cursor is STRICTLY below the retention high-water mark (an un-consumed event was
@@ -250,7 +271,7 @@ export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
     const last = raw.length ? raw[raw.length - 1] : null;
     const nextCursor = last ? formatCursor(last.xactId, last.id) : formatCursor(cursor.xactId, cursor.id);
     const oldestPendingAgeMs = await this.oldestPendingAgeMs(parseCursor(nextCursor));
-    return { events, nextCursor, head, oldestPendingAgeMs };
+    return { events, nextCursor, head, oldestPendingAgeMs, dropped: dropped.length };
   }
 
   /** The long-poll wait after an empty gated read. Parks until a wake or the deadline, EXCEPT that (a) a wake

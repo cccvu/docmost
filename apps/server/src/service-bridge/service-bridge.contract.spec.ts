@@ -148,7 +148,7 @@ describe('service-bridge.openapi.json is the canonical inbound contract (provide
     PageRestrictionChanged: { seq: true, type: true, pageId: true, restricted: true },
     PagePermissionChanged: { seq: true, type: true, pageId: true, userId: true, groupId: true, role: true, removed: true },
   };
-  const FORK_CHANGES_KEYS: Record<keyof ChangesResult, true> = { events: true, nextCursor: true, head: true, oldestPendingAgeMs: true };
+  const FORK_CHANGES_KEYS: Record<keyof ChangesResult, true> = { events: true, nextCursor: true, head: true, oldestPendingAgeMs: true, dropped: true };
   const FORK_SNAPSHOT_KEYS: Record<keyof SnapshotResult, true> = { events: true, nextCursor: true, baseline: true };
   const sortedKeys = (o: object): string[] => Object.keys(o).sort();
 
