@@ -26,10 +26,23 @@ interface ServiceCredential {
   scopes: ReadonlySet<ServiceScope>;
 }
 
-const RATE_LIMIT = (() => {
-  const n = Number.parseInt(process.env.SERVICE_BRIDGE_RATE_LIMIT ?? '', 10);
-  return Number.isFinite(n) && n > 0 ? n : 600;
-})();
+const envLimit = (name: string, def: number): number => {
+  const n = Number.parseInt(process.env[name] ?? '', 10);
+  return Number.isFinite(n) && n > 0 ? n : def;
+};
+const RATE_LIMIT = envLimit('SERVICE_BRIDGE_RATE_LIMIT', 600);
+/**
+ * Scopes on the platform's per-request hot path get their own, larger window (each scope is already its own bucket;
+ * this sets its size). They are cheap indexed reads, and every caller behind them is already rate-limited per
+ * principal at the platform edge, so a shared 600/min would throttle every user because of one:
+ * - `pages:authz:read` (#545): the page projector reads it once per page event, plus fan-out and reconcile chunks.
+ * - `pages:read` (#493): `/v1` page-content routes resolve "is this page live" through `resolve-space` on EVERY
+ *   request; the platform answers a throttled resolve as a retriable 503, but it should not happen under normal load.
+ */
+const SCOPE_RATE_LIMITS: Partial<Record<ServiceScope, number>> = {
+  [ServiceScope.PagesAuthzRead]: envLimit('SERVICE_BRIDGE_PAGES_AUTHZ_RATE_LIMIT', 6000),
+  [ServiceScope.PagesRead]: envLimit('SERVICE_BRIDGE_PAGES_READ_RATE_LIMIT', 6000),
+};
 
 /**
  * CCC service-bridge — NOT upstream Docmost code.
@@ -49,6 +62,9 @@ const RATE_LIMIT = (() => {
 export class ServiceAuthGuard implements CanActivate {
   private readonly credentials: ServiceCredential[];
   private readonly limiter = new FixedWindowRateLimiter(RATE_LIMIT, 60_000);
+  private readonly scopeLimiters = new Map(
+    Object.entries(SCOPE_RATE_LIMITS).map(([scope, n]) => [scope, new FixedWindowRateLimiter(n, 60_000)]),
+  );
 
   constructor(private readonly reflector: Reflector) {
     const raw = process.env.PLATFORM_AUTHZ_SERVICE_SECRET ?? '';
@@ -94,7 +110,8 @@ export class ServiceAuthGuard implements CanActivate {
       throw new ForbiddenException(`service credential lacks scope ${required}`);
     }
 
-    if (!this.limiter.allow(`${cred.id}:${required}`)) {
+    const limiter = this.scopeLimiters.get(required) ?? this.limiter;
+    if (!limiter.allow(`${cred.id}:${required}`)) {
       throw new HttpException(
         'service rate limit exceeded',
         HttpStatus.TOO_MANY_REQUESTS,

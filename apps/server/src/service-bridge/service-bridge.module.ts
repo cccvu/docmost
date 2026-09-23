@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { APP_INTERCEPTOR } from '@nestjs/core';
 import { ServiceBridgeController } from './service-bridge.controller';
 import { ServiceBridgeService } from './service-bridge.service';
 import { ServiceAuthGuard } from './service-auth.guard';
@@ -19,6 +20,9 @@ import { AuthzSnapshotService } from './authz-snapshot.service';
 import { ServicePageLifecycleService } from './service-page-lifecycle.service';
 import { PageCycleGuardInstaller } from './page-cycle-guard.installer';
 import { AuthzOutboxInstaller } from './authz-outbox.installer';
+import { PageAuthzStateService } from './page-authz-state.service';
+import { PageRestrictionGuardInstaller } from './page-restriction-guard.installer';
+import { PageGuardConflictInterceptor } from './page-guard-conflict.interceptor';
 // Seam #5 (see UPSTREAM_MODIFICATIONS.md): SearchModule binds the SearchService token to PdpSearchService in
 // AUTHZ_MODE=remote. Importing it here lets ServiceSearchService inject that PDP-gated search — the binding
 // is module-local, so the token must be resolved through the module that exports it (a @Global rebind can't
@@ -62,6 +66,10 @@ import { SearchModule } from '../core/search/search.module';
     ServiceAuthGuard,
     ServicePageLifecycleService, // #485 (appended)
     PageCycleGuardInstaller, // #485 (appended)
+    PageAuthzStateService, // #545 (appended)
+    PageRestrictionGuardInstaller, // #493/#545 (appended)
+    // #493/#545: the page guards' DB refusals → 409 (inner to AppModule's audit interceptor; see the class).
+    { provide: APP_INTERCEPTOR, useClass: PageGuardConflictInterceptor },
   ],
 })
 export class ServiceBridgeModule {}

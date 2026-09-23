@@ -11,6 +11,7 @@ import {
   mkReadModelDb,
   createReadModelTables,
 } from '../service-bridge/read-model-pg.testkit';
+import { LIFECYCLE_MAX_DEPTH } from '../service-bridge/page-lineage';
 
 /**
  * Real-Postgres proof of the #524 lineage check in `PdpPagePermissionRepo.canUserEditPage`. When the PDP has no
@@ -175,7 +176,7 @@ d('PdpPagePermissionRepo lineage check on real Postgres (#524)', () => {
     expect(await check(C)).toEqual(DENY);
   });
 
-  it('is bounded at 256 steps: a 257-page chain is walked to its root, a 258-page chain denies', async () => {
+  it('is bounded at LIFECYCLE_MAX_DEPTH (1024) steps: a 1025-page chain is walked to its root, a 1026-page chain denies', async () => {
     const chain = async (first: number, length: number) => {
       const last = first + length - 1;
       await pg`
@@ -186,8 +187,9 @@ d('PdpPagePermissionRepo lineage check on real Postgres (#524)', () => {
           from generate_series(${first}::int, ${last}::int) g`;
       return uuid(first);
     };
-    expect(await check(await chain(5000, 257))).toEqual(PASS);
-    expect(await check(await chain(6000, 258))).toEqual(DENY);
+    expect(LIFECYCLE_MAX_DEPTH).toBe(1024);
+    expect(await check(await chain(5000, 1025))).toEqual(PASS);
+    expect(await check(await chain(7000, 1026))).toEqual(DENY);
   });
 
   it('a parent it cannot read (dangling) or in ANOTHER workspace ends the walk early and denies', async () => {

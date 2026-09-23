@@ -15,8 +15,10 @@ import { KyselyDB } from '@docmost/db/types/kysely.types';
  * Bound on every tree walk. Real page trees are a handful of levels deep; a walk that reaches this bound — or
  * meets a cycle, or a parent it cannot read — is reported as INCOMPLETE, and every caller treats an incomplete
  * lineage as restricted (fail closed). Nothing here ever reports "unrestricted" for a lineage it did not finish.
+ * The same number as the cycle guard's bound (`CYCLE_GUARD_MAX_DEPTH`, pinned equal by a spec), so a tree the guard
+ * lets a move build is not read as incomplete — and so as locked — by the PDP's `lineage_restricted` marker (#545).
  */
-export const LIFECYCLE_MAX_DEPTH = 256;
+export const LIFECYCLE_MAX_DEPTH = 1024;
 
 /** A page's restriction lineage: the restricted ids on the walk, and whether the walk reached a root. */
 export interface Lineage {

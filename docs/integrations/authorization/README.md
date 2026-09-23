@@ -98,6 +98,11 @@ You only implement a *caller* for these; the fork is the server. They fall into 
   (reconcile, then reset its cursor to the snapshot `baseline`) rather than skipping. A batch whose `dropped` is
   non-zero (1.6.0) advanced past rows that mapped to no event: record it as skipped until a reconcile repairs it. This replaces the
   platform reaching directly into Docmost's database, so it needs no Docmost DB credentials.
+  `POST /api/service/authz/pages/state` (1.7.0, scope `pages:authz:read`) serves the CURRENT authorization
+  structure of pages — placement, own restriction, and whether the page or any ancestor (trashed ones included) is
+  restricted — by id, by subtree or as a full keyset scan, one SQL statement per response. It lets a platform
+  project pages level-triggered (re-read what an event names instead of trusting its payload), so a reordered,
+  retried or skipped event cannot leave a stale edge.
 - **Collab** (`collab`): `POST /api/collab/revalidate` (re-check every live realtime connection after a
   narrowing access change and narrow the ones that lost access, #501; it replaced the per-page
   `force-disconnect` in 1.5.0) and `POST /api/collab/force-disconnect-user` (account disable, #455).
@@ -108,14 +113,26 @@ a platform relays) carries `Authz-Propagation: confirmed | pending` — whether 
 authorization service (via the optional outbound `/sync/settle` above). It never changes the status or the body.
 An absent header means unknown, never confirmed.
 
+**Page restriction guards (1.7.0, wiki-v2 #493/#545).** In `AUTHZ_MODE=remote` the fork installs database triggers
+that refuse to take a restriction away by anything but an explicit unrestrict or a purge: a native move-to-space of
+a restricted page or of a page in a restricted section — checked on every page the move sets `space_id` on, even
+one already in the target space (upstream deletes every moved page's restrictions) — and a
+re-parent or restore-detach that takes an unrestricted page out from under its last restricted ancestor. A
+restriction written takes the same lock and its `space_id` from the page, so a restrict and a move serialize. The
+native routes answer a refusal — and a move cycle — with `409 { message, code }`, `code` one of
+`ccc_page_no_cycle`, `ccc_page_restricted_space_move`, `ccc_page_restriction_strip`, and the refused statement's
+transaction rolls back. A move rolls back whole; upstream's restore is not transactional, so on a refused detach the
+un-trash has already committed and the page stays under its trashed, restricted parent (never declassified;
+wiki-v2 issue 556).
+
 Three properties bind the whole surface:
 
 - **Mode-gated.** Every route is `404` unless the fork runs `AUTHZ_MODE=remote` (RemoteOnlyGuard, checked
   before the secret). In native mode there is no integrating platform and the surface does not exist.
 - **Scoped + secret-gated.** Every request carries `x-authz-service-secret`; each `/api/service/*` route
   requires exactly one least-privilege scope (`session:mint`, `users:provision`, `users:resolve`,
-  `workspace:read`, `workspace:settings:write`, `spaces:read`, `spaces:write`, `pages:read`, `content:read`,
-  `changes:read`).
+  `workspace:read`, `workspace:settings:write`, `spaces:read`, `spaces:write`, `pages:read`, `pages:authz:read`,
+  `content:read`, `content:search`, `attachments:read`, `changes:read`).
 - **The platform is the authorization authority.** Identity-mutating endpoints are keyed only on an opaque
   `externalId` (no arbitrary-identity selection). The `content/*` read endpoints are a **privileged data
   plane, not a second gate**: the platform performs the PDP decision first and passes the authorized id set;

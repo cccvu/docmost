@@ -37,4 +37,8 @@ export enum ServiceScope {
   // Group D (issue #171): the authz change-feed + snapshot the platform drains to project membership/page/
   // restriction changes into SpiceDB. Read-only; replaces the platform's direct Docmost-DB outbox access.
   ChangesRead = 'changes:read',
+  // #545: the CURRENT authorization structure of pages (placement, restriction, lineage) the platform's page
+  // projector re-reads on every page event. Read-only, and distinct from changes:read because it is called once per
+  // page event (plus fan-out and reconcile) and so gets its own, larger rate bucket (ServiceAuthGuard).
+  PagesAuthzRead = 'pages:authz:read',
 }

@@ -32,6 +32,7 @@ const DEFAULT_WS = uuid(100);
 const FOREIGN_WS = uuid(200);
 const PAGE = uuid(50);
 const OTHER_PAGE = uuid(51);
+const TRASHED_PAGE = uuid(52);
 const SPACE = uuid(60);
 
 d('ServiceAttachmentService on real Postgres (resolve + list + paging keyset)', () => {
@@ -76,6 +77,10 @@ d('ServiceAttachmentService on real Postgres (resolve + list + paging keyset)', 
         created_at timestamptz not null default now(), updated_at timestamptz not null default now(),
         deleted_at timestamptz
       )`;
+    // The pages resolvePage joins (#493: an attachment of a trashed or missing page does not resolve).
+    await pg`create table pages (id uuid primary key, deleted_at timestamptz)`;
+    await pg`insert into pages (id) values (${PAGE}), (${OTHER_PAGE})`;
+    await pg`insert into pages (id, deleted_at) values (${TRASHED_PAGE}, now())`;
     svc = new ServiceAttachmentService(db as any, fakeWorkspaceResolver(DEFAULT_WS));
 
     // resolve fixtures (uuid(1) lives on OTHER_PAGE so it does not pollute PAGE's list assertions below)
@@ -83,6 +88,8 @@ d('ServiceAttachmentService on real Postgres (resolve + list + paging keyset)', 
     await insertAttachment(uuid(2), { pageId: null, spaceId: null, type: 'avatar' }); // non-page (null page/space)
     await insertAttachment(uuid(3), { workspaceId: FOREIGN_WS }); // cross-tenant
     await insertAttachment(uuid(4), { deleted: true }); // soft-deleted
+    await insertAttachment(uuid(5), { pageId: TRASHED_PAGE }); // on a trashed page
+    await insertAttachment(uuid(6), { pageId: uuid(98) }); // on a page that no longer exists
 
     // list fixtures on PAGE: a non-file (excluded) + 4 file rows with controlled created_at (uuid 12/13 tie)
     await insertAttachment(uuid(10), { pageId: PAGE, type: 'chat' }); // not type=file → excluded
@@ -110,6 +117,10 @@ d('ServiceAttachmentService on real Postgres (resolve + list + paging keyset)', 
       await expect(svc.resolvePage(uuid(3))).rejects.toBeInstanceOf(NotFoundException);
       await expect(svc.resolvePage(uuid(4))).rejects.toBeInstanceOf(NotFoundException);
       await expect(svc.resolvePage(uuid(999))).rejects.toBeInstanceOf(NotFoundException);
+    });
+    it('404s an attachment of a TRASHED or missing page (#493: trash keeps page#view, /v1 must not serve it)', async () => {
+      await expect(svc.resolvePage(uuid(5))).rejects.toBeInstanceOf(NotFoundException);
+      await expect(svc.resolvePage(uuid(6))).rejects.toBeInstanceOf(NotFoundException);
     });
   });
 

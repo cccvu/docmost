@@ -23,6 +23,8 @@ import { WorkspaceSettingsView } from './service-workspace.service';
 import { ShadowUserLookup } from './service-bridge.service';
 import { UpdateSpaceMemberDto } from './dto/space-admin.dto';
 import { DescendantFacts, LifecycleTarget, PageLifecycleState, TrashedPageRow } from './service-page-lifecycle.service';
+import { PageAuthzState, PageAuthzStateResult } from './page-authz-state.service';
+import { PAGE_AUTHZ_STATE_MAX, PageAuthzStateDto } from './dto/page-authz-state.dto';
 
 /**
  * Provider-side contract test: the routes the fork actually implements MUST equal the operations declared in
@@ -212,6 +214,9 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     // #485 lifecycle facts. (PageLifecycleState itself has one OPTIONAL key, so it is pinned separately below.)
     PageLifecycleTarget: keysOf<LifecycleTarget>({ parentPageId: true, exists: true, spaceId: true, deletedAt: true, restrictedLineageIds: true, lineageComplete: true, isSelfOrDescendant: true, nextPosition: true }),
     TrashedPage: keysOf<TrashedPageRow>({ id: true, title: true, icon: true, parentPageId: true, deletedAt: true, deletedBy: true }),
+    // #545 page authz state.
+    PageAuthzState: keysOf<PageAuthzState>({ pageId: true, exists: true, spaceId: true, parentPageId: true, restricted: true, lineageRestricted: true, lineageComplete: true }),
+    PageAuthzStateResponse: keysOf<PageAuthzStateResult>({ pages: true, nextAfter: true }),
   };
 
   // The 5 inline (non-component) scalar bodies, tied to the CONTROLLER return types (a signature change reds).
@@ -255,7 +260,20 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     { id: 'listPageAttachments', method: 'get', path: '/api/service/attachments/by-page/{pageId}', expect: { kind: 'items', name: 'PublicAttachmentSummary' } },
     { id: 'pageLifecycleState', method: 'post', path: '/api/service/pages/lifecycle-state', expect: { kind: 'ref', name: 'PageLifecycleState' } },
     { id: 'listTrashedPages', method: 'post', path: '/api/service/pages/trash', expect: { kind: 'items', name: 'TrashedPage' } },
+    { id: 'getPageAuthzState', method: 'post', path: '/api/service/authz/pages/state', expect: { kind: 'ref', name: 'PageAuthzStateResponse' } },
   ];
+
+  // #545: the request is typed against the DTO (a field added on either side fails) and its caps are the DTO's.
+  it('PageAuthzStateRequest declares exactly the DTO keys, none required, with the DTO caps', () => {
+    const schema = SPEC.components.schemas.PageAuthzStateRequest;
+    expect(sortedKeys(schema.properties)).toEqual(
+      keysOf<PageAuthzStateDto>({ pageIds: true, subtreeRootId: true, after: true, limit: true }),
+    );
+    expect(schema.required).toBeUndefined();
+    expect(schema.additionalProperties).toBe(false);
+    expect(schema.properties.pageIds.maxItems).toBe(PAGE_AUTHZ_STATE_MAX);
+    expect(schema.properties.limit.maximum).toBe(PAGE_AUTHZ_STATE_MAX);
+  });
 
   // #485: `target` is present only when the request named one, so it is the one non-required key.
   it('PageLifecycleState has exactly the fork type’s keys, all required but the optional `target`', () => {

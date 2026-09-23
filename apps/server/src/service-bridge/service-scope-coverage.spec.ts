@@ -72,6 +72,7 @@ const EXPECTED_SCOPE: Record<string, ServiceScope> = {
   'ServiceAttachmentController.listByPage': ServiceScope.AttachmentsRead,
   'AuthzChangeController.changes': ServiceScope.ChangesRead,
   'AuthzChangeController.getSnapshot': ServiceScope.ChangesRead,
+  'AuthzChangeController.pagesState': ServiceScope.PagesAuthzRead, // #545: its own (larger) rate bucket
 };
 
 /**

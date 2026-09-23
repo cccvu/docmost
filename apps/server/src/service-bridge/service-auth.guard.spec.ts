@@ -129,6 +129,39 @@ describe('ServiceAuthGuard', () => {
       }
     });
 
+    // Hot-path scopes have their OWN, larger window — a burst of them can neither starve the other scopes nor be
+    // throttled at the shared 600/min: #545 the page projector's per-event reads, #493 the /v1 live-page resolve.
+    it.each([ServiceScope.PagesAuthzRead, ServiceScope.PagesRead])(
+      '%s is limited by its own larger window, independent of the shared one',
+      (scope) => {
+        const pages = new ServiceAuthGuard(reflectorReturning(scope));
+        const other = new ServiceAuthGuard(reflectorReturning(ServiceScope.ChangesRead));
+        (pages as any).limiter = (other as any).limiter; // one shared window, as in one process
+        let passed = 0;
+        for (let i = 0; i < 700; i++) if (pages.canActivate(ctx(SECRET))) passed++;
+        expect(passed).toBe(700); // beyond the shared 600/min
+        expect(other.canActivate(ctx(SECRET))).toBe(true); // and the shared window was never touched
+        const window = (pages as any).scopeLimiters.get(scope);
+        while (window.allow(`shared:${scope}`)) {
+          /* exhaust the scope's own window */
+        }
+        expect(() => pages.canActivate(ctx(SECRET))).toThrow(expect.objectContaining({ status: 429 }));
+      },
+    );
+
+    it('every other scope stays on the shared 600/min window', () => {
+      const g = new ServiceAuthGuard(reflectorReturning(ServiceScope.ChangesRead));
+      let passed = 0;
+      for (let i = 0; i < 700; i++) {
+        try {
+          if (g.canActivate(ctx(SECRET))) passed++;
+        } catch (e: any) {
+          expect(e.getStatus?.()).toBe(429);
+        }
+      }
+      expect(passed).toBe(600);
+    });
+
     // F6: a valid credential is NOT starved by a flood of bad requests — the anon bucket and the
     // per-credential bucket are separate keys.
     it('F6: a valid credential still passes even after the anon bucket is exhausted', () => {
