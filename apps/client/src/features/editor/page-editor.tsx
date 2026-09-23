@@ -61,7 +61,9 @@ import {
   CollabAccessEvent,
   CollabAccessState,
   collabAllowsEditing,
+  currentCollabToken,
   initialCollabAccess,
+  isCollabTokenExpired,
   nextCollabAccess,
 } from "@/features/editor-ux/collab-access";
 import DrawioMenu from "./components/drawio/drawio-menu";
@@ -75,7 +77,6 @@ import { useParams } from "react-router-dom";
 import { extractPageSlugId, platformModifierKey } from "@/lib";
 import { FIVE_MINUTES } from "@/lib/constants.ts";
 import { PageEditMode } from "@/features/user/types/user.types.ts";
-import { jwtDecode } from "jwt-decode";
 import { searchSpotlight } from "@/features/search/constants.ts";
 import { useEditorScroll } from "./hooks/use-editor-scroll";
 import { EditorAiMenu } from "@/ee/ai/components/editor/ai-menu/ai-menu";
@@ -185,14 +186,24 @@ export default function PageEditor({
           setYjsConnectionStatus(WebSocketStatus.Disconnected);
         }
         if (step.reconnect) {
+          // Reopen on the socket's own `disconnect` (status is back to Disconnected), not on a timer:
+          // `disconnect()` keeps the status Connected until the browser's close event, and `connect()`
+          // is a no-op while it reads Connected — a slow close would strand the editor.
+          const reopen = () => {
+            socket.off("disconnect", reopen);
+            if (providersRef.current?.socket === socket) socket.connect(); // not after unmount
+          };
+          socket.on("disconnect", reopen);
           socket.disconnect();
-          setTimeout(() => socket.connect(), 100);
         }
       };
       const onAuthenticationFailedHandler = () => {
-        const payload = jwtDecode(collabQuery?.token);
-        const now = Date.now().valueOf() / 1000;
-        const isTokenExpired = now >= payload.exp;
+        // CCC (#501): judge the token the provider actually sent — a refresh updates remote.configuration.token,
+        // and the mount-time collabQuery token would read every later refusal as an expiry (a refetch loop).
+        const isTokenExpired = isCollabTokenExpired(
+          currentCollabToken(remote.configuration.token, collabQuery?.token),
+          Date.now(),
+        );
         onCollabAccess({ kind: "auth-failed", tokenExpired: isTokenExpired });
         if (isTokenExpired) {
           refetchCollabToken().then((result) => {

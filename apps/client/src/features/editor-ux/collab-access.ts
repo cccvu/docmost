@@ -1,3 +1,5 @@
+import { jwtDecode } from "jwt-decode";
+
 /**
  * CCC fork addition (cccvu/wiki-v2#501) — how an open editor reacts when the server narrows its collab access.
  *
@@ -74,4 +76,31 @@ export function nextCollabAccess(
 /** The editor may edit only if the page allows it AND the server still lets this connection write. */
 export function collabAllowsEditing(state: CollabAccessState): boolean {
   return !state.lost && !state.readOnly;
+}
+
+/**
+ * The collab token the provider will send on its next authentication. A refresh writes the new token to
+ * `remote.configuration.token`; the value captured when the editor mounted goes stale after the first refresh,
+ * and deciding "expired?" from it misreads every later refusal as an expiry (refetch → reconnect → refused,
+ * forever, never reaching the lost state).
+ */
+export function currentCollabToken(
+  configured: unknown,
+  initial: string | undefined,
+): string | undefined {
+  return typeof configured === "string" && configured ? configured : initial;
+}
+
+/** Expired (or unreadable/missing — refresh it rather than declare access lost). */
+export function isCollabTokenExpired(
+  token: string | undefined,
+  nowMs: number,
+): boolean {
+  if (!token) return true;
+  try {
+    const { exp } = jwtDecode(token);
+    return typeof exp !== "number" || nowMs / 1000 >= exp;
+  } catch {
+    return true;
+  }
 }
