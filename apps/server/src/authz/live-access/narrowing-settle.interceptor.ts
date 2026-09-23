@@ -8,7 +8,7 @@ import {
 } from '@nestjs/common';
 import type { FastifyReply } from 'fastify';
 import { InjectKysely } from 'nestjs-kysely';
-import { Observable, mergeMap } from 'rxjs';
+import { Observable, from, mergeMap } from 'rxjs';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
 import { AUTHZ_MODE, AuthzMode } from '../mode/authz-mode';
 import { HttpAuthzClient } from '../http-authz.client';
@@ -42,12 +42,18 @@ export function narrowingSettleTimeoutMs(
  *
  * Confirm-before-respond for the routes that take access away (`narrowing-routes.ts`). A narrowing change commits
  * here first and reaches the PDP through the outbox → platform relay; until then, decisions still allow the old
- * access. So after such a handler SUCCEEDS (remote mode only), and before the response leaves:
- *   1. read the fence `P` = the max committed outbox position (`maxCommittedPosition`, never the xmin-gated head);
+ * access. So on such a route (remote mode only):
+ *   0. before the handler, read the current fence; after it SUCCEEDS, read it again. Unchanged means nothing was
+ *      committed to the outbox meanwhile — this request changed no access (a same-parent reorder, a no-op) — so
+ *      there is nothing to settle and no header (unknown). Our own rows always move it: their transaction id is
+ *      assigned after the first read, so they sort after everything committed before it;
+ *   1. the fence `P` = that max committed outbox position (`maxCommittedPosition`, never the xmin-gated head);
  *   2. ask the platform to settle to `P` (`POST /sync/settle`, bounded) — `confirmed` means the relay projected
  *      every access change committed up to now, this request's included, and refreshed the watermark;
  *   3. on `confirmed`, give this node's live connections a re-check (bounded; other nodes' sweeps are the bound);
- *   4. set `Authz-Propagation: confirmed | pending`.
+ *   4. set `Authz-Propagation: confirmed | pending`. A `pending` the platform did not itself answer (it was
+ *      unreachable, had no route, or timed out) is logged here with the alarmed `AUTHZ_PROPAGATION_PENDING`; one it
+ *      answered was already logged and alarmed there.
  * The fence is GLOBAL on purpose: the outbox rows come from triggers inside upstream transactions that name no
  * request, and a per-request fence could under-wait (a move-to-space writes rows about the whole subtree), which
  * would report `confirmed` for a change that is not enforced. A global fence can only over-wait, bounded.
@@ -79,33 +85,52 @@ export class NarrowingSettleInterceptor implements NestInterceptor {
     if (!NARROWING_ROUTES.has(route)) return next.handle();
     const startedAt = Date.now();
     const reply = context.switchToHttp().getResponse<FastifyReply>();
-    return next.handle().pipe(
-      mergeMap(async (body) => {
-        const verdict = await this.settle(route, startedAt);
-        if (!reply.sent) reply.header(AUTHZ_PROPAGATION_HEADER, verdict);
-        return body;
-      }),
+    // null = unknown (the read failed): then settle anyway, never skip on a guess.
+    const before = maxCommittedPosition(this.db).catch(() => null);
+    return from(before).pipe(
+      mergeMap((fenceBefore) =>
+        next.handle().pipe(
+          mergeMap(async (body) => {
+            const verdict = await this.settle(route, startedAt, fenceBefore);
+            if (verdict && !reply.sent) {
+              reply.header(AUTHZ_PROPAGATION_HEADER, verdict);
+            }
+            return body;
+          }),
+        ),
+      ),
     );
   }
 
+  /** The verdict for the header, or null when this request committed no access change (no header). */
   private async settle(
     route: string,
     startedAt: number,
-  ): Promise<'confirmed' | 'pending'> {
+    fenceBefore: string | null,
+  ): Promise<'confirmed' | 'pending' | null> {
     const left = () => REQUEST_BUDGET_MS - (Date.now() - startedAt);
     let position = '?';
     try {
       position = await maxCommittedPosition(this.db);
+      if (fenceBefore !== null && position === fenceBefore) return null;
       const waitMs = Math.max(
         0,
         Math.min(this.settleMs, left() - REVALIDATE_WAIT_MS),
       );
       const settled = await this.authz.settleProjection(position, waitMs);
       if (settled.status !== 'confirmed') {
-        this.logger.warn(
-          `narrowing change answered before the PDP enforced it (Authz-Propagation: pending): route=${route} ` +
-            `position=${position} reason=${settled.reason}`,
-        );
+        if (settled.reason.startsWith('settle-')) {
+          // No verdict from the platform, so nothing was logged there: this line is the alarm.
+          this.logger.warn(
+            `AUTHZ_PROPAGATION_PENDING reason=${settled.reason} route=${route} position=${position} ` +
+              `the fork got no settle verdict from the platform; the narrowing change is saved but not shown enforced`,
+          );
+        } else {
+          this.logger.warn(
+            `narrowing change answered before the PDP enforced it (Authz-Propagation: pending): route=${route} ` +
+              `position=${position} reason=${settled.reason}`,
+          );
+        }
         return 'pending';
       }
       await this.revalidateLocal(
@@ -114,7 +139,8 @@ export class NarrowingSettleInterceptor implements NestInterceptor {
       return 'confirmed';
     } catch (e) {
       this.logger.warn(
-        `narrowing settle failed (Authz-Propagation: pending): route=${route} position=${position}: ${(e as Error).message}`,
+        `AUTHZ_PROPAGATION_PENDING reason=settle-fence-unreadable route=${route} position=${position} ` +
+          `the narrowing change is saved but its settle failed: ${(e as Error).message}`,
       );
       return 'pending';
     }

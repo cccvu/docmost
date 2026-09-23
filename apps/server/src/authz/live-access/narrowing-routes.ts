@@ -9,12 +9,13 @@
  * changes through the service bridge.
  *
  * Deliberately NOT here (ADR 0026 §4, "eventual, bounded"): trash / permanent delete, space and group delete,
- * workspace-member delete and deactivate, and every widening route (unrestrict, add member, add grant). Those still
- * reach live sessions through the relay signal and the sweep.
+ * workspace-member delete and deactivate, and the purely widening routes (native add member, add group member).
+ * Those still reach live sessions through the relay signal and the sweep.
  */
 export const NARROWING_ROUTES: ReadonlySet<string> = new Set([
   // page restriction + grants (fork-owned controller)
   'PageRestrictionController.restrict',
+  'PageRestrictionController.removeRestriction', // drops every grant with the marker: a grantee can lose edit
   'PageRestrictionController.addPermission', // an existing grantee's role is replaced (can demote)
   'PageRestrictionController.removePermission',
   'PageRestrictionController.updatePermission',

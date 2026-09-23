@@ -121,6 +121,7 @@ describe('AuthzChangeFeedService (R2 commit-safe cursor)', () => {
     const res = await svc.getChanges('49.0', 0, 500);
     expect(res.events).toHaveLength(1);
     expect(res.nextCursor).toBe('50.8'); // the cursor still advances past the dropped row (the reconciler is the backstop)
+    expect(res.dropped).toBe(1); // reported, so the platform dead-letters the range (a settle then stays pending, #501)
     const dropped = warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes('AUTHZ_CHANGE_EVENT_DROPPED'));
     expect(dropped).toHaveLength(1);
     expect(dropped[0]).toContain('space_members');

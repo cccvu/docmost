@@ -107,6 +107,10 @@ export interface ChangesResult {
   /** Age in ms of the OLDEST safe row still pending after `nextCursor` (null when caught up). Feeds the
    *  platform's oldest-unconsumed-age alarm without the platform ever querying Docmost. */
   oldestPendingAgeMs: number | null;
+  /** How many rows in this batch came from a table the mapper KNOWS yet mapped to nothing (a mapper/payload
+   *  defect, `AUTHZ_CHANGE_EVENT_DROPPED`). `nextCursor` still advances past them, so the platform records the
+   *  range as a dead letter: the change was never projected, and a settle must not report it enforced (#501). */
+  dropped: number;
 }
 
 /** Thrown when the requested cursor is STRICTLY below the retention high-water mark (an un-consumed event was
@@ -267,7 +271,7 @@ export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
     const last = raw.length ? raw[raw.length - 1] : null;
     const nextCursor = last ? formatCursor(last.xactId, last.id) : formatCursor(cursor.xactId, cursor.id);
     const oldestPendingAgeMs = await this.oldestPendingAgeMs(parseCursor(nextCursor));
-    return { events, nextCursor, head, oldestPendingAgeMs };
+    return { events, nextCursor, head, oldestPendingAgeMs, dropped: dropped.length };
   }
 
   /** The long-poll wait after an empty gated read. Parks until a wake or the deadline, EXCEPT that (a) a wake

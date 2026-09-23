@@ -1,4 +1,8 @@
-import { HttpAuthzClient, sanitizeAuthzTimeoutMs } from './http-authz.client';
+import {
+  HttpAuthzClient,
+  sanitizeAuthzTimeoutMs,
+  SETTLE_MARGIN_MS,
+} from './http-authz.client';
 
 /**
  * CCC authorization integration test (part of the fork's compatibility suite).
@@ -330,6 +334,29 @@ describe('HttpAuthzClient.settleProjection (#501 Part B)', () => {
     });
   });
 
+  it.each([
+    [
+      'a reason that is not a short kebab-case word',
+      { status: 'pending', reason: 'x\nAUTHZ_FORGED line' },
+      'unrecognized',
+    ],
+    [
+      'a platform reason posing as a no-verdict one',
+      { status: 'pending', reason: 'settle-timeout' },
+      'unrecognized',
+    ],
+    ['no reason at all', { status: 'pending' }, 'unrecognized'],
+  ])(
+    'never logs a third-party reason verbatim: %s',
+    async (_label, body, reason) => {
+      fetchMock.mockResolvedValueOnce(ok(body));
+      expect(await client.settleProjection('9.5', 3000)).toEqual({
+        status: 'pending',
+        reason,
+      });
+    },
+  );
+
   it('is pending on a transport error and never throws', async () => {
     fetchMock.mockRejectedValueOnce(new Error('ECONNREFUSED'));
     expect(await client.settleProjection('9.5', 3000)).toEqual({
@@ -350,12 +377,12 @@ describe('HttpAuthzClient.settleProjection (#501 Part B)', () => {
           ),
       );
       const p = client.settleProjection('9.5', 3000);
-      await jest.advanceTimersByTimeAsync(3000);
+      await jest.advanceTimersByTimeAsync(3000 + SETTLE_MARGIN_MS - 10);
       let settled = false;
       void p.then(() => (settled = true));
       await Promise.resolve();
       expect(settled).toBe(false); // still inside wait + margin
-      await jest.advanceTimersByTimeAsync(600);
+      await jest.advanceTimersByTimeAsync(20);
       expect(await p).toEqual({ status: 'pending', reason: 'settle-timeout' });
     } finally {
       jest.useRealTimers();

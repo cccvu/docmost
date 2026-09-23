@@ -31,8 +31,9 @@ And one OPTIONAL endpoint (1.1.0, #501):
 - `/sync/settle` `{ position, timeoutMs }` -> `{ status: "confirmed" | "pending", reason? }`. After a request that
   takes access away succeeds, the fork asks whether every access change up to its outbox position `position` is
   already reflected in your decisions, and reports the answer to its caller as the `Authz-Propagation` response
-  header. Answer `confirmed` only when that is true. Without this route (404), every such response says
-  `pending`: safe, never a failure. `AUTHZ_NARROWING_SETTLE_TIMEOUT_MS` (default 3000, max 5000, `0` = off) is
+  header. Answer `confirmed` only when that is true. Positions (like change-feed cursors) order as a pair of
+  64-bit integers `(xact_id, id)`, never as strings: `"9.9"` is before `"10.1"`. Without this route (404), every
+  such response says `pending`: safe, never a failure. `AUTHZ_NARROWING_SETTLE_TIMEOUT_MS` (default 3000, max 5000, `0` = off) is
   how long the fork lets you wait.
 
 Point the fork at your service with two environment variables:
@@ -94,7 +95,8 @@ You only implement a *caller* for these; the fork is the server. They fall into 
   event `seq` is diagnostic only). This requires PostgreSQL 13+ (the installer fails the boot in remote mode
   otherwise). The durable outbox is the source of truth (LISTEN/NOTIFY is a wakeup-only latency optimization);
   a cursor at/below the retention high-water mark returns `409 {stale, head}` so the platform rebaselines
-  (reconcile, then reset its cursor to the snapshot `baseline`) rather than skipping. This replaces the
+  (reconcile, then reset its cursor to the snapshot `baseline`) rather than skipping. A batch whose `dropped` is
+  non-zero (1.6.0) advanced past rows that mapped to no event: record it as skipped until a reconcile repairs it. This replaces the
   platform reaching directly into Docmost's database, so it needs no Docmost DB credentials.
 - **Collab** (`collab`): `POST /api/collab/revalidate` (re-check every live realtime connection after a
   narrowing access change and narrow the ones that lost access, #501; it replaced the per-page

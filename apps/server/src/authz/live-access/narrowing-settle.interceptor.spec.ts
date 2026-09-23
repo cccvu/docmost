@@ -31,6 +31,7 @@ class PageRestrictionController {
 }
 class PageController {
   getPage() {}
+  movePage() {}
 }
 
 function ctx(controller: new () => object, handler: string) {
@@ -76,7 +77,12 @@ const run = (
 
 let warn: jest.SpyInstance;
 beforeEach(() => {
-  mockedFence.mockReset().mockResolvedValue('42.7');
+  // Two reads per request: the fence before the handler ('41.0') and after it ('42.7') — it moved, so there is
+  // something to settle. Tests that need another shape reset it.
+  let reads = 0;
+  mockedFence
+    .mockReset()
+    .mockImplementation(async () => (++reads % 2 === 1 ? '41.0' : '42.7'));
   warn = jest
     .spyOn(Logger.prototype, 'warn')
     .mockImplementation(() => undefined);
@@ -107,18 +113,83 @@ describe('NarrowingSettleInterceptor', () => {
     await run(icpt, context);
     expect(reply.headers[AUTHZ_PROPAGATION_HEADER]).toBe('pending');
     expect(liveAccess.signal).not.toHaveBeenCalled();
-    expect(String(warn.mock.calls[0][0])).toMatch(
+    const line = String(warn.mock.calls[0][0]);
+    expect(line).toMatch(
       /route=PageRestrictionController\.restrict position=42\.7 reason=timeout/,
+    );
+    // The platform answered (and logged the alarmed line itself): the fork must not count it twice.
+    expect(line).not.toContain('AUTHZ_PROPAGATION_PENDING');
+  });
+
+  it('a pending with NO platform verdict (settle-*) is logged here with the alarmed token', async () => {
+    const settle = jest.fn(async () => ({
+      status: 'pending',
+      reason: 'settle-http-404',
+    }));
+    const { icpt } = build({ settle });
+    const { context, reply } = ctx(PageRestrictionController, 'restrict');
+    await run(icpt, context);
+    expect(reply.headers[AUTHZ_PROPAGATION_HEADER]).toBe('pending');
+    expect(String(warn.mock.calls[0][0])).toMatch(
+      /^AUTHZ_PROPAGATION_PENDING reason=settle-http-404 route=PageRestrictionController\.restrict position=42\.7/,
     );
   });
 
-  it('a fence that cannot be read is pending, never an error', async () => {
-    mockedFence.mockRejectedValueOnce(new Error('db down'));
+  it('a fence that cannot be read after the handler is pending (alarmed), never an error', async () => {
+    mockedFence
+      .mockReset()
+      .mockResolvedValueOnce('41.0')
+      .mockRejectedValueOnce(new Error('db down'));
     const { icpt, authz } = build();
     const { context, reply } = ctx(PageRestrictionController, 'restrict');
     await expect(run(icpt, context)).resolves.toEqual({ data: 'x' });
     expect(reply.headers[AUTHZ_PROPAGATION_HEADER]).toBe('pending');
     expect(authz.settleProjection).not.toHaveBeenCalled();
+    expect(String(warn.mock.calls[0][0])).toMatch(
+      /^AUTHZ_PROPAGATION_PENDING reason=settle-fence-unreadable/,
+    );
+  });
+
+  it('a request that committed no outbox row (fence unchanged: a same-parent reorder, a no-op) settles nothing and sends no header', async () => {
+    mockedFence.mockReset().mockResolvedValue('42.7');
+    const { icpt, authz, liveAccess } = build();
+    const { context, reply } = ctx(PageController, 'movePage');
+    const body = { data: 'moved' };
+    expect(await run(icpt, context, body)).toBe(body);
+    expect(authz.settleProjection).not.toHaveBeenCalled();
+    expect(liveAccess.signal).not.toHaveBeenCalled();
+    expect(reply.headers).toEqual({}); // unknown — never confirmed
+  });
+
+  it('reads the "before" fence BEFORE the handler runs', async () => {
+    const order: string[] = [];
+    mockedFence.mockReset().mockImplementation(async () => {
+      order.push('fence');
+      return order.length === 1 ? '41.0' : '42.7';
+    });
+    const { icpt } = build();
+    const { context } = ctx(PageRestrictionController, 'restrict');
+    await lastValueFrom(
+      icpt.intercept(context, {
+        handle: () => {
+          order.push('handler');
+          return of({});
+        },
+      }),
+    );
+    expect(order).toEqual(['fence', 'handler', 'fence']);
+  });
+
+  it('an unreadable "before" fence never skips: it settles as usual', async () => {
+    mockedFence
+      .mockReset()
+      .mockRejectedValueOnce(new Error('db blip'))
+      .mockResolvedValue('42.7');
+    const { icpt, authz } = build();
+    const { context, reply } = ctx(PageRestrictionController, 'restrict');
+    await run(icpt, context);
+    expect(authz.settleProjection).toHaveBeenCalledWith('42.7', 3000);
+    expect(reply.headers[AUTHZ_PROPAGATION_HEADER]).toBe('confirmed');
   });
 
   it('leaves a failed handler alone: the error passes through, nothing is settled, no header', async () => {
@@ -197,6 +268,40 @@ describe('NarrowingSettleInterceptor', () => {
     } finally {
       jest.useRealTimers();
     }
+  });
+
+  it('a failing live-session pass does not change the verdict (the PDP already enforces the change)', async () => {
+    const signal = jest.fn(async () => {
+      throw new Error('pass failed');
+    });
+    const { icpt } = build({ signal });
+    const { context, reply } = ctx(PageRestrictionController, 'restrict');
+    await run(icpt, context);
+    expect(reply.headers[AUTHZ_PROPAGATION_HEADER]).toBe('confirmed');
+  });
+
+  it('caps the live-session wait by what is left of the request budget', async () => {
+    const t0 = 2_000_000;
+    const now = jest.spyOn(Date, 'now').mockReturnValue(t0);
+    const signal = jest.fn(() => new Promise(() => undefined)); // never settles
+    const settle = jest.fn(async () => {
+      now.mockReturnValue(t0 + REQUEST_BUDGET_MS); // the settle used the whole budget
+      return { status: 'confirmed' };
+    });
+    const { icpt } = build({ settle, signal });
+    const { context, reply } = ctx(PageRestrictionController, 'restrict');
+    await run(icpt, context); // real timers: a 0 ms wait, so this returns at once
+    expect(signal).toHaveBeenCalledWith('narrowing');
+    expect(reply.headers[AUTHZ_PROPAGATION_HEADER]).toBe('confirmed');
+  });
+
+  it('passes through a non-HTTP context', async () => {
+    const { icpt, authz } = build();
+    const { context } = ctx(PageRestrictionController, 'restrict');
+    context.getType = () => 'ws';
+    await run(icpt, context);
+    expect(authz.settleProjection).not.toHaveBeenCalled();
+    expect(mockedFence).not.toHaveBeenCalled();
   });
 
   it('does not set a header on a reply that was already sent', async () => {
