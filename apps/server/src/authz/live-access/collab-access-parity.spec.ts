@@ -9,6 +9,7 @@ jest.mock('../../collaboration/collaboration.util', () => ({
 import { AuthenticationExtension } from '../../collaboration/extensions/authentication.extension';
 import { PdpSpaceMemberRepo } from '../pdp-space-member.repo';
 import { PdpPagePermissionRepo } from '../pdp-page-permission.repo';
+import { spyKysely } from '../../service-bridge/kysely-spy.testkit';
 import { CollabAccess, decideCollabAccess } from './collab-access.decision';
 
 /**
@@ -21,7 +22,12 @@ import { CollabAccess, decideCollabAccess } from './collab-access.decision';
  * extension over the real PDP-backed repos, and the pure decision — and asserts they agree.
  *
  * The one deliberate difference is a PDP failure: connect fails closed (deny), revalidation answers `unknown`
- * (no action; the revalidator caps consecutive unknowns). That mapping is asserted explicitly below.
+ * (no action; the revalidator caps consecutive unknowns). That mapping is asserted explicitly below, and so is the
+ * same mapping for a failed #524 lineage read.
+ *
+ * #524: each case also fixes the page's lineage in the fork's own rows (`open` = a root with no restriction,
+ * `restricted` = a restriction on it). The connect path reads it through the real repo; the decision is handed
+ * what the revalidator would read (`lineageRestricted`).
  */
 
 const USER = '11111111-1111-4111-8111-111111111111';
@@ -42,6 +48,22 @@ interface Case {
   page?: Record<string, unknown> | null;
   grants: Grants;
   pdpFails?: boolean;
+  lineage?: 'open' | 'restricted' | 'error';
+}
+
+/** The fork DB for the repo's #524 lineage walk: a one-row walk that ends at a root. */
+function dbFor(c: Case) {
+  return spyKysely((q) => {
+    if (c.lineage === 'error') throw new Error('db down');
+    return [
+      {
+        id: q.parameters[0],
+        parent_page_id: null,
+        depth: 0,
+        restricted: c.lineage === 'restricted',
+      },
+    ];
+  }).db;
 }
 
 /** A PDP stub for the repos: answers space administer/edit/view and page view/edit/locked from `grants`. */
@@ -82,7 +104,7 @@ async function connectDecision(c: Case): Promise<CollabAccess> {
     { findById: async () => (c.user === undefined ? liveUser : c.user) } as any,
     { findById: async () => (c.page === undefined ? livePage : c.page) } as any,
     new PdpSpaceMemberRepo({} as any, {} as any, {} as any, {} as any, authz),
-    new PdpPagePermissionRepo({} as any, {} as any, {} as any, authz),
+    new PdpPagePermissionRepo(dbFor(c), {} as any, {} as any, authz),
   );
   const data = {
     documentName: `page.${PAGE}`,
@@ -110,6 +132,8 @@ function revalidateDecision(c: Case): CollabAccess {
     pagePerms: c.pdpFails
       ? null
       : { view: !!g.pageView, edit: !!g.pageEdit, locked: !!g.locked },
+    lineageRestricted:
+      c.lineage === 'error' ? null : c.lineage === 'restricted',
   });
 }
 
@@ -125,10 +149,13 @@ for (const [role, space] of roles) {
     for (const pageView of [false, true]) {
       for (const pageEdit of [false, true]) {
         if (pageEdit && !pageView) continue; // edit implies view in the schema
-        cases.push({
-          name: `${role}, locked=${locked}, pageView=${pageView}, pageEdit=${pageEdit}`,
-          grants: { ...space, locked, pageView, pageEdit },
-        });
+        for (const lineage of ['open', 'restricted'] as const) {
+          cases.push({
+            name: `${role}, locked=${locked}, pageView=${pageView}, pageEdit=${pageEdit}, lineage=${lineage}`,
+            grants: { ...space, locked, pageView, pageEdit },
+            lineage,
+          });
+        }
       }
     }
   }
@@ -138,6 +165,19 @@ cases.push(
     name: 'writer on a TRASHED page',
     page: { ...livePage, deletedAt: new Date() },
     grants: { edit: true, view: true, pageView: true, pageEdit: true },
+  },
+  // #524: trashing reaps #space/#parent, so the PDP answers no view, not locked for everyone.
+  {
+    name: 'writer on a TRASHED page the PDP no longer places, restricted lineage',
+    page: { ...livePage, deletedAt: new Date() },
+    grants: { edit: true, view: true },
+    lineage: 'restricted',
+  },
+  {
+    name: 'writer on a TRASHED page the PDP no longer places, open lineage',
+    page: { ...livePage, deletedAt: new Date() },
+    grants: { edit: true, view: true },
+    lineage: 'open',
   },
   {
     name: 'missing user',
@@ -174,5 +214,38 @@ describe('collab access parity: decideCollabAccess ⇔ AuthenticationExtension.o
     };
     expect(await connectDecision(c)).toBe('deny');
     expect(revalidateDecision(c)).toBe('unknown');
+  });
+
+  it('#524: a failed lineage read on an unplaced page is DENY at connect but UNKNOWN on revalidation', async () => {
+    const c: Case = {
+      name: 'lineage read fails',
+      grants: { edit: true, view: true },
+      lineage: 'error',
+    };
+    expect(await connectDecision(c)).toBe('deny');
+    expect(revalidateDecision(c)).toBe('unknown');
+  });
+
+  it('#524: a failed lineage read is never consulted for a page the PDP places', async () => {
+    const c: Case = {
+      name: 'placed, lineage read would fail',
+      grants: { edit: true, view: true, pageView: true, pageEdit: true },
+      lineage: 'error',
+    };
+    expect(await connectDecision(c)).toBe('write');
+    expect(revalidateDecision(c)).toBe('write');
+  });
+
+  it('non-vacuity: the lineage decides the unplaced cases (both paths flip together)', async () => {
+    const base: Case = {
+      name: 'unplaced writer',
+      grants: { edit: true, view: true },
+    };
+    const open = { ...base, lineage: 'open' as const };
+    const restricted = { ...base, lineage: 'restricted' as const };
+    expect(await connectDecision(open)).toBe('write');
+    expect(revalidateDecision(open)).toBe('write');
+    expect(await connectDecision(restricted)).toBe('deny');
+    expect(revalidateDecision(restricted)).toBe('deny');
   });
 });

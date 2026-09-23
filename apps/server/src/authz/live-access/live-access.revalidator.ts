@@ -5,6 +5,8 @@ import {
   OnModuleDestroy,
   OnModuleInit,
 } from '@nestjs/common';
+import { InjectKysely } from 'nestjs-kysely';
+import { KyselyDB } from '@docmost/db/types/kysely.types';
 import { UserRepo } from '@docmost/db/repos/user/user.repo';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { CollaborationGateway } from '../../collaboration/collaboration.gateway';
@@ -17,6 +19,10 @@ import {
   PagePermissions,
   SpacePermissions,
 } from './collab-access.decision';
+import {
+  lineageRestricted,
+  readPageLineage,
+} from '../../service-bridge/page-lineage';
 
 /**
  * CCC authorization integration — NOT upstream Docmost code (#501).
@@ -36,7 +42,8 @@ import {
  *     node's documents, a native deactivate that emits no event).
  *
  * What it does, per connection:
- *   - collab: `decideCollabAccess` (a mirror of `onAuthenticate`). `deny`, or `read` on a writable
+ *   - collab: `decideCollabAccess` (a mirror of `onAuthenticate`, including the #524 lineage read for a page the
+ *     PDP has not placed — read only for those pages, once per pass). `deny`, or `read` on a writable
  *     connection, closes it (`connection.close()`, the #455 pattern). Closing rather than flipping `readOnly`
  *     is deliberate: the client re-authenticates on reconnect, so a transient decision (e.g. between the
  *     delete and the insert of a non-atomic re-grant) heals itself instead of silently dropping the user's
@@ -154,6 +161,7 @@ export class LiveAccessRevalidator implements OnModuleInit, OnModuleDestroy {
     private readonly pageRepo: PageRepo,
     private readonly authz: HttpAuthzClient,
     @Inject(AUTHZ_MODE) private readonly mode: AuthzMode,
+    @InjectKysely() private readonly db: KyselyDB,
   ) {}
 
   onModuleInit(): void {
@@ -238,7 +246,7 @@ export class LiveAccessRevalidator implements OnModuleInit, OnModuleDestroy {
     };
     try {
       const users = new UserCache(this.userRepo);
-      await this.revalidateCollab(s, users);
+      await this.revalidateCollab(s, users, new LineageCache(this.db));
       await this.revalidateSockets(s, users);
     } catch (e) {
       this.logFailed(
@@ -272,6 +280,7 @@ export class LiveAccessRevalidator implements OnModuleInit, OnModuleDestroy {
   private async revalidateCollab(
     s: LiveAccessSummary,
     users: UserCache,
+    lineages: LineageCache,
   ): Promise<void> {
     // Snapshot first: closing a connection (or its document unloading) mutates the live maps.
     const entries: {
@@ -328,7 +337,18 @@ export class LiveAccessRevalidator implements OnModuleInit, OnModuleDestroy {
           } else {
             const space = page ? spacePerms(results, page.spaceId) : null;
             const pagePerms = page ? pagePermsOf(results, page.id) : null;
-            decision = decideCollabAccess({ user, page, space, pagePerms });
+            // #524: only a page the PDP has not placed needs its lineage (the decision reads it only then).
+            const lineage =
+              page && pagePerms && !pagePerms.view && !pagePerms.locked
+                ? await lineages.get(page.id)
+                : undefined;
+            decision = decideCollabAccess({
+              user,
+              page,
+              space,
+              pagePerms,
+              lineageRestricted: lineage,
+            });
           }
           this.actOnCollab(e.conn, decision, s);
         }
@@ -472,6 +492,24 @@ class UserCache {
         () => 'error' as const,
       );
       this.rows.set(userId, p);
+    }
+    return p;
+  }
+}
+
+/** #524: one lineage read per page per pass (it does not depend on the user). `null` = the read failed (unknown,
+ *  never a deny — the connect path denies on it, see collab-access.decision.ts). */
+class LineageCache {
+  private readonly rows = new Map<string, Promise<boolean | null>>();
+  constructor(private readonly db: KyselyDB) {}
+  get(pageId: string): Promise<boolean | null> {
+    let p = this.rows.get(pageId);
+    if (!p) {
+      p = readPageLineage(this.db, pageId, { includeSelf: true }).then(
+        lineageRestricted,
+        () => null,
+      );
+      this.rows.set(pageId, p);
     }
     return p;
   }
