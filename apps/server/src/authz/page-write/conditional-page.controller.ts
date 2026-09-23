@@ -9,16 +9,18 @@ import {
   ServiceUnavailableException,
   UseGuards,
 } from '@nestjs/common';
-import { IsOptional, IsString, MaxLength } from 'class-validator';
+import { IsBoolean, IsOptional, IsString, MaxLength } from 'class-validator';
 import { AuthUser } from '../../common/decorators/auth-user.decorator';
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { User } from '@docmost/db/types/entity.types';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
+import { PageHistoryRepo } from '@docmost/db/repos/page/page-history.repo';
 import { PageService } from '../../core/page/services/page.service';
 import { PageAccessService } from '../../core/page/page-access/page-access.service';
 import { UpdatePageDto } from '../../core/page/dto/update-page.dto';
 import { CollaborationGateway } from '../../collaboration/collaboration.gateway';
 import { ConditionalUpdateOutcome } from './collab-outcomes';
+import { stableHash } from './stable-hash';
 
 /**
  * EXTENDS `UpdatePageDto` deliberately, rather than restating its fields. The fork's global
@@ -49,6 +51,21 @@ export class ConditionalUpdatePageDto extends UpdatePageDto {
    * edge also rejects an over-long header, so this is the fork-side half of a two-layer bound.
    */
   @IsOptional() @IsString() @MaxLength(255) idempotencyKey?: string;
+
+  /**
+   * #485: before a content `replace`, save the page's CURRENT content as a history version, so the write can be
+   * undone in one step (the engine's own history job runs minutes later and would miss it). Skipped when the
+   * current content already equals the newest version or the incoming content. The response then carries
+   * `snapshot: { status: 'saved' | 'unchanged', historyId }`; the platform treats its ABSENCE as an engine that
+   * predates this field and refuses the write.
+   */
+  @IsOptional() @IsBoolean() snapshotBefore?: boolean;
+}
+
+/** What a `snapshotBefore` write reports back (#485). `historyId` is the version that holds the prior content. */
+export interface SnapshotOutcome {
+  status: 'saved' | 'unchanged';
+  historyId: string | null;
 }
 
 /**
@@ -82,6 +99,7 @@ export class ConditionalPageController {
     private readonly pageService: PageService,
     private readonly pageAccessService: PageAccessService,
     private readonly gateway: CollaborationGateway,
+    private readonly pageHistoryRepo?: PageHistoryRepo, // #485 snapshotBefore (appended)
   ) {}
 
   @HttpCode(HttpStatus.OK)
@@ -115,8 +133,10 @@ export class ConditionalPageController {
       format: _format,
       expectedContentHash: _expectedContentHash,
       idempotencyKey: _idempotencyKey,
+      snapshotBefore: _snapshotBefore,
       ...rest
     } = dto;
+    let snapshot: SnapshotOutcome | undefined;
     const metadataOnly: UpdatePageDto = { ...rest, pageId: page.id };
     // Does this request carry an actual metadata edit (title/icon/parent/…)? `rest` is `dto` minus the
     // content + transport fields; `pageId` only addresses the row, it is not an edit.
@@ -133,6 +153,12 @@ export class ConditionalPageController {
         dto.content,
         dto.format ?? 'json',
       );
+      // #485: snapshot AFTER the edit check and the parse (a refused or malformed write saves nothing), BEFORE
+      // the apply. A replace that then 412s leaves a version equal to the unchanged page — harmless, and the
+      // next attempt reports it as `unchanged` rather than saving a duplicate.
+      if (dto.snapshotBefore && (dto.operation ?? 'replace') === 'replace') {
+        snapshot = await this.snapshotCurrent(page.id, prosemirrorJson, dto.title);
+      }
       // `page.id`, NEVER `dto.pageId`. `PageRepo.findById` resolves a non-UUID as a slugId, and live
       // documents are keyed `page.<uuid>` — so a slug-shaped id would name a DIFFERENT document: the
       // precondition would find nothing resident and silently apply unconditionally, and the direct
@@ -160,7 +186,7 @@ export class ConditionalPageController {
           const current = await this.pageRepo.findById(page.id, {
             includeContent: true,
           });
-          return { ...current, permissions: { canEdit: true, hasRestriction } };
+          return { ...current, permissions: { canEdit: true, hasRestriction }, ...(snapshot ? { snapshot } : {}) };
         }
         // else: fall through to the metadata write (the content was already applied by the first request).
       } else if (result?.applied !== true) {
@@ -181,6 +207,42 @@ export class ConditionalPageController {
     // PageService.update's content branch cannot run here.
     const updatedPage = await this.pageService.update(page, metadataOnly, user);
 
-    return { ...updatedPage, permissions: { canEdit: true, hasRestriction } };
+    return { ...updatedPage, permissions: { canEdit: true, hasRestriction }, ...(snapshot ? { snapshot } : {}) };
+  }
+
+  /**
+   * Save the page's current title + content as a history version unless that would add nothing: the write
+   * changes neither (its title is omitted or equal, and its content is equal), or the newest saved version
+   * already holds exactly this title + content. Content is compared by `stableHash` (key-order-insensitive).
+   * The row is current: the platform settles the live document before a guarded write (ADR 0019).
+   */
+  private async snapshotCurrent(
+    pageId: string,
+    incoming: unknown,
+    incomingTitle: string | undefined,
+  ): Promise<SnapshotOutcome> {
+    if (!this.pageHistoryRepo) throw new ServiceUnavailableException('page history is unavailable');
+    const current = await this.pageRepo.findById(pageId, { includeContent: true });
+    if (!current) throw new NotFoundException('Page not found');
+    const currentHash = stableHash(current.content ?? null);
+    const titleKept = incomingTitle === undefined || incomingTitle === current.title;
+    if (titleKept && currentHash === stableHash(incoming ?? null)) return { status: 'unchanged', historyId: null };
+    const last = await this.pageHistoryRepo.findPageLastHistory(pageId, { includeContent: true });
+    if (last && last.title === current.title && stableHash(last.content ?? null) === currentHash) {
+      return { status: 'unchanged', historyId: last.id };
+    }
+    const saved = await this.pageHistoryRepo.insertPageHistory({
+      pageId: current.id,
+      slugId: current.slugId,
+      title: current.title,
+      content: current.content,
+      icon: current.icon,
+      coverPhoto: current.coverPhoto,
+      lastUpdatedById: current.lastUpdatedById ?? current.creatorId,
+      contributorIds: current.contributorIds,
+      spaceId: current.spaceId,
+      workspaceId: current.workspaceId,
+    });
+    return { status: 'saved', historyId: saved.id };
   }
 }

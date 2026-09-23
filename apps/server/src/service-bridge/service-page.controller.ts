@@ -17,6 +17,12 @@ import { ServiceScope } from './service-scope';
 import { RawPagePermission, ServiceContentService } from './service-content.service';
 import { ResolvePageSpaceDto } from './dto/content-read.dto';
 import { parseSubCollectionQuery } from './dto/sub-collection-page.dto';
+import { PageLifecycleStateDto, TrashListDto } from './dto/page-lifecycle.dto';
+import {
+  PageLifecycleState,
+  ServicePageLifecycleService,
+  TrashedPageRow,
+} from './service-page-lifecycle.service';
 
 /**
  * CCC service-bridge — NOT upstream Docmost code.
@@ -29,7 +35,10 @@ import { parseSubCollectionQuery } from './dto/sub-collection-page.dto';
 @Controller('service/pages')
 @UseGuards(RemoteOnlyGuard, ServiceAuthGuard)
 export class ServicePageController {
-  constructor(private readonly content: ServiceContentService) {}
+  constructor(
+    private readonly content: ServiceContentService,
+    private readonly lifecycle: ServicePageLifecycleService,
+  ) {}
 
   @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
 
@@ -52,5 +61,25 @@ export class ServicePageController {
   ): Promise<{ items: RawPagePermission[] }> {
     // Opt-in keyset paging (no params → all grants, the backward-compatible default).
     return this.content.listPagePermissions(pageId, parseSubCollectionQuery(limit, beforeCreatedAt, beforeId));
+  }
+
+  // ---- #485 page lifecycle facts (appended). Facts only — the platform decides. ----
+
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
+  @Post('lifecycle-state')
+  @HttpCode(HttpStatus.OK)
+  @RequireServiceScope(ServiceScope.PagesRead)
+  async lifecycleState(@Body() dto: PageLifecycleStateDto): Promise<PageLifecycleState> {
+    return this.lifecycle.lifecycleState(dto);
+  }
+
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
+  @Post('trash')
+  @HttpCode(HttpStatus.OK)
+  @RequireServiceScope(ServiceScope.ContentRead)
+  async trash(@Body() dto: TrashListDto): Promise<{ items: TrashedPageRow[] }> {
+    return this.lifecycle.trash(dto);
   }
 }

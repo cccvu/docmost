@@ -62,6 +62,8 @@ const EXPECTED_SCOPE: Record<string, ServiceScope> = {
   'ServiceSpaceController.removeMember': ServiceScope.SpacesWrite,
   'ServicePageController.resolveSpace': ServiceScope.PagesRead,
   'ServicePageController.listPermissions': ServiceScope.ContentRead,
+  'ServicePageController.lifecycleState': ServiceScope.PagesRead, // #485
+  'ServicePageController.trash': ServiceScope.ContentRead, // #485
   'ServiceContentController.listPages': ServiceScope.ContentRead,
   'ServiceContentController.listSpaces': ServiceScope.ContentRead,
   'ServiceContentController.getSpace': ServiceScope.ContentRead,
