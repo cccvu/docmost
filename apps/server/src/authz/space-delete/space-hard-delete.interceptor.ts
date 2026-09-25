@@ -38,7 +38,7 @@ type AuthedRequest = FastifyRequest & {
  * Removal in remote mode is the platform's archive (`/v1`, the console, MCP). There is no remote purge path.
  * Native (standalone) mode keeps the upstream route.
  *
- * An interceptor rather than a guard, registered innermost in app.module.ts (seam #4), after the #467 per-request
+ * An interceptor rather than a guard, registered in app.module.ts (seam #4) after the #467 per-request
  * access audit and per-principal rate limit: the controller stays untouched, `req.user` is resolved, a flood of
  * attempts is rate-limited, and the access row records the 404. It runs before the handler, so before CASL and the
  * delete, and before `ValidationPipe`, so the body is raw and is read defensively. The refusal writes one domain

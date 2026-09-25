@@ -138,7 +138,7 @@ try {
     // ORDER MATTERS and is load-bearing (see UPSTREAM_MODIFICATIONS.md seam #4): AuditActorInterceptor
     // (above) stamps the CLS actor first; ApiAccessAuditInterceptor wraps the request so it records the
     // final outcome INCLUDING a 429 the rate limiter raises; PrincipalRateLimitInterceptor rejects before the
-    // handler runs. SpaceHardDeleteInterceptor (#502) is innermost, so its 404 is rate-limited and lands in the
+    // handler runs. SpaceHardDeleteInterceptor (#502) is registered last of these, so its 404 is rate-limited and lands in the
     // access row too. Do not reorder.
     ApiAccessAuditService,
     {
