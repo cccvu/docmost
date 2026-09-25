@@ -44,6 +44,8 @@ import { PublicSurfaceThrottlerGuard } from './authz/route-guard/public-surface-
 import { ApiAccessAuditService } from './authz/request-controls/api-access-audit.service';
 import { ApiAccessAuditInterceptor } from './authz/request-controls/api-access-audit.interceptor';
 import { PrincipalRateLimitInterceptor } from './authz/request-controls/principal-rate-limit.interceptor';
+// CCC seam (#502): remote mode refuses the engine's native space hard delete (archive is the only removal).
+import { SpaceHardDeleteInterceptor } from './authz/space-delete/space-hard-delete.interceptor';
 
 const enterpriseModules = [];
 try {
@@ -135,8 +137,9 @@ try {
     // JwtAuthGuard runs AFTER the global guards but BEFORE interceptors, so req.user is resolved here.
     // ORDER MATTERS and is load-bearing (see UPSTREAM_MODIFICATIONS.md seam #4): AuditActorInterceptor
     // (above) stamps the CLS actor first; ApiAccessAuditInterceptor wraps the request so it records the
-    // final outcome INCLUDING a 429 the rate limiter raises; PrincipalRateLimitInterceptor is innermost so
-    // it rejects before the handler runs. Do not reorder.
+    // final outcome INCLUDING a 429 the rate limiter raises; PrincipalRateLimitInterceptor rejects before the
+    // handler runs. SpaceHardDeleteInterceptor (#502) is innermost, so its 404 is rate-limited and lands in the
+    // access row too. Do not reorder.
     ApiAccessAuditService,
     {
       provide: APP_INTERCEPTOR,
@@ -145,6 +148,10 @@ try {
     {
       provide: APP_INTERCEPTOR,
       useClass: PrincipalRateLimitInterceptor,
+    },
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: SpaceHardDeleteInterceptor,
     },
   ],
 })

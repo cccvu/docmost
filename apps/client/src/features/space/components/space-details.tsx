@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import { useSpaceQuery } from "@/features/space/queries/space-query.ts";
 import { EditSpaceForm } from "@/features/space/components/edit-space-form.tsx";
-import { Button, Divider, Text, Title } from "@mantine/core";
+import { Anchor, Button, Divider, Text, Title } from "@mantine/core";
 import DeleteSpaceModal from "./delete-space-modal";
 import { useDisclosure } from "@mantine/hooks";
 import ExportModal from "@/components/common/export-modal.tsx";
@@ -18,6 +18,8 @@ import {
   ResponsiveSettingsControl,
   ResponsiveSettingsRow,
 } from "@/components/ui/responsive-settings-row.tsx";
+import { isNativeAuthEnabled } from "@/features/auth-native/lib/auth-mode.ts";
+import { usePlatformAdminContext } from "@/features/admin-entry/use-platform-admin-context.ts";
 
 
 interface SpaceDetailsProps {
@@ -30,6 +32,14 @@ export default function SpaceDetails({ spaceId, readOnly }: SpaceDetailsProps) {
   const [exportOpened, { open: openExportModal, close: closeExportModal }] =
     useDisclosure(false);
   const [isIconUploading, setIsIconUploading] = useState(false);
+
+  // CCC (#502): in remote (platform) mode the server refuses the native space hard delete
+  // (404) — removal is archive-only (Admin Console, /v1, MCP) — so the Delete button
+  // could only fail. Show an informational note instead, plus a console link for platform
+  // workspace admins (the console is workspace-admin-only). Native/standalone mode keeps
+  // the upstream Delete row. The admin-context query is the header's shared, cached one.
+  const spaceDeleteArchiveOnly = !isNativeAuthEnabled();
+  const platformAdminGate = usePlatformAdminContext();
 
   const handleIconUpload = async (file: File) => {
     setIsIconUploading(true);
@@ -110,12 +120,30 @@ export default function SpaceDetails({ spaceId, readOnly }: SpaceDetailsProps) {
                 <ResponsiveSettingsContent>
                   <Text size="md">{t("Delete space")}</Text>
                   <Text size="sm" c="dimmed">
-                    {t("Delete this space with all its pages and data.")}
+                    {spaceDeleteArchiveOnly
+                      ? t(
+                          "Spaces can't be permanently deleted here. A workspace admin can archive this space instead; archived spaces can be restored.",
+                        )
+                      : t("Delete this space with all its pages and data.")}
                   </Text>
                 </ResponsiveSettingsContent>
-                <ResponsiveSettingsControl>
-                  <DeleteSpaceModal space={space} />
-                </ResponsiveSettingsControl>
+                {!spaceDeleteArchiveOnly ? (
+                  <ResponsiveSettingsControl>
+                    <DeleteSpaceModal space={space} />
+                  </ResponsiveSettingsControl>
+                ) : (
+                  platformAdminGate === "admin" && (
+                    <ResponsiveSettingsControl>
+                      <Anchor
+                        href="/console"
+                        target="_blank"
+                        rel="noopener noreferrer"
+                      >
+                        {t("Open the Admin Console")}
+                      </Anchor>
+                    </ResponsiveSettingsControl>
+                  )
+                )}
               </ResponsiveSettingsRow>
 
               <ExportModal
