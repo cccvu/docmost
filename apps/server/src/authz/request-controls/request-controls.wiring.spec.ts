@@ -45,7 +45,7 @@ describe('request-controls wiring (#467) — app.module.ts source pin', () => {
     const iRate = src.indexOf('useClass: PrincipalRateLimitInterceptor');
     expect(iAudit).toBeGreaterThan(-1);
     expect(iAccess).toBeGreaterThan(iAudit); // access-audit wraps the rate limiter, so it records the 429
-    expect(iRate).toBeGreaterThan(iAccess); // rate limiter is innermost — rejects before the handler
+    expect(iRate).toBeGreaterThan(iAccess); // rate limiter runs inside the access audit — rejects before the handler
   });
 });
 

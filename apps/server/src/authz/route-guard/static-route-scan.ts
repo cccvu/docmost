@@ -50,6 +50,12 @@ export interface StaticRoute {
    * native-credential-routes.spec.ts.
    */
   mintsNativeSession: boolean;
+  /**
+   * The handler BODY calls a `.deleteSpace(` — the service/repo space hard delete (#502). A static (text) tell so
+   * space-hard-delete.fitness.spec.ts can assert that the routes carrying it are EXACTLY the routes remote mode
+   * refuses. Not `deleteSpaceWatch(` (the watcher unwatch). The spec's source inventory pins the indirect callers.
+   */
+  callsSpaceHardDelete: boolean;
 }
 
 // Text tell that a handler body establishes a native session. Matches the session-cookie set — the raw
@@ -63,6 +69,10 @@ export interface StaticRoute {
 // shape. Exported so native-credential-routes.spec.ts can exercise the CLASSIFIER directly (not just the walk).
 export const NATIVE_SESSION_MINT_RE =
   /setCookie\(\s*['"](?:__Host-)?authToken['"]|setAuthCookie\s*\(|setDocmostAuthCookie\s*\(|docmostAuthCookieSetOptions\s*\(|createSessionAndToken\s*\(/;
+
+// Text tell that a handler body reaches the space hard delete (#502): `spaceService.deleteSpace(` today, or a direct
+// `spaceRepo.deleteSpace(`. The `(` right after the name keeps `deleteSpaceWatch(` out.
+export const SPACE_HARD_DELETE_CALL_RE = /\.deleteSpace\s*\(/;
 
 const ROUTE_DECORATORS = new Set(['Get', 'Post', 'Put', 'Patch', 'Delete', 'Options', 'Head', 'All', 'Search']);
 const PUBLIC_DECORATORS = new Set(['Public', 'PlatformPublic']);
@@ -165,6 +175,7 @@ export function scanRoutes(srcRoot: string): StaticRoute[] {
             classFacts.isSessionScopedRoute || methodFacts.isSessionScopedRoute,
           isClassLevelSessionScoped: classFacts.isSessionScopedRoute,
           mintsNativeSession: NATIVE_SESSION_MINT_RE.test(member.getText(sf)),
+          callsSpaceHardDelete: SPACE_HARD_DELETE_CALL_RE.test(member.getText(sf)),
           guardNames: [...new Set([...classFacts.guardNames, ...methodFacts.guardNames])],
         });
       }
