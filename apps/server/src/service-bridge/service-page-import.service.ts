@@ -14,7 +14,12 @@ import {
   ValidateContentDto,
 } from './dto/page-import.dto';
 
-export type ContentValidationCode = 'invalid_content' | 'too_large' | 'empty_content';
+/**
+ * Why an item's content was refused. `invalid_content`, `too_large` and `empty_content` are properties of the content
+ * (or of the request's total size), so the same request fails again; `parse_budget_exceeded` is NOT: the call's parse
+ * time ran out before this item was parsed, so it was not checked at all and the same request can pass on a retry.
+ */
+export type ContentValidationCode = 'invalid_content' | 'too_large' | 'empty_content' | 'parse_budget_exceeded';
 export type ContentValidationResult = { idx: number; ok: true } | { idx: number; ok: false; code: ContentValidationCode };
 export interface ValidateContentResult {
   results: ContentValidationResult[];
@@ -30,7 +35,7 @@ export interface TitleCandidatesResult {
   matches: TitleCandidate[];
 }
 
-/** Wall-clock budget for the parses of ONE validate-content call; past it, the remaining items are `too_large`. */
+/** Wall-clock budget for the parses of ONE validate-content call; past it, the remaining items are `parse_budget_exceeded`. */
 export const PAGE_IMPORT_PARSE_BUDGET_MS = 4000;
 /** validate-content calls parsing at once per process, and how long a call waits for a slot (then 503 engine_busy). */
 export const PAGE_IMPORT_PARSE_MAX_CONCURRENT = 2;
@@ -74,7 +79,9 @@ export class PageContentParser {
  *
  * validate-content: each item is parsed exactly as a create would parse it, SEQUENTIALLY (the event loop is yielded
  * between items), inside two budgets — ≤ PAGE_IMPORT_TOTAL_MAX_BYTES of parsed content and ≤ PAGE_IMPORT_PARSE_BUDGET_MS
- * of parsing; at the first overrun that item and every later one answer `too_large` unparsed. An item over
+ * of parsing; at the first overrun that item and every later one answer unparsed: `too_large` for the byte budget (a
+ * property of the request), `parse_budget_exceeded` for the time budget (the engine's load, not the content: the item
+ * was never checked, and the caller must retry, never "fix" it). An item over
  * PAGE_IMPORT_ITEM_MAX_BYTES is `too_large` on its own; whitespace-only content is `empty_content`; a parse failure is
  * `invalid_content` (its message is never answered: it can quote the content). At most
  * PAGE_IMPORT_PARSE_MAX_CONCURRENT calls parse at once per process; a call that gets no slot in time is 503 `engine_busy`.
@@ -113,12 +120,13 @@ export class ServicePageImportService {
   private async validateAll(dto: ValidateContentDto): Promise<ValidateContentResult> {
     const started = Date.now();
     let parsedBytes = 0;
-    let overrun = false;
+    /** Set at the first overrun: the code that item and every later one answer, unparsed. */
+    let stopped: 'too_large' | 'parse_budget_exceeded' | null = null;
     const results: ContentValidationResult[] = [];
     for (let idx = 0; idx < dto.items.length; idx++) {
       const { format, content } = dto.items[idx];
-      if (overrun) {
-        results.push({ idx, ok: false, code: 'too_large' });
+      if (stopped) {
+        results.push({ idx, ok: false, code: stopped });
         continue;
       }
       const bytes = Buffer.byteLength(content, 'utf8');
@@ -130,10 +138,17 @@ export class ServicePageImportService {
         results.push({ idx, ok: false, code: 'empty_content' });
         continue;
       }
-      if (parsedBytes + bytes > PAGE_IMPORT_TOTAL_MAX_BYTES || Date.now() - started > this.parseBudgetMs) {
-        overrun = true;
-        this.logger.warn(`PAGE_IMPORT_VALIDATE_BUDGET idx=${idx}: budget spent; this and later items answered too_large`);
-        results.push({ idx, ok: false, code: 'too_large' });
+      if (parsedBytes + bytes > PAGE_IMPORT_TOTAL_MAX_BYTES) {
+        stopped = 'too_large';
+      } else if (Date.now() - started > this.parseBudgetMs) {
+        stopped = 'parse_budget_exceeded';
+      }
+      if (stopped) {
+        this.logger.warn(
+          `PAGE_IMPORT_VALIDATE_BUDGET idx=${idx} budget=${stopped === 'too_large' ? 'bytes' : 'time'}: ` +
+            `budget spent; this and later items answered ${stopped}`,
+        );
+        results.push({ idx, ok: false, code: stopped });
         continue;
       }
       parsedBytes += bytes;

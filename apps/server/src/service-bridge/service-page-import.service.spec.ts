@@ -18,8 +18,9 @@ import { OpSemaphore } from '../authz/page-write/op-semaphore';
  * #616 page-import helpers — the unit contract (real Postgres for title-candidates: service-page-import.pg.spec.ts):
  *   validate-content: every item parsed through the create's own parser, sequentially; per-item `too_large` /
  *   `empty_content` / `invalid_content`; the call's byte and time budgets stop at the first overrun (that item and all
- *   later ones `too_large`, unparsed); at most 2 calls parse at once (else 503 engine_busy); content and parse errors
- *   are never answered.
+ *   later ones unparsed: `too_large` for the byte budget, `parse_budget_exceeded` — retryable, never a content verdict —
+ *   for the time budget); at most 2 calls parse at once (else 503 engine_busy); content and parse errors are never
+ *   answered.
  *   title-candidates: exact and `(n ≥ 2)` matches only, ids + indices only, bounded scan (503 list_too_broad), a
  *   statement past its bound → 503 engine_busy.
  */
@@ -119,7 +120,7 @@ describe('validate-content — budgets and codes', () => {
     expect(t.parsed).toHaveLength(2);
   });
 
-  it('the time budget stops at the first overrun too (checked before each item)', async () => {
+  it('the time budget stops at the first overrun too (checked before each item) — as parse_budget_exceeded, never too_large', async () => {
     let clock = 0;
     const now = jest.spyOn(Date, 'now').mockImplementation(() => clock);
     try {
@@ -128,14 +129,59 @@ describe('validate-content — budgets and codes', () => {
       });
       t.svc.parseBudgetMs = 4000;
       const res = await t.svc.validateContent({ items: ['a', 'b', 'c', 'd'].map((content) => ({ format: 'markdown' as const, content })) });
-      // 0s → parse a (3s) → parse b (6s) → 6s > 4s: c and d are too_large.
+      // 0s → parse a (3s) → parse b (6s) → 6s > 4s: c and d were never checked — the engine's load, not their content.
+      expect(res.results).toEqual([
+        { idx: 0, ok: true },
+        { idx: 1, ok: true },
+        { idx: 2, ok: false, code: 'parse_budget_exceeded' },
+        { idx: 3, ok: false, code: 'parse_budget_exceeded' },
+      ]);
+      expect(t.parsed).toEqual(['a', 'b']);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('the byte budget still wins when both are spent at the same item (too_large: the request itself is too big)', async () => {
+    let clock = 0;
+    const now = jest.spyOn(Date, 'now').mockImplementation(() => clock);
+    try {
+      const half = 'x'.repeat(PAGE_IMPORT_ITEM_MAX_BYTES);
+      const t = make(async () => {
+        clock += 3000;
+      });
+      t.svc.parseBudgetMs = 4000;
+      const res = await t.svc.validateContent({
+        items: [half, half, 'tiny'].map((content) => ({ format: 'markdown' as const, content })),
+      });
+      // At idx 2: 6s > 4s AND 1 MiB + 4 bytes > 1 MiB — the byte verdict is the one that is true on every retry.
       expect(res.results).toEqual([
         { idx: 0, ok: true },
         { idx: 1, ok: true },
         { idx: 2, ok: false, code: 'too_large' },
-        { idx: 3, ok: false, code: 'too_large' },
       ]);
-      expect(t.parsed).toEqual(['a', 'b']);
+    } finally {
+      now.mockRestore();
+    }
+  });
+
+  it('a time-budget stop is per call: the same items, re-sent to an idle engine, are all checked', async () => {
+    let clock = 0;
+    let cost = 3000;
+    const now = jest.spyOn(Date, 'now').mockImplementation(() => clock);
+    try {
+      const t = make(async () => {
+        clock += cost;
+      });
+      t.svc.parseBudgetMs = 4000;
+      const items = ['a', 'b', 'c'].map((content) => ({ format: 'markdown' as const, content }));
+      expect((await t.svc.validateContent({ items })).results[2]).toEqual({ idx: 2, ok: false, code: 'parse_budget_exceeded' });
+      cost = 10; // the engine is no longer loaded
+      expect((await t.svc.validateContent({ items })).results).toEqual([
+        { idx: 0, ok: true },
+        { idx: 1, ok: true },
+        { idx: 2, ok: true },
+      ]);
     } finally {
       now.mockRestore();
     }

@@ -559,13 +559,13 @@ describe('service-bridge.openapi.json page-import helpers (#616)', () => {
     expect(item.properties.format.enum).toEqual([...PAGE_IMPORT_FORMATS]);
   });
 
-  it('ContentValidationResult: { idx, ok: true } or { idx, ok: false, code ∈ the three codes } — nothing else', () => {
+  it('ContentValidationResult: { idx, ok: true } or { idx, ok: false, code ∈ the four codes } — nothing else', () => {
     const [ok, refused] = S.components.schemas.ContentValidationResult.oneOf;
     expect(sorted(ok.properties)).toEqual(['idx', 'ok']);
     expect(ok.properties.ok.const).toBe(true);
     expect(sorted(refused.properties)).toEqual(['code', 'idx', 'ok']);
     expect(refused.properties.ok.const).toBe(false);
-    expect([...refused.properties.code.enum].sort()).toEqual(['empty_content', 'invalid_content', 'too_large']);
+    expect([...refused.properties.code.enum].sort()).toEqual(['empty_content', 'invalid_content', 'parse_budget_exceeded', 'too_large']);
     for (const branch of [ok, refused]) expect(branch.additionalProperties).toBe(false);
   });
 

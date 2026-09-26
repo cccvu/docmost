@@ -528,7 +528,7 @@
         "operationId": "validateImportContent",
         "tags": ["pages"],
         "summary": "Would each item parse as a page body? (1.9.0, #616 import helper; parses, writes nothing).",
-        "description": "Each item is parsed exactly as a page create parses it (Markdown → HTML → the network-inert HTML parse → ProseMirror JSON → schema check), sequentially, in the order given; nothing is written and no content, parse error or derived text is ever answered — only `{idx, ok}` or `{idx, ok: false, code}`, one per item, in item order. Codes: `too_large` — the item is over 524288 UTF-8 bytes, OR a per-call budget ran out before it (1048576 parsed bytes in total, or 4 s of parsing, checked before each item; from that item on every item is `too_large`, unparsed); `empty_content` — the content is empty or whitespace only; `invalid_content` — it does not parse to a valid page body. At most 2 calls parse at once per fork process: a call that gets no slot within 2s answers 503 `engine_busy` (retryable). Scope: pages:import:read (its own, smaller rate bucket).",
+        "description": "Each item is parsed exactly as a page create parses it (Markdown → HTML → the network-inert HTML parse → ProseMirror JSON → schema check), sequentially, in the order given; nothing is written and no content, parse error or derived text is ever answered — only `{idx, ok}` or `{idx, ok: false, code}`, one per item, in item order. Codes: `too_large` — the item is over 524288 UTF-8 bytes, OR the call's byte budget ran out before it (1048576 parsed bytes in total, checked before each item; from that item on every item is `too_large`, unparsed); `parse_budget_exceeded` — the call's time budget (4 s of parsing, checked before each item) ran out before it, so it was NOT checked (from that item on every item is `parse_budget_exceeded`, unparsed): a statement about the engine's load, never about the content — retry the same request (the byte budget wins when both are spent at the same item); `empty_content` — the content is empty or whitespace only; `invalid_content` — it does not parse to a valid page body. At most 2 calls parse at once per fork process: a call that gets no slot within 2s answers 503 `engine_busy` (retryable). Scope: pages:import:read (its own, smaller rate bucket).",
         "requestBody": { "required": true, "content": { "application/json": {
           "schema": { "$ref": "#/components/schemas/ValidateContentRequest" },
           "example": { "items": [{ "format": "markdown", "content": "# Notes\n\nHello" }, { "format": "html", "content": "" }] }
@@ -1473,7 +1473,7 @@
       "ContentValidationResult": {
         "oneOf": [
           { "type": "object", "additionalProperties": false, "required": ["idx", "ok"], "properties": { "idx": { "type": "integer", "minimum": 0 }, "ok": { "const": true } } },
-          { "type": "object", "additionalProperties": false, "required": ["idx", "ok", "code"], "properties": { "idx": { "type": "integer", "minimum": 0 }, "ok": { "const": false }, "code": { "type": "string", "enum": ["invalid_content", "too_large", "empty_content"] } } }
+          { "type": "object", "additionalProperties": false, "required": ["idx", "ok", "code"], "properties": { "idx": { "type": "integer", "minimum": 0 }, "ok": { "const": false }, "code": { "type": "string", "enum": ["invalid_content", "too_large", "empty_content", "parse_budget_exceeded"] } } }
         ]
       },
       "TitleCandidatesRequest": {

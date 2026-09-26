@@ -478,6 +478,29 @@ d('PageRestrictionService versioned writes on real Postgres (#616)', () => {
       expect(await snapshot()).toEqual(before);
     });
 
+    it("a remove naming nobody (the platform's probe for a grant whose grantees have no account yet) runs add's state checks and writes nothing", async () => {
+      // Unrestricted: refused, exactly as the real add is once the platform has provisioned and sends the ids.
+      await expect(svc.preview({ pageId: P, action: 'remove', userIds: [] } as never, actor)).resolves.toMatchObject({
+        outcome: 'refused',
+        code: 'not_restricted',
+      });
+      expect(await outcome(svc.addPermission({ pageId: P, role: 'reader', userIds: [U1] } as never, actor))).toBe('400:');
+
+      await restrictRow(P, [[U1, 'reader']]);
+      const v = await version(P);
+      const before = await snapshot();
+      await expect(svc.preview({ pageId: P, action: 'remove', userIds: [] } as never, actor)).resolves.toEqual({
+        outcome: 'noop',
+        version: v, // the CURRENT version: what the real grant's expectedVersion should carry
+        effect: { restrictedBefore: true, restrictedAfter: true, added: [], changed: [], removed: [] },
+      });
+      await expect(
+        svc.preview({ pageId: P, action: 'remove', userIds: [], expectedVersion: 'f'.repeat(64) } as never, actor),
+      ).resolves.toMatchObject({ outcome: 'refused', code: 'precondition_failed', version: v });
+      expect(await snapshot()).toEqual(before);
+      expect(invalidations).toEqual([]);
+    });
+
     it('A3 with requireActorCoverage: an exposed sub-page is refused in the preview exactly as in the write', async () => {
       await page(uuid(5), P); // unrestricted child of P
       await restrictRow(P);

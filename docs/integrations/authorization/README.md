@@ -143,8 +143,9 @@ scope `pages:import:read` (a smaller rate bucket, `SERVICE_BRIDGE_PAGES_IMPORT_R
 /api/service/pages/validate-content` `{ items: [{ format: markdown | html, content }] }` (1–50 items) parses each item
 exactly as a page create would (including the network-inert HTML parse), writes nothing, and answers `{ results: [{ idx,
 ok: true } | { idx, ok: false, code }] }` in item order — `too_large` (over 512 KiB, or once the call's budget of 1 MiB
-parsed / 4 s of parsing is spent, for that item and every later one), `empty_content` (whitespace only) or
-`invalid_content`; it never answers content or a parse error, and a call that finds both parse slots busy for 2 s is a
+parsed is spent, for that item and every later one), `parse_budget_exceeded` (once the call's 4 s of parsing is spent,
+for that item and every later one: NOT checked, a retryable engine-load answer, never a content verdict), `empty_content`
+(whitespace only) or `invalid_content`; it never answers content or a parse error, and a call that finds both parse slots busy for 2 s is a
 retryable `503 { code: engine_busy }`. `POST /api/service/pages/title-candidates` `{ spaceId, parentPageId?: uuid | null,
 titles: [1–50 strings, 1–255] }` answers `{ matches: [{ titleIdx, pageId, suffix: null | n }] }`: the live direct
 children of that parent (null or omitted = the space root) whose title is exactly `titles[titleIdx]` or `<title> (n)`
