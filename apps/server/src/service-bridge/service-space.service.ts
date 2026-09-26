@@ -3,6 +3,7 @@ import {
   ConflictException,
   ForbiddenException,
   Injectable,
+  InternalServerErrorException,
   Logger,
   NotFoundException,
 } from '@nestjs/common';
@@ -32,6 +33,12 @@ import {
   refusalCodeOf,
   spaceVersion,
 } from './resource-version';
+import {
+  boundLedgerTx,
+  IdempotencyLedgerService,
+  idempotencyKeyReused,
+  servicePrincipal,
+} from '../authz/idempotency/idempotency-ledger.service';
 
 /** Space summary the platform relays to the console (createdAt as an ISO string over the wire). */
 export interface SpaceView {
@@ -78,6 +85,17 @@ export interface SpaceMemberPreview {
     /** An add would first create the member's shadow account (the member has none yet). */
     provisionsAccount: boolean;
   };
+}
+
+/**
+ * What a space create answers. `replayed` is present only on a KEYED create (#616): `false` when this call created the
+ * space, `true` when it answers the space an earlier call with the same key created (nothing re-run).
+ */
+export interface CreatedSpace {
+  id: string;
+  slug: string;
+  name: string | null;
+  replayed?: boolean;
 }
 
 // The fork's Kysely runs CamelCasePlugin, so raw-sql result keys come back camelCased (created_at ->
@@ -193,6 +211,7 @@ export class ServiceSpaceService {
     @InjectKysely() private readonly db: KyselyDB,
     private readonly workspaces: WorkspaceResolver,
     private readonly bridge: ServiceBridgeService,
+    private readonly ledger?: IdempotencyLedgerService, // #616 keyed create (appended)
   ) {}
 
   /** Derive a valid, lowercased Docmost slug from a source string; null if nothing usable remains. */
@@ -288,8 +307,13 @@ export class ServiceSpaceService {
    * spaces row and the initial space_members row fire the outbox capture together (the atomicity the SpiceDB
    * projection relies on). The creator's shadow user is resolved (provisioned if absent, idempotent) from
    * the opaque externalId.
+   *
+   * #616: with `idempotencyKey` (+ `idempotencyNamespace` + `fingerprint`) the create is KEYED — see `createKeyed`.
+   * Without it, exactly the statements below (the response carries no `replayed`). `credentialId` is the service
+   * credential that authenticated the call (ServiceAuthGuard); a keyed create refuses to run without it.
    */
-  async create(input: CreateSpaceDto): Promise<{ id: string; slug: string; name: string | null }> {
+  async create(input: CreateSpaceDto, credentialId?: string): Promise<CreatedSpace> {
+    if (input.idempotencyKey !== undefined) return this.createKeyed(input, credentialId);
     const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
     const slug = input.slug ? input.slug.toLowerCase() : this.deriveSlug(input.name);
     if (!slug) {
@@ -325,6 +349,90 @@ export class ServiceSpaceService {
         throw new ConflictException(`a space with the slug "${slug}" already exists`);
       }
       throw e;
+    }
+  }
+
+  /**
+   * #616 — the KEYED create: a retry after a relay failure that followed the commit answers the space the first call
+   * created instead of failing on its own slug (or creating a twin). One bounded transaction:
+   *
+   *   provision the creator (before, as unkeyed) → BEGIN → SET LOCAL timeouts → reserve the key in the ledger
+   *     fresh    → the SAME two inserts as unkeyed → complete(slot, space.id) → COMMIT → `replayed: false`
+   *     replay   → read that space (archived or not) → `replayed: true`; NOTHING re-runs (no insert, no member row,
+   *                no outbox row — the platform skips its own grants on `replayed`)
+   *     mismatch → 409 `idempotency_key_reused`, nothing written
+   *
+   * - No friendly slug pre-check: the retry of a committed create must reach the ledger, and its own space holds the
+   *   slug. A slug taken by ANOTHER space surfaces as the unique index's 23505 → the same 409 as unkeyed, and the
+   *   reservation rolls back with it.
+   * - The creator's shadow user is provisioned before the transaction on every call, replays included, exactly as
+   *   unkeyed: an idempotent upsert (same row, same `member` role; `users` carries no outbox trigger) — and its id is
+   *   the acting human the key is bound to.
+   * - The key is bound to (workspace, `servicePrincipal(credential, creator)`, `idempotencyNamespace`): another human,
+   *   or the same human through another service credential, never reaches this entry.
+   * - A lock not got within 2s (a same-key twin still in flight), a deadlock or a statement past 15s → 503 `engine_busy`.
+   */
+  private async createKeyed(input: CreateSpaceDto, credentialId?: string): Promise<CreatedSpace> {
+    if (!this.ledger || !credentialId) {
+      // Wiring bug (no ledger injected, or no authenticated credential on the request) — never create unrecorded.
+      throw new InternalServerErrorException('keyed create unavailable: no idempotency ledger or service credential');
+    }
+    const ledger = this.ledger;
+    const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
+    const slug = input.slug ? input.slug.toLowerCase() : this.deriveSlug(input.name);
+    if (!slug) {
+      throw new BadRequestException('could not derive a valid slug from the name — provide a slug explicitly');
+    }
+
+    const { userId: creatorId } = await this.bridge.provisionShadowUser({
+      externalId: input.creatorExternalId,
+    });
+
+    try {
+      return await this.db.transaction().execute(async (trx) => {
+        await boundLedgerTx(trx);
+        const reservation = await ledger.reserve(trx, {
+          workspaceId,
+          principal: servicePrincipal(credentialId, creatorId),
+          namespace: input.idempotencyNamespace as string,
+          op: 'space.create',
+          key: input.idempotencyKey as string,
+          fingerprint: input.fingerprint as string,
+        });
+        if (reservation.outcome === 'mismatch') throw idempotencyKeyReused();
+        if (reservation.outcome === 'replay') {
+          const existing = await sql<{ id: string; slug: string; name: string | null }>`
+            select id, slug, name from spaces where id = ${reservation.resourceId} and workspace_id = ${workspaceId}
+          `.execute(trx);
+          const space = existing.rows[0];
+          if (!space) {
+            throw new NotFoundException({
+              message: 'the space created under this idempotency key no longer exists',
+              code: 'idempotency_resource_gone',
+            });
+          }
+          this.logger.log(`IDEMPOTENT_SPACE_CREATE_REPLAYED space=${space.id}: answered the space this key created`);
+          return { id: space.id, slug: space.slug, name: space.name, replayed: true };
+        }
+
+        const s = await sql<{ id: string; slug: string; name: string | null }>`
+          insert into spaces (name, description, slug, creator_id, workspace_id)
+          values (${input.name}, ${input.description ?? null}, ${slug}, ${creatorId}, ${workspaceId})
+          returning id, slug, name
+        `.execute(trx);
+        const space = s.rows[0];
+        await sql`
+          insert into space_members (user_id, space_id, role, added_by_id)
+          values (${creatorId}, ${space.id}, 'admin', ${creatorId})
+        `.execute(trx);
+        await ledger.complete(trx, reservation.slot, space.id);
+        return { id: space.id, slug: space.slug, name: space.name, replayed: false };
+      });
+    } catch (e) {
+      if ((e as { code?: string })?.code === '23505') {
+        throw new ConflictException(`a space with the slug "${slug}" already exists`);
+      }
+      throw this.retryableIfBusy(e);
     }
   }
 

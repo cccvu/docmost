@@ -4,7 +4,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
-import { ServiceAuthGuard } from './service-auth.guard';
+import { attachServiceCredential, ServiceAuthGuard, serviceCredentialIdOf } from './service-auth.guard';
 import { ServiceScope } from './service-scope';
 
 const SECRET = 'test-service-secret-0123456789ab';
@@ -44,6 +44,24 @@ describe('ServiceAuthGuard', () => {
     it('allows a matching secret that carries the route scope', () => {
       const g = new ServiceAuthGuard(reflectorReturning(ServiceScope.SessionMint));
       expect(g.canActivate(ctx(SECRET))).toBe(true);
+    });
+
+    // #616: the keyed space create binds its ledger entry to the credential that authenticated the call.
+    it('records the admitting credential on the request — and only once it admitted it; a body/header cannot set it', () => {
+      const g = new ServiceAuthGuard(reflectorReturning(ServiceScope.SpacesWrite));
+      const onReq = (req: object) =>
+        ({ switchToHttp: () => ({ getRequest: () => req }), getHandler: () => () => undefined, getClass: () => class {} }) as any;
+      const ok = { headers: { 'x-authz-service-secret': SECRET }, body: { credentialId: 'forged' } };
+      expect(serviceCredentialIdOf(ok)).toBeUndefined();
+      expect(g.canActivate(onReq(ok))).toBe(true);
+      expect(serviceCredentialIdOf(ok)).toBe('shared');
+      const bad = { headers: { 'x-authz-service-secret': 'wrong', 'x-ccc-service-credential': 'shared' } };
+      expect(() => g.canActivate(onReq(bad))).toThrow(UnauthorizedException);
+      expect(serviceCredentialIdOf(bad)).toBeUndefined();
+      expect(serviceCredentialIdOf({ cccServiceCredentialId: 'shared' })).toBeUndefined(); // only the private key counts
+      const marked = {};
+      attachServiceCredential(marked, 'x');
+      expect(serviceCredentialIdOf(marked)).toBe('x');
     });
 
     it('401 on a missing secret header', () => {

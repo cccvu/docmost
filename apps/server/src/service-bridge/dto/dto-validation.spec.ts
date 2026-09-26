@@ -7,7 +7,7 @@ import { MintSessionDto } from './mint-session.dto';
 import { ProvisionUserDto } from './provision-user.dto';
 import { SessionExternalIdDto } from './session-external-id.dto';
 import { LookupUsersDto } from './lookup-users.dto';
-import { UpdateSpaceMemberDto } from './space-admin.dto';
+import { CreateSpaceDto, UpdateSpaceMemberDto } from './space-admin.dto';
 import { PageAuthzStateDto } from './page-authz-state.dto';
 
 /**
@@ -238,6 +238,44 @@ describe('service-bridge DTO validation (constraints are load-bearing)', () => {
         expect(await errCount(UpdateSpaceMemberDto, { role: 'writer', actorExternalId })).toBeGreaterThan(0);
       }
       expect(await errCount(UpdateSpaceMemberDto, { role: 'owner', actorExternalId: UUID })).toBeGreaterThan(0);
+    });
+  });
+
+  /**
+   * #616: the keyed space create. The three keyed fields are optional but ALL-OR-NONE (a partial key is a 400, never
+   * an unkeyed create the caller believed was keyed), with the ledger's bounds.
+   */
+  describe('CreateSpaceDto (keyed create: all three keyed fields or none)', () => {
+    const base = { name: 'Engineering', creatorExternalId: 'ext-1' };
+    const keyed = { idempotencyKey: 'k-1', idempotencyNamespace: 'user:ext-1', fingerprint: 'a'.repeat(64) };
+    const failing = async (obj: object) =>
+      (await validate(plainToInstance(CreateSpaceDto, obj))).map((e) => e.property).sort();
+
+    it('accepts no keyed field, or all three within bounds', async () => {
+      expect(await errCount(CreateSpaceDto, base)).toBe(0);
+      expect(await errCount(CreateSpaceDto, { ...base, ...keyed })).toBe(0);
+      expect(
+        await errCount(CreateSpaceDto, { ...base, ...keyed, idempotencyKey: 'k'.repeat(255), idempotencyNamespace: 'n'.repeat(128) }),
+      ).toBe(0);
+    });
+
+    it('rejects a partial key: every missing keyed field is reported', async () => {
+      expect(await failing({ ...base, idempotencyKey: 'k-1' })).toEqual(['fingerprint', 'idempotencyNamespace']);
+      expect(await failing({ ...base, fingerprint: keyed.fingerprint })).toEqual(['idempotencyKey', 'idempotencyNamespace']);
+      expect(await failing({ ...base, idempotencyNamespace: 'ns', fingerprint: keyed.fingerprint })).toEqual(['idempotencyKey']);
+    });
+
+    it('rejects out-of-bounds values', async () => {
+      for (const over of [
+        { idempotencyKey: '' },
+        { idempotencyKey: 'k'.repeat(256) },
+        { idempotencyNamespace: 'n'.repeat(129) },
+        { fingerprint: 'A'.repeat(64) },
+        { fingerprint: 'a'.repeat(63) },
+        { idempotencyKey: null },
+      ]) {
+        expect(await errCount(CreateSpaceDto, { ...base, ...keyed, ...over })).toBeGreaterThan(0);
+      }
     });
   });
 });

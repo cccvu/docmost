@@ -20,6 +20,24 @@ export const SERVICE_SCOPE_KEY = 'ccc:service-scope';
 export const RequireServiceScope = (scope: ServiceScope) =>
   SetMetadata(SERVICE_SCOPE_KEY, scope);
 
+/**
+ * #616: the id of the credential that authenticated the request, set on the request by the guard. A Symbol key, so
+ * nothing a caller sends (headers, body, query) can set or shadow it. A handler reads it with
+ * {@link serviceCredentialIdOf} to bind state to WHICH service called (the create-idempotency ledger).
+ */
+const SERVICE_CREDENTIAL_ID = Symbol('ccc.serviceCredentialId');
+
+/** The authenticated service credential's id, or undefined when no ServiceAuthGuard admitted the request. */
+export function serviceCredentialIdOf(req: unknown): string | undefined {
+  const id = (req as Record<symbol, unknown> | null | undefined)?.[SERVICE_CREDENTIAL_ID];
+  return typeof id === 'string' ? id : undefined;
+}
+
+/** Record the credential that authenticated `req` (the guard, once it admitted it; a test's stand-in guard). */
+export function attachServiceCredential(req: unknown, credentialId: string): void {
+  if (req && typeof req === 'object') (req as Record<symbol, unknown>)[SERVICE_CREDENTIAL_ID] = credentialId;
+}
+
 interface ServiceCredential {
   id: string;
   secret: string;
@@ -117,6 +135,7 @@ export class ServiceAuthGuard implements CanActivate {
         HttpStatus.TOO_MANY_REQUESTS,
       );
     }
+    attachServiceCredential(req, cred.id);
     return true;
   }
 

@@ -6,8 +6,14 @@ import {
   Matches,
   MaxLength,
   MinLength,
+  ValidateIf,
 } from 'class-validator';
 import { IsExpectedVersion } from '../resource-version';
+import {
+  IsIdempotencyKey,
+  IsIdempotencyNamespace,
+  IsRequestFingerprint,
+} from '../../authz/idempotency/idempotency-dto';
 
 /**
  * CCC service-bridge — NOT upstream Docmost code. DTOs for the space/membership control plane the platform
@@ -43,6 +49,32 @@ export class CreateSpaceDto {
   @IsString()
   @Matches(EXTERNAL_ID, { message: 'creatorExternalId must be 1-128 chars of [A-Za-z0-9._+-]' })
   creatorExternalId!: string;
+
+  /**
+   * #616: an optional KEYED create — all three fields or none (one without the others is a 400). A keyed create is
+   * recorded in the fork's idempotency ledger in the space insert's own transaction, bound to the workspace, the
+   * authenticating service credential, the creator (the acting human) and `idempotencyNamespace`: a repeat answers the
+   * space it created with `replayed: true`, the same key with a different `fingerprint` is a 409
+   * `idempotency_key_reused`. Omitted → the unkeyed create, unchanged.
+   */
+  @ValidateIf(isKeyedCreate)
+  @IsIdempotencyKey()
+  idempotencyKey?: string;
+
+  /** #616: the integrator's opaque key namespace (1–128). Required with `idempotencyKey`. */
+  @ValidateIf(isKeyedCreate)
+  @IsIdempotencyNamespace()
+  idempotencyNamespace?: string;
+
+  /** #616: sha256 hex (64 lowercase) of the integrator's stable request body. Required with `idempotencyKey`. */
+  @ValidateIf(isKeyedCreate)
+  @IsRequestFingerprint()
+  fingerprint?: string;
+}
+
+/** A create that sends ANY of the three keyed fields must send all three (each is then validated as required). */
+function isKeyedCreate(o: CreateSpaceDto): boolean {
+  return o.idempotencyKey !== undefined || o.idempotencyNamespace !== undefined || o.fingerprint !== undefined;
 }
 
 export class UpdateSpaceDto {

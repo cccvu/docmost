@@ -28,12 +28,18 @@ import { SpaceView, RawSpaceMember, SpaceDetailView, SpaceMemberPreview } from '
 import { WorkspaceSettingsView } from './service-workspace.service';
 import { ShadowUserLookup } from './service-bridge.service';
 import {
+  CreateSpaceDto,
   ExpectedVersionDto,
   SpaceMemberPreviewDto,
   UpdateSpaceDto,
   UpdateSpaceMemberDto,
 } from './dto/space-admin.dto';
 import { MAX_EXPECTED_VERSION_LENGTH } from './resource-version';
+import {
+  IDEMPOTENCY_KEY_MAX_LENGTH,
+  IDEMPOTENCY_NAMESPACE_MAX_LENGTH,
+  REQUEST_FINGERPRINT_PATTERN,
+} from '../authz/idempotency/idempotency-ledger.service';
 import { DescendantFacts, LifecycleTarget, PageLifecycleState, TrashedPageRow } from './service-page-lifecycle.service';
 import { PageAuthzState, PageAuthzStateResult } from './page-authz-state.service';
 import { PAGE_AUTHZ_STATE_MAX, PageAuthzStateDto } from './dto/page-authz-state.dto';
@@ -240,7 +246,8 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
   const REVOKE = keysOf<Awaited<ReturnType<ServiceBridgeController['revokeSession']>>>({ userId: true, deactivated: true, sessionsRevoked: true });
   const RESTORE = keysOf<Awaited<ReturnType<ServiceBridgeController['restoreSession']>>>({ reactivated: true });
   const DEFAULT_WS = keysOf<Awaited<ReturnType<ServiceWorkspaceController['getDefault']>>>({ workspaceId: true });
-  const CREATE_SPACE = keysOf<Awaited<ReturnType<ServiceSpaceController['create']>>>({ id: true, slug: true, name: true });
+  // #616: `replayed` is present only on a keyed create, so it is the one optional key.
+  const CREATE_SPACE = keysOf<Awaited<ReturnType<ServiceSpaceController['create']>>>({ id: true, slug: true, name: true, replayed: true });
   const ADD_MEMBER = keysOf<Awaited<ReturnType<ServiceSpaceController['addMember']>>>({ memberId: true, userId: true, version: true });
   const RESOLVE_PAGE_SPACE = keysOf<Awaited<ReturnType<ServicePageController['resolveSpace']>>>({ pageId: true, spaceId: true });
   const RESOLVE_ATTACHMENT_PAGE = keysOf<Awaited<ReturnType<ServiceAttachmentController['resolvePage']>>>({ attachmentId: true, pageId: true, spaceId: true });
@@ -249,7 +256,7 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     | { kind: 'ref'; name: string }
     | { kind: 'array'; name: string }
     | { kind: 'items'; name: string }
-    | { kind: 'inline'; keys: string[] };
+    | { kind: 'inline'; keys: string[]; optional?: string[] };
 
   const OPS: Array<{ id: string; method: string; path: string; expect: OpExpect }> = [
     { id: 'provisionShadowUser', method: 'post', path: '/api/service/users', expect: { kind: 'ref', name: 'ProvisionedUser' } },
@@ -262,7 +269,7 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     { id: 'getWorkspaceSettings', method: 'get', path: '/api/service/workspace/settings', expect: { kind: 'ref', name: 'WorkspaceSettings' } },
     { id: 'updateWorkspaceSettings', method: 'patch', path: '/api/service/workspace/settings', expect: { kind: 'ref', name: 'WorkspaceSettings' } },
     { id: 'listSpaces', method: 'get', path: '/api/service/spaces', expect: { kind: 'array', name: 'SpaceView' } },
-    { id: 'createSpace', method: 'post', path: '/api/service/spaces', expect: { kind: 'inline', keys: CREATE_SPACE } },
+    { id: 'createSpace', method: 'post', path: '/api/service/spaces', expect: { kind: 'inline', keys: CREATE_SPACE, optional: ['replayed'] } },
     { id: 'getSpace', method: 'get', path: '/api/service/spaces/{spaceId}', expect: { kind: 'ref', name: 'SpaceDetail' } },
     { id: 'listSpaceMembers', method: 'get', path: '/api/service/spaces/{spaceId}/members', expect: { kind: 'array', name: 'RawSpaceMember' } },
     { id: 'addSpaceMember', method: 'post', path: '/api/service/spaces/{spaceId}/members', expect: { kind: 'inline', keys: ADD_MEMBER } },
@@ -335,7 +342,7 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
       expect(refName(schema.properties.items.items)).toBe(exp.name);
     } else {
       expect(sortedKeys(schema.properties)).toEqual(exp.keys);
-      if (schema.required) expect([...schema.required].sort()).toEqual(exp.keys);
+      if (schema.required) expect([...schema.required].sort()).toEqual(exp.keys.filter((k) => !exp.optional?.includes(k)));
     }
   });
 });
@@ -466,5 +473,52 @@ describe('service-bridge.openapi.json versions + member preview (#616)', () => {
     const effectKeys = keysOf<SpaceMemberPreview['effect']>({ roleBefore: true, roleAfter: true, provisionsAccount: true });
     expect(sorted(effect.properties)).toEqual(effectKeys);
     expect([...effect.required].sort()).toEqual(effectKeys);
+  });
+});
+
+/**
+ * #616 Stage 3 — the keyed space create is part of the wire contract: the request keys are typed against the fork DTO
+ * (a field added on either side fails), the three keyed fields are optional but all-or-none (`dependentRequired`, the
+ * DTO's `ValidateIf`), their bounds are the ledger's, and the refusals the platform maps by code are declared.
+ */
+describe('service-bridge.openapi.json keyed space create (#616)', () => {
+  const S = SPEC as any;
+  const create = S.paths['/api/service/spaces'].post;
+  const refName = (r: any): string => String(r?.$ref ?? '').split('/').pop()!;
+  const keysOf = <T,>(m: Record<keyof T, true>): string[] => Object.keys(m).sort();
+  const KEYED = ['idempotencyKey', 'idempotencyNamespace', 'fingerprint'];
+
+  it('CreateSpaceRequest carries exactly the DTO keys; only name + creatorExternalId are required', () => {
+    const schema = S.components.schemas.CreateSpaceRequest;
+    expect(schema.additionalProperties).toBe(false);
+    expect(Object.keys(schema.properties).sort()).toEqual(
+      keysOf<CreateSpaceDto>({ name: true, slug: true, description: true, creatorExternalId: true, idempotencyKey: true, idempotencyNamespace: true, fingerprint: true }),
+    );
+    expect([...schema.required].sort()).toEqual(['creatorExternalId', 'name']);
+  });
+
+  it('the three keyed fields are all-or-none, with the ledger bounds', () => {
+    const schema = S.components.schemas.CreateSpaceRequest;
+    for (const k of KEYED) expect([...schema.dependentRequired[k]].sort()).toEqual(KEYED.filter((x) => x !== k).sort());
+    expect(schema.properties.idempotencyKey).toMatchObject({ minLength: 1, maxLength: IDEMPOTENCY_KEY_MAX_LENGTH });
+    expect(schema.properties.idempotencyNamespace).toMatchObject({ minLength: 1, maxLength: IDEMPOTENCY_NAMESPACE_MAX_LENGTH });
+    expect(schema.properties.fingerprint.pattern).toBe(REQUEST_FINGERPRINT_PATTERN.source);
+  });
+
+  it('declares the keyed refusals by code: 409 idempotency_key_reused, 404 idempotency_resource_gone, 503 engine_busy', () => {
+    expect(refName(create.responses['409'])).toBe('CreateSpaceConflict');
+    expect(refName(create.responses['404'])).toBe('IdempotentResourceGone');
+    expect(refName(create.responses['503'])).toBe('UnconfiguredOrBusy');
+    const branches = (r: string) => S.components.responses[r].content['application/json'].schema.anyOf.map(refName).sort();
+    expect(branches('CreateSpaceConflict')).toEqual(['Error', 'IdempotencyKeyReusedError']);
+    expect(branches('IdempotentResourceGone')).toEqual(['Error', 'IdempotencyResourceGoneError']);
+    expect(S.components.schemas.IdempotencyKeyReusedError.properties.code.const).toBe('idempotency_key_reused');
+    expect(S.components.schemas.IdempotencyResourceGoneError.properties.code.const).toBe('idempotency_resource_gone');
+  });
+
+  it('`replayed` is an optional boolean on the create body', () => {
+    const body = create.responses['200'].content['application/json'].schema;
+    expect(body.properties.replayed.type).toBe('boolean');
+    expect(body.required).not.toContain('replayed');
   });
 });

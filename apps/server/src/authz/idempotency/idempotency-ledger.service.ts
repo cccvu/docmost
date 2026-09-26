@@ -26,9 +26,9 @@ export type IdempotentOp = 'page.create' | 'space.create';
 export interface IdempotencyScope {
   workspaceId: string;
   /**
-   * The identity the fork itself authenticated: `userPrincipal(user.id)` on a route relayed as the user (JWT), or the
-   * service route's own acting identity. Binding it into the namespace means one caller can never replay another's
-   * result, whatever namespace string either of them sends.
+   * The identity the fork itself authenticated: `userPrincipal(user.id)` on a route relayed as the user (JWT), or
+   * `servicePrincipal(credentialId, actorUserId)` on a service-bridge route. Binding it into the namespace means one
+   * caller can never replay another's result, whatever namespace string either of them sends.
    */
   principal: string;
   /** The caller's opaque key namespace (the platform sends its idempotency subject, `subject[:obo:human]`), ≤128. */
@@ -62,6 +62,15 @@ export const sha256hex = (s: string): string => createHash('sha256').update(s, '
 
 /** The principal of a route relayed as the fork user `userId` (JwtAuthGuard). */
 export const userPrincipal = (userId: string): string => `user:${userId}`;
+
+/**
+ * The principal of a service-bridge call (ServiceAuthGuard): the credential that authenticated it AND the acting human
+ * it names, as the fork resolved that human to a shadow user. Both are fixed-shape (a registry credential id, a uuid),
+ * so the `/` boundary is unambiguous — and neither the same human through another service credential nor another
+ * human through the same one can reach this caller's entries.
+ */
+export const servicePrincipal = (credentialId: string, actorUserId: string): string =>
+  `service:${credentialId}/user:${actorUserId}`;
 
 /**
  * The stored namespace: sha256 over the JSON array [version, workspace, principal, caller namespace]. JSON-encoding

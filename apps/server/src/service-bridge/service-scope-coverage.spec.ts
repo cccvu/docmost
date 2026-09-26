@@ -53,7 +53,7 @@ const EXPECTED_SCOPE: Record<string, ServiceScope> = {
   'ServiceSpaceController.list': ServiceScope.SpacesRead,
   'ServiceSpaceController.getDetail': ServiceScope.SpacesRead,
   'ServiceSpaceController.listMembers': ServiceScope.SpacesRead,
-  'ServiceSpaceController.create': ServiceScope.SpacesWrite,
+  'ServiceSpaceController.create': ServiceScope.SpacesWrite, // #616: keyed or not, the same write scope
   'ServiceSpaceController.update': ServiceScope.SpacesWrite,
   'ServiceSpaceController.archive': ServiceScope.SpacesWrite,
   'ServiceSpaceController.unarchive': ServiceScope.SpacesWrite,

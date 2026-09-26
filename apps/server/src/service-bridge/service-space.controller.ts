@@ -10,13 +10,15 @@ import {
   Patch,
   Post,
   Query,
+  Req,
   UseGuards,
 } from '@nestjs/common';
 import { SkipTransform } from '../common/decorators/skip-transform.decorator';
 import { RemoteOnlyGuard } from '../authz/mode/remote-only.guard';
-import { RequireServiceScope, ServiceAuthGuard } from './service-auth.guard';
+import { RequireServiceScope, ServiceAuthGuard, serviceCredentialIdOf } from './service-auth.guard';
 import { ServiceScope } from './service-scope';
 import {
+  CreatedSpace,
   RawSpaceMember,
   ServiceSpaceService,
   SpaceDetailView,
@@ -45,7 +47,8 @@ import { parseSubCollectionQuery } from './dto/sub-collection-page.dto';
  * #616: the detail and every membership carry a `version`; rename / archive / role change / removal take an optional
  * `expectedVersion` compared atomically (412 `precondition_failed`) and answer the new version (a removal has none).
  * `members/preview` answers what a member write would do without writing (same scope as the write; not a narrowing
- * route — it narrows nothing).
+ * route — it narrows nothing). A create may be KEYED (`idempotencyKey` + `idempotencyNamespace` + `fingerprint`): a
+ * repeat answers the space it created with `replayed: true` and re-runs nothing.
  */
 @Controller('service/spaces')
 @UseGuards(RemoteOnlyGuard, ServiceAuthGuard)
@@ -87,8 +90,9 @@ export class ServiceSpaceController {
   @Post()
   @HttpCode(HttpStatus.OK)
   @RequireServiceScope(ServiceScope.SpacesWrite)
-  async create(@Body() dto: CreateSpaceDto): Promise<{ id: string; slug: string; name: string | null }> {
-    return this.service.create(dto);
+  async create(@Body() dto: CreateSpaceDto, @Req() req?: unknown): Promise<CreatedSpace> {
+    // #616: a keyed create is bound to the credential that authenticated this call (see ServiceSpaceService.createKeyed).
+    return this.service.create(dto, serviceCredentialIdOf(req));
   }
 
   @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)

@@ -4,7 +4,7 @@ import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify
 import { Test } from '@nestjs/testing';
 import { TransformHttpResponseInterceptor } from '../common/interceptors/http-response.interceptor';
 import { RemoteOnlyGuard } from '../authz/mode/remote-only.guard';
-import { ServiceAuthGuard } from './service-auth.guard';
+import { attachServiceCredential, ServiceAuthGuard } from './service-auth.guard';
 import { ServiceWorkspaceController } from './service-workspace.controller';
 import { ServiceContentController } from './service-content.controller';
 import { AuthzChangeController } from './authz-change.controller';
@@ -357,5 +357,105 @@ describe('service-bridge versioned writes + member preview on the wire (#616)', 
       payload: { action: 'update', role: 'reader', actorExternalId: 'ext-me' },
     });
     expect(res.statusCode).toBe(400);
+  });
+});
+
+/**
+ * #616 Stage 3 — the keyed space create through the real pipeline: the global ValidationPipe (which would silently
+ * strip an undeclared key field) keeps the three keyed fields and refuses a partial key before the service runs; the
+ * body is the bare create shape plus `replayed`; the ledger sees the credential the guard admitted; a mismatch is a
+ * 409 whose body carries `code: 'idempotency_key_reused'` (the platform maps it by code); unkeyed carries no `replayed`.
+ */
+describe('service-bridge keyed space create on the wire (#616)', () => {
+  const FP = 'c'.repeat(64);
+  const KEYED = { name: 'Eng', creatorExternalId: 'ext-me', idempotencyKey: 'k-1', idempotencyNamespace: 'user:ext-me', fingerprint: FP };
+  let app: NestFastifyApplication;
+  let calls: SpyQuery[];
+  let reservation: unknown;
+  const reserve = jest.fn(async (_trx: unknown, _claim: unknown) => reservation);
+
+  beforeAll(async () => {
+    const spy = spyKysely((query) => {
+      const s = query.sql.toLowerCase();
+      if (s.includes('insert into spaces')) return [{ id: 'sp-new', slug: 'eng', name: 'Eng' }];
+      if (s.includes('select id, slug, name from spaces')) return [{ id: 'sp-old', slug: 'eng', name: 'Eng' }];
+      return [];
+    });
+    calls = spy.calls;
+    const bridge = { provisionShadowUser: async ({ externalId }: { externalId: string }) => ({ userId: `u-${externalId}`, workspaceId: WS }) };
+    const ledger = { reserve, complete: async () => undefined };
+    const moduleRef = await Test.createTestingModule({
+      controllers: [ServiceSpaceController],
+      providers: [
+        {
+          provide: ServiceSpaceService,
+          useValue: new ServiceSpaceService(spy.db, { resolveDefaultWorkspaceId: async () => WS } as any, bridge as any, ledger as any),
+        },
+      ],
+    })
+      .overrideGuard(RemoteOnlyGuard)
+      .useValue({ canActivate: () => true })
+      .overrideGuard(ServiceAuthGuard) // stands in for the real guard: admits, recording its credential as it does
+      .useValue({ canActivate: (ctx: any) => (attachServiceCredential(ctx.switchToHttp().getRequest(), 'shared'), true) })
+      .compile();
+    app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    app.setGlobalPrefix('api'); // main.ts
+    app.useGlobalPipes(new ValidationPipe({ whitelist: true, stopAtFirstError: true, transform: true })); // main.ts
+    app.useGlobalInterceptors(new TransformHttpResponseInterceptor(app.get(Reflector))); // main.ts
+    await app.init();
+    await app.getHttpAdapter().getInstance().ready();
+  });
+
+  afterAll(async () => await app?.close());
+  beforeEach(() => {
+    calls.length = 0;
+    reserve.mockClear();
+  });
+
+  const post = (payload: object) => app.inject({ method: 'POST', url: '/api/service/spaces', payload });
+
+  it('a fresh keyed create answers the bare body with replayed:false; the ledger got the key bound to the credential', async () => {
+    reservation = { outcome: 'fresh', slot: {} };
+    const res = await post(KEYED);
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ id: 'sp-new', slug: 'eng', name: 'Eng', replayed: false });
+    expect(reserve.mock.calls[0][1]).toEqual({
+      workspaceId: WS,
+      principal: 'service:shared/user:u-ext-me',
+      namespace: 'user:ext-me',
+      op: 'space.create',
+      key: 'k-1',
+      fingerprint: FP,
+    });
+  });
+
+  it('a replay answers the space the key created with replayed:true and inserts nothing', async () => {
+    reservation = { outcome: 'replay', resourceId: 'sp-old' };
+    const res = await post(KEYED);
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ id: 'sp-old', slug: 'eng', name: 'Eng', replayed: true });
+    expect(calls.some((c) => c.sql.toLowerCase().includes('insert into'))).toBe(false);
+  });
+
+  it('a mismatch is a 409 whose body carries code idempotency_key_reused', async () => {
+    reservation = { outcome: 'mismatch' };
+    const res = await post(KEYED);
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({ code: 'idempotency_key_reused' });
+  });
+
+  it('a partial key is a 400 that never reaches the service', async () => {
+    const { fingerprint: _fp, ...partial } = KEYED;
+    const res = await post(partial);
+    expect(res.statusCode).toBe(400);
+    expect(calls).toEqual([]);
+    expect(reserve).not.toHaveBeenCalled();
+  });
+
+  it('unkeyed answers the pre-#616 body (no replayed) and never touches the ledger', async () => {
+    const res = await post({ name: 'Eng', creatorExternalId: 'ext-me' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ id: 'sp-new', slug: 'eng', name: 'Eng' });
+    expect(reserve).not.toHaveBeenCalled();
   });
 });
