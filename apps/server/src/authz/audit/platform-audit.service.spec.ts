@@ -1,3 +1,6 @@
+import { NoopAuditService } from '../../integrations/audit/audit.service';
+import { StandaloneAuditService } from './activity-audit.writer';
+import { createAuditService } from './audit.module';
 import { PlatformAuditClient } from './platform-audit.client';
 import { PlatformAuditService } from './platform-audit.service';
 
@@ -156,5 +159,114 @@ describe('PlatformAuditService (AUDIT_SERVICE rebind)', () => {
     expect(client.forward.mock.calls[0][0][0]).toMatchObject({ actorId: undefined, workspaceId: undefined });
     // setActorId with no context is a safe no-op.
     expect(() => svc.setActorId('x')).not.toThrow();
+  });
+});
+
+/**
+ * #615: the local activity copy rides alongside the forward and must never change it. The writer's own rules
+ * (allowlist, skips, never rejects) are in activity-audit.writer.spec.ts; these pin the SERVICE's half: every
+ * log path hands the writer the same context it forwards with, the forward is issued first and is identical
+ * with or without a writer, and a failing writer never reaches the request path.
+ */
+describe('PlatformAuditService local activity copy (#615)', () => {
+  const ctx = {
+    workspaceId: '11111111-1111-4111-8111-111111111111',
+    actorId: '22222222-2222-4222-8222-222222222222',
+    actorType: 'user' as const,
+    ipAddress: '10.0.0.1',
+    userAgent: 'jest',
+  };
+  const payload = {
+    event: 'page.trashed',
+    resourceType: 'page',
+    resourceId: '33333333-3333-4333-8333-333333333333',
+    spaceId: '44444444-4444-4444-8444-444444444444',
+  } as const;
+  const makeCls = () => ({ get: jest.fn(() => ({ ...ctx })), set: jest.fn() });
+  const makeClient = () => ({ forward: jest.fn(async (_events: any) => undefined) });
+  const makeWriter = () => ({ record: jest.fn(async (_p: any, _c: any) => undefined) });
+
+  it('log() records the payload with the CLS actor context, after issuing the forward', () => {
+    const order: string[] = [];
+    const client = { forward: jest.fn(async () => void order.push('forward')) };
+    const writer = { record: jest.fn(async () => void order.push('record')) };
+    new PlatformAuditService(makeCls() as any, client as any, writer as any).log(payload as any);
+
+    expect(writer.record).toHaveBeenCalledTimes(1);
+    const [payloads, context] = writer.record.mock.calls[0] as unknown as [unknown[], Record<string, unknown>];
+    expect(payloads).toEqual([payload]);
+    expect(context).toMatchObject({ workspaceId: ctx.workspaceId, actorId: ctx.actorId, actorType: 'user' });
+    expect(order).toEqual(['forward', 'record']);
+  });
+
+  it('logWithContext / logBatchWithContext record with the caller-supplied context', () => {
+    const writer = makeWriter();
+    const svc = new PlatformAuditService(makeCls() as any, makeClient() as any, writer as any);
+    const explicit = { workspaceId: ctx.workspaceId, actorId: ctx.actorId, actorType: 'system' as const };
+
+    svc.logWithContext(payload as any, explicit);
+    svc.logBatchWithContext([payload as any, { ...payload, event: 'page.restored' } as any], explicit);
+
+    expect(writer.record).toHaveBeenNthCalledWith(1, [payload], explicit);
+    expect(writer.record).toHaveBeenNthCalledWith(2, [payload, { ...payload, event: 'page.restored' }], explicit);
+  });
+
+  it('forwards exactly the same events with or without the writer', () => {
+    const withWriter = makeClient();
+    const without = makeClient();
+    const a = new PlatformAuditService(makeCls() as any, withWriter as any, makeWriter() as any);
+    const b = new PlatformAuditService(makeCls() as any, without as any);
+    const explicit = { workspaceId: 'w1', actorId: 'u1', actorType: 'user' as const, ipAddress: '9.9.9.9' };
+
+    a.log(payload as any);
+    b.log(payload as any);
+    a.logWithContext(payload as any, explicit);
+    b.logWithContext(payload as any, explicit);
+    a.logBatchWithContext([payload as any], explicit);
+    b.logBatchWithContext([payload as any], explicit);
+
+    expect(withWriter.forward.mock.calls).toEqual(without.forward.mock.calls);
+    // The IP still reaches the platform — only the local copy drops it.
+    expect(withWriter.forward.mock.calls[0][0][0].ipAddress).toBe('10.0.0.1');
+  });
+
+  it.each([
+    ['throws synchronously', () => { throw new Error('boom'); }],
+    ['rejects', () => Promise.reject(new Error('boom'))],
+    ['returns nothing', () => undefined],
+  ])('never throws into the request path, and still forwards, when the writer %s', async (_name, record) => {
+    const client = makeClient();
+    const svc = new PlatformAuditService(makeCls() as any, client as any, { record } as any);
+    expect(() => svc.log(payload as any)).not.toThrow();
+    expect(() => svc.logWithContext(payload as any, { workspaceId: 'w1' })).not.toThrow();
+    expect(() => svc.logBatchWithContext([payload as any], { workspaceId: 'w1' })).not.toThrow();
+    expect(client.forward).toHaveBeenCalledTimes(3);
+    await new Promise((r) => setImmediate(r)); // a swallowed rejection must not surface as an unhandled one
+  });
+});
+
+describe('createAuditService (the AUDIT_SERVICE factory)', () => {
+  const ctx = { workspaceId: '11111111-1111-4111-8111-111111111111', actorId: null, actorType: 'user' };
+  const payload = { event: 'page.restored', resourceType: 'page', resourceId: '33333333-3333-4333-8333-333333333333' };
+
+  it('remote → PlatformAuditService, forwarding AND recording the activity copy', () => {
+    const client = { forward: jest.fn(async () => undefined) };
+    const writer = { record: jest.fn(async () => undefined) };
+    const svc = createAuditService('remote', { get: () => ctx, set: jest.fn() } as any, client as any, writer as any);
+    expect(svc).toBeInstanceOf(PlatformAuditService);
+    svc.log(payload as any);
+    expect(client.forward).toHaveBeenCalledTimes(1);
+    expect(writer.record).toHaveBeenCalledTimes(1);
+  });
+
+  it('native → the standalone service: records the activity copy, forwards nothing', () => {
+    const client = { forward: jest.fn(async () => undefined) };
+    const writer = { record: jest.fn(async () => undefined) };
+    const svc = createAuditService('native', { get: () => ctx, set: jest.fn() } as any, client as any, writer as any);
+    expect(svc).toBeInstanceOf(StandaloneAuditService);
+    expect(svc).toBeInstanceOf(NoopAuditService);
+    svc.log(payload as any);
+    expect(client.forward).not.toHaveBeenCalled();
+    expect(writer.record).toHaveBeenCalledTimes(1);
   });
 });

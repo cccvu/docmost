@@ -40,6 +40,7 @@ import { AuthzModule } from '../authz/authz.module';
 import {
   spaceMemberRepoProvider,
   pagePermissionRepoProvider,
+  labelRepoProvider,
 } from '../authz/mode/repo-providers';
 
 @Global()
@@ -102,7 +103,7 @@ import {
     ShareRepo,
     NotificationRepo,
     WatcherRepo,
-    LabelRepo,
+    labelRepoProvider, // CCC mode-selected (#615): remote = PDP-gated label lists. See #1.
     TemplateRepo,
     PageListener,
   ],

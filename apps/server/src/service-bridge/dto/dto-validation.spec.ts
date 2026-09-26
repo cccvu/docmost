@@ -59,6 +59,45 @@ describe('service-bridge DTO validation (constraints are load-bearing)', () => {
       expect(await errCount(ContentSearchDto, { userId: UUID, query: 'x', limit: 0 })).toBeGreaterThan(0);
       expect(await errCount(ContentSearchDto, { userId: UUID, query: 'x', offset: -1 })).toBeGreaterThan(0);
     });
+
+    // #615 filters + the on-behalf-of service leg.
+    it('accepts every #615 filter and a service principal id of any uuid version', async () => {
+      expect(
+        await errCount(ContentSearchDto, {
+          userId: UUID,
+          query: 'x',
+          lastUpdatedById: UUID,
+          parentPageId: UUID,
+          labelName: 'road-map',
+          updatedSince: '2026-01-01T00:00:00.000Z',
+          updatedUntil: '2026-02-01T00:00:00Z',
+          serviceSubjectId: UUID,
+        }),
+      ).toBe(0);
+      // A platform id is a uuid COLUMN value: a non-v4 / non-RFC-variant one is still a real service account id.
+      expect(
+        await errCount(ContentSearchDto, { userId: UUID, query: 'x', serviceSubjectId: '00000000-0000-0000-0000-000000000001' }),
+      ).toBe(0);
+    });
+    it('normalizes a label name as Docmost stores it before checking its grammar', async () => {
+      const dto = plainToInstance(ContentSearchDto, { userId: UUID, query: 'x', labelName: '  Road Map ' });
+      expect(dto.labelName).toBe('road-map');
+      expect(await validate(dto)).toHaveLength(0);
+    });
+    it('rejects a non-uuid editor / parent, a bad label, a non-ISO bound and a malformed service principal id', async () => {
+      const base = { userId: UUID, query: 'x' };
+      expect(await errCount(ContentSearchDto, { ...base, lastUpdatedById: 'nope' })).toBeGreaterThan(0);
+      expect(await errCount(ContentSearchDto, { ...base, parentPageId: 'nope' })).toBeGreaterThan(0);
+      expect(await errCount(ContentSearchDto, { ...base, labelName: 'a/b' })).toBeGreaterThan(0);
+      expect(await errCount(ContentSearchDto, { ...base, labelName: '~lead' })).toBeGreaterThan(0);
+      expect(await errCount(ContentSearchDto, { ...base, labelName: 'a'.repeat(101) })).toBeGreaterThan(0);
+      expect(await errCount(ContentSearchDto, { ...base, labelName: '   ' })).toBeGreaterThan(0);
+      expect(await errCount(ContentSearchDto, { ...base, updatedSince: 'yesterday' })).toBeGreaterThan(0);
+      expect(await errCount(ContentSearchDto, { ...base, updatedUntil: 'not-a-date' })).toBeGreaterThan(0);
+      expect(await errCount(ContentSearchDto, { ...base, serviceSubjectId: 'svc-1' })).toBeGreaterThan(0);
+      expect(await errCount(ContentSearchDto, { ...base, serviceSubjectId: `${UUID}x` })).toBeGreaterThan(0);
+      expect(await errCount(ContentSearchDto, { ...base, serviceSubjectId: 42 })).toBeGreaterThan(0);
+    });
   });
 
   describe('ContentSortDto', () => {

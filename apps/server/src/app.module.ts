@@ -9,6 +9,8 @@ import { EnvironmentModule } from './integrations/environment/environment.module
 import { CollaborationModule } from './collaboration/collaboration.module';
 import { CollabDisconnectModule } from './authz/collab/collab-disconnect.module';
 import { ConditionalPageModule } from './authz/page-write/conditional-page.module';
+// CCC seam (#615): comment resolve/reopen (POST /api/comments/resolve); needs CollaborationModule, so app root.
+import { CommentResolutionModule } from './authz/comment-resolution/comment-resolution.module';
 // CCC seam (#319, #62): installs the response security headers (Referrer-Policy) on EVERY response,
 // including the static SPA documents an interceptor would miss. main.ts is upstream-owned, so the hook is
 // registered from a CCC module instead.
@@ -90,6 +92,7 @@ try {
     CollaborationModule,
     CollabDisconnectModule,
     ConditionalPageModule,
+    CommentResolutionModule,
     ResponseHeadersModule,
     WsModule,
     QueueModule,

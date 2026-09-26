@@ -9,7 +9,10 @@ import { Injectable, Logger } from '@nestjs/common';
  * platform outage cannot silently grant access.
  */
 export type AuthzSubject =
-  | { principalId: string }
+  // A platform principal. `subjectType: 'service'` names a SERVICE ACCOUNT (the platform resolves it to its
+  // `service_account` subject, never a user); absent or 'user' is a user principal. The fork sends the service
+  // form only for the service leg of an on-behalf-of search (#615); every user decision uses the external ref.
+  | { principalId: string; subjectType?: 'user' | 'service' }
   | { provider: string; externalId: string };
 
 export interface AuthzCheckItem {

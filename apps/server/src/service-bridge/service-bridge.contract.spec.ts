@@ -11,12 +11,45 @@ import { ServicePageController } from './service-page.controller';
 import { ServiceContentController } from './service-content.controller';
 import { ServiceAttachmentController } from './service-attachment.controller';
 import { AuthzChangeController } from './authz-change.controller';
-import { CONTENT_LIST_MAX_IDS, CONTENT_LIST_MAX_LIMIT } from './dto/content-read.dto';
+import {
+  CONTENT_DESCENDANT_MAX_DEPTH,
+  CONTENT_LIST_MAX_IDS,
+  CONTENT_LIST_MAX_LIMIT,
+  CONTENT_SORT_FIELDS,
+  ContentAncestorsDto,
+  ContentCursorDto,
+  ContentListDto,
+  ContentSortDto,
+  LABEL_NAME_MAX_LENGTH,
+  LABEL_NAME_PATTERN,
+  SpaceCommentPolicyDto,
+} from './dto/content-read.dto';
+import { ContentLabelCursorDto, ContentLabelListDto } from './dto/content-labels.dto';
+import {
+  CONTENT_SEARCH_MAX_LIMIT,
+  ContentSearchDto,
+  PRINCIPAL_ID_PATTERN,
+} from './dto/content-search.dto';
+import { MAX_SEARCH_QUERY_LENGTH } from '../core/search/dto/search.dto';
+import {
+  ACTIVITY_KEY_PATTERN,
+  ACTIVITY_TYPES,
+  ContentActivityCursorDto,
+  ContentActivityListDto,
+} from './dto/content-activity.dto';
 import { AuthzChangeEvent, AuthzChangeEventType } from './authz-change-event';
 import { ChangesResult } from './authz-change-feed.service';
 import { SnapshotResult } from './authz-snapshot.service';
-import { PublicPageSummary, PublicSpaceSummary, RawPagePermission } from './service-content.service';
-import { PublicSearchHit } from './service-search.service';
+import {
+  PageAncestors,
+  PublicLabelSummary,
+  PublicPageSummary,
+  PublicSpaceSummary,
+  RawPagePermission,
+  SpaceCommentPolicy,
+} from './service-content.service';
+import { PublicActivityEvent } from './service-content-activity';
+import { ContentSearchResult, PublicSearchHit } from './service-search.service';
 import { PublicAttachmentSummary } from './service-attachment.service';
 import { SpaceView, RawSpaceMember } from './service-space.service';
 import { WorkspaceSettingsView } from './service-workspace.service';
@@ -205,7 +238,7 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     WorkspaceSettings: keysOf<WorkspaceSettingsView>({ name: true, defaultPageEditMode: true }),
     SpaceView: keysOf<SpaceView>({ id: true, name: true, slug: true, description: true, visibility: true, memberCount: true, archived: true, createdAt: true }),
     RawSpaceMember: keysOf<RawSpaceMember>({ memberId: true, userId: true, groupId: true, role: true, createdAt: true }),
-    PublicPageSummary: keysOf<PublicPageSummary>({ id: true, slugId: true, title: true, icon: true, spaceId: true, parentPageId: true, position: true, createdAt: true, updatedAt: true }),
+    PublicPageSummary: keysOf<PublicPageSummary>({ id: true, slugId: true, title: true, icon: true, spaceId: true, parentPageId: true, position: true, createdAt: true, updatedAt: true, creatorId: true, creatorName: true, lastUpdatedById: true, lastUpdatedByName: true }),
     PublicSpaceSummary: keysOf<PublicSpaceSummary>({ id: true, name: true, slug: true, description: true, visibility: true, createdAt: true, updatedAt: true }),
     RawPagePermission: keysOf<RawPagePermission>({ id: true, userId: true, groupId: true, role: true, createdAt: true }),
     PublicSearchHit: keysOf<PublicSearchHit>({ id: true, title: true, icon: true, parentPageId: true, space: true, highlight: true, createdAt: true, updatedAt: true }),
@@ -217,6 +250,11 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     // #545 page authz state.
     PageAuthzState: keysOf<PageAuthzState>({ pageId: true, exists: true, spaceId: true, parentPageId: true, restricted: true, lineageRestricted: true, lineageComplete: true }),
     PageAuthzStateResponse: keysOf<PageAuthzStateResult>({ pages: true, nextAfter: true }),
+    // #615 knowledge reads.
+    PageAncestors: keysOf<PageAncestors>({ ancestorIds: true, complete: true }),
+    PublicLabelSummary: keysOf<PublicLabelSummary>({ name: true, pageCount: true }),
+    PublicActivityEvent: keysOf<PublicActivityEvent>({ key: true, type: true, occurredAt: true, actorId: true, actorName: true, pageId: true, spaceId: true, pageTitle: true, commentId: true, versionId: true }),
+    SpaceCommentPolicy: keysOf<SpaceCommentPolicy>({ allowViewerComments: true }),
   };
 
   // The 5 inline (non-component) scalar bodies, tied to the CONTROLLER return types (a signature change reds).
@@ -227,12 +265,15 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
   const CREATE_SPACE = keysOf<Awaited<ReturnType<ServiceSpaceController['create']>>>({ id: true, slug: true, name: true });
   const ADD_MEMBER = keysOf<Awaited<ReturnType<ServiceSpaceController['addMember']>>>({ memberId: true, userId: true });
   const RESOLVE_PAGE_SPACE = keysOf<Awaited<ReturnType<ServicePageController['resolveSpace']>>>({ pageId: true, spaceId: true });
+  const SEARCH_PAGE = keysOf<ContentSearchResult>({ items: true, hasMore: true });
   const RESOLVE_ATTACHMENT_PAGE = keysOf<Awaited<ReturnType<ServiceAttachmentController['resolvePage']>>>({ attachmentId: true, pageId: true, spaceId: true });
 
   type OpExpect =
     | { kind: 'ref'; name: string }
     | { kind: 'array'; name: string }
     | { kind: 'items'; name: string }
+    // #615: one page of `items` plus exactly these other keys (all required), e.g. search's `hasMore`.
+    | { kind: 'itemsPage'; name: string; keys: string[] }
     | { kind: 'inline'; keys: string[] };
 
   const OPS: Array<{ id: string; method: string; path: string; expect: OpExpect }> = [
@@ -255,12 +296,18 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     { id: 'listContentPages', method: 'post', path: '/api/service/content/pages/list', expect: { kind: 'items', name: 'PublicPageSummary' } },
     { id: 'listContentSpaces', method: 'post', path: '/api/service/content/spaces/list', expect: { kind: 'items', name: 'PublicSpaceSummary' } },
     { id: 'getContentSpace', method: 'get', path: '/api/service/content/spaces/{spaceId}', expect: { kind: 'ref', name: 'PublicSpaceSummary' } },
-    { id: 'searchContent', method: 'post', path: '/api/service/content/search', expect: { kind: 'items', name: 'PublicSearchHit' } },
+    // #615 (1.8.0): the search page carries `hasMore` beside its items (typed against the service's return shape).
+    { id: 'searchContent', method: 'post', path: '/api/service/content/search', expect: { kind: 'itemsPage', name: 'PublicSearchHit', keys: SEARCH_PAGE } },
     { id: 'resolveAttachmentPage', method: 'get', path: '/api/service/attachments/{attachmentId}/page', expect: { kind: 'inline', keys: RESOLVE_ATTACHMENT_PAGE } },
     { id: 'listPageAttachments', method: 'get', path: '/api/service/attachments/by-page/{pageId}', expect: { kind: 'items', name: 'PublicAttachmentSummary' } },
     { id: 'pageLifecycleState', method: 'post', path: '/api/service/pages/lifecycle-state', expect: { kind: 'ref', name: 'PageLifecycleState' } },
     { id: 'listTrashedPages', method: 'post', path: '/api/service/pages/trash', expect: { kind: 'items', name: 'TrashedPage' } },
     { id: 'getPageAuthzState', method: 'post', path: '/api/service/authz/pages/state', expect: { kind: 'ref', name: 'PageAuthzStateResponse' } },
+    // #615 knowledge reads.
+    { id: 'pageAncestors', method: 'post', path: '/api/service/content/pages/ancestors', expect: { kind: 'ref', name: 'PageAncestors' } },
+    { id: 'listContentLabels', method: 'post', path: '/api/service/content/labels/list', expect: { kind: 'items', name: 'PublicLabelSummary' } },
+    { id: 'listContentActivity', method: 'post', path: '/api/service/content/activity/list', expect: { kind: 'items', name: 'PublicActivityEvent' } },
+    { id: 'getSpaceCommentPolicy', method: 'post', path: '/api/service/content/spaces/comment-policy', expect: { kind: 'ref', name: 'SpaceCommentPolicy' } },
   ];
 
   // #545: the request is typed against the DTO (a field added on either side fails) and its caps are the DTO's.
@@ -316,6 +363,11 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
       expect(sortedKeys(schema.properties)).toEqual(['items']);
       expect(schema.properties.items.type).toBe('array');
       expect(refName(schema.properties.items.items)).toBe(exp.name);
+    } else if (exp.kind === 'itemsPage') {
+      expect(sortedKeys(schema.properties)).toEqual(exp.keys);
+      expect([...schema.required].sort()).toEqual(exp.keys);
+      expect(schema.properties.items.type).toBe('array');
+      expect(refName(schema.properties.items.items)).toBe(exp.name);
     } else {
       expect(sortedKeys(schema.properties)).toEqual(exp.keys);
       if (schema.required) expect([...schema.required].sort()).toEqual(exp.keys);
@@ -361,5 +413,100 @@ describe('service-bridge.openapi.json member-mutation refusals (#486)', () => {
     expect(schema.additionalProperties).toBe(false);
     expect(Object.keys(schema.properties).sort()).toEqual(keys);
     expect([...schema.required].sort()).toEqual(keys);
+  });
+});
+
+/**
+ * #615 — the REQUEST schemas of the content reads, tethered to the fork DTOs. The global ValidationPipe runs with
+ * `whitelist` but WITHOUT `forbidNonWhitelisted`, so a field the document declares but the DTO lacks is SILENTLY
+ * DROPPED (a filter the platform sends would simply not apply — for a narrowing filter, a wider answer than asked
+ * for). Each key map below is typed against its DTO (`Record<keyof Dto, true>`: a DTO rename fails to compile), and
+ * the document's closed key set must equal it (a document rename fails here), so the two can only move together.
+ * The caps and enums the DTOs enforce are pinned to the document's the same way.
+ */
+describe('service-bridge.openapi.json content request schemas match the fork DTOs (#615)', () => {
+  const schemas = SPEC.components.schemas;
+  const sortedKeys = (o: object): string[] => Object.keys(o).sort();
+  const keysOf = <T,>(m: Record<keyof T, true>): string[] => Object.keys(m).sort();
+  const closed = (schema: any, keys: string[], required: string[]): void => {
+    expect(schema.additionalProperties).toBe(false);
+    expect(sortedKeys(schema.properties)).toEqual(keys);
+    expect([...(schema.required ?? [])].sort()).toEqual([...required].sort());
+  };
+
+  it('ContentListRequest declares exactly the ContentListDto keys (and its nested sort / cursor the nested DTOs’)', () => {
+    const schema = schemas.ContentListRequest;
+    closed(
+      schema,
+      keysOf<ContentListDto>({
+        ids: true, spaceId: true, parentPageId: true, topLevel: true, descendantOf: true, maxDepth: true, linksTo: true,
+        linkedFrom: true, labelName: true, titleContains: true, creatorId: true, lastUpdatedById: true, nameContains: true,
+        updatedSince: true, updatedUntil: true, createdSince: true, createdUntil: true, sort: true, before: true, limit: true,
+      }),
+      ['ids', 'limit'],
+    );
+    closed(schema.properties.sort, keysOf<ContentSortDto>({ field: true, direction: true }), ['field', 'direction']);
+    closed(schema.properties.before, keysOf<ContentCursorDto>({ updatedAt: true, value: true, id: true }), ['id']);
+    expect(schema.properties.sort.properties.field.enum).toEqual([...CONTENT_SORT_FIELDS]);
+    expect(schema.properties.maxDepth.maximum).toBe(CONTENT_DESCENDANT_MAX_DEPTH);
+    expect(schema.properties.labelName.maxLength).toBe(LABEL_NAME_MAX_LENGTH);
+    expect(schema.properties.labelName.pattern).toBe(LABEL_NAME_PATTERN.source);
+  });
+
+  it('ContentAncestorsRequest / SpaceCommentPolicyRequest declare exactly their DTO keys', () => {
+    closed(schemas.ContentAncestorsRequest, keysOf<ContentAncestorsDto>({ pageId: true }), ['pageId']);
+    closed(schemas.SpaceCommentPolicyRequest, keysOf<SpaceCommentPolicyDto>({ spaceId: true }), ['spaceId']);
+  });
+
+  it('ContentLabelListRequest declares exactly the ContentLabelListDto keys, with the DTO caps', () => {
+    const schema = schemas.ContentLabelListRequest;
+    closed(
+      schema,
+      keysOf<ContentLabelListDto>({ ids: true, spaceId: true, nameContains: true, before: true, limit: true }),
+      ['ids', 'limit'],
+    );
+    closed(schema.properties.before, keysOf<ContentLabelCursorDto>({ name: true }), ['name']);
+    expect(schema.properties.ids.maxItems).toBe(CONTENT_LIST_MAX_IDS);
+    expect(schema.properties.limit.maximum).toBe(CONTENT_LIST_MAX_LIMIT);
+    expect(schema.properties.nameContains.maxLength).toBe(LABEL_NAME_MAX_LENGTH);
+  });
+
+  it('ContentActivityListRequest declares exactly the ContentActivityListDto keys, with the DTO caps and type enum', () => {
+    const schema = schemas.ContentActivityListRequest;
+    closed(
+      schema,
+      keysOf<ContentActivityListDto>({
+        ids: true, spaceId: true, pageId: true, since: true, until: true, types: true, actorId: true, before: true, limit: true,
+      }),
+      ['ids', 'since', 'limit'],
+    );
+    closed(schema.properties.before, keysOf<ContentActivityCursorDto>({ occurredAt: true, key: true }), ['occurredAt', 'key']);
+    expect(schema.properties.before.properties.key.pattern).toBe(ACTIVITY_KEY_PATTERN.source);
+    expect(schema.properties.ids.maxItems).toBe(CONTENT_LIST_MAX_IDS);
+    expect(schema.properties.limit.maximum).toBe(CONTENT_LIST_MAX_LIMIT);
+    expect(schema.properties.types.items.enum).toEqual([...ACTIVITY_TYPES]);
+    expect(schema.properties.types.maxItems).toBe(ACTIVITY_TYPES.length);
+    // The response names the same event set.
+    expect(schemas.PublicActivityEvent.properties.type.enum).toEqual([...ACTIVITY_TYPES]);
+  });
+
+  it('ContentSearchRequest declares exactly the ContentSearchDto keys, with the DTO caps and grammars', () => {
+    const schema = schemas.ContentSearchRequest;
+    closed(
+      schema,
+      keysOf<ContentSearchDto>({
+        userId: true, query: true, spaceId: true, creatorId: true, lastUpdatedById: true, parentPageId: true,
+        labelName: true, updatedSince: true, updatedUntil: true, serviceSubjectId: true, limit: true, offset: true,
+      }),
+      ['userId', 'query'],
+    );
+    const props = schema.properties;
+    expect(props.query.maxLength).toBe(MAX_SEARCH_QUERY_LENGTH);
+    expect(props.limit.maximum).toBe(CONTENT_SEARCH_MAX_LIMIT);
+    expect(props.labelName.maxLength).toBe(LABEL_NAME_MAX_LENGTH);
+    expect(props.labelName.pattern).toBe(LABEL_NAME_PATTERN.source);
+    // The service principal id grammar is the DTO's (an any-version hex uuid, the platform's id column shape).
+    expect(props.serviceSubjectId.pattern).toBe(PRINCIPAL_ID_PATTERN.source);
+    for (const k of ['updatedSince', 'updatedUntil'] as const) expect(props[k].format).toBe('date-time');
   });
 });

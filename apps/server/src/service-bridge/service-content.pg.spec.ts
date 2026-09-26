@@ -10,6 +10,7 @@ import {
   bootstrapSchema,
   mkReadModelDb,
   createReadModelTables,
+  createKnowledgeTables,
 } from './read-model-pg.testkit';
 
 /**
@@ -90,6 +91,7 @@ d('ServiceContentService on real Postgres (keyset ordering + confidentiality)', 
     appPg = mkReadModelPg(SCHEMA, 2);
     db = mkReadModelDb(appPg);
     await createReadModelTables(pg);
+    await createKnowledgeTables(pg); // #615: the page list projects creator/editor names from `users`
     svc = new ServiceContentService(db as any, fakeWorkspaceResolver(DEFAULT_WS));
 
     // ---- F1 keyset fixtures: three pages, two of which share a truncated millisecond. ----

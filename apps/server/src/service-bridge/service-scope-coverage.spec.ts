@@ -67,6 +67,10 @@ const EXPECTED_SCOPE: Record<string, ServiceScope> = {
   'ServiceContentController.listPages': ServiceScope.ContentRead,
   'ServiceContentController.listSpaces': ServiceScope.ContentRead,
   'ServiceContentController.getSpace': ServiceScope.ContentRead,
+  'ServiceContentController.pageAncestors': ServiceScope.ContentRead, // #615
+  'ServiceContentController.listLabels': ServiceScope.ContentRead, // #615
+  'ServiceContentController.listActivity': ServiceScope.ContentRead, // #615
+  'ServiceContentController.spaceCommentPolicy': ServiceScope.ContentRead, // #615
   'ServiceContentController.search': ServiceScope.ContentSearch,
   'ServiceAttachmentController.resolvePage': ServiceScope.AttachmentsRead,
   'ServiceAttachmentController.listByPage': ServiceScope.AttachmentsRead,
