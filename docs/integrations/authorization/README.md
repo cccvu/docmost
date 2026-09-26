@@ -125,6 +125,17 @@ transaction rolls back. A move rolls back whole; upstream's restore is not trans
 un-trash has already committed and the page stays under its trashed, restricted parent (never declassified;
 wiki-v2 issue 556).
 
+**Conditional page operations (1.9.0, wiki-v2 #616).** `POST /api/service/pages/lifecycle-state` also reports the
+page's own `position`. Beside the native page routes a platform relays as the acting user, the fork serves atomic
+compare-and-write twins: `POST /api/pages/conditional-delete`, `conditional-move`, `conditional-move-to-space` and
+`conditional-update-meta`, each taking the native body plus `expectedEtags` (1–8 opaque page versions, or exactly
+`["*"]` for "the page exists"). The version is compared inside the write's transaction under the page row lock (`FOR
+NO KEY UPDATE`, which never deadlocks with the restriction guards above): stale → `412 { code: precondition_failed }`
+with nothing changed; already done → `200 { outcome: noop }` (never for a permanent delete); otherwise `200 {
+outcome: applied }`. A busy engine answers a retryable `503 { code: engine_busy }`. The two moves settle like the
+native moves (`Authz-Propagation`). A fork without these routes answers the framework's plain 404 — an integrator
+must read that as "upgrade pending", never as page-not-found, and must never fall back to the unconditional route.
+
 Three properties bind the whole surface:
 
 - **Mode-gated.** Every route is `404` unless the fork runs `AUTHZ_MODE=remote` (RemoteOnlyGuard, checked

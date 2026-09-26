@@ -20,7 +20,7 @@ import { generateJitteredKeyBetween } from 'fractional-indexing-jittered';
 import { MovePageDto } from '../dto/move-page.dto';
 import { generateSlugId } from '../../../common/helpers';
 import { getPageTitle } from '../../../common/helpers';
-import { executeTx } from '@docmost/db/utils';
+import { dbOrTx, executeTx } from '@docmost/db/utils';
 import { AttachmentRepo } from '@docmost/db/repos/attachment/attachment.repo';
 import { v7 as uuid7 } from 'uuid';
 import {
@@ -174,10 +174,14 @@ export class PageService {
     return page;
   }
 
-  async nextPagePosition(spaceId: string, parentPageId?: string) {
+  async nextPagePosition(
+    spaceId: string,
+    parentPageId?: string,
+    trx?: KyselyTransaction, // CCC seam #121 (#616): optional caller trx
+  ) {
     let pagePosition: string;
 
-    const lastPageQuery = this.db
+    const lastPageQuery = dbOrTx(this.db, trx)
       .selectFrom('pages')
       .select(['position'])
       .where('spaceId', '=', spaceId)
@@ -215,10 +219,13 @@ export class PageService {
     return pagePosition;
   }
 
+  // CCC seam #121 (#616): optional caller `trx` for the row write and the read-back; omitted = unchanged. A content
+  // write still goes through the collab document (outside any transaction) — the CCC caller sends none.
   async update(
     page: Page,
     updatePageDto: UpdatePageDto,
     user: User,
+    trx?: KyselyTransaction,
   ): Promise<Page> {
     const contributors = new Set<string>(page.contributorIds);
     contributors.add(user.id);
@@ -233,6 +240,7 @@ export class PageService {
         contributorIds: contributorIds,
       },
       page.id,
+      trx,
     );
 
     this.generalQueue
@@ -266,6 +274,7 @@ export class PageService {
       includeCreator: true,
       includeLastUpdatedBy: true,
       includeContributors: true,
+      trx,
     });
   }
 
@@ -390,11 +399,19 @@ export class PageService {
     return result;
   }
 
-  async movePageToSpace(rootPage: Page, spaceId: string, userId: string) {
+  // CCC seam #121 (#616): optional caller transaction (`callerTrx`, so the callback's own `trx` keeps its name). The
+  // walk, the position reads and the writes join it; omitted = unchanged (positions are still read outside the tx).
+  async movePageToSpace(
+    rootPage: Page,
+    spaceId: string,
+    userId: string,
+    callerTrx?: KyselyTransaction,
+  ) {
     let childPageIds: string[] = [];
 
     const allPages = await this.pageRepo.getPageAndDescendants(rootPage.id, {
       includeContent: false,
+      trx: callerTrx,
     });
 
     // Filter to only accessible pages while maintaining tree integrity
@@ -420,6 +437,7 @@ export class PageService {
         const orphanPosition = await this.nextPagePosition(
           rootPage.spaceId,
           null,
+          callerTrx,
         );
         await this.pageRepo.updatePage(
           { parentPageId: null, position: orphanPosition },
@@ -429,7 +447,7 @@ export class PageService {
       }
 
       // Update root page
-      const nextPosition = await this.nextPagePosition(spaceId);
+      const nextPosition = await this.nextPagePosition(spaceId, undefined, callerTrx);
       await this.pageRepo.updatePage(
         { spaceId, parentPageId: null, position: nextPosition },
         rootPage.id,
@@ -502,7 +520,7 @@ export class PageService {
           workspaceId: rootPage.workspaceId,
         });
       }
-    });
+    }, callerTrx);
 
     return { childPageIds };
   }
@@ -803,7 +821,8 @@ export class PageService {
     };
   }
 
-  async movePage(dto: MovePageDto, movedPage: Page) {
+  // CCC seam #121 (#616): optional caller `trx` for the parent read and the write; omitted = unchanged.
+  async movePage(dto: MovePageDto, movedPage: Page, trx?: KyselyTransaction) {
     // validate position value by attempting to generate a key
     try {
       generateJitteredKeyBetween(dto.position, null);
@@ -817,7 +836,7 @@ export class PageService {
     } else {
       // changing the page's parent
       if (dto.parentPageId) {
-        const parentPage = await this.pageRepo.findById(dto.parentPageId);
+        const parentPage = await this.pageRepo.findById(dto.parentPageId, { trx });
         if (
           !parentPage ||
           parentPage.deletedAt ||
@@ -835,6 +854,7 @@ export class PageService {
         parentPageId: parentPageId,
       },
       dto.pageId,
+      trx,
     );
   }
 
@@ -989,9 +1009,16 @@ export class PageService {
     return result;
   }
 
-  async forceDelete(pageId: string, workspaceId: string): Promise<void> {
+  // CCC seam #121 (#616): optional caller `trx` — the walk and the delete join it, and the deleted ids are returned.
+  // Under a caller trx the attachment-deletion jobs are NOT queued here: the delete can still roll back, and a job
+  // would then delete the files of a page that survives. The caller queues them after its commit.
+  async forceDelete(
+    pageId: string,
+    workspaceId: string,
+    trx?: KyselyTransaction,
+  ): Promise<string[]> {
     // Get all descendant IDs (including the page itself) using recursive CTE
-    const descendants = await this.db
+    const descendants = await dbOrTx(this.db, trx)
       .withRecursive('page_descendants', (db) =>
         db
           .selectFrom('pages')
@@ -1011,7 +1038,7 @@ export class PageService {
     const pageIds = descendants.map((d) => d.id);
 
     // Queue attachment deletion for all pages with unique job IDs to prevent duplicates
-    for (const id of pageIds) {
+    for (const id of trx ? [] : pageIds) {
       await this.attachmentQueue.add(
         QueueJob.DELETE_PAGE_ATTACHMENTS,
         {
@@ -1029,20 +1056,22 @@ export class PageService {
     }
 
     if (pageIds.length > 0) {
-      await this.db.deleteFrom('pages').where('id', 'in', pageIds).execute();
+      await dbOrTx(this.db, trx).deleteFrom('pages').where('id', 'in', pageIds).execute();
       this.eventEmitter.emit(EventName.PAGE_DELETED, {
         pageIds: pageIds,
         workspaceId,
       });
     }
+    return pageIds;
   }
 
   async removePage(
     pageId: string,
     userId: string,
     workspaceId: string,
+    trx?: KyselyTransaction, // CCC seam #121 (#616): optional caller trx
   ): Promise<void> {
-    await this.pageRepo.removePage(pageId, userId, workspaceId);
+    await this.pageRepo.removePage(pageId, userId, workspaceId, trx);
   }
 
   // CCC integration seam (UPSTREAM_MODIFICATIONS.md #121): visibility widened from `private` to `public`

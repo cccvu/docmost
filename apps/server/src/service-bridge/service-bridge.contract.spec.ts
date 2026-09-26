@@ -278,7 +278,7 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
   // #485: `target` is present only when the request named one, so it is the one non-required key.
   it('PageLifecycleState has exactly the fork type’s keys, all required but the optional `target`', () => {
     const schema = SPEC.components.schemas.PageLifecycleState;
-    const keys = keysOf<PageLifecycleState>({ pageId: true, spaceId: true, parentPageId: true, deletedAt: true, parent: true, restrictedAncestorIds: true, ancestorsComplete: true, selfRestricted: true, descendants: true, target: true });
+    const keys = keysOf<PageLifecycleState>({ pageId: true, spaceId: true, parentPageId: true, position: true, deletedAt: true, parent: true, restrictedAncestorIds: true, ancestorsComplete: true, selfRestricted: true, descendants: true, target: true });
     expect(sortedKeys(schema.properties)).toEqual(keys);
     expect([...schema.required].sort()).toEqual(keys.filter((k) => k !== 'target'));
     expect(sortedKeys(schema.properties.descendants.properties)).toEqual(

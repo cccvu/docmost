@@ -34,6 +34,8 @@ export interface PageLifecycleState {
   pageId: string;
   spaceId: string;
   parentPageId: string | null;
+  /** The page's sibling position (1.9.0, #616) — lets the platform tell a move to where the page already is (a no-op). */
+  position: string | null;
   deletedAt: string | null;
   /** The current parent's facts, or null for a root page (or a parent that cannot be read). */
   parent: { spaceId: string; deletedAt: string | null } | null;
@@ -53,6 +55,14 @@ export interface TrashedPageRow {
   deletedAt: string;
   /** Display name of who trashed it — never an internal user id. */
   deletedBy: string | null;
+}
+
+interface PageRow {
+  id: string;
+  spaceId: string;
+  parentPageId: string | null;
+  position: string | null;
+  deletedAt: Date | null;
 }
 
 const iso = (v: unknown): string | null => (v == null ? null : new Date(v as string).toISOString());
@@ -87,6 +97,7 @@ export class ServicePageLifecycleService {
       pageId: page.id,
       spaceId: page.spaceId,
       parentPageId: page.parentPageId,
+      position: page.position,
       deletedAt: iso(page.deletedAt),
       parent: parent ? { spaceId: parent.spaceId, deletedAt: iso(parent.deletedAt) } : null,
       restrictedAncestorIds: ancestors.restrictedIds,
@@ -166,12 +177,9 @@ export class ServicePageLifecycleService {
     };
   }
 
-  private async pageRow(
-    ws: string,
-    id: string,
-  ): Promise<{ id: string; spaceId: string; parentPageId: string | null; deletedAt: Date | null } | null> {
-    const res = await sql<{ id: string; spaceId: string; parentPageId: string | null; deletedAt: Date | null }>`
-      select id, space_id, parent_page_id, deleted_at from pages where id = ${id} and workspace_id = ${ws}
+  private async pageRow(ws: string, id: string): Promise<PageRow | null> {
+    const res = await sql<PageRow>`
+      select id, space_id, parent_page_id, position, deleted_at from pages where id = ${id} and workspace_id = ${ws}
     `.execute(this.db);
     return res.rows[0] ?? null;
   }

@@ -85,6 +85,14 @@ d('ServicePageLifecycleService + PageCycleGuardInstaller on real Postgres', () =
       expect(s.parent).toEqual({ spaceId: SPACE, deletedAt: '2026-01-01T00:00:00.000Z' });
     });
 
+    // 1.9.0 (#616): the page's own position, so the platform can tell a move to where the page already is (a no-op).
+    it('reports the page’s own position (null when it has none)', async () => {
+      await page(uuid(1), null, { position: 'a0V' });
+      await page(uuid(2), uuid(1));
+      expect((await svc.lifecycleState({ pageId: uuid(1) })).position).toBe('a0V');
+      expect((await svc.lifecycleState({ pageId: uuid(2) })).position).toBeNull();
+    });
+
     it('excludes the page itself from restrictedAncestorIds (selfRestricted carries it)', async () => {
       await page(uuid(1), null);
       await restrict(uuid(1));

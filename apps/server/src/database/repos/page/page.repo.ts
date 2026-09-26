@@ -192,14 +192,17 @@ export class PageRepo {
     await query.execute();
   }
 
+  // CCC seam (UPSTREAM_MODIFICATIONS.md #172, wiki-v2 #616): optional caller `trx` — the walk and the writes join
+  // it; omitted = unchanged. The event is then emitted before the caller commits (listeners only enqueue jobs).
   async removePage(
     pageId: string,
     deletedById: string,
     workspaceId: string,
+    trx?: KyselyTransaction,
   ): Promise<void> {
     const currentDate = new Date();
 
-    const descendants = await this.db
+    const descendants = await dbOrTx(this.db, trx)
       .withRecursive('page_descendants', (db) =>
         db
           .selectFrom('pages')
@@ -233,7 +236,7 @@ export class PageRepo {
           .execute();
 
         await trx.deleteFrom('shares').where('pageId', 'in', pageIds).execute();
-      });
+      }, trx);
 
       this.eventEmitter.emit(EventName.PAGE_SOFT_DELETED, {
         pageIds: pageIds,
@@ -489,9 +492,9 @@ export class PageRepo {
 
   async getPageAndDescendants(
     parentPageId: string,
-    opts: { includeContent: boolean },
+    opts: { includeContent: boolean; trx?: KyselyTransaction }, // CCC seam #172: optional trx
   ) {
-    return this.db
+    return dbOrTx(this.db, opts?.trx)
       .withRecursive('page_hierarchy', (db) =>
         db
           .selectFrom('pages')

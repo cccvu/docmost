@@ -1,0 +1,164 @@
+[
+  {
+    "name": "null content",
+    "input": {
+      "updatedAt": "2026-09-26T16:20:31.123Z",
+      "lastUpdatedById": "019299aa-0000-7000-8000-000000000001",
+      "content": null
+    },
+    "opaque": "e8998a6c7504ba1841eae4016f62fadbd3aac1d6a56f012d37b7468be6a51f5d"
+  },
+  {
+    "name": "null lastUpdatedById",
+    "input": {
+      "updatedAt": "2026-09-26T16:20:31.123Z",
+      "lastUpdatedById": null,
+      "content": {
+        "type": "doc",
+        "content": []
+      }
+    },
+    "opaque": "e7735853e5503876edbce0dbfb47da4379334542238bceb173aa26f77a589e02"
+  },
+  {
+    "name": "nested content with unsorted keys",
+    "input": {
+      "updatedAt": "2025-01-02T03:04:05.006Z",
+      "lastUpdatedById": "019299aa-0000-7000-8000-000000000001",
+      "content": {
+        "type": "doc",
+        "content": [
+          {
+            "type": "heading",
+            "attrs": {
+              "level": 2,
+              "id": "h1",
+              "indent": 0
+            },
+            "content": [
+              {
+                "type": "text",
+                "text": "Title"
+              }
+            ]
+          },
+          {
+            "content": [
+              {
+                "text": "body",
+                "type": "text"
+              }
+            ],
+            "attrs": {
+              "textAlign": null,
+              "indent": 0,
+              "id": "p1"
+            },
+            "type": "paragraph"
+          }
+        ]
+      }
+    },
+    "opaque": "969e184baa44fb2e1d80ca7f500905455f32310b572fddf7823d7ddaf28d11b3"
+  },
+  {
+    "name": "unicode text",
+    "input": {
+      "updatedAt": "2026-02-28T23:59:59.999Z",
+      "lastUpdatedById": "019299aa-0000-7000-8000-000000000001",
+      "content": {
+        "type": "doc",
+        "content": [
+          {
+            "type": "paragraph",
+            "content": [
+              {
+                "type": "text",
+                "text": "Grüße — 日本語 ✓ 🚀 \"quoted\" \\ back sep"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "opaque": "fac5cdac812409e8795439185f94a8de2f81298e86bf6459b366b44feae195d0"
+  },
+  {
+    "name": "arrays of marks",
+    "input": {
+      "updatedAt": "2026-09-01T00:00:00.000Z",
+      "lastUpdatedById": "019299aa-0000-7000-8000-000000000001",
+      "content": {
+        "type": "doc",
+        "content": [
+          {
+            "type": "paragraph",
+            "content": [
+              {
+                "type": "text",
+                "text": "bold link",
+                "marks": [
+                  {
+                    "type": "bold"
+                  },
+                  {
+                    "type": "link",
+                    "attrs": {
+                      "target": "_blank",
+                      "href": "https://example.org/a?b=1&c=2",
+                      "rel": null,
+                      "class": null
+                    }
+                  }
+                ]
+              },
+              {
+                "type": "text",
+                "text": " plain"
+              },
+              {
+                "type": "text",
+                "text": "code",
+                "marks": [
+                  {
+                    "type": "code"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    "opaque": "9d86a1dd0d8a0be78b7a6d838af414537c05e91aac20413ad0dfae7297b531e2"
+  },
+  {
+    "name": "numbers, booleans and empty containers",
+    "input": {
+      "updatedAt": "2026-09-26T12:00:00.000Z",
+      "lastUpdatedById": "019299aa-0000-7000-8000-000000000001",
+      "content": {
+        "type": "doc",
+        "attrs": {
+          "n": 0,
+          "f": 1.5,
+          "neg": -3,
+          "t": true,
+          "fl": false,
+          "e": {},
+          "a": []
+        },
+        "content": []
+      }
+    },
+    "opaque": "ef88a250210d83e4a0f7830a9f82a155ba27f46a0c0bfb628bce7f0b0c55f042"
+  },
+  {
+    "name": "absent content (undefined) hashes like null",
+    "input": {
+      "updatedAt": "2026-09-26T16:20:31.123Z",
+      "lastUpdatedById": "019299aa-0000-7000-8000-000000000001"
+    },
+    "opaque": "e8998a6c7504ba1841eae4016f62fadbd3aac1d6a56f012d37b7468be6a51f5d"
+  }
+]
