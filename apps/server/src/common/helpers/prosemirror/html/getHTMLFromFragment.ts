@@ -1,6 +1,6 @@
 import type { Node, Schema } from '@tiptap/pm/model';
 import { DOMSerializer } from '@tiptap/pm/model';
-import { Window } from 'happy-dom';
+import { createNetworkIsolatedWindow } from './generateJSON';
 
 /**
  * Returns the HTML string representation of a given document node.
@@ -31,7 +31,8 @@ export function getHTMLFromFragment(
     return wrap.innerHTML;
   }
 
-  const localWindow = new Window();
+  // CCC #621: the same network-inert window the parser uses.
+  const localWindow = createNetworkIsolatedWindow();
   let result: string;
 
   try {
