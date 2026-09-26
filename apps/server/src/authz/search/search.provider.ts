@@ -7,6 +7,7 @@ import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 import { SearchService } from '../../core/search/search.service';
 import { AUTHZ_MODE, AuthzMode } from '../mode/authz-mode';
+import { HttpAuthzClient } from '../http-authz.client';
 import { PdpSearchService } from './pdp-search.service';
 
 /**
@@ -18,6 +19,10 @@ import { PdpSearchService } from './pdp-search.service';
  * fork's `PdpSearchService` (filter-then-retrieve, fixing authorized-k-under-truncation). SearchService
  * is a MODULE-LOCAL provider, so the selection must be bound in search.module.ts (a @Global rebind
  * cannot win over the module-local injection) — see UPSTREAM_MODIFICATIONS.md #5.
+ *
+ * The remote subclass also gets its own `HttpAuthzClient` for the SERVICE leg of an on-behalf-of search (#615).
+ * The client is stateless (env-configured, like the one PageRestrictionModule provides for itself), and injecting
+ * it would need an export from the upstream-owned DatabaseModule — so it is constructed here, in fork code.
  */
 const KYSELY = KYSELY_MODULE_CONNECTION_TOKEN();
 
@@ -33,6 +38,13 @@ export const searchServiceProvider: Provider = {
     pagePermissionRepo: PagePermissionRepo,
   ): SearchService =>
     mode === 'remote'
-      ? new PdpSearchService(db, pageRepo, shareRepo, spaceMemberRepo, pagePermissionRepo)
+      ? new PdpSearchService(
+          db,
+          pageRepo,
+          shareRepo,
+          spaceMemberRepo,
+          pagePermissionRepo,
+          new HttpAuthzClient(),
+        )
       : new SearchService(db, pageRepo, shareRepo, spaceMemberRepo, pagePermissionRepo),
 };

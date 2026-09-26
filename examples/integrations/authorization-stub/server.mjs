@@ -66,7 +66,10 @@ const GRANTS = Array.isArray(policy.grants) ? policy.grants : [];
 // a call into your real engine to build a production service.
 function decide(subject, permission, resourceType, resourceId) {
   const externalId = subject && subject.externalId;
-  if (!externalId) return false; // this fork only ever sends { provider:'docmost', externalId }
+  // Every user decision arrives as { provider:'docmost', externalId }. The fork also sends
+  // { principalId, subjectType:'service' } for the service leg of an on-behalf-of search (#615); the stub has
+  // no grants for service principals, so it DENIES that subject (fail-closed: such a search returns nothing).
+  if (!externalId) return false;
   return GRANTS.some(
     (g) =>
       g.externalId === externalId &&

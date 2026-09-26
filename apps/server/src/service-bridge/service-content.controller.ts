@@ -14,12 +14,18 @@ import { RemoteOnlyGuard } from '../authz/mode/remote-only.guard';
 import { RequireServiceScope, ServiceAuthGuard } from './service-auth.guard';
 import { ServiceScope } from './service-scope';
 import {
+  PageAncestors,
+  PublicLabelSummary,
   PublicPageSummary,
   PublicSpaceSummary,
   ServiceContentService,
+  SpaceCommentPolicy,
 } from './service-content.service';
+import { PublicActivityEvent } from './service-content-activity';
 import { PublicSearchHit, ServiceSearchService } from './service-search.service';
-import { ContentListDto } from './dto/content-read.dto';
+import { ContentAncestorsDto, ContentListDto, SpaceCommentPolicyDto } from './dto/content-read.dto';
+import { ContentLabelListDto } from './dto/content-labels.dto';
+import { ContentActivityListDto } from './dto/content-activity.dto';
 import { ContentSearchDto } from './dto/content-search.dto';
 
 /**
@@ -64,6 +70,47 @@ export class ServiceContentController {
     @Param('spaceId', ParseUUIDPipe) spaceId: string,
   ): Promise<PublicSpaceSummary> {
     return this.content.getSpace(spaceId);
+  }
+
+  // #615: a page's ancestor ids, nearest first (never the page itself, never its restriction facts). The platform
+  // authorizes each id and stops at the first it may not show.
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
+  @Post('pages/ancestors')
+  @HttpCode(HttpStatus.OK)
+  @RequireServiceScope(ServiceScope.ContentRead)
+  async pageAncestors(@Body() dto: ContentAncestorsDto): Promise<PageAncestors> {
+    return this.content.pageAncestors(dto);
+  }
+
+  // #615: the page labels on the authorized pages (the belt), with per-label counts over those pages only.
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
+  @Post('labels/list')
+  @HttpCode(HttpStatus.OK)
+  @RequireServiceScope(ServiceScope.ContentRead)
+  async listLabels(@Body() dto: ContentLabelListDto): Promise<{ items: PublicLabelSummary[] }> {
+    return this.content.listLabels(dto);
+  }
+
+  // #615: the activity feed over the authorized pages (the belt).
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
+  @Post('activity/list')
+  @HttpCode(HttpStatus.OK)
+  @RequireServiceScope(ServiceScope.ContentRead)
+  async listActivity(@Body() dto: ContentActivityListDto): Promise<{ items: PublicActivityEvent[] }> {
+    return this.content.listActivity(dto);
+  }
+
+  // #615: a space's viewer-comment setting — a fact the platform combines with the PDP; never a decision.
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
+  @Post('spaces/comment-policy')
+  @HttpCode(HttpStatus.OK)
+  @RequireServiceScope(ServiceScope.ContentRead)
+  async spaceCommentPolicy(@Body() dto: SpaceCommentPolicyDto): Promise<SpaceCommentPolicy> {
+    return this.content.spaceCommentPolicy(dto);
   }
 
   // Permission-aware search. UNLIKE the list ops above, this is NOT a privileged data plane over a pre-

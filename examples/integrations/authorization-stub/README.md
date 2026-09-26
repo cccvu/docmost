@@ -77,3 +77,7 @@ All six contract endpoints, with the secret guard (`x-authz-service-secret`, con
 correct status codes (`200`/`202`/`400`/`401`/`404`/`405`/`503`), and the `{ provider: "docmost", externalId }`
 subject shape. It does not attempt SpiceDB semantics, caching, or ZedToken freshness; those are the
 responsibility of a real implementation.
+
+The stub grants nothing to a `{ principalId, subjectType: "service" }` subject (contract 1.2.0). The fork sends
+that shape only for the service-account leg of an on-behalf-of `content/search`, which needs the CCC platform's
+`serviceSubjectId`; against the stub such a search is empty (fail-closed), and nothing else changes.

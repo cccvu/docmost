@@ -2,9 +2,9 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Docmost Service Bridge (east-west)",
-    "version": "1.7.0",
+    "version": "1.8.0",
     "summary": "The east-west endpoints this Docmost fork EXPOSES to an integrating platform.",
-    "description": "These are the machine-to-machine endpoints the fork hosts for an integrating platform (the inverse direction of authorization-service.openapi.json, which the fork calls). They exist so an external identity/session broker can provision a fork-local shadow user and mint a Docmost session for it, re-check (and narrow) live realtime connections after a revocation, and (Phase C) administer workspace settings + spaces and read the content model WITHOUT the platform reaching into Docmost's database directly. They are NOT part of the public north-south API and are not browser-facing.\n\nMode: the whole surface is 404 unless the fork runs with AUTHZ_MODE=remote (RemoteOnlyGuard, checked BEFORE the secret). In AUTHZ_MODE=native there is no integrating platform and every route below returns 404 for all callers.\n\nAuth: every request carries a shared service secret in the x-authz-service-secret header (PLATFORM_AUTHZ_SERVICE_SECRET). Each /api/service/* route additionally requires exactly one least-privilege scope: session:mint, users:provision, users:resolve, workspace:read, workspace:settings:write, spaces:read, spaces:write, pages:read, pages:authz:read, content:read, content:search, attachments:read, changes:read. Today a single full-scope secret is issued; per-scope credentials can be added later with no contract change.\n\nSecurity properties an integrator must understand:\n  - Identity-mutating endpoints are keyed ONLY on the caller's opaque externalId. The fork derives the shadow email (externalId@shadow.wiki-v2.internal) and resolves its own default workspace, so a caller can never select an arbitrary Docmost identity, name a real/privileged/native account, or supply a workspace id. This is a strong narrowing, not impersonation.\n  - The platform is the authorization authority: it performs the PDP decision (space/workspace administer, or the filter-then-retrieve authorized-id set) BEFORE calling these endpoints. The content read endpoints are a PRIVILEGED DATA PLANE, not a second gate: they return metadata for exactly the supplied ids and do NOT re-authorize. The security of the caller's /v1 surface rests entirely on it passing an authorized id set.\n  - Fail-closed: not remote -> 404; unconfigured secret -> 503; missing/wrong secret -> 401; wrong scope -> 403; over the per-credential rate limit -> 429; invalid body -> 400.\n\nResponse shape (incident #181): every 2xx body is EXACTLY the schema declared for its operation. The fork's global { data, success, status } response envelope (upstream TransformHttpResponseInterceptor) is skipped on this whole surface via per-handler @SkipTransform(); an integrator that receives an envelope is talking to a mis-built fork. Bring-up precondition: until Docmost first-run setup (POST /api/auth/setup) has created a workspace row, EVERY operation answers HTTP 404 with message exactly \"Workspace not found\" (an upstream pre-handler that runs before the service-bridge guards). That status + message pair is the ONLY response a consumer may treat as \"no workspace provisioned yet\"; any other 404 (e.g. the bare \"Not Found\" the fork answers when not in AUTHZ_MODE=remote) is a configuration error, and any 2xx body that does not match its declared schema is a contract violation the consumer must fail closed on.\n\nAccess-narrowing propagation (1.6.0, #501): a successful response from a route that can take access away (archiveSpace, addSpaceMember — an upsert can demote —, changeSpaceMemberRole, removeSpaceMember; and the native narrowing routes the integrator relays) carries `Authz-Propagation: confirmed | pending`. `confirmed` = the fork asked the integrator's OPTIONAL `POST /sync/settle` (authorization-service.openapi.json) and it answered that every access change committed up to this response is enforced; `pending` = the change is committed but could not be shown enforced within the bound (an integrator without /sync/settle always gets `pending`). The header never changes the status or the body, and it is absent in AUTHZ_MODE=native or when AUTHZ_NARROWING_SETTLE_TIMEOUT_MS=0. A consumer must treat an ABSENT header as unknown, never as confirmed.\n\nPage structure (1.7.0, wiki-v2 #493/#545): `POST /api/service/authz/pages/state` serves the CURRENT authorization structure of pages (placement, restriction, restriction lineage), so an integrator can project it level-triggered instead of trusting event payloads. And in AUTHZ_MODE=remote the fork installs database guards that refuse to take a restriction away by anything but an explicit unrestrict or a purge: a native move-to-space of a restricted page or of a page in a restricted section, and a re-parent or restore-detach that takes an unrestricted page out from under its last restricted ancestor. The native routes the integrator relays answer those refusals (and a move cycle) with `409 { message, code }`, `code` one of `ccc_page_no_cycle`, `ccc_page_restricted_space_move`, `ccc_page_restriction_strip`; the whole write is rolled back.",
+    "description": "These are the machine-to-machine endpoints the fork hosts for an integrating platform (the inverse direction of authorization-service.openapi.json, which the fork calls). They exist so an external identity/session broker can provision a fork-local shadow user and mint a Docmost session for it, re-check (and narrow) live realtime connections after a revocation, and (Phase C) administer workspace settings + spaces and read the content model WITHOUT the platform reaching into Docmost's database directly. They are NOT part of the public north-south API and are not browser-facing.\n\nMode: the whole surface is 404 unless the fork runs with AUTHZ_MODE=remote (RemoteOnlyGuard, checked BEFORE the secret). In AUTHZ_MODE=native there is no integrating platform and every route below returns 404 for all callers.\n\nAuth: every request carries a shared service secret in the x-authz-service-secret header (PLATFORM_AUTHZ_SERVICE_SECRET). Each /api/service/* route additionally requires exactly one least-privilege scope: session:mint, users:provision, users:resolve, workspace:read, workspace:settings:write, spaces:read, spaces:write, pages:read, pages:authz:read, content:read, content:search, attachments:read, changes:read. Today a single full-scope secret is issued; per-scope credentials can be added later with no contract change.\n\nSecurity properties an integrator must understand:\n  - Identity-mutating endpoints are keyed ONLY on the caller's opaque externalId. The fork derives the shadow email (externalId@shadow.wiki-v2.internal) and resolves its own default workspace, so a caller can never select an arbitrary Docmost identity, name a real/privileged/native account, or supply a workspace id. This is a strong narrowing, not impersonation.\n  - The platform is the authorization authority: it performs the PDP decision (space/workspace administer, or the filter-then-retrieve authorized-id set) BEFORE calling these endpoints. The content read endpoints are a PRIVILEGED DATA PLANE, not a second gate: they return metadata for exactly the supplied ids and do NOT re-authorize. The security of the caller's /v1 surface rests entirely on it passing an authorized id set.\n  - Fail-closed: not remote -> 404; unconfigured secret -> 503; missing/wrong secret -> 401; wrong scope -> 403; over the per-credential rate limit -> 429; invalid body -> 400.\n\nResponse shape (incident #181): every 2xx body is EXACTLY the schema declared for its operation. The fork's global { data, success, status } response envelope (upstream TransformHttpResponseInterceptor) is skipped on this whole surface via per-handler @SkipTransform(); an integrator that receives an envelope is talking to a mis-built fork. Bring-up precondition: until Docmost first-run setup (POST /api/auth/setup) has created a workspace row, EVERY operation answers HTTP 404 with message exactly \"Workspace not found\" (an upstream pre-handler that runs before the service-bridge guards). That status + message pair is the ONLY response a consumer may treat as \"no workspace provisioned yet\"; any other 404 (e.g. the bare \"Not Found\" the fork answers when not in AUTHZ_MODE=remote) is a configuration error, and any 2xx body that does not match its declared schema is a contract violation the consumer must fail closed on.\n\nAccess-narrowing propagation (1.6.0, #501): a successful response from a route that can take access away (archiveSpace, addSpaceMember — an upsert can demote —, changeSpaceMemberRole, removeSpaceMember; and the native narrowing routes the integrator relays) carries `Authz-Propagation: confirmed | pending`. `confirmed` = the fork asked the integrator's OPTIONAL `POST /sync/settle` (authorization-service.openapi.json) and it answered that every access change committed up to this response is enforced; `pending` = the change is committed but could not be shown enforced within the bound (an integrator without /sync/settle always gets `pending`). The header never changes the status or the body, and it is absent in AUTHZ_MODE=native or when AUTHZ_NARROWING_SETTLE_TIMEOUT_MS=0. A consumer must treat an ABSENT header as unknown, never as confirmed.\n\nPage structure (1.7.0, wiki-v2 #493/#545): `POST /api/service/authz/pages/state` serves the CURRENT authorization structure of pages (placement, restriction, restriction lineage), so an integrator can project it level-triggered instead of trusting event payloads. And in AUTHZ_MODE=remote the fork installs database guards that refuse to take a restriction away by anything but an explicit unrestrict or a purge: a native move-to-space of a restricted page or of a page in a restricted section, and a re-parent or restore-detach that takes an unrestricted page out from under its last restricted ancestor. The native routes the integrator relays answer those refusals (and a move cycle) with `409 { message, code }`, `code` one of `ccc_page_no_cycle`, `ccc_page_restricted_space_move`, `ccc_page_restriction_strip`; the whole write is rolled back.\n\nKnowledge reads (1.8.0, wiki-v2 #615): `listContentPages` gains page filters (`labelName`, `lastUpdatedById`, the created range, `topLevel`, `descendantOf` + `maxDepth`, `linksTo` / `linkedFrom`), a `position` sort (sibling order) and a wire-only creator / last-editor projection (Docmost user ids + display names, for the integrator to map to its own identities); and four new content:read operations serve a page's ancestor ids (`pageAncestors`), the page labels on an authorized page set (`listContentLabels`), the activity feed over an authorized page set (`listContentActivity`), and a space's viewer-comment setting (`getSpaceCommentPolicy`). Like the other content reads they are a PRIVILEGED DATA PLANE: every one is pinned to the supplied authorized ids (live, in the workspace) and none re-authorizes; the ancestor ids and the comment setting are FACTS the integrator must authorize or combine with its own decision before showing anything. `searchContent` (the authorization gate, not a data plane) gains the same candidate filters (`parentPageId`, `labelName`, `lastUpdatedById`, the updated range, beside `creatorId`), applied in the candidate SQL BEFORE the authorization windows, answers `{items, hasMore}` (`hasMore` is a one-row peek past the page, never a count), and takes an optional `serviceSubjectId`: an on-behalf-of service account's platform principal id, for which the fork gates every window too (`POST /authz/filter-resources` with `{principalId, subjectType: 'service'}`), so the page and `hasMore` are service ∩ user.",
     "license": { "name": "AGPL-3.0-only", "identifier": "AGPL-3.0-only" },
     "x-canonical": true
   },
@@ -518,7 +518,7 @@
         "operationId": "listContentPages",
         "tags": ["content"],
         "summary": "Filter-then-retrieve page metadata for an authorized id set.",
-        "description": "PRIVILEGED DATA PLANE: returns metadata for EXACTLY the supplied ids (the platform's PDP-authorized set) and does NOT re-authorize. Keyset-ordered by (updated_at desc, id desc); the fork returns up to limit+1 rows so the platform can detect hasMore. Scope: content:read.",
+        "description": "PRIVILEGED DATA PLANE: returns metadata for EXACTLY the supplied ids (the platform's PDP-authorized set) and does NOT re-authorize. Keyset-ordered by (updated_at desc, id desc) unless `sort` names another field; the fork returns up to limit+1 rows so the platform can detect hasMore. Every filter only NARROWS the supplied set (live, in the workspace): `descendantOf` walks down ONLY through supplied, live, in-workspace pages (an unsupplied or trashed page hides its whole subtree; the root is never returned), and `linksTo` / `linkedFrom` read Docmost's `backlinks` (maintained from page content, eventually consistent). Combining `topLevel` with `parentPageId`, `linksTo` with `linkedFrom`, or `descendantOf` with any of `parentPageId` / `topLevel` / `linksTo` / `linkedFrom` — or sending `maxDepth` without `descendantOf` — is a 400. Each row carries the creator and last editor as Docmost user ids + display names (1.8.0): WIRE-ONLY, for the platform to map to its own identities. Scope: content:read.",
         "requestBody": { "required": true, "content": { "application/json": {
           "schema": { "$ref": "#/components/schemas/ContentListRequest" },
           "example": { "ids": ["33333333-3333-3333-3333-333333333333"], "limit": 50 }
@@ -528,6 +528,39 @@
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
+    "/api/service/content/pages/ancestors": {
+      "post": {
+        "operationId": "pageAncestors",
+        "tags": ["content"],
+        "summary": "A page's ancestor ids, nearest first (1.8.0, wiki-v2 #615).",
+        "description": "The ids on the page's parent chain, nearest first, the page itself excluded — the fork's bounded, cycle-safe lineage walk pinned to the workspace (trashed ancestors included: the walk is structural). FACTS only: the platform authorizes each id and shows only the contiguous run it may, nearest-first; restriction facts are never returned. `complete` is false when the walk did not reach a root (a cycle, a missing or out-of-workspace parent, or the depth bound). 404 unless the page is live in the workspace. Scope: content:read.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ContentAncestorsRequest" },
+              "example": { "pageId": "33333333-3333-3333-3333-333333333333" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The ancestor ids.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/PageAncestors" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
           "429": { "$ref": "#/components/responses/RateLimited" },
           "503": { "$ref": "#/components/responses/Unconfigured" }
         }
@@ -570,18 +603,152 @@
         }
       }
     },
+    "/api/service/content/spaces/comment-policy": {
+      "post": {
+        "operationId": "getSpaceCommentPolicy",
+        "tags": ["content"],
+        "summary": "Whether a space lets viewers comment (1.8.0, wiki-v2 #615).",
+        "description": "Docmost's space setting `settings.comments.allowViewerComments` (absent = false) — the input the engine's own comment check reads. A FACT, not a decision: the integrator combines it with its PDP answer. Workspace-scoped; an archived space answers its stored setting; unknown or out-of-workspace → 404. Scope: content:read.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SpaceCommentPolicyRequest" },
+              "example": { "spaceId": "55555555-5555-5555-5555-555555555555" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The space's viewer-comment setting.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SpaceCommentPolicy" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
+    "/api/service/content/labels/list": {
+      "post": {
+        "operationId": "listContentLabels",
+        "tags": ["content"],
+        "summary": "The page labels on an authorized page set, with per-label page counts (1.8.0, wiki-v2 #615).",
+        "description": "PRIVILEGED DATA PLANE (see listContentPages): only labels of type `page` in the workspace that are attached to a SUPPLIED, live page are listed, and `pageCount` counts those pages only — a label that sits only on pages outside `ids` is never named, and a count never reveals one (Docmost's native label list has no such gate and must not be relayed). `ids: []` lists nothing. Keyset on `name` (unique per workspace and type) ascending, byte order (\"C\" collation); returns up to limit+1 rows. Label ids and timestamps are never returned. Scope: content:read.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ContentLabelListRequest" },
+              "example": { "ids": ["33333333-3333-3333-3333-333333333333"], "limit": 50 }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Label summaries (up to limit+1).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["items"],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/PublicLabelSummary" }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
+    "/api/service/content/activity/list": {
+      "post": {
+        "operationId": "listContentActivity",
+        "tags": ["content"],
+        "summary": "The activity feed over an authorized page set (1.8.0, wiki-v2 #615).",
+        "description": "PRIVILEGED DATA PLANE (see listContentPages): a keyset-paged union of events on the SUPPLIED pages in the workspace, from the engine's own tables — `page.created` (pages), `page.updated` (page_history; `versionId` is that row), `comment.created` (live comments), `attachment.uploaded` (live page attachments) — and the lifecycle events Docmost's `audit` table records (`page.trashed`, `page.restored`, `page.moved_to_space`, `comment.deleted`, `comment.resolved`, `comment.reopened`). Every source is pinned to the supplied ids and the workspace. A trashed page keeps its events (`pageTitle` null); a purged page leaves the feed; `spaceId` is the page's CURRENT space (and the `spaceId` filter matches it). Window [since, until). Ordered by (occurredAt truncated to ms, key) descending, the key under the \"C\" collation, so the order is total; returns up to limit+1 rows. `actorId` is a Docmost user id (WIRE-ONLY, for the platform to map). Scope: content:read.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ContentActivityListRequest" },
+              "example": { "ids": ["33333333-3333-3333-3333-333333333333"], "since": "2026-09-01T00:00:00.000Z", "limit": 50 }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Activity events (up to limit+1).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["items"],
+                  "properties": {
+                    "items": {
+                      "type": "array",
+                      "items": { "$ref": "#/components/schemas/PublicActivityEvent" }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
     "/api/service/content/search": {
       "post": {
         "operationId": "searchContent",
         "tags": ["content"],
         "summary": "Permission-aware full-text search over the pages the caller can see.",
-        "description": "The AUTHORIZATION GATE for /v1 search (unlike the list ops, which are a privileged data plane over an already-authorized id set). PdpSearchService walks the rank-ordered FTS candidate stream in bounded windows and admits ONLY the caller's authorized pages BEFORE the limit/offset slice (filter-then-retrieve; ADR-0005), so a principal too broad to LIST can still SEARCH. The platform passes the caller's Docmost user id and MUST NOT post-filter the result (that reintroduces reverse-index truncation). The hit shape is PII-free: NO creatorId (ADR-0001) and NO rank / total count (no ranking side-channel). Scope: content:search.",
-        "requestBody": { "required": true, "content": { "application/json": {
-          "schema": { "$ref": "#/components/schemas/ContentSearchRequest" },
-          "example": { "userId": "9b1f0c2e-0000-4000-8000-000000000001", "query": "release notes", "limit": 25 }
-        } } },
+        "description": "The AUTHORIZATION GATE for /v1 search (unlike the list ops, which are a privileged data plane over an already-authorized id set). PdpSearchService walks the rank-ordered FTS candidate stream in bounded windows and admits ONLY the caller's authorized pages BEFORE the limit/offset slice (filter-then-retrieve; ADR-0005), so a principal too broad to LIST can still SEARCH. The platform passes the caller's Docmost user id and MUST NOT post-filter the result (that reintroduces reverse-index truncation). 1.8.0 (#615): the filters are predicates in the candidate SQL (never a post-filter, so a filtered page still fills), the answer carries `hasMore` (the fork collects ONE authorized hit past the page; true only when such a hit exists for the same principals — no count), and `serviceSubjectId` adds the on-behalf-of SERVICE leg to every window (service ∩ user). The hit shape is PII-free: NO creatorId (ADR-0001) and NO rank / total count (no ranking side-channel). Scope: content:search.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ContentSearchRequest" },
+              "example": { "userId": "9b1f0c2e-0000-4000-8000-000000000001", "query": "release notes", "labelName": "roadmap", "limit": 25 }
+            }
+          }
+        },
         "responses": {
-          "200": { "description": "Authorized search hits (rank-ordered, up to limit).", "content": { "application/json": { "schema": { "type": "object", "required": ["items"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/PublicSearchHit" } } } } } } },
+          "200": {
+            "description": "One page of authorized search hits (rank-ordered, up to limit) and whether at least one more authorized hit follows.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["items", "hasMore"],
+                  "properties": {
+                    "items": { "type": "array", "items": { "$ref": "#/components/schemas/PublicSearchHit" } },
+                    "hasMore": { "type": "boolean", "description": "True when at least one further authorized hit follows this page (a one-row peek past it, gated like the page itself, service ∩ user when serviceSubjectId is set). Never a count. True only when that further hit was actually collected: when the bounded candidate scan budget stops the walk first, hasMore is false (never a promise the next page cannot fill, and never a bit that reveals how many matches the caller cannot see; the stop is logged fork-side), so a very deep page of a heavily-restricted result set can under-report." }
+                  }
+                }
+              }
+            }
+          },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" },
@@ -1025,19 +1192,26 @@
           "ids": { "type": "array", "maxItems": 10000, "items": { "type": "string", "format": "uuid" }, "description": "The platform's PDP-authorized id set (the belt). maxItems MUST stay >= the platform's content.maxListAuthorizedIds default (10000) or a well-authorized principal gets a 400; the provider/consumer contract tests enforce this." },
           "spaceId": { "type": "string", "format": "uuid", "description": "Pages only: scope the list to one space." },
           "parentPageId": { "type": "string", "format": "uuid", "description": "Pages only: children of this parent." },
+          "topLevel": { "type": "boolean", "description": "Pages only (1.8.0): true = pages with no parent, false = pages with one. A 400 with parentPageId." },
+          "descendantOf": { "type": "string", "format": "uuid", "description": "Pages only (1.8.0): pages below this page, reached ONLY through supplied, live, in-workspace pages; the root itself is never returned. A 400 with parentPageId / topLevel / linksTo / linkedFrom." },
+          "maxDepth": { "type": "integer", "minimum": 1, "maximum": 10, "description": "Pages only (1.8.0): levels below descendantOf to walk (default 3). A 400 without descendantOf." },
+          "linksTo": { "type": "string", "format": "uuid", "description": "Pages only (1.8.0): pages whose content links TO this page (incoming). A 400 with linkedFrom." },
+          "linkedFrom": { "type": "string", "format": "uuid", "description": "Pages only (1.8.0): pages this page's content links to (outgoing). A 400 with linksTo." },
+          "labelName": { "type": "string", "maxLength": 100, "pattern": "^[a-z0-9_-][a-z0-9_~-]*$", "description": "Pages only (1.8.0): pages carrying this page label of the workspace. The fork first normalizes it as Docmost stores label names (trim, whitespace → '-', lowercase), then checks the pattern and length — the same grammar Docmost enforces when a label is added." },
           "titleContains": { "type": "string", "maxLength": 256, "description": "Pages only: case-insensitive title substring (ilike; %/_ matched literally)." },
           "creatorId": { "type": "string", "format": "uuid", "description": "Pages only: the page's Docmost creator id (the platform translates identity → docmost id BEFORE calling)." },
+          "lastUpdatedById": { "type": "string", "format": "uuid", "description": "Pages only (1.8.0): the Docmost id of the page's last editor (translated like creatorId)." },
           "nameContains": { "type": "string", "maxLength": 256, "description": "Spaces only: case-insensitive name substring." },
           "updatedSince": { "type": "string", "format": "date-time", "description": "Pages + spaces: updated-at >= (inclusive)." },
           "updatedUntil": { "type": "string", "format": "date-time", "description": "Pages + spaces: updated-at < (exclusive)." },
-          "createdSince": { "type": "string", "format": "date-time", "description": "Spaces only: created-at >= (inclusive)." },
-          "createdUntil": { "type": "string", "format": "date-time", "description": "Spaces only: created-at < (exclusive)." },
+          "createdSince": { "type": "string", "format": "date-time", "description": "Pages + spaces (pages since 1.8.0): created-at >= (inclusive)." },
+          "createdUntil": { "type": "string", "format": "date-time", "description": "Pages + spaces (pages since 1.8.0): created-at < (exclusive)." },
           "sort": {
             "type": "object",
             "additionalProperties": false,
             "required": ["field", "direction"],
             "properties": {
-              "field": { "type": "string", "enum": ["updatedAt", "createdAt", "title", "name"], "description": "title is pages-only, name is spaces-only; a cross-resource field is a 400. Always tie-broken by id." },
+              "field": { "type": "string", "enum": ["updatedAt", "createdAt", "title", "name", "position"], "description": "title and position are pages-only, name is spaces-only; a cross-resource field is a 400. Always tie-broken by id. position (1.8.0) is sibling order as Docmost orders a tree level: coalesce(position, '~') under the \"C\" collation, so a null position sorts last ascending." },
               "direction": { "type": "string", "enum": ["asc", "desc"] }
             },
             "description": "Allowlisted sort key + direction; absent → the legacy `updatedAt desc` default (id-tiebroken). The keyset SQL is generalized to the chosen field; text sorts coalesce null → ''."
@@ -1048,7 +1222,7 @@
             "required": ["id"],
             "properties": {
               "updatedAt": { "type": "string", "description": "Legacy / timestamp-sort bound (bound as ::timestamptz). Optional so a text-sort cursor still validates." },
-              "value": { "type": "string", "maxLength": 512, "description": "Generic cursor-v2 bound for the ACTIVE sort field — a timestamp (updatedAt/createdAt) or the coalesced title/name string." },
+              "value": { "type": "string", "maxLength": 512, "description": "Generic cursor-v2 bound for the ACTIVE sort field — a timestamp (updatedAt/createdAt), the coalesced title/name string, or `position ?? '~'` for the position sort." },
               "id": { "type": "string" }
             },
             "description": "The decoded keyset cursor position (cursor encode/decode stays on the platform)."
@@ -1058,7 +1232,7 @@
       },
       "PublicPageSummary": {
         "type": "object",
-        "required": ["id", "slugId", "title", "icon", "spaceId", "parentPageId", "position", "createdAt", "updatedAt"],
+        "required": ["id", "slugId", "title", "icon", "spaceId", "parentPageId", "position", "createdAt", "updatedAt", "creatorId", "creatorName", "lastUpdatedById", "lastUpdatedByName"],
         "properties": {
           "id": { "type": "string", "format": "uuid" },
           "slugId": { "type": "string" },
@@ -1068,7 +1242,131 @@
           "parentPageId": { "type": ["string", "null"] },
           "position": { "type": ["string", "null"] },
           "createdAt": { "type": "string", "format": "date-time" },
-          "updatedAt": { "type": "string", "format": "date-time" }
+          "updatedAt": { "type": "string", "format": "date-time" },
+          "creatorId": { "type": ["string", "null"], "format": "uuid", "description": "1.8.0: the creator's Docmost user id. WIRE-ONLY — the platform maps it to its own identity and never relays it." },
+          "creatorName": { "type": ["string", "null"], "description": "1.8.0: the creator's display name (null when unknown or outside the workspace)." },
+          "lastUpdatedById": { "type": ["string", "null"], "format": "uuid", "description": "1.8.0: the last editor's Docmost user id. WIRE-ONLY, like creatorId." },
+          "lastUpdatedByName": { "type": ["string", "null"], "description": "1.8.0: the last editor's display name (null when unknown or outside the workspace)." }
+        }
+      },
+      "ContentAncestorsRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["pageId"],
+        "properties": {
+          "pageId": { "type": "string", "format": "uuid" }
+        }
+      },
+      "PageAncestors": {
+        "type": "object",
+        "required": ["ancestorIds", "complete"],
+        "properties": {
+          "ancestorIds": {
+            "type": "array",
+            "items": { "type": "string", "format": "uuid" },
+            "description": "Nearest first; never the page itself."
+          },
+          "complete": { "type": "boolean", "description": "The walk reached a root (false at a cycle, a missing or out-of-workspace parent, or the depth bound)." }
+        }
+      },
+      "ContentLabelListRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ids", "limit"],
+        "properties": {
+          "ids": {
+            "type": "array",
+            "maxItems": 10000,
+            "items": { "type": "string", "format": "uuid" },
+            "description": "The platform's PDP-authorized page set (the belt); same cap as ContentListRequest.ids."
+          },
+          "spaceId": { "type": "string", "format": "uuid", "description": "Only labels on supplied pages in this space (and counts over those pages)." },
+          "nameContains": { "type": "string", "minLength": 1, "maxLength": 100, "description": "Case-insensitive name substring (ilike; %/_ matched literally), normalized as Docmost stores label names." },
+          "before": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name"],
+            "properties": {
+              "name": { "type": "string", "maxLength": 100 }
+            },
+            "description": "Keyset position: the last row's name."
+          },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
+        }
+      },
+      "PublicLabelSummary": {
+        "type": "object",
+        "required": ["name", "pageCount"],
+        "properties": {
+          "name": { "type": "string" },
+          "pageCount": { "type": "integer", "minimum": 1, "description": "How many of the SUPPLIED live pages carry the label." }
+        }
+      },
+      "ContentActivityListRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["ids", "since", "limit"],
+        "properties": {
+          "ids": {
+            "type": "array",
+            "maxItems": 10000,
+            "items": { "type": "string", "format": "uuid" },
+            "description": "The platform's PDP-authorized page set (the belt); same cap as ContentListRequest.ids."
+          },
+          "spaceId": { "type": "string", "format": "uuid", "description": "Only events on pages CURRENTLY in this space." },
+          "pageId": { "type": "string", "format": "uuid", "description": "Only events on this page (it must also be supplied in ids)." },
+          "since": { "type": "string", "format": "date-time", "description": "occurredAt >= (inclusive)." },
+          "until": { "type": "string", "format": "date-time", "description": "occurredAt < (exclusive)." },
+          "types": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 10,
+            "items": { "type": "string", "enum": ["page.created", "page.updated", "comment.created", "attachment.uploaded", "page.trashed", "page.restored", "page.moved_to_space", "comment.deleted", "comment.resolved", "comment.reopened"] },
+            "description": "Only these event types (absent = all)."
+          },
+          "actorId": { "type": "string", "format": "uuid", "description": "Only events by this Docmost user (the platform translates identity → docmost id before calling)." },
+          "before": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["occurredAt", "key"],
+            "properties": {
+              "occurredAt": { "type": "string", "format": "date-time" },
+              "key": { "type": "string", "pattern": "^[pchae]:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$" }
+            },
+            "description": "Keyset position: the last row's (occurredAt, key)."
+          },
+          "limit": { "type": "integer", "minimum": 1, "maximum": 100 }
+        }
+      },
+      "PublicActivityEvent": {
+        "type": "object",
+        "required": ["key", "type", "occurredAt", "actorId", "actorName", "pageId", "spaceId", "pageTitle", "commentId", "versionId"],
+        "properties": {
+          "key": { "type": "string", "description": "Source letter + source row id (p: page, h: page_history, c: comment, a: attachment, e: audit); unique across sources." },
+          "type": { "type": "string", "enum": ["page.created", "page.updated", "comment.created", "attachment.uploaded", "page.trashed", "page.restored", "page.moved_to_space", "comment.deleted", "comment.resolved", "comment.reopened"] },
+          "occurredAt": { "type": "string", "format": "date-time", "description": "Millisecond precision." },
+          "actorId": { "type": ["string", "null"], "format": "uuid", "description": "The acting Docmost user id (WIRE-ONLY — the platform maps it); null when the source records none." },
+          "actorName": { "type": ["string", "null"], "description": "The actor's display name (null when unknown or outside the workspace)." },
+          "pageId": { "type": "string", "format": "uuid" },
+          "spaceId": { "type": "string", "format": "uuid", "description": "The page's CURRENT space." },
+          "pageTitle": { "type": ["string", "null"], "description": "The page's current title; null while the page is trashed." },
+          "commentId": { "type": ["string", "null"], "format": "uuid" },
+          "versionId": { "type": ["string", "null"], "format": "uuid", "description": "For page.updated: the page_history row (a page version id)." }
+        }
+      },
+      "SpaceCommentPolicyRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["spaceId"],
+        "properties": {
+          "spaceId": { "type": "string", "format": "uuid" }
+        }
+      },
+      "SpaceCommentPolicy": {
+        "type": "object",
+        "required": ["allowViewerComments"],
+        "properties": {
+          "allowViewerComments": { "type": "boolean" }
         }
       },
       "PublicSpaceSummary": {
@@ -1104,6 +1402,12 @@
           "query": { "type": "string", "minLength": 1, "maxLength": 1024, "description": "Full-text query. Bounded to defeat pg-tsquery ReDoS; the fork re-clamps limit/offset server-side." },
           "spaceId": { "type": "string", "format": "uuid", "description": "Restrict to one space; omitted → the user's member spaces (the PDP gate is authoritative either way)." },
           "creatorId": { "type": "string", "format": "uuid", "description": "Restrict to one Docmost creator id (the platform translates identity → docmost id before calling)." },
+          "lastUpdatedById": { "type": "string", "format": "uuid", "description": "1.8.0: restrict to pages whose last editor is this Docmost user id (translated like creatorId). A candidate-SQL predicate." },
+          "parentPageId": { "type": "string", "format": "uuid", "description": "1.8.0: restrict to the direct children of this page. A candidate-SQL predicate." },
+          "labelName": { "type": "string", "maxLength": 100, "pattern": "^[a-z0-9_-][a-z0-9_~-]*$", "description": "1.8.0: restrict to pages carrying this page label of the workspace. The fork first normalizes it as Docmost stores label names (trim, whitespace → '-', lowercase), then checks the pattern and length." },
+          "updatedSince": { "type": "string", "format": "date-time", "description": "1.8.0: updated-at >= (inclusive). A value Postgres cannot parse is a 400." },
+          "updatedUntil": { "type": "string", "format": "date-time", "description": "1.8.0: updated-at < (exclusive)." },
+          "serviceSubjectId": { "type": "string", "format": "uuid", "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$", "description": "1.8.0: an on-behalf-of credential's SERVICE-ACCOUNT platform principal id (never a Docmost id). The fork then gates every candidate window for userId AND this service account (`POST /authz/filter-resources` with `{principalId, subjectType: 'service'}`), so the page and hasMore are service ∩ user. Absent → the user alone." },
           "limit": { "type": "integer", "minimum": 1, "maximum": 100 },
           "offset": { "type": "integer", "minimum": 0 }
         }
