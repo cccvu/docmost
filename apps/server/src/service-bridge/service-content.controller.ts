@@ -15,6 +15,7 @@ import { RequireServiceScope, ServiceAuthGuard } from './service-auth.guard';
 import { ServiceScope } from './service-scope';
 import {
   PublicPageSummary,
+  PublicSpaceDetail,
   PublicSpaceSummary,
   ServiceContentService,
 } from './service-content.service';
@@ -62,7 +63,7 @@ export class ServiceContentController {
   @RequireServiceScope(ServiceScope.ContentRead)
   async getSpace(
     @Param('spaceId', ParseUUIDPipe) spaceId: string,
-  ): Promise<PublicSpaceSummary> {
+  ): Promise<PublicSpaceDetail> {
     return this.content.getSpace(spaceId);
   }
 

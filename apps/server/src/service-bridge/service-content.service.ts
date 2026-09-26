@@ -11,6 +11,8 @@ import {
 } from './dto/content-read.dto';
 import { isIsoInstant, SubCollectionPage } from './dto/sub-collection-page.dto';
 import { WorkspaceResolver } from './workspace-resolver';
+import { spaceVersion } from './resource-version';
+import { aclVersionOf, readAclState } from '../authz/page-restriction/acl-state';
 
 // Escape LIKE/ILIKE metacharacters so a user-supplied substring matches literally (Postgres LIKE's default
 // escape char is backslash). Prevents a stray `%`/`_` from becoming a wildcard.
@@ -39,6 +41,26 @@ export interface PublicSpaceSummary {
   visibility: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * #616: the single-space read (`GET content/spaces/:id`, the `/v1` space GET) also carries the space's fork-issued
+ * `version` — over every field above plus the archived state (`resource-version.ts` SPACE_VERSION_KEYS), so it is a
+ * strong validator for this representation. The list items do not carry it.
+ */
+export interface PublicSpaceDetail extends PublicSpaceSummary {
+  version: string;
+}
+
+/**
+ * #616: the ACL read also answers whether the page carries its own restriction and the ACL's `version` — over the
+ * WHOLE ACL (every grant, not only the page of `items` returned), what a restrict / grant / revoke / re-role sends
+ * back as `expectedVersion`.
+ */
+export interface PagePermissionsResult {
+  items: RawPagePermission[];
+  restricted: boolean;
+  version: string;
 }
 
 /** A raw ACL grant on a page — grantee by Docmost user/group id (the platform maps the user id to identity). */
@@ -234,8 +256,8 @@ export class ServiceContentService {
     }
   }
 
-  /** A single space by id (workspace-scoped, active only). Null -> 404 handled by the caller. */
-  async getSpace(spaceId: string): Promise<PublicSpaceSummary> {
+  /** A single space by id (workspace-scoped, active only), with its version. Null -> 404 handled by the caller. */
+  async getSpace(spaceId: string): Promise<PublicSpaceDetail> {
     const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
     const res = await sql<SpaceRow>`
       select id, name, slug, description, visibility, created_at, updated_at
@@ -243,19 +265,20 @@ export class ServiceContentService {
     `.execute(this.db);
     const row = res.rows[0];
     if (!row) throw new NotFoundException('space not found');
-    return toSpaceSummary(row);
+    return { ...toSpaceSummary(row), version: spaceVersion({ ...row, archived: false }) }; // active only
   }
 
   /**
    * The explicit ACL grants on a page (page_permissions ⋈ page_access); grantee by Docmost user/group id.
    * Opt-in keyset paging (same contract as space members): with `page.limit` the fork walks
    * `(pp.created_at, pp.id)` ascending and returns up to limit+1; without it the read is unpaged (all grants).
-   * The default (unpaged) query is unchanged.
+   * The default (unpaged) query is unchanged. #616: the items, `restricted` and the ACL `version` come from ONE
+   * snapshot (a read-only REPEATABLE READ transaction), so the version always describes the grants returned.
    */
   async listPagePermissions(
     pageId: string,
     page?: SubCollectionPage,
-  ): Promise<{ items: RawPagePermission[] }> {
+  ): Promise<PagePermissionsResult> {
     const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
     const paged = page?.limit !== undefined;
     const conds = [sql`pa.page_id = ${pageId}`, sql`pa.workspace_id = ${workspaceId}`];
@@ -268,29 +291,38 @@ export class ServiceContentService {
       ? sql`order by date_trunc('milliseconds', pp.created_at) asc, pp.id::text asc`
       : sql`order by pp.created_at asc`;
     const limitClause = paged ? sql`limit ${page!.limit! + 1}` : sql``;
-    const res = await sql<{
-      id: string;
-      userId: string | null;
-      groupId: string | null;
-      role: string;
-      createdAt: Date;
-    }>`
-      select pp.id, pp.user_id, pp.group_id, pp.role, pp.created_at
-      from page_permissions pp
-      join page_access pa on pa.id = pp.page_access_id
-      where ${sql.join(conds, sql` and `)}
-      ${order}
-      ${limitClause}
-    `.execute(this.db);
-    return {
-      items: res.rows.map((r) => ({
-        id: r.id,
-        userId: r.userId,
-        groupId: r.groupId,
-        role: r.role,
-        createdAt: iso(r.createdAt),
-      })),
-    };
+    return this.db
+      .transaction()
+      .setIsolationLevel('repeatable read')
+      .setAccessMode('read only')
+      .execute(async (trx) => {
+        const res = await sql<{
+          id: string;
+          userId: string | null;
+          groupId: string | null;
+          role: string;
+          createdAt: Date;
+        }>`
+          select pp.id, pp.user_id, pp.group_id, pp.role, pp.created_at
+          from page_permissions pp
+          join page_access pa on pa.id = pp.page_access_id
+          where ${sql.join(conds, sql` and `)}
+          ${order}
+          ${limitClause}
+        `.execute(trx);
+        const acl = await readAclState(trx, pageId, workspaceId);
+        return {
+          items: res.rows.map((r) => ({
+            id: r.id,
+            userId: r.userId,
+            groupId: r.groupId,
+            role: r.role,
+            createdAt: iso(r.createdAt),
+          })),
+          restricted: acl.restricted,
+          version: aclVersionOf(pageId, acl),
+        };
+      });
   }
 }
 

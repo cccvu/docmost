@@ -136,6 +136,26 @@ outcome: applied }`. A busy engine answers a retryable `503 { code: engine_busy 
 native moves (`Authz-Propagation`). A fork without these routes answers the framework's plain 404 — an integrator
 must read that as "upgrade pending", never as page-not-found, and must never fall back to the unconditional route.
 
+**Versions, atomic compares and previews for ACLs, members and spaces (1.9.0, wiki-v2 #616).** The fork issues an
+opaque `version` (64 hex, a digest of the resource's state — `service-bridge/resource-version.ts`) for a space
+(`GET /api/service/content/spaces/{id}` and `GET /api/service/spaces/{id}`; over every public field plus the archived
+state), a membership (each `GET …/members` item, the member `POST`) and a page's ACL (`GET
+/api/service/pages/{id}/permissions`, which also answers `restricted`; over the restriction and every grant, read with
+the items from one snapshot). `PATCH /api/service/spaces/{id}`, `POST …/archive`, `PATCH` and `DELETE
+…/members/{memberId}` take an optional `expectedVersion` (a version, or `*` = it exists; archive and removal take it
+as an optional JSON body) and compare it inside the write's transaction under the row lock they already take — stale
+→ `412 { code: precondition_failed }` with nothing changed; the rename, archive and role change answer the new
+`version`. The page-ACL routes a platform relays as the acting user (`POST /api/pages/restrict`,
+`remove-restriction`, `add-permission`, `remove-permission`, `update-permission`) each run as ONE transaction under a
+per-page lock `pg_advisory_xact_lock(616616, hashtext(pageId))` — taken first, before the workspace lock the guards
+above take (no trigger ever takes it, so the order cannot invert) — take the same optional `expectedVersion`, and
+answer `{ restricted | success, version, effect }`. Two previews write nothing: `POST /api/pages/restriction-preview`
+(`{ pageId, action, …that route's body }`, same authorization; it runs the real write and rolls it back) and `POST
+/api/service/spaces/{id}/members/preview` (scope `spaces:write`; shadow users are only looked up, never provisioned);
+both answer `{ outcome: would_apply | noop | refused, code?, version, effect }` with the CURRENT version. Neither is a
+narrowing route. A busy engine (a lock not got within 2 s, a deadlock, a statement over 15 s) answers a retryable
+`503 { code: engine_busy }`; an ACL write is always bounded this way, a member / space write only when it compares.
+
 Three properties bind the whole surface:
 
 - **Mode-gated.** Every route is `404` unless the fork runs `AUTHZ_MODE=remote` (RemoteOnlyGuard, checked

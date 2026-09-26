@@ -15,13 +15,25 @@ import { CONTENT_LIST_MAX_IDS, CONTENT_LIST_MAX_LIMIT } from './dto/content-read
 import { AuthzChangeEvent, AuthzChangeEventType } from './authz-change-event';
 import { ChangesResult } from './authz-change-feed.service';
 import { SnapshotResult } from './authz-snapshot.service';
-import { PublicPageSummary, PublicSpaceSummary, RawPagePermission } from './service-content.service';
+import {
+  PagePermissionsResult,
+  PublicPageSummary,
+  PublicSpaceDetail,
+  PublicSpaceSummary,
+  RawPagePermission,
+} from './service-content.service';
 import { PublicSearchHit } from './service-search.service';
 import { PublicAttachmentSummary } from './service-attachment.service';
-import { SpaceView, RawSpaceMember } from './service-space.service';
+import { SpaceView, RawSpaceMember, SpaceDetailView, SpaceMemberPreview } from './service-space.service';
 import { WorkspaceSettingsView } from './service-workspace.service';
 import { ShadowUserLookup } from './service-bridge.service';
-import { UpdateSpaceMemberDto } from './dto/space-admin.dto';
+import {
+  ExpectedVersionDto,
+  SpaceMemberPreviewDto,
+  UpdateSpaceDto,
+  UpdateSpaceMemberDto,
+} from './dto/space-admin.dto';
+import { MAX_EXPECTED_VERSION_LENGTH } from './resource-version';
 import { DescendantFacts, LifecycleTarget, PageLifecycleState, TrashedPageRow } from './service-page-lifecycle.service';
 import { PageAuthzState, PageAuthzStateResult } from './page-authz-state.service';
 import { PAGE_AUTHZ_STATE_MAX, PageAuthzStateDto } from './dto/page-authz-state.dto';
@@ -204,7 +216,11 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     ProvisionedUser: keysOf<Awaited<ReturnType<ServiceBridgeController['resolveUser']>>>({ userId: true, workspaceId: true }),
     WorkspaceSettings: keysOf<WorkspaceSettingsView>({ name: true, defaultPageEditMode: true }),
     SpaceView: keysOf<SpaceView>({ id: true, name: true, slug: true, description: true, visibility: true, memberCount: true, archived: true, createdAt: true }),
-    RawSpaceMember: keysOf<RawSpaceMember>({ memberId: true, userId: true, groupId: true, role: true, createdAt: true }),
+    RawSpaceMember: keysOf<RawSpaceMember>({ memberId: true, userId: true, groupId: true, role: true, createdAt: true, version: true }),
+    // #616: the detail reads carry the space version; the ACL read carries `restricted` + the ACL version.
+    SpaceDetail: keysOf<SpaceDetailView>({ id: true, name: true, slug: true, description: true, visibility: true, memberCount: true, archived: true, createdAt: true, version: true }),
+    PublicSpaceDetail: keysOf<PublicSpaceDetail>({ id: true, name: true, slug: true, description: true, visibility: true, createdAt: true, updatedAt: true, version: true }),
+    PagePermissions: keysOf<PagePermissionsResult>({ items: true, restricted: true, version: true }),
     PublicPageSummary: keysOf<PublicPageSummary>({ id: true, slugId: true, title: true, icon: true, spaceId: true, parentPageId: true, position: true, createdAt: true, updatedAt: true }),
     PublicSpaceSummary: keysOf<PublicSpaceSummary>({ id: true, name: true, slug: true, description: true, visibility: true, createdAt: true, updatedAt: true }),
     RawPagePermission: keysOf<RawPagePermission>({ id: true, userId: true, groupId: true, role: true, createdAt: true }),
@@ -225,7 +241,7 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
   const RESTORE = keysOf<Awaited<ReturnType<ServiceBridgeController['restoreSession']>>>({ reactivated: true });
   const DEFAULT_WS = keysOf<Awaited<ReturnType<ServiceWorkspaceController['getDefault']>>>({ workspaceId: true });
   const CREATE_SPACE = keysOf<Awaited<ReturnType<ServiceSpaceController['create']>>>({ id: true, slug: true, name: true });
-  const ADD_MEMBER = keysOf<Awaited<ReturnType<ServiceSpaceController['addMember']>>>({ memberId: true, userId: true });
+  const ADD_MEMBER = keysOf<Awaited<ReturnType<ServiceSpaceController['addMember']>>>({ memberId: true, userId: true, version: true });
   const RESOLVE_PAGE_SPACE = keysOf<Awaited<ReturnType<ServicePageController['resolveSpace']>>>({ pageId: true, spaceId: true });
   const RESOLVE_ATTACHMENT_PAGE = keysOf<Awaited<ReturnType<ServiceAttachmentController['resolvePage']>>>({ attachmentId: true, pageId: true, spaceId: true });
 
@@ -247,14 +263,15 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     { id: 'updateWorkspaceSettings', method: 'patch', path: '/api/service/workspace/settings', expect: { kind: 'ref', name: 'WorkspaceSettings' } },
     { id: 'listSpaces', method: 'get', path: '/api/service/spaces', expect: { kind: 'array', name: 'SpaceView' } },
     { id: 'createSpace', method: 'post', path: '/api/service/spaces', expect: { kind: 'inline', keys: CREATE_SPACE } },
-    { id: 'getSpace', method: 'get', path: '/api/service/spaces/{spaceId}', expect: { kind: 'ref', name: 'SpaceView' } },
+    { id: 'getSpace', method: 'get', path: '/api/service/spaces/{spaceId}', expect: { kind: 'ref', name: 'SpaceDetail' } },
     { id: 'listSpaceMembers', method: 'get', path: '/api/service/spaces/{spaceId}/members', expect: { kind: 'array', name: 'RawSpaceMember' } },
     { id: 'addSpaceMember', method: 'post', path: '/api/service/spaces/{spaceId}/members', expect: { kind: 'inline', keys: ADD_MEMBER } },
     { id: 'resolvePageSpace', method: 'post', path: '/api/service/pages/resolve-space', expect: { kind: 'inline', keys: RESOLVE_PAGE_SPACE } },
-    { id: 'listPagePermissions', method: 'get', path: '/api/service/pages/{pageId}/permissions', expect: { kind: 'items', name: 'RawPagePermission' } },
+    { id: 'listPagePermissions', method: 'get', path: '/api/service/pages/{pageId}/permissions', expect: { kind: 'ref', name: 'PagePermissions' } },
     { id: 'listContentPages', method: 'post', path: '/api/service/content/pages/list', expect: { kind: 'items', name: 'PublicPageSummary' } },
     { id: 'listContentSpaces', method: 'post', path: '/api/service/content/spaces/list', expect: { kind: 'items', name: 'PublicSpaceSummary' } },
-    { id: 'getContentSpace', method: 'get', path: '/api/service/content/spaces/{spaceId}', expect: { kind: 'ref', name: 'PublicSpaceSummary' } },
+    { id: 'getContentSpace', method: 'get', path: '/api/service/content/spaces/{spaceId}', expect: { kind: 'ref', name: 'PublicSpaceDetail' } },
+    { id: 'previewSpaceMember', method: 'post', path: '/api/service/spaces/{spaceId}/members/preview', expect: { kind: 'ref', name: 'SpaceMemberPreview' } },
     { id: 'searchContent', method: 'post', path: '/api/service/content/search', expect: { kind: 'items', name: 'PublicSearchHit' } },
     { id: 'resolveAttachmentPage', method: 'get', path: '/api/service/attachments/{attachmentId}/page', expect: { kind: 'inline', keys: RESOLVE_ATTACHMENT_PAGE } },
     { id: 'listPageAttachments', method: 'get', path: '/api/service/attachments/by-page/{pageId}', expect: { kind: 'items', name: 'PublicAttachmentSummary' } },
@@ -356,10 +373,98 @@ describe('service-bridge.openapi.json member-mutation refusals (#486)', () => {
   });
 
   it('UpdateSpaceMemberRequest requires exactly the DTO keys — actorExternalId included (rule M fails closed)', () => {
-    const keys = Object.keys({ role: true, actorExternalId: true } satisfies Record<keyof UpdateSpaceMemberDto, true>).sort();
+    const keys = Object.keys({ role: true, actorExternalId: true, expectedVersion: true } satisfies Record<keyof UpdateSpaceMemberDto, true>).sort();
     const schema = SPEC.components.schemas.UpdateSpaceMemberRequest;
     expect(schema.additionalProperties).toBe(false);
     expect(Object.keys(schema.properties).sort()).toEqual(keys);
-    expect([...schema.required].sort()).toEqual(keys);
+    // #616: the compare is optional; the actor is not.
+    expect([...schema.required].sort()).toEqual(keys.filter((k) => k !== 'expectedVersion'));
+  });
+});
+
+/**
+ * #616 Stage 2 — versions, atomic compares and the member preview are part of the wire contract: the request keys are
+ * typed against the fork DTOs (a field added on either side fails), the compared writes declare their 412 and the
+ * retryable `engine_busy` 503, and the preview's body is pinned key for key.
+ */
+describe('service-bridge.openapi.json versions + member preview (#616)', () => {
+  const S = SPEC as any;
+  const op = (path: string, method: string): any => S.paths[path][method];
+  const refName = (r: any): string => String(r?.$ref ?? '').split('/').pop()!;
+  const sorted = (o: object): string[] => Object.keys(o).sort();
+  const keysOf = <T,>(m: Record<keyof T, true>): string[] => Object.keys(m).sort();
+  const SPACE = '/api/service/spaces/{spaceId}';
+  const MEMBER = '/api/service/spaces/{spaceId}/members/{memberId}';
+
+  it('ExpectedVersion is the DTO bound; Version is 64 hex', () => {
+    expect(S.components.schemas.ExpectedVersion.maxLength).toBe(MAX_EXPECTED_VERSION_LENGTH);
+    expect(S.components.schemas.ExpectedVersion.minLength).toBe(1);
+    expect(S.components.schemas.Version.pattern).toBe('^[0-9a-f]{64}$');
+  });
+
+  it('the request schemas carry exactly the DTO keys (expectedVersion optional everywhere)', () => {
+    const update = S.components.schemas.UpdateSpaceRequest;
+    expect(sorted(update.properties)).toEqual(keysOf<UpdateSpaceDto>({ name: true, description: true, expectedVersion: true }));
+    expect(update.required).toBeUndefined();
+    const bare = S.components.schemas.ExpectedVersionRequest;
+    expect(bare.additionalProperties).toBe(false);
+    expect(sorted(bare.properties)).toEqual(keysOf<ExpectedVersionDto>({ expectedVersion: true }));
+    expect(bare.required).toBeUndefined();
+    const preview = S.components.schemas.SpaceMemberPreviewRequest;
+    expect(preview.additionalProperties).toBe(false);
+    expect(sorted(preview.properties)).toEqual(
+      keysOf<SpaceMemberPreviewDto>({ action: true, externalId: true, addedByExternalId: true, memberId: true, role: true, actorExternalId: true, expectedVersion: true }),
+    );
+    expect(preview.required).toEqual(['action']);
+    expect(preview.properties.action.enum).toEqual(['add', 'update', 'remove']);
+  });
+
+  it('archive and member removal take an OPTIONAL ExpectedVersionRequest body (none = the pre-#616 request)', () => {
+    for (const o of [op(`${SPACE}/archive`, 'post'), op(MEMBER, 'delete')]) {
+      expect(o.requestBody.required).toBe(false);
+      expect(refName(o.requestBody.content['application/json'].schema)).toBe('ExpectedVersionRequest');
+    }
+  });
+
+  it('every compared write declares 412 PreconditionFailed and the retryable engine_busy 503', () => {
+    for (const o of [op(SPACE, 'patch'), op(`${SPACE}/archive`, 'post'), op(MEMBER, 'patch'), op(MEMBER, 'delete')]) {
+      expect(refName(o.responses['412'])).toBe('PreconditionFailed');
+      expect(refName(o.responses['503'])).toBe('UnconfiguredOrBusy');
+    }
+    expect(S.components.schemas.PreconditionFailedError.properties.code.const).toBe('precondition_failed');
+    expect(S.components.schemas.EngineBusyError.properties.code.const).toBe('engine_busy');
+    const busy = S.components.responses.UnconfiguredOrBusy.content['application/json'].schema.anyOf.map(refName);
+    expect(busy.sort()).toEqual(['EngineBusyError', 'Error']);
+  });
+
+  it('rename / archive / role change answer the new version (the narrowing ones keep Authz-Propagation)', () => {
+    expect(refName(op(SPACE, 'patch').responses['200'])).toBe('OkVersioned');
+    expect(refName(op(`${SPACE}/archive`, 'post').responses['200'])).toBe('OkVersionedNarrowing');
+    expect(refName(op(MEMBER, 'patch').responses['200'])).toBe('OkVersionedNarrowing');
+    const UPDATE = keysOf<Awaited<ReturnType<ServiceSpaceController['update']>>>({ ok: true, version: true });
+    const ARCHIVE = keysOf<Awaited<ReturnType<ServiceSpaceController['archive']>>>({ ok: true, version: true });
+    const ROLE = keysOf<Awaited<ReturnType<ServiceSpaceController['changeMemberRole']>>>({ ok: true, version: true });
+    for (const [name, keys] of [['OkVersioned', UPDATE], ['OkVersionedNarrowing', ARCHIVE], ['OkVersionedNarrowing', ROLE]] as const) {
+      const schema = S.components.responses[name].content['application/json'].schema;
+      expect(sorted(schema.properties)).toEqual(keys);
+      expect([...schema.required].sort()).toEqual(keys);
+    }
+    expect(S.components.responses.OkVersionedNarrowing.headers['Authz-Propagation']).toBeDefined();
+  });
+
+  it('SpaceMemberPreview has exactly the fork type keys (code optional), its effect too, and the refusal codes', () => {
+    const schema = S.components.schemas.SpaceMemberPreview;
+    const keys = keysOf<SpaceMemberPreview>({ outcome: true, code: true, version: true, effect: true });
+    expect(schema.additionalProperties).toBe(false);
+    expect(sorted(schema.properties)).toEqual(keys);
+    expect([...schema.required].sort()).toEqual(keys.filter((k) => k !== 'code'));
+    expect(schema.properties.outcome.enum).toEqual(['would_apply', 'noop', 'refused']);
+    expect([...schema.properties.code.enum].sort()).toEqual(
+      ['last_admin', 'member_not_found', 'precondition_failed', 'self_grant', 'space_archived'],
+    );
+    const effect = schema.properties.effect;
+    const effectKeys = keysOf<SpaceMemberPreview['effect']>({ roleBefore: true, roleAfter: true, provisionsAccount: true });
+    expect(sorted(effect.properties)).toEqual(effectKeys);
+    expect([...effect.required].sort()).toEqual(effectKeys);
   });
 });

@@ -223,3 +223,139 @@ describe('service-bridge member mutation refusals on the wire (#486)', () => {
     expect(calls).toEqual([]);
   });
 });
+
+/**
+ * #616 Stage 2 — the versioned member / space writes and the member preview through the real pipeline (global
+ * ValidationPipe exactly as main.ts mounts it, which strips unknown keys and would silently drop an undeclared
+ * `expectedVersion`): a stale version is a 412 whose body carries `code: 'precondition_failed'` (the platform maps
+ * it by code), the optional DELETE / archive body is parsed and validated, a body-less archive / removal is the
+ * pre-#616 request, and the preview answers its bare body with a 200 and writes nothing.
+ */
+describe('service-bridge versioned writes + member preview on the wire (#616)', () => {
+  const SPACE = '22222222-2222-4222-8222-222222222222';
+  const MEMBER = '33333333-3333-4333-8333-333333333333';
+  let app: NestFastifyApplication;
+  let calls: SpyQuery[];
+  const STALE = 'f'.repeat(64);
+
+  beforeAll(async () => {
+    const spy = spyKysely((query) => {
+      const s = query.sql.toLowerCase();
+      if (s.includes('for no key update')) return [{ id: SPACE, deletedAt: null }];
+      if (s.includes('from space_members') && s.includes('for update')) {
+        return [{ id: MEMBER, userId: 'u-ext-other', groupId: null, role: 'writer', deletedAt: null }];
+      }
+      if (s.includes('update spaces set')) return [{ id: SPACE, deletedAt: new Date() }];
+      return [];
+    });
+    calls = spy.calls;
+    const bridge = {
+      provisionShadowUser: async () => {
+        throw new Error('a preview must never provision');
+      },
+      // `ext-new` has never been provisioned: the preview must report it, never create it.
+      findShadowUserId: async (externalId: string) => (externalId === 'ext-new' ? null : `u-${externalId}`),
+    };
+    const moduleRef = await Test.createTestingModule({
+      controllers: [ServiceSpaceController],
+      providers: [
+        {
+          provide: ServiceSpaceService,
+          useValue: new ServiceSpaceService(spy.db, { resolveDefaultWorkspaceId: async () => WS } as any, bridge as any),
+        },
+      ],
+    })
+      .overrideGuard(RemoteOnlyGuard)
+      .useValue({ canActivate: () => true })
+      .overrideGuard(ServiceAuthGuard)
+      .useValue({ canActivate: () => true })
+      .compile();
+    app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    app.setGlobalPrefix('api'); // main.ts
+    app.useGlobalPipes(new ValidationPipe({ whitelist: true, stopAtFirstError: true, transform: true })); // main.ts
+    app.useGlobalInterceptors(new TransformHttpResponseInterceptor(app.get(Reflector))); // main.ts
+    await app.init();
+    await app.getHttpAdapter().getInstance().ready();
+  });
+
+  afterAll(async () => await app?.close());
+  beforeEach(() => {
+    calls.length = 0;
+  });
+
+  const VERSION = expect.stringMatching(/^[0-9a-f]{64}$/);
+  const wrote = () => calls.some((c) => /^\s*(update|delete|insert)/i.test(c.sql));
+
+  it('PATCH member with a stale expectedVersion answers 412 precondition_failed and writes nothing', async () => {
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/service/spaces/${SPACE}/members/${MEMBER}`,
+      payload: { role: 'reader', actorExternalId: 'ext-me', expectedVersion: STALE },
+    });
+    expect(res.statusCode).toBe(412);
+    expect(res.json()).toEqual({ code: 'precondition_failed', message: expect.any(String) });
+    expect(wrote()).toBe(false);
+  });
+
+  it('PATCH member with "*" (exists) applies and answers { ok, version }', async () => {
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/service/spaces/${SPACE}/members/${MEMBER}`,
+      payload: { role: 'reader', actorExternalId: 'ext-me', expectedVersion: '*' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true, version: VERSION });
+  });
+
+  it('DELETE member parses its optional JSON body: a stale version is a 412, and no body at all is the old request', async () => {
+    const stale = await app.inject({
+      method: 'DELETE',
+      url: `/api/service/spaces/${SPACE}/members/${MEMBER}`,
+      payload: { expectedVersion: STALE },
+    });
+    expect(stale.statusCode).toBe(412);
+    expect(wrote()).toBe(false);
+    const bare = await app.inject({ method: 'DELETE', url: `/api/service/spaces/${SPACE}/members/${MEMBER}` });
+    expect(bare.statusCode).toBe(200);
+    expect(bare.json()).toEqual({ ok: true });
+  });
+
+  it('an over-long expectedVersion is a 400 (validated, never stripped)', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/service/spaces/${SPACE}/archive`,
+      payload: { expectedVersion: 'x'.repeat(129) },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('POST archive without a body answers { ok, version } (the pre-#616 request, a new field in the answer)', async () => {
+    const res = await app.inject({ method: 'POST', url: `/api/service/spaces/${SPACE}/archive` });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true, version: VERSION });
+  });
+
+  it('POST members/preview answers the bare preview with a 200, provisions nobody and writes nothing', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/service/spaces/${SPACE}/members/preview`,
+      payload: { action: 'add', externalId: 'ext-new', role: 'writer', addedByExternalId: 'ext-me' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({
+      outcome: 'would_apply',
+      version: null,
+      effect: { roleBefore: null, roleAfter: 'writer', provisionsAccount: true },
+    });
+    expect(wrote()).toBe(false);
+  });
+
+  it('POST members/preview without a field its action requires is a 400', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/service/spaces/${SPACE}/members/preview`,
+      payload: { action: 'update', role: 'reader', actorExternalId: 'ext-me' },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+});

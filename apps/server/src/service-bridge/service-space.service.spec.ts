@@ -28,6 +28,9 @@ const make = (respond: (q: SpyQuery) => unknown[]) => {
 // Raw `sql` keeps its literal (unquoted, indented) text, so match with lowercased `includes`.
 const q = (s: string) => s.toLowerCase();
 
+/** #616: a rename / archive / role change now answers the resource's new version. */
+const VERSIONED = { version: expect.stringMatching(/^[0-9a-f]{64}$/) };
+
 describe('ServiceSpaceService.create — transactional atomicity', () => {
   it('rolls back the space row when the creator-member insert fails (no partial space)', async () => {
     // Force the SECOND insert (space_members) to fail INSIDE the transaction. The first insert (spaces) must
@@ -82,7 +85,7 @@ describe('ServiceSpaceService.create — transactional atomicity', () => {
 describe('ServiceSpaceService.archive — reversible soft-delete', () => {
   it('sets deleted_at (soft delete), scoped to an ACTIVE space, and 404s a missing/archived one', async () => {
     const ok = make((query) => (q(query.sql).includes('update spaces set') ? [{ id: 'sp1' }] : []));
-    await expect(ok.svc.archive('sp1')).resolves.toBeUndefined();
+    await expect(ok.svc.archive('sp1')).resolves.toEqual(VERSIONED);
     const upd = ok.spy.calls.find((c) => q(c.sql).includes('update spaces set'))!;
     expect(q(upd.sql)).toContain('deleted_at = now()');
     expect(q(upd.sql)).toContain('deleted_at is null'); // only archives an active space
@@ -183,14 +186,14 @@ describe('ServiceSpaceService member mutations — last-admin invariant (#486)',
 
     it('commits the demotion when another live admin remains', async () => {
       const { svc, spy } = make(respondTo({ member: { role: 'admin' }, otherAdmins: 1 }));
-      await expect(svc.changeMemberRole('sp1', 'm1', 'reader', 'ext-actor')).resolves.toBeUndefined();
+      await expect(svc.changeMemberRole('sp1', 'm1', 'reader', 'ext-actor')).resolves.toEqual(VERSIONED);
       expect(spy.tx).toEqual(['begin', 'commit']);
       expect(ran(spy, 'update space_members')).toBe(true);
     });
 
     it('does not count admins for an admin→admin write (not a demotion)', async () => {
       const { svc, spy } = make(respondTo({ member: { role: 'admin' }, otherAdmins: 0 }));
-      await expect(svc.changeMemberRole('sp1', 'm1', 'admin', 'ext-actor')).resolves.toBeUndefined();
+      await expect(svc.changeMemberRole('sp1', 'm1', 'admin', 'ext-actor')).resolves.toEqual(VERSIONED);
       expect(ran(spy, 'count(*)::int')).toBe(false);
     });
 
@@ -253,7 +256,7 @@ describe('ServiceSpaceService member mutations — last-admin invariant (#486)',
 
     it('locks inside the transaction AFTER the pre-check and provisioning, then upserts on commit', async () => {
       const { svc, spy } = make(respondTo({ member: null }));
-      await expect(svc.addMember('sp1', dto('writer'))).resolves.toEqual({ memberId: 'm1', userId: 'docmost-ext-m' });
+      await expect(svc.addMember('sp1', dto('writer'))).resolves.toEqual({ memberId: 'm1', userId: 'docmost-ext-m', ...VERSIONED });
       expect(spy.tx).toEqual(['begin', 'commit']);
       expect(idx(spy, 'from spaces s')).toBeLessThan(idx(spy, 'for no key update')); // fast pre-check first
       expect(idx(spy, 'for no key update')).toBeLessThan(idx(spy, 'insert into space_members'));
@@ -346,7 +349,7 @@ describe('ServiceSpaceService member mutations — rule M, no self-raising write
 
     it('allows demoting your own row', async () => {
       const { svc, spy } = make(respondTo({ member: { role: 'admin', userId: ME }, otherAdmins: 1 }));
-      await expect(svc.changeMemberRole('sp1', 'm1', 'writer', 'ext-me')).resolves.toBeUndefined();
+      await expect(svc.changeMemberRole('sp1', 'm1', 'writer', 'ext-me')).resolves.toEqual(VERSIONED);
       expect(ran(spy, 'update space_members')).toBe(true);
     });
 
@@ -357,24 +360,24 @@ describe('ServiceSpaceService member mutations — rule M, no self-raising write
       expect(probe.parameters).toEqual(['g1', ME]);
 
       const notMine = make(respondTo({ member: { role: 'reader', groupId: 'g1' }, inGroup: false }));
-      await expect(notMine.svc.changeMemberRole('sp1', 'm1', 'writer', 'ext-me')).resolves.toBeUndefined();
+      await expect(notMine.svc.changeMemberRole('sp1', 'm1', 'writer', 'ext-me')).resolves.toEqual(VERSIONED);
     });
 
     it('allows demoting a group row the actor belongs to (narrowing never widens anyone)', async () => {
       const { svc, spy } = make(respondTo({ member: { role: 'admin', groupId: 'g1' }, inGroup: true, otherAdmins: 1 }));
-      await expect(svc.changeMemberRole('sp1', 'm1', 'reader', 'ext-me')).resolves.toBeUndefined();
+      await expect(svc.changeMemberRole('sp1', 'm1', 'reader', 'ext-me')).resolves.toEqual(VERSIONED);
       expect(ran(spy, 'from group_users')).toBe(false); // not a raise → coverage is never consulted
     });
 
     it("allows raising someone else's user row without consulting group_users", async () => {
       const { svc, spy } = make(respondTo({ member: { role: 'reader', userId: 'docmost-ext-other' } }));
-      await expect(svc.changeMemberRole('sp1', 'm1', 'admin', 'ext-me')).resolves.toBeUndefined();
+      await expect(svc.changeMemberRole('sp1', 'm1', 'admin', 'ext-me')).resolves.toEqual(VERSIONED);
       expect(ran(spy, 'from group_users')).toBe(false);
     });
 
     it('an actor with no shadow user is covered by nothing (a null id never matches a null user_id)', async () => {
       const { svc, spy } = make(respondTo({ member: { role: 'reader', userId: null, groupId: 'g1' }, inGroup: true }));
-      await expect(svc.changeMemberRole('sp1', 'm1', 'admin', 'ext-ghost')).resolves.toBeUndefined();
+      await expect(svc.changeMemberRole('sp1', 'm1', 'admin', 'ext-ghost')).resolves.toEqual(VERSIONED);
       expect(ran(spy, 'from group_users')).toBe(false);
     });
 

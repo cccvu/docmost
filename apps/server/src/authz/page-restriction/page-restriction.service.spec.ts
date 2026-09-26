@@ -51,6 +51,12 @@ const ACCESS_ID = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
 
 const userOf = (id: string) => ({ id }) as unknown as User;
 
+/** #616: every ACL write now answers the ACL's new version and the write's effect. */
+const WRITTEN = expect.objectContaining({
+  version: expect.stringMatching(/^[0-9a-f]{64}$/),
+  effect: expect.objectContaining({ added: expect.any(Array), changed: expect.any(Array), removed: expect.any(Array) }),
+});
+
 type Role = 'admin' | 'writer' | 'reader' | undefined;
 
 /**
@@ -118,7 +124,13 @@ function makeService(opts: {
 
   // The service's own Kysely reads/writes (the grant lookup + update-by-id, the A1 group probe, the A3 child
   // probe) go through the compiling spy.
+  // #616: each write re-reads the page's ACL inside its transaction (`readAclState`, one raw statement). The page
+  // starts in the state the FIRST `accessSeq` entry models (restricted with no grants, or not restricted).
+  const initialAccess = seq?.[0];
   const spy = spyKysely((q: SpyQuery) => {
+    if (q.sql.includes('from page_access pa left join page_permissions')) {
+      return initialAccess ? [{ accessId: initialAccess.id, userId: null, groupId: null, role: null }] : [];
+    }
     if (q.sql.includes('from "page_permissions"')) return opts.grant ? [opts.grant] : [];
     if (q.sql.includes('from "group_users"')) return opts.inGroup ? [{ groupId: TARGET_GROUP }] : [];
     if (q.sql.includes('from "pages" as "c"')) return opts.darkChild ? [{ id: 'child' }] : [];
@@ -154,7 +166,7 @@ describe('PageRestrictionService — who may restrict a page (space-admin gate)'
 
     await expect(
       service.restrict(PAGE_ID, userOf(ADMIN_ID)),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual(WRITTEN);
 
     expect(pagePermissionRepo.insertPageAccess).toHaveBeenCalledTimes(1);
     expect((pagePermissionRepo.insertPageAccess.mock.calls[0] as any[])[0]).toMatchObject({
@@ -166,7 +178,7 @@ describe('PageRestrictionService — who may restrict a page (space-admin gate)'
     });
     expect(pagePermissionRepo.insertPagePermissions).toHaveBeenCalledWith([
       { pageAccessId: ACCESS_ID, userId: ADMIN_ID, role: 'writer', addedById: ADMIN_ID },
-    ]);
+    ], expect.anything() /* #616: the write's transaction */);
   });
 
   // Invariant (P0, deny-by-default): a plain space READER may NOT restrict — Forbidden, and NO write.
@@ -208,7 +220,7 @@ describe('PageRestrictionService — who may restrict a page (space-admin gate)'
 
     await expect(
       service.restrict(PAGE_ID, userOf(ADMIN_ID)),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual(WRITTEN);
     expect(pagePermissionRepo.insertPageAccess).not.toHaveBeenCalled();
     expect(pagePermissionRepo.insertPagePermissions).not.toHaveBeenCalled();
   });
@@ -232,8 +244,8 @@ describe('PageRestrictionService — who may restrict a page (space-admin gate)'
     const { service, pagePermissionRepo } = makeService({ role: 'admin' });
     await expect(
       service.unrestrict(PAGE_ID, userOf(ADMIN_ID)),
-    ).resolves.toBeUndefined();
-    expect(pagePermissionRepo.deletePageAccess).toHaveBeenCalledWith(PAGE_ID);
+    ).resolves.toEqual(WRITTEN);
+    expect(pagePermissionRepo.deletePageAccess).toHaveBeenCalledWith(PAGE_ID, expect.anything() /* #616: the write's transaction */);
   });
 
   it('denies a plain space reader from unrestricting a page (Forbidden, no delete)', async () => {
@@ -259,15 +271,16 @@ describe('PageRestrictionService — who may grant/revoke/update a page permissi
         { pageId: PAGE_ID, role: 'reader', userIds: [TARGET_USER] } as AddPagePermissionDto,
         userOf(ADMIN_ID),
       ),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual(WRITTEN);
 
     expect(pagePermissionRepo.deletePagePermissionsByUserIds).toHaveBeenCalledWith(
       ACCESS_ID,
       [TARGET_USER],
+      expect.anything() /* #616: the write's transaction */,
     );
     expect(pagePermissionRepo.insertPagePermissions).toHaveBeenCalledWith([
       { pageAccessId: ACCESS_ID, userId: TARGET_USER, role: 'reader', addedById: ADMIN_ID },
-    ]);
+    ], expect.anything() /* #616: the write's transaction */);
   });
 
   // Invariant (P0): a plain reader may NOT grant — Forbidden, and no delete/insert reaches the repo.
@@ -347,10 +360,11 @@ describe('PageRestrictionService — who may grant/revoke/update a page permissi
         { pageId: PAGE_ID, userIds: [TARGET_USER] } as RemovePagePermissionDto,
         userOf(ADMIN_ID),
       ),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual(WRITTEN);
     expect(pagePermissionRepo.deletePagePermissionsByUserIds).toHaveBeenCalledWith(
       ACCESS_ID,
       [TARGET_USER],
+      expect.anything() /* #616: the write's transaction */,
     );
   });
 
@@ -383,7 +397,7 @@ describe('PageRestrictionService — who may grant/revoke/update a page permissi
         { pageId: PAGE_ID, role: 'writer', userId: TARGET_USER } as UpdatePagePermissionDto,
         userOf(ADMIN_ID),
       ),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual(WRITTEN);
     expect(spy.tx).toEqual(['begin', 'commit']);
     const [select, update] = spy.calls.filter((c) => c.sql.includes('"page_permissions"'));
     expect(select.sql).toContain('from "page_permissions"');
@@ -505,7 +519,7 @@ describe('PageRestrictionService — A1: no self page-grant (#486)', () => {
     const { service, pagePermissionRepo } = makeService({ role: 'admin', accessSeq: [{ id: ACCESS_ID }] });
     await expect(
       service.addPermission(grant({ userIds: [TARGET_USER], groupIds: [TARGET_GROUP] }), userOf(ADMIN_ID)),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual(WRITTEN);
     expect(pagePermissionRepo.insertPagePermissions).toHaveBeenCalled();
   });
 
@@ -533,8 +547,8 @@ describe('PageRestrictionService — A1: no self page-grant (#486)', () => {
     const { service, pagePermissionRepo } = makeService({ role: 'admin', accessSeq: [{ id: ACCESS_ID }] });
     await expect(
       service.removePermission({ pageId: PAGE_ID, userIds: [ADMIN_ID] } as RemovePagePermissionDto, userOf(ADMIN_ID)),
-    ).resolves.toBeUndefined();
-    expect(pagePermissionRepo.deletePagePermissionsByUserIds).toHaveBeenCalledWith(ACCESS_ID, [ADMIN_ID]);
+    ).resolves.toEqual(WRITTEN);
+    expect(pagePermissionRepo.deletePagePermissionsByUserIds).toHaveBeenCalledWith(ACCESS_ID, [ADMIN_ID], expect.anything() /* #616: the write's transaction */);
   });
 });
 
@@ -554,7 +568,7 @@ describe('PageRestrictionService — A2: restrict keeps only the access the acto
     ]);
     expect(pagePermissionRepo.insertPagePermissions).toHaveBeenCalledWith([
       { pageAccessId: ACCESS_ID, userId: ADMIN_ID, role, addedById: ADMIN_ID },
-    ]);
+    ], expect.anything() /* #616: the write's transaction */);
   });
 
   it('no space view → the page is restricted but the actor is granted nothing', async () => {
@@ -586,7 +600,7 @@ describe('PageRestrictionService — A2: restrict keeps only the access the acto
     expect(authz.tryCheckBulk).not.toHaveBeenCalled();
     expect(pagePermissionRepo.insertPagePermissions).toHaveBeenCalledWith([
       { pageAccessId: ACCESS_ID, userId: ADMIN_ID, role: 'writer', addedById: ADMIN_ID },
-    ]);
+    ], expect.anything() /* #616: the write's transaction */);
   });
 
   it('never asks the PDP for `locked` (issue 499)', async () => {
@@ -604,10 +618,11 @@ describe('PageRestrictionService — A3: covered unrestrict (#486)', () => {
 
   it('without the flag, unrestrict is unchanged: no PDP call, no child probe', async () => {
     const { service, pagePermissionRepo, authz, spy } = unrestrictAs({ pdp: [false], darkChild: true });
-    await expect(service.unrestrict(PAGE_ID, userOf(ADMIN_ID))).resolves.toBeUndefined();
+    await expect(service.unrestrict(PAGE_ID, userOf(ADMIN_ID))).resolves.toEqual(WRITTEN);
     expect(authz.tryCheckBulk).not.toHaveBeenCalled();
-    expect(spy.calls).toEqual([]);
-    expect(pagePermissionRepo.deletePageAccess).toHaveBeenCalledWith(PAGE_ID);
+    // #616: the write is now one transaction (ACL lock + re-read), so "no query at all" became "no child probe".
+    expect(spy.calls.some((c) => c.sql.includes('from "pages" as "c"'))).toBe(false);
+    expect(pagePermissionRepo.deletePageAccess).toHaveBeenCalledWith(PAGE_ID, expect.anything() /* #616: the write's transaction */);
   });
 
   it('with the flag, 403s when the actor cannot edit the page (strict page#edit), nothing deleted', async () => {
@@ -632,8 +647,8 @@ describe('PageRestrictionService — A3: covered unrestrict (#486)', () => {
 
   it('with the flag, removes the restriction when the actor can edit and every sub-page is restricted', async () => {
     const { service, pagePermissionRepo } = unrestrictAs({ pdp: [true], darkChild: false });
-    await expect(service.unrestrict(PAGE_ID, userOf(ADMIN_ID), covered)).resolves.toBeUndefined();
-    expect(pagePermissionRepo.deletePageAccess).toHaveBeenCalledWith(PAGE_ID);
+    await expect(service.unrestrict(PAGE_ID, userOf(ADMIN_ID), covered)).resolves.toEqual(WRITTEN);
+    expect(pagePermissionRepo.deletePageAccess).toHaveBeenCalledWith(PAGE_ID, expect.anything() /* #616: the write's transaction */);
   });
 
   it('with the flag, a PDP failure is a 503 and nothing is deleted', async () => {
@@ -781,7 +796,7 @@ describe('PageRestrictionController (auth guard + delegation)', () => {
     await expect(
       controller.restrict({ pageId: PAGE_ID } as RestrictPageDto, admin),
     ).resolves.toEqual({ restricted: true });
-    expect(service.restrict).toHaveBeenCalledWith(PAGE_ID, admin);
+    expect(service.restrict).toHaveBeenCalledWith(PAGE_ID, admin, {}); // #616: + the optional compare (none sent)
   });
 
   it('remove-restriction delegates and returns {restricted:false}', async () => {
@@ -842,6 +857,6 @@ describe('PageRestrictionService — socket.io restriction cache (#501)', () => 
   it('a cache failure never fails the restrict (the entry just expires in 30 s)', async () => {
     const ws = { invalidateSpaceRestrictionCache: jest.fn(async () => { throw new Error('redis down'); }) };
     const { service } = makeService({ role: 'admin', accessSeq: [undefined, { id: ACCESS_ID }], ws });
-    await expect(service.restrict(PAGE_ID, userOf(ADMIN_ID))).resolves.toBeUndefined();
+    await expect(service.restrict(PAGE_ID, userOf(ADMIN_ID))).resolves.toEqual(WRITTEN);
   });
 });

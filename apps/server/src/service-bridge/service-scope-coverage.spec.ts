@@ -60,6 +60,9 @@ const EXPECTED_SCOPE: Record<string, ServiceScope> = {
   'ServiceSpaceController.addMember': ServiceScope.SpacesWrite,
   'ServiceSpaceController.changeMemberRole': ServiceScope.SpacesWrite,
   'ServiceSpaceController.removeMember': ServiceScope.SpacesWrite,
+  // #616: the member preview carries the SAME scope as the member write it previews (it writes nothing, but it must
+  // never be reachable by a credential that could not make the write).
+  'ServiceSpaceController.previewMember': ServiceScope.SpacesWrite,
   'ServicePageController.resolveSpace': ServiceScope.PagesRead,
   'ServicePageController.listPermissions': ServiceScope.ContentRead,
   'ServicePageController.lifecycleState': ServiceScope.PagesRead, // #485

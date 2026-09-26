@@ -2,10 +2,12 @@ import {
   IsIn,
   IsOptional,
   IsString,
+  IsUUID,
   Matches,
   MaxLength,
   MinLength,
 } from 'class-validator';
+import { IsExpectedVersion } from '../resource-version';
 
 /**
  * CCC service-bridge — NOT upstream Docmost code. DTOs for the space/membership control plane the platform
@@ -54,6 +56,16 @@ export class UpdateSpaceDto {
   @IsString()
   @MaxLength(1000)
   description?: string;
+
+  /** #616: the space's version (its `GET` `version`), or `"*"`; compared under the space row lock (412 if stale). */
+  @IsExpectedVersion()
+  expectedVersion?: string;
+}
+
+/** #616: the optional body of archive and member removal — only the version to compare. */
+export class ExpectedVersionDto {
+  @IsExpectedVersion()
+  expectedVersion?: string;
 }
 
 export class AddSpaceMemberDto {
@@ -82,4 +94,50 @@ export class UpdateSpaceMemberDto {
   @IsString()
   @Matches(EXTERNAL_ID, { message: 'actorExternalId must be 1-128 chars of [A-Za-z0-9._+-]' })
   actorExternalId!: string;
+
+  /** #616: the membership's version (its list item `version`), or `"*"`; compared under the row lock. */
+  @IsExpectedVersion()
+  expectedVersion?: string;
+}
+
+export const SPACE_MEMBER_PREVIEW_ACTIONS = ['add', 'update', 'remove'] as const;
+export type SpaceMemberPreviewAction = (typeof SPACE_MEMBER_PREVIEW_ACTIONS)[number];
+
+/**
+ * #616: `POST service/spaces/:spaceId/members/preview` — `action` plus the body of the real write it previews:
+ *   add    → `externalId`, `role`, `addedByExternalId`            (as `POST …/members`)
+ *   update → `memberId`, `role`, `actorExternalId`, `expectedVersion?` (as `PATCH …/members/:memberId`)
+ *   remove → `memberId`, `expectedVersion?`                        (as `DELETE …/members/:memberId`)
+ * Each field is validated as the real route validates it; a field the action does not take is ignored, and one it
+ * requires but lacks is a 400.
+ */
+export class SpaceMemberPreviewDto {
+  @IsIn(SPACE_MEMBER_PREVIEW_ACTIONS)
+  action!: SpaceMemberPreviewAction;
+
+  @IsOptional()
+  @IsString()
+  @Matches(EXTERNAL_ID, { message: 'externalId must be 1-128 chars of [A-Za-z0-9._+-]' })
+  externalId?: string;
+
+  @IsOptional()
+  @IsString()
+  @Matches(EXTERNAL_ID, { message: 'addedByExternalId must be 1-128 chars of [A-Za-z0-9._+-]' })
+  addedByExternalId?: string;
+
+  @IsOptional()
+  @IsUUID()
+  memberId?: string;
+
+  @IsOptional()
+  @IsIn(SPACE_ROLES)
+  role?: SpaceMemberRole;
+
+  @IsOptional()
+  @IsString()
+  @Matches(EXTERNAL_ID, { message: 'actorExternalId must be 1-128 chars of [A-Za-z0-9._+-]' })
+  actorExternalId?: string;
+
+  @IsExpectedVersion()
+  expectedVersion?: string;
 }
