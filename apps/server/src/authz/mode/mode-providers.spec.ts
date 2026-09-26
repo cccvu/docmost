@@ -1,12 +1,15 @@
 import { FactoryProvider } from '@nestjs/common';
 import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
+import { LabelRepo } from '@docmost/db/repos/label/label.repo';
 import { SearchService } from '../../core/search/search.service';
 import { PdpSpaceMemberRepo } from '../pdp-space-member.repo';
 import { PdpPagePermissionRepo } from '../pdp-page-permission.repo';
+import { PdpLabelRepo } from '../pdp-label.repo';
 import { PdpSearchService } from '../search/pdp-search.service';
 import { AUTHZ_MODE } from './authz-mode';
 import {
+  labelRepoProvider,
   pagePermissionRepoProvider,
   spaceMemberRepoProvider,
 } from './repo-providers';
@@ -24,10 +27,11 @@ const stub = {} as any;
  * pinned by a test.
  */
 describe('mode-selected DI providers', () => {
-  it('all three name AUTHZ_MODE as their first injected dependency', () => {
+  it('all four name AUTHZ_MODE as their first injected dependency', () => {
     for (const p of [
       spaceMemberRepoProvider,
       pagePermissionRepoProvider,
+      labelRepoProvider,
       searchServiceProvider,
     ]) {
       expect((p as FactoryProvider).inject?.[0]).toBe(AUTHZ_MODE);
@@ -59,6 +63,18 @@ describe('mode-selected DI providers', () => {
       expect(f('remote', stub, stub, stub, stub)).toBeInstanceOf(
         PdpPagePermissionRepo,
       );
+    });
+  });
+
+  describe('labelRepoProvider (#615)', () => {
+    const f = (labelRepoProvider as FactoryProvider).useFactory;
+    it('native → stock LabelRepo, never the PDP subclass', () => {
+      const inst = f('native', stub, stub, stub);
+      expect(inst).toBeInstanceOf(LabelRepo);
+      expect(inst).not.toBeInstanceOf(PdpLabelRepo);
+    });
+    it('remote → PdpLabelRepo', () => {
+      expect(f('remote', stub, stub, stub)).toBeInstanceOf(PdpLabelRepo);
     });
   });
 

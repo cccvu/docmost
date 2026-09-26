@@ -54,8 +54,12 @@ PLATFORM_AUTHZ_SERVICE_SECRET=<a shared secret, >= 16 chars>
 - **The fork fails closed.** If your service is unreachable, times out, returns a non-2xx, or returns a
   malformed body, the fork denies (`check` -> false, the list endpoints -> empty). It NEVER falls back to
   native decisions. So returning `5xx` on your own errors is safe: it degrades to deny, never to allow.
-- **Subjects arrive as** `{ "provider": "docmost", "externalId": "<docmost user id>" }`. The `{ principalId }`
-  shape is in the schema for completeness but this fork does not send it.
+- **Subjects arrive as** `{ "provider": "docmost", "externalId": "<docmost user id>" }` for every user
+  decision. One exception (1.2.0, wiki-v2 #615): when a caller of the service-bridge `content/search` passes a
+  `serviceSubjectId` (the CCC platform does for an on-behalf-of search), the fork also sends
+  `/authz/filter-resources` a `{ "principalId": "<that id>", "subjectType": "service" }` subject for the
+  service account's leg of each window. A service that denies that subject is safe (fail-closed), but every
+  such search then comes back empty; one that never receives a `serviceSubjectId` never sees the shape.
 - The reference implementation also rejects unknown request keys with `400` and enforces the array caps; the
   fork never sends unknown keys or over-cap arrays, so a faithful implementation is strict but never triggers
   those paths in normal operation.
@@ -83,7 +87,9 @@ You only implement a *caller* for these; the fork is the server. They fall into 
   `.../spaces/{id}/members`.
 - **Content read model** (`pages`, `content`): `POST /api/service/pages/resolve-space`,
   `GET /api/service/pages/{id}/permissions`, `POST /api/service/content/pages/list`,
-  `POST /api/service/content/spaces/list`, `GET /api/service/content/spaces/{id}`.
+  `POST /api/service/content/spaces/list`, `GET /api/service/content/spaces/{id}`, and (1.8.0, #615)
+  `POST /api/service/content/pages/ancestors`, `POST /api/service/content/labels/list`,
+  `POST /api/service/content/activity/list`, `POST /api/service/content/spaces/comment-policy`.
 - **Change feed** (`changes`): `GET /api/service/authz/changes` (long-poll for membership/page/restriction
   change events after an opaque cursor) and `GET /api/service/authz/snapshot` (the full desired set,
   paginated, for drift repair). The fork owns a transactional outbox (an AFTER trigger writes a change row
@@ -124,6 +130,16 @@ native routes answer a refusal — and a move cycle — with `409 { message, cod
 transaction rolls back. A move rolls back whole; upstream's restore is not transactional, so on a refused detach the
 un-trash has already committed and the page stays under its trashed, restricted parent (never declassified;
 wiki-v2 issue 556).
+
+**Knowledge reads (1.8.0, wiki-v2 #615).** `content/pages/list` gains page filters (labelName, lastUpdatedById,
+created range, topLevel, descendantOf+maxDepth — walks only through supplied live pages —, linksTo/linkedFrom), a
+`position` sort and a wire-only creator/last-editor projection; four new `content:read` operations serve ancestor
+ids (facts to authorize), labels and activity over an authorized page set (pinned to the supplied ids, live,
+workspace), and a space's viewer-comment setting (a fact, not a decision). `content/search` gains the same
+narrowing filters (parentPageId, labelName, lastUpdatedById, updated range) applied BEFORE the authorization walk,
+plus an optional `serviceSubjectId` so an on-behalf-of result is service ∩ user; it now answers
+`{items, hasMore}`, where `hasMore` is true only when an authorized hit past the page was actually collected (a
+scan-budget stop reports false, never a promise of an empty next page).
 
 **Conditional page operations (1.9.0, wiki-v2 #616).** `POST /api/service/pages/lifecycle-state` also reports the
 page's own `position`. Beside the native page routes a platform relays as the acting user, the fork serves atomic

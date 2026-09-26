@@ -142,6 +142,28 @@ describe('HttpAuthzClient', () => {
     ).toEqual(['a', 'c']);
   });
 
+  // #615: the service leg of an on-behalf-of search names the SERVICE ACCOUNT. The subject must cross verbatim —
+  // dropping `subjectType` would make the platform resolve the id as a USER principal (a different subject).
+  it('filterResources sends a service-principal subject verbatim (principalId + subjectType service)', async () => {
+    fetchMock.mockResolvedValueOnce(ok({ ids: ['a'] }));
+    expect(
+      await client.filterResources(
+        { principalId: 'sa-1', subjectType: 'service' },
+        'view',
+        'page',
+        ['a', 'b'],
+      ),
+    ).toEqual(['a']);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe('http://platform.test/authz/filter-resources');
+    expect(JSON.parse(init.body)).toEqual({
+      subject: { principalId: 'sa-1', subjectType: 'service' },
+      permission: 'view',
+      resourceType: 'page',
+      candidateIds: ['a', 'b'],
+    });
+  });
+
   it('filterSubjects wraps candidate ids, echoes the passing externalIds, and skips the call when empty', async () => {
     expect(await client.filterSubjects('view', 'page', 'pg1', [])).toEqual([]);
     expect(fetchMock).not.toHaveBeenCalled();

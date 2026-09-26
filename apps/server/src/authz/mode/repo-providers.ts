@@ -7,22 +7,25 @@ import { GroupRepo } from '@docmost/db/repos/group/group.repo';
 import { SpaceRepo } from '@docmost/db/repos/space/space.repo';
 import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
+import { LabelRepo } from '@docmost/db/repos/label/label.repo';
 import { AUTHZ_MODE, AuthzMode } from './authz-mode';
 import { HttpAuthzClient } from '../http-authz.client';
 import { PdpSpaceMemberRepo } from '../pdp-space-member.repo';
 import { PdpPagePermissionRepo } from '../pdp-page-permission.repo';
+import { PdpLabelRepo } from '../pdp-label.repo';
 
 /**
  * CCC authorization integration — NOT upstream Docmost code.
  *
- * Mode-selected DI providers for the two authorization repos. In `native` mode each token resolves to
- * the STOCK upstream class (Docmost's own authorization — a legitimate control, never allow-all); in
- * `remote` mode to the PDP-backed fork subclass. The two repos move together as ONE atom: a mixed
- * native-page / remote-space state is incoherent and a security hazard, so both key off the same
- * resolved AUTHZ_MODE.
+ * Mode-selected DI providers for the two authorization repos and the label repo. In `native` mode each
+ * token resolves to the STOCK upstream class (Docmost's own authorization — a legitimate control, never
+ * allow-all); in `remote` mode to the PDP-backed fork subclass. All three move together as ONE atom: a mixed
+ * native-page / remote-space state is incoherent and a security hazard, and a stock label repo under a remote
+ * page repo lists the labels of pages the PDP hides (#615) — so every one keys off the same resolved
+ * AUTHZ_MODE.
  *
  * Centralizing the selection (and the messy nestjs-kysely connection token / cache / dep plumbing)
- * here shrinks the upstream seam in database.module.ts (#1) to two symbol references.
+ * here shrinks the upstream seam in database.module.ts (#1) to three symbol references.
  */
 const KYSELY = KYSELY_MODULE_CONNECTION_TOKEN();
 
@@ -55,4 +58,22 @@ export const pagePermissionRepoProvider: Provider = {
     mode === 'remote'
       ? new PdpPagePermissionRepo(db, groupRepo, cache, authz)
       : new PagePermissionRepo(db, groupRepo, cache),
+};
+
+/**
+ * The native label lists (#615): remote → `PdpLabelRepo`, which gates every candidate window through the
+ * PDP-backed `PagePermissionRepo` resolved here (the provider above, in the same mode), before pagination.
+ */
+export const labelRepoProvider: Provider = {
+  provide: LabelRepo,
+  inject: [AUTHZ_MODE, KYSELY, SpaceMemberRepo, PagePermissionRepo],
+  useFactory: (
+    mode: AuthzMode,
+    db: KyselyDB,
+    spaceMemberRepo: SpaceMemberRepo,
+    pagePermissionRepo: PagePermissionRepo,
+  ): LabelRepo =>
+    mode === 'remote'
+      ? new PdpLabelRepo(db, spaceMemberRepo, pagePermissionRepo)
+      : new LabelRepo(db, spaceMemberRepo),
 };

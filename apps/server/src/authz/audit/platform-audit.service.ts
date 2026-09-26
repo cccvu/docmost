@@ -6,15 +6,25 @@ import { AuditLogContext, IAuditService } from '../../integrations/audit/audit.s
 import { ActorType, AuditLogPayload } from '../../common/events/audit-events';
 import { AuditClientEvidence, AuditIngestEvent, PlatformAuditClient } from './platform-audit.client';
 import { buildClientEvidenceFromReq } from './request-evidence';
+import { ActivityAuditContext, ActivityAuditWriter } from './activity-audit.writer';
 
 /**
  * CCC audit integration — NOT upstream Docmost code.
  *
- * The `AUDIT_SERVICE` implementation that replaces `NoopAuditService`: instead of persisting to
- * Docmost's DB, it FORWARDS each domain audit event to the wiki-v2 platform's central sink (the single
- * tamper-evident source of truth). All policy/persistence lives in the platform; this only maps the
- * upstream payload + the CLS actor context onto the ingest contract and hands it to the fire-and-forget
- * client. It never persists locally and never throws into a request path.
+ * The remote-mode `AUDIT_SERVICE` implementation that replaces `NoopAuditService`. It FORWARDS every domain
+ * audit event to the wiki-v2 platform's central sink — the single tamper-evident source of truth, and the only
+ * audit record that carries each event's client address — by mapping the upstream payload + the CLS actor
+ * context onto the ingest contract and handing it to the fire-and-forget client.
+ *
+ * It ALSO persists a small allowlist locally (#615): page trash / restore / move-to-space and comment delete /
+ * resolve / reopen go into Docmost's own `audit` table through `ActivityAuditWriter`, because the service-bridge
+ * activity feed reads them there and those lifecycle facts leave no other trace in the fork. That copy is a
+ * product feed, not audit: it holds the actor, the resource and (for comments) the page id — never the IP, user
+ * agent, `changes` or other metadata — and is pruned by workspace retention. Every other event is forward-only.
+ * See activity-audit.writer.ts for the exact row shape and skip rules.
+ *
+ * Neither path ever throws into a request, and persistence never delays or alters the forward: the forward is
+ * issued first, with exactly the events it carried before the local copy existed.
  */
 type ForwardContext = {
   workspaceId?: string;
@@ -26,9 +36,14 @@ type ForwardContext = {
 
 @Injectable()
 export class PlatformAuditService implements IAuditService {
+  /**
+   * `activity` is optional only so the forwarding-focused specs can build the service without a database; the
+   * module factory (`createAuditService`) always passes it, and platform-audit.service.spec.ts pins that.
+   */
   constructor(
     private readonly cls: ClsService,
     private readonly client: PlatformAuditClient,
+    private readonly activity?: ActivityAuditWriter,
   ) {}
 
   /**
@@ -42,15 +57,19 @@ export class PlatformAuditService implements IAuditService {
    * future upstream caller could invoke it mid-request and silently attribute the wrong socket peer.
    */
   log(payload: AuditLogPayload): void {
-    void this.client.forward([this.toEvent(payload, this.currentContext(), this.clientEvidence())]);
+    const context = this.currentContext();
+    void this.client.forward([this.toEvent(payload, context, this.clientEvidence())]);
+    this.recordActivity([payload], context);
   }
 
   logWithContext(payload: AuditLogPayload, context: AuditLogContext): void {
     void this.client.forward([this.toEvent(payload, context)]);
+    this.recordActivity([payload], context);
   }
 
   logBatchWithContext(payloads: AuditLogPayload[], context: AuditLogContext): void {
     void this.client.forward(payloads.map((p) => this.toEvent(p, context)));
+    this.recordActivity(payloads, context);
   }
 
   /** The auth/import flows call setActorId then log — persist it into the CLS context the log reads. */
@@ -84,6 +103,19 @@ export class PlatformAuditService implements IAuditService {
         metadata: { retentionDays },
       },
     ]);
+  }
+
+  /**
+   * The local activity copy (#615), AFTER the forward was issued. The writer drops non-allowlisted events itself
+   * and never rejects; the try/catch only keeps a broken writer off the request path.
+   */
+  private recordActivity(payloads: readonly AuditLogPayload[], context: ActivityAuditContext | undefined): void {
+    if (!this.activity) return;
+    try {
+      void this.activity.record(payloads, context).catch(() => undefined);
+    } catch {
+      // record() never throws by contract.
+    }
   }
 
   private currentContext(): ForwardContext | undefined {

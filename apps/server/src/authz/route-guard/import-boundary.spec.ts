@@ -51,7 +51,7 @@ const CCC_PREFIXES = ['authz', 'service-bridge', 'editor-compat'];
 // to SRC_ROOT, POSIX-separated. Keep in lockstep with UPSTREAM_MODIFICATIONS.md.
 const SEAM_ALLOWLIST = new Set<string>([
   'database/database.module.ts', // seam #1 — the DI rebind (AuthzModule + mode/repo-providers)
-  'app.module.ts', // seam #4 — CollabDisconnectModule + ConditionalPageModule + PlatformAuditModule + PlatformAuthorizationGuard + PublicSurfaceThrottlerGuard (#29) + ResponseHeadersModule + SpaceHardDeleteInterceptor (#502)
+  'app.module.ts', // seam #4 — CollabDisconnectModule + ConditionalPageModule + CommentResolutionModule (#615) + PlatformAuditModule + PlatformAuthorizationGuard + PublicSurfaceThrottlerGuard (#29) + ResponseHeadersModule + SpaceHardDeleteInterceptor (#502)
   'core/search/search.module.ts', // seam #5 — PDP-gated search provider
   'integrations/static/static.module.ts', // seam #86 — client capability injection (NATIVE_AUTH_ENABLED, reads authz mode)
   'core/auth/auth.controller.ts', // seam #87 — NativeAuthModeGuard + @SessionScopedRoute() allowlist (collab-token/logout); + #310 session-cookie set/clear via authz/session-cookie

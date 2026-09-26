@@ -305,3 +305,194 @@ describe('ServiceContentService.listPagePermissions — opt-in keyset paging (ba
     expect(call.parameters).toContainEqual(11); // limit + 1
   });
 });
+
+describe('ServiceContentService — #615 page-list filters, projection and position sort', () => {
+  const IDS = ['11111111-1111-1111-1111-111111111111'];
+  const U = '22222222-2222-2222-2222-222222222222';
+
+  it('the default path keeps its legacy shape and adds only the workspace-pinned creator/editor projection', async () => {
+    const { spy, svc } = make(() => []);
+    await svc.listPagesByIds({ ids: IDS, limit: 10 } as any);
+    const sql = q(spy.calls[0].sql);
+    expect(sql).toContain("order by date_trunc('milliseconds', updated_at) desc, id::text desc");
+    expect(sql).not.toContain('with recursive');
+    expect(sql).toContain('creator_id, last_updated_by_id');
+    expect(sql).toContain('u.id = pages.creator_id and u.workspace_id = pages.workspace_id');
+    expect(sql).toContain('u.id = pages.last_updated_by_id and u.workspace_id = pages.workspace_id');
+  });
+
+  it('maps the projection straight through (ids and names, null when absent)', async () => {
+    const { svc } = make(() => [
+      { ...pageRow(IDS[0]), creatorId: U, creatorName: 'Alice', lastUpdatedById: null, lastUpdatedByName: null },
+    ]);
+    const [item] = (await svc.listPagesByIds({ ids: IDS, limit: 10 } as any)).items;
+    expect(item).toMatchObject({ creatorId: U, creatorName: 'Alice', lastUpdatedById: null, lastUpdatedByName: null });
+  });
+
+  it('pushes lastUpdatedById, the created range, topLevel, links and the (normalized) label into the WHERE', async () => {
+    const { spy, svc } = make(() => []);
+    await svc.listPagesByIds({
+      ids: IDS,
+      lastUpdatedById: U,
+      createdSince: '2026-01-01T00:00:00.000Z',
+      createdUntil: '2026-02-01T00:00:00.000Z',
+      topLevel: true,
+      linksTo: U,
+      labelName: '  Road Map ',
+      limit: 10,
+    } as any);
+    const call = spy.calls[0];
+    const sql = q(call.sql);
+    expect(sql).toContain('last_updated_by_id =');
+    expect(sql).toContain('created_at >=');
+    expect(sql).toContain('created_at <');
+    expect(sql).toContain('parent_page_id is null');
+    expect(sql).toContain('select b.source_page_id from backlinks b');
+    expect(sql).toContain("l.type = 'page'");
+    expect(sql).toContain('pl.page_id = pages.id and l.workspace_id =');
+    expect(call.parameters).toContainEqual('road-map');
+  });
+
+  it('topLevel=false selects pages that have a parent; linkedFrom follows outgoing links', async () => {
+    const { spy, svc } = make(() => []);
+    await svc.listPagesByIds({ ids: IDS, topLevel: false, linkedFrom: U, limit: 10 } as any);
+    const sql = q(spy.calls[0].sql);
+    expect(sql).toContain('parent_page_id is not null');
+    expect(sql).toContain('select b.target_page_id from backlinks b');
+  });
+
+  it('descendantOf walks a depth-bounded CTE through ids + live + workspace only (default depth 3)', async () => {
+    const { spy, svc } = make(() => []);
+    await svc.listPagesByIds({ ids: IDS, descendantOf: U, limit: 10 } as any);
+    const call = spy.calls[0];
+    const sql = q(call.sql);
+    expect(sql).toContain('with recursive descendants');
+    expect(sql).toContain('id in (select d.id from descendants d)');
+    // Both the seed and the recursive step are pinned to the authorized, live, in-workspace rows.
+    expect(sql.match(/c\.deleted_at is null and c\.id = any\(/g)).toHaveLength(2);
+    expect(call.parameters).toContainEqual(3);
+  });
+
+  it.each([
+    [{ topLevel: true, parentPageId: '33333333-3333-3333-3333-333333333333' }],
+    [{ linksTo: '33333333-3333-3333-3333-333333333333', linkedFrom: '33333333-3333-3333-3333-333333333333' }],
+    [{ descendantOf: '33333333-3333-3333-3333-333333333333', parentPageId: '33333333-3333-3333-3333-333333333333' }],
+    [{ descendantOf: '33333333-3333-3333-3333-333333333333', topLevel: false }],
+    [{ descendantOf: '33333333-3333-3333-3333-333333333333', linksTo: '33333333-3333-3333-3333-333333333333' }],
+    [{ descendantOf: '33333333-3333-3333-3333-333333333333', linkedFrom: '33333333-3333-3333-3333-333333333333' }],
+    [{ maxDepth: 2 }],
+    [{ updatedSince: '2026' }],
+    [{ createdUntil: '2026' }],
+  ])('rejects %j with a 400 before any query', async (extra) => {
+    const { spy, svc } = make(() => []);
+    await expect(svc.listPagesByIds({ ids: IDS, limit: 10, ...extra } as any)).rejects.toBeInstanceOf(
+      BadRequestException,
+    );
+    expect(spy.calls).toHaveLength(0);
+  });
+
+  it('sort=position orders by coalesce(position, "~") under the C collation and bounds the keyset the same way', async () => {
+    const { spy, svc } = make(() => []);
+    await svc.listPagesByIds({
+      ids: IDS,
+      parentPageId: U,
+      sort: { field: 'position', direction: 'asc' },
+      before: { value: 'a0', id: 'x' },
+      limit: 10,
+    } as any);
+    const call = spy.calls[0];
+    const sql = q(call.sql);
+    expect(sql).toContain(`order by coalesce(position, '~') collate "c" asc, id::text asc`);
+    expect(sql).toContain(`(coalesce(position, '~') collate "c", id::text) > ($`);
+    expect(sql).toContain('::text collate "c"');
+    expect(call.parameters).toContainEqual('a0');
+  });
+
+  it('position is pages-only (a spaces position sort is a 400)', async () => {
+    const { svc } = make(() => []);
+    await expect(
+      svc.listSpacesByIds({ ids: IDS, sort: { field: 'position', direction: 'asc' }, limit: 10 } as any),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+});
+
+describe('ServiceContentService — #615 ancestors, labels, activity, comment policy', () => {
+  const PAGE = '44444444-4444-4444-4444-444444444444';
+
+  it('ancestors: 404 unless the page is live in the workspace; never returns the page itself', async () => {
+    const missing = make(() => []);
+    await expect(missing.svc.pageAncestors({ pageId: PAGE })).rejects.toBeInstanceOf(NotFoundException);
+    expect(q(missing.spy.calls[0].sql)).toContain('deleted_at is null');
+
+    const { svc } = make((c) =>
+      q(c.sql).includes('with recursive anc')
+        ? [
+            { id: PAGE, parentPageId: 'p1', depth: 0, restricted: true },
+            { id: 'p1', parentPageId: null, depth: 1, restricted: true },
+          ]
+        : [{ id: PAGE }],
+    );
+    // The walk's restriction facts are never part of the answer.
+    expect(await svc.pageAncestors({ pageId: PAGE })).toEqual({ ancestorIds: ['p1'], complete: true });
+  });
+
+  it('labels: ids = [] answers [] without a query; otherwise pinned to ids + live + workspace + page type', async () => {
+    const empty = make(() => []);
+    expect(await empty.svc.listLabels({ ids: [], limit: 10 } as any)).toEqual({ items: [] });
+    expect(empty.spy.calls).toHaveLength(0);
+
+    const { svc, spy } = make(() => [{ name: 'road-map', pageCount: '2' }]);
+    const res = await svc.listLabels({ ids: [PAGE], nameContains: 'Road_Map', before: { name: 'a' }, limit: 5 } as any);
+    expect(res.items).toEqual([{ name: 'road-map', pageCount: 2 }]);
+    const call = spy.calls[0];
+    const sql = q(call.sql);
+    for (const pin of ['l.workspace_id =', "l.type = 'page'", 'p.workspace_id =', 'p.deleted_at is null', 'p.id = any(']) {
+      expect(sql).toContain(pin);
+    }
+    expect(sql).toContain('order by l.name collate "c" asc');
+    expect(call.parameters).toContainEqual('%road\\_map%'); // normalized, then LIKE-escaped
+    expect(call.parameters).toContainEqual(6); // limit + 1
+  });
+
+  it('activity: one branch per requested source, each pinned to the authorized pages and the workspace', async () => {
+    const { svc, spy } = make(() => []);
+    await svc.listActivity({ ids: [PAGE], since: '2026-01-01T00:00:00.000Z', limit: 10 } as any);
+    const sql = q(spy.calls[0].sql);
+    expect(sql).toContain('p.id = any(');
+    expect(sql).toContain('p.workspace_id =');
+    for (const src of ['page_history h join ap', 'comments c join ap', 'attachments f join ap', 'audit a join ap']) {
+      expect(sql).toContain(src);
+    }
+    for (const pin of ['h.workspace_id =', 'c.workspace_id =', 'f.workspace_id =', 'a.workspace_id =']) {
+      expect(sql).toContain(pin);
+    }
+    expect(sql).toContain('order by e.occurred_at desc, e.key collate "c" desc');
+
+    const narrow = make(() => []);
+    await narrow.svc.listActivity({ ids: [PAGE], since: '2026-01-01T00:00:00.000Z', types: ['comment.created'], limit: 10 } as any);
+    const only = q(narrow.spy.calls[0].sql);
+    expect(only).toContain('comments c join ap');
+    expect(only).not.toContain('page_history');
+    expect(only).not.toContain('audit a');
+  });
+
+  it('activity: ids = [] answers [] without a query; a malformed instant is a 400', async () => {
+    const empty = make(() => []);
+    expect(await empty.svc.listActivity({ ids: [], since: '2026-01-01T00:00:00.000Z', limit: 10 } as any)).toEqual({ items: [] });
+    expect(empty.spy.calls).toHaveLength(0);
+    await expect(
+      empty.svc.listActivity({ ids: [PAGE], since: '2026', limit: 10 } as any),
+    ).rejects.toBeInstanceOf(BadRequestException);
+  });
+
+  it('comment policy: workspace-scoped read of settings.comments.allowViewerComments; 404 when absent', async () => {
+    const missing = make(() => []);
+    await expect(missing.svc.spaceCommentPolicy({ spaceId: PAGE })).rejects.toBeInstanceOf(NotFoundException);
+    const sql = q(missing.spy.calls[0].sql);
+    expect(sql).toContain('workspace_id =');
+    expect(sql).toContain(`settings->'comments'->>'allowviewercomments'`);
+
+    const on = make(() => [{ allowViewerComments: true }]);
+    expect(await on.svc.spaceCommentPolicy({ spaceId: PAGE })).toEqual({ allowViewerComments: true });
+  });
+});

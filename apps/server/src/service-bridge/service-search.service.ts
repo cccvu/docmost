@@ -1,7 +1,8 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger, ServiceUnavailableException } from '@nestjs/common';
 import { SearchService } from '../core/search/search.service';
 import { SearchDTO } from '../core/search/dto/search.dto';
 import { SearchResponseDto } from '../core/search/dto/search-response.dto';
+import { PdpSearchService } from '../authz/search/pdp-search.service';
 import { WorkspaceResolver } from './workspace-resolver';
 import { ContentSearchDto } from './dto/content-search.dto';
 
@@ -22,6 +23,12 @@ export interface PublicSearchHit {
   updatedAt: string;
 }
 
+/** The `searchContent` answer (#615, contract 1.8.0): one authorized page of hits + whether more follow. */
+export interface ContentSearchResult {
+  items: PublicSearchHit[];
+  hasMore: boolean;
+}
+
 const iso = (d: Date | string): string =>
   d instanceof Date ? d.toISOString() : new Date(d).toISOString();
 
@@ -37,30 +44,55 @@ const iso = (d: Date | string): string =>
  * reintroduce the reverse-index truncation the subclass exists to avoid. It passes the caller's Docmost user
  * id and projects the PII-free shape. This is a SEPARATE provider from ServiceContentService precisely so the
  * content read model keeps its structural "no authorization collaborator" invariant.
+ *
+ * #615: the filters, the `hasMore` peek and the on-behalf-of service leg exist only on PdpSearchService
+ * (`searchAuthorized`), so the injected SearchService is narrowed to it at call time. The token resolves to the
+ * stock upstream SearchService in AUTHZ_MODE=native (and this bridge is remote-only anyway); anything but the PDP
+ * subclass answers 503 rather than run a search without the filter-then-retrieve gate.
  */
 @Injectable()
 export class ServiceSearchService {
+  private readonly logger = new Logger(ServiceSearchService.name);
+
   constructor(
     private readonly search: SearchService,
     private readonly workspaces: WorkspaceResolver,
   ) {}
 
-  async searchContent(dto: ContentSearchDto): Promise<{ items: PublicSearchHit[] }> {
+  async searchContent(dto: ContentSearchDto): Promise<ContentSearchResult> {
+    const search = this.pdpSearch();
     const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
     // Exactly the authenticated-path fields — NEVER shareId (the native controller deletes it when a user is
-    // present; the fork's PdpSearchService applies the per-principal gate only on the userId path).
+    // present; the fork's PdpSearchService applies the per-principal gate only on the userId path). Every
+    // narrowing is a candidate filter (below), never a post-filter of the page.
     const searchParams = {
       query: dto.query,
       spaceId: dto.spaceId,
-      creatorId: dto.creatorId,
       limit: dto.limit,
       offset: dto.offset,
     } as SearchDTO;
-    const { items } = await this.search.searchPage(searchParams, {
-      userId: dto.userId,
-      workspaceId,
-    });
-    return { items: items.map(toSearchHit) };
+    const { items, hasMore } = await search.searchAuthorized(
+      searchParams,
+      {
+        creatorId: dto.creatorId,
+        lastUpdatedById: dto.lastUpdatedById,
+        parentPageId: dto.parentPageId,
+        labelName: dto.labelName,
+        updatedSince: dto.updatedSince,
+        updatedUntil: dto.updatedUntil,
+      },
+      { userId: dto.userId, workspaceId, serviceSubjectId: dto.serviceSubjectId },
+    );
+    return { items: items.map(toSearchHit), hasMore: hasMore === true };
+  }
+
+  /** The injected search, narrowed to the PDP subclass (the only one with `searchAuthorized`); else 503. */
+  private pdpSearch(): PdpSearchService {
+    if (this.search instanceof PdpSearchService) return this.search;
+    this.logger.error(
+      'content search needs the PDP-gated search (AUTHZ_MODE=remote); the SearchService token resolved to another class',
+    );
+    throw new ServiceUnavailableException('content search is not available');
   }
 }
 
