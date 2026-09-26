@@ -43,6 +43,15 @@ import {
 import { DescendantFacts, LifecycleTarget, PageLifecycleState, TrashedPageRow } from './service-page-lifecycle.service';
 import { PageAuthzState, PageAuthzStateResult } from './page-authz-state.service';
 import { PAGE_AUTHZ_STATE_MAX, PageAuthzStateDto } from './dto/page-authz-state.dto';
+import {
+  PAGE_IMPORT_FORMATS,
+  PAGE_IMPORT_MAX_ITEMS,
+  PAGE_IMPORT_TITLE_MAX_LENGTH,
+  TitleCandidatesDto,
+  ValidateContentDto,
+  ValidateContentItemDto,
+} from './dto/page-import.dto';
+import { TitleCandidate } from './service-page-import.service';
 
 /**
  * Provider-side contract test: the routes the fork actually implements MUST equal the operations declared in
@@ -251,6 +260,9 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
   const ADD_MEMBER = keysOf<Awaited<ReturnType<ServiceSpaceController['addMember']>>>({ memberId: true, userId: true, version: true });
   const RESOLVE_PAGE_SPACE = keysOf<Awaited<ReturnType<ServicePageController['resolveSpace']>>>({ pageId: true, spaceId: true });
   const RESOLVE_ATTACHMENT_PAGE = keysOf<Awaited<ReturnType<ServiceAttachmentController['resolvePage']>>>({ attachmentId: true, pageId: true, spaceId: true });
+  // #616 import helpers (their item shapes are pinned in the #616 import-helper block below).
+  const VALIDATE_CONTENT = keysOf<Awaited<ReturnType<ServicePageController['validateContent']>>>({ results: true });
+  const TITLE_CANDIDATES = keysOf<Awaited<ReturnType<ServicePageController['titleCandidates']>>>({ matches: true });
 
   type OpExpect =
     | { kind: 'ref'; name: string }
@@ -285,6 +297,8 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     { id: 'pageLifecycleState', method: 'post', path: '/api/service/pages/lifecycle-state', expect: { kind: 'ref', name: 'PageLifecycleState' } },
     { id: 'listTrashedPages', method: 'post', path: '/api/service/pages/trash', expect: { kind: 'items', name: 'TrashedPage' } },
     { id: 'getPageAuthzState', method: 'post', path: '/api/service/authz/pages/state', expect: { kind: 'ref', name: 'PageAuthzStateResponse' } },
+    { id: 'validateImportContent', method: 'post', path: '/api/service/pages/validate-content', expect: { kind: 'inline', keys: VALIDATE_CONTENT } },
+    { id: 'pageTitleCandidates', method: 'post', path: '/api/service/pages/title-candidates', expect: { kind: 'inline', keys: TITLE_CANDIDATES } },
   ];
 
   // #545: the request is typed against the DTO (a field added on either side fails) and its caps are the DTO's.
@@ -520,5 +534,63 @@ describe('service-bridge.openapi.json keyed space create (#616)', () => {
     const body = create.responses['200'].content['application/json'].schema;
     expect(body.properties.replayed.type).toBe('boolean');
     expect(body.required).not.toContain('replayed');
+  });
+});
+
+/**
+ * #616 Stage 5 — the page-import helpers are part of the wire contract: request keys typed against the fork DTOs, the
+ * bounds equal to the DTO constants, the per-item result a closed `oneOf` whose codes are exactly the three the
+ * service answers, a candidate that carries ids and indices only (never a title), and the refusals by code.
+ */
+describe('service-bridge.openapi.json page-import helpers (#616)', () => {
+  const S = SPEC as any;
+  const refName = (r: any): string => String(r?.$ref ?? '').split('/').pop()!;
+  const keysOf = <T,>(m: Record<keyof T, true>): string[] => Object.keys(m).sort();
+  const sorted = (o: object): string[] => Object.keys(o).sort();
+
+  it('ValidateContentRequest: the DTO keys, 1..MAX items of { format (the DTO formats), content }', () => {
+    const req = S.components.schemas.ValidateContentRequest;
+    expect(req.additionalProperties).toBe(false);
+    expect(sorted(req.properties)).toEqual(keysOf<ValidateContentDto>({ items: true }));
+    expect(req.properties.items).toMatchObject({ minItems: 1, maxItems: PAGE_IMPORT_MAX_ITEMS });
+    const item = req.properties.items.items;
+    expect(item.additionalProperties).toBe(false);
+    expect(sorted(item.properties)).toEqual(keysOf<ValidateContentItemDto>({ format: true, content: true }));
+    expect(item.properties.format.enum).toEqual([...PAGE_IMPORT_FORMATS]);
+  });
+
+  it('ContentValidationResult: { idx, ok: true } or { idx, ok: false, code ∈ the three codes } — nothing else', () => {
+    const [ok, refused] = S.components.schemas.ContentValidationResult.oneOf;
+    expect(sorted(ok.properties)).toEqual(['idx', 'ok']);
+    expect(ok.properties.ok.const).toBe(true);
+    expect(sorted(refused.properties)).toEqual(['code', 'idx', 'ok']);
+    expect(refused.properties.ok.const).toBe(false);
+    expect([...refused.properties.code.enum].sort()).toEqual(['empty_content', 'invalid_content', 'too_large']);
+    for (const branch of [ok, refused]) expect(branch.additionalProperties).toBe(false);
+  });
+
+  it('TitleCandidatesRequest: the DTO keys and bounds; only spaceId + titles required', () => {
+    const req = S.components.schemas.TitleCandidatesRequest;
+    expect(req.additionalProperties).toBe(false);
+    expect(sorted(req.properties)).toEqual(keysOf<TitleCandidatesDto>({ spaceId: true, parentPageId: true, titles: true }));
+    expect([...req.required].sort()).toEqual(['spaceId', 'titles']);
+    expect(req.properties.titles).toMatchObject({ minItems: 1, maxItems: PAGE_IMPORT_MAX_ITEMS });
+    expect(req.properties.titles.items).toMatchObject({ minLength: 1, maxLength: PAGE_IMPORT_TITLE_MAX_LENGTH });
+  });
+
+  it('TitleCandidate carries exactly { titleIdx, pageId, suffix } — no title', () => {
+    const c = S.components.schemas.TitleCandidate;
+    expect(sorted(c.properties)).toEqual(keysOf<TitleCandidate>({ titleIdx: true, pageId: true, suffix: true }));
+    expect([...c.required].sort()).toEqual(['pageId', 'suffix', 'titleIdx']);
+    expect(c.additionalProperties).toBe(false);
+  });
+
+  it('declares the refusals by code: validate 503 engine_busy; title-candidates 503 engine_busy | list_too_broad', () => {
+    const op = (p: string) => S.paths[p].post;
+    expect(refName(op('/api/service/pages/validate-content').responses['503'])).toBe('UnconfiguredOrBusy');
+    expect(refName(op('/api/service/pages/title-candidates').responses['503'])).toBe('UnconfiguredBusyOrTooBroad');
+    const branches = S.components.responses.UnconfiguredBusyOrTooBroad.content['application/json'].schema.anyOf.map(refName);
+    expect(branches.sort()).toEqual(['EngineBusyError', 'Error', 'ListTooBroadError']);
+    expect(S.components.schemas.ListTooBroadError.properties.code.const).toBe('list_too_broad');
   });
 });

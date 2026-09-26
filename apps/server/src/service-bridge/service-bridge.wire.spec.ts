@@ -17,6 +17,9 @@ import { AuthzSnapshotService } from './authz-snapshot.service';
 import { PageAuthzStateService } from './page-authz-state.service';
 import { ServiceSpaceController } from './service-space.controller';
 import { ServiceSpaceService } from './service-space.service';
+import { ServicePageController } from './service-page.controller';
+import { ServicePageLifecycleService } from './service-page-lifecycle.service';
+import { ServicePageImportService } from './service-page-import.service';
 import { spyKysely, SpyQuery } from './kysely-spy.testkit';
 
 /**
@@ -457,5 +460,124 @@ describe('service-bridge keyed space create on the wire (#616)', () => {
     expect(res.statusCode).toBe(200);
     expect(res.json()).toEqual({ id: 'sp-new', slug: 'eng', name: 'Eng' });
     expect(reserve).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * #616 Stage 5 — the page-import helpers through the real pipeline (global ValidationPipe exactly as main.ts mounts
+ * it, so the NESTED item validation is the one that runs in production): bare `{ results }` / `{ matches }` bodies,
+ * per-item codes, content and titles never echoed, and a malformed batch is a 400 that never reaches the parser.
+ */
+describe('service-bridge page-import helpers on the wire (#616)', () => {
+  const SPACE = '22222222-2222-4222-8222-222222222222';
+  let app: NestFastifyApplication;
+  let calls: SpyQuery[];
+  const parsed: string[] = [];
+
+  beforeAll(async () => {
+    const spy = spyKysely((query) =>
+      /select id, title from pages/i.test(query.sql)
+        ? [{ id: 'p-1', title: 'Secret plan' }, { id: 'p-2', title: 'Secret plan (2)' }, { id: 'p-3', title: 'Other' }]
+        : [],
+    );
+    calls = spy.calls;
+    const parser = {
+      parse: async (content: string) => {
+        parsed.push(content);
+        if (content.includes('BROKEN')) throw new Error(`cannot parse: ${content}`);
+        return {};
+      },
+    };
+    const moduleRef = await Test.createTestingModule({
+      controllers: [ServicePageController],
+      providers: [
+        { provide: ServiceContentService, useValue: {} },
+        { provide: ServicePageLifecycleService, useValue: {} },
+        {
+          provide: ServicePageImportService,
+          useValue: new ServicePageImportService(spy.db, { resolveDefaultWorkspaceId: async () => WS } as any, parser as any),
+        },
+      ],
+    })
+      .overrideGuard(RemoteOnlyGuard)
+      .useValue({ canActivate: () => true })
+      .overrideGuard(ServiceAuthGuard)
+      .useValue({ canActivate: () => true })
+      .compile();
+    app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    app.setGlobalPrefix('api'); // main.ts
+    app.useGlobalPipes(new ValidationPipe({ whitelist: true, stopAtFirstError: true, transform: true })); // main.ts
+    app.useGlobalInterceptors(new TransformHttpResponseInterceptor(app.get(Reflector))); // main.ts
+    await app.init();
+    await app.getHttpAdapter().getInstance().ready();
+  });
+
+  afterAll(async () => await app?.close());
+  beforeEach(() => {
+    calls.length = 0;
+    parsed.length = 0;
+  });
+
+  it('POST validate-content answers the bare { results } with per-item codes and never echoes content', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/service/pages/validate-content',
+      payload: {
+        items: [
+          { format: 'markdown', content: '# ok' },
+          { format: 'html', content: '<p>BROKEN secret</p>' },
+          { format: 'html', content: '  ' },
+        ],
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({
+      results: [
+        { idx: 0, ok: true },
+        { idx: 1, ok: false, code: 'invalid_content' },
+        { idx: 2, ok: false, code: 'empty_content' },
+      ],
+    });
+    expect(res.body).not.toMatch(/secret|BROKEN|cannot parse/);
+  });
+
+  it.each([
+    ['no items', {}],
+    ['an empty batch', { items: [] }],
+    ['51 items', { items: Array.from({ length: 51 }, () => ({ format: 'html', content: 'x' })) }],
+    ['a json item', { items: [{ format: 'json', content: '{}' }] }],
+    ['an item without content', { items: [{ format: 'html' }] }],
+  ])('POST validate-content with %s is a 400 that parses nothing', async (_what, payload) => {
+    const res = await app.inject({ method: 'POST', url: '/api/service/pages/validate-content', payload });
+    expect(res.statusCode).toBe(400);
+    expect(parsed).toEqual([]);
+  });
+
+  it('POST title-candidates answers the bare { matches }: ids, indices and suffixes — never a title', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/service/pages/title-candidates',
+      payload: { spaceId: SPACE, parentPageId: null, titles: ['Secret plan', 'Nope'] },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({
+      matches: [
+        { titleIdx: 0, pageId: 'p-1', suffix: null },
+        { titleIdx: 0, pageId: 'p-2', suffix: 2 },
+      ],
+    });
+    expect(res.body).not.toMatch(/Secret|Other/);
+  });
+
+  it('POST title-candidates with a bad parent id or an over-long title is a 400 that reads nothing', async () => {
+    for (const payload of [
+      { spaceId: SPACE, parentPageId: 'nope', titles: ['A'] },
+      { spaceId: SPACE, titles: ['t'.repeat(256)] },
+      { spaceId: 'nope', titles: ['A'] },
+    ]) {
+      const res = await app.inject({ method: 'POST', url: '/api/service/pages/title-candidates', payload });
+      expect(res.statusCode).toBe(400);
+    }
+    expect(calls).toEqual([]);
   });
 });

@@ -23,6 +23,7 @@ import { AuthzOutboxInstaller } from './authz-outbox.installer';
 import { PageAuthzStateService } from './page-authz-state.service';
 import { PageRestrictionGuardInstaller } from './page-restriction-guard.installer';
 import { PageGuardConflictInterceptor } from './page-guard-conflict.interceptor';
+import { PageContentParser, ServicePageImportService } from './service-page-import.service';
 // Seam #5 (see UPSTREAM_MODIFICATIONS.md): SearchModule binds the SearchService token to PdpSearchService in
 // AUTHZ_MODE=remote. Importing it here lets ServiceSearchService inject that PDP-gated search — the binding
 // is module-local, so the token must be resolved through the module that exports it (a @Global rebind can't
@@ -71,6 +72,8 @@ import { IdempotencyLedgerModule } from '../authz/idempotency/idempotency-ledger
     PageCycleGuardInstaller, // #485 (appended)
     PageAuthzStateService, // #545 (appended)
     PageRestrictionGuardInstaller, // #493/#545 (appended)
+    ServicePageImportService, // #616 import helpers (appended)
+    PageContentParser, // #616: parses through the app's PageService, resolved lazily (appended)
     // #493/#545: the page guards' DB refusals → 409 (inner to AppModule's audit interceptor; see the class).
     { provide: APP_INTERCEPTOR, useClass: PageGuardConflictInterceptor },
   ],

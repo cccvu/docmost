@@ -46,6 +46,29 @@ describe('ServiceAuthGuard', () => {
       expect(g.canActivate(ctx(SECRET))).toBe(true);
     });
 
+    // #616: the import helpers' scope has its OWN rate bucket (smaller than the default), independent of the others.
+    it('pages:import:read is limited in its own bucket: exhausting it leaves other scopes untouched', () => {
+      const g = new ServiceAuthGuard(reflectorReturning(ServiceScope.PagesImportRead));
+      const limiters = (g as any).scopeLimiters as Map<string, unknown>;
+      expect(limiters.has(ServiceScope.PagesImportRead)).toBe(true);
+      expect(limiters.get(ServiceScope.PagesImportRead)).not.toBe((g as any).limiter);
+      let admitted = 0;
+      for (let i = 0; i < 200; i++) {
+        try {
+          g.canActivate(ctx(SECRET));
+          admitted++;
+        } catch (e) {
+          expect((e as { getStatus?: () => number }).getStatus?.()).toBe(429);
+          break;
+        }
+      }
+      expect(admitted).toBe(120); // SERVICE_BRIDGE_PAGES_IMPORT_RATE_LIMIT default
+      const other = new ServiceAuthGuard(reflectorReturning(ServiceScope.PagesRead));
+      (other as any).scopeLimiters = limiters; // same buckets
+      (other as any).limiter = (g as any).limiter;
+      expect(other.canActivate(ctx(SECRET))).toBe(true);
+    });
+
     // #616: the keyed space create binds its ledger entry to the credential that authenticated the call.
     it('records the admitting credential on the request — and only once it admitted it; a body/header cannot set it', () => {
       const g = new ServiceAuthGuard(reflectorReturning(ServiceScope.SpacesWrite));

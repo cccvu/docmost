@@ -67,6 +67,9 @@ const EXPECTED_SCOPE: Record<string, ServiceScope> = {
   'ServicePageController.listPermissions': ServiceScope.ContentRead,
   'ServicePageController.lifecycleState': ServiceScope.PagesRead, // #485
   'ServicePageController.trash': ServiceScope.ContentRead, // #485
+  // #616 import helpers: their own read scope (and smaller rate bucket) — never pages:read / content:read.
+  'ServicePageController.validateContent': ServiceScope.PagesImportRead,
+  'ServicePageController.titleCandidates': ServiceScope.PagesImportRead,
   'ServiceContentController.listPages': ServiceScope.ContentRead,
   'ServiceContentController.listSpaces': ServiceScope.ContentRead,
   'ServiceContentController.getSpace': ServiceScope.ContentRead,

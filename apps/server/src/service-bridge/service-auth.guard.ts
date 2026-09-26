@@ -56,10 +56,13 @@ const RATE_LIMIT = envLimit('SERVICE_BRIDGE_RATE_LIMIT', 600);
  * - `pages:authz:read` (#545): the page projector reads it once per page event, plus fan-out and reconcile chunks.
  * - `pages:read` (#493): `/v1` page-content routes resolve "is this page live" through `resolve-space` on EVERY
  *   request; the platform answers a throttled resolve as a retriable 503, but it should not happen under normal load.
+ * The import helpers go the other way (#616): `pages:import:read` gets a SMALLER window, because a validate-content call
+ * parses up to 1 MiB of HTML/Markdown on the fork's single event loop (two calls per import submit or preview).
  */
 const SCOPE_RATE_LIMITS: Partial<Record<ServiceScope, number>> = {
   [ServiceScope.PagesAuthzRead]: envLimit('SERVICE_BRIDGE_PAGES_AUTHZ_RATE_LIMIT', 6000),
   [ServiceScope.PagesRead]: envLimit('SERVICE_BRIDGE_PAGES_READ_RATE_LIMIT', 6000),
+  [ServiceScope.PagesImportRead]: envLimit('SERVICE_BRIDGE_PAGES_IMPORT_RATE_LIMIT', 120),
 };
 
 /**

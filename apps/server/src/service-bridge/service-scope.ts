@@ -41,4 +41,8 @@ export enum ServiceScope {
   // projector re-reads on every page event. Read-only, and distinct from changes:read because it is called once per
   // page event (plus fan-out and reconcile) and so gets its own, larger rate bucket (ServiceAuthGuard).
   PagesAuthzRead = 'pages:authz:read',
+  // #616: the page-import helpers (`pages/validate-content`, `pages/title-candidates`). Read-only (they parse and look
+  // up; they never write), but distinct from pages:read / content:read: validate-content is CPU-heavy (an HTML/Markdown
+  // parse of up to 1 MiB) and title-candidates scans a parent's children, so both get their own, smaller rate bucket.
+  PagesImportRead = 'pages:import:read',
 }

@@ -138,6 +138,19 @@ must read that as "upgrade pending", never as page-not-found, and must never fal
 
 **Keyed page create (1.9.0, wiki-v2 #616).** `POST /api/pages/idempotent-create` (relayed as the acting user; `404` unless `AUTHZ_MODE=remote`) takes the native `POST /api/pages/create` body plus `idempotencyKey` (1–255), `idempotencyNamespace` (1–128, the integrator's key namespace) and `fingerprint` (64 lowercase hex, sha256 of the integrator's stable request body). The fork binds the key to the workspace, the authenticated user and the namespace, and records it in the page's own transaction for at least 24h. First use → `200` native body + `replayed: false`; same key + fingerprint → `200` with that page's current state, re-authorized, `replayed: true`, nothing re-run; different fingerprint → `409 { code: idempotency_key_reused }`; page since deleted → `404 { code: idempotency_resource_gone }`; busy → `503 { code: engine_busy }`. The native authorization runs on every call. A fork without the route answers the framework's plain 404 — read it as "upgrade pending", never as not-found. `POST /api/service/spaces` takes the same three fields, optionally (all or none; a partial key is a `400`): the key is recorded in the space insert's transaction, bound to the workspace, the service credential that authenticated the call and the creator (`creatorExternalId`, as its shadow user), so a key sent for another human — or through another credential — is a separate entry and can never answer this space. A repeat answers `{ id, slug, name, replayed: true }` and re-runs nothing (no space, member or outbox row; the creator's shadow-user upsert runs as on every call and is idempotent); a keyed create skips the friendly slug pre-check, so a slug held by another space is still the unique index's `409`; mismatch, gone and busy answer as for pages. Unkeyed, the space create is unchanged and its body carries no `replayed`.
 
+**Import helpers (1.9.0, wiki-v2 #616).** Two read-only routes a platform plans a page import with, under their own
+scope `pages:import:read` (a smaller rate bucket, `SERVICE_BRIDGE_PAGES_IMPORT_RATE_LIMIT`, default 120/min). `POST
+/api/service/pages/validate-content` `{ items: [{ format: markdown | html, content }] }` (1–50 items) parses each item
+exactly as a page create would (including the network-inert HTML parse), writes nothing, and answers `{ results: [{ idx,
+ok: true } | { idx, ok: false, code }] }` in item order — `too_large` (over 512 KiB, or once the call's budget of 1 MiB
+parsed / 4 s of parsing is spent, for that item and every later one), `empty_content` (whitespace only) or
+`invalid_content`; it never answers content or a parse error, and a call that finds both parse slots busy for 2 s is a
+retryable `503 { code: engine_busy }`. `POST /api/service/pages/title-candidates` `{ spaceId, parentPageId?: uuid | null,
+titles: [1–50 strings, 1–255] }` answers `{ matches: [{ titleIdx, pageId, suffix: null | n }] }`: the live direct
+children of that parent (null or omitted = the space root) whose title is exactly `titles[titleIdx]` or `<title> (n)`
+with n ≥ 2 — case-sensitive, ids and indices only, never a title. A parent with more than 5000 live children answers
+`503 { code: list_too_broad }`. The integrator keeps only the matches its caller may view.
+
 **Versions, atomic compares and previews for ACLs, members and spaces (1.9.0, wiki-v2 #616).** The fork issues an
 opaque `version` (64 hex, a digest of the resource's state — `service-bridge/resource-version.ts`) for a space
 (`GET /api/service/content/spaces/{id}` and `GET /api/service/spaces/{id}`; over every public field plus the archived
@@ -165,6 +178,7 @@ Three properties bind the whole surface:
 - **Scoped + secret-gated.** Every request carries `x-authz-service-secret`; each `/api/service/*` route
   requires exactly one least-privilege scope (`session:mint`, `users:provision`, `users:resolve`,
   `workspace:read`, `workspace:settings:write`, `spaces:read`, `spaces:write`, `pages:read`, `pages:authz:read`,
+  `pages:import:read`,
   `content:read`, `content:search`, `attachments:read`, `changes:read`).
 - **The platform is the authorization authority.** Identity-mutating endpoints are keyed only on an opaque
   `externalId` (no arbitrary-identity selection). The `content/*` read endpoints are a **privileged data

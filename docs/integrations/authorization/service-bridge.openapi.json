@@ -4,7 +4,7 @@
     "title": "Docmost Service Bridge (east-west)",
     "version": "1.9.0",
     "summary": "The east-west endpoints this Docmost fork EXPOSES to an integrating platform.",
-    "description": "These are the machine-to-machine endpoints the fork hosts for an integrating platform (the inverse direction of authorization-service.openapi.json, which the fork calls). They exist so an external identity/session broker can provision a fork-local shadow user and mint a Docmost session for it, re-check (and narrow) live realtime connections after a revocation, and (Phase C) administer workspace settings + spaces and read the content model WITHOUT the platform reaching into Docmost's database directly. They are NOT part of the public north-south API and are not browser-facing.\n\nMode: the whole surface is 404 unless the fork runs with AUTHZ_MODE=remote (RemoteOnlyGuard, checked BEFORE the secret). In AUTHZ_MODE=native there is no integrating platform and every route below returns 404 for all callers.\n\nAuth: every request carries a shared service secret in the x-authz-service-secret header (PLATFORM_AUTHZ_SERVICE_SECRET). Each /api/service/* route additionally requires exactly one least-privilege scope: session:mint, users:provision, users:resolve, workspace:read, workspace:settings:write, spaces:read, spaces:write, pages:read, pages:authz:read, content:read, content:search, attachments:read, changes:read. Today a single full-scope secret is issued; per-scope credentials can be added later with no contract change.\n\nSecurity properties an integrator must understand:\n  - Identity-mutating endpoints are keyed ONLY on the caller's opaque externalId. The fork derives the shadow email (externalId@shadow.wiki-v2.internal) and resolves its own default workspace, so a caller can never select an arbitrary Docmost identity, name a real/privileged/native account, or supply a workspace id. This is a strong narrowing, not impersonation.\n  - The platform is the authorization authority: it performs the PDP decision (space/workspace administer, or the filter-then-retrieve authorized-id set) BEFORE calling these endpoints. The content read endpoints are a PRIVILEGED DATA PLANE, not a second gate: they return metadata for exactly the supplied ids and do NOT re-authorize. The security of the caller's /v1 surface rests entirely on it passing an authorized id set.\n  - Fail-closed: not remote -> 404; unconfigured secret -> 503; missing/wrong secret -> 401; wrong scope -> 403; over the per-credential rate limit -> 429; invalid body -> 400.\n\nResponse shape (incident #181): every 2xx body is EXACTLY the schema declared for its operation. The fork's global { data, success, status } response envelope (upstream TransformHttpResponseInterceptor) is skipped on this whole surface via per-handler @SkipTransform(); an integrator that receives an envelope is talking to a mis-built fork. Bring-up precondition: until Docmost first-run setup (POST /api/auth/setup) has created a workspace row, EVERY operation answers HTTP 404 with message exactly \"Workspace not found\" (an upstream pre-handler that runs before the service-bridge guards). That status + message pair is the ONLY response a consumer may treat as \"no workspace provisioned yet\"; any other 404 (e.g. the bare \"Not Found\" the fork answers when not in AUTHZ_MODE=remote) is a configuration error, and any 2xx body that does not match its declared schema is a contract violation the consumer must fail closed on.\n\nAccess-narrowing propagation (1.6.0, #501): a successful response from a route that can take access away (archiveSpace, addSpaceMember — an upsert can demote —, changeSpaceMemberRole, removeSpaceMember; and the native narrowing routes the integrator relays) carries `Authz-Propagation: confirmed | pending`. `confirmed` = the fork asked the integrator's OPTIONAL `POST /sync/settle` (authorization-service.openapi.json) and it answered that every access change committed up to this response is enforced; `pending` = the change is committed but could not be shown enforced within the bound (an integrator without /sync/settle always gets `pending`). The header never changes the status or the body, and it is absent in AUTHZ_MODE=native or when AUTHZ_NARROWING_SETTLE_TIMEOUT_MS=0. A consumer must treat an ABSENT header as unknown, never as confirmed.\n\nPage structure (1.7.0, wiki-v2 #493/#545): `POST /api/service/authz/pages/state` serves the CURRENT authorization structure of pages (placement, restriction, restriction lineage), so an integrator can project it level-triggered instead of trusting event payloads. And in AUTHZ_MODE=remote the fork installs database guards that refuse to take a restriction away by anything but an explicit unrestrict or a purge: a native move-to-space of a restricted page or of a page in a restricted section, and a re-parent or restore-detach that takes an unrestricted page out from under its last restricted ancestor. The native routes the integrator relays answer those refusals (and a move cycle) with `409 { message, code }`, `code` one of `ccc_page_no_cycle`, `ccc_page_restricted_space_move`, `ccc_page_restriction_strip`; the whole write is rolled back.\n\nConditional page operations (1.9.0, wiki-v2 #616): `pageLifecycleState` also reports the page's own `position`. And, beside the native page routes an integrator relays as the acting user (NOT part of this /api/service surface), the fork serves atomic compare-and-write twins — `POST /api/pages/conditional-delete`, `conditional-move`, `conditional-move-to-space`, `conditional-update-meta` — each taking the native body plus `expectedEtags` (1..8 opaque page versions, each at most 128 characters, or exactly [\"*\"] = the page exists). The version is compared inside the write's transaction under the page row lock: a stale one answers `412 { code: precondition_failed }` with nothing changed; a write that already happened answers `200 { outcome: noop, pageId }` (never for a permanent delete); otherwise `200 { outcome: applied, pageId }` (inside the upstream response envelope). A busy engine (lock or statement timeout, deadlock, too many in flight) answers a retryable `503 { code: engine_busy }`. A fork without these routes answers the framework's plain 404, which an integrator must treat as \"upgrade pending\", never as page-not-found. Versions and previews (1.9.0, wiki-v2 #616): the space detail (`getSpace`, `getContentSpace`), every space membership (`listSpaceMembers`, `addSpaceMember`) and a page's ACL (`listPagePermissions`, with `restricted`) carry an opaque `version` (64 hex). `updateSpace`, `archiveSpace`, `changeSpaceMemberRole` and `removeSpaceMember` take an optional `expectedVersion` (a version, or `*` = it exists), compared inside the write's transaction under its row lock: stale → `412 { code: precondition_failed }` with nothing changed; a rename, archive and role change answer the new version. The same holds for the page-ACL routes an integrator relays as the acting user (NOT part of this /api/service surface, inside the upstream `{ data, success }` envelope): `POST /api/pages/restrict`, `remove-restriction`, `add-permission`, `remove-permission`, `update-permission` each take the native body plus an optional `expectedVersion` (the ACL version), run as ONE transaction under a per-page lock, and answer `{ restricted | success, version, effect: { restrictedBefore, restrictedAfter, added[], changed[], removed[], retainedRole? } }` (grantees as Docmost user / group ids). `POST /api/pages/restriction-preview` `{ pageId, action: restrict | unrestrict | add | remove | update, …that route's body }` runs the real write and rolls it back (nothing survives — no row, no outbox row, no cache invalidation) and answers `{ outcome: would_apply | noop | refused, code?, version (the CURRENT one), effect }`; `previewSpaceMember` is its member-write twin here. A preview is never a narrowing route. A busy engine answers a retryable `503 { code: engine_busy }`. Keyed creates (1.9.0, wiki-v2 #616): `createSpace` takes an optional `idempotencyKey` + `idempotencyNamespace` + `fingerprint` (all three or none) and records the key in the space insert's own transaction, bound to the workspace, the authenticating service credential and the creator; a repeat answers the space it created with `replayed: true` and re-runs nothing, the same key with another fingerprint is `409 { code: idempotency_key_reused }`. Its page twin, relayed as the acting user (NOT part of this /api/service surface, inside the upstream envelope), is `POST /api/pages/idempotent-create`.",
+    "description": "These are the machine-to-machine endpoints the fork hosts for an integrating platform (the inverse direction of authorization-service.openapi.json, which the fork calls). They exist so an external identity/session broker can provision a fork-local shadow user and mint a Docmost session for it, re-check (and narrow) live realtime connections after a revocation, and (Phase C) administer workspace settings + spaces and read the content model WITHOUT the platform reaching into Docmost's database directly. They are NOT part of the public north-south API and are not browser-facing.\n\nMode: the whole surface is 404 unless the fork runs with AUTHZ_MODE=remote (RemoteOnlyGuard, checked BEFORE the secret). In AUTHZ_MODE=native there is no integrating platform and every route below returns 404 for all callers.\n\nAuth: every request carries a shared service secret in the x-authz-service-secret header (PLATFORM_AUTHZ_SERVICE_SECRET). Each /api/service/* route additionally requires exactly one least-privilege scope: session:mint, users:provision, users:resolve, workspace:read, workspace:settings:write, spaces:read, spaces:write, pages:read, pages:authz:read, pages:import:read, content:read, content:search, attachments:read, changes:read. Today a single full-scope secret is issued; per-scope credentials can be added later with no contract change.\n\nSecurity properties an integrator must understand:\n  - Identity-mutating endpoints are keyed ONLY on the caller's opaque externalId. The fork derives the shadow email (externalId@shadow.wiki-v2.internal) and resolves its own default workspace, so a caller can never select an arbitrary Docmost identity, name a real/privileged/native account, or supply a workspace id. This is a strong narrowing, not impersonation.\n  - The platform is the authorization authority: it performs the PDP decision (space/workspace administer, or the filter-then-retrieve authorized-id set) BEFORE calling these endpoints. The content read endpoints are a PRIVILEGED DATA PLANE, not a second gate: they return metadata for exactly the supplied ids and do NOT re-authorize. The security of the caller's /v1 surface rests entirely on it passing an authorized id set.\n  - Fail-closed: not remote -> 404; unconfigured secret -> 503; missing/wrong secret -> 401; wrong scope -> 403; over the per-credential rate limit -> 429; invalid body -> 400.\n\nResponse shape (incident #181): every 2xx body is EXACTLY the schema declared for its operation. The fork's global { data, success, status } response envelope (upstream TransformHttpResponseInterceptor) is skipped on this whole surface via per-handler @SkipTransform(); an integrator that receives an envelope is talking to a mis-built fork. Bring-up precondition: until Docmost first-run setup (POST /api/auth/setup) has created a workspace row, EVERY operation answers HTTP 404 with message exactly \"Workspace not found\" (an upstream pre-handler that runs before the service-bridge guards). That status + message pair is the ONLY response a consumer may treat as \"no workspace provisioned yet\"; any other 404 (e.g. the bare \"Not Found\" the fork answers when not in AUTHZ_MODE=remote) is a configuration error, and any 2xx body that does not match its declared schema is a contract violation the consumer must fail closed on.\n\nAccess-narrowing propagation (1.6.0, #501): a successful response from a route that can take access away (archiveSpace, addSpaceMember — an upsert can demote —, changeSpaceMemberRole, removeSpaceMember; and the native narrowing routes the integrator relays) carries `Authz-Propagation: confirmed | pending`. `confirmed` = the fork asked the integrator's OPTIONAL `POST /sync/settle` (authorization-service.openapi.json) and it answered that every access change committed up to this response is enforced; `pending` = the change is committed but could not be shown enforced within the bound (an integrator without /sync/settle always gets `pending`). The header never changes the status or the body, and it is absent in AUTHZ_MODE=native or when AUTHZ_NARROWING_SETTLE_TIMEOUT_MS=0. A consumer must treat an ABSENT header as unknown, never as confirmed.\n\nPage structure (1.7.0, wiki-v2 #493/#545): `POST /api/service/authz/pages/state` serves the CURRENT authorization structure of pages (placement, restriction, restriction lineage), so an integrator can project it level-triggered instead of trusting event payloads. And in AUTHZ_MODE=remote the fork installs database guards that refuse to take a restriction away by anything but an explicit unrestrict or a purge: a native move-to-space of a restricted page or of a page in a restricted section, and a re-parent or restore-detach that takes an unrestricted page out from under its last restricted ancestor. The native routes the integrator relays answer those refusals (and a move cycle) with `409 { message, code }`, `code` one of `ccc_page_no_cycle`, `ccc_page_restricted_space_move`, `ccc_page_restriction_strip`; the whole write is rolled back.\n\nConditional page operations (1.9.0, wiki-v2 #616): `pageLifecycleState` also reports the page's own `position`. And, beside the native page routes an integrator relays as the acting user (NOT part of this /api/service surface), the fork serves atomic compare-and-write twins — `POST /api/pages/conditional-delete`, `conditional-move`, `conditional-move-to-space`, `conditional-update-meta` — each taking the native body plus `expectedEtags` (1..8 opaque page versions, each at most 128 characters, or exactly [\"*\"] = the page exists). The version is compared inside the write's transaction under the page row lock: a stale one answers `412 { code: precondition_failed }` with nothing changed; a write that already happened answers `200 { outcome: noop, pageId }` (never for a permanent delete); otherwise `200 { outcome: applied, pageId }` (inside the upstream response envelope). A busy engine (lock or statement timeout, deadlock, too many in flight) answers a retryable `503 { code: engine_busy }`. A fork without these routes answers the framework's plain 404, which an integrator must treat as \"upgrade pending\", never as page-not-found. Versions and previews (1.9.0, wiki-v2 #616): the space detail (`getSpace`, `getContentSpace`), every space membership (`listSpaceMembers`, `addSpaceMember`) and a page's ACL (`listPagePermissions`, with `restricted`) carry an opaque `version` (64 hex). `updateSpace`, `archiveSpace`, `changeSpaceMemberRole` and `removeSpaceMember` take an optional `expectedVersion` (a version, or `*` = it exists), compared inside the write's transaction under its row lock: stale → `412 { code: precondition_failed }` with nothing changed; a rename, archive and role change answer the new version. The same holds for the page-ACL routes an integrator relays as the acting user (NOT part of this /api/service surface, inside the upstream `{ data, success }` envelope): `POST /api/pages/restrict`, `remove-restriction`, `add-permission`, `remove-permission`, `update-permission` each take the native body plus an optional `expectedVersion` (the ACL version), run as ONE transaction under a per-page lock, and answer `{ restricted | success, version, effect: { restrictedBefore, restrictedAfter, added[], changed[], removed[], retainedRole? } }` (grantees as Docmost user / group ids). `POST /api/pages/restriction-preview` `{ pageId, action: restrict | unrestrict | add | remove | update, …that route's body }` runs the real write and rolls it back (nothing survives — no row, no outbox row, no cache invalidation) and answers `{ outcome: would_apply | noop | refused, code?, version (the CURRENT one), effect }`; `previewSpaceMember` is its member-write twin here. A preview is never a narrowing route. A busy engine answers a retryable `503 { code: engine_busy }`. Keyed creates (1.9.0, wiki-v2 #616): `createSpace` takes an optional `idempotencyKey` + `idempotencyNamespace` + `fingerprint` (all three or none) and records the key in the space insert's own transaction, bound to the workspace, the authenticating service credential and the creator; a repeat answers the space it created with `replayed: true` and re-runs nothing, the same key with another fingerprint is `409 { code: idempotency_key_reused }`. Its page twin, relayed as the acting user (NOT part of this /api/service surface, inside the upstream envelope), is `POST /api/pages/idempotent-create`. Import helpers (1.9.0, wiki-v2 #616; scope `pages:import:read`, its own smaller rate bucket): `validateImportContent` parses each item exactly as a create would and answers per-item `ok` or a code, never content; `pageTitleCandidates` answers the live children of a parent whose title is an input title or `<title> (n)`, as ids and indices only.",
     "license": { "name": "AGPL-3.0-only", "identifier": "AGPL-3.0-only" },
     "x-canonical": true
   },
@@ -523,6 +523,52 @@
         }
       }
     },
+    "/api/service/pages/validate-content": {
+      "post": {
+        "operationId": "validateImportContent",
+        "tags": ["pages"],
+        "summary": "Would each item parse as a page body? (1.9.0, #616 import helper; parses, writes nothing).",
+        "description": "Each item is parsed exactly as a page create parses it (Markdown → HTML → the network-inert HTML parse → ProseMirror JSON → schema check), sequentially, in the order given; nothing is written and no content, parse error or derived text is ever answered — only `{idx, ok}` or `{idx, ok: false, code}`, one per item, in item order. Codes: `too_large` — the item is over 524288 UTF-8 bytes, OR a per-call budget ran out before it (1048576 parsed bytes in total, or 4 s of parsing, checked before each item; from that item on every item is `too_large`, unparsed); `empty_content` — the content is empty or whitespace only; `invalid_content` — it does not parse to a valid page body. At most 2 calls parse at once per fork process: a call that gets no slot within 2s answers 503 `engine_busy` (retryable). Scope: pages:import:read (its own, smaller rate bucket).",
+        "requestBody": { "required": true, "content": { "application/json": {
+          "schema": { "$ref": "#/components/schemas/ValidateContentRequest" },
+          "example": { "items": [{ "format": "markdown", "content": "# Notes\n\nHello" }, { "format": "html", "content": "" }] }
+        } } },
+        "responses": {
+          "200": { "description": "One result per item, in item order.", "content": { "application/json": {
+            "schema": { "type": "object", "required": ["results"], "properties": { "results": { "type": "array", "items": { "$ref": "#/components/schemas/ContentValidationResult" } } } },
+            "example": { "results": [{ "idx": 0, "ok": true }, { "idx": 1, "ok": false, "code": "empty_content" }] }
+          } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/UnconfiguredOrBusy" }
+        }
+      }
+    },
+    "/api/service/pages/title-candidates": {
+      "post": {
+        "operationId": "pageTitleCandidates",
+        "tags": ["pages"],
+        "summary": "Live children of a parent whose title is an input title or `<title> (n)` (1.9.0, #616 import helper).",
+        "description": "Reads the LIVE (not trashed) direct children of `parentPageId` in `spaceId` — or the space's root level when `parentPageId` is omitted or null — in the fork's workspace, and answers each child whose title equals `titles[titleIdx]` exactly (`suffix: null`) or is `${titles[titleIdx]} (${n})` for an integer n ≥ 2 written without leading zeros (`suffix: n`). Exact, case-sensitive and untrimmed. A title repeated in `titles` is answered under its first index. Only ids and indices are answered — never a title — and the integrator must keep only the matches its caller may view. Sorted by titleIdx, then suffix (null first), then pageId. At most 5000 children are read: a parent with more answers 503 `list_too_broad`; a read past its statement bound answers 503 `engine_busy`. A parent that is missing, trashed or in another space simply has no live children here. Scope: pages:import:read.",
+        "requestBody": { "required": true, "content": { "application/json": {
+          "schema": { "$ref": "#/components/schemas/TitleCandidatesRequest" },
+          "example": { "spaceId": "22222222-2222-2222-2222-222222222222", "parentPageId": null, "titles": ["Notes", "Plan"] }
+        } } },
+        "responses": {
+          "200": { "description": "The matching children, ids and indices only.", "content": { "application/json": {
+            "schema": { "type": "object", "required": ["matches"], "properties": { "matches": { "type": "array", "items": { "$ref": "#/components/schemas/TitleCandidate" } } } },
+            "example": { "matches": [{ "titleIdx": 0, "pageId": "33333333-3333-3333-3333-333333333333", "suffix": null }, { "titleIdx": 0, "pageId": "44444444-4444-4444-4444-444444444444", "suffix": 2 }] }
+          } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/UnconfiguredBusyOrTooBroad" }
+        }
+      }
+    },
     "/api/service/pages/{pageId}/permissions": {
       "parameters": [{ "name": "pageId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
       "get": {
@@ -829,6 +875,10 @@
       "Conflict": {
         "description": "A uniqueness constraint is already taken (the space slug on create; on restore, the owner's one live personal space).",
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "UnconfiguredBusyOrTooBroad": {
+        "description": "As UnconfiguredOrBusy; or (1.9.0, #616) the parent has more live children than the scan bound — then the body carries code `list_too_broad` (a retry will not help until the parent has fewer children).",
+        "content": { "application/json": { "schema": { "anyOf": [{ "$ref": "#/components/schemas/Error" }, { "$ref": "#/components/schemas/EngineBusyError" }, { "$ref": "#/components/schemas/ListTooBroadError" }] } } }
       },
       "CreateSpaceConflict": {
         "description": "The slug is already taken by another space; or (1.9.0, #616) a keyed create's `idempotencyKey` was already used with a different `fingerprint` — then the body is an IdempotencyKeyReusedError and nothing was written.",
@@ -1396,6 +1446,61 @@
         "required": ["code", "message"],
         "properties": {
           "code": { "const": "engine_busy" },
+          "message": { "type": "string" }
+        }
+      },
+      "ValidateContentRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["items"],
+        "properties": {
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 50,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["format", "content"],
+              "properties": {
+                "format": { "type": "string", "enum": ["markdown", "html"] },
+                "content": { "type": "string", "description": "Up to 524288 UTF-8 bytes; larger is answered per item as `too_large` (the request body limit bounds the call)." }
+              }
+            }
+          }
+        }
+      },
+      "ContentValidationResult": {
+        "oneOf": [
+          { "type": "object", "additionalProperties": false, "required": ["idx", "ok"], "properties": { "idx": { "type": "integer", "minimum": 0 }, "ok": { "const": true } } },
+          { "type": "object", "additionalProperties": false, "required": ["idx", "ok", "code"], "properties": { "idx": { "type": "integer", "minimum": 0 }, "ok": { "const": false }, "code": { "type": "string", "enum": ["invalid_content", "too_large", "empty_content"] } } }
+        ]
+      },
+      "TitleCandidatesRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["spaceId", "titles"],
+        "properties": {
+          "spaceId": { "type": "string", "format": "uuid" },
+          "parentPageId": { "type": ["string", "null"], "format": "uuid", "description": "Omitted or null: the space's root level." },
+          "titles": { "type": "array", "minItems": 1, "maxItems": 50, "items": { "type": "string", "minLength": 1, "maxLength": 255 } }
+        }
+      },
+      "TitleCandidate": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["titleIdx", "pageId", "suffix"],
+        "properties": {
+          "titleIdx": { "type": "integer", "minimum": 0 },
+          "pageId": { "type": "string", "format": "uuid" },
+          "suffix": { "type": ["integer", "null"], "minimum": 2, "description": "null: the exact title; n: `<title> (n)`." }
+        }
+      },
+      "ListTooBroadError": {
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "const": "list_too_broad" },
           "message": { "type": "string" }
         }
       },

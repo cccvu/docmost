@@ -9,6 +9,7 @@ import { SessionExternalIdDto } from './session-external-id.dto';
 import { LookupUsersDto } from './lookup-users.dto';
 import { CreateSpaceDto, UpdateSpaceMemberDto } from './space-admin.dto';
 import { PageAuthzStateDto } from './page-authz-state.dto';
+import { TitleCandidatesDto, ValidateContentDto } from './page-import.dto';
 
 /**
  * These DTOs' class-validator decorators are the load-bearing input guard for the new service-bridge ops (the
@@ -238,6 +239,36 @@ describe('service-bridge DTO validation (constraints are load-bearing)', () => {
         expect(await errCount(UpdateSpaceMemberDto, { role: 'writer', actorExternalId })).toBeGreaterThan(0);
       }
       expect(await errCount(UpdateSpaceMemberDto, { role: 'owner', actorExternalId: UUID })).toBeGreaterThan(0);
+    });
+  });
+
+  /** #616 import helpers: the batch bounds are the DTO's; oversized CONTENT is a per-item answer, not a 400. */
+  describe('ValidateContentDto / TitleCandidatesDto', () => {
+    const item = { format: 'markdown', content: '# x' };
+
+    it('validate-content: 1..50 items of markdown|html with string content (any length — too_large is per item)', async () => {
+      expect(await errCount(ValidateContentDto, { items: [item] })).toBe(0);
+      expect(await errCount(ValidateContentDto, { items: Array.from({ length: 50 }, () => item) })).toBe(0);
+      expect(await errCount(ValidateContentDto, { items: [{ format: 'html', content: 'x'.repeat(600 * 1024) }] })).toBe(0);
+      expect(await errCount(ValidateContentDto, { items: [] })).toBeGreaterThan(0);
+      expect(await errCount(ValidateContentDto, { items: Array.from({ length: 51 }, () => item) })).toBeGreaterThan(0);
+      expect(await errCount(ValidateContentDto, { items: [{ format: 'json', content: '{}' }] })).toBeGreaterThan(0);
+      expect(await errCount(ValidateContentDto, { items: [{ format: 'html' }] })).toBeGreaterThan(0);
+      expect(await errCount(ValidateContentDto, { items: [{ format: 'html', content: 5 }] })).toBeGreaterThan(0);
+    });
+
+    it('title-candidates: a space uuid, an optional uuid-or-null parent, 1..50 titles of 1..255 chars', async () => {
+      const ok = { spaceId: UUID, titles: ['A'] };
+      expect(await errCount(TitleCandidatesDto, ok)).toBe(0);
+      expect(await errCount(TitleCandidatesDto, { ...ok, parentPageId: null })).toBe(0);
+      expect(await errCount(TitleCandidatesDto, { ...ok, parentPageId: UUID })).toBe(0);
+      expect(await errCount(TitleCandidatesDto, { ...ok, titles: ['t'.repeat(255)] })).toBe(0);
+      expect(await errCount(TitleCandidatesDto, { ...ok, spaceId: 'nope' })).toBeGreaterThan(0);
+      expect(await errCount(TitleCandidatesDto, { ...ok, parentPageId: 'nope' })).toBeGreaterThan(0);
+      expect(await errCount(TitleCandidatesDto, { ...ok, titles: [] })).toBeGreaterThan(0);
+      expect(await errCount(TitleCandidatesDto, { ...ok, titles: Array.from({ length: 51 }, () => 'A') })).toBeGreaterThan(0);
+      expect(await errCount(TitleCandidatesDto, { ...ok, titles: [''] })).toBeGreaterThan(0);
+      expect(await errCount(TitleCandidatesDto, { ...ok, titles: ['t'.repeat(256)] })).toBeGreaterThan(0);
     });
   });
 
