@@ -113,6 +113,12 @@ You only implement a *caller* for these; the fork is the server. They fall into 
   narrowing access change and narrow the ones that lost access, #501; it replaced the per-page
   `force-disconnect` in 1.5.0) and `POST /api/collab/force-disconnect-user` (account disable, #455).
 
+**Native space routes refused in remote mode (wiki-v2 #502, #598).** In `AUTHZ_MODE=remote` the engine answers
+`404` to every authenticated caller of its native `POST /api/spaces/create` and `POST /api/spaces/delete`, before
+any permission check, and forwards one audit row (`space.native_create_refused` / `space.hard_delete_refused`) to
+`/audit/ingest`. Create spaces through `POST /api/service/spaces`; remove them with `POST .../archive`. A session
+minted before the switch to remote (an owner's included) gets the same `404`. Native mode keeps both routes.
+
 **Access-narrowing propagation (1.6.0, #501).** A successful response from a route that can take access away
 (`archive`, the member `POST` upsert, `PATCH` and `DELETE` here, and the native restrict/grant/move/member routes
 a platform relays) carries `Authz-Propagation: confirmed | pending` — whether the change is already enforced by the
