@@ -4,7 +4,7 @@ import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify
 import { Test } from '@nestjs/testing';
 import { TransformHttpResponseInterceptor } from '../common/interceptors/http-response.interceptor';
 import { RemoteOnlyGuard } from '../authz/mode/remote-only.guard';
-import { ServiceAuthGuard } from './service-auth.guard';
+import { attachServiceCredential, ServiceAuthGuard } from './service-auth.guard';
 import { ServiceWorkspaceController } from './service-workspace.controller';
 import { ServiceContentController } from './service-content.controller';
 import { AuthzChangeController } from './authz-change.controller';
@@ -17,6 +17,9 @@ import { AuthzSnapshotService } from './authz-snapshot.service';
 import { PageAuthzStateService } from './page-authz-state.service';
 import { ServiceSpaceController } from './service-space.controller';
 import { ServiceSpaceService } from './service-space.service';
+import { ServicePageController } from './service-page.controller';
+import { ServicePageLifecycleService } from './service-page-lifecycle.service';
+import { ServicePageImportService } from './service-page-import.service';
 import { spyKysely, SpyQuery } from './kysely-spy.testkit';
 
 /**
@@ -220,6 +223,361 @@ describe('service-bridge member mutation refusals on the wire (#486)', () => {
       payload: { role: 'admin' },
     });
     expect(res.statusCode).toBe(400);
+    expect(calls).toEqual([]);
+  });
+});
+
+/**
+ * #616 Stage 2 — the versioned member / space writes and the member preview through the real pipeline (global
+ * ValidationPipe exactly as main.ts mounts it, which strips unknown keys and would silently drop an undeclared
+ * `expectedVersion`): a stale version is a 412 whose body carries `code: 'precondition_failed'` (the platform maps
+ * it by code), the optional DELETE / archive body is parsed and validated, a body-less archive / removal is the
+ * pre-#616 request, and the preview answers its bare body with a 200 and writes nothing.
+ */
+describe('service-bridge versioned writes + member preview on the wire (#616)', () => {
+  const SPACE = '22222222-2222-4222-8222-222222222222';
+  const MEMBER = '33333333-3333-4333-8333-333333333333';
+  let app: NestFastifyApplication;
+  let calls: SpyQuery[];
+  const STALE = 'f'.repeat(64);
+
+  beforeAll(async () => {
+    const spy = spyKysely((query) => {
+      const s = query.sql.toLowerCase();
+      if (s.includes('for no key update')) return [{ id: SPACE, deletedAt: null }];
+      if (s.includes('from space_members') && s.includes('for update')) {
+        return [{ id: MEMBER, userId: 'u-ext-other', groupId: null, role: 'writer', deletedAt: null }];
+      }
+      if (s.includes('update spaces set')) return [{ id: SPACE, deletedAt: new Date() }];
+      return [];
+    });
+    calls = spy.calls;
+    const bridge = {
+      provisionShadowUser: async () => {
+        throw new Error('a preview must never provision');
+      },
+      // `ext-new` has never been provisioned: the preview must report it, never create it.
+      findShadowUserId: async (externalId: string) => (externalId === 'ext-new' ? null : `u-${externalId}`),
+    };
+    const moduleRef = await Test.createTestingModule({
+      controllers: [ServiceSpaceController],
+      providers: [
+        {
+          provide: ServiceSpaceService,
+          useValue: new ServiceSpaceService(spy.db, { resolveDefaultWorkspaceId: async () => WS } as any, bridge as any),
+        },
+      ],
+    })
+      .overrideGuard(RemoteOnlyGuard)
+      .useValue({ canActivate: () => true })
+      .overrideGuard(ServiceAuthGuard)
+      .useValue({ canActivate: () => true })
+      .compile();
+    app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    app.setGlobalPrefix('api'); // main.ts
+    app.useGlobalPipes(new ValidationPipe({ whitelist: true, stopAtFirstError: true, transform: true })); // main.ts
+    app.useGlobalInterceptors(new TransformHttpResponseInterceptor(app.get(Reflector))); // main.ts
+    await app.init();
+    await app.getHttpAdapter().getInstance().ready();
+  });
+
+  afterAll(async () => await app?.close());
+  beforeEach(() => {
+    calls.length = 0;
+  });
+
+  const VERSION = expect.stringMatching(/^[0-9a-f]{64}$/);
+  const wrote = () => calls.some((c) => /^\s*(update|delete|insert)/i.test(c.sql));
+
+  it('PATCH member with a stale expectedVersion answers 412 precondition_failed and writes nothing', async () => {
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/service/spaces/${SPACE}/members/${MEMBER}`,
+      payload: { role: 'reader', actorExternalId: 'ext-me', expectedVersion: STALE },
+    });
+    expect(res.statusCode).toBe(412);
+    expect(res.json()).toEqual({ code: 'precondition_failed', message: expect.any(String) });
+    expect(wrote()).toBe(false);
+  });
+
+  it('PATCH member with "*" (exists) applies and answers { ok, version }', async () => {
+    const res = await app.inject({
+      method: 'PATCH',
+      url: `/api/service/spaces/${SPACE}/members/${MEMBER}`,
+      payload: { role: 'reader', actorExternalId: 'ext-me', expectedVersion: '*' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true, version: VERSION });
+  });
+
+  it('DELETE member parses its optional JSON body: a stale version is a 412, and no body at all is the old request', async () => {
+    const stale = await app.inject({
+      method: 'DELETE',
+      url: `/api/service/spaces/${SPACE}/members/${MEMBER}`,
+      payload: { expectedVersion: STALE },
+    });
+    expect(stale.statusCode).toBe(412);
+    expect(wrote()).toBe(false);
+    const bare = await app.inject({ method: 'DELETE', url: `/api/service/spaces/${SPACE}/members/${MEMBER}` });
+    expect(bare.statusCode).toBe(200);
+    expect(bare.json()).toEqual({ ok: true });
+  });
+
+  it('an over-long expectedVersion is a 400 (validated, never stripped)', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/service/spaces/${SPACE}/archive`,
+      payload: { expectedVersion: 'x'.repeat(129) },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+
+  it('POST archive without a body answers { ok, version } (the pre-#616 request, a new field in the answer)', async () => {
+    const res = await app.inject({ method: 'POST', url: `/api/service/spaces/${SPACE}/archive` });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ ok: true, version: VERSION });
+  });
+
+  it('POST members/preview answers the bare preview with a 200, provisions nobody and writes nothing', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/service/spaces/${SPACE}/members/preview`,
+      payload: { action: 'add', externalId: 'ext-new', role: 'writer', addedByExternalId: 'ext-me' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({
+      outcome: 'would_apply',
+      version: null,
+      effect: { roleBefore: null, roleAfter: 'writer', provisionsAccount: true },
+    });
+    expect(wrote()).toBe(false);
+  });
+
+  it('POST members/preview without a field its action requires is a 400', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: `/api/service/spaces/${SPACE}/members/preview`,
+      payload: { action: 'update', role: 'reader', actorExternalId: 'ext-me' },
+    });
+    expect(res.statusCode).toBe(400);
+  });
+});
+
+/**
+ * #616 Stage 3 — the keyed space create through the real pipeline: the global ValidationPipe (which would silently
+ * strip an undeclared key field) keeps the three keyed fields and refuses a partial key before the service runs; the
+ * body is the bare create shape plus `replayed`; the ledger sees the credential the guard admitted; a mismatch is a
+ * 409 whose body carries `code: 'idempotency_key_reused'` (the platform maps it by code); unkeyed carries no `replayed`.
+ */
+describe('service-bridge keyed space create on the wire (#616)', () => {
+  const FP = 'c'.repeat(64);
+  const KEYED = { name: 'Eng', creatorExternalId: 'ext-me', idempotencyKey: 'k-1', idempotencyNamespace: 'user:ext-me', fingerprint: FP };
+  let app: NestFastifyApplication;
+  let calls: SpyQuery[];
+  let reservation: unknown;
+  const reserve = jest.fn(async (_trx: unknown, _claim: unknown) => reservation);
+
+  beforeAll(async () => {
+    const spy = spyKysely((query) => {
+      const s = query.sql.toLowerCase();
+      if (s.includes('insert into spaces')) return [{ id: 'sp-new', slug: 'eng', name: 'Eng' }];
+      if (s.includes('select id, slug, name from spaces')) return [{ id: 'sp-old', slug: 'eng', name: 'Eng' }];
+      return [];
+    });
+    calls = spy.calls;
+    const bridge = { provisionShadowUser: async ({ externalId }: { externalId: string }) => ({ userId: `u-${externalId}`, workspaceId: WS }) };
+    const ledger = { reserve, complete: async () => undefined };
+    const moduleRef = await Test.createTestingModule({
+      controllers: [ServiceSpaceController],
+      providers: [
+        {
+          provide: ServiceSpaceService,
+          useValue: new ServiceSpaceService(spy.db, { resolveDefaultWorkspaceId: async () => WS } as any, bridge as any, ledger as any),
+        },
+      ],
+    })
+      .overrideGuard(RemoteOnlyGuard)
+      .useValue({ canActivate: () => true })
+      .overrideGuard(ServiceAuthGuard) // stands in for the real guard: admits, recording its credential as it does
+      .useValue({ canActivate: (ctx: any) => (attachServiceCredential(ctx.switchToHttp().getRequest(), 'shared'), true) })
+      .compile();
+    app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    app.setGlobalPrefix('api'); // main.ts
+    app.useGlobalPipes(new ValidationPipe({ whitelist: true, stopAtFirstError: true, transform: true })); // main.ts
+    app.useGlobalInterceptors(new TransformHttpResponseInterceptor(app.get(Reflector))); // main.ts
+    await app.init();
+    await app.getHttpAdapter().getInstance().ready();
+  });
+
+  afterAll(async () => await app?.close());
+  beforeEach(() => {
+    calls.length = 0;
+    reserve.mockClear();
+  });
+
+  const post = (payload: object) => app.inject({ method: 'POST', url: '/api/service/spaces', payload });
+
+  it('a fresh keyed create answers the bare body with replayed:false; the ledger got the key bound to the credential', async () => {
+    reservation = { outcome: 'fresh', slot: {} };
+    const res = await post(KEYED);
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ id: 'sp-new', slug: 'eng', name: 'Eng', replayed: false });
+    expect(reserve.mock.calls[0][1]).toEqual({
+      workspaceId: WS,
+      principal: 'service:shared/user:u-ext-me',
+      namespace: 'user:ext-me',
+      op: 'space.create',
+      key: 'k-1',
+      fingerprint: FP,
+    });
+  });
+
+  it('a replay answers the space the key created with replayed:true and inserts nothing', async () => {
+    reservation = { outcome: 'replay', resourceId: 'sp-old' };
+    const res = await post(KEYED);
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ id: 'sp-old', slug: 'eng', name: 'Eng', replayed: true });
+    expect(calls.some((c) => c.sql.toLowerCase().includes('insert into'))).toBe(false);
+  });
+
+  it('a mismatch is a 409 whose body carries code idempotency_key_reused', async () => {
+    reservation = { outcome: 'mismatch' };
+    const res = await post(KEYED);
+    expect(res.statusCode).toBe(409);
+    expect(res.json()).toMatchObject({ code: 'idempotency_key_reused' });
+  });
+
+  it('a partial key is a 400 that never reaches the service', async () => {
+    const { fingerprint: _fp, ...partial } = KEYED;
+    const res = await post(partial);
+    expect(res.statusCode).toBe(400);
+    expect(calls).toEqual([]);
+    expect(reserve).not.toHaveBeenCalled();
+  });
+
+  it('unkeyed answers the pre-#616 body (no replayed) and never touches the ledger', async () => {
+    const res = await post({ name: 'Eng', creatorExternalId: 'ext-me' });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ id: 'sp-new', slug: 'eng', name: 'Eng' });
+    expect(reserve).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * #616 Stage 5 — the page-import helpers through the real pipeline (global ValidationPipe exactly as main.ts mounts
+ * it, so the NESTED item validation is the one that runs in production): bare `{ results }` / `{ matches }` bodies,
+ * per-item codes, content and titles never echoed, and a malformed batch is a 400 that never reaches the parser.
+ */
+describe('service-bridge page-import helpers on the wire (#616)', () => {
+  const SPACE = '22222222-2222-4222-8222-222222222222';
+  let app: NestFastifyApplication;
+  let calls: SpyQuery[];
+  const parsed: string[] = [];
+
+  beforeAll(async () => {
+    const spy = spyKysely((query) =>
+      /select id, title from pages/i.test(query.sql)
+        ? [{ id: 'p-1', title: 'Secret plan' }, { id: 'p-2', title: 'Secret plan (2)' }, { id: 'p-3', title: 'Other' }]
+        : [],
+    );
+    calls = spy.calls;
+    const parser = {
+      parse: async (content: string) => {
+        parsed.push(content);
+        if (content.includes('BROKEN')) throw new Error(`cannot parse: ${content}`);
+        return {};
+      },
+    };
+    const moduleRef = await Test.createTestingModule({
+      controllers: [ServicePageController],
+      providers: [
+        { provide: ServiceContentService, useValue: {} },
+        { provide: ServicePageLifecycleService, useValue: {} },
+        {
+          provide: ServicePageImportService,
+          useValue: new ServicePageImportService(spy.db, { resolveDefaultWorkspaceId: async () => WS } as any, parser as any),
+        },
+      ],
+    })
+      .overrideGuard(RemoteOnlyGuard)
+      .useValue({ canActivate: () => true })
+      .overrideGuard(ServiceAuthGuard)
+      .useValue({ canActivate: () => true })
+      .compile();
+    app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
+    app.setGlobalPrefix('api'); // main.ts
+    app.useGlobalPipes(new ValidationPipe({ whitelist: true, stopAtFirstError: true, transform: true })); // main.ts
+    app.useGlobalInterceptors(new TransformHttpResponseInterceptor(app.get(Reflector))); // main.ts
+    await app.init();
+    await app.getHttpAdapter().getInstance().ready();
+  });
+
+  afterAll(async () => await app?.close());
+  beforeEach(() => {
+    calls.length = 0;
+    parsed.length = 0;
+  });
+
+  it('POST validate-content answers the bare { results } with per-item codes and never echoes content', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/service/pages/validate-content',
+      payload: {
+        items: [
+          { format: 'markdown', content: '# ok' },
+          { format: 'html', content: '<p>BROKEN secret</p>' },
+          { format: 'html', content: '  ' },
+        ],
+      },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({
+      results: [
+        { idx: 0, ok: true },
+        { idx: 1, ok: false, code: 'invalid_content' },
+        { idx: 2, ok: false, code: 'empty_content' },
+      ],
+    });
+    expect(res.body).not.toMatch(/secret|BROKEN|cannot parse/);
+  });
+
+  it.each([
+    ['no items', {}],
+    ['an empty batch', { items: [] }],
+    ['51 items', { items: Array.from({ length: 51 }, () => ({ format: 'html', content: 'x' })) }],
+    ['a json item', { items: [{ format: 'json', content: '{}' }] }],
+    ['an item without content', { items: [{ format: 'html' }] }],
+  ])('POST validate-content with %s is a 400 that parses nothing', async (_what, payload) => {
+    const res = await app.inject({ method: 'POST', url: '/api/service/pages/validate-content', payload });
+    expect(res.statusCode).toBe(400);
+    expect(parsed).toEqual([]);
+  });
+
+  it('POST title-candidates answers the bare { matches }: ids, indices and suffixes — never a title', async () => {
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/service/pages/title-candidates',
+      payload: { spaceId: SPACE, parentPageId: null, titles: ['Secret plan', 'Nope'] },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({
+      matches: [
+        { titleIdx: 0, pageId: 'p-1', suffix: null },
+        { titleIdx: 0, pageId: 'p-2', suffix: 2 },
+      ],
+    });
+    expect(res.body).not.toMatch(/Secret|Other/);
+  });
+
+  it('POST title-candidates with a bad parent id or an over-long title is a 400 that reads nothing', async () => {
+    for (const payload of [
+      { spaceId: SPACE, parentPageId: 'nope', titles: ['A'] },
+      { spaceId: SPACE, titles: ['t'.repeat(256)] },
+      { spaceId: 'nope', titles: ['A'] },
+    ]) {
+      const res = await app.inject({ method: 'POST', url: '/api/service/pages/title-candidates', payload });
+      expect(res.statusCode).toBe(400);
+    }
     expect(calls).toEqual([]);
   });
 });

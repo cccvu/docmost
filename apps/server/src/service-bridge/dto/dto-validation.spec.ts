@@ -7,8 +7,9 @@ import { MintSessionDto } from './mint-session.dto';
 import { ProvisionUserDto } from './provision-user.dto';
 import { SessionExternalIdDto } from './session-external-id.dto';
 import { LookupUsersDto } from './lookup-users.dto';
-import { UpdateSpaceMemberDto } from './space-admin.dto';
+import { CreateSpaceDto, UpdateSpaceMemberDto } from './space-admin.dto';
 import { PageAuthzStateDto } from './page-authz-state.dto';
+import { TitleCandidatesDto, ValidateContentDto } from './page-import.dto';
 
 /**
  * These DTOs' class-validator decorators are the load-bearing input guard for the new service-bridge ops (the
@@ -277,6 +278,74 @@ describe('service-bridge DTO validation (constraints are load-bearing)', () => {
         expect(await errCount(UpdateSpaceMemberDto, { role: 'writer', actorExternalId })).toBeGreaterThan(0);
       }
       expect(await errCount(UpdateSpaceMemberDto, { role: 'owner', actorExternalId: UUID })).toBeGreaterThan(0);
+    });
+  });
+
+  /** #616 import helpers: the batch bounds are the DTO's; oversized CONTENT is a per-item answer, not a 400. */
+  describe('ValidateContentDto / TitleCandidatesDto', () => {
+    const item = { format: 'markdown', content: '# x' };
+
+    it('validate-content: 1..50 items of markdown|html with string content (any length — too_large is per item)', async () => {
+      expect(await errCount(ValidateContentDto, { items: [item] })).toBe(0);
+      expect(await errCount(ValidateContentDto, { items: Array.from({ length: 50 }, () => item) })).toBe(0);
+      expect(await errCount(ValidateContentDto, { items: [{ format: 'html', content: 'x'.repeat(600 * 1024) }] })).toBe(0);
+      expect(await errCount(ValidateContentDto, { items: [] })).toBeGreaterThan(0);
+      expect(await errCount(ValidateContentDto, { items: Array.from({ length: 51 }, () => item) })).toBeGreaterThan(0);
+      expect(await errCount(ValidateContentDto, { items: [{ format: 'json', content: '{}' }] })).toBeGreaterThan(0);
+      expect(await errCount(ValidateContentDto, { items: [{ format: 'html' }] })).toBeGreaterThan(0);
+      expect(await errCount(ValidateContentDto, { items: [{ format: 'html', content: 5 }] })).toBeGreaterThan(0);
+    });
+
+    it('title-candidates: a space uuid, an optional uuid-or-null parent, 1..50 titles of 1..255 chars', async () => {
+      const ok = { spaceId: UUID, titles: ['A'] };
+      expect(await errCount(TitleCandidatesDto, ok)).toBe(0);
+      expect(await errCount(TitleCandidatesDto, { ...ok, parentPageId: null })).toBe(0);
+      expect(await errCount(TitleCandidatesDto, { ...ok, parentPageId: UUID })).toBe(0);
+      expect(await errCount(TitleCandidatesDto, { ...ok, titles: ['t'.repeat(255)] })).toBe(0);
+      expect(await errCount(TitleCandidatesDto, { ...ok, spaceId: 'nope' })).toBeGreaterThan(0);
+      expect(await errCount(TitleCandidatesDto, { ...ok, parentPageId: 'nope' })).toBeGreaterThan(0);
+      expect(await errCount(TitleCandidatesDto, { ...ok, titles: [] })).toBeGreaterThan(0);
+      expect(await errCount(TitleCandidatesDto, { ...ok, titles: Array.from({ length: 51 }, () => 'A') })).toBeGreaterThan(0);
+      expect(await errCount(TitleCandidatesDto, { ...ok, titles: [''] })).toBeGreaterThan(0);
+      expect(await errCount(TitleCandidatesDto, { ...ok, titles: ['t'.repeat(256)] })).toBeGreaterThan(0);
+    });
+  });
+
+  /**
+   * #616: the keyed space create. The three keyed fields are optional but ALL-OR-NONE (a partial key is a 400, never
+   * an unkeyed create the caller believed was keyed), with the ledger's bounds.
+   */
+  describe('CreateSpaceDto (keyed create: all three keyed fields or none)', () => {
+    const base = { name: 'Engineering', creatorExternalId: 'ext-1' };
+    const keyed = { idempotencyKey: 'k-1', idempotencyNamespace: 'user:ext-1', fingerprint: 'a'.repeat(64) };
+    const failing = async (obj: object) =>
+      (await validate(plainToInstance(CreateSpaceDto, obj))).map((e) => e.property).sort();
+
+    it('accepts no keyed field, or all three within bounds', async () => {
+      expect(await errCount(CreateSpaceDto, base)).toBe(0);
+      expect(await errCount(CreateSpaceDto, { ...base, ...keyed })).toBe(0);
+      expect(
+        await errCount(CreateSpaceDto, { ...base, ...keyed, idempotencyKey: 'k'.repeat(255), idempotencyNamespace: 'n'.repeat(128) }),
+      ).toBe(0);
+    });
+
+    it('rejects a partial key: every missing keyed field is reported', async () => {
+      expect(await failing({ ...base, idempotencyKey: 'k-1' })).toEqual(['fingerprint', 'idempotencyNamespace']);
+      expect(await failing({ ...base, fingerprint: keyed.fingerprint })).toEqual(['idempotencyKey', 'idempotencyNamespace']);
+      expect(await failing({ ...base, idempotencyNamespace: 'ns', fingerprint: keyed.fingerprint })).toEqual(['idempotencyKey']);
+    });
+
+    it('rejects out-of-bounds values', async () => {
+      for (const over of [
+        { idempotencyKey: '' },
+        { idempotencyKey: 'k'.repeat(256) },
+        { idempotencyNamespace: 'n'.repeat(129) },
+        { fingerprint: 'A'.repeat(64) },
+        { fingerprint: 'a'.repeat(63) },
+        { idempotencyKey: null },
+      ]) {
+        expect(await errCount(CreateSpaceDto, { ...base, ...keyed, ...over })).toBeGreaterThan(0);
+      }
     });
   });
 });

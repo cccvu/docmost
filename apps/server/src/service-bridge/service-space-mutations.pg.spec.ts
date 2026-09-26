@@ -51,6 +51,8 @@ const S = uuid(1); // the space under test
 const S_OTHER = uuid(2); // another space (cross-space memberId)
 const GROUP = uuid(60);
 const ACTOR = 'ops-admin'; // the acting identity where rule M is not under test (never covered by a row)
+/** #616: a role change now answers the membership's new version. */
+const VERSIONED = { version: expect.stringMatching(/^[0-9a-f]{64}$/) };
 
 d('ServiceSpaceService member mutations on real Postgres (#486)', () => {
   jest.setTimeout(30_000); // provisioning bcrypt-hashes an unusable password per new shadow user
@@ -189,7 +191,7 @@ d('ServiceSpaceService member mutations on real Postgres (#486)', () => {
       const alice = await shadow('alice');
       const m = await member(S, { userId: alice }, 'admin');
       await member(S, { groupId: GROUP }, 'admin');
-      await expect(svc.changeMemberRole(S, m, 'reader', ACTOR)).resolves.toBeUndefined();
+      await expect(svc.changeMemberRole(S, m, 'reader', ACTOR)).resolves.toEqual(VERSIONED);
       expect(await roleOf(m)).toBe('reader');
       await expect(svc.removeMember(S, m)).resolves.toBeUndefined();
       expect(await roleOf(m)).toBeUndefined();
@@ -233,7 +235,7 @@ d('ServiceSpaceService member mutations on real Postgres (#486)', () => {
 
       holder.release();
       await holder.done;
-      await expect(change).resolves.toBeUndefined();
+      await expect(change).resolves.toEqual(VERSIONED);
       expect(await roleOf(m)).toBe('reader');
     });
 
@@ -327,7 +329,7 @@ d('ServiceSpaceService member mutations on real Postgres (#486)', () => {
       await selfGrant(svc.changeMemberRole(S, own, 'admin', 'ALICE'));
       expect(await roleOf(own)).toBe('writer');
 
-      await expect(svc.changeMemberRole(S, own, 'reader', 'alice')).resolves.toBeUndefined();
+      await expect(svc.changeMemberRole(S, own, 'reader', 'alice')).resolves.toEqual(VERSIONED);
       expect(await roleOf(own)).toBe('reader');
     });
 
@@ -340,7 +342,7 @@ d('ServiceSpaceService member mutations on real Postgres (#486)', () => {
       expect(await roleOf(grp)).toBe('reader');
 
       await pg`update space_members set role = 'admin' where id = ${grp}`;
-      await expect(svc.changeMemberRole(S, grp, 'reader', 'alice')).resolves.toBeUndefined();
+      await expect(svc.changeMemberRole(S, grp, 'reader', 'alice')).resolves.toEqual(VERSIONED);
       expect(await roleOf(grp)).toBe('reader');
     });
 
@@ -349,14 +351,14 @@ d('ServiceSpaceService member mutations on real Postgres (#486)', () => {
       await pg`insert into group_users (user_id, group_id) values (${await shadow('carol')}, ${GROUP})`;
       const grp = await member(S, { groupId: GROUP }, 'reader');
       const bob = await member(S, { userId: await shadow('bob') }, 'reader');
-      await expect(svc.changeMemberRole(S, grp, 'admin', 'alice')).resolves.toBeUndefined();
-      await expect(svc.changeMemberRole(S, bob, 'writer', 'alice')).resolves.toBeUndefined();
+      await expect(svc.changeMemberRole(S, grp, 'admin', 'alice')).resolves.toEqual(VERSIONED);
+      await expect(svc.changeMemberRole(S, bob, 'writer', 'alice')).resolves.toEqual(VERSIONED);
       expect([await roleOf(grp), await roleOf(bob)]).toEqual(['admin', 'writer']);
     });
 
     it('PATCH: an actor that was never provisioned is covered by nothing, and is not created', async () => {
       const grp = await member(S, { groupId: GROUP }, 'reader');
-      await expect(svc.changeMemberRole(S, grp, 'writer', 'nobody')).resolves.toBeUndefined();
+      await expect(svc.changeMemberRole(S, grp, 'writer', 'nobody')).resolves.toEqual(VERSIONED);
       const rows = await pg`select 1 from users where email = ${shadowEmailFor('nobody')}`;
       expect(rows).toHaveLength(0);
     });

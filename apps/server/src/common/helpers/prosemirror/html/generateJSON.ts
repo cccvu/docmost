@@ -1,7 +1,56 @@
 import type { Extensions } from '@tiptap/core';
 import { getSchema } from '@tiptap/core';
 import { type ParseOptions, DOMParser as PMDOMParser } from '@tiptap/pm/model';
-import { Window } from 'happy-dom';
+import {
+  type IFetchInterceptor,
+  type IOptionalBrowserSettings,
+  Window,
+} from 'happy-dom';
+
+/**
+ * CCC #621: the parse window must never reach the network.
+ *
+ * The HTML parsed here is untrusted (`/v1` page writes, MCP page tools, imports), and happy-dom loads what a
+ * browser would load: a connected `<iframe src>` navigates, a `<link rel=stylesheet|preload>` fetches, and an
+ * `<iframe srcdoc>` does both again in a child frame. Closing the window after the parse only races those
+ * requests; it does not stop them. So every loader is switched off, and the fetch layer that all of them share
+ * refuses whatever still reaches it. None of this changes how the DOM is built, so the ProseMirror output is
+ * the same.
+ */
+const DENY_ALL_FETCH: IFetchInterceptor = {
+  // Resolve to a network error: no socket is opened, and happy-dom's own task bookkeeping stays balanced.
+  beforeAsyncRequest: async ({ window }) => window.Response.error(),
+  beforeSyncRequest: ({ request }) => {
+    throw new Error(
+      `Network access is disabled for HTML parsing: ${request.url}`,
+    );
+  },
+};
+
+const networkIsolatedSettings = (): IOptionalBrowserSettings => ({
+  // No inline <script>, on* handler or javascript: URL runs. This is already the 20.x default; pinned here.
+  enableJavaScriptEvaluation: false,
+  // <script src>, <link rel=modulepreload>, <link rel=preload as=script>.
+  disableJavaScriptFileLoading: true,
+  // <link rel=stylesheet>, <link rel=preload as=style>.
+  disableCSSFileLoading: true,
+  // <iframe src>. Marked deprecated, but it is the flag HTMLIFrameElement still checks in happy-dom 20.x.
+  disableIframePageLoading: true,
+  navigation: {
+    disableMainFrameNavigation: true,
+    // The non-deprecated spelling of the iframe gate above.
+    disableChildFrameNavigation: true,
+    disableChildPageNavigation: true,
+    // A refused navigation does not change the frame's URL either.
+    disableFallbackToSetURL: true,
+  },
+  fetch: { interceptor: DENY_ALL_FETCH },
+});
+
+/** A happy-dom window that cannot make a network request. Close it with `happyDOM.close()` when done. */
+export function createNetworkIsolatedWindow(): Window {
+  return new Window({ settings: networkIsolatedSettings() });
+}
 
 /**
  * Generates a JSON object from the given HTML string and converts it into a Prosemirror node with content.
@@ -27,7 +76,7 @@ export function generateJSON(
     );
   }
 
-  const localWindow = new Window();
+  const localWindow = createNetworkIsolatedWindow();
   const localDOMParser = new localWindow.DOMParser();
   let result: Record<string, any>;
 

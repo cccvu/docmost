@@ -3,6 +3,9 @@ import { PageModule } from '../../core/page/page.module';
 import { PageAccessModule } from '../../core/page/page-access/page-access.module';
 import { CollaborationModule } from '../../collaboration/collaboration.module';
 import { ConditionalPageController } from './conditional-page.controller';
+import { ConditionalPageOpsController } from './conditional-page-ops.controller';
+import { IdempotencyLedgerModule } from '../idempotency/idempotency-ledger.module';
+import { IdempotentPageCreateController } from '../idempotency/idempotent-page-create.controller';
 
 /**
  * CCC authorization integration — NOT upstream Docmost code.
@@ -12,12 +15,20 @@ import { ConditionalPageController } from './conditional-page.controller';
  * PageAccessModule for the `validateCanEdit` re-check, and CollaborationModule for the gateway that routes
  * the conditional apply to the doc-owning node. PageRepo comes from the @Global DatabaseModule.
  *
+ * Also mounts the #616 atomic compare-and-write page operations (`ConditionalPageOpsController`: conditional trash /
+ * permanent delete / move / move-to-space / metadata update), which need the same PageService + PageAccessService;
+ * SpaceAbilityFactory (CaslModule), AUDIT_SERVICE and the attachment queue (QueueModule) are global.
+ *
+ * And the #616 keyed page create (`IdempotentPageCreateController`, `POST /api/pages/idempotent-create`, in
+ * authz/idempotency/), which needs the same PageService/PageAccessService plus the create-idempotency ledger
+ * (IdempotencyLedgerModule: its installer, sweep and service).
+ *
  * Mounted at the app root (app.module.ts — a documented composition seam) rather than via AuthzModule, for
  * the same reason as CollabDisconnectModule: to keep CollaborationModule's heavy graph out of the
  * database-module init chain.
  */
 @Module({
-  imports: [PageModule, PageAccessModule, CollaborationModule],
-  controllers: [ConditionalPageController],
+  imports: [PageModule, PageAccessModule, CollaborationModule, IdempotencyLedgerModule],
+  controllers: [ConditionalPageController, ConditionalPageOpsController, IdempotentPageCreateController],
 })
 export class ConditionalPageModule {}

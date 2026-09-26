@@ -23,11 +23,15 @@ import { AuthzOutboxInstaller } from './authz-outbox.installer';
 import { PageAuthzStateService } from './page-authz-state.service';
 import { PageRestrictionGuardInstaller } from './page-restriction-guard.installer';
 import { PageGuardConflictInterceptor } from './page-guard-conflict.interceptor';
+import { PageContentParser, ServicePageImportService } from './service-page-import.service';
 // Seam #5 (see UPSTREAM_MODIFICATIONS.md): SearchModule binds the SearchService token to PdpSearchService in
 // AUTHZ_MODE=remote. Importing it here lets ServiceSearchService inject that PDP-gated search — the binding
 // is module-local, so the token must be resolved through the module that exports it (a @Global rebind can't
 // win). No cycle: SearchModule imports no modules (its provider deps are all @Global).
 import { SearchModule } from '../core/search/search.module';
+// #616: the create-idempotency ledger (CCC authz/idempotency) for the keyed space create. Nest instantiates it once
+// with ConditionalPageModule's import, so its installer and sweep run once per process.
+import { IdempotencyLedgerModule } from '../authz/idempotency/idempotency-ledger.module';
 
 /**
  * CCC service-bridge — NOT upstream Docmost code.
@@ -42,7 +46,7 @@ import { SearchModule } from '../core/search/search.module';
  * ENFORCEMENT in native mode, not by the accident of a missing secret.
  */
 @Module({
-  imports: [SearchModule],
+  imports: [SearchModule, IdempotencyLedgerModule],
   controllers: [
     ServiceBridgeController,
     ServiceWorkspaceController,
@@ -68,6 +72,8 @@ import { SearchModule } from '../core/search/search.module';
     PageCycleGuardInstaller, // #485 (appended)
     PageAuthzStateService, // #545 (appended)
     PageRestrictionGuardInstaller, // #493/#545 (appended)
+    ServicePageImportService, // #616 import helpers (appended)
+    PageContentParser, // #616: parses through the app's PageService, resolved lazily (appended)
     // #493/#545: the page guards' DB refusals → 409 (inner to AppModule's audit interceptor; see the class).
     { provide: APP_INTERCEPTOR, useClass: PageGuardConflictInterceptor },
   ],

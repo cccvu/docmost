@@ -8,7 +8,8 @@
  * `/v1` and MCP reach the page and space-member ones through the platform's relay, and archive and service-member
  * changes through the service bridge.
  *
- * Deliberately NOT here (ADR 0026 §4, "eventual, bounded"): trash / permanent delete, space and group delete,
+ * Deliberately NOT here (ADR 0026 §4, "eventual, bounded"): trash / permanent delete (native and the #616
+ * `conditionalDelete`), the metadata-only update (`conditionalUpdateMeta` — title/icon change no access), space and group delete,
  * workspace-member delete and deactivate, and the purely widening routes (native add member, add group member).
  * Those still reach live sessions through the relay signal and the sweep.
  */
@@ -22,6 +23,9 @@ export const NARROWING_ROUTES: ReadonlySet<string> = new Set([
   // page structure: moving under a restricted parent, or to another space, narrows the subtree
   'PageController.movePage',
   'PageController.movePageToSpace',
+  // …and their #616 atomic compare-and-write twins (the platform relays a move carrying If-Match here)
+  'ConditionalPageOpsController.conditionalMove',
+  'ConditionalPageOpsController.conditionalMoveToSpace',
   // native space + group membership
   'SpaceController.removeSpaceMember',
   'SpaceController.updateSpaceMemberRole',

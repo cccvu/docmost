@@ -17,6 +17,7 @@ import {
   PageAncestors,
   PublicLabelSummary,
   PublicPageSummary,
+  PublicSpaceDetail,
   PublicSpaceSummary,
   ServiceContentService,
   SpaceCommentPolicy,
@@ -68,7 +69,7 @@ export class ServiceContentController {
   @RequireServiceScope(ServiceScope.ContentRead)
   async getSpace(
     @Param('spaceId', ParseUUIDPipe) spaceId: string,
-  ): Promise<PublicSpaceSummary> {
+  ): Promise<PublicSpaceDetail> {
     return this.content.getSpace(spaceId);
   }
 

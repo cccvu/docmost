@@ -2,9 +2,9 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Docmost Service Bridge (east-west)",
-    "version": "1.8.0",
+    "version": "1.9.0",
     "summary": "The east-west endpoints this Docmost fork EXPOSES to an integrating platform.",
-    "description": "These are the machine-to-machine endpoints the fork hosts for an integrating platform (the inverse direction of authorization-service.openapi.json, which the fork calls). They exist so an external identity/session broker can provision a fork-local shadow user and mint a Docmost session for it, re-check (and narrow) live realtime connections after a revocation, and (Phase C) administer workspace settings + spaces and read the content model WITHOUT the platform reaching into Docmost's database directly. They are NOT part of the public north-south API and are not browser-facing.\n\nMode: the whole surface is 404 unless the fork runs with AUTHZ_MODE=remote (RemoteOnlyGuard, checked BEFORE the secret). In AUTHZ_MODE=native there is no integrating platform and every route below returns 404 for all callers.\n\nAuth: every request carries a shared service secret in the x-authz-service-secret header (PLATFORM_AUTHZ_SERVICE_SECRET). Each /api/service/* route additionally requires exactly one least-privilege scope: session:mint, users:provision, users:resolve, workspace:read, workspace:settings:write, spaces:read, spaces:write, pages:read, pages:authz:read, content:read, content:search, attachments:read, changes:read. Today a single full-scope secret is issued; per-scope credentials can be added later with no contract change.\n\nSecurity properties an integrator must understand:\n  - Identity-mutating endpoints are keyed ONLY on the caller's opaque externalId. The fork derives the shadow email (externalId@shadow.wiki-v2.internal) and resolves its own default workspace, so a caller can never select an arbitrary Docmost identity, name a real/privileged/native account, or supply a workspace id. This is a strong narrowing, not impersonation.\n  - The platform is the authorization authority: it performs the PDP decision (space/workspace administer, or the filter-then-retrieve authorized-id set) BEFORE calling these endpoints. The content read endpoints are a PRIVILEGED DATA PLANE, not a second gate: they return metadata for exactly the supplied ids and do NOT re-authorize. The security of the caller's /v1 surface rests entirely on it passing an authorized id set.\n  - Fail-closed: not remote -> 404; unconfigured secret -> 503; missing/wrong secret -> 401; wrong scope -> 403; over the per-credential rate limit -> 429; invalid body -> 400.\n\nResponse shape (incident #181): every 2xx body is EXACTLY the schema declared for its operation. The fork's global { data, success, status } response envelope (upstream TransformHttpResponseInterceptor) is skipped on this whole surface via per-handler @SkipTransform(); an integrator that receives an envelope is talking to a mis-built fork. Bring-up precondition: until Docmost first-run setup (POST /api/auth/setup) has created a workspace row, EVERY operation answers HTTP 404 with message exactly \"Workspace not found\" (an upstream pre-handler that runs before the service-bridge guards). That status + message pair is the ONLY response a consumer may treat as \"no workspace provisioned yet\"; any other 404 (e.g. the bare \"Not Found\" the fork answers when not in AUTHZ_MODE=remote) is a configuration error, and any 2xx body that does not match its declared schema is a contract violation the consumer must fail closed on.\n\nAccess-narrowing propagation (1.6.0, #501): a successful response from a route that can take access away (archiveSpace, addSpaceMember — an upsert can demote —, changeSpaceMemberRole, removeSpaceMember; and the native narrowing routes the integrator relays) carries `Authz-Propagation: confirmed | pending`. `confirmed` = the fork asked the integrator's OPTIONAL `POST /sync/settle` (authorization-service.openapi.json) and it answered that every access change committed up to this response is enforced; `pending` = the change is committed but could not be shown enforced within the bound (an integrator without /sync/settle always gets `pending`). The header never changes the status or the body, and it is absent in AUTHZ_MODE=native or when AUTHZ_NARROWING_SETTLE_TIMEOUT_MS=0. A consumer must treat an ABSENT header as unknown, never as confirmed.\n\nPage structure (1.7.0, wiki-v2 #493/#545): `POST /api/service/authz/pages/state` serves the CURRENT authorization structure of pages (placement, restriction, restriction lineage), so an integrator can project it level-triggered instead of trusting event payloads. And in AUTHZ_MODE=remote the fork installs database guards that refuse to take a restriction away by anything but an explicit unrestrict or a purge: a native move-to-space of a restricted page or of a page in a restricted section, and a re-parent or restore-detach that takes an unrestricted page out from under its last restricted ancestor. The native routes the integrator relays answer those refusals (and a move cycle) with `409 { message, code }`, `code` one of `ccc_page_no_cycle`, `ccc_page_restricted_space_move`, `ccc_page_restriction_strip`; the whole write is rolled back.\n\nKnowledge reads (1.8.0, wiki-v2 #615): `listContentPages` gains page filters (`labelName`, `lastUpdatedById`, the created range, `topLevel`, `descendantOf` + `maxDepth`, `linksTo` / `linkedFrom`), a `position` sort (sibling order) and a wire-only creator / last-editor projection (Docmost user ids + display names, for the integrator to map to its own identities); and four new content:read operations serve a page's ancestor ids (`pageAncestors`), the page labels on an authorized page set (`listContentLabels`), the activity feed over an authorized page set (`listContentActivity`), and a space's viewer-comment setting (`getSpaceCommentPolicy`). Like the other content reads they are a PRIVILEGED DATA PLANE: every one is pinned to the supplied authorized ids (live, in the workspace) and none re-authorizes; the ancestor ids and the comment setting are FACTS the integrator must authorize or combine with its own decision before showing anything. `searchContent` (the authorization gate, not a data plane) gains the same candidate filters (`parentPageId`, `labelName`, `lastUpdatedById`, the updated range, beside `creatorId`), applied in the candidate SQL BEFORE the authorization windows, answers `{items, hasMore}` (`hasMore` is a one-row peek past the page, never a count), and takes an optional `serviceSubjectId`: an on-behalf-of service account's platform principal id, for which the fork gates every window too (`POST /authz/filter-resources` with `{principalId, subjectType: 'service'}`), so the page and `hasMore` are service ∩ user.",
+    "description": "These are the machine-to-machine endpoints the fork hosts for an integrating platform (the inverse direction of authorization-service.openapi.json, which the fork calls). They exist so an external identity/session broker can provision a fork-local shadow user and mint a Docmost session for it, re-check (and narrow) live realtime connections after a revocation, and (Phase C) administer workspace settings + spaces and read the content model WITHOUT the platform reaching into Docmost's database directly. They are NOT part of the public north-south API and are not browser-facing.\n\nMode: the whole surface is 404 unless the fork runs with AUTHZ_MODE=remote (RemoteOnlyGuard, checked BEFORE the secret). In AUTHZ_MODE=native there is no integrating platform and every route below returns 404 for all callers.\n\nAuth: every request carries a shared service secret in the x-authz-service-secret header (PLATFORM_AUTHZ_SERVICE_SECRET). Each /api/service/* route additionally requires exactly one least-privilege scope: session:mint, users:provision, users:resolve, workspace:read, workspace:settings:write, spaces:read, spaces:write, pages:read, pages:authz:read, pages:import:read, content:read, content:search, attachments:read, changes:read. Today a single full-scope secret is issued; per-scope credentials can be added later with no contract change.\n\nSecurity properties an integrator must understand:\n  - Identity-mutating endpoints are keyed ONLY on the caller's opaque externalId. The fork derives the shadow email (externalId@shadow.wiki-v2.internal) and resolves its own default workspace, so a caller can never select an arbitrary Docmost identity, name a real/privileged/native account, or supply a workspace id. This is a strong narrowing, not impersonation.\n  - The platform is the authorization authority: it performs the PDP decision (space/workspace administer, or the filter-then-retrieve authorized-id set) BEFORE calling these endpoints. The content read endpoints are a PRIVILEGED DATA PLANE, not a second gate: they return metadata for exactly the supplied ids and do NOT re-authorize. The security of the caller's /v1 surface rests entirely on it passing an authorized id set.\n  - Fail-closed: not remote -> 404; unconfigured secret -> 503; missing/wrong secret -> 401; wrong scope -> 403; over the per-credential rate limit -> 429; invalid body -> 400.\n\nResponse shape (incident #181): every 2xx body is EXACTLY the schema declared for its operation. The fork's global { data, success, status } response envelope (upstream TransformHttpResponseInterceptor) is skipped on this whole surface via per-handler @SkipTransform(); an integrator that receives an envelope is talking to a mis-built fork. Bring-up precondition: until Docmost first-run setup (POST /api/auth/setup) has created a workspace row, EVERY operation answers HTTP 404 with message exactly \"Workspace not found\" (an upstream pre-handler that runs before the service-bridge guards). That status + message pair is the ONLY response a consumer may treat as \"no workspace provisioned yet\"; any other 404 (e.g. the bare \"Not Found\" the fork answers when not in AUTHZ_MODE=remote) is a configuration error, and any 2xx body that does not match its declared schema is a contract violation the consumer must fail closed on.\n\nAccess-narrowing propagation (1.6.0, #501): a successful response from a route that can take access away (archiveSpace, addSpaceMember — an upsert can demote —, changeSpaceMemberRole, removeSpaceMember; and the native narrowing routes the integrator relays) carries `Authz-Propagation: confirmed | pending`. `confirmed` = the fork asked the integrator's OPTIONAL `POST /sync/settle` (authorization-service.openapi.json) and it answered that every access change committed up to this response is enforced; `pending` = the change is committed but could not be shown enforced within the bound (an integrator without /sync/settle always gets `pending`). The header never changes the status or the body, and it is absent in AUTHZ_MODE=native or when AUTHZ_NARROWING_SETTLE_TIMEOUT_MS=0. A consumer must treat an ABSENT header as unknown, never as confirmed.\n\nPage structure (1.7.0, wiki-v2 #493/#545): `POST /api/service/authz/pages/state` serves the CURRENT authorization structure of pages (placement, restriction, restriction lineage), so an integrator can project it level-triggered instead of trusting event payloads. And in AUTHZ_MODE=remote the fork installs database guards that refuse to take a restriction away by anything but an explicit unrestrict or a purge: a native move-to-space of a restricted page or of a page in a restricted section, and a re-parent or restore-detach that takes an unrestricted page out from under its last restricted ancestor. The native routes the integrator relays answer those refusals (and a move cycle) with `409 { message, code }`, `code` one of `ccc_page_no_cycle`, `ccc_page_restricted_space_move`, `ccc_page_restriction_strip`; the whole write is rolled back.\n\nKnowledge reads (1.8.0, wiki-v2 #615): `listContentPages` gains page filters (`labelName`, `lastUpdatedById`, the created range, `topLevel`, `descendantOf` + `maxDepth`, `linksTo` / `linkedFrom`), a `position` sort (sibling order) and a wire-only creator / last-editor projection (Docmost user ids + display names, for the integrator to map to its own identities); and four new content:read operations serve a page's ancestor ids (`pageAncestors`), the page labels on an authorized page set (`listContentLabels`), the activity feed over an authorized page set (`listContentActivity`), and a space's viewer-comment setting (`getSpaceCommentPolicy`). Like the other content reads they are a PRIVILEGED DATA PLANE: every one is pinned to the supplied authorized ids (live, in the workspace) and none re-authorizes; the ancestor ids and the comment setting are FACTS the integrator must authorize or combine with its own decision before showing anything. `searchContent` (the authorization gate, not a data plane) gains the same candidate filters (`parentPageId`, `labelName`, `lastUpdatedById`, the updated range, beside `creatorId`), applied in the candidate SQL BEFORE the authorization windows, answers `{items, hasMore}` (`hasMore` is a one-row peek past the page, never a count), and takes an optional `serviceSubjectId`: an on-behalf-of service account's platform principal id, for which the fork gates every window too (`POST /authz/filter-resources` with `{principalId, subjectType: 'service'}`), so the page and `hasMore` are service ∩ user.\n\nConditional page operations (1.9.0, wiki-v2 #616): `pageLifecycleState` also reports the page's own `position`. And, beside the native page routes an integrator relays as the acting user (NOT part of this /api/service surface), the fork serves atomic compare-and-write twins — `POST /api/pages/conditional-delete`, `conditional-move`, `conditional-move-to-space`, `conditional-update-meta` — each taking the native body plus `expectedEtags` (1..8 opaque page versions, each at most 128 characters, or exactly [\"*\"] = the page exists). The version is compared inside the write's transaction under the page row lock: a stale one answers `412 { code: precondition_failed }` with nothing changed; a write that already happened answers `200 { outcome: noop, pageId }` (never for a permanent delete); otherwise `200 { outcome: applied, pageId }` (inside the upstream response envelope). A busy engine (lock or statement timeout, deadlock, too many in flight) answers a retryable `503 { code: engine_busy }`. A fork without these routes answers the framework's plain 404, which an integrator must treat as \"upgrade pending\", never as page-not-found. Versions and previews (1.9.0, wiki-v2 #616): the space detail (`getSpace`, `getContentSpace`), every space membership (`listSpaceMembers`, `addSpaceMember`) and a page's ACL (`listPagePermissions`, with `restricted`) carry an opaque `version` (64 hex). `updateSpace`, `archiveSpace`, `changeSpaceMemberRole` and `removeSpaceMember` take an optional `expectedVersion` (a version, or `*` = it exists), compared inside the write's transaction under its row lock: stale → `412 { code: precondition_failed }` with nothing changed; a rename, archive and role change answer the new version. The same holds for the page-ACL routes an integrator relays as the acting user (NOT part of this /api/service surface, inside the upstream `{ data, success }` envelope): `POST /api/pages/restrict`, `remove-restriction`, `add-permission`, `remove-permission`, `update-permission` each take the native body plus an optional `expectedVersion` (the ACL version), run as ONE transaction under a per-page lock, and answer `{ restricted | success, version, effect: { restrictedBefore, restrictedAfter, added[], changed[], removed[], retainedRole? } }` (grantees as Docmost user / group ids). `POST /api/pages/restriction-preview` `{ pageId, action: restrict | unrestrict | add | remove | update, …that route's body }` runs the real write and rolls it back (nothing survives — no row, no outbox row, no cache invalidation) and answers `{ outcome: would_apply | noop | refused, code?, version (the CURRENT one), effect }`; `previewSpaceMember` is its member-write twin here. A preview is never a narrowing route. A busy engine answers a retryable `503 { code: engine_busy }`. Keyed creates (1.9.0, wiki-v2 #616): `createSpace` takes an optional `idempotencyKey` + `idempotencyNamespace` + `fingerprint` (all three or none) and records the key in the space insert's own transaction, bound to the workspace, the authenticating service credential and the creator; a repeat answers the space it created with `replayed: true` and re-runs nothing, the same key with another fingerprint is `409 { code: idempotency_key_reused }`. Its page twin, relayed as the acting user (NOT part of this /api/service surface, inside the upstream envelope), is `POST /api/pages/idempotent-create`. Import helpers (1.9.0, wiki-v2 #616; scope `pages:import:read`, its own smaller rate bucket): `validateImportContent` parses each item exactly as a create would and answers per-item `ok` or a code, never content; `pageTitleCandidates` answers the live children of a parent whose title is an input title or `<title> (n)`, as ids and indices only.",
     "license": { "name": "AGPL-3.0-only", "identifier": "AGPL-3.0-only" },
     "x-canonical": true
   },
@@ -263,19 +263,20 @@
         "operationId": "createSpace",
         "tags": ["spaces"],
         "summary": "Create a space and add the creator as its admin member (atomically).",
-        "description": "Both the space row and the creator-admin member row are written in ONE transaction so the outbox projects them together. The creator is resolved from creatorExternalId. Scope: spaces:write.",
+        "description": "Both the space row and the creator-admin member row are written in ONE transaction so the outbox projects them together. The creator is resolved from creatorExternalId. Keyed create (1.9.0, wiki-v2 #616): with `idempotencyKey` + `idempotencyNamespace` + `fingerprint` (all three or none) the key is recorded in the fork's idempotency ledger in the space insert's own transaction, for at least 24h, bound to the workspace, the service credential that authenticated the call, the creator (the acting human, as its shadow user) and `idempotencyNamespace` — so no other caller can ever be answered this space. First use → the created space with `replayed: false`; the same key and fingerprint again → the space that call created (archived or not) with `replayed: true`, and NOTHING re-runs (no space or member row, no outbox row; only the creator's idempotent shadow-user upsert runs, as on every call); the same key with another fingerprint → 409 `idempotency_key_reused`; that space since removed → 404 `idempotency_resource_gone`; a same-key call still in flight past the lock bound → 503 `engine_busy`. A keyed create skips the friendly slug pre-check (its own committed space holds the slug); a slug held by another space is still a 409. Without the key: unchanged, and the body carries no `replayed`. Scope: spaces:write.",
         "requestBody": { "required": true, "content": { "application/json": {
           "schema": { "$ref": "#/components/schemas/CreateSpaceRequest" },
           "example": { "name": "Engineering", "creatorExternalId": "ext-abc123" }
         } } },
         "responses": {
-          "200": { "description": "The created space.", "content": { "application/json": { "schema": { "type": "object", "required": ["id", "slug", "name"], "properties": { "id": { "type": "string", "format": "uuid" }, "slug": { "type": "string" }, "name": { "type": ["string", "null"] } } } } } },
+          "200": { "description": "The created space (or, on a keyed replay, the space the key created).", "content": { "application/json": { "schema": { "type": "object", "required": ["id", "slug", "name"], "properties": { "id": { "type": "string", "format": "uuid" }, "slug": { "type": "string" }, "name": { "type": ["string", "null"] }, "replayed": { "type": "boolean", "description": "Present only on a keyed create (1.9.0, #616): false = this call created the space; true = an earlier call with the same key did, and nothing was re-run." } } } } } },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" },
-          "409": { "$ref": "#/components/responses/Conflict" },
+          "404": { "$ref": "#/components/responses/IdempotentResourceGone" },
+          "409": { "$ref": "#/components/responses/CreateSpaceConflict" },
           "429": { "$ref": "#/components/responses/RateLimited" },
-          "503": { "$ref": "#/components/responses/Unconfigured" }
+          "503": { "$ref": "#/components/responses/UnconfiguredOrBusy" }
         }
       }
     },
@@ -285,9 +286,9 @@
         "operationId": "getSpace",
         "tags": ["spaces"],
         "summary": "Space detail (with member count).",
-        "description": "Scope: spaces:read.",
+        "description": "Also carries the space's `version` (1.9.0, wiki-v2 #616): the value a rename or archive sends back as `expectedVersion`. Scope: spaces:read.",
         "responses": {
-          "200": { "description": "The space.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SpaceView" } } } },
+          "200": { "description": "The space.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SpaceDetail" } } } },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" },
@@ -299,16 +300,17 @@
         "operationId": "updateSpace",
         "tags": ["spaces"],
         "summary": "Rename / re-describe a space (slug is stable).",
-        "description": "Scope: spaces:write.",
+        "description": "Answers the space's new `version`. With `expectedVersion` (1.9.0, #616) the space row is locked and the version compared first: stale → 412 `precondition_failed`, nothing changed. Scope: spaces:write.",
         "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/UpdateSpaceRequest" } } } },
         "responses": {
-          "200": { "$ref": "#/components/responses/Ok" },
+          "200": { "$ref": "#/components/responses/OkVersioned" },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" },
+          "412": { "$ref": "#/components/responses/PreconditionFailed" },
           "429": { "$ref": "#/components/responses/RateLimited" },
-          "503": { "$ref": "#/components/responses/Unconfigured" }
+          "503": { "$ref": "#/components/responses/UnconfiguredOrBusy" }
         }
       }
     },
@@ -318,14 +320,17 @@
         "operationId": "archiveSpace",
         "tags": ["spaces"],
         "summary": "Archive a space (reversible soft-delete).",
-        "description": "Narrows access (a plain member loses the space), so the response carries Authz-Propagation. Scope: spaces:write.",
+        "description": "Narrows access (a plain member loses the space), so the response carries Authz-Propagation. Answers the archived space's `version`. The body is optional (none = as before); with `expectedVersion` (1.9.0, #616) the version is compared under the space row lock: stale → 412 `precondition_failed`, nothing changed. Scope: spaces:write.",
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ExpectedVersionRequest" } } } },
         "responses": {
-          "200": { "$ref": "#/components/responses/OkNarrowing" },
+          "200": { "$ref": "#/components/responses/OkVersionedNarrowing" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" },
+          "412": { "$ref": "#/components/responses/PreconditionFailed" },
           "429": { "$ref": "#/components/responses/RateLimited" },
-          "503": { "$ref": "#/components/responses/Unconfigured" }
+          "503": { "$ref": "#/components/responses/UnconfiguredOrBusy" }
         }
       }
     },
@@ -353,7 +358,7 @@
         "operationId": "listSpaceMembers",
         "tags": ["spaces"],
         "summary": "Raw space members (Docmost user/group ids).",
-        "description": "Returns Docmost user/group ids ONLY; the platform maps user ids back to its own identities. Opt-in keyset paging: send `limit` (+ optional `beforeCreatedAt`/`beforeId` cursor) to page over `(created_at, id)` ascending — up to limit+1 rows; omit `limit` for all members (the default). The response shape is unchanged (a bare array) either way. Scope: spaces:read.",
+        "description": "Returns Docmost user/group ids ONLY; the platform maps user ids back to its own identities. Opt-in keyset paging: send `limit` (+ optional `beforeCreatedAt`/`beforeId` cursor) to page over `(created_at, id)` ascending — up to limit+1 rows; omit `limit` for all members (the default). The response shape is unchanged (a bare array) either way. Each member carries its `version` (1.9.0, #616): what a role change or removal sends back as `expectedVersion`. Scope: spaces:read.",
         "parameters": [
           { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 200 }, "description": "Opt-in: page size (returns up to limit+1); omit for all rows." },
           { "name": "beforeCreatedAt", "in": "query", "required": false, "schema": { "type": "string", "format": "date-time" }, "description": "Keyset cursor bound (last kept row's createdAt). Requires beforeId + limit." },
@@ -372,13 +377,13 @@
         "operationId": "addSpaceMember",
         "tags": ["spaces"],
         "summary": "Add (or re-add / re-role) a shadow user as a space member.",
-        "description": "The member + adder are resolved from their externalIds. An UPSERT: an existing member (a soft-deleted one included) is re-roled, so this can also demote. It runs under the space row lock and refuses (403, code `self_grant`) adding yourself or raising your own membership (member == adder; a soft-deleted row ranks as none), and (409) demoting the last live admin. Scope: spaces:write.",
+        "description": "The member + adder are resolved from their externalIds. An UPSERT: an existing member (a soft-deleted one included) is re-roled, so this can also demote. It runs under the space row lock and refuses (403, code `self_grant`) adding yourself or raising your own membership (member == adder; a soft-deleted row ranks as none), and (409) demoting the last live admin. Answers the membership's `version` (1.9.0, #616); an add takes no `expectedVersion` (there is no version before it). Scope: spaces:write.",
         "requestBody": { "required": true, "content": { "application/json": {
           "schema": { "$ref": "#/components/schemas/AddSpaceMemberRequest" },
           "example": { "externalId": "ext-def456", "role": "writer", "addedByExternalId": "ext-abc123" }
         } } },
         "responses": {
-          "200": { "description": "The upserted member.", "headers": { "Authz-Propagation": { "$ref": "#/components/headers/AuthzPropagation" } }, "content": { "application/json": { "schema": { "type": "object", "required": ["memberId", "userId"], "properties": { "memberId": { "type": "string", "format": "uuid" }, "userId": { "type": "string", "format": "uuid" } } } } } },
+          "200": { "description": "The upserted member.", "headers": { "Authz-Propagation": { "$ref": "#/components/headers/AuthzPropagation" } }, "content": { "application/json": { "schema": { "type": "object", "required": ["memberId", "userId", "version"], "properties": { "memberId": { "type": "string", "format": "uuid" }, "userId": { "type": "string", "format": "uuid" }, "version": { "$ref": "#/components/schemas/Version" } } } } } },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/MemberWriteForbidden" },
@@ -386,6 +391,28 @@
           "409": { "$ref": "#/components/responses/LastAdmin" },
           "429": { "$ref": "#/components/responses/RateLimited" },
           "503": { "$ref": "#/components/responses/Unconfigured" }
+        }
+      }
+    },
+    "/api/service/spaces/{spaceId}/members/preview": {
+      "parameters": [{ "name": "spaceId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
+      "post": {
+        "operationId": "previewSpaceMember",
+        "tags": ["spaces"],
+        "summary": "What a member add / role change / removal would do (1.9.0, wiki-v2 #616).",
+        "description": "Decided exactly as the real write decides it (rule M, the last-admin guard, the `expectedVersion` compare), in a transaction under the same locks that is then rolled back: nothing is written, no shadow user is provisioned (identities are only looked up), no outbox row survives. `version` is the membership's CURRENT version (null when there is no row). A state-dependent refusal is `200 { outcome: refused, code }` — `code` one of `self_grant`, `last_admin`, `member_not_found`, `space_archived`, `precondition_failed`; a missing space is a 404 and a malformed body (or a field the action requires, missing) a 400, as on the real route. Not a narrowing route (no Authz-Propagation). A fork without this route answers the framework's plain 404 — never read that as space-not-found. Scope: spaces:write (the scope of the write it previews).",
+        "requestBody": { "required": true, "content": { "application/json": {
+          "schema": { "$ref": "#/components/schemas/SpaceMemberPreviewRequest" },
+          "example": { "action": "update", "memberId": "44444444-4444-4444-8444-444444444444", "role": "reader", "actorExternalId": "ext-abc123" }
+        } } },
+        "responses": {
+          "200": { "description": "The preview.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SpaceMemberPreview" } } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/UnconfiguredOrBusy" }
         }
       }
     },
@@ -398,35 +425,39 @@
         "operationId": "changeSpaceMemberRole",
         "tags": ["spaces"],
         "summary": "Change a member's space role.",
-        "description": "The acting identity (actorExternalId) is REQUIRED — a request without it is a 400. Under the space row lock: 404 when memberId is not a live member of THIS space; 403 (code `self_grant`) when the row covers the actor (their own user row, or a group row they belong to) and the new role outranks its current one — narrowing is allowed; 409 when it would demote the last live admin. Scope: spaces:write.",
+        "description": "The acting identity (actorExternalId) is REQUIRED — a request without it is a 400. Under the space row lock: 404 when memberId is not a live member of THIS space; 403 (code `self_grant`) when the row covers the actor (their own user row, or a group row they belong to) and the new role outranks its current one — narrowing is allowed; 409 when it would demote the last live admin. Answers the membership's new `version`. With `expectedVersion` (1.9.0, #616) it is compared under the row lock, right after the row is found and before rule M and the last-admin guard: stale → 412 `precondition_failed`, nothing changed. Scope: spaces:write.",
         "requestBody": { "required": true, "content": { "application/json": {
           "schema": { "$ref": "#/components/schemas/UpdateSpaceMemberRequest" },
           "example": { "role": "reader", "actorExternalId": "ext-abc123" }
         } } },
         "responses": {
-          "200": { "$ref": "#/components/responses/OkNarrowing" },
+          "200": { "$ref": "#/components/responses/OkVersionedNarrowing" },
           "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/MemberWriteForbidden" },
           "404": { "$ref": "#/components/responses/NotFound" },
           "409": { "$ref": "#/components/responses/LastAdmin" },
+          "412": { "$ref": "#/components/responses/PreconditionFailed" },
           "429": { "$ref": "#/components/responses/RateLimited" },
-          "503": { "$ref": "#/components/responses/Unconfigured" }
+          "503": { "$ref": "#/components/responses/UnconfiguredOrBusy" }
         }
       },
       "delete": {
         "operationId": "removeSpaceMember",
         "tags": ["spaces"],
         "summary": "Remove a member from a space.",
-        "description": "Allowed on an archived space too. Removing yourself or a group you belong to is allowed. 409 when the member is the last live admin — on an archived space as well, where a direct admin row is the only administer path left. Scope: spaces:write.",
+        "description": "Allowed on an archived space too. Removing yourself or a group you belong to is allowed. 409 when the member is the last live admin — on an archived space as well, where a direct admin row is the only administer path left. The body is optional (none = as before); with `expectedVersion` (1.9.0, #616; a soft-deleted row's version is its `live: false` one) the version is compared under the row lock: stale → 412 `precondition_failed`, nothing changed. Scope: spaces:write.",
+        "requestBody": { "required": false, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ExpectedVersionRequest" } } } },
         "responses": {
           "200": { "$ref": "#/components/responses/OkNarrowing" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" },
           "409": { "$ref": "#/components/responses/LastAdmin" },
+          "412": { "$ref": "#/components/responses/PreconditionFailed" },
           "429": { "$ref": "#/components/responses/RateLimited" },
-          "503": { "$ref": "#/components/responses/Unconfigured" }
+          "503": { "$ref": "#/components/responses/UnconfiguredOrBusy" }
         }
       }
     },
@@ -492,20 +523,66 @@
         }
       }
     },
+    "/api/service/pages/validate-content": {
+      "post": {
+        "operationId": "validateImportContent",
+        "tags": ["pages"],
+        "summary": "Would each item parse as a page body? (1.9.0, #616 import helper; parses, writes nothing).",
+        "description": "Each item is parsed exactly as a page create parses it (Markdown → HTML → the network-inert HTML parse → ProseMirror JSON → schema check), sequentially, in the order given; nothing is written and no content, parse error or derived text is ever answered — only `{idx, ok}` or `{idx, ok: false, code}`, one per item, in item order. Codes: `too_large` — the item is over 524288 UTF-8 bytes, OR the call's byte budget ran out before it (1048576 parsed bytes in total, checked before each item; from that item on every item is `too_large`, unparsed); `parse_budget_exceeded` — the call's time budget (4 s of parsing, checked before each item) ran out before it, so it was NOT checked (from that item on every item is `parse_budget_exceeded`, unparsed): a statement about the engine's load, never about the content — retry the same request (the byte budget wins when both are spent at the same item); `empty_content` — the content is empty or whitespace only; `invalid_content` — it does not parse to a valid page body. At most 2 calls parse at once per fork process: a call that gets no slot within 2s answers 503 `engine_busy` (retryable). Scope: pages:import:read (its own, smaller rate bucket).",
+        "requestBody": { "required": true, "content": { "application/json": {
+          "schema": { "$ref": "#/components/schemas/ValidateContentRequest" },
+          "example": { "items": [{ "format": "markdown", "content": "# Notes\n\nHello" }, { "format": "html", "content": "" }] }
+        } } },
+        "responses": {
+          "200": { "description": "One result per item, in item order.", "content": { "application/json": {
+            "schema": { "type": "object", "required": ["results"], "properties": { "results": { "type": "array", "items": { "$ref": "#/components/schemas/ContentValidationResult" } } } },
+            "example": { "results": [{ "idx": 0, "ok": true }, { "idx": 1, "ok": false, "code": "empty_content" }] }
+          } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/UnconfiguredOrBusy" }
+        }
+      }
+    },
+    "/api/service/pages/title-candidates": {
+      "post": {
+        "operationId": "pageTitleCandidates",
+        "tags": ["pages"],
+        "summary": "Live children of a parent whose title is an input title or `<title> (n)` (1.9.0, #616 import helper).",
+        "description": "Reads the LIVE (not trashed) direct children of `parentPageId` in `spaceId` — or the space's root level when `parentPageId` is omitted or null — in the fork's workspace, and answers each child whose title equals `titles[titleIdx]` exactly (`suffix: null`) or is `${titles[titleIdx]} (${n})` for an integer n ≥ 2 written without leading zeros (`suffix: n`). Exact, case-sensitive and untrimmed. A title repeated in `titles` is answered under its first index. Only ids and indices are answered — never a title — and the integrator must keep only the matches its caller may view. Sorted by titleIdx, then suffix (null first), then pageId. At most 5000 children are read: a parent with more answers 503 `list_too_broad`; a read past its statement bound answers 503 `engine_busy`. A parent that is missing, trashed or in another space simply has no live children here. Scope: pages:import:read.",
+        "requestBody": { "required": true, "content": { "application/json": {
+          "schema": { "$ref": "#/components/schemas/TitleCandidatesRequest" },
+          "example": { "spaceId": "22222222-2222-2222-2222-222222222222", "parentPageId": null, "titles": ["Notes", "Plan"] }
+        } } },
+        "responses": {
+          "200": { "description": "The matching children, ids and indices only.", "content": { "application/json": {
+            "schema": { "type": "object", "required": ["matches"], "properties": { "matches": { "type": "array", "items": { "$ref": "#/components/schemas/TitleCandidate" } } } },
+            "example": { "matches": [{ "titleIdx": 0, "pageId": "33333333-3333-3333-3333-333333333333", "suffix": null }, { "titleIdx": 0, "pageId": "44444444-4444-4444-4444-444444444444", "suffix": 2 }] }
+          } } },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "429": { "$ref": "#/components/responses/RateLimited" },
+          "503": { "$ref": "#/components/responses/UnconfiguredBusyOrTooBroad" }
+        }
+      }
+    },
     "/api/service/pages/{pageId}/permissions": {
       "parameters": [{ "name": "pageId", "in": "path", "required": true, "schema": { "type": "string", "format": "uuid" } }],
       "get": {
         "operationId": "listPagePermissions",
         "tags": ["pages"],
         "summary": "The explicit ACL grants on a page.",
-        "description": "page_permissions joined to page_access; grantee by Docmost user/group id (the platform maps user ids to identities). Opt-in keyset paging: send `limit` (+ optional `beforeCreatedAt`/`beforeId` cursor) to page over `(pp.created_at, pp.id)` ascending — up to limit+1 items; omit `limit` for all grants (the default). The response shape ({items}) is unchanged either way. Scope: content:read.",
+        "description": "page_permissions joined to page_access; grantee by Docmost user/group id (the platform maps user ids to identities). Opt-in keyset paging: send `limit` (+ optional `beforeCreatedAt`/`beforeId` cursor) to page over `(pp.created_at, pp.id)` ascending — up to limit+1 items; omit `limit` for all grants (the default). Since 1.9.0 (wiki-v2 #616) the body also carries `restricted` (the page carries its own restriction) and the ACL's `version` — over the WHOLE ACL, not only the page of items — read with the items from one snapshot; that version is what the page restrict / grant / revoke / re-role routes take as `expectedVersion`. Scope: content:read.",
         "parameters": [
           { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 200 }, "description": "Opt-in: page size (returns up to limit+1); omit for all rows." },
           { "name": "beforeCreatedAt", "in": "query", "required": false, "schema": { "type": "string", "format": "date-time" }, "description": "Keyset cursor bound (last kept row's createdAt). Requires beforeId + limit." },
           { "name": "beforeId", "in": "query", "required": false, "schema": { "type": "string", "format": "uuid" }, "description": "Keyset cursor tiebreak (last kept row's id). Requires beforeCreatedAt + limit." }
         ],
         "responses": {
-          "200": { "description": "The ACL grants.", "content": { "application/json": { "schema": { "type": "object", "required": ["items"], "properties": { "items": { "type": "array", "items": { "$ref": "#/components/schemas/RawPagePermission" } } } } } } },
+          "200": { "description": "The ACL grants, whether the page is restricted, and the ACL version.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PagePermissions" } } } },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" },
           "429": { "$ref": "#/components/responses/RateLimited" },
@@ -592,9 +669,9 @@
         "operationId": "getContentSpace",
         "tags": ["content"],
         "summary": "A single space's public summary (active only).",
-        "description": "Scope: content:read.",
+        "description": "Also carries the space's `version` (1.9.0, wiki-v2 #616) — a digest over every field of the summary plus the archived state, so it is a strong validator for this representation and the value a rename or archive takes as `expectedVersion`. Scope: content:read.",
         "responses": {
-          "200": { "description": "The space summary.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PublicSpaceSummary" } } } },
+          "200": { "description": "The space summary with its version.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PublicSpaceDetail" } } } },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" },
@@ -929,6 +1006,23 @@
         "headers": { "Authz-Propagation": { "$ref": "#/components/headers/AuthzPropagation" } },
         "content": { "application/json": { "schema": { "type": "object", "required": ["ok"], "properties": { "ok": { "type": "boolean" } } } } }
       },
+      "OkVersioned": {
+        "description": "Success, with the resource's new version (1.9.0, #616).",
+        "content": { "application/json": { "schema": { "type": "object", "required": ["ok", "version"], "properties": { "ok": { "type": "boolean" }, "version": { "$ref": "#/components/schemas/Version" } } } } }
+      },
+      "OkVersionedNarrowing": {
+        "description": "Success, with the resource's new version (1.9.0, #616), on a route that can take access away (#501).",
+        "headers": { "Authz-Propagation": { "$ref": "#/components/headers/AuthzPropagation" } },
+        "content": { "application/json": { "schema": { "type": "object", "required": ["ok", "version"], "properties": { "ok": { "type": "boolean" }, "version": { "$ref": "#/components/schemas/Version" } } } } }
+      },
+      "PreconditionFailed": {
+        "description": "The `expectedVersion` sent is not the resource's current version (1.9.0, #616). Compared inside the write's transaction under its lock; nothing was changed. Re-read and decide again.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PreconditionFailedError" } } }
+      },
+      "UnconfiguredOrBusy": {
+        "description": "As Unconfigured; or (1.9.0, #616) the write could not get its lock in time, was chosen as a deadlock victim or ran past its statement bound — then the body carries code `engine_busy`, nothing was changed, and a retry may succeed.",
+        "content": { "application/json": { "schema": { "anyOf": [{ "$ref": "#/components/schemas/Error" }, { "$ref": "#/components/schemas/EngineBusyError" }] } } }
+      },
       "BadRequest": {
         "description": "Invalid body (bad shape, unknown key, or a value failing validation).",
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
@@ -948,6 +1042,18 @@
       "Conflict": {
         "description": "A uniqueness constraint is already taken (the space slug on create; on restore, the owner's one live personal space).",
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "UnconfiguredBusyOrTooBroad": {
+        "description": "As UnconfiguredOrBusy; or (1.9.0, #616) the parent has more live children than the scan bound — then the body carries code `list_too_broad` (a retry will not help until the parent has fewer children).",
+        "content": { "application/json": { "schema": { "anyOf": [{ "$ref": "#/components/schemas/Error" }, { "$ref": "#/components/schemas/EngineBusyError" }, { "$ref": "#/components/schemas/ListTooBroadError" }] } } }
+      },
+      "CreateSpaceConflict": {
+        "description": "The slug is already taken by another space; or (1.9.0, #616) a keyed create's `idempotencyKey` was already used with a different `fingerprint` — then the body is an IdempotencyKeyReusedError and nothing was written.",
+        "content": { "application/json": { "schema": { "anyOf": [{ "$ref": "#/components/schemas/Error" }, { "$ref": "#/components/schemas/IdempotencyKeyReusedError" }] } } }
+      },
+      "IdempotentResourceGone": {
+        "description": "As every route's workspace/mode 404; or (1.9.0, #616) a keyed create's replay whose space no longer exists — then the body is an IdempotencyResourceGoneError.",
+        "content": { "application/json": { "schema": { "anyOf": [{ "$ref": "#/components/schemas/Error" }, { "$ref": "#/components/schemas/IdempotencyResourceGoneError" }] } } }
       },
       "LastAdmin": {
         "description": "The write would leave the space with no live admin (user AND group admin rows count; soft-deleted rows do not). Promote another member to admin first.",
@@ -1065,15 +1171,32 @@
           "createdAt": { "type": "string", "format": "date-time" }
         }
       },
+      "SpaceDetail": {
+        "type": "object",
+        "description": "SpaceView plus the space's version (1.9.0, #616).",
+        "required": ["id", "name", "slug", "description", "visibility", "memberCount", "archived", "createdAt", "version"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "name": { "type": ["string", "null"] },
+          "slug": { "type": "string" },
+          "description": { "type": ["string", "null"] },
+          "visibility": { "type": "string" },
+          "memberCount": { "type": "integer" },
+          "archived": { "type": "boolean" },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "version": { "$ref": "#/components/schemas/Version" }
+        }
+      },
       "RawSpaceMember": {
         "type": "object",
-        "required": ["memberId", "userId", "groupId", "role", "createdAt"],
+        "required": ["memberId", "userId", "groupId", "role", "createdAt", "version"],
         "properties": {
           "memberId": { "type": "string", "format": "uuid" },
           "userId": { "type": ["string", "null"], "description": "Docmost user id (null for a group member)." },
           "groupId": { "type": ["string", "null"] },
           "role": { "type": "string" },
-          "createdAt": { "type": "string", "format": "date-time" }
+          "createdAt": { "type": "string", "format": "date-time" },
+          "version": { "$ref": "#/components/schemas/Version", "description": "The membership's version (1.9.0, #616): what a role change or removal sends back as `expectedVersion`." }
         }
       },
       "CreateSpaceRequest": {
@@ -1084,7 +1207,15 @@
           "name": { "type": "string", "minLength": 1, "maxLength": 120 },
           "slug": { "type": "string", "maxLength": 60 },
           "description": { "type": "string", "maxLength": 1000 },
-          "creatorExternalId": { "$ref": "#/components/schemas/ExternalId" }
+          "creatorExternalId": { "$ref": "#/components/schemas/ExternalId" },
+          "idempotencyKey": { "type": "string", "minLength": 1, "maxLength": 255, "description": "1.9.0 (#616): makes the create keyed. Only its sha256 is stored." },
+          "idempotencyNamespace": { "type": "string", "minLength": 1, "maxLength": 128, "description": "1.9.0 (#616): the integrator's opaque key namespace (e.g. its idempotency subject). Required with idempotencyKey." },
+          "fingerprint": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "1.9.0 (#616): sha256 hex of the integrator's stable request body; the same key with a different fingerprint is refused (409 idempotency_key_reused). Required with idempotencyKey." }
+        },
+        "dependentRequired": {
+          "idempotencyKey": ["idempotencyNamespace", "fingerprint"],
+          "idempotencyNamespace": ["idempotencyKey", "fingerprint"],
+          "fingerprint": ["idempotencyKey", "idempotencyNamespace"]
         }
       },
       "UpdateSpaceRequest": {
@@ -1092,7 +1223,16 @@
         "additionalProperties": false,
         "properties": {
           "name": { "type": "string", "minLength": 1, "maxLength": 120 },
-          "description": { "type": "string", "maxLength": 1000 }
+          "description": { "type": "string", "maxLength": 1000 },
+          "expectedVersion": { "$ref": "#/components/schemas/ExpectedVersion" }
+        }
+      },
+      "ExpectedVersionRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "The optional body of archiveSpace and removeSpaceMember (1.9.0, #616).",
+        "properties": {
+          "expectedVersion": { "$ref": "#/components/schemas/ExpectedVersion" }
         }
       },
       "AddSpaceMemberRequest": {
@@ -1111,7 +1251,43 @@
         "required": ["role", "actorExternalId"],
         "properties": {
           "role": { "$ref": "#/components/schemas/SpaceMemberRole" },
-          "actorExternalId": { "$ref": "#/components/schemas/ExternalId", "description": "The acting identity (wiki-v2 #486): compared against the member row to refuse a self-raising write; never written." }
+          "actorExternalId": { "$ref": "#/components/schemas/ExternalId", "description": "The acting identity (wiki-v2 #486): compared against the member row to refuse a self-raising write; never written." },
+          "expectedVersion": { "$ref": "#/components/schemas/ExpectedVersion" }
+        }
+      },
+      "SpaceMemberPreviewRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "description": "`action` plus the body of the member write it previews (1.9.0, #616): add → externalId, role, addedByExternalId; update → memberId, role, actorExternalId, expectedVersion?; remove → memberId, expectedVersion?. A field the action does not take is ignored; one it requires but lacks is a 400.",
+        "required": ["action"],
+        "properties": {
+          "action": { "enum": ["add", "update", "remove"] },
+          "externalId": { "$ref": "#/components/schemas/ExternalId" },
+          "addedByExternalId": { "$ref": "#/components/schemas/ExternalId" },
+          "memberId": { "type": "string", "format": "uuid" },
+          "role": { "$ref": "#/components/schemas/SpaceMemberRole" },
+          "actorExternalId": { "$ref": "#/components/schemas/ExternalId" },
+          "expectedVersion": { "$ref": "#/components/schemas/ExpectedVersion" }
+        }
+      },
+      "SpaceMemberPreview": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["outcome", "version", "effect"],
+        "properties": {
+          "outcome": { "enum": ["would_apply", "noop", "refused"] },
+          "code": { "enum": ["self_grant", "last_admin", "member_not_found", "space_archived", "precondition_failed"], "description": "Present exactly when outcome is refused." },
+          "version": { "type": ["string", "null"], "description": "The membership's CURRENT version; null when there is no membership row (or the refusal came before it was read)." },
+          "effect": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["roleBefore", "roleAfter", "provisionsAccount"],
+            "properties": {
+              "roleBefore": { "type": ["string", "null"], "description": "The live role now; null when not a live member." },
+              "roleAfter": { "type": ["string", "null"], "description": "The live role after; null when removed. Equals roleBefore when refused." },
+              "provisionsAccount": { "type": "boolean", "description": "An add would first create the member's shadow account (none exists yet). Always false when refused." }
+            }
+          }
         }
       },
       "ResolvePageSpaceRequest": {
@@ -1134,11 +1310,12 @@
       },
       "PageLifecycleState": {
         "type": "object",
-        "required": ["pageId", "spaceId", "parentPageId", "deletedAt", "parent", "restrictedAncestorIds", "ancestorsComplete", "selfRestricted", "descendants"],
+        "required": ["pageId", "spaceId", "parentPageId", "position", "deletedAt", "parent", "restrictedAncestorIds", "ancestorsComplete", "selfRestricted", "descendants"],
         "properties": {
           "pageId": { "type": "string", "format": "uuid" },
           "spaceId": { "type": "string", "format": "uuid" },
           "parentPageId": { "type": ["string", "null"], "format": "uuid" },
+          "position": { "type": ["string", "null"], "description": "The page's own sibling position (1.9.0, wiki-v2 #616): a move to the current parent at this position is a no-op." },
           "deletedAt": { "type": ["string", "null"], "format": "date-time" },
           "parent": { "type": ["object", "null"], "required": ["spaceId", "deletedAt"], "properties": { "spaceId": { "type": "string", "format": "uuid" }, "deletedAt": { "type": ["string", "null"], "format": "date-time" } } },
           "restrictedAncestorIds": { "type": "array", "items": { "type": "string", "format": "uuid" } },
@@ -1382,6 +1559,30 @@
           "updatedAt": { "type": "string", "format": "date-time" }
         }
       },
+      "PublicSpaceDetail": {
+        "type": "object",
+        "description": "PublicSpaceSummary plus the space's version (1.9.0, #616).",
+        "required": ["id", "name", "slug", "description", "visibility", "createdAt", "updatedAt", "version"],
+        "properties": {
+          "id": { "type": "string", "format": "uuid" },
+          "name": { "type": ["string", "null"] },
+          "slug": { "type": "string" },
+          "description": { "type": ["string", "null"] },
+          "visibility": { "type": ["string", "null"] },
+          "createdAt": { "type": "string", "format": "date-time" },
+          "updatedAt": { "type": "string", "format": "date-time" },
+          "version": { "$ref": "#/components/schemas/Version" }
+        }
+      },
+      "PagePermissions": {
+        "type": "object",
+        "required": ["items", "restricted", "version"],
+        "properties": {
+          "items": { "type": "array", "items": { "$ref": "#/components/schemas/RawPagePermission" } },
+          "restricted": { "type": "boolean", "description": "The page carries its own restriction (a `page_access` row)." },
+          "version": { "$ref": "#/components/schemas/Version", "description": "The page ACL's version (1.9.0, #616), over the whole ACL." }
+        }
+      },
       "RawPagePermission": {
         "type": "object",
         "required": ["id", "userId", "groupId", "role", "createdAt"],
@@ -1523,6 +1724,104 @@
         "properties": {
           "pages": { "type": "array", "items": { "$ref": "#/components/schemas/PageAuthzState" } },
           "nextAfter": { "type": ["string", "null"], "format": "uuid", "description": "Pass as `after` for the next page of a subtree or keyset read; null when done (always null for `pageIds`)." }
+        }
+      },
+      "Version": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$",
+        "description": "An opaque, fork-issued resource version (1.9.0, wiki-v2 #616): a digest of the resource's state. Only equality is meaningful; send it back unchanged as `expectedVersion`."
+      },
+      "ExpectedVersion": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 128,
+        "description": "A version the caller last read, or `*` (the resource exists). Compared inside the write's transaction under its lock; a stale one is a 412 `precondition_failed` with nothing changed. Omit it for the unconditional write."
+      },
+      "PreconditionFailedError": {
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "const": "precondition_failed" },
+          "message": { "type": "string" }
+        }
+      },
+      "EngineBusyError": {
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "const": "engine_busy" },
+          "message": { "type": "string" }
+        }
+      },
+      "ValidateContentRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["items"],
+        "properties": {
+          "items": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 50,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["format", "content"],
+              "properties": {
+                "format": { "type": "string", "enum": ["markdown", "html"] },
+                "content": { "type": "string", "description": "Up to 524288 UTF-8 bytes; larger is answered per item as `too_large` (the request body limit bounds the call)." }
+              }
+            }
+          }
+        }
+      },
+      "ContentValidationResult": {
+        "oneOf": [
+          { "type": "object", "additionalProperties": false, "required": ["idx", "ok"], "properties": { "idx": { "type": "integer", "minimum": 0 }, "ok": { "const": true } } },
+          { "type": "object", "additionalProperties": false, "required": ["idx", "ok", "code"], "properties": { "idx": { "type": "integer", "minimum": 0 }, "ok": { "const": false }, "code": { "type": "string", "enum": ["invalid_content", "too_large", "empty_content", "parse_budget_exceeded"] } } }
+        ]
+      },
+      "TitleCandidatesRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["spaceId", "titles"],
+        "properties": {
+          "spaceId": { "type": "string", "format": "uuid" },
+          "parentPageId": { "type": ["string", "null"], "format": "uuid", "description": "Omitted or null: the space's root level." },
+          "titles": { "type": "array", "minItems": 1, "maxItems": 50, "items": { "type": "string", "minLength": 1, "maxLength": 255 } }
+        }
+      },
+      "TitleCandidate": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["titleIdx", "pageId", "suffix"],
+        "properties": {
+          "titleIdx": { "type": "integer", "minimum": 0 },
+          "pageId": { "type": "string", "format": "uuid" },
+          "suffix": { "type": ["integer", "null"], "minimum": 2, "description": "null: the exact title; n: `<title> (n)`." }
+        }
+      },
+      "ListTooBroadError": {
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "const": "list_too_broad" },
+          "message": { "type": "string" }
+        }
+      },
+      "IdempotencyKeyReusedError": {
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "const": "idempotency_key_reused" },
+          "message": { "type": "string" }
+        }
+      },
+      "IdempotencyResourceGoneError": {
+        "type": "object",
+        "required": ["code", "message"],
+        "properties": {
+          "code": { "const": "idempotency_resource_gone" },
+          "message": { "type": "string" }
         }
       },
       "SelfGrantError": {

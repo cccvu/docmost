@@ -53,17 +53,23 @@ const EXPECTED_SCOPE: Record<string, ServiceScope> = {
   'ServiceSpaceController.list': ServiceScope.SpacesRead,
   'ServiceSpaceController.getDetail': ServiceScope.SpacesRead,
   'ServiceSpaceController.listMembers': ServiceScope.SpacesRead,
-  'ServiceSpaceController.create': ServiceScope.SpacesWrite,
+  'ServiceSpaceController.create': ServiceScope.SpacesWrite, // #616: keyed or not, the same write scope
   'ServiceSpaceController.update': ServiceScope.SpacesWrite,
   'ServiceSpaceController.archive': ServiceScope.SpacesWrite,
   'ServiceSpaceController.unarchive': ServiceScope.SpacesWrite,
   'ServiceSpaceController.addMember': ServiceScope.SpacesWrite,
   'ServiceSpaceController.changeMemberRole': ServiceScope.SpacesWrite,
   'ServiceSpaceController.removeMember': ServiceScope.SpacesWrite,
+  // #616: the member preview carries the SAME scope as the member write it previews (it writes nothing, but it must
+  // never be reachable by a credential that could not make the write).
+  'ServiceSpaceController.previewMember': ServiceScope.SpacesWrite,
   'ServicePageController.resolveSpace': ServiceScope.PagesRead,
   'ServicePageController.listPermissions': ServiceScope.ContentRead,
   'ServicePageController.lifecycleState': ServiceScope.PagesRead, // #485
   'ServicePageController.trash': ServiceScope.ContentRead, // #485
+  // #616 import helpers: their own read scope (and smaller rate bucket) — never pages:read / content:read.
+  'ServicePageController.validateContent': ServiceScope.PagesImportRead,
+  'ServicePageController.titleCandidates': ServiceScope.PagesImportRead,
   'ServiceContentController.listPages': ServiceScope.ContentRead,
   'ServiceContentController.listSpaces': ServiceScope.ContentRead,
   'ServiceContentController.getSpace': ServiceScope.ContentRead,

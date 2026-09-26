@@ -28,6 +28,9 @@ const make = (respond: (q: SpyQuery) => unknown[]) => {
 // Raw `sql` keeps its literal (unquoted, indented) text, so match with lowercased `includes`.
 const q = (s: string) => s.toLowerCase();
 
+/** #616: a rename / archive / role change now answers the resource's new version. */
+const VERSIONED = { version: expect.stringMatching(/^[0-9a-f]{64}$/) };
+
 describe('ServiceSpaceService.create — transactional atomicity', () => {
   it('rolls back the space row when the creator-member insert fails (no partial space)', async () => {
     // Force the SECOND insert (space_members) to fail INSIDE the transaction. The first insert (spaces) must
@@ -79,10 +82,138 @@ describe('ServiceSpaceService.create — transactional atomicity', () => {
   });
 });
 
+/**
+ * #616 — the KEYED create: the ledger reservation sits in the space insert's own bounded transaction; a replay re-runs
+ * nothing; a mismatch writes nothing; the key is bound to the service credential + the creator; no friendly slug
+ * pre-check (the retry's own space holds the slug); unkeyed stays byte-identical (no `replayed`).
+ */
+describe('ServiceSpaceService.create — keyed (#616)', () => {
+  const FP = 'f'.repeat(64);
+  const keyed = { name: 'Sp', creatorExternalId: 'ext-1', idempotencyKey: 'k-1', idempotencyNamespace: 'user:ext-1', fingerprint: FP };
+  const slot = { namespaceDigest: 'n'.repeat(64), op: 'space.create', keyDigest: 'd'.repeat(64) };
+
+  const makeKeyed = (reservation: unknown, respond: (q: SpyQuery) => unknown[] = () => [], reserveThrows?: unknown) => {
+    const spy = spyKysely(respond);
+    const order: string[] = [];
+    const b = bridge();
+    b.provisionShadowUser.mockImplementation(async ({ externalId }: { externalId: string }) => {
+      order.push(`provision:${spy.tx.join('>')}`);
+      return { userId: `docmost-${externalId}`, workspaceId: 'ws1' };
+    });
+    const ledger = {
+      reserve: jest.fn(async (_trx: unknown, _claim: unknown) => {
+        order.push(`reserve:${spy.tx.join('>')}`);
+        if (reserveThrows) throw reserveThrows;
+        return reservation;
+      }),
+      complete: jest.fn(async (_trx: unknown, s: unknown, id: string) => {
+        order.push(`complete:${id}`);
+        expect(s).toBe(slot);
+      }),
+    };
+    const svc = new ServiceSpaceService(spy.db, workspaces(), b, ledger as any);
+    return { svc, spy, ledger, order, b };
+  };
+  const inserts = (spy: { calls: SpyQuery[] }) =>
+    spy.calls.map((c) => q(c.sql)).filter((c) => c.includes('insert into')).map((c) => c.match(/insert into (\w+)/)![1]);
+
+  it('fresh: provision → BEGIN → SET LOCAL bounds → reserve → the SAME two inserts → complete → COMMIT; replayed:false', async () => {
+    const t = makeKeyed({ outcome: 'fresh', slot }, (query) =>
+      q(query.sql).includes('insert into spaces') ? [{ id: 'sp1', slug: 'sp', name: 'Sp' }] : [],
+    );
+    await expect(t.svc.create(keyed as any, 'shared')).resolves.toEqual({ id: 'sp1', slug: 'sp', name: 'Sp', replayed: false });
+    expect(t.order).toEqual(['provision:', 'reserve:begin', 'complete:sp1']);
+    expect(t.spy.calls.slice(0, 2).map((c) => c.sql)).toEqual([
+      "SET LOCAL lock_timeout = '2s'",
+      "SET LOCAL statement_timeout = '15s'",
+    ]);
+    expect(inserts(t.spy)).toEqual(['spaces', 'space_members']);
+    expect(t.spy.calls.some((c) => q(c.sql).includes('select 1 from spaces'))).toBe(false); // no friendly pre-check
+    expect(t.spy.tx).toEqual(['begin', 'commit']);
+    expect(t.ledger.reserve.mock.calls[0][1]).toEqual({
+      workspaceId: 'ws1',
+      principal: 'service:shared/user:docmost-ext-1', // the credential + the acting human, as the fork resolved it
+      namespace: 'user:ext-1',
+      op: 'space.create',
+      key: 'k-1',
+      fingerprint: FP,
+    });
+  });
+
+  it('replay: reads the space the key created; NO insert, NO complete; replayed:true', async () => {
+    const t = makeKeyed({ outcome: 'replay', resourceId: 'sp0' }, (query) =>
+      q(query.sql).includes('select id, slug, name from spaces') ? [{ id: 'sp0', slug: 'sp', name: 'Sp' }] : [],
+    );
+    await expect(t.svc.create(keyed as any, 'shared')).resolves.toEqual({ id: 'sp0', slug: 'sp', name: 'Sp', replayed: true });
+    expect(inserts(t.spy)).toEqual([]);
+    expect(t.ledger.complete).not.toHaveBeenCalled();
+    const read = t.spy.calls.find((c) => q(c.sql).includes('select id, slug, name from spaces'))!;
+    expect(read.parameters).toEqual(['sp0', 'ws1']); // workspace-scoped
+  });
+
+  it('replay of a space that is gone → 404 idempotency_resource_gone', async () => {
+    const t = makeKeyed({ outcome: 'replay', resourceId: 'sp0' });
+    const err = await t.svc.create(keyed as any, 'shared').catch((e) => e);
+    expect(err).toBeInstanceOf(NotFoundException);
+    expect(err.getResponse()).toMatchObject({ code: 'idempotency_resource_gone' });
+  });
+
+  it('mismatch → 409 idempotency_key_reused, rolled back, nothing inserted', async () => {
+    const t = makeKeyed({ outcome: 'mismatch' });
+    const err = await t.svc.create(keyed as any, 'shared').catch((e) => e);
+    expect(err).toBeInstanceOf(ConflictException);
+    expect(err.getResponse()).toMatchObject({ code: 'idempotency_key_reused' });
+    expect(inserts(t.spy)).toEqual([]);
+    expect(t.spy.tx).toEqual(['begin', 'rollback']);
+  });
+
+  it('a slug held by another space (23505) → the same 409 as unkeyed, and the reservation rolls back with it', async () => {
+    const t = makeKeyed({ outcome: 'fresh', slot }, (query) => {
+      if (q(query.sql).includes('insert into spaces')) throw Object.assign(new Error('dup'), { code: '23505' });
+      return [];
+    });
+    await expect(t.svc.create(keyed as any, 'shared')).rejects.toThrow('a space with the slug "sp" already exists');
+    expect(t.spy.tx).toEqual(['begin', 'rollback']);
+    expect(t.ledger.complete).not.toHaveBeenCalled();
+  });
+
+  it.each(['55P03', '40P01', '57014'])('a busy engine (%s) → 503 engine_busy', async (code) => {
+    const t = makeKeyed(undefined, () => [], Object.assign(new Error('busy'), { code }));
+    const err = await t.svc.create(keyed as any, 'shared').catch((e) => e);
+    expect(err.getStatus()).toBe(503);
+    expect(err.getResponse()).toMatchObject({ code: 'engine_busy' });
+  });
+
+  it('fails closed without an authenticated credential or an injected ledger: nothing provisioned, no transaction', async () => {
+    const noCred = makeKeyed({ outcome: 'fresh', slot });
+    await expect(noCred.svc.create(keyed as any)).rejects.toThrow(/keyed create unavailable/);
+    expect(noCred.b.provisionShadowUser).not.toHaveBeenCalled();
+    expect(noCred.spy.tx).toEqual([]);
+    const spy = spyKysely(() => []);
+    const noLedger = new ServiceSpaceService(spy.db, workspaces(), bridge());
+    await expect(noLedger.create(keyed as any, 'shared')).rejects.toThrow(/keyed create unavailable/);
+    expect(spy.tx).toEqual([]);
+  });
+
+  it('unkeyed: the pre-#616 statements, never the ledger, and no `replayed` in the body', async () => {
+    const t = makeKeyed({ outcome: 'fresh', slot }, (query) =>
+      q(query.sql).includes('insert into spaces') ? [{ id: 'sp1', slug: 'sp', name: 'Sp' }] : [],
+    );
+    const res = await t.svc.create({ name: 'Sp', creatorExternalId: 'ext-1' } as any, 'shared');
+    expect(Object.keys(res).sort()).toEqual(['id', 'name', 'slug']);
+    expect(t.ledger.reserve).not.toHaveBeenCalled();
+    expect(t.spy.calls.map((c) => q(c.sql).trim().split(/\s+/).slice(0, 3).join(' '))).toEqual([
+      'select 1 from',
+      'insert into spaces',
+      'insert into space_members',
+    ]);
+  });
+});
+
 describe('ServiceSpaceService.archive — reversible soft-delete', () => {
   it('sets deleted_at (soft delete), scoped to an ACTIVE space, and 404s a missing/archived one', async () => {
     const ok = make((query) => (q(query.sql).includes('update spaces set') ? [{ id: 'sp1' }] : []));
-    await expect(ok.svc.archive('sp1')).resolves.toBeUndefined();
+    await expect(ok.svc.archive('sp1')).resolves.toEqual(VERSIONED);
     const upd = ok.spy.calls.find((c) => q(c.sql).includes('update spaces set'))!;
     expect(q(upd.sql)).toContain('deleted_at = now()');
     expect(q(upd.sql)).toContain('deleted_at is null'); // only archives an active space
@@ -183,14 +314,14 @@ describe('ServiceSpaceService member mutations — last-admin invariant (#486)',
 
     it('commits the demotion when another live admin remains', async () => {
       const { svc, spy } = make(respondTo({ member: { role: 'admin' }, otherAdmins: 1 }));
-      await expect(svc.changeMemberRole('sp1', 'm1', 'reader', 'ext-actor')).resolves.toBeUndefined();
+      await expect(svc.changeMemberRole('sp1', 'm1', 'reader', 'ext-actor')).resolves.toEqual(VERSIONED);
       expect(spy.tx).toEqual(['begin', 'commit']);
       expect(ran(spy, 'update space_members')).toBe(true);
     });
 
     it('does not count admins for an admin→admin write (not a demotion)', async () => {
       const { svc, spy } = make(respondTo({ member: { role: 'admin' }, otherAdmins: 0 }));
-      await expect(svc.changeMemberRole('sp1', 'm1', 'admin', 'ext-actor')).resolves.toBeUndefined();
+      await expect(svc.changeMemberRole('sp1', 'm1', 'admin', 'ext-actor')).resolves.toEqual(VERSIONED);
       expect(ran(spy, 'count(*)::int')).toBe(false);
     });
 
@@ -253,7 +384,7 @@ describe('ServiceSpaceService member mutations — last-admin invariant (#486)',
 
     it('locks inside the transaction AFTER the pre-check and provisioning, then upserts on commit', async () => {
       const { svc, spy } = make(respondTo({ member: null }));
-      await expect(svc.addMember('sp1', dto('writer'))).resolves.toEqual({ memberId: 'm1', userId: 'docmost-ext-m' });
+      await expect(svc.addMember('sp1', dto('writer'))).resolves.toEqual({ memberId: 'm1', userId: 'docmost-ext-m', ...VERSIONED });
       expect(spy.tx).toEqual(['begin', 'commit']);
       expect(idx(spy, 'from spaces s')).toBeLessThan(idx(spy, 'for no key update')); // fast pre-check first
       expect(idx(spy, 'for no key update')).toBeLessThan(idx(spy, 'insert into space_members'));
@@ -346,7 +477,7 @@ describe('ServiceSpaceService member mutations — rule M, no self-raising write
 
     it('allows demoting your own row', async () => {
       const { svc, spy } = make(respondTo({ member: { role: 'admin', userId: ME }, otherAdmins: 1 }));
-      await expect(svc.changeMemberRole('sp1', 'm1', 'writer', 'ext-me')).resolves.toBeUndefined();
+      await expect(svc.changeMemberRole('sp1', 'm1', 'writer', 'ext-me')).resolves.toEqual(VERSIONED);
       expect(ran(spy, 'update space_members')).toBe(true);
     });
 
@@ -357,24 +488,24 @@ describe('ServiceSpaceService member mutations — rule M, no self-raising write
       expect(probe.parameters).toEqual(['g1', ME]);
 
       const notMine = make(respondTo({ member: { role: 'reader', groupId: 'g1' }, inGroup: false }));
-      await expect(notMine.svc.changeMemberRole('sp1', 'm1', 'writer', 'ext-me')).resolves.toBeUndefined();
+      await expect(notMine.svc.changeMemberRole('sp1', 'm1', 'writer', 'ext-me')).resolves.toEqual(VERSIONED);
     });
 
     it('allows demoting a group row the actor belongs to (narrowing never widens anyone)', async () => {
       const { svc, spy } = make(respondTo({ member: { role: 'admin', groupId: 'g1' }, inGroup: true, otherAdmins: 1 }));
-      await expect(svc.changeMemberRole('sp1', 'm1', 'reader', 'ext-me')).resolves.toBeUndefined();
+      await expect(svc.changeMemberRole('sp1', 'm1', 'reader', 'ext-me')).resolves.toEqual(VERSIONED);
       expect(ran(spy, 'from group_users')).toBe(false); // not a raise → coverage is never consulted
     });
 
     it("allows raising someone else's user row without consulting group_users", async () => {
       const { svc, spy } = make(respondTo({ member: { role: 'reader', userId: 'docmost-ext-other' } }));
-      await expect(svc.changeMemberRole('sp1', 'm1', 'admin', 'ext-me')).resolves.toBeUndefined();
+      await expect(svc.changeMemberRole('sp1', 'm1', 'admin', 'ext-me')).resolves.toEqual(VERSIONED);
       expect(ran(spy, 'from group_users')).toBe(false);
     });
 
     it('an actor with no shadow user is covered by nothing (a null id never matches a null user_id)', async () => {
       const { svc, spy } = make(respondTo({ member: { role: 'reader', userId: null, groupId: 'g1' }, inGroup: true }));
-      await expect(svc.changeMemberRole('sp1', 'm1', 'admin', 'ext-ghost')).resolves.toBeUndefined();
+      await expect(svc.changeMemberRole('sp1', 'm1', 'admin', 'ext-ghost')).resolves.toEqual(VERSIONED);
       expect(ran(spy, 'from group_users')).toBe(false);
     });
 

@@ -141,6 +141,53 @@ plus an optional `serviceSubjectId` so an on-behalf-of result is service ∩ use
 `{items, hasMore}`, where `hasMore` is true only when an authorized hit past the page was actually collected (a
 scan-budget stop reports false, never a promise of an empty next page).
 
+**Conditional page operations (1.9.0, wiki-v2 #616).** `POST /api/service/pages/lifecycle-state` also reports the
+page's own `position`. Beside the native page routes a platform relays as the acting user, the fork serves atomic
+compare-and-write twins: `POST /api/pages/conditional-delete`, `conditional-move`, `conditional-move-to-space` and
+`conditional-update-meta`, each taking the native body plus `expectedEtags` (1–8 opaque page versions, or exactly
+`["*"]` for "the page exists"). The version is compared inside the write's transaction under the page row lock (`FOR
+NO KEY UPDATE`, which never deadlocks with the restriction guards above): stale → `412 { code: precondition_failed }`
+with nothing changed; already done → `200 { outcome: noop }` (never for a permanent delete); otherwise `200 {
+outcome: applied }`. A busy engine answers a retryable `503 { code: engine_busy }`. The two moves settle like the
+native moves (`Authz-Propagation`). A fork without these routes answers the framework's plain 404 — an integrator
+must read that as "upgrade pending", never as page-not-found, and must never fall back to the unconditional route.
+
+**Keyed page create (1.9.0, wiki-v2 #616).** `POST /api/pages/idempotent-create` (relayed as the acting user; `404` unless `AUTHZ_MODE=remote`) takes the native `POST /api/pages/create` body plus `idempotencyKey` (1–255), `idempotencyNamespace` (1–128, the integrator's key namespace) and `fingerprint` (64 lowercase hex, sha256 of the integrator's stable request body). The fork binds the key to the workspace, the authenticated user and the namespace, and records it in the page's own transaction for at least 24h. First use → `200` native body + `replayed: false`; same key + fingerprint → `200` with that page's current state, re-authorized, `replayed: true`, nothing re-run; different fingerprint → `409 { code: idempotency_key_reused }`; page since deleted → `404 { code: idempotency_resource_gone }`; busy → `503 { code: engine_busy }`. The native authorization runs on every call. A fork without the route answers the framework's plain 404 — read it as "upgrade pending", never as not-found. `POST /api/service/spaces` takes the same three fields, optionally (all or none; a partial key is a `400`): the key is recorded in the space insert's transaction, bound to the workspace, the service credential that authenticated the call and the creator (`creatorExternalId`, as its shadow user), so a key sent for another human — or through another credential — is a separate entry and can never answer this space. A repeat answers `{ id, slug, name, replayed: true }` and re-runs nothing (no space, member or outbox row; the creator's shadow-user upsert runs as on every call and is idempotent); a keyed create skips the friendly slug pre-check, so a slug held by another space is still the unique index's `409`; mismatch, gone and busy answer as for pages. Unkeyed, the space create is unchanged and its body carries no `replayed`.
+
+**Import helpers (1.9.0, wiki-v2 #616).** Two read-only routes a platform plans a page import with, under their own
+scope `pages:import:read` (a smaller rate bucket, `SERVICE_BRIDGE_PAGES_IMPORT_RATE_LIMIT`, default 120/min). `POST
+/api/service/pages/validate-content` `{ items: [{ format: markdown | html, content }] }` (1–50 items) parses each item
+exactly as a page create would (including the network-inert HTML parse), writes nothing, and answers `{ results: [{ idx,
+ok: true } | { idx, ok: false, code }] }` in item order — `too_large` (over 512 KiB, or once the call's budget of 1 MiB
+parsed is spent, for that item and every later one), `parse_budget_exceeded` (once the call's 4 s of parsing is spent,
+for that item and every later one: NOT checked, a retryable engine-load answer, never a content verdict), `empty_content`
+(whitespace only) or `invalid_content`; it never answers content or a parse error, and a call that finds both parse slots busy for 2 s is a
+retryable `503 { code: engine_busy }`. `POST /api/service/pages/title-candidates` `{ spaceId, parentPageId?: uuid | null,
+titles: [1–50 strings, 1–255] }` answers `{ matches: [{ titleIdx, pageId, suffix: null | n }] }`: the live direct
+children of that parent (null or omitted = the space root) whose title is exactly `titles[titleIdx]` or `<title> (n)`
+with n ≥ 2 — case-sensitive, ids and indices only, never a title. A parent with more than 5000 live children answers
+`503 { code: list_too_broad }`. The integrator keeps only the matches its caller may view.
+
+**Versions, atomic compares and previews for ACLs, members and spaces (1.9.0, wiki-v2 #616).** The fork issues an
+opaque `version` (64 hex, a digest of the resource's state — `service-bridge/resource-version.ts`) for a space
+(`GET /api/service/content/spaces/{id}` and `GET /api/service/spaces/{id}`; over every public field plus the archived
+state), a membership (each `GET …/members` item, the member `POST`) and a page's ACL (`GET
+/api/service/pages/{id}/permissions`, which also answers `restricted`; over the restriction and every grant, read with
+the items from one snapshot). `PATCH /api/service/spaces/{id}`, `POST …/archive`, `PATCH` and `DELETE
+…/members/{memberId}` take an optional `expectedVersion` (a version, or `*` = it exists; archive and removal take it
+as an optional JSON body) and compare it inside the write's transaction under the row lock they already take — stale
+→ `412 { code: precondition_failed }` with nothing changed; the rename, archive and role change answer the new
+`version`. The page-ACL routes a platform relays as the acting user (`POST /api/pages/restrict`,
+`remove-restriction`, `add-permission`, `remove-permission`, `update-permission`) each run as ONE transaction under a
+per-page lock `pg_advisory_xact_lock(616616, hashtext(pageId))` — taken first, before the workspace lock the guards
+above take (no trigger ever takes it, so the order cannot invert) — take the same optional `expectedVersion`, and
+answer `{ restricted | success, version, effect }`. Two previews write nothing: `POST /api/pages/restriction-preview`
+(`{ pageId, action, …that route's body }`, same authorization; it runs the real write and rolls it back) and `POST
+/api/service/spaces/{id}/members/preview` (scope `spaces:write`; shadow users are only looked up, never provisioned);
+both answer `{ outcome: would_apply | noop | refused, code?, version, effect }` with the CURRENT version. Neither is a
+narrowing route. A busy engine (a lock not got within 2 s, a deadlock, a statement over 15 s) answers a retryable
+`503 { code: engine_busy }`; an ACL write is always bounded this way, a member / space write only when it compares.
+
 Three properties bind the whole surface:
 
 - **Mode-gated.** Every route is `404` unless the fork runs `AUTHZ_MODE=remote` (RemoteOnlyGuard, checked
@@ -148,6 +195,7 @@ Three properties bind the whole surface:
 - **Scoped + secret-gated.** Every request carries `x-authz-service-secret`; each `/api/service/*` route
   requires exactly one least-privilege scope (`session:mint`, `users:provision`, `users:resolve`,
   `workspace:read`, `workspace:settings:write`, `spaces:read`, `spaces:write`, `pages:read`, `pages:authz:read`,
+  `pages:import:read`,
   `content:read`, `content:search`, `attachments:read`, `changes:read`).
 - **The platform is the authorization authority.** Identity-mutating endpoints are keyed only on an opaque
   `externalId` (no arbitrary-identity selection). The `content/*` read endpoints are a **privileged data

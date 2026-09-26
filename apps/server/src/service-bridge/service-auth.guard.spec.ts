@@ -4,7 +4,7 @@ import {
   UnauthorizedException,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
-import { ServiceAuthGuard } from './service-auth.guard';
+import { attachServiceCredential, ServiceAuthGuard, serviceCredentialIdOf } from './service-auth.guard';
 import { ServiceScope } from './service-scope';
 
 const SECRET = 'test-service-secret-0123456789ab';
@@ -44,6 +44,47 @@ describe('ServiceAuthGuard', () => {
     it('allows a matching secret that carries the route scope', () => {
       const g = new ServiceAuthGuard(reflectorReturning(ServiceScope.SessionMint));
       expect(g.canActivate(ctx(SECRET))).toBe(true);
+    });
+
+    // #616: the import helpers' scope has its OWN rate bucket (smaller than the default), independent of the others.
+    it('pages:import:read is limited in its own bucket: exhausting it leaves other scopes untouched', () => {
+      const g = new ServiceAuthGuard(reflectorReturning(ServiceScope.PagesImportRead));
+      const limiters = (g as any).scopeLimiters as Map<string, unknown>;
+      expect(limiters.has(ServiceScope.PagesImportRead)).toBe(true);
+      expect(limiters.get(ServiceScope.PagesImportRead)).not.toBe((g as any).limiter);
+      let admitted = 0;
+      for (let i = 0; i < 200; i++) {
+        try {
+          g.canActivate(ctx(SECRET));
+          admitted++;
+        } catch (e) {
+          expect((e as { getStatus?: () => number }).getStatus?.()).toBe(429);
+          break;
+        }
+      }
+      expect(admitted).toBe(120); // SERVICE_BRIDGE_PAGES_IMPORT_RATE_LIMIT default
+      const other = new ServiceAuthGuard(reflectorReturning(ServiceScope.PagesRead));
+      (other as any).scopeLimiters = limiters; // same buckets
+      (other as any).limiter = (g as any).limiter;
+      expect(other.canActivate(ctx(SECRET))).toBe(true);
+    });
+
+    // #616: the keyed space create binds its ledger entry to the credential that authenticated the call.
+    it('records the admitting credential on the request — and only once it admitted it; a body/header cannot set it', () => {
+      const g = new ServiceAuthGuard(reflectorReturning(ServiceScope.SpacesWrite));
+      const onReq = (req: object) =>
+        ({ switchToHttp: () => ({ getRequest: () => req }), getHandler: () => () => undefined, getClass: () => class {} }) as any;
+      const ok = { headers: { 'x-authz-service-secret': SECRET }, body: { credentialId: 'forged' } };
+      expect(serviceCredentialIdOf(ok)).toBeUndefined();
+      expect(g.canActivate(onReq(ok))).toBe(true);
+      expect(serviceCredentialIdOf(ok)).toBe('shared');
+      const bad = { headers: { 'x-authz-service-secret': 'wrong', 'x-ccc-service-credential': 'shared' } };
+      expect(() => g.canActivate(onReq(bad))).toThrow(UnauthorizedException);
+      expect(serviceCredentialIdOf(bad)).toBeUndefined();
+      expect(serviceCredentialIdOf({ cccServiceCredentialId: 'shared' })).toBeUndefined(); // only the private key counts
+      const marked = {};
+      attachServiceCredential(marked, 'x');
+      expect(serviceCredentialIdOf(marked)).toBe('x');
     });
 
     it('401 on a missing secret header', () => {

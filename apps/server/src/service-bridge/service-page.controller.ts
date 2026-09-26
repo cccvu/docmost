@@ -14,7 +14,7 @@ import { SkipTransform } from '../common/decorators/skip-transform.decorator';
 import { RemoteOnlyGuard } from '../authz/mode/remote-only.guard';
 import { RequireServiceScope, ServiceAuthGuard } from './service-auth.guard';
 import { ServiceScope } from './service-scope';
-import { RawPagePermission, ServiceContentService } from './service-content.service';
+import { PagePermissionsResult, ServiceContentService } from './service-content.service';
 import { ResolvePageSpaceDto } from './dto/content-read.dto';
 import { parseSubCollectionQuery } from './dto/sub-collection-page.dto';
 import { PageLifecycleStateDto, TrashListDto } from './dto/page-lifecycle.dto';
@@ -23,6 +23,12 @@ import {
   ServicePageLifecycleService,
   TrashedPageRow,
 } from './service-page-lifecycle.service';
+import { TitleCandidatesDto, ValidateContentDto } from './dto/page-import.dto';
+import {
+  ServicePageImportService,
+  TitleCandidatesResult,
+  ValidateContentResult,
+} from './service-page-import.service';
 
 /**
  * CCC service-bridge — NOT upstream Docmost code.
@@ -30,7 +36,8 @@ import {
  * Bounded page lookups the platform calls: resolve a page's owning space (for `@AuthzDerived` route checks)
  * and list a page's ACL grants (for the `/v1` ACL read). `RemoteOnlyGuard` 404s the surface unless remote;
  * the scoped ServiceAuthGuard enforces least privilege. The ACL listing is a privileged data plane; the
- * platform maps the returned Docmost user ids back to its own identities.
+ * platform maps the returned Docmost user ids back to its own identities. #616: the page-import helpers
+ * (validate-content, title-candidates) carry their own scope, `pages:import:read`, and its smaller rate bucket.
  */
 @Controller('service/pages')
 @UseGuards(RemoteOnlyGuard, ServiceAuthGuard)
@@ -38,6 +45,7 @@ export class ServicePageController {
   constructor(
     private readonly content: ServiceContentService,
     private readonly lifecycle: ServicePageLifecycleService,
+    private readonly imports: ServicePageImportService, // #616 (appended)
   ) {}
 
   @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
@@ -58,8 +66,8 @@ export class ServicePageController {
     @Query('limit') limit?: string,
     @Query('beforeCreatedAt') beforeCreatedAt?: string,
     @Query('beforeId') beforeId?: string,
-  ): Promise<{ items: RawPagePermission[] }> {
-    // Opt-in keyset paging (no params → all grants, the backward-compatible default).
+  ): Promise<PagePermissionsResult> {
+    // Opt-in keyset paging (no params → all grants, the backward-compatible default). #616: + restricted, version.
     return this.content.listPagePermissions(pageId, parseSubCollectionQuery(limit, beforeCreatedAt, beforeId));
   }
 
@@ -81,5 +89,25 @@ export class ServicePageController {
   @RequireServiceScope(ServiceScope.ContentRead)
   async trash(@Body() dto: TrashListDto): Promise<{ items: TrashedPageRow[] }> {
     return this.lifecycle.trash(dto);
+  }
+
+  // ---- #616 page-import helpers (appended). Read-only; indices, ids and codes only — never content or titles. ----
+
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
+  @Post('validate-content')
+  @HttpCode(HttpStatus.OK)
+  @RequireServiceScope(ServiceScope.PagesImportRead)
+  async validateContent(@Body() dto: ValidateContentDto): Promise<ValidateContentResult> {
+    return this.imports.validateContent(dto);
+  }
+
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
+  @Post('title-candidates')
+  @HttpCode(HttpStatus.OK)
+  @RequireServiceScope(ServiceScope.PagesImportRead)
+  async titleCandidates(@Body() dto: TitleCandidatesDto): Promise<TitleCandidatesResult> {
+    return this.imports.titleCandidates(dto);
   }
 }
