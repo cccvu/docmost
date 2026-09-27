@@ -16,6 +16,9 @@ import {
  * requests; it does not stop them. So every loader is switched off, and the fetch layer that all of them share
  * refuses whatever still reaches it. None of this changes how the DOM is built, so the ProseMirror output is
  * the same.
+ *
+ * CCC #626: `generateJSON` also parses into a detached element (see there), so its window loads nothing to begin
+ * with; these settings stay as the second layer, and still cover the serializer, which builds a fragment.
  */
 const DENY_ALL_FETCH: IFetchInterceptor = {
   // Resolve to a network error: no socket is opened, and happy-dom's own task bookkeeping stays balanced.
@@ -77,22 +80,25 @@ export function generateJSON(
   }
 
   const localWindow = createNetworkIsolatedWindow();
-  const localDOMParser = new localWindow.DOMParser();
   let result: Record<string, any>;
 
   try {
     const schema = getSchema(extensions);
-    let doc: ReturnType<typeof localDOMParser.parseFromString> | null = null;
 
-    const htmlString = `<!DOCTYPE html><html><body>${html}</body></html>`;
-    doc = localDOMParser.parseFromString(htmlString, 'text/html');
+    // CCC #626: parse into a DETACHED <html> element rather than a DOMParser document. happy-dom builds the
+    // same head/body structure for both, so the output is unchanged, but nothing here is connected to a
+    // document: an <iframe srcdoc> no longer builds a child window (and document.write()s its markup) during
+    // the parse, and no other element runs its on-connect behavior either.
+    const root = localWindow.document.createElement('html');
+    root.innerHTML = `<!DOCTYPE html><html><body>${html}</body></html>`;
+    const body = root.lastElementChild;
 
-    if (!doc) {
+    if (body?.tagName !== 'BODY') {
       throw new Error('Failed to parse HTML string');
     }
 
     result = PMDOMParser.fromSchema(schema)
-      .parse(doc.body as unknown as Node, options)
+      .parse(body as unknown as Node, options)
       .toJSON();
   } finally {
     // clean up happy-dom to avoid memory leaks
