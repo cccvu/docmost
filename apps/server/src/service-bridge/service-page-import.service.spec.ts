@@ -13,6 +13,11 @@ import {
 import { PAGE_IMPORT_ITEM_MAX_BYTES, PageImportFormat } from './dto/page-import.dto';
 import { PageService } from '../core/page/services/page.service';
 import { OpSemaphore } from '../authz/page-write/op-semaphore';
+import {
+  closeContentParser,
+  ContentParseBusyException,
+  ContentTooComplexException,
+} from '../editor-compat/content-parse/content-parse.service';
 
 /**
  * #616 page-import helpers — the unit contract (real Postgres for title-candidates: service-page-import.pg.spec.ts):
@@ -53,6 +58,9 @@ const status = async (p: Promise<unknown>) => {
 
 describe('validate-content through the REAL create parser (#621 network-inert window)', () => {
   const svc = new ServicePageImportService(spyKysely(() => []).db, workspaces, realParser());
+  // #626: the real parser converts in a worker thread; stop it when done.
+  afterAll(() => closeContentParser());
+  jest.setTimeout(120_000); // the worker compiles its parsers through ts-node on first use
 
   it('accepts valid markdown and html; rejects empty; answers ids and codes only (never content or an error)', async () => {
     const res = await svc.validateContent({
@@ -140,6 +148,31 @@ describe('validate-content — budgets and codes', () => {
     } finally {
       now.mockRestore();
     }
+  });
+
+  it('#626: an item past the converter\'s bounds is too_large; later items still parse', async () => {
+    const t = make(async (content) => {
+      if (content === 'huge') throw new ContentTooComplexException();
+    });
+    const res = await t.svc.validateContent({ items: ['ok', 'huge', 'ok'].map((content) => ({ format: 'html' as const, content })) });
+    expect(res.results).toEqual([
+      { idx: 0, ok: true },
+      { idx: 1, ok: false, code: 'too_large' },
+      { idx: 2, ok: true },
+    ]);
+  });
+
+  it('#626: a converter too busy to take an item stops the call like the time budget — parse_budget_exceeded, never a content verdict', async () => {
+    const t = make(async (content) => {
+      if (content === 'b') throw new ContentParseBusyException();
+    });
+    const res = await t.svc.validateContent({ items: ['a', 'b', 'c'].map((content) => ({ format: 'markdown' as const, content })) });
+    expect(res.results).toEqual([
+      { idx: 0, ok: true },
+      { idx: 1, ok: false, code: 'parse_budget_exceeded' },
+      { idx: 2, ok: false, code: 'parse_budget_exceeded' },
+    ]);
+    expect(t.parsed).toEqual(['a', 'b']); // c was never handed to the converter
   });
 
   it('the byte budget still wins when both are spent at the same item (too_large: the request itself is too big)', async () => {

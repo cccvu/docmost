@@ -18,7 +18,8 @@ import { generateSlugId } from '../../../common/helpers';
 import { v7 } from 'uuid';
 import { generateJitteredKeyBetween } from 'fractional-indexing-jittered';
 import { FileTask, InsertablePage } from '@docmost/db/types/entity.types';
-import { markdownToHtml } from '@docmost/editor-ext';
+// CCC #626 (UPSTREAM_MODIFICATIONS, file-import-task.service.ts): Markdown is converted off the event loop.
+import { untrustedMarkdownToHtml } from '../../../editor-compat/content-parse/content-parse.service';
 import { getProsemirrorContent } from '../../../common/helpers/prosemirror/utils';
 import { formatImportHtml } from '../utils/import-formatter';
 import {
@@ -484,7 +485,7 @@ export class FileImportTaskService {
               content = await fs.readFile(absPath, 'utf-8');
 
               if (page.fileExtension.toLowerCase() === '.md') {
-                content = await markdownToHtml(content);
+                content = await untrustedMarkdownToHtml(content);
               }
             } catch (err: any) {
               if (err?.code === 'ENOENT') {
