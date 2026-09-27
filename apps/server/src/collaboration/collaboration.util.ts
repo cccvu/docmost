@@ -40,7 +40,6 @@ import {
   Columns,
   Column,
   Status,
-  addUniqueIdsToDoc,
   htmlToMarkdown,
   TransclusionSource,
   TransclusionReference,
@@ -59,6 +58,8 @@ import * as Y from 'yjs';
 import { Logger } from '@nestjs/common';
 // #392: fork-owned (boundary-excluded) backfill logic; this seam only wires it into htmlToJson.
 import { backfillAttachmentIds } from '../editor-compat/attachment-id-backfill';
+// #626: fork-owned linear replacement for editor-ext's O(n²) `addUniqueIdsToDoc`; this seam only calls it.
+import { addUniqueIds } from '../editor-compat/unique-ids';
 
 export const tiptapExtensions = [
   StarterKit.configure({
@@ -131,13 +132,13 @@ export function htmlToJson(html: string) {
   const pmJson = generateJSON(html, tiptapExtensions);
 
   // #392: rebuild attachment linkage before anything downstream reads it. Mutates in place so the
-  // fill survives even if `addUniqueIdsToDoc` throws and we fall back to `pmJson`. A separate pass from
-  // `addUniqueIdsToDoc` (both O(n) over a page-sized doc, off the collab hot path — the doubled walk is
+  // fill survives even if `addUniqueIds` throws and we fall back to `pmJson`. A separate pass from
+  // `addUniqueIds` (both O(n) over a page-sized doc, off the collab hot path — the doubled walk is
   // an accepted tradeoff vs. conflating this into the shared editor-ext helper). (#396 perf review)
   backfillAttachmentIds(pmJson);
 
   try {
-    return addUniqueIdsToDoc(pmJson, tiptapExtensions);
+    return addUniqueIds(pmJson, tiptapExtensions);
   } catch (error) {
     console.warn('failed to add unique ids to doc', error);
     return pmJson;
