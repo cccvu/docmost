@@ -11,7 +11,9 @@
 #   4. the fork's decisions track the STUB, not native ACLs — a non-member the stub GRANTS reads page1 (200,
 #      native would DENY), while the same user, ungranted on page2, is DENIED (403/404). That divergence from
 #      native can only come from a real delegation to the stub, closing the OUTBOUND contract-parse gap that is
-#      the reciprocal of #181's INBOUND envelope break (a fork ignoring the stub or fail-opening would flip it).
+#      the reciprocal of #181's INBOUND envelope break (a fork ignoring the stub or fail-opening would flip it),
+#   5. the engine's native space create is refused in remote mode (404, no row) even for a native-phase OWNER
+#      session (#598): creation belongs to the integrating platform (POST /api/service/spaces).
 #
 # Because the stub matches EXACT { externalId, permission, resourceType, resourceId } tuples and the fork
 # generates its own UUIDs, we first bootstrap real data in a NATIVE-mode boot (native credential routes are
@@ -218,6 +220,19 @@ if [ "$bob_read2" = "403" ] || [ "$bob_read2" = "404" ]; then
 else
   bad "Bob was NOT denied page2 (HTTP $bob_read2) — the stub's deny-by-default did not gate the fork: $(cat "$TMP/read.json" 2>/dev/null)"
 fi
+
+# (d) #598: remote mode refuses the engine's native space create for EVERY caller — including this native-phase
+# OWNER session, which upstream CASL (users.role) would let through and which (a) just proved is still valid here.
+# Creation in remote mode belongs to the integrating platform (POST /api/service/spaces).
+log "remote mode refuses the native space create, even for the native-phase OWNER (#598)"
+create_remote="$(curl -s -o /dev/null -w '%{http_code}' -b "$A_JAR" -H 'content-type: application/json' \
+  -d '{"name":"Owner Remote Space","slug":"owner-remote-598"}' "${BASE}/api/spaces/create")"
+[ "$create_remote" = "404" ] \
+  && pass "native /api/spaces/create by the OWNER → 404 in remote mode (SpaceNativeCreateInterceptor)" \
+  || bad "native /api/spaces/create by the OWNER expected 404 in remote mode, got HTTP $create_remote"
+owner_spaces="$(psql "select count(*) from spaces where slug='owner-remote-598'")"
+[ "$owner_spaces" = "0" ] && pass "… and no space row was written" \
+  || bad "the refused native create still wrote $owner_spaces space row(s)"
 
 log "RESULT"
 if [ "$fail" = "0" ]; then

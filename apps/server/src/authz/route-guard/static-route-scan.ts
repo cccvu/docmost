@@ -56,6 +56,12 @@ export interface StaticRoute {
    * refuses. Not `deleteSpaceWatch(` (the watcher unwatch). The spec's source inventory pins the indirect callers.
    */
   callsSpaceHardDelete: boolean;
+  /**
+   * The handler BODY calls a `.createSpace(` — the engine's native space create (#598). A static (text) tell so
+   * space-native-create.fitness.spec.ts can assert that the routes carrying it are EXACTLY the routes remote mode
+   * refuses. The spec's source inventory pins the indirect callers and every `spaces` row insert.
+   */
+  callsNativeSpaceCreate: boolean;
 }
 
 // Text tell that a handler body establishes a native session. Matches the session-cookie set — the raw
@@ -73,6 +79,10 @@ export const NATIVE_SESSION_MINT_RE =
 // Text tell that a handler body reaches the space hard delete (#502): `spaceService.deleteSpace(` today, or a direct
 // `spaceRepo.deleteSpace(`. The `(` right after the name keeps `deleteSpaceWatch(` out.
 export const SPACE_HARD_DELETE_CALL_RE = /\.deleteSpace\s*\(/;
+
+// Text tell that a handler body reaches the native space create (#598): `spaceService.createSpace(` today. The `(`
+// right after the name keeps a longer identifier (`createSpaceModal(`) out.
+export const NATIVE_SPACE_CREATE_CALL_RE = /\.createSpace\s*\(/;
 
 const ROUTE_DECORATORS = new Set(['Get', 'Post', 'Put', 'Patch', 'Delete', 'Options', 'Head', 'All', 'Search']);
 const PUBLIC_DECORATORS = new Set(['Public', 'PlatformPublic']);
@@ -176,6 +186,7 @@ export function scanRoutes(srcRoot: string): StaticRoute[] {
           isClassLevelSessionScoped: classFacts.isSessionScopedRoute,
           mintsNativeSession: NATIVE_SESSION_MINT_RE.test(member.getText(sf)),
           callsSpaceHardDelete: SPACE_HARD_DELETE_CALL_RE.test(member.getText(sf)),
+          callsNativeSpaceCreate: NATIVE_SPACE_CREATE_CALL_RE.test(member.getText(sf)),
           guardNames: [...new Set([...classFacts.guardNames, ...methodFacts.guardNames])],
         });
       }

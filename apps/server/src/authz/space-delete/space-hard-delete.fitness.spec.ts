@@ -1,6 +1,7 @@
-import { readdirSync, readFileSync, statSync } from 'fs';
+import { readFileSync } from 'fs';
 import { join } from 'path';
 import * as ts from 'typescript';
+import { literalText, ownerOf, sourceFiles } from '../route-guard/ast-sink-scan';
 import { SPACE_HARD_DELETE_CALL_RE, scanRoutes } from '../route-guard/static-route-scan';
 import { SPACE_HARD_DELETE_ROUTES } from './space-hard-delete.interceptor';
 
@@ -17,13 +18,12 @@ import { SPACE_HARD_DELETE_ROUTES } from './space-hard-delete.interceptor';
  *    `SpaceService.deleteSpace` and `SpaceController.deleteSpace`, and only `SpaceService.deleteSpace` queues the
  *    space attachment purge. A new method that reaches a sink — a `bulkDelete` looping the repo, a job, a listener —
  *    fails RED, and whoever adds it decides deliberately whether remote mode must refuse it too;
- *  - app.module.ts registers the interceptor last of its own interceptors, after the per-principal rate limiter, so
- *    a flood of refused attempts is rate-limited and each attempt lands in the #467 access row.
+ *  - app.module.ts registers the interceptor after the per-principal rate limiter, so a flood of refused attempts is
+ *    rate-limited and each attempt lands in the #467 access row.
  * A static inventory: a sink reached through an unrecognized indirection (a method passed by reference, a dynamic
  * property name) is invisible to it. The meta-guard at the bottom pins the shapes it does recognize.
  */
 const SRC_ROOT = join(__dirname, '..', '..'); // .../apps/server/src
-const SKIP_DIRS = new Set(['ee', 'node_modules', 'dist']);
 
 // Raw SQL `DELETE FROM spaces` inside a string or template literal.
 export const RAW_SPACES_ROW_DELETE_RE = /\bdelete\s+from\s+(?:"?public"?\.)?"?spaces"?(?![\w"])/i;
@@ -36,34 +36,8 @@ const WORKSPACES_TABLE_RE = /^workspaces(?:\s+as\s+\w+)?$/;
 type SinkKind = 'spacesRowDelete' | 'workspaceRowDelete' | 'deleteSpaceCall' | 'spaceAttachmentPurge';
 export interface SinkSite {
   kind: SinkKind;
-  /** `Class.method` (or the function / variable name) that encloses the occurrence; `<module>` at top level. */
+  /** `Class.method` (or the function name) that encloses the occurrence; `<module>` at top level (see `ownerOf`). */
   owner: string;
-}
-
-function literalText(node: ts.Node): string | undefined {
-  if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) return node.text;
-  if (ts.isTemplateExpression(node)) {
-    return node.head.text + node.templateSpans.map((s) => ' ${} ' + s.literal.text).join('');
-  }
-  return undefined;
-}
-
-function ownerOf(node: ts.Node): string {
-  for (let n: ts.Node | undefined = node.parent; n; n = n.parent) {
-    if (
-      (ts.isMethodDeclaration(n) || ts.isGetAccessor(n) || ts.isSetAccessor(n) || ts.isPropertyDeclaration(n)) &&
-      n.name &&
-      ts.isClassLike(n.parent)
-    ) {
-      return `${n.parent.name?.text ?? '<anonymous>'}.${n.name.getText()}`;
-    }
-    if (ts.isConstructorDeclaration(n) && ts.isClassLike(n.parent)) {
-      return `${n.parent.name?.text ?? '<anonymous>'}.constructor`;
-    }
-    if (ts.isFunctionDeclaration(n) && n.name) return n.name.text;
-    if (ts.isVariableDeclaration(n) && ts.isIdentifier(n.name)) return n.name.text;
-  }
-  return '<module>';
 }
 
 /** Every space hard-delete sink in one source file, attributed to its enclosing method. Pure; exported for the meta-guard. */
@@ -96,18 +70,6 @@ export function scanSpaceDeleteSinks(fileName: string, source: string): SinkSite
   };
   visit(sf);
   return sites;
-}
-
-function sourceFiles(dir: string, out: string[] = []): string[] {
-  for (const name of readdirSync(dir)) {
-    const full = join(dir, name);
-    if (statSync(full).isDirectory()) {
-      if (!SKIP_DIRS.has(name)) sourceFiles(full, out);
-    } else if (name.endsWith('.ts') && !name.endsWith('.spec.ts') && !name.endsWith('.d.ts')) {
-      out.push(full);
-    }
-  }
-  return out;
 }
 
 describe('space hard delete is refused on every route that reaches it (#502)', () => {
@@ -207,6 +169,15 @@ describe('the space hard-delete sink scanner recognizes every sink shape (meta-g
     expect(kinds(src)).toEqual([
       'deleteSpaceCall@SpaceService.deleteSpace',
       'deleteSpaceCall@SpaceService.bulkDelete',
+    ]);
+  });
+
+  it('attributes a sink bound to a local to the METHOD, not the local (a moved sink must change the inventory)', () => {
+    expect(kinds(`class R { d() { const s = this.db.deleteFrom('spaces'); return s.execute(); } }`)).toEqual([
+      'spacesRowDelete@R.d',
+    ]);
+    expect(kinds('class R { d(id) { const q = sql`delete from spaces where id = ${id}`; return q; } }')).toEqual([
+      'spacesRowDelete@R.d',
     ]);
   });
 
