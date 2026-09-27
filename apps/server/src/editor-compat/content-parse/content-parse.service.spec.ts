@@ -17,13 +17,26 @@ import {
 
 const FIXTURE = path.join(__dirname, '__fixtures__', 'scripted.worker.cjs');
 
-const LIMITS: ContentParseLimits = { deadlineMs: 400, waitMs: 2_000, memoryMb: 64, maxNodes: 100, startupMs: 5_000 };
+const LIMITS: ContentParseLimits = {
+  deadlineMs: 400,
+  waitMs: 2_000,
+  memoryMb: 64,
+  maxNodes: 100,
+  maxChars: 1_000,
+  batchWaitMs: 5_000,
+  startupMs: 5_000,
+};
 
-/** A pool over the fixture that counts how many workers it started. */
-const makePool = (limits: Partial<ContentParseLimits> = {}, mode = 'normal') => {
+/**
+ * A pool over the fixture that counts how many workers it started. `mode` is the fixture's start-up behavior; a list
+ * gives each successive worker its own (the last one repeats).
+ */
+const makePool = (limits: Partial<ContentParseLimits> = {}, mode: string | string[] = 'normal') => {
   const spawned: Worker[] = [];
+  const modes = Array.isArray(mode) ? mode : [mode];
   const spawn: SpawnWorker = (memoryMb) => {
-    const w = new Worker(FIXTURE, { workerData: { mode }, resourceLimits: { maxOldGenerationSizeMb: memoryMb } });
+    const workerData = { mode: modes[Math.min(spawned.length, modes.length - 1)] };
+    const w = new Worker(FIXTURE, { workerData, resourceLimits: { maxOldGenerationSizeMb: memoryMb } });
     spawned.push(w);
     return w;
   };
@@ -45,6 +58,15 @@ const maxLoopLag = async (work: Promise<unknown>): Promise<number> => {
     clearInterval(tick);
   }
   return worst;
+};
+
+/** Resolves once `cond` holds, polling; rejects after `ms`. */
+const until = async (cond: () => boolean, ms = 3_000): Promise<void> => {
+  const by = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > by) throw new Error('condition not met in time');
+    await new Promise((r) => setTimeout(r, 10));
+  }
 };
 
 const pools: ContentParsePool[] = [];
@@ -121,6 +143,32 @@ describe('#626 the bounds', () => {
   );
 });
 
+describe('#626 the worker is replaced whenever it is lost', () => {
+  it('a worker that failed to start is dropped: the next conversion starts a new one and succeeds', async () => {
+    const { pool, spawned } = track(makePool({ startupMs: 300 }, ['throw-on-load', 'normal']));
+    await expect(pool.parse('a', 'html', 'user:1')).rejects.toBeInstanceOf(ContentParseBusyException);
+    await expect(pool.parse('b', 'html', 'user:1')).resolves.toEqual({ type: 'doc', label: 'b' });
+    expect(spawned).toHaveLength(2);
+  });
+
+  it('a worker that dies while idle is replaced, so the next conversion is not handed to a dead worker', async () => {
+    const { pool, spawned } = track(makePool({ deadlineMs: 5_000 }));
+    await pool.parse('a', 'html', 'user:1');
+    await spawned[0].terminate();
+    const started = Date.now();
+    // Handed to the dead worker, this would wait out the deadline and answer a wrong 422.
+    await expect(pool.parse('b', 'html', 'user:1')).resolves.toEqual({ type: 'doc', label: 'b' });
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(spawned).toHaveLength(2);
+  });
+
+  it('a worker killed by a job is replaced at once, before any next conversion asks for one', async () => {
+    const { pool, spawned } = track(makePool());
+    await expect(pool.parse('hang', 'html', 'user:1')).rejects.toBeInstanceOf(ContentTooComplexException);
+    await until(() => spawned.length === 2);
+  });
+});
+
 describe('#626 admission and fairness', () => {
   it('no turn within the wait budget → 503 engine_busy; nothing is queued behind it', async () => {
     const { pool } = track(makePool({ waitMs: 150, deadlineMs: 5_000 }));
@@ -143,6 +191,14 @@ describe('#626 admission and fairness', () => {
     // Without the per-principal gate, B would wait behind all three of A's (FIFO on the worker).
     expect(done.indexOf('b')).toBeLessThan(done.indexOf('a3'));
     expect(done.indexOf('b')).toBe(1);
+  });
+
+  it('a batch queue may wait longer than a request: it is served where a request would get 503', async () => {
+    const { pool } = track(makePool({ waitMs: 150, deadlineMs: 5_000 }));
+    const long = pool.parse('sleep:800', 'html', 'user:A');
+    await expect(pool.parse('b', 'html', 'user:B')).rejects.toBeInstanceOf(ContentParseBusyException);
+    await expect(pool.parse('c', 'html', 'batch:file-task:1', 3_000)).resolves.toEqual({ type: 'doc', label: 'c' });
+    await long;
   });
 
   it('forgets a principal once it has nothing queued or running (no per-principal state leaks)', async () => {

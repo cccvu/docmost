@@ -36,18 +36,18 @@ const walk = (dir: string, out: string[]): string[] => {
   return out;
 };
 
-/** Every place a file uses one of the names (not its own declaration, and not an import/export specifier). */
-const usesIn = (file: string): Array<{ name: string; line: number }> => {
-  const sf = ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true);
+/**
+ * Every place a file uses one of the names, other than its own declaration. An import or re-export counts too, so an
+ * alias (`import { htmlToJson as parse }`) or a pass-through re-export cannot hide a use; so does a property access or
+ * a destructured `require()`, since those name the function as well.
+ */
+const usesIn = (file: string, text = readFileSync(file, 'utf8')): Array<{ name: string; line: number }> => {
+  const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
   const found: Array<{ name: string; line: number }> = [];
   const visit = (node: ts.Node) => {
     if (ts.isIdentifier(node) && Object.prototype.hasOwnProperty.call(ALLOWED, node.text)) {
       const p = node.parent;
-      const declaration =
-        (ts.isFunctionDeclaration(p) && p.name === node) ||
-        ts.isImportSpecifier(p) ||
-        ts.isExportSpecifier(p) ||
-        ts.isImportClause(p);
+      const declaration = ts.isFunctionDeclaration(p) && p.name === node;
       if (!declaration) found.push({ name: node.text, line: sf.getLineAndCharacterOfPosition(node.getStart()).line + 1 });
     }
     ts.forEachChild(node, visit);
@@ -68,6 +68,18 @@ describe('#626 untrusted content is converted only in the bounded worker', () =>
     for (const [name, where] of Object.entries(ALLOWED)) {
       for (const file of where) expect(uses).toContainEqual(expect.objectContaining({ name, file }));
     }
+  });
+
+  it('catches a use however it is named: alias, re-export, property access, destructured require', () => {
+    const cases = [
+      `import { htmlToJson as parse } from '../../collaboration/collaboration.util';`,
+      `export { markdownToHtml } from '@docmost/editor-ext';`,
+      `import * as util from '../../collaboration/collaboration.util'; util.htmlToJson('<p>x</p>');`,
+      `const { generateJSON: g } = require('../../common/helpers/prosemirror/html');`,
+    ];
+    for (const source of cases) expect(usesIn('probe.ts', source)).not.toEqual([]);
+    // Anti-vacuity: the same shapes naming something else are not uses.
+    expect(usesIn('probe.ts', `import { jsonToText as t } from '../../collaboration/collaboration.util';`)).toEqual([]);
   });
 
   it('no other server code calls htmlToJson, markdownToHtml or generateJSON', () => {

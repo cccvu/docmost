@@ -19,7 +19,7 @@ import { v7 } from 'uuid';
 import { generateJitteredKeyBetween } from 'fractional-indexing-jittered';
 import { FileTask, InsertablePage } from '@docmost/db/types/entity.types';
 // CCC #626 (UPSTREAM_MODIFICATIONS, file-import-task.service.ts): Markdown is converted off the event loop.
-import { untrustedMarkdownToHtml } from '../../../editor-compat/content-parse/content-parse.service';
+import { batchConversion, untrustedMarkdownToHtml } from '../../../editor-compat/content-parse/content-parse.service';
 import { getProsemirrorContent } from '../../../common/helpers/prosemirror/utils';
 import { formatImportHtml } from '../utils/import-formatter';
 import {
@@ -469,6 +469,9 @@ export class FileImportTaskService {
     // Sort levels to process in order
     const sortedLevels = Array.from(pagesByLevel.keys()).sort((a, b) => a - b);
 
+    // CCC #626: this job's own conversion queue, with the batch wait: one busy answer would fail the whole import.
+    const conversions = batchConversion(`file-task:${fileTask.id}`);
+
     try {
       await executeTx(this.db, async (trx) => {
         // Process pages level by level sequentially within the transaction
@@ -485,7 +488,7 @@ export class FileImportTaskService {
               content = await fs.readFile(absPath, 'utf-8');
 
               if (page.fileExtension.toLowerCase() === '.md') {
-                content = await untrustedMarkdownToHtml(content);
+                content = await untrustedMarkdownToHtml(content, conversions);
               }
             } catch (err: any) {
               if (err?.code === 'ENOENT') {
@@ -517,7 +520,7 @@ export class FileImportTaskService {
             });
 
             const pmState = getProsemirrorContent(
-              await this.importService.processHTML(html),
+              await this.importService.processHTML(html, conversions),
             );
 
             const { title, prosemirrorJson } =

@@ -23,6 +23,7 @@ import { TiptapTransformer } from '@hocuspocus/transformer';
 import * as Y from 'yjs';
 // CCC #626 (UPSTREAM_MODIFICATIONS #147): imported Markdown/HTML is converted off the event loop, within fixed bounds.
 import {
+  type ConversionQueue,
   isContentParseRefusal,
   parseUntrustedContent,
   untrustedMarkdownToHtml,
@@ -159,11 +160,12 @@ export class ImportService {
     }
   }
 
-  async processHTML(htmlInput: string): Promise<any> {
+  // CCC #626: `queue` — the zip import's own batch queue; a request's import uses its actor's (the default).
+  async processHTML(htmlInput: string, queue?: ConversionQueue): Promise<any> {
     try {
       const $ = load(htmlInput);
       normalizeImportHtml($, $.root());
-      return await parseUntrustedContent($.html() || '', 'html');
+      return await parseUntrustedContent($.html() || '', 'html', queue);
     } catch (err) {
       throw err;
     }

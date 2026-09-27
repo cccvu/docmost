@@ -17,6 +17,7 @@ import {
   untrustedMarkdownToHtml,
   type ContentParseLimits,
 } from './content-parse.service';
+import { countChars } from './content-parse.worker';
 
 // ts-node compiles the collaboration graph when a worker starts; allow for a slow CI runner.
 const STARTUP_MS = 90_000;
@@ -107,6 +108,30 @@ describe('#626 the real worker enforces the bounds', () => {
     await expect(parseUntrustedContent(content, format)).rejects.toBeInstanceOf(ContentTooComplexException);
     // A stack overflow, not the deadline: the worker's stack matches the main thread's.
     expect(Date.now() - started).toBeLessThan(CONTENT_PARSE_LIMITS.deadlineMs);
+  });
+
+  // One long string repeated in many nodes: small input, a huge result. The node cap does not bound it; the character
+  // cap does (a 286 MiB result and a crashed import before it, from ~200–300 KiB of input).
+  const URL_20K = 'http://x.test/' + 'a'.repeat(20_000);
+  const MD_REFS = '[a][r] '.repeat(1_000) + '\n\n[r]: ' + URL_20K + '\n'; // 27 KiB → ~20 Mi characters
+  it.each([
+    ['Markdown: one reference definition used 1,000 times', () => parseUntrustedContent(MD_REFS, 'markdown')],
+    [
+      'HTML: one <a href> around 20,000 blocks',
+      () => parseUntrustedContent(`<a href="${URL_20K.slice(0, 1_000)}">` + '<p>x</p>'.repeat(20_000) + '</a>', 'html'),
+    ],
+    ['Markdown → HTML (the importers): the same reference definition', () => untrustedMarkdownToHtml(MD_REFS)],
+  ] as const)('%s → 422, never returned to the main thread', async (_name, convert) => {
+    await expect(convert()).rejects.toBeInstanceOf(ContentTooComplexException);
+  });
+
+  it('counts every string, including one shared by many nodes, and stops counting past the limit', () => {
+    const href = 'h'.repeat(100);
+    const text = (t: string) => ({ type: 'text', text: t, marks: [{ type: 'link', attrs: { href } }] });
+    const doc = { type: 'doc', content: [{ type: 'paragraph', content: [text('ab'), text('cd')] }] };
+    const types = 'doc'.length + 'paragraph'.length + 2 * ('text'.length + 'link'.length);
+    expect(countChars(doc, 1e6)).toBe(types + 4 + 2 * 100);
+    expect(countChars(doc, 10)).toBeLessThan(200); // bails out, never walks the rest
   });
 
   it('a payload that blocked the event loop for seconds now leaves it free, and is refused at the deadline', async () => {
