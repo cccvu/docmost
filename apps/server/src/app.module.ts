@@ -48,6 +48,8 @@ import { ApiAccessAuditInterceptor } from './authz/request-controls/api-access-a
 import { PrincipalRateLimitInterceptor } from './authz/request-controls/principal-rate-limit.interceptor';
 // CCC seam (#502): remote mode refuses the engine's native space hard delete (archive is the only removal).
 import { SpaceHardDeleteInterceptor } from './authz/space-delete/space-hard-delete.interceptor';
+// CCC seam (#598): remote mode refuses the engine's native space create (the platform's create is the only one).
+import { SpaceNativeCreateInterceptor } from './authz/space-create/space-native-create.interceptor';
 
 const enterpriseModules = [];
 try {
@@ -141,8 +143,8 @@ try {
     // ORDER MATTERS and is load-bearing (see UPSTREAM_MODIFICATIONS.md seam #4): AuditActorInterceptor
     // (above) stamps the CLS actor first; ApiAccessAuditInterceptor wraps the request so it records the
     // final outcome INCLUDING a 429 the rate limiter raises; PrincipalRateLimitInterceptor rejects before the
-    // handler runs. SpaceHardDeleteInterceptor (#502) is registered last of these, so its 404 is rate-limited and lands in the
-    // access row too. Do not reorder.
+    // handler runs. SpaceHardDeleteInterceptor (#502) and SpaceNativeCreateInterceptor (#598) are registered after
+    // these, so their 404s are rate-limited and land in the access row too. Do not reorder.
     ApiAccessAuditService,
     {
       provide: APP_INTERCEPTOR,
@@ -155,6 +157,10 @@ try {
     {
       provide: APP_INTERCEPTOR,
       useClass: SpaceHardDeleteInterceptor,
+    },
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: SpaceNativeCreateInterceptor,
     },
   ],
 })
