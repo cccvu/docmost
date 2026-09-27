@@ -6,6 +6,7 @@ import { KyselyDB } from '@docmost/db/types/kysely.types';
 import { WorkspaceResolver } from './workspace-resolver';
 import { asEngineBusy, engineBusy } from './resource-version';
 import { OpSemaphore, OpSemaphoreTimeout } from '../authz/page-write/op-semaphore';
+import { ContentParseBusyException, ContentTooComplexException } from '../editor-compat/content-parse/content-parse.service';
 import {
   PAGE_IMPORT_ITEM_MAX_BYTES,
   PAGE_IMPORT_TOTAL_MAX_BYTES,
@@ -83,7 +84,9 @@ export class PageContentParser {
  * property of the request), `parse_budget_exceeded` for the time budget (the engine's load, not the content: the item
  * was never checked, and the caller must retry, never "fix" it). An item over
  * PAGE_IMPORT_ITEM_MAX_BYTES is `too_large` on its own; whitespace-only content is `empty_content`; a parse failure is
- * `invalid_content` (its message is never answered: it can quote the content). At most
+ * `invalid_content` (its message is never answered: it can quote the content). An item past the converter's bounds
+ * (#626: its deadline, heap, node count or nesting) is `too_large`; a converter too busy to take it stops the call like
+ * the time budget (`parse_budget_exceeded` for it and every later item). At most
  * PAGE_IMPORT_PARSE_MAX_CONCURRENT calls parse at once per process; a call that gets no slot in time is 503 `engine_busy`.
  *
  * title-candidates: the LIVE direct children of one parent (or of the space root) whose title is exactly an input title
@@ -155,8 +158,17 @@ export class ServicePageImportService {
       try {
         await this.parser.parse(content, format);
         results.push({ idx, ok: true });
-      } catch {
-        results.push({ idx, ok: false, code: 'invalid_content' });
+      } catch (err) {
+        if (err instanceof ContentParseBusyException) {
+          // #626: no conversion could run in time — the engine's load, not this item: it and every later one are
+          // answered unchecked, exactly like the time budget.
+          stopped = 'parse_budget_exceeded';
+          this.logger.warn(`PAGE_IMPORT_VALIDATE_BUDGET idx=${idx} budget=converter: engine busy; this and later items answered ${stopped}`);
+          results.push({ idx, ok: false, code: stopped });
+          continue;
+        }
+        // #626: past the converter's bounds (deadline, heap, node count, nesting) is a property of the item: too_large.
+        results.push({ idx, ok: false, code: err instanceof ContentTooComplexException ? 'too_large' : 'invalid_content' });
       }
       if (idx < dto.items.length - 1) await new Promise<void>((r) => setImmediate(r));
     }

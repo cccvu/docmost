@@ -30,8 +30,11 @@ export class OpSemaphore {
     return this.active;
   }
 
-  /** Resolves with a release function once a slot is held; rejects with `OpSemaphoreTimeout` after `waitMs`. */
-  acquire(): Promise<() => void> {
+  /**
+   * Resolves with a release function once a slot is held; rejects with `OpSemaphoreTimeout` after `waitMs` (the
+   * constructor's, unless the caller passes what is left of its own budget — #626).
+   */
+  acquire(waitMs: number = this.waitMs): Promise<() => void> {
     if (this.active < this.max) {
       this.active++;
       return Promise.resolve(this.releaser());
@@ -46,7 +49,7 @@ export class OpSemaphore {
         const i = this.waiters.indexOf(grant);
         if (i >= 0) this.waiters.splice(i, 1);
         reject(new OpSemaphoreTimeout());
-      }, this.waitMs);
+      }, waitMs);
       (timer as unknown as { unref?: () => void }).unref?.();
       this.waiters.push(grant);
     });

@@ -25,7 +25,10 @@ import {
   jsonToHtml,
   tiptapExtensions,
 } from '../../../../collaboration/collaboration.util';
+import { getSchema } from '@tiptap/core';
+import { DOMParser as PMDOMParser } from '@tiptap/pm/model';
 import { Window } from 'happy-dom';
+import BrowserFrameFactory from 'happy-dom/lib/browser/utilities/BrowserFrameFactory.js';
 import { createNetworkIsolatedWindow, generateJSON } from './generateJSON';
 
 /** Long enough for a loopback request to land; the parse itself is synchronous. */
@@ -311,6 +314,144 @@ describe('#621 the hardening leaves ordinary content unchanged', () => {
   it('serializing that JSON matches the pre-fix HTML', () => {
     expect(jsonToHtml(EXPECTED_JSON)).toEqual(EXPECTED_HTML);
   });
+});
+
+/**
+ * #626: before, the parse ran in a DOMParser document, where every connected `<iframe srcdoc>` made happy-dom build a
+ * child window and `document.write()` the srcdoc into it (~0.3 ms of blocking CPU per iframe, with no setting to
+ * turn it off). `generateJSON` now parses into a detached `<html>` element: happy-dom runs the same
+ * document-structure parser, but nothing is connected, so nothing is loaded or built.
+ */
+describe('#626 the parse builds no child window', () => {
+  let createChildFrame: jest.SpyInstance;
+  beforeEach(() => {
+    createChildFrame = jest.spyOn(BrowserFrameFactory, 'createChildFrame');
+  });
+  afterEach(() => createChildFrame.mockRestore());
+
+  const SRCDOC = `<p>a</p><iframe srcdoc="<p>inner</p><iframe srcdoc='<p>deeper</p>'></iframe>"></iframe><iframe srcdoc="x"></iframe><p>b</p>`;
+
+  it('control: a DOMParser document of the same HTML does build child windows (the spy works)', async () => {
+    const w = createNetworkIsolatedWindow();
+    try {
+      new w.DOMParser().parseFromString(`<!DOCTYPE html><html><body>${SRCDOC}</body></html>`, 'text/html');
+      expect(createChildFrame).toHaveBeenCalled();
+    } finally {
+      await w.happyDOM.close();
+    }
+  });
+
+  it('generateJSON builds none, and keeps the content around the iframes', () => {
+    const json = generateJSON(SRCDOC, tiptapExtensions);
+    expect(createChildFrame).not.toHaveBeenCalled();
+    expect(JSON.stringify(json)).toContain('"text":"a"');
+    expect(JSON.stringify(json)).toContain('"text":"b"');
+    expect(JSON.stringify(json)).not.toContain('inner');
+  });
+});
+
+describe('#626 the detached parse gives the same output as the document parse it replaced', () => {
+  /** The pre-#626 parse, kept here as the oracle. */
+  const documentParse = async (html: string) => {
+    const w = createNetworkIsolatedWindow();
+    try {
+      const doc = new w.DOMParser().parseFromString(`<!DOCTYPE html><html><body>${html}</body></html>`, 'text/html');
+      return PMDOMParser.fromSchema(getSchema(tiptapExtensions)).parse(doc.body as unknown as Node).toJSON();
+    } finally {
+      await w.happyDOM.close();
+    }
+  };
+  const same = async (html: string) => {
+    let expected: unknown;
+    try {
+      expected = await documentParse(html);
+    } catch {
+      return; // the old parse threw on this input; there is no output to preserve
+    }
+    expect({ html, json: generateJSON(html, tiptapExtensions) }).toEqual({ html, json: expected });
+    // Let each window's asynchronous close() finish before the next parse (many windows at once exhaust the heap).
+    await new Promise((r) => setImmediate(r));
+  };
+
+  const TRICKY = [
+    '<!DOCTYPE html><html><head><title>T</title><meta charset="utf-8"><style>p{}</style></head><body class="b"><h1>Hi</h1><p>x</p></body></html>',
+    '<html><body><p>a</p></body></html><p>after</p>',
+    'text before<html><head></head><body>in body</body></html>text after',
+    '<head><title>only head</title></head><p>p</p>',
+    '<p>a</p><body><p>b</p></body><p>c</p>',
+    '<tr><td>stray</td></tr>',
+    '<td>a</td><td>b</td>',
+    '<table><td>no tr</td></table>',
+    '<table><div>moved</div><tr><td>x</td></tr></table>',
+    '<li>stray li</li><ul><li>a<li>b</ul>',
+    '<p>a<p>b<a href=x>1<a href=y>2</a></a><b><p>mis</b>nest</p>',
+    '<!-- c --><p>x</p><!--x',
+    '<!DOCTYPE html><p>x</p><!DOCTYPE html><p>y</p>',
+    '<p>&amp;&lt;&nbsp;&#x1F600;&bogus;</p>',
+    '<svg><circle r=1></circle></svg><script>alert(1)</script><template><p>t</p></template><p>x</p>',
+    '<pre><code class="language-js">const a = 1;\n</code></pre><p>line<br>break</p>',
+    '<ul data-type="taskList"><li data-type="taskItem" data-checked="true"><p>t</p></li></ul>',
+    '<details><summary>s</summary><div>d</div></details><div data-type="callout" data-callout-type="info"><p>c</p></div>',
+    '<p style="text-align:center;color:red"><span style="color:#f00">c</span></p>',
+    '',
+    'plain text only',
+    '<base href="https://example.com/"><a href="rel">r</a><p>unclosed <b>bold <i>it</p><p>next</p>',
+  ];
+
+  it.each(TRICKY.map((h) => [h]))('%j', async (html) => {
+    await same(html);
+  });
+
+  it('Markdown output (tables, code, task lists, raw HTML) parses the same', async () => {
+    const md = [
+      '# T',
+      '',
+      '| a | b |',
+      '|---|---|',
+      '| 1 | **2** |',
+      '',
+      '- [x] done',
+      '- [ ] todo',
+      '',
+      '```ts',
+      'const x = 1;',
+      '```',
+      '',
+      '> quote with [link](https://example.com)',
+      '',
+      '<div data-type="callout"><p>raw</p></div>',
+    ].join('\n');
+    await same(await markdownToHtml(md));
+  });
+
+  it('300 seeded tag-soup documents (no <template>) parse the same', async () => {
+    // <template> is left out: in malformed soup its content can differ, and there the old parse sometimes threw.
+    const TAGS = ['p', 'div', 'span', 'b', 'i', 'a', 'h1', 'h2', 'ul', 'ol', 'li', 'table', 'tbody', 'tr', 'td', 'th',
+      'blockquote', 'pre', 'code', 'br', 'hr', 'img', 'iframe', 'video', 'html', 'head', 'body', 'title', 'style',
+      'script', 'svg', 'details', 'summary', 'form', 'input', 'sup', 'sub', 'mark', 'figure', 'dl', 'dt', 'dd'];
+    const ATTRS = ['', ' class="c"', ' href="https://example.com/x"', ' src="a.png"', ' srcdoc="<p>i</p>"',
+      ' style="color:red"', ' data-type="taskList"', ' data-type="callout"', ' data-youtube-video', ' colspan=2', " title='t>'"];
+    const TEXT = ['x', 'hello world', '&amp;', '&lt;', ' ', '\n', '<', '>', '"', '<!--c-->', '<!--', '-->', '<!DOCTYPE html>', '</', '/>'];
+    let seed = 626;
+    const rnd = (n: number) => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    const gen = (depth = 0): string => {
+      let s = '';
+      for (let i = 1 + rnd(6); i > 0; i--) {
+        if (rnd(10) < 3 || depth > 5) {
+          s += TEXT[rnd(TEXT.length)];
+          continue;
+        }
+        const t = TAGS[rnd(TAGS.length)];
+        s += `<${t}${ATTRS[rnd(ATTRS.length)]}>${gen(depth + 1)}`;
+        if (rnd(5) !== 0) s += `</${rnd(5) === 0 ? TAGS[rnd(TAGS.length)] : t}>`;
+      }
+      return s;
+    };
+    for (let i = 0; i < 300; i++) await same(gen());
+  }, 60_000);
 });
 
 // Last in the file on purpose: a request that lands after its own test's wait still fails the file.

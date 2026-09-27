@@ -8,7 +8,6 @@ import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { MultipartFile } from '@fastify/multipart';
 import * as path from 'path';
 import {
-  htmlToJson,
   jsonToText,
   tiptapExtensions,
 } from '../../../collaboration/collaboration.util';
@@ -22,7 +21,13 @@ import {
 import { generateJitteredKeyBetween } from 'fractional-indexing-jittered';
 import { TiptapTransformer } from '@hocuspocus/transformer';
 import * as Y from 'yjs';
-import { markdownToHtml } from '@docmost/editor-ext';
+// CCC #626 (UPSTREAM_MODIFICATIONS #147): imported Markdown/HTML is converted off the event loop, within fixed bounds.
+import {
+  type ConversionQueue,
+  isContentParseRefusal,
+  parseUntrustedContent,
+  untrustedMarkdownToHtml,
+} from '../../../editor-compat/content-parse/content-parse.service';
 import {
   FileTaskStatus,
   FileTaskType,
@@ -96,6 +101,7 @@ export class ImportService {
         );
       }
     } catch (err) {
+      if (isContentParseRefusal(err)) throw err; // CCC #626: "too complex" (422) or "busy, retry" (503), as is
       const message = 'Error processing file content';
       this.logger.error(message, err);
       throw new BadRequestException(message);
@@ -147,18 +153,19 @@ export class ImportService {
 
   async processMarkdown(markdownInput: string): Promise<any> {
     try {
-      const html = await markdownToHtml(markdownInput);
+      const html = await untrustedMarkdownToHtml(markdownInput);
       return this.processHTML(html);
     } catch (err) {
       throw err;
     }
   }
 
-  async processHTML(htmlInput: string): Promise<any> {
+  // CCC #626: `queue` — the zip import's own batch queue; a request's import uses its actor's (the default).
+  async processHTML(htmlInput: string, queue?: ConversionQueue): Promise<any> {
     try {
       const $ = load(htmlInput);
       normalizeImportHtml($, $.root());
-      return htmlToJson($.html() || '');
+      return await parseUntrustedContent($.html() || '', 'html', queue);
     } catch (err) {
       throw err;
     }

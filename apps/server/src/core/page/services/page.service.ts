@@ -31,7 +31,6 @@ import {
   removeMarkTypeFromDoc,
 } from '../../../common/helpers/prosemirror/utils';
 import {
-  htmlToJson,
   jsonToNode,
   jsonToText,
 } from 'src/collaboration/collaboration.util';
@@ -51,7 +50,8 @@ import {
   INTERNAL_LINK_REGEX,
   extractPageSlugId,
 } from '../../../integrations/export/utils';
-import { markdownToHtml } from '@docmost/editor-ext';
+// CCC #626 (UPSTREAM_MODIFICATIONS #121): HTML/Markdown is converted off the event loop, within fixed bounds.
+import { parseUntrustedContent } from '../../../editor-compat/content-parse/content-parse.service';
 import { WatcherService } from '../../watcher/watcher.service';
 import { sql } from 'kysely';
 import { TransclusionService } from '../transclusion/transclusion.service';
@@ -1085,12 +1085,11 @@ export class PageService {
 
     switch (format) {
       case 'markdown': {
-        const html = await markdownToHtml(content as string);
-        prosemirrorJson = htmlToJson(html as string);
+        prosemirrorJson = await parseUntrustedContent(content as string, 'markdown');
         break;
       }
       case 'html': {
-        prosemirrorJson = htmlToJson(content as string);
+        prosemirrorJson = await parseUntrustedContent(content as string, 'html');
         break;
       }
       case 'json':

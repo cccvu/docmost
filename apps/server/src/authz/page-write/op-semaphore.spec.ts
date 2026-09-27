@@ -32,6 +32,18 @@ describe('OpSemaphore', () => {
     r2();
   });
 
+  it('a per-call wait overrides the constructor wait (#626: two gates sharing one admission budget)', async () => {
+    const s = new OpSemaphore(1, 60_000);
+    const r1 = await s.acquire();
+    const started = Date.now();
+    await expect(s.acquire(15)).rejects.toBeInstanceOf(OpSemaphoreTimeout);
+    expect(Date.now() - started).toBeLessThan(5_000);
+    r1();
+    const r2 = await s.acquire(0); // a free slot is granted at once, whatever the budget left
+    expect(s.inUse).toBe(1);
+    r2();
+  });
+
   it('a double release never frees a slot someone else holds', async () => {
     const s = new OpSemaphore(1, 1000);
     const r1 = await s.acquire();
