@@ -26,7 +26,8 @@ export const NARROWING_ROUTES: ReadonlySet<string> = new Set([
   // …and their #616 atomic compare-and-write twins (the platform relays a move carrying If-Match here)
   'ConditionalPageOpsController.conditionalMove',
   'ConditionalPageOpsController.conditionalMoveToSpace',
-  // native space + group membership
+  // native space + group membership. The two SpaceController entries are inert in remote mode, where
+  // `SpaceMemberMutationInterceptor` (#542) 404s them before the handler; kept so the settle returns if that lifts.
   'SpaceController.removeSpaceMember',
   'SpaceController.updateSpaceMemberRole',
   'GroupController.removeGroupMember',

@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { HttpAuthzClient } from './http-authz.client';
 import { AuthzModeModule } from './mode/authz-mode.module';
+import { NativeRouteAuthzModule } from './native-routes/native-route-authz.module';
 import { PageRestrictionModule } from './page-restriction/page-restriction.module';
 import { PublicDiscoveryModule } from './public-discovery/public-discovery.module';
 import { ServiceBridgeModule } from '../service-bridge/service-bridge.module';
@@ -14,11 +15,13 @@ import { ServiceBridgeModule } from '../service-bridge/service-bridge.module';
  *
  * Also mounts the page-restriction write feature and the anonymous public-content discovery feature
  * (their deps are all @Global, so no upstream edit is needed to register the routes — AuthzModule is
- * already in the graph via database.module).
+ * already in the graph via database.module), and the remote-mode interceptors on native upstream routes
+ * (NativeRouteAuthzModule, #542/#574).
  */
 @Module({
   imports: [
     AuthzModeModule,
+    NativeRouteAuthzModule, // #542/#574: remote-mode refusal/redaction on native routes
     PageRestrictionModule,
     PublicDiscoveryModule,
     ServiceBridgeModule,
