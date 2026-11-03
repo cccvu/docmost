@@ -97,7 +97,10 @@ d('AuthzChangeFeedService retention on real Postgres (gc sweep + stale-cursor ma
     role: 'reader',
     deleted_at: null,
   });
-  const insertRow = (conn: postgres.Sql | postgres.ReservedSql, n: number) =>
+  const insertRow = (
+    conn: postgres.Sql<{ bigint: number }> | postgres.ReservedSql<{ bigint: number }>,
+    n: number,
+  ) =>
     conn`insert into authz_outbox (op, table_name, payload) values ('INSERT', 'space_members', ${pg.json(memberPayload(n))})`;
 
   const outboxRows = async (): Promise<Tuple[]> => {
