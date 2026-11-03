@@ -110,6 +110,10 @@ d('PageRestrictionService self-dealing SQL on real Postgres (#486)', () => {
     };
     const authz = {
       tryCheckBulk: async (subject: unknown, checks: unknown[]) => {
+        // #542: remote mode's space-admin gate (`authorize`) asks space#administer first. It is not under test
+        // here (the unit spec pins it), so it always allows and is kept out of `pdpCalls`/`pdpAnswer`.
+        const [c] = checks as Array<{ permission: string; resourceType: string }>;
+        if (checks.length === 1 && c.permission === 'administer' && c.resourceType === 'space') return [true];
         pdpCalls.push({ subject, checks });
         return pdpAnswer;
       },

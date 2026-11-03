@@ -143,12 +143,20 @@ const roles: Array<[string, Grants]> = [
   ['writer', { edit: true, view: true }],
   ['reader', { view: true }],
   ['no role', {}],
+  // #542: bindings without space view (or without edit) must get exactly what the PDP gives — no native role
+  // without view, and reader (never admin) for administer + view without edit.
+  ['administer only (manage_members, no view)', { administer: true }],
+  ['administer + view, no edit', { administer: true, view: true }],
+  ['edit only (no view)', { edit: true }],
+  ['administer + edit, no view', { administer: true, edit: true }],
 ];
 for (const [role, space] of roles) {
   for (const locked of [false, true]) {
     for (const pageView of [false, true]) {
       for (const pageEdit of [false, true]) {
-        if (pageEdit && !pageView) continue; // edit implies view in the schema
+        // Edit implies view in the schema since #542: `role_binding.can_edit` requires `grants_view` too, so no
+        // binding (space or page scope) yields page#edit without page#view.
+        if (pageEdit && !pageView) continue;
         for (const lineage of ['open', 'restricted'] as const) {
           cases.push({
             name: `${role}, locked=${locked}, pageView=${pageView}, pageEdit=${pageEdit}, lineage=${lineage}`,
@@ -161,12 +169,25 @@ for (const [role, space] of roles) {
   }
 }
 cases.push(
+  // #542: named negatives on an unrestricted, placed page (also covered by the matrix above).
+  {
+    name: '#542 administer without view on an unrestricted page → deny',
+    grants: { administer: true, pageView: false, pageEdit: false },
+    lineage: 'open',
+  },
+  {
+    name: '#542 administer + view without edit on an unrestricted page → read-only',
+    grants: { administer: true, view: true, pageView: true },
+    lineage: 'open',
+  },
   {
     name: 'writer on a TRASHED page',
     page: { ...livePage, deletedAt: new Date() },
     grants: { edit: true, view: true, pageView: true, pageEdit: true },
   },
-  // #524: trashing reaps #space/#parent, so the PDP answers no view, not locked for everyone.
+  // #524: "no view, not locked" — a page the PDP has not placed. Since ADR 0027 Release B (#493) trashing KEEPS the
+  // #space/#parent edges, so in production this is a new or re-parented page not projected yet (or a subject without
+  // space view); the trashed variant stays as the defensive case.
   {
     name: 'writer on a TRASHED page the PDP no longer places, restricted lineage',
     page: { ...livePage, deletedAt: new Date() },
@@ -205,6 +226,22 @@ describe('collab access parity: decideCollabAccess ⇔ AuthenticationExtension.o
   it.each(cases)('agrees on: $name', async (c) => {
     expect(revalidateDecision(c)).toBe(await connectDecision(c));
   });
+
+  it.each([
+    ['administer only (no view)', { administer: true }, 'deny'],
+    ['administer + edit (no view)', { administer: true, edit: true }, 'deny'],
+    ['edit only (no view)', { edit: true }, 'deny'],
+    ['administer + view (no edit)', { administer: true, view: true, pageView: true }, 'read'],
+    ['view + edit, no administer', { edit: true, view: true, pageView: true, pageEdit: true }, 'write'],
+    ['administer + edit + view', { administer: true, edit: true, view: true, pageView: true, pageEdit: true }, 'write'],
+  ] as Array<[string, Grants, CollabAccess]>)(
+    '#542: on an unrestricted page, %s → %s on BOTH paths (the role needs space view; admin needs edit too)',
+    async (_n, grants, expected) => {
+      const c: Case = { name: _n, grants, lineage: 'open' };
+      expect(await connectDecision(c)).toBe(expected);
+      expect(revalidateDecision(c)).toBe(expected);
+    },
+  );
 
   it('a PDP failure is DENY at connect (fail closed) but UNKNOWN on revalidation (no mass eviction)', async () => {
     const c: Case = {

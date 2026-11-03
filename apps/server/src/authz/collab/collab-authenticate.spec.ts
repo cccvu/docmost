@@ -8,15 +8,18 @@ jest.mock('../../collaboration/collaboration.util', () => ({
 import { UnauthorizedException } from '@nestjs/common';
 import { AuthenticationExtension } from '../../collaboration/extensions/authentication.extension';
 import { PdpPagePermissionRepo } from '../pdp-page-permission.repo';
+import { PdpSpaceMemberRepo } from '../pdp-space-member.repo';
 import { spyKysely } from '../../service-bridge/kysely-spy.testkit';
 
 /**
  * CCC authorization integration test — NOT upstream Docmost code.
  *
  * #524 on the collab websocket. The Hocuspocus connect check calls `canUserEditPage` itself and, like
- * PageAccessService, falls back to the SPACE role when the answer is "unrestricted". For a trashed page in a
- * restricted section the PDP answered exactly that (its #parent edge is reaped), so any space member could open
- * the page's document. This drives the REAL extension over the REAL PDP repo (PDP and rows stubbed).
+ * PageAccessService, falls back to the SPACE role when the answer is "unrestricted". For a page the PDP has not
+ * placed (no view, not locked) in a restricted section that fallback would let any space member open the page's
+ * document. Since ADR 0027 Release B (#493) trashing KEEPS a page's #space/#parent edges, so in production such a
+ * page is new or re-parented and not projected yet; the trashed fixture below is the defensive case. This drives
+ * the REAL extension over the REAL PDP repo (PDP and rows stubbed).
  */
 describe('#524 — the collab connect refuses a page the PDP has not placed in a restricted section', () => {
   const row = (
@@ -82,5 +85,63 @@ describe('#524 — the collab connect refuses a page the PDP has not placed in a
       user: expect.objectContaining({ id: 'u1' }),
     });
     expect(data.connectionConfig.readOnly).toBe(true);
+  });
+});
+
+/**
+ * #542 on the collab websocket: the connect takes the space role from `PdpSpaceMemberRepo.getUserSpaceRoles`, which
+ * now needs space#view (and admin needs edit too). Drives the REAL extension over BOTH real PDP repos.
+ */
+describe('#542 — the collab connect takes the strict PDP space role', () => {
+  const PAGE = 'p1';
+  const SPACE = 's1';
+  /** A PDP answering space and page permissions from `grants`; page `locked` is false (an unrestricted page). */
+  const pdp = (grants: Record<string, boolean>) => {
+    const answer = (checks: Array<{ permission: string; resourceType: string }>) =>
+      checks.map((c) => grants[`${c.resourceType}:${c.permission}`] === true);
+    return { checkBulk: async (_s: unknown, c: any[]) => answer(c), tryCheckBulk: async (_s: unknown, c: any[]) => answer(c) };
+  };
+  // The page is a live root with no restriction in the fork's rows (read only when the PDP neither shows nor locks it).
+  const openLineage = () => spyKysely((q) => [{ id: q.parameters[0], parent_page_id: null, depth: 0, restricted: false }]).db;
+  const extension = (grants: Record<string, boolean>) => {
+    const authz = pdp(grants) as any;
+    return new AuthenticationExtension(
+      { verifyJwt: async () => ({ sub: 'u1', workspaceId: 'w1' }) } as any,
+      { findById: async () => ({ id: 'u1', deactivatedAt: null, deletedAt: null }) } as any,
+      { findById: async () => ({ id: PAGE, spaceId: SPACE, deletedAt: null }) } as any,
+      new PdpSpaceMemberRepo({} as any, {} as any, {} as any, {} as any, authz),
+      new PdpPagePermissionRepo(openLineage(), {} as any, {} as any, authz),
+    );
+  };
+  const payload = () => ({ documentName: `page.${PAGE}`, token: 't', connectionConfig: { readOnly: false } }) as any;
+
+  it('refuses a space admin without space view (manage_members only) on an unrestricted page', async () => {
+    await expect(extension({ 'space:administer': true }).onAuthenticate(payload())).rejects.toBeInstanceOf(
+      UnauthorizedException,
+    );
+  });
+
+  it('refuses an edit-only binding without space view', async () => {
+    await expect(
+      extension({ 'space:administer': true, 'space:edit': true }).onAuthenticate(payload()),
+    ).rejects.toBeInstanceOf(UnauthorizedException);
+  });
+
+  it('connects administer + view without edit READ-ONLY on an unrestricted page (reader, never admin)', async () => {
+    const data = payload();
+    await extension({ 'space:administer': true, 'space:view': true, 'page:view': true }).onAuthenticate(data);
+    expect(data.connectionConfig.readOnly).toBe(true);
+  });
+
+  it('control: administer + edit + view connects read-write (the tests are not vacuous)', async () => {
+    const data = payload();
+    await extension({
+      'space:administer': true,
+      'space:edit': true,
+      'space:view': true,
+      'page:view': true,
+      'page:edit': true,
+    }).onAuthenticate(data);
+    expect(data.connectionConfig.readOnly).toBe(false);
   });
 });

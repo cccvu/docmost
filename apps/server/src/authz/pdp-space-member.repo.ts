@@ -34,14 +34,40 @@ export class PdpSpaceMemberRepo extends SpaceMemberRepo {
     return { provider: 'docmost', externalId: userId } as const;
   }
 
-  /** Synthesize the highest space role from the PDP (administer→admin, edit→writer, view→reader). */
+  /**
+   * Synthesize the space role from the PDP's space administer/edit/view — STRICTLY, so the native engine never
+   * grants more than the PDP does (#542):
+   *
+   *   no view                        → no role
+   *   view, no edit                  → reader   (administer or not)
+   *   view + edit, no administer     → writer
+   *   view + edit + administer       → admin
+   *
+   * Why: every native content path takes its decision from this role — CASL (`SpaceAbilityFactory`) and the collab
+   * connect (`AuthenticationExtension`) both read it. CASL `admin` holds `Manage` on Page, i.e. full read/write on
+   * every unrestricted page, so it must need edit AND view; `writer` needs both too. A binding that grants
+   * administer without view (a `manage_members`-only role, ADR 0025) or edit without view used to map to admin or
+   * writer and so reached content the PDP refuses. With no view there is now no role at all: `SpaceAbilityFactory`
+   * answers 404 and the collab connect Unauthorized. That one rule closes page info (by id or slug), update, trash,
+   * restore, move, create, import, the sidebar, comments, shares, uploads and permanent delete (CASL Manage
+   * Settings) for a view-less space admin. Space administration itself (members, settings, page ACLs) does not
+   * depend on this role: the console and `/v1` decide it on `space#administer` (and the ACL write service in remote
+   * mode, see `PageRestrictionService.authorize`).
+   *
+   * Accepted loss (ADR 0025 amendment): an administer + view holder without edit becomes a native READER, so the
+   * native-only space settings (space update, icon, comment moderation, native space export) are gone for them.
+   *
+   * `checkBulk` denies the whole batch on a PDP error (all false), which reads as no view → no role: fail closed.
+   * `live-access/collab-access.decision.ts` applies the same mapping to open collab connections (pinned by
+   * `collab-access-parity.spec.ts`).
+   */
   override async getUserSpaceRoles(userId: string, spaceId: string): Promise<UserSpaceRole[]> {
     const [admin, edit, view] = await this.authz.checkBulk(this.subject(userId), [
       { permission: 'administer', resourceType: 'space', resourceId: spaceId },
       { permission: 'edit', resourceType: 'space', resourceId: spaceId },
       { permission: 'view', resourceType: 'space', resourceId: spaceId },
     ]);
-    const role = admin ? SpaceRole.ADMIN : edit ? SpaceRole.WRITER : view ? SpaceRole.READER : null;
+    const role = view ? (edit ? (admin ? SpaceRole.ADMIN : SpaceRole.WRITER) : SpaceRole.READER) : null;
     // Mirror the upstream contract: undefined (not []) when the user has no role in the space.
     return role ? [{ userId, role }] : (undefined as unknown as UserSpaceRole[]);
   }

@@ -179,7 +179,13 @@ d('PageRestrictionService versioned writes on real Postgres (#616)', () => {
       repo as never,
       { createForUser: async () => ({ cannot: () => false }) } as never,
       'remote',
-      { tryCheckBulk: async (_s: unknown, checks: unknown[]) => checks.map((_c, i) => pdp[i] ?? true) } as never,
+      {
+        // #542: remote mode's space-admin gate asks space#administer alone; it allows here (the unit spec pins it).
+        tryCheckBulk: async (_s: unknown, checks: unknown[]) =>
+          checks.length === 1 && (checks[0] as { permission: string }).permission === 'administer'
+            ? [true]
+            : checks.map((_c, i) => pdp[i] ?? true),
+      } as never,
       { invalidateSpaceRestrictionCache: async (spaceId: string) => void invalidations.push(spaceId) } as never,
     );
     reads = new ServiceContentService(db as never, fakeWorkspaceResolver(WS));
