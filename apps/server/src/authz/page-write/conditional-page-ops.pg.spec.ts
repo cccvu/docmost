@@ -176,6 +176,8 @@ d('ConditionalPageOpsController on real Postgres (#616)', () => {
       { createForUser: async () => allow } as never,
       { log: (p: { event: string }) => audits.push(p.event) } as never,
       { add: async (_j: string, data: { pageId: string }) => void controllerJobs.push(data.pageId) } as never,
+      'native', // the native replica; the remote permanent delete is RemotePurgeService's (remote-purge.pg.spec.ts)
+      {} as never,
     );
   });
 

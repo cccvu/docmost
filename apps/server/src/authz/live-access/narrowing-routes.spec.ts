@@ -1,5 +1,6 @@
 import { join } from 'path';
 import { scanRoutes } from '../route-guard/static-route-scan';
+import { REMOTE_REFUSED_ROUTES } from '../remote-refusal/remote-refusal.table';
 import { NARROWING_ROUTES } from './narrowing-routes';
 
 /**
@@ -41,6 +42,17 @@ describe('narrowing route table', () => {
       expect(routes.has(out)).toBe(true);
       expect(NARROWING_ROUTES.has(out)).toBe(false);
     }
+  });
+
+  // #636: remote mode refuses the native membership routes before the handler, so their settle entries are dead in
+  // remote and kept for native. Exactly these three may overlap: a NEW overlap means a narrowing route that remote
+  // now 404s (decide whether its platform twin settles), and a missing one means a refusal was lifted or renamed.
+  it('overlaps the remote refusal table in exactly the three native membership routes', () => {
+    expect([...NARROWING_ROUTES].filter((k) => REMOTE_REFUSED_ROUTES.has(k)).sort()).toEqual([
+      'GroupController.removeGroupMember',
+      'SpaceController.removeSpaceMember',
+      'SpaceController.updateSpaceMemberRole',
+    ]);
   });
 
   it('covers every narrowing family the ADR names (restrict/grants, move, members, archive)', () => {

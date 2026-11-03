@@ -69,6 +69,8 @@ const build = (opts: {
   targetParent?: unknown;
   serviceThrows?: unknown;
   holdEdit?: Promise<void>;
+  mode?: 'native' | 'remote';
+  purge?: (...args: unknown[]) => Promise<unknown>;
 } = {}) => {
   const calls: string[] = [];
   const row = opts.row === null ? null : { ...ROW, ...(opts.row ?? {}) };
@@ -131,6 +133,12 @@ const build = (opts: {
       calls.push(`queue:${data.pageId}:${spy.tx.join('>')}`);
     }),
   };
+  const remotePurge = {
+    purge: jest.fn(async (...args: unknown[]) => {
+      calls.push('remotePurge');
+      return opts.purge ? opts.purge(...args) : { page: { id: 'page-uuid-1' }, deletedIds: ['page-uuid-1'] };
+    }),
+  };
   const controller = new ConditionalPageOpsController(
     spy.db,
     pageRepo as never,
@@ -139,8 +147,10 @@ const build = (opts: {
     spaceAbility as never,
     auditService as never,
     attachmentQueue as never,
+    opts.mode ?? 'native',
+    remotePurge as never,
   );
-  return { controller, calls, spy, pageRepo, pageService, pageAccessService, spaceAbility, auditService, attachmentQueue };
+  return { controller, calls, spy, pageRepo, pageService, pageAccessService, spaceAbility, auditService, attachmentQueue, remotePurge };
 };
 
 const del = (over: Partial<ConditionalDeletePageDto> = {}) =>
@@ -278,6 +288,50 @@ describe('conditional-delete (trash / permanent)', () => {
   it('["*"] passes on any live row', async () => {
     const t = build();
     await expect(t.controller.conditionalDelete(del({ expectedEtags: ['*'] }), USER, WS)).resolves.toMatchObject({ outcome: 'applied' });
+  });
+
+  it('native mode never consults the remote purge (the replica above decides)', async () => {
+    const t = build();
+    await t.controller.conditionalDelete(del({ permanentlyDelete: true }), USER, WS);
+    expect(t.remotePurge.purge).not.toHaveBeenCalled();
+    expect(t.pageService.forceDelete).toHaveBeenCalled();
+  });
+});
+
+describe('conditional-delete in AUTHZ_MODE=remote (#636 W6)', () => {
+  it('permanent → the remote purge routine with the caller, the page ref, the workspace and the tags; nothing else runs here', async () => {
+    const t = build({ mode: 'remote' });
+    await expect(t.controller.conditionalDelete(del({ permanentlyDelete: true, pageId: 'slug-1' }), USER, WS)).resolves.toEqual({
+      outcome: 'applied',
+      pageId: 'page-uuid-1',
+    });
+    expect(t.remotePurge.purge).toHaveBeenCalledWith(USER, 'slug-1', 'ws-1', [FRESH]);
+    // The service owns the slot, the transaction, the decision, the jobs and the audit: none of them run twice.
+    expect(t.calls).toEqual(['remotePurge']);
+    expect(t.spy.tx).toEqual([]);
+    expect(t.pageService.forceDelete).not.toHaveBeenCalled();
+    expect(t.attachmentQueue.add).not.toHaveBeenCalled();
+    expect(t.auditService.log).not.toHaveBeenCalled();
+  });
+
+  it('a purge refusal passes through unchanged (403 purge_needs_edit, 412, 503)', async () => {
+    for (const err of [
+      new ForbiddenException({ message: 'x', code: 'purge_needs_edit' }),
+      new PreconditionFailedException({ message: 'page changed', code: 'precondition_failed' }),
+      new ServiceUnavailableException({ message: 'x', code: 'purge_unconfirmed' }),
+    ]) {
+      const t = build({ mode: 'remote', purge: async () => Promise.reject(err) });
+      const r = await codeOf(t.controller.conditionalDelete(del({ permanentlyDelete: true }), USER, WS));
+      expect(r).toEqual({ status: err.getStatus(), body: err.getResponse() });
+      expect(t.pageService.forceDelete).not.toHaveBeenCalled();
+    }
+  });
+
+  it('a trash in remote mode is unchanged: the native replica, never the purge', async () => {
+    const t = build({ mode: 'remote' });
+    await expect(t.controller.conditionalDelete(del(), USER, WS)).resolves.toEqual({ outcome: 'applied', pageId: 'page-uuid-1' });
+    expect(t.remotePurge.purge).not.toHaveBeenCalled();
+    expect(t.pageService.removePage).toHaveBeenCalled();
   });
 });
 

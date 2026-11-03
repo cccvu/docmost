@@ -14,6 +14,7 @@ import {
   spaceMemberRepoProvider,
 } from './repo-providers';
 import { searchServiceProvider } from '../search/search.provider';
+import { workspaceAbilityFactoryProvider } from './workspace-ability';
 
 // Constructor bodies of the repos/search are side-effect-free (empty or a field assign), so opaque stubs
 // are enough to exercise the selection factory and assert which concrete class is produced.
@@ -27,12 +28,13 @@ const stub = {} as any;
  * pinned by a test.
  */
 describe('mode-selected DI providers', () => {
-  it('all four name AUTHZ_MODE as their first injected dependency', () => {
+  it('all five name AUTHZ_MODE as their first injected dependency', () => {
     for (const p of [
       spaceMemberRepoProvider,
       pagePermissionRepoProvider,
       labelRepoProvider,
       searchServiceProvider,
+      workspaceAbilityFactoryProvider,
     ]) {
       expect((p as FactoryProvider).inject?.[0]).toBe(AUTHZ_MODE);
     }

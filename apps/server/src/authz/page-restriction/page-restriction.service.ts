@@ -41,6 +41,8 @@ import {
   refusalCodeOf,
 } from '../../service-bridge/resource-version';
 import { AclEffect, AclState, aclVersionOf, diffAcl, isNoop, noEffect, readAclState } from './acl-state';
+import { AUDIT_SERVICE, IAuditService } from '../../integrations/audit/audit.service';
+import { AclAuditAction, aclAuditPayload } from './acl-audit';
 
 /** A1 (#486): the 403 body carries a machine-readable `code`, the same one rule M uses on the bridge. */
 const selfGrant = () =>
@@ -122,6 +124,10 @@ interface AclRun {
  * the lock now protects (still restricted, grant still there, A3's children). The PDP reads (A2, A3) and the A1
  * group probe stay BEFORE the lock: no HTTP call is ever made while holding it. Each write answers the ACL's new
  * `version` and its `effect`; `preview` runs the same code and rolls it back.
+ *
+ * Audit (#503): each APPLIED write emits exactly one domain-audit row (`acl-audit.ts`: upstream event names, ids and
+ * roles only, `metadata.surface: 'engine'`) after its transaction commits. A no-op, a refusal, a busy or failed
+ * transaction and a preview emit nothing; a broken audit sink never fails a committed write.
  */
 @Injectable()
 export class PageRestrictionService {
@@ -139,6 +145,10 @@ export class PageRestrictionService {
     // or the newly restricted page's titles and comment bodies keep going to every member for up to 30 s.
     // Optional only so the unit specs can omit it; the @Global WsModule always provides it in the app.
     @Optional() private readonly wsService?: WsService,
+    // #503: the domain-audit sink. Optional because the collaboration app (CollabAppModule) reaches this module
+    // through DatabaseModule → AuthzModule but mounts no audit module, so a required token would break collab boot.
+    // The web app's @Global PlatformAuditModule always provides it (page-restriction.module.spec.ts pins both).
+    @Optional() @Inject(AUDIT_SERVICE) private readonly audit?: IAuditService,
   ) {}
 
   private subject(user: User) {
@@ -265,7 +275,7 @@ export class PageRestrictionService {
    * out — and nothing more. The role is decided BEFORE any lock or write.
    */
   async restrict(pageId: string, user: User, opts: AclWriteOptions = {}): Promise<AclWriteResult> {
-    return this.settle(await this.runRestrict(pageId, user, { expectedVersion: opts.expectedVersion }));
+    return this.settle('restrict', await this.runRestrict(pageId, user, { expectedVersion: opts.expectedVersion }));
   }
 
   private async runRestrict(pageId: string, user: User, run: RunOptions): Promise<AclRun> {
@@ -325,6 +335,7 @@ export class PageRestrictionService {
     opts: { requireActorCoverage?: boolean } & AclWriteOptions = {},
   ): Promise<AclWriteResult> {
     return this.settle(
+      'unrestrict',
       await this.runUnrestrict(pageId, user, opts.requireActorCoverage === true, { expectedVersion: opts.expectedVersion }),
     );
   }
@@ -370,7 +381,7 @@ export class PageRestrictionService {
 
   /** Grant users/groups access to a restricted page (idempotent: replaces any existing grant). */
   async addPermission(dto: AddPagePermissionDto, user: User): Promise<AclWriteResult> {
-    return this.settle(await this.runAddPermission(dto, user, { expectedVersion: dto.expectedVersion }));
+    return this.settle('add', await this.runAddPermission(dto, user, { expectedVersion: dto.expectedVersion }));
   }
 
   private async runAddPermission(dto: AddPagePermissionDto, user: User, run: RunOptions): Promise<AclRun> {
@@ -403,7 +414,7 @@ export class PageRestrictionService {
 
   /** Revoke users'/groups' access to a restricted page (revoking your own grant is always allowed). */
   async removePermission(dto: RemovePagePermissionDto, user: User): Promise<AclWriteResult> {
-    return this.settle(await this.runRemovePermission(dto, user, { expectedVersion: dto.expectedVersion }));
+    return this.settle('remove', await this.runRemovePermission(dto, user, { expectedVersion: dto.expectedVersion }));
   }
 
   private async runRemovePermission(dto: RemovePagePermissionDto, user: User, run: RunOptions): Promise<AclRun> {
@@ -431,7 +442,7 @@ export class PageRestrictionService {
    * to answer success. The grant row is found and locked in this transaction, then updated by its id.
    */
   async updatePermission(dto: UpdatePagePermissionDto, user: User): Promise<AclWriteResult> {
-    return this.settle(await this.runUpdatePermission(dto, user, { expectedVersion: dto.expectedVersion }));
+    return this.settle('update', await this.runUpdatePermission(dto, user, { expectedVersion: dto.expectedVersion }));
   }
 
   private async runUpdatePermission(dto: UpdatePagePermissionDto, user: User, run: RunOptions): Promise<AclRun> {
@@ -537,12 +548,28 @@ export class PageRestrictionService {
    * After the COMMIT: the socket.io plane's "does this space have any restriction" cache. Dropped only after a
    * restrict actually committed — inside the transaction a concurrent reader could re-cache the pre-commit answer —
    * and never for a preview (which never reaches here). A cache failure never fails the write (the entry expires).
+   * Then the write's one domain-audit row (#503), for an applied write only: emitted here, after the commit, so a
+   * row never describes a write that rolled back. Fire-and-forget — a sink that throws or rejects is logged, never
+   * surfaced: the write has already committed.
    */
-  private async settle(run: AclRun): Promise<AclWriteResult> {
+  private async settle(action: AclAuditAction, run: AclRun): Promise<AclWriteResult> {
     if (run.outcome === 'applied' && run.invalidateSpace) {
       await this.wsService?.invalidateSpaceRestrictionCache(run.invalidateSpace).catch(() => undefined);
     }
+    if (run.outcome === 'applied' && this.audit) {
+      try {
+        void Promise.resolve(this.audit.log(aclAuditPayload(action, run.page, run.effect))).catch((err) =>
+          this.auditFailed(action, err),
+        );
+      } catch (err) {
+        this.auditFailed(action, err);
+      }
+    }
     return { version: run.version, effect: run.effect };
+  }
+
+  private auditFailed(action: AclAuditAction, err: unknown): void {
+    this.logger.warn(`PAGE_ACL_AUDIT_FAILED action=${action}: ${(err as Error)?.message ?? String(err)}`);
   }
 }
 

@@ -8,7 +8,9 @@ This is a fork of Docmost that adds a server-controlled authorization mode. It c
   not an "allow all" or a degraded fallback.
 - **`AUTHZ_MODE=remote`**: authorization decisions come from an external service over the published contract
   in [`../integrations/authorization/`](../integrations/authorization/), and native credential login is
-  disabled server-side. See [`external-services.md`](./external-services.md).
+  disabled server-side. `users.role` confers no workspace authority, and the native admin routes (space delete
+  and create, workspace, group and space-member admin, email change) answer `404`. See
+  [`external-services.md`](./external-services.md).
 
 `AUTHZ_MODE` is **required** and validated at boot. There is no default, the value is never inferred from
 whether an authorization URL is set, and it cannot change at runtime. A missing or invalid value aborts

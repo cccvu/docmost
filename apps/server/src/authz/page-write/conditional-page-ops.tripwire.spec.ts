@@ -68,7 +68,12 @@ const squash = (s: string) => s.replace(/\s+/g, '').replace(/,([}\])])/g, '$1');
  * Pinned at upstream v0.95.0 (page.controller.ts is not a seam file — the fork does not modify it).
  */
 const PINNED: Record<string, { replica: string; digest: string }> = {
-  'PageController.delete': { replica: 'ConditionalPageOpsController.conditionalDelete', digest: '4ff686296be38b1d' },
+  // The permanent branch is also replicated, in remote mode, by RemotePurgeService.purge (authz/page-delete/, #636 W6):
+  // the same space Manage-Settings refusal and the same `page.deleted` audit payload.
+  'PageController.delete': {
+    replica: 'ConditionalPageOpsController.conditionalDelete + RemotePurgeService.purge',
+    digest: '4ff686296be38b1d',
+  },
   'PageController.movePage': { replica: 'ConditionalPageOpsController.conditionalMove', digest: '983e3fcf4aa37308' },
   'PageController.movePageToSpace': {
     replica: 'ConditionalPageOpsController.conditionalMoveToSpace',
@@ -106,7 +111,7 @@ describe('#616 tripwire — the replicated native page-handler preambles', () =>
 
 describe('#616 tripwire — the PageService behaviour the replicas depend on', () => {
   const service = read('core/page/services/page.service.ts');
-  const ops = read('authz/page-write/conditional-page-ops.controller.ts');
+  const jobs = read('authz/page-delete/page-attachment-jobs.ts');
 
   it('update() writes exactly title/icon from the request — the fields metadata convergence compares', () => {
     const [write] = calls(service, method(service, 'PageService', 'update'), 'this.pageRepo.updatePage');
@@ -123,14 +128,20 @@ describe('#616 tripwire — the PageService behaviour the replicas depend on', (
     const force = method(service, 'PageService', 'forceDelete');
     expect(squash(force.getText(service))).toContain('for(constidoftrx?[]:pageIds)');
     const [upstream] = calls(service, force, 'this.attachmentQueue.add');
-    const [replica] = calls(ops, method(ops, 'ConditionalPageOpsController', 'queueAttachmentDeletion'), 'this.attachmentQueue.add');
+    // The one replica both callers under a transaction use: the conditional delete and the remote purge (#636 W6).
+    let helper: ts.FunctionDeclaration | undefined;
+    jobs.forEachChild((n) => {
+      if (ts.isFunctionDeclaration(n) && n.name?.text === 'queuePageAttachmentDeletion') helper = n;
+    });
+    if (!helper) throw new Error('queuePageAttachmentDeletion not found in authz/page-delete/page-attachment-jobs.ts');
+    const [replica] = calls(jobs, helper, 'queue.add');
     const expected = [
       'QueueJob.DELETE_PAGE_ATTACHMENTS',
       '{pageId:id}',
       "{jobId:`delete-page-attachments-${id}`,attempts:3,backoff:{type:'exponential',delay:5000}}",
     ];
     expect(upstream.arguments.map((a) => squash(a.getText(service)))).toEqual(expected);
-    expect(replica.arguments.map((a) => squash(a.getText(ops)))).toEqual(expected);
+    expect(replica.arguments.map((a) => squash(a.getText(jobs)))).toEqual(expected);
   });
 
   /** The condition of the nearest `if` enclosing `node` (squashed), or null. */

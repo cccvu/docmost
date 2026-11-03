@@ -2,14 +2,14 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import * as ts from 'typescript';
 import { literalText, ownerOf, sourceFiles } from '../route-guard/ast-sink-scan';
-import { SPACE_HARD_DELETE_CALL_RE, scanRoutes } from '../route-guard/static-route-scan';
-import { SPACE_HARD_DELETE_ROUTES } from './space-hard-delete.interceptor';
+import { handlerCalls, scanRoutes } from '../route-guard/static-route-scan';
+import { routesOf } from './remote-refusal.table';
 
 /**
  * Space hard-delete FITNESS TEST (#502) — NOT upstream Docmost code.
  *
- * `SpaceHardDeleteInterceptor` refuses the native space delete in remote mode by `Controller.handler` key, so it is
- * only as good as that key set. This pins it statically (no imports of the real controllers, no boot):
+ * `RemoteNativeRefusalInterceptor` refuses the native space delete in remote mode by `Controller.handler` key (the
+ * `spaceHardDelete` family of `remote-refusal.table.ts`), so it is only as good as that key set. This pins it statically (no imports of the real controllers, no boot):
  *  - the refused set is EXACTLY the set of routes whose handler reaches `.deleteSpace(` — both directions. An
  *    upstream bump that renames the handler (the key would silently stop matching and the route would be open) or
  *    adds a second route reaching the delete fails RED here;
@@ -17,13 +17,16 @@ import { SPACE_HARD_DELETE_ROUTES } from './space-hard-delete.interceptor';
  *    count): the only `DELETE FROM spaces` is in `SpaceRepo.deleteSpace`, `.deleteSpace(` is called only from
  *    `SpaceService.deleteSpace` and `SpaceController.deleteSpace`, and only `SpaceService.deleteSpace` queues the
  *    space attachment purge. A new method that reaches a sink — a `bulkDelete` looping the repo, a job, a listener —
- *    fails RED, and whoever adds it decides deliberately whether remote mode must refuse it too;
- *  - app.module.ts registers the interceptor after the per-principal rate limiter, so a flood of refused attempts is
- *    rate-limited and each attempt lands in the #467 access row.
+ *    fails RED, and whoever adds it decides deliberately whether remote mode must refuse it too.
+ * The interceptor's registration (once, after the per-principal rate limiter) is pinned in remote-refusal.fitness.spec.ts.
  * A static inventory: a sink reached through an unrecognized indirection (a method passed by reference, a dynamic
  * property name) is invisible to it. The meta-guard at the bottom pins the shapes it does recognize.
  */
 const SRC_ROOT = join(__dirname, '..', '..'); // .../apps/server/src
+
+// Text tell that a handler body reaches the space hard delete (#502): `spaceService.deleteSpace(` today, or a direct
+// `spaceRepo.deleteSpace(`. The `(` right after the name keeps `deleteSpaceWatch(` out.
+export const SPACE_HARD_DELETE_CALL_RE = /\.deleteSpace\s*\(/;
 
 // Raw SQL `DELETE FROM spaces` inside a string or template literal.
 export const RAW_SPACES_ROW_DELETE_RE = /\bdelete\s+from\s+(?:"?public"?\.)?"?spaces"?(?![\w"])/i;
@@ -95,12 +98,12 @@ describe('space hard delete is refused on every route that reaches it (#502)', (
 
   it('every refused key names a real route', () => {
     const known = new Set(routes.map(key));
-    expect([...SPACE_HARD_DELETE_ROUTES].filter((k) => !known.has(k))).toEqual([]);
+    expect([...routesOf('spaceHardDelete')].filter((k) => !known.has(k))).toEqual([]);
   });
 
   it('the refused set is EXACTLY the routes whose handler reaches the space hard delete', () => {
-    const reaching = routes.filter((r) => r.callsSpaceHardDelete).map(key).sort();
-    expect(reaching).toEqual([...SPACE_HARD_DELETE_ROUTES].sort());
+    const reaching = routes.filter((r) => handlerCalls(r, SPACE_HARD_DELETE_CALL_RE)).map(key).sort();
+    expect(reaching).toEqual([...routesOf('spaceHardDelete')].sort());
   });
 
   it('the only `DELETE FROM spaces` is the one in SpaceRepo.deleteSpace', () => {
@@ -122,14 +125,6 @@ describe('space hard delete is refused on every route that reaches it (#502)', (
     expect(sitesOf('spaceAttachmentPurge')).toEqual([
       'core/space/services/space.service.ts:SpaceService.deleteSpace',
     ]);
-  });
-
-  it('app.module.ts registers the interceptor after the per-principal rate limiter', () => {
-    const app = files.find((f) => f.file === 'app.module.ts')?.src ?? '';
-    const limiter = app.indexOf('useClass: PrincipalRateLimitInterceptor');
-    const refusal = app.indexOf('useClass: SpaceHardDeleteInterceptor');
-    expect(limiter).toBeGreaterThan(-1);
-    expect(refusal).toBeGreaterThan(limiter);
   });
 });
 

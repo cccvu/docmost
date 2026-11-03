@@ -46,10 +46,12 @@ import { PublicSurfaceThrottlerGuard } from './authz/route-guard/public-surface-
 import { ApiAccessAuditService } from './authz/request-controls/api-access-audit.service';
 import { ApiAccessAuditInterceptor } from './authz/request-controls/api-access-audit.interceptor';
 import { PrincipalRateLimitInterceptor } from './authz/request-controls/principal-rate-limit.interceptor';
-// CCC seam (#502): remote mode refuses the engine's native space hard delete (archive is the only removal).
-import { SpaceHardDeleteInterceptor } from './authz/space-delete/space-hard-delete.interceptor';
-// CCC seam (#598): remote mode refuses the engine's native space create (the platform's create is the only one).
-import { SpaceNativeCreateInterceptor } from './authz/space-create/space-native-create.interceptor';
+// CCC seam (#502, #598, #636): remote mode refuses the engine's native admin routes (space hard delete and create,
+// workspace/group/space-member admin, email change) — a table in authz/remote-refusal/.
+import { RemoteNativeRefusalInterceptor } from './authz/remote-refusal/remote-refusal.interceptor';
+// CCC seam (#636 W6): remote mode runs a permanent page delete through the locked, fenced purge routine.
+import { PageDeleteModule } from './authz/page-delete/page-delete.module';
+import { RemotePurgeInterceptor } from './authz/page-delete/remote-purge.interceptor';
 
 const enterpriseModules = [];
 try {
@@ -94,6 +96,7 @@ try {
     CollaborationModule,
     CollabDisconnectModule,
     ConditionalPageModule,
+    PageDeleteModule,
     CommentResolutionModule,
     ResponseHeadersModule,
     WsModule,
@@ -143,8 +146,9 @@ try {
     // ORDER MATTERS and is load-bearing (see UPSTREAM_MODIFICATIONS.md seam #4): AuditActorInterceptor
     // (above) stamps the CLS actor first; ApiAccessAuditInterceptor wraps the request so it records the
     // final outcome INCLUDING a 429 the rate limiter raises; PrincipalRateLimitInterceptor rejects before the
-    // handler runs. SpaceHardDeleteInterceptor (#502) and SpaceNativeCreateInterceptor (#598) are registered after
-    // these, so their 404s are rate-limited and land in the access row too. Do not reorder.
+    // handler runs. RemoteNativeRefusalInterceptor (#502, #598, #636) is registered after these, so its 404s are
+    // rate-limited and land in the access row too. RemotePurgeInterceptor (#636 W6) is registered after them too,
+    // so a remote purge is rate-limited and lands in the access row. Do not reorder.
     ApiAccessAuditService,
     {
       provide: APP_INTERCEPTOR,
@@ -156,11 +160,11 @@ try {
     },
     {
       provide: APP_INTERCEPTOR,
-      useClass: SpaceHardDeleteInterceptor,
+      useClass: RemoteNativeRefusalInterceptor,
     },
     {
       provide: APP_INTERCEPTOR,
-      useClass: SpaceNativeCreateInterceptor,
+      useClass: RemotePurgeInterceptor,
     },
   ],
 })

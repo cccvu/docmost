@@ -80,7 +80,10 @@ describe('toActivityAuditRow (allowlist + skip rules)', () => {
     'page.created',
     'page.deleted', // a permanent delete: the page is no longer authorizable, so the feed never shows it
     'page.duplicated',
-    'page.restricted',
+    'page.restricted', // #503: the page-ACL events are forward-only — ACL membership never reaches the feed
+    'page.restriction_removed',
+    'page.permission_added',
+    'page.permission_removed',
     'comment.created', // the feed reads creates from the comments table itself
     'comment.updated',
     'user.login',

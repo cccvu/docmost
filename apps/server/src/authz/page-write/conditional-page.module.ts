@@ -6,6 +6,7 @@ import { ConditionalPageController } from './conditional-page.controller';
 import { ConditionalPageOpsController } from './conditional-page-ops.controller';
 import { IdempotencyLedgerModule } from '../idempotency/idempotency-ledger.module';
 import { IdempotentPageCreateController } from '../idempotency/idempotent-page-create.controller';
+import { PageDeleteModule } from '../page-delete/page-delete.module';
 
 /**
  * CCC authorization integration — NOT upstream Docmost code.
@@ -23,12 +24,15 @@ import { IdempotentPageCreateController } from '../idempotency/idempotent-page-c
  * authz/idempotency/), which needs the same PageService/PageAccessService plus the create-idempotency ledger
  * (IdempotencyLedgerModule: its installer, sweep and service).
  *
+ * PageDeleteModule supplies `RemotePurgeService`: in remote mode the conditional permanent delete runs the locked,
+ * fenced purge routine (#636 W6), the same one the native `PageController.delete` reaches via its interceptor.
+ *
  * Mounted at the app root (app.module.ts — a documented composition seam) rather than via AuthzModule, for
  * the same reason as CollabDisconnectModule: to keep CollaborationModule's heavy graph out of the
  * database-module init chain.
  */
 @Module({
-  imports: [PageModule, PageAccessModule, CollaborationModule, IdempotencyLedgerModule],
+  imports: [PageModule, PageAccessModule, CollaborationModule, IdempotencyLedgerModule, PageDeleteModule],
   controllers: [ConditionalPageController, ConditionalPageOpsController, IdempotentPageCreateController],
 })
 export class ConditionalPageModule {}
