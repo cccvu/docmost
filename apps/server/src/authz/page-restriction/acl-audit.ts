@@ -7,12 +7,14 @@ import { MAX_PAGE_GRANTEES } from './dto';
  * CCC authorization integration — NOT upstream Docmost code (#503).
  *
  * The domain-audit row for one APPLIED page-ACL write (restrict / unrestrict / add / remove / update). Pure: the
- * service builds it from the committed write's `effect` and hands it to `AUDIT_SERVICE` after the commit.
+ * service builds it from the committed write's `effect` and hands it to `AUDIT_SERVICE` after the commit. Plus one
+ * row for a write REFUSED as self-dealing (#673, `aclRefusalAuditPayload` below).
  *
- *   - Upstream's event names only (no edit to `audit-events.ts`); there is no "permission updated" event, so a role
- *     change is `page.permission_added` with `metadata.operation: 'role_changed'` — the same vocabulary as the
- *     platform's `/v1` `admin_change` rows. Count ACL changes by `source` / `event_category` too: a `/v1` change
- *     writes both rows.
+ *   - An applied write uses upstream's event names only (no edit to `audit-events.ts`); there is no "permission
+ *     updated" event, so a role change is `page.permission_added` with `metadata.operation: 'role_changed'` — the
+ *     same vocabulary as the platform's `/v1` `admin_change` rows. Count ACL changes by `source` / `event_category`
+ *     too: a `/v1` change writes both rows. The one CCC-only name is the refusal's `page.acl_write_refused`: upstream
+ *     has no denied-write event, and adding one to `audit-events.ts` would be an upstream edit.
  *   - `metadata.surface: 'engine'` marks this as the ENGINE's record of the write. A `/v1` or MCP change reaches here
  *     through the platform relay as the relayed human, with no service account or on-behalf-of: the platform's own
  *     `admin_change` row (`source: 'platform'`) is the authoritative agent attribution, this row is not. The fork
@@ -70,5 +72,36 @@ export function aclAuditPayload(
     spaceId: page.spaceId,
     changes: { before: { restricted: effect.restrictedBefore }, after: { restricted: effect.restrictedAfter } },
     metadata,
+  };
+}
+
+/**
+ * #673: a refused page-ACL write that is a self-dealing attempt — a grant or re-role naming the actor or their group
+ * (A1, `self_grant`), or lifting a restriction from a page the actor cannot edit (A3, `actor_cannot_edit`). Those are
+ * the refusals worth a reviewer's attention: an admin reaching for content they cannot see. Every other refusal (the
+ * page is not restricted, a sub-page would be exposed, a stale version, no such grant) is a state conflict and stays
+ * unaudited, as an applied no-op does.
+ */
+export const AUDITED_ACL_REFUSALS: ReadonlySet<string> = new Set(['self_grant', 'actor_cannot_edit']);
+
+/** Not an upstream `AuditEvent`: the platform ingest accepts any event name (see the module note above). */
+export const ACL_WRITE_REFUSED_EVENT = 'page.acl_write_refused';
+
+/**
+ * The one row a refused write emits, or `undefined` when `reason` is not one `AUDITED_ACL_REFUSALS` names. Ids only:
+ * never the page title (a restricted page's title is itself confidential) and never the grantees the actor named.
+ */
+export function aclRefusalAuditPayload(
+  action: AclAuditAction,
+  page: Pick<Page, 'id' | 'spaceId'>,
+  reason: string,
+): AuditLogPayload | undefined {
+  if (!AUDITED_ACL_REFUSALS.has(reason)) return undefined;
+  return {
+    event: ACL_WRITE_REFUSED_EVENT as string as AuditEventType,
+    resourceType: AuditResource.PAGE,
+    resourceId: page.id,
+    spaceId: page.spaceId,
+    metadata: { surface: 'engine', outcome: 'denied', action, reason },
   };
 }

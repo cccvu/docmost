@@ -36,16 +36,11 @@ export class PageRestrictionController {
     return { restricted: true, ...(await this.restriction.restrict(dto.pageId, user, expected(dto))) };
   }
 
+  /** #673: A3 always runs in the service; `dto.requireActorCoverage` is accepted and deliberately not forwarded. */
   @HttpCode(HttpStatus.OK)
   @Post('remove-restriction')
   async removeRestriction(@Body() dto: RemoveRestrictionDto, @AuthUser() user: User) {
-    return {
-      restricted: false,
-      ...(await this.restriction.unrestrict(dto.pageId, user, {
-        requireActorCoverage: dto.requireActorCoverage === true,
-        ...expected(dto),
-      })),
-    };
+    return { restricted: false, ...(await this.restriction.unrestrict(dto.pageId, user, expected(dto))) };
   }
 
   @HttpCode(HttpStatus.OK)
