@@ -72,8 +72,13 @@ function makeService(opts: {
   grant?: { id: string };
   /** AUTHZ_MODE (default `native`, where restrict keeps upstream's writer self-grant). */
   mode?: 'native' | 'remote';
-  /** What `tryCheckBulk` answers (null = the PDP failed); all-true by default. */
+  /** What `tryCheckBulk` answers for A2/A3 (null = the PDP failed); all-true by default. */
   pdp?: boolean[] | null;
+  /**
+   * Remote mode's space-admin gate (#542): what the PDP answers for `space#administer` (null = the PDP failed).
+   * Defaults to `role === 'admin'`, so the gate decides as the native CASL rule would for the same role.
+   */
+  pdpAdmin?: boolean | null;
   /** Whether the actor is a member of the groups the A1 probe asks about. */
   inGroup?: boolean;
   /** Whether the page has a restricted ancestor (A2). */
@@ -137,11 +142,15 @@ function makeService(opts: {
     return [];
   });
 
+  const pdpAdmin = opts.pdpAdmin === undefined ? opts.role === 'admin' : opts.pdpAdmin;
   const authz = {
-    tryCheckBulk: jest.fn(async (_s: unknown, checks: unknown[]) =>
-      opts.pdp === undefined ? checks.map(() => true) : opts.pdp,
-    ),
+    tryCheckBulk: jest.fn(async (_s: unknown, checks: unknown[]) => {
+      if (isAdminGate(checks)) return pdpAdmin === null ? null : [pdpAdmin];
+      return opts.pdp === undefined ? checks.map(() => true) : opts.pdp;
+    }),
   };
+  /** The PDP calls other than remote mode's space-admin gate (A2's space view/edit, A3's page edit). */
+  const contentChecks = () => authz.tryCheckBulk.mock.calls.filter((c) => !isAdminGate(c[1] as unknown[]));
 
   const service = new PageRestrictionService(
     spy.db,
@@ -152,7 +161,13 @@ function makeService(opts: {
     authz as any,
     opts.ws as any,
   );
-  return { service, pageRepo, pagePermissionRepo, getUserSpaceRoles, spy, authz };
+  return { service, pageRepo, pagePermissionRepo, getUserSpaceRoles, spy, authz, contentChecks };
+}
+
+/** Remote mode's space-admin gate in `authorize` (#542): ONE check, `space#administer`. */
+function isAdminGate(checks: unknown[]): boolean {
+  const [c] = checks as Array<{ permission: string; resourceType: string }>;
+  return checks.length === 1 && c.permission === 'administer' && c.resourceType === 'space';
 }
 
 describe('PageRestrictionService — who may restrict a page (space-admin gate)', () => {
@@ -552,6 +567,111 @@ describe('PageRestrictionService — A1: no self page-grant (#486)', () => {
   });
 });
 
+describe('PageRestrictionService — remote mode gates on the PDP\'s space#administer (#542)', () => {
+  // Since #542 the native space role needs space#view, so a view-less space admin (manage_members only, ADR 0025)
+  // has NO CASL role. In remote mode the gate asks the PDP's space#administer instead, which keeps the /v1 ACL relay
+  // working for them; native mode keeps upstream's CASL rule.
+  const ADMIN_GATE = [{ permission: 'administer', resourceType: 'space', resourceId: SPACE_ID }];
+
+  it('allows a view-less space admin (no CASL role) when the PDP grants space#administer', async () => {
+    const { service, pagePermissionRepo, authz, getUserSpaceRoles } = makeService({
+      role: undefined, // what PdpSpaceMemberRepo now answers for administer without view
+      pdpAdmin: true,
+      mode: 'remote',
+      accessSeq: [{ id: ACCESS_ID }],
+    });
+    await expect(
+      service.addPermission({ pageId: PAGE_ID, userIds: [TARGET_USER], role: 'reader' } as AddPagePermissionDto, userOf(ADMIN_ID)),
+    ).resolves.toEqual(WRITTEN);
+    expect(authz.tryCheckBulk).toHaveBeenCalledWith({ provider: 'docmost', externalId: ADMIN_ID }, ADMIN_GATE);
+    expect(getUserSpaceRoles).not.toHaveBeenCalled(); // CASL is not consulted in remote mode
+    expect(pagePermissionRepo.insertPagePermissions).toHaveBeenCalledTimes(1);
+  });
+
+  it('a view-less space admin restricting keeps nothing (A2): restricted, no self-grant', async () => {
+    const { service, pagePermissionRepo } = makeService({
+      role: undefined,
+      pdpAdmin: true,
+      mode: 'remote',
+      pdp: [false, false], // space view, space edit
+      accessSeq: [undefined, { id: ACCESS_ID }],
+    });
+    await expect(service.restrict(PAGE_ID, userOf(ADMIN_ID))).resolves.toEqual(WRITTEN);
+    expect(pagePermissionRepo.insertPageAccess).toHaveBeenCalledTimes(1);
+    expect(pagePermissionRepo.insertPagePermissions).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['restrict', (svc: PageRestrictionService) => svc.restrict(PAGE_ID, userOf(WRITER_ID))],
+    ['unrestrict', (svc: PageRestrictionService) => svc.unrestrict(PAGE_ID, userOf(WRITER_ID))],
+    [
+      'addPermission',
+      (svc: PageRestrictionService) =>
+        svc.addPermission({ pageId: PAGE_ID, userIds: [TARGET_USER], role: 'reader' } as AddPagePermissionDto, userOf(WRITER_ID)),
+    ],
+    [
+      'removePermission',
+      (svc: PageRestrictionService) =>
+        svc.removePermission({ pageId: PAGE_ID, userIds: [TARGET_USER] } as RemovePagePermissionDto, userOf(WRITER_ID)),
+    ],
+    [
+      'updatePermission',
+      (svc: PageRestrictionService) =>
+        svc.updatePermission({ pageId: PAGE_ID, userId: TARGET_USER, role: 'writer' } as UpdatePagePermissionDto, userOf(WRITER_ID)),
+    ],
+    [
+      'preview',
+      (svc: PageRestrictionService) => svc.preview({ pageId: PAGE_ID, action: 'restrict' } as any, userOf(WRITER_ID)),
+    ],
+  ] as const)('%s: PDP denies space#administer → 403 even with a CASL admin role, nothing written', async (_n, call) => {
+    const { service, pagePermissionRepo, spy, getUserSpaceRoles } = makeService({
+      role: 'admin', // a CASL admin the PDP does not back: the PDP decides
+      pdpAdmin: false,
+      mode: 'remote',
+      accessSeq: [{ id: ACCESS_ID }],
+      grant: { id: 'g1' },
+    });
+    await expect(call(service)).rejects.toThrow(new ForbiddenException('only a space admin may manage page restrictions'));
+    expect(getUserSpaceRoles).not.toHaveBeenCalled();
+    expect(pagePermissionRepo.insertPageAccess).not.toHaveBeenCalled();
+    expect(pagePermissionRepo.insertPagePermissions).not.toHaveBeenCalled();
+    expect(pagePermissionRepo.deletePageAccess).not.toHaveBeenCalled();
+    expect(pagePermissionRepo.deletePagePermissionsByUserIds).not.toHaveBeenCalled();
+    expect(spy.calls).toHaveLength(0); // refused before any transaction
+  });
+
+  it('a PDP failure on the gate is a 503 with nothing written (never a guess)', async () => {
+    const { service, pagePermissionRepo, spy } = makeService({
+      role: 'admin',
+      pdpAdmin: null,
+      mode: 'remote',
+      accessSeq: [undefined, { id: ACCESS_ID }],
+    });
+    const err = await service.restrict(PAGE_ID, userOf(ADMIN_ID)).catch((e) => e);
+    expect(err).toBeInstanceOf(ServiceUnavailableException);
+    expect((err as Error).message).toMatch(/retry/);
+    expect(pagePermissionRepo.insertPageAccess).not.toHaveBeenCalled();
+    expect(spy.calls).toHaveLength(0);
+  });
+
+  it('a missing page is still a 404 before the PDP is asked', async () => {
+    const { service, authz } = makeService({ page: undefined, mode: 'remote', pdpAdmin: true });
+    await expect(service.restrict(PAGE_ID, userOf(ADMIN_ID))).rejects.toThrow(NotFoundException);
+    expect(authz.tryCheckBulk).not.toHaveBeenCalled();
+  });
+
+  it('native mode keeps the CASL rule and never asks the PDP: a view-less admin (no role) is refused', async () => {
+    const none = makeService({ role: undefined, pdpAdmin: true, mode: 'native', accessSeq: [{ id: ACCESS_ID }] });
+    await expect(none.service.unrestrict(PAGE_ID, userOf(ADMIN_ID))).rejects.toThrow(NotFoundException);
+    expect(none.authz.tryCheckBulk).not.toHaveBeenCalled();
+
+    const admin = makeService({ role: 'admin', pdpAdmin: false, mode: 'native', accessSeq: [{ id: ACCESS_ID }] });
+    await expect(admin.service.unrestrict(PAGE_ID, userOf(ADMIN_ID))).resolves.toEqual(WRITTEN);
+    expect(admin.getUserSpaceRoles).toHaveBeenCalled();
+    expect(admin.authz.tryCheckBulk).not.toHaveBeenCalled();
+  });
+});
+
 describe('PageRestrictionService — A2: restrict keeps only the access the actor already had (#486)', () => {
   const restrictAs = (opts: Parameters<typeof makeService>[0]) =>
     makeService({ role: 'admin', accessSeq: [undefined, { id: ACCESS_ID }], mode: 'remote', ...opts });
@@ -579,10 +699,10 @@ describe('PageRestrictionService — A2: restrict keeps only the access the acto
   });
 
   it('under a restricted ancestor → no grant, and the PDP is not even asked', async () => {
-    const { service, pagePermissionRepo, authz } = restrictAs({ restrictedAncestor: true });
+    const { service, pagePermissionRepo, contentChecks } = restrictAs({ restrictedAncestor: true });
     await service.restrict(PAGE_ID, userOf(ADMIN_ID));
     expect(pagePermissionRepo.hasRestrictedAncestor).toHaveBeenCalledWith(PAGE_ID);
-    expect(authz.tryCheckBulk).not.toHaveBeenCalled();
+    expect(contentChecks()).toHaveLength(0); // only the space-admin gate (#542) was asked
     expect(pagePermissionRepo.insertPageAccess).toHaveBeenCalledTimes(1);
     expect(pagePermissionRepo.insertPagePermissions).not.toHaveBeenCalled();
   });
@@ -617,9 +737,9 @@ describe('PageRestrictionService — A3: covered unrestrict (#486)', () => {
   const covered = { requireActorCoverage: true };
 
   it('without the flag, unrestrict is unchanged: no PDP call, no child probe', async () => {
-    const { service, pagePermissionRepo, authz, spy } = unrestrictAs({ pdp: [false], darkChild: true });
+    const { service, pagePermissionRepo, contentChecks, spy } = unrestrictAs({ pdp: [false], darkChild: true });
     await expect(service.unrestrict(PAGE_ID, userOf(ADMIN_ID))).resolves.toEqual(WRITTEN);
-    expect(authz.tryCheckBulk).not.toHaveBeenCalled();
+    expect(contentChecks()).toHaveLength(0); // only the space-admin gate (#542) was asked
     // #616: the write is now one transaction (ACL lock + re-read), so "no query at all" became "no child probe".
     expect(spy.calls.some((c) => c.sql.includes('from "pages" as "c"'))).toBe(false);
     expect(pagePermissionRepo.deletePageAccess).toHaveBeenCalledWith(PAGE_ID, expect.anything() /* #616: the write's transaction */);
@@ -668,9 +788,9 @@ describe('PageRestrictionService — A3: covered unrestrict (#486)', () => {
   });
 
   it('the space-admin gate still runs first: a writer is Forbidden before any coverage check', async () => {
-    const { service, authz } = unrestrictAs({ role: 'writer' });
+    const { service, contentChecks } = unrestrictAs({ role: 'writer' });
     await expect(service.unrestrict(PAGE_ID, userOf(WRITER_ID), covered)).rejects.toThrow(ForbiddenException);
-    expect(authz.tryCheckBulk).not.toHaveBeenCalled();
+    expect(contentChecks()).toHaveLength(0);
   });
 });
 

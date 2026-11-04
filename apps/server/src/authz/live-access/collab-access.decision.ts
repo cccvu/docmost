@@ -55,19 +55,22 @@ export function decideCollabAccess(f: CollabAccessFacts): CollabAccess {
   if (!f.page) return 'deny';
   if (!f.space || !f.pagePerms) return 'unknown';
 
-  // onAuthenticate: findHighestUserSpaceRole over the PDP's administer/edit/view; no role → Unauthorized.
-  const role = f.space.administer
-    ? 'admin'
-    : f.space.edit
-      ? 'writer'
-      : f.space.view
-        ? 'reader'
-        : null;
+  // onAuthenticate: findHighestUserSpaceRole over PdpSpaceMemberRepo.getUserSpaceRoles; no role → Unauthorized.
+  // The SAME strict mapping (#542): no space view → no role; view without edit → reader (administer or not);
+  // admin needs administer + edit + view.
+  const role = f.space.view
+    ? f.space.edit
+      ? f.space.administer
+        ? 'admin'
+        : 'writer'
+      : 'reader'
+    : null;
   if (!role) return 'deny';
 
-  // #524: "no view, not locked" is a page the PDP has not placed (trashed, or not projected yet) — never evidence
-  // of "unrestricted". Mirrors PdpPagePermissionRepo.canUserEditPage: only a lineage the fork walked to its root
-  // with no restriction on it may fall back to the space role.
+  // #524: "no view, not locked" is never evidence of "unrestricted". Since ADR 0027 Release B (#493) a trashed page
+  // keeps its #space/#parent edges, so this is a page the PDP has not placed yet (new or re-parented, not projected)
+  // or a subject without space view. Mirrors PdpPagePermissionRepo.canUserEditPage: only a lineage the fork walked to
+  // its root with no restriction on it may fall back to the space role.
   let restricted = f.pagePerms.locked;
   if (!f.pagePerms.view && !f.pagePerms.locked) {
     if (f.lineageRestricted == null) return 'unknown';

@@ -67,10 +67,7 @@ d('AuthzChangeFeedService — real-Postgres commit-safety (Group D R2)', () => {
   // string scalar reads back as a string the old feed then parsed, while production's object reads back as
   // an object whose nested keys the app Kysely camelCases.)
   const memberPayload = (space: string) => ({ space_id: space, user_id: 'u', group_id: null, role: 'reader' });
-  const insertMember = (
-    conn: postgres.Sql<{ bigint: number }> | postgres.ReservedSql<{ bigint: number }>,
-    space: string,
-  ) =>
+  const insertMember = (conn: postgres.Sql<{ bigint: number }> | postgres.ReservedSql<{ bigint: number }>, space: string) =>
     conn`
       insert into authz_outbox (op, table_name, payload)
       values ('INSERT', 'space_members', ${admin.json(memberPayload(space))})

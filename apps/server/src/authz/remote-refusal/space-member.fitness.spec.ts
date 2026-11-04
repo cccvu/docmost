@@ -6,7 +6,7 @@ import { handlerCalls, scanRoutes } from '../route-guard/static-route-scan';
 import { routesOf } from './remote-refusal.table';
 
 /**
- * Native space-member writes FITNESS TEST (#636) — NOT upstream Docmost code.
+ * Native space-member writes FITNESS TEST (#542, #636) — NOT upstream Docmost code.
  *
  * In remote mode the native `/api/spaces/members/{add,remove,change-role}` routes are gated by PDP-backed space CASL,
  * but nothing there stops a `space#administer` holder adding or raising themselves (or a group they are in) to a

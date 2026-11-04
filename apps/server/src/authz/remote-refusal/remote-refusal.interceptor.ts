@@ -27,7 +27,7 @@ type AuthedRequest = FastifyRequest & {
 };
 
 /**
- * CCC authorization integration — NOT upstream Docmost code (#502, #598, #636).
+ * CCC authorization integration — NOT upstream Docmost code (#502, #542, #598, #636).
  *
  * In `AUTHZ_MODE=remote` every route in `remote-refusal.table.ts` is refused with a 404 for every authenticated
  * caller, whatever its engine role. The table says why per family. In short: each of these routes is either gated by
@@ -44,7 +44,8 @@ type AuthedRequest = FastifyRequest & {
  * counts as refuse, fail closed) and a UUID-only `resourceIdField`; everything else in it is free text and is not
  * evidence. The refusal writes one domain row through `PlatformAuditClient` directly, so the `API_AUDIT_ENABLED` kill
  * switch cannot drop it, and best-effort, so a failing sink still gives the 404. The actor's engine role is recorded
- * only as one of the known enum values, so an attempt by a leftover privileged session stands out.
+ * only as one of the known enum values, so an attempt by a leftover privileged session stands out, and a member write
+ * that names the caller's own user id is flagged `targetsActor` (the #542 self-grant shape).
  *
  * Not in AuthzModeModule: the collab app has no PlatformAuditModule, and it serves none of these routes.
  */
@@ -76,6 +77,7 @@ export class RemoteNativeRefusalInterceptor implements NestInterceptor {
     if (!actorId) return;
     const field = entry.resourceIdField;
     const resourceId = field ? attemptedId(req, field) : undefined;
+    const targetsActor = entry.targetUserField ? namesUser(req, entry.targetUserField, actorId) : false;
     const role = req.user?.user?.role;
     const ua = req.headers?.['user-agent'];
     const row: AuditIngestEvent = {
@@ -92,6 +94,7 @@ export class RemoteNativeRefusalInterceptor implements NestInterceptor {
         reason: family.reason,
         route: entry.route,
         ...(field && !resourceId ? { [INVALID_ID_FLAG[field]]: true } : {}),
+        ...(targetsActor ? { targetsActor: true } : {}),
         ...(typeof role === 'string' && USER_ROLES.has(role) ? { actorRole: role } : {}),
       },
     };
@@ -104,6 +107,18 @@ function refuses(when: (body: unknown) => boolean, req: AuthedRequest): boolean 
     return when(req.body) !== false;
   } catch {
     return true;
+  }
+}
+
+/** Whether the raw body's `field` (one id or an array of ids) names `userId`. A comparison only. Never throws. */
+function namesUser(req: AuthedRequest, field: string, userId: string): boolean {
+  try {
+    const body: unknown = req.body;
+    const value =
+      body && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>)[field] : undefined;
+    return (Array.isArray(value) ? value : [value]).some((id) => id === userId);
+  } catch {
+    return false;
   }
 }
 

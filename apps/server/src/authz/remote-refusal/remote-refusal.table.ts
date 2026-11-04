@@ -1,5 +1,5 @@
 /**
- * CCC authorization integration — NOT upstream Docmost code (#502, #598, #636).
+ * CCC authorization integration — NOT upstream Docmost code (#502, #542, #598, #636).
  *
  * The engine's native routes that `AUTHZ_MODE=remote` refuses with a 404, as DATA. `RemoteNativeRefusalInterceptor`
  * looks each request up here by `<ControllerClass>.<handler>` and does nothing else per family, so a new refused route
@@ -36,6 +36,11 @@ export interface RefusedRoute {
    * may have no access to it.
    */
   readonly resourceIdField?: 'spaceId' | 'groupId';
+  /**
+   * A body field naming the target user(s), a string or an array of strings. When it names the caller's own user id
+   * the row carries `metadata.targetsActor: true`, the #542 self-grant shape. A comparison only: nothing is echoed.
+   */
+  readonly targetUserField?: 'userId' | 'userIds';
   /** Pass through only when this returns `false` for the raw body. Absent means always refuse; a throw refuses. */
   readonly when?: (body: unknown) => boolean;
 }
@@ -112,11 +117,17 @@ export const REMOTE_REFUSAL_FAMILIES: readonly RefusalFamily[] = [
     resourceType: 'space',
     reason: 'platform_only',
     routes: new Map([
-      ['SpaceController.addSpaceMember', { route: 'POST /api/spaces/members/add', resourceIdField: 'spaceId' }],
-      ['SpaceController.removeSpaceMember', { route: 'POST /api/spaces/members/remove', resourceIdField: 'spaceId' }],
+      [
+        'SpaceController.addSpaceMember',
+        { route: 'POST /api/spaces/members/add', resourceIdField: 'spaceId', targetUserField: 'userIds' },
+      ],
+      [
+        'SpaceController.removeSpaceMember',
+        { route: 'POST /api/spaces/members/remove', resourceIdField: 'spaceId', targetUserField: 'userId' },
+      ],
       [
         'SpaceController.updateSpaceMemberRole',
-        { route: 'POST /api/spaces/members/change-role', resourceIdField: 'spaceId' },
+        { route: 'POST /api/spaces/members/change-role', resourceIdField: 'spaceId', targetUserField: 'userId' },
       ],
     ]),
   },

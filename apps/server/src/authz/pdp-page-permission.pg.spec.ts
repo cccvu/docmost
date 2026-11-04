@@ -15,8 +15,9 @@ import { LIFECYCLE_MAX_DEPTH } from '../service-bridge/page-lineage';
 
 /**
  * Real-Postgres proof of the #524 lineage check in `PdpPagePermissionRepo.canUserEditPage`. When the PDP has no
- * placement for a page (trashed: its #space/#parent edges are reaped; new, restored or re-parented: not projected
- * yet) it answers view=false AND locked=false, and upstream would fall back to the space role. The repo then walks
+ * placement for a page (new or re-parented: not projected yet; a trashed page keeps its #space/#parent edges since
+ * ADR 0027 Release B, only a purge reaps them) it answers view=false AND locked=false, and upstream would fall back
+ * to the space role. The repo then walks
  * the page's own rows, and only an unrestricted, completely walked lineage may fall back. What a query spy cannot
  * show is proven here against real tables: the walk crosses TRASHED ancestors, sees a restriction added after the
  * trash (no cache), stays bounded and cycle-safe, never leaves the page's workspace, and reads every walk it cannot

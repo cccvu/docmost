@@ -212,6 +212,40 @@ describe('RemoteNativeRefusalInterceptor — every table key (#636)', () => {
     });
   });
 
+  describe('a member write that names the caller is flagged targetsActor (the #542 self-grant shape)', () => {
+    const OTHER_USER = '0198c2a1-0000-7000-8000-000000000002';
+    it.each([
+      ['add: userIds contains self', 'addSpaceMember', { spaceId: TARGET_ID, userIds: [OTHER_USER, USER_ID], role: 'writer' }],
+      ['change-role: userId is self', 'updateSpaceMemberRole', { spaceId: TARGET_ID, userId: USER_ID, role: 'admin' }],
+      ['remove: userId is self', 'removeSpaceMember', { spaceId: TARGET_ID, userId: USER_ID }],
+    ])('%s', async (_l, handlerName, body) => {
+      const { interceptor, next, forward } = setup('remote');
+      await expect(run(interceptor, ctx('SpaceController', handlerName, authedReq(body)), next)).rejects.toBeInstanceOf(
+        NotFoundException,
+      );
+      const [[row]] = forward.mock.calls[0] as [AuditIngestEvent[]];
+      expect(row.metadata).toMatchObject({ targetsActor: true });
+    });
+
+    it.each([
+      ['another user', 'addSpaceMember', { spaceId: TARGET_ID, userIds: [OTHER_USER] }],
+      ['the wrong field (userId on add)', 'addSpaceMember', { spaceId: TARGET_ID, userId: USER_ID }],
+      ['a non-array, non-string value', 'removeSpaceMember', { spaceId: TARGET_ID, userId: { id: USER_ID } }],
+      ['a self-add to a group (not a space-member family field)', 'addGroupMember', { groupId: TARGET_ID, userIds: [USER_ID] }],
+    ])('not for %s', async (_l, handlerName, body) => {
+      const { interceptor, next, forward } = setup('remote');
+      const cls = handlerName === 'addGroupMember' ? 'GroupController' : 'SpaceController';
+      await expect(run(interceptor, ctx(cls, handlerName, authedReq(body)), next)).rejects.toBeInstanceOf(NotFoundException);
+      const [[row]] = forward.mock.calls[0] as [AuditIngestEvent[]];
+      expect(row.metadata).not.toHaveProperty('targetsActor');
+    });
+
+    it('only the three space-member routes carry a target field', () => {
+      const withTarget = [...REMOTE_REFUSED_ROUTES].filter(([, h]) => h.entry.targetUserField).map(([k]) => k).sort();
+      expect(withTarget).toEqual([...routesOf('spaceMember')].sort());
+    });
+  });
+
   describe('UserController.updateUser is refused only when the body names email (fail closed)', () => {
     const update = (req: Req) => ctx('UserController', 'updateUser', req);
     it.each([

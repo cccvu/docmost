@@ -52,6 +52,8 @@ import {
 } from '../../../integrations/export/utils';
 // CCC #626 (UPSTREAM_MODIFICATIONS #121): HTML/Markdown is converted off the event loop, within fixed bounds.
 import { parseUntrustedContent } from '../../../editor-compat/content-parse/content-parse.service';
+// CCC #573 (UPSTREAM_MODIFICATIONS #121): remote mode refuses a duplicate that would drop a restriction.
+import { hasCopyRestrictionGuard } from '../../../authz/page-copy/copy-restriction.guard';
 import { WatcherService } from '../../watcher/watcher.service';
 import { sql } from 'kysely';
 import { TransclusionService } from '../transclusion/transclusion.service';
@@ -705,7 +707,19 @@ export class PageService {
       }),
     );
 
-    await this.db.insertInto('pages').values(insertablePages).execute();
+    // CCC seam #121 (#573): the insert runs in a transaction that first lets the remote-mode repo refuse a copy
+    // that would drop a restriction (authz/page-copy) — on this exact set, under the workspace guard lock. The
+    // native repo has no guard: as upstream.
+    await executeTx(this.db, async (trx) => {
+      if (hasCopyRestrictionGuard(this.pagePermissionRepo)) {
+        await this.pagePermissionRepo.assertCopyKeepsRestrictions(trx, {
+          pageIds: pages.map((p) => p.id),
+          rootPage,
+          targetSpaceId: spaceId,
+        });
+      }
+      await trx.insertInto('pages').values(insertablePages).execute();
+    });
 
     // Extract transclusions from every duplicated page and persist them in
     // one statement. Duplication bypasses Yjs onStoreDocument; brand-new

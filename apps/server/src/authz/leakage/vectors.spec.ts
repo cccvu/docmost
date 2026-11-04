@@ -114,6 +114,8 @@ describe('Indirect-leakage vectors — §8 coverage matrix (every vector maps to
     { vector: 'mention/comment/update notifications', repo: 'page',  primitive: 'getUserIdsWithPageAccess' },
     { vector: 'favorites (space)',                     repo: 'space', primitive: 'getUserSpaceIds' },
     { vector: 'digest/verification notifications',     repo: 'space', primitive: 'getUserIdsWithSpaceAccess' },
+    // Both CASL (SpaceAbilityFactory) and the collab connect derive the space role from getUserSpaceRoles. #542: the
+    // role needs space#view (no view → no role → CASL 404 / collab Unauthorized), and admin needs edit + view.
     { vector: 'CASL / collab space role',              repo: 'space', primitive: 'getUserSpaceRoles' },
     // #615: the native label lists paginate over PDP-viewable pages (upstream scoped them to space membership
     // only, so a label on a restricted page was listed by name). Each gates its windows through

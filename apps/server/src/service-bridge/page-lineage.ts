@@ -6,9 +6,10 @@ import { KyselyDB } from '@docmost/db/types/kysely.types';
  *
  * The ONE restriction-lineage walk over the fork's own rows, shared by the `/v1` lifecycle facts
  * (`ServicePageLifecycleService`), the PEP (`PdpPagePermissionRepo`, #524) and the live-connection revalidator
- * (`LiveAccessRevalidator`, #501) so none of them can disagree about which pages sit in a restricted section. It reads `pages`/`page_access` directly because the PDP cannot answer
- * this for a page it has not placed: trashing reaps a page's `#space`/`#parent` edges, and a new, restored or
- * re-parented page has none until the relay projects it.
+ * (`LiveAccessRevalidator`, #501) and the duplicate's copy guard (`authz/page-copy`, #573), so none of them can
+ * disagree about which pages sit in a restricted section. It reads `pages`/`page_access` directly because the PDP
+ * cannot answer this for a page it has not placed: a new or re-parented page has no `#space`/`#parent` edge until
+ * the relay projects it. (Since ADR 0027 Release B a trashed page keeps its edges; only a purge reaps them.)
  */
 
 /**
