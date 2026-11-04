@@ -2,7 +2,7 @@ import * as postgres from 'postgres';
 import { Kysely, sql } from 'kysely';
 import { ShareRepo } from '@docmost/db/repos/share/share.repo';
 import { emptyCursorPaginationResult } from '@docmost/db/pagination/cursor-pagination';
-import { PdpShareRepo } from './pdp-share.repo';
+import { PdpShareRepo, SHARE_PUBLISH_LOCK_CLASS } from './pdp-share.repo';
 import { PdpPagePermissionRepo } from './pdp-page-permission.repo';
 import { PdpSpaceMemberRepo } from './pdp-space-member.repo';
 import { LABEL_SCAN } from './pdp-label.repo';
@@ -22,7 +22,10 @@ import { PG_URL, uuid, mkReadModelPg, bootstrapSchema, mkReadModelDb } from '../
  *  - expiry is enforced at READ time with no sweeper running: findById / findByPageId / getShares refuse an
  *    expired share (default, explicit, the exact boundary instant), "Never" and renewals stay live, and an error
  *    evaluating expiry throws instead of returning the share;
- *  - a re-share after expiry deletes the dead row in the same transaction and yields one fresh share.
+ *  - a re-share after expiry deletes the dead row in the same transaction and yields one fresh share;
+ *  - one live share per page: two concurrent publishes serialize on the per-page lock and both get the same share
+ *    (the stock repo, as a control, writes two), and the lock wait is bounded.
+ * Concurrency is deterministic: promise handoffs and `pg_locks` polling, no sleeps on the pass path.
  * Lives in the `docmost-authz-pg` CI lane; self-skips without AUTHZ_TEST_PG_URL.
  */
 /** Clear every row the spec writes (the expiry table only when it exists). Inline in the spec, not the testkit: the
@@ -55,6 +58,21 @@ const SPACE_B = uuid(2); // a space the PDP does not list for the caller
 const SPACE_X = uuid(3); // a space in ANOTHER workspace (the PDP wrongly lists it: the workspace pin must hold)
 const USER = uuid(900);
 const CREATOR = uuid(901);
+
+const deferred = <T = void>() => {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((r) => (resolve = r));
+  return { promise, resolve };
+};
+
+/** Poll until `cond` holds (a state the test is waiting for another connection to reach). Bounded. */
+const until = async (cond: () => Promise<boolean>, what: string): Promise<void> => {
+  for (let i = 0; i < 500; i++) {
+    if (await cond()) return;
+    await new Promise((r) => setTimeout(r, 10));
+  }
+  throw new Error(`timed out waiting for: ${what}`);
+};
 
 const decode = (cursor: string | null) =>
   cursor ? Object.fromEntries(new URLSearchParams(Buffer.from(cursor, 'base64url').toString('utf8'))) : null;
@@ -351,10 +369,13 @@ d('PdpShareRepo on real Postgres (#660, #335)', () => {
       expect((await repo.findById(fresh.id))?.id).toBe(fresh.id); // the fresh share's default is created_at + 90d
     });
 
-    it('a LIVE share of the page is never deleted by the insert', async () => {
+    it('a LIVE share of the page is never deleted, and is returned instead of inserting a second one', async () => {
       await share(uuid(210), uuid(10), { createdAgo: 1 });
-      await repo.insertShare({ key: 'second', pageId: uuid(10), spaceId: SPACE_A, workspaceId: WS, creatorId: CREATOR });
-      expect((await pg`select 1 from shares where id = ${uuid(210)}`).length).toBe(1);
+      const got = await repo.insertShare({
+        key: 'second', pageId: uuid(10), spaceId: SPACE_A, workspaceId: WS, creatorId: CREATOR,
+      });
+      expect(got.id).toBe(uuid(210));
+      expect((await pg`select id from shares where page_id = ${uuid(10)}`).map((r) => r.id)).toEqual([uuid(210)]);
     });
 
     it('cleanup and insert are ONE transaction: the caller\'s rollback restores the dead row', async () => {
@@ -366,6 +387,100 @@ d('PdpShareRepo on real Postgres (#660, #335)', () => {
         if (!e.rollback) throw e;
       });
       expect((await pg`select id from shares where page_id = ${uuid(10)}`).map((r) => r.id)).toEqual([uuid(210)]);
+    });
+  });
+
+  describe('insertShare — one live share per page under concurrent publishes', () => {
+    const P = uuid(10);
+    const ins = (r: ShareRepo, key: string) =>
+      r.insertShare({ key, pageId: P, spaceId: SPACE_A, workspaceId: WS, creatorId: CREATOR });
+    /** Callers waiting (not granted) on the per-page publish lock of P (the two-int4 form: objsubid = 2). */
+    const publishWaiters = async (): Promise<number> => {
+      const r = await pg`
+        select count(*)::int as n from pg_locks
+        where locktype = 'advisory' and not granted and objsubid = 2
+          and classid = ${SHARE_PUBLISH_LOCK_CLASS}::oid
+          and objid = (hashtext(${P}::text)::bigint & 4294967295)::oid
+          and database = (select oid from pg_database where datname = current_database())`;
+      return r[0].n;
+    };
+    /** Hold P's publish lock on a separate connection until `release`; resolves `held` once it is granted. */
+    const holdPublishLock = () => {
+      const hold = postgres(PG_URL as string, { max: 1, onnotice: () => {} });
+      const release = deferred();
+      const held = deferred();
+      const holder = hold.begin(async (t) => {
+        const tx = t as unknown as postgres.Sql;
+        await tx`select pg_advisory_xact_lock(${SHARE_PUBLISH_LOCK_CLASS}, hashtext(${P}::text))`;
+        held.resolve();
+        await release.promise;
+      });
+      const done = async () => {
+        release.resolve();
+        await holder.catch(() => undefined);
+        await hold.end({ timeout: 5 });
+      };
+      return { held: held.promise, release: release.resolve, done };
+    };
+
+    beforeEach(async () => {
+      await page(P, SPACE_A);
+    });
+
+    it('CONTROL: the stock repo writes two live shares when two publishes both passed createShare\'s pre-check', async () => {
+      const stock = new ShareRepo(db as any, {} as any);
+      // upstream createShare: findByPageId → none for BOTH callers (the check-then-insert gap), then both insert.
+      expect(await stock.findByPageId(P)).toBeUndefined();
+      const [a, b] = await Promise.all([ins(stock, 'stocka'), ins(stock, 'stockb')]);
+      expect(a.id).not.toBe(b.id);
+      expect((await pg`select count(*)::int as n from shares where page_id = ${P}`)[0].n).toBe(2);
+    });
+
+    it('two concurrent publishes serialize on the per-page lock: exactly one live row, both get the same share', async () => {
+      expect(await repo.findByPageId(P)).toBeUndefined(); // both callers passed createShare's pre-check
+      const lock = holdPublishLock();
+      try {
+        await lock.held;
+        const a = ins(repo, 'racea');
+        const b = ins(repo, 'raceb');
+        // Both are provably inside insertShare's transaction, blocked on the lock, before either can insert.
+        await until(async () => (await publishWaiters()) === 2, 'both publishes waiting on the per-page lock');
+        expect((await pg`select count(*)::int as n from shares where page_id = ${P}`)[0].n).toBe(0);
+        lock.release();
+        const [ra, rb] = await Promise.all([a, b]);
+        expect(ra.id).toBe(rb.id);
+        const rows = await pg`select id, key from shares where page_id = ${P}`;
+        expect(rows.map((r) => r.id)).toEqual([ra.id]);
+        expect(['racea', 'raceb']).toContain(rows[0].key);
+        expect((await repo.findByPageId(P))?.id).toBe(ra.id);
+      } finally {
+        await lock.done();
+      }
+    });
+
+    it('the lock wait is bounded: a publish blocked past lock_timeout fails (55P03) and writes nothing', async () => {
+      const lock = holdPublishLock();
+      try {
+        await lock.held;
+        await expect(ins(repo, 'blocked')).rejects.toMatchObject({ code: '55P03' });
+        expect((await pg`select count(*)::int as n from shares where page_id = ${P}`)[0].n).toBe(0);
+      } finally {
+        await lock.done();
+      }
+    }, 15_000);
+
+    it('a different page is not serialized behind another page\'s publish lock', async () => {
+      await page(uuid(11), SPACE_A);
+      const lock = holdPublishLock();
+      try {
+        await lock.held;
+        const other = await repo.insertShare({
+          key: 'otherpage', pageId: uuid(11), spaceId: SPACE_A, workspaceId: WS, creatorId: CREATOR,
+        });
+        expect(other.pageId).toBe(uuid(11));
+      } finally {
+        await lock.done();
+      }
     });
   });
 });

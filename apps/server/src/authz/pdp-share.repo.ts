@@ -14,6 +14,7 @@ import {
 } from '@docmost/db/pagination/cursor-pagination';
 import { CURSOR_KEY, LABEL_SCAN, authorizedKeysetPage, clampLimit, scanBudget } from './pdp-label.repo';
 import { shareIsLiveSql } from './share-lifecycle/share-expiry.sql';
+import { boundWaits } from '../service-bridge/resource-version';
 
 /**
  * CCC authorization integration — NOT upstream Docmost code.
@@ -39,6 +40,14 @@ import { shareIsLiveSql } from './share-lifecycle/share-expiry.sql';
  *    `insertShare` deletes the page's expired rows in the same transaction before inserting, so a re-share after
  *    expiry is a fresh share and never a duplicate row the `limit 1` CTE in `getShareForPage` could pick.
  *
+ * 3. ONE live share per page (#335 review). Upstream `createShare` is check-then-insert with no unique constraint, so
+ *    two concurrent publishes of one page could both insert: unpublish or an expiry change then acts on one row and
+ *    the page stays public through the other. `insertShare` takes the per-page lock
+ *    `pg_advisory_xact_lock(SHARE_PUBLISH_LOCK_CLASS, hashtext(pageId))` FIRST, re-checks for a live share under it
+ *    and returns that share instead of inserting — upstream's own idempotent answer when a share exists. Waits are
+ *    bounded (`boundWaits`) when it owns the transaction; a timeout reaches `createShare`'s catch, which answers
+ *    upstream's 400 "Failed to share page" (retryable; the lock is held for one short transaction).
+ *
  * The surface is pinned in pdp-share.repo.spec.ts: every `ShareRepo` method is classified, so an upstream bump that
  * adds a share read goes red until someone decides how it handles expiry and the PDP.
  *
@@ -46,6 +55,12 @@ import { shareIsLiveSql } from './share-lifecycle/share-expiry.sql';
  * v0.95.0. Its sort compares `date_trunc('milliseconds', updated_at)` (the cursor carries a millisecond Date and the
  * walk crosses a keyset edge every window — see PdpLabelRepo).
  */
+/**
+ * The two-int4 advisory lock class of the per-page publish lock (`insertShare`). Distinct from the other CCC classes
+ * (485485 cycle/restriction guards, 616616 page ACL); the single-bigint install keys live in a separate key space.
+ */
+export const SHARE_PUBLISH_LOCK_CLASS = 335335;
+
 @Injectable()
 export class PdpShareRepo extends ShareRepo {
   private readonly logger = new Logger(PdpShareRepo.name);
@@ -94,16 +109,27 @@ export class PdpShareRepo extends ShareRepo {
     return this.findById(id, { includeCreator: opts?.includeCreator, withLock: opts?.withLock, trx: opts?.trx });
   }
 
-  /** Remove the page's expired (not yet swept) share rows, then insert — one transaction. */
+  /**
+   * Under the per-page publish lock: remove the page's expired (not yet swept) share rows, then return the page's
+   * live share if one exists (a concurrent publish won), else insert — one transaction.
+   */
   override async insertShare(insertableShare: InsertableShare, trx?: KyselyTransaction): Promise<Share> {
     return executeTx(
       this.database,
       async (tx) => {
-        if (insertableShare.pageId) {
+        const pageId = insertableShare.pageId as string | undefined;
+        if (pageId) {
+          // Bound the waits only on our own transaction (SET LOCAL would outlive this call in a caller's).
+          if (!trx) await boundWaits(tx);
+          await sql`
+            select pg_advisory_xact_lock(${sql.lit(SHARE_PUBLISH_LOCK_CLASS)}, hashtext(${pageId}::text))
+          `.execute(tx);
           await sql`
             delete from shares s
-            where s.page_id = ${insertableShare.pageId as string} and not ${shareIsLiveSql('s')}
+            where s.page_id = ${pageId} and not ${shareIsLiveSql('s')}
           `.execute(tx);
+          const live = await this.findByPageId(pageId, { trx: tx });
+          if (live) return live;
         }
         return super.insertShare(insertableShare, tx);
       },
