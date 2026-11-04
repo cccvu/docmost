@@ -8,10 +8,12 @@
 /**
  * `Referrer-Policy` — why this value and not a stricter one.
  *
- * The leak this closes: a document URL is sent as the `Referer` of every request the page makes. Docmost
- * serves pages whose URL is itself a capability — a public share is `/share/<key>/p/<slug>`, where the key
- * is a non-expiring bearer capability — so a page that loads or links to a third-party origin hands that
- * key over. `strict-origin-when-cross-origin` reduces the cross-origin `Referer` to the bare origin.
+ * The leak this closes: a document URL is sent as the `Referer` of every request the page makes, and some
+ * Docmost URLs are worth keeping off third-party origins — a public share is `/share/<key>/p/<slug>`, and a
+ * public attachment carries its short-lived `?jwt=` token. The share key is NOT the capability (a published
+ * page is addressed by its slug; its controls are unpublish and expiry — ADR 0032), but the URL still names
+ * what was shared, so a page that loads or links to a third-party origin should not hand it over.
+ * `strict-origin-when-cross-origin` reduces the cross-origin `Referer` to the bare origin.
  *
  * NOT `no-referrer`, deliberately. The platform's `OriginCheckGuard` falls back to the `Referer` header when
  * `Origin` is absent, and `strict-origin-when-cross-origin` keeps the FULL URL on same-origin requests — the

@@ -33,6 +33,7 @@ jest.mock('../../core/page/page-access/page-access.service', () => ({
 }));
 
 import { AttachmentController } from '../../core/attachment/attachment.controller';
+import { ShareService } from '../../core/share/share.service';
 import { AttachmentService } from '../../core/attachment/services/attachment.service';
 import { StorageService } from '../../integrations/storage/storage.service';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
@@ -93,6 +94,7 @@ async function bootApp(mode: AuthzMode, user: { id: string; role: string }) {
       { provide: TokenService, useValue: {} },
       { provide: PageAccessService, useValue: {} },
       { provide: AUDIT_SERVICE, useValue: { log: jest.fn() } },
+      { provide: ShareService, useValue: {} },
     ],
   })
     // The real JwtAuthGuard's contract: an authenticated request carries `req.user = { user, workspace }`.

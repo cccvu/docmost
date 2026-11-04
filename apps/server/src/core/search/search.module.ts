@@ -7,8 +7,11 @@ import { SearchService } from './search.service';
 // SearchService is a module-local provider, so the selection must be bound here (a @Global rebind can't
 // win over the module-local injection). All policy lives in the fork-owned provider/subclass.
 import { searchServiceProvider } from '../../authz/search/search.provider';
+// CCC #660 seam (#5 above): the remote provider injects ShareService for the public share-search gate.
+import { ShareModule } from '../share/share.module';
 
 @Module({
+  imports: [ShareModule],
   controllers: [SearchController],
   providers: [searchServiceProvider],
   exports: [SearchService],

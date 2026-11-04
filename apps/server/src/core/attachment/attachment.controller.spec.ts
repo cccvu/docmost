@@ -31,6 +31,7 @@ describe('AttachmentController.uploadFile — #308 preserves the real 413 (not 4
       {} as any, // tokenService
       pageAccessService,
       auditService,
+      {} as any, // shareService (#334: getPublicFile only)
     );
     const req = { file: overrides.reqFile } as any;
     const res = { send: jest.fn() } as any;

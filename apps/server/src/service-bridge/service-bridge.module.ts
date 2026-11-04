@@ -27,7 +27,7 @@ import { PageContentParser, ServicePageImportService } from './service-page-impo
 // Seam #5 (see UPSTREAM_MODIFICATIONS.md): SearchModule binds the SearchService token to PdpSearchService in
 // AUTHZ_MODE=remote. Importing it here lets ServiceSearchService inject that PDP-gated search — the binding
 // is module-local, so the token must be resolved through the module that exports it (a @Global rebind can't
-// win). No cycle: SearchModule imports no modules (its provider deps are all @Global).
+// win). No cycle: SearchModule imports only ShareModule (#660), whose TokenModule/TransclusionModule import nothing back.
 import { SearchModule } from '../core/search/search.module';
 // #616: the create-idempotency ledger (CCC authz/idempotency) for the keyed space create. Nest instantiates it once
 // with ConditionalPageModule's import, so its installer and sweep run once per process.

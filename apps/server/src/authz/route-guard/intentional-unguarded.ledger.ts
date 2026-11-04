@@ -15,7 +15,7 @@ export type UnguardedMode =
   | 'public-infra' // health/robots/app-root/version — public infrastructure, non-sensitive
   | 'public-auth' // pre-authentication endpoints (login, password reset, setup) — no session yet, exist
   //             behind ThrottlerGuard/SetupGuard which are NOT authentication
-  | 'signed-token' // gated by a signed one-time token in the request (e.g. attachment ?jwt=), not a session
+  | 'signed-token' // gated by a signed, short-lived token in the request (e.g. attachment ?jwt=), not a session
   | 'workspace-asset' // workspace-scoped public asset (logo/avatar) — no per-page/space authorization
   | 'known-gap'; // a real gap, accepted for now with a linked tracking issue
 
@@ -61,8 +61,10 @@ export const INTENTIONAL_UNGUARDED: readonly UnguardedRoute[] = [
     handler: 'getShare',
     mode: 'public-infra',
     reason:
-      'Public shared-page SEO — Docmost share feature is public-by-design; ShareService authorizes on the ' +
-      'share row existing/enabled, the public share link is the capability. No session.',
+      'Public shared-page SEO — Docmost share feature is public-by-design (addressed by page slug, not by a ' +
+      'secret share key). Emits og:title only when ShareService.getShareForPage resolves the page: shared now, ' +
+      'sharing enabled and the space not archived, the requested page under no restriction, and the share not ' +
+      'expired (the ShareRepo re-read; #660/#335, ADR 0032). No session.',
   },
 
   // --- pre-authentication endpoints (no session exists yet; ThrottlerGuard/SetupGuard are NOT auth) ---
@@ -103,8 +105,10 @@ export const INTENTIONAL_UNGUARDED: readonly UnguardedRoute[] = [
     handler: 'getPublicFile',
     mode: 'signed-token',
     reason:
-      'GET /files/public/:fileId/:fileName — gated by a signed ?jwt= attachment token verified against ' +
-      'attachmentId + workspaceId + pageId; the token is the capability, not a session.',
+      'GET /files/public/:fileId/:fileName — gated by a signed ?jwt= attachment token (reusable until it ' +
+      'expires, at most 1 h) verified against attachmentId + workspaceId + pageId, AND re-checked at use time ' +
+      'against the current share state via ShareService.getShareForPage (unshare/restrict/trash/archive/expiry ' +
+      'deny at once; Cache-Control private, no-cache; #334, ADR 0032). No session.',
   },
   {
     controller: 'AttachmentController',
