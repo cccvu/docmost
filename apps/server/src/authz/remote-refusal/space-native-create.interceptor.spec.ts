@@ -2,14 +2,13 @@ import { CallHandler, ExecutionContext, NotFoundException } from '@nestjs/common
 import { lastValueFrom, of } from 'rxjs';
 import type { AuditIngestEvent, PlatformAuditClient } from '../audit/platform-audit.client';
 import type { AuthzMode } from '../mode/authz-mode';
-import {
-  NATIVE_SPACE_CREATE_ROUTES,
-  SPACE_NATIVE_CREATE_REFUSED_EVENT,
-  SpaceNativeCreateInterceptor,
-} from './space-native-create.interceptor';
+import { RemoteNativeRefusalInterceptor } from './remote-refusal.interceptor';
+import { routesOf } from './remote-refusal.table';
+
+const SPACE_NATIVE_CREATE_REFUSED_EVENT = 'space.native_create_refused';
 
 /**
- * SpaceNativeCreateInterceptor (#598) — NOT upstream Docmost code.
+ * The #598 family of RemoteNativeRefusalInterceptor — NOT upstream Docmost code.
  *
  * In `AUTHZ_MODE=remote` the engine's native space create is refused (404) for every authenticated caller, before the
  * handler (so before CASL and the insert), and the refusal is audited without reading the body. Everything else —
@@ -54,7 +53,7 @@ const ctx = (target: object, handler: unknown, req: Req, type = 'http'): Executi
 function setup(mode: AuthzMode, forward?: jest.Mock) {
   const fwd = forward ?? jest.fn().mockResolvedValue(undefined);
   const client = { forward: fwd } as unknown as PlatformAuditClient;
-  const interceptor = new SpaceNativeCreateInterceptor(mode, client);
+  const interceptor = new RemoteNativeRefusalInterceptor(mode, client);
   const handler = jest.fn(() => of('handled'));
   const next: CallHandler = { handle: handler };
   return { interceptor, next, handler, forward: fwd };
@@ -62,13 +61,13 @@ function setup(mode: AuthzMode, forward?: jest.Mock) {
 
 const refusedCreate = (req: Req) => ctx(SpaceController, SpaceController.prototype.createSpace, req);
 
-async function expect404(interceptor: SpaceNativeCreateInterceptor, context: ExecutionContext, next: CallHandler) {
+async function expect404(interceptor: RemoteNativeRefusalInterceptor, context: ExecutionContext, next: CallHandler) {
   await expect(lastValueFrom(interceptor.intercept(context, next))).rejects.toBeInstanceOf(NotFoundException);
 }
 
-describe('SpaceNativeCreateInterceptor (#598)', () => {
+describe('RemoteNativeRefusalInterceptor: the native space create (#598)', () => {
   it('refuses exactly SpaceController.createSpace', () => {
-    expect([...NATIVE_SPACE_CREATE_ROUTES]).toEqual(['SpaceController.createSpace']);
+    expect([...routesOf('spaceNativeCreate')]).toEqual(['SpaceController.createSpace']);
     expect(SPACE_NATIVE_CREATE_REFUSED_EVENT).toBe('space.native_create_refused');
   });
 
@@ -182,7 +181,6 @@ describe('SpaceNativeCreateInterceptor (#598)', () => {
 
   describe('everything else passes through with no row', () => {
     it.each([
-      ['the native delete (the #502 interceptor owns it)', ctx(SpaceController, SpaceController.prototype.deleteSpace, authedReq({}))],
       ['another handler on SpaceController', ctx(SpaceController, SpaceController.prototype.updateSpace, authedReq(BODY))],
       ['a same-named handler on another controller', ctx(OtherController, OtherController.prototype.createSpace, authedReq(BODY))],
       ['a non-HTTP context', ctx(SpaceController, SpaceController.prototype.createSpace, authedReq(BODY), 'ws')],

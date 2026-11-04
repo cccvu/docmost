@@ -45,8 +45,11 @@ import { MovePageDto, MovePageToSpaceDto } from '../../core/page/dto/move-page.d
 import { UpdatePageDto } from '../../core/page/dto/update-page.dto';
 import { AuditEvent, AuditResource } from '../../common/events/audit-events';
 import { AUDIT_SERVICE, IAuditService } from '../../integrations/audit/audit.service';
-import { QueueJob, QueueName } from '../../integrations/queue/constants';
+import { QueueName } from '../../integrations/queue/constants';
 import { getPageTitle } from '../../common/helpers';
+import { AUTHZ_MODE, AuthzMode } from '../mode/authz-mode';
+import { RemotePurgeService } from '../page-delete/remote-purge.service';
+import { queuePageAttachmentDeletion } from '../page-delete/page-attachment-jobs';
 import { pageEtagOpaque } from './page-etag';
 import { OpSemaphore, OpSemaphoreTimeout } from './op-semaphore';
 
@@ -181,6 +184,10 @@ export function toEngineBusy(err: unknown): ServiceUnavailableException | null {
  * (`live-access/narrowing-routes.ts`), so they answer only once the PDP enforces them, like the native moves. The
  * #545 guard refusals map to 409 through the global `PageGuardConflictInterceptor`; busy SQLSTATEs map to 503
  * `engine_busy` here. Keeps the upstream `{ data, success }` envelope.
+ *
+ * In `AUTHZ_MODE=remote` a PERMANENT delete is not decided here: it runs `RemotePurgeService.purge` (#636 W6), the
+ * one remote purge routine the native route also runs — space admin AND `page#edit` on every page removed, under
+ * locks, after a settle fence. Native mode keeps the replica below.
  */
 @UseGuards(JwtAuthGuard)
 @Controller('pages')
@@ -196,6 +203,8 @@ export class ConditionalPageOpsController {
     private readonly spaceAbility: SpaceAbilityFactory,
     @Inject(AUDIT_SERVICE) private readonly auditService: IAuditService,
     @InjectQueue(QueueName.ATTACHMENT_QUEUE) private readonly attachmentQueue: Queue,
+    @Inject(AUTHZ_MODE) private readonly mode: AuthzMode,
+    private readonly remotePurge: RemotePurgeService,
   ) {}
 
   /** Replicates `PageController.delete`. Trash converges on an already-trashed page; a permanent delete never does. */
@@ -206,6 +215,11 @@ export class ConditionalPageOpsController {
     @AuthUser() user: User,
     @AuthWorkspace() workspace: Workspace,
   ): Promise<ConditionalOpResult> {
+    if (dto.permanentlyDelete && this.mode === 'remote') {
+      // #636 W6: the remote purge routine — its own slot, transaction, compare, decision, jobs and `page.deleted` audit.
+      const purged = await this.remotePurge.purge(user, dto.pageId, workspace.id, dto.expectedEtags);
+      return { outcome: 'applied', pageId: purged.page.id };
+    }
     const done = await this.guarded(async (trx) => {
       const page = await this.lockPage(trx, dto.pageId, workspace.id, { allowTrashed: true });
       const ability = await this.spaceAbility.createForUser(user, page.spaceId);
@@ -239,7 +253,7 @@ export class ConditionalPageOpsController {
       if (dto.permanentlyDelete) {
         // AFTER the commit (PageService.forceDelete skips these under a caller transaction): a job queued before a
         // delete that then rolled back would delete the files of a page that survives.
-        await this.queueAttachmentDeletion(done.deletedIds);
+        await queuePageAttachmentDeletion(this.attachmentQueue, done.deletedIds, this.logger);
         this.auditService.log({
           event: AuditEvent.PAGE_DELETED,
           resourceType: AuditResource.PAGE,
@@ -450,31 +464,6 @@ export class ConditionalPageOpsController {
     const current = pageEtagOpaque(page);
     if (!expectedEtags.includes(current)) {
       throw new PreconditionFailedException({ message: 'page changed', code: 'precondition_failed' });
-    }
-  }
-
-  /**
-   * The attachment-deletion jobs `PageService.forceDelete` queues on its own path — same job name, id and retry
-   * policy (pinned against the upstream source by the tripwire spec). Run after the commit; a failure here cannot
-   * undo the committed delete, so it is logged (files left in storage), never turned into an error.
-   */
-  private async queueAttachmentDeletion(pageIds: string[]): Promise<void> {
-    for (const id of pageIds) {
-      try {
-        await this.attachmentQueue.add(
-          QueueJob.DELETE_PAGE_ATTACHMENTS,
-          { pageId: id },
-          {
-            jobId: `delete-page-attachments-${id}`,
-            attempts: 3,
-            backoff: { type: 'exponential', delay: 5000 },
-          },
-        );
-      } catch (err) {
-        this.logger.error(
-          `PAGE_ATTACHMENT_CLEANUP_ENQUEUE_FAILED page=${id}: the page is deleted but its attachment files were not queued for deletion: ${(err as Error).message}`,
-        );
-      }
     }
   }
 }

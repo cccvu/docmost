@@ -15,13 +15,13 @@ import { ServiceBridgeModule } from '../service-bridge/service-bridge.module';
  *
  * Also mounts the page-restriction write feature and the anonymous public-content discovery feature
  * (their deps are all @Global, so no upstream edit is needed to register the routes — AuthzModule is
- * already in the graph via database.module), and the remote-mode interceptors on native upstream routes
- * (NativeRouteAuthzModule, #542/#574).
+ * already in the graph via database.module), and the remote-mode breadcrumb redaction on a native upstream route
+ * (NativeRouteAuthzModule, #574).
  */
 @Module({
   imports: [
     AuthzModeModule,
-    NativeRouteAuthzModule, // #542/#574: remote-mode refusal/redaction on native routes
+    NativeRouteAuthzModule, // #574: remote-mode breadcrumb redaction on a native route
     PageRestrictionModule,
     PublicDiscoveryModule,
     ServiceBridgeModule,

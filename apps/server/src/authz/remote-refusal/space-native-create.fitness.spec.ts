@@ -2,15 +2,16 @@ import { readFileSync } from 'fs';
 import { join } from 'path';
 import * as ts from 'typescript';
 import { literalText, ownerOf, sourceFiles } from '../route-guard/ast-sink-scan';
-import { NATIVE_SPACE_CREATE_CALL_RE, scanRoutes } from '../route-guard/static-route-scan';
-import { NATIVE_SPACE_CREATE_ROUTES } from './space-native-create.interceptor';
+import { handlerCalls, scanRoutes } from '../route-guard/static-route-scan';
+import { routesOf } from './remote-refusal.table';
 
 /**
  * Native space create FITNESS TEST (#598) — NOT upstream Docmost code.
  *
  * Invariant I27: in remote mode the only route that creates a `spaces` row is the platform's service-bridge create
- * (`POST /api/service/spaces`). `SpaceNativeCreateInterceptor` refuses the engine's native create by
- * `Controller.handler` key, so it is only as good as that key set and the call graph behind it. This pins both
+ * (`POST /api/service/spaces`). `RemoteNativeRefusalInterceptor` refuses the engine's native create by
+ * `Controller.handler` key (the `spaceNativeCreate` family of `remote-refusal.table.ts`), so it is only as good as
+ * that key set and the call graph behind it. This pins both
  * statically (no imports of the real controllers, no boot):
  *  - the refused set is EXACTLY the set of routes whose handler reaches `.createSpace(` — both directions;
  *  - every `spaces` ROW INSERT, per METHOD and per occurrence (TS AST, so comments never count): the upstream
@@ -25,13 +26,17 @@ import { NATIVE_SPACE_CREATE_ROUTES } from './space-native-create.interceptor';
  *                                                   the governed path)
  *    A new method or route that reaches any hop fails RED, and whoever adds it decides deliberately whether remote
  *    mode must refuse it too;
- *  - the holders of an injected `SpaceService` (class + property name), so the receiver-name match above is sound;
- *  - app.module.ts registers the interceptor after the per-principal rate limiter (and the #502 refusal).
+ *  - the holders of an injected `SpaceService` (class + property name), so the receiver-name match above is sound.
+ * The interceptor's registration (once, after the per-principal rate limiter) is pinned in remote-refusal.fitness.spec.ts.
  * A static inventory: a sink reached through an unrecognized indirection (a method passed by reference, a dynamic
  * property name) is invisible to it. The meta-guard at the bottom pins the shapes it does recognize. The `ee`
  * directory (the personal-space route) is not scanned: it is never initialized in this repo (AGENTS.md).
  */
 const SRC_ROOT = join(__dirname, '..', '..'); // .../apps/server/src
+
+// Text tell that a handler body reaches the native space create (#598): `spaceService.createSpace(` today. The `(`
+// right after the name keeps a longer identifier (`createSpaceModal(`) out.
+export const NATIVE_SPACE_CREATE_CALL_RE = /\.createSpace\s*\(/;
 
 // Raw SQL `INSERT INTO spaces` inside a string or template literal (not `space_members`, not trigger DDL).
 export const RAW_SPACES_ROW_INSERT_RE = /\binsert\s+into\s+(?:"?public"?\.)?"?spaces"?(?![\w"])/i;
@@ -129,12 +134,12 @@ describe('native space create is refused on every route that reaches it (#598, I
   });
 
   it('every refused key names a real route', () => {
-    expect([...NATIVE_SPACE_CREATE_ROUTES].filter((k) => !routeByKey.has(k))).toEqual([]);
+    expect([...routesOf('spaceNativeCreate')].filter((k) => !routeByKey.has(k))).toEqual([]);
   });
 
   it('the refused set is EXACTLY the routes whose handler reaches the native space create', () => {
-    const reaching = routes.filter((r) => r.callsNativeSpaceCreate).map(key).sort();
-    expect(reaching).toEqual([...NATIVE_SPACE_CREATE_ROUTES].sort());
+    const reaching = routes.filter((r) => handlerCalls(r, NATIVE_SPACE_CREATE_CALL_RE)).map(key).sort();
+    expect(reaching).toEqual([...routesOf('spaceNativeCreate')].sort());
   });
 
   it('every `spaces` row insert is the upstream repo insert or one of the service bridge’s two', () => {
@@ -181,16 +186,6 @@ describe('native space create is refused on every route that reaches it (#598, I
       'core/space/space.controller.ts:SpaceController#spaceService',
       'core/workspace/services/workspace.service.ts:WorkspaceService#spaceService',
     ]);
-  });
-
-  it('app.module.ts registers the interceptor after the per-principal rate limiter and the #502 refusal', () => {
-    const app = files.find((f) => f.file === 'app.module.ts')?.src ?? '';
-    const limiter = app.indexOf('useClass: PrincipalRateLimitInterceptor');
-    const hardDelete = app.indexOf('useClass: SpaceHardDeleteInterceptor');
-    const refusal = app.indexOf('useClass: SpaceNativeCreateInterceptor');
-    expect(limiter).toBeGreaterThan(-1);
-    expect(hardDelete).toBeGreaterThan(limiter);
-    expect(refusal).toBeGreaterThan(hardDelete);
   });
 });
 

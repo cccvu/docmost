@@ -13,7 +13,9 @@
 #      native can only come from a real delegation to the stub, closing the OUTBOUND contract-parse gap that is
 #      the reciprocal of #181's INBOUND envelope break (a fork ignoring the stub or fail-opening would flip it),
 #   5. the engine's native space create is refused in remote mode (404, no row) even for a native-phase OWNER
-#      session (#598): creation belongs to the integrating platform (POST /api/service/spaces).
+#      session (#598): creation belongs to the integrating platform (POST /api/service/spaces),
+#   6. so are its native group, workspace-member, workspace, space-member and email-change admin routes (#636): the
+#      same OWNER session that creates a group in native mode gets 404 on each in remote mode, and the DB is unchanged.
 #
 # Because the stub matches EXACT { externalId, permission, resourceType, resourceId } tuples and the fork
 # generates its own UUIDs, we first bootstrap real data in a NATIVE-mode boot (native credential routes are
@@ -160,6 +162,39 @@ ALICE_ID="$(psql "select id from users where email='alice@example.com'")"
 BOB_ID="$(psql "select id from users where email='bob@example.com'")"
 [ -n "$BOB_ID" ] && pass "captured Bob's externalId ($BOB_ID)" || { bad "could not read Bob's user id"; exit 1; }
 
+# Native-phase controls for (e) below: the same OWNER session reaches each route (e) refuses, with a body of the same
+# shape, so a remote 404 is the remote refusal, not a wrong path or body. Each control is chosen not to disturb what
+# (e) asserts: Bob is re-roled to the role he has, the workspace is "renamed" to its own name, the email is "changed"
+# to the same address, and the member add puts the (empty) control group into space1, never Bob into space2.
+log "native-phase controls: the OWNER reaches every route remote mode will refuse (200)"
+native_post() { # $1 = path, $2 = JSON body -> echoes HTTP status, body in $TMP/native.json
+  curl -s -o "$TMP/native.json" -w '%{http_code}' -b "$A_JAR" -H 'content-type: application/json' -d "$2" "${BASE}$1"
+}
+group_native="$(curl -s -o "$TMP/group.json" -w '%{http_code}' -b "$A_JAR" -H 'content-type: application/json' \
+  -d '{"name":"Native Group 636"}' "${BASE}/api/groups/create")"
+[ "$group_native" = "200" ] && pass "native /api/groups/create by the OWNER → 200 in native mode" \
+  || { bad "native /api/groups/create by the OWNER expected 200 in native mode, got HTTP $group_native: $(cat "$TMP/group.json" 2>/dev/null)"; exit 1; }
+native_groups="$(psql "select count(*) from groups where name='Native Group 636'")"
+[ "$native_groups" = "1" ] && pass "… and one group row was written" \
+  || { bad "the native group create wrote $native_groups group row(s), expected 1"; exit 1; }
+NATIVE_GROUP_ID="$(jq -r '.id // .data.id // empty' "$TMP/group.json")"
+[ -n "$NATIVE_GROUP_ID" ] || { bad "could not read the control group's id: $(cat "$TMP/group.json")"; exit 1; }
+code="$(native_post /api/workspace/members/change-role "{\"userId\":\"$BOB_ID\",\"role\":\"member\"}")"
+[ "$code" = "200" ] && pass "native /api/workspace/members/change-role (Bob → member, his current role) by the OWNER → 200 in native mode" \
+  || { bad "native change-role control expected 200, got HTTP $code: $(cat "$TMP/native.json" 2>/dev/null)"; exit 1; }
+code="$(native_post /api/workspace/update '{"name":"Contract"}')"
+[ "$code" = "200" ] && pass "native /api/workspace/update (its current name) by the OWNER → 200 in native mode" \
+  || { bad "native workspace/update control expected 200, got HTTP $code: $(cat "$TMP/native.json" 2>/dev/null)"; exit 1; }
+code="$(native_post /api/spaces/members/add "{\"spaceId\":\"$SPACE_ID\",\"role\":\"reader\",\"userIds\":[],\"groupIds\":[\"$NATIVE_GROUP_ID\"]}")"
+[ "$code" = "200" ] && pass "native /api/spaces/members/add (the empty control group → space1) by the OWNER → 200 in native mode" \
+  || { bad "native spaces/members/add control expected 200, got HTTP $code: $(cat "$TMP/native.json" 2>/dev/null)"; exit 1; }
+n="$(psql "select count(*) from space_members where space_id='$SPACE_ID' and group_id='$NATIVE_GROUP_ID'")"
+[ "$n" = "1" ] && pass "… and the group's space_members row was written" \
+  || { bad "the native member add control wrote $n space_members row(s), expected 1"; exit 1; }
+code="$(native_post /api/users/update '{"email":"alice@example.com","confirmPassword":"AlicePw123!"}')"
+[ "$code" = "200" ] && pass "native /api/users/update {email (unchanged)} by the OWNER → 200 in native mode" \
+  || { bad "native users/update {email} control expected 200, got HTTP $code: $(cat "$TMP/native.json" 2>/dev/null)"; exit 1; }
+
 # ── Phase 2: seed the stub policy with the REAL ids, then flip the fork to REMOTE ──────────────────────
 # Grant Alice AND Bob view on space1/page1; grant NEITHER anything on space2/page2. Bob is a plain workspace
 # member with NO native membership of either space, so in NATIVE mode he would be denied BOTH pages. The only
@@ -228,11 +263,49 @@ log "remote mode refuses the native space create, even for the native-phase OWNE
 create_remote="$(curl -s -o /dev/null -w '%{http_code}' -b "$A_JAR" -H 'content-type: application/json' \
   -d '{"name":"Owner Remote Space","slug":"owner-remote-598"}' "${BASE}/api/spaces/create")"
 [ "$create_remote" = "404" ] \
-  && pass "native /api/spaces/create by the OWNER → 404 in remote mode (SpaceNativeCreateInterceptor)" \
+  && pass "native /api/spaces/create by the OWNER → 404 in remote mode (RemoteNativeRefusalInterceptor)" \
   || bad "native /api/spaces/create by the OWNER expected 404 in remote mode, got HTTP $create_remote"
 owner_spaces="$(psql "select count(*) from spaces where slug='owner-remote-598'")"
 [ "$owner_spaces" = "0" ] && pass "… and no space row was written" \
   || bad "the refused native create still wrote $owner_spaces space row(s)"
+
+# (e) #636: the rest of the native admin surface is refused the same way, for the same OWNER session. Upstream gates
+# these on users.role (owner) or space CASL with no self-dealing check; group and space membership feed the PDP.
+# Each route answered 200 natively above (the native-phase controls); each refusal is proven against the DB.
+owner_post() { # $1 = path, $2 = JSON body -> echoes HTTP status
+  curl -s -o /dev/null -w '%{http_code}' -b "$A_JAR" -H 'content-type: application/json' -d "$2" "${BASE}$1"
+}
+log "remote mode refuses the native admin routes, even for the native-phase OWNER (#636)"
+code="$(owner_post /api/groups/create '{"name":"Remote Group 636"}')"
+[ "$code" = "404" ] && pass "native /api/groups/create by the OWNER → 404 in remote mode" \
+  || bad "native /api/groups/create by the OWNER expected 404 in remote mode, got HTTP $code"
+n="$(psql "select count(*) from groups where name='Remote Group 636'")"
+[ "$n" = "0" ] && pass "… and no group row was written" || bad "the refused group create still wrote $n group row(s)"
+
+code="$(owner_post /api/workspace/members/change-role "{\"userId\":\"$BOB_ID\",\"role\":\"admin\"}")"
+[ "$code" = "404" ] && pass "native /api/workspace/members/change-role (Bob → admin) by the OWNER → 404 in remote mode" \
+  || bad "native /api/workspace/members/change-role expected 404 in remote mode, got HTTP $code"
+bob_role="$(psql "select role from users where id='$BOB_ID'")"
+[ "$bob_role" = "member" ] && pass "… and Bob is still a member" || bad "the refused change-role left Bob's role as '$bob_role'"
+
+code="$(owner_post /api/workspace/update '{"name":"Renamed 636"}')"
+[ "$code" = "404" ] && pass "native /api/workspace/update by the OWNER → 404 in remote mode" \
+  || bad "native /api/workspace/update expected 404 in remote mode, got HTTP $code"
+n="$(psql "select count(*) from workspaces where name='Renamed 636'")"
+[ "$n" = "0" ] && pass "… and the workspace was not renamed" || bad "the refused workspace update still renamed the workspace"
+
+code="$(owner_post /api/spaces/members/add "{\"spaceId\":\"$SPACE2_ID\",\"role\":\"writer\",\"userIds\":[\"$BOB_ID\"],\"groupIds\":[]}")"
+[ "$code" = "404" ] && pass "native /api/spaces/members/add (Bob → space2) by the OWNER → 404 in remote mode" \
+  || bad "native /api/spaces/members/add expected 404 in remote mode, got HTTP $code"
+n="$(psql "select count(*) from space_members where space_id='$SPACE2_ID' and user_id='$BOB_ID'")"
+[ "$n" = "0" ] && pass "… and Bob is not a member of space2" || bad "the refused member add still wrote $n space_members row(s)"
+
+code="$(owner_post /api/users/update '{"email":"alice-moved@example.com","confirmPassword":"AlicePw123!"}')"
+[ "$code" = "404" ] && pass "native /api/users/update {email} by the OWNER → 404 in remote mode" \
+  || bad "native /api/users/update {email} expected 404 in remote mode, got HTTP $code"
+alice_email="$(psql "select email from users where id='$ALICE_ID'")"
+[ "$alice_email" = "alice@example.com" ] && pass "… and Alice's email is unchanged" \
+  || bad "the refused email change left Alice's email as '$alice_email'"
 
 log "RESULT"
 if [ "$fail" = "0" ]; then

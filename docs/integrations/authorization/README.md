@@ -113,17 +113,41 @@ You only implement a *caller* for these; the fork is the server. They fall into 
   narrowing access change and narrow the ones that lost access, #501; it replaced the per-page
   `force-disconnect` in 1.5.0) and `POST /api/collab/force-disconnect-user` (account disable, #455).
 
-**Native space routes refused in remote mode (wiki-v2 #502, #598).** In `AUTHZ_MODE=remote` the engine answers
-`404` to every authenticated caller of its native `POST /api/spaces/create` and `POST /api/spaces/delete`, before
-any permission check, and forwards one audit row (`space.native_create_refused` / `space.hard_delete_refused`) to
-`/audit/ingest`. Create spaces through `POST /api/service/spaces`; remove them with `POST .../archive`. A session
-minted before the switch to remote (an owner's included) gets the same `404`. Native mode keeps both routes.
+**Native routes refused in remote mode (1.10.0; wiki-v2 #502, #598, #636).** In `AUTHZ_MODE=remote` the engine
+answers `404` to every authenticated caller of the native routes below, before any permission check, and forwards one
+audit row per refusal (its event in brackets) to `/audit/ingest`. A session minted before the switch to remote (an
+owner's included) gets the same `404`. Reads stay reachable (member lists, the invite list, group reads). Native
+mode keeps every route.
+- Space hard delete: `POST /api/spaces/delete` (`space.hard_delete_refused`). Remove a space with
+  `POST /api/service/spaces/{id}/archive`.
+- Space create: `POST /api/spaces/create` (`space.native_create_refused`). Use `POST /api/service/spaces`.
+- Space members: `POST /api/spaces/members/add`, `.../remove` and `.../change-role`
+  (`space.native_member_refused`). Use `/api/service/spaces/{id}/members`.
+- Workspace admin: `POST /api/workspace/update`, `/api/workspace/members/{deactivate,activate,delete,change-role}`
+  and `/api/workspace/invites/{create,resend,revoke,link}` (`workspace.native_admin_refused`). Workspace settings go
+  through `PATCH /api/service/workspace/settings`.
+- Group admin: `POST /api/groups/create`, `.../update`, `.../delete` and `/api/groups/members/{add,remove}`
+  (`group.native_admin_refused`). The bridge has no group write.
+- Email change: `POST /api/users/update` when the body has an `email` key, even `null` or unchanged
+  (`user.native_email_change_refused`). In remote mode a user's email is identity, which the platform owns. The
+  name and preference forms still work.
+
+In remote mode `users.role` confers no workspace authority either: a native-phase owner session gets the member
+ability on every route gated on workspace permissions (1.10.0, #636).
+
+**Permanent delete needs edit on every page it removes (1.10.0, #636).** In remote mode a permanent delete (`POST
+/api/pages/delete {permanentlyDelete: true}`, `POST /api/pages/conditional-delete`) also requires `page#edit` for the
+caller on every page it removes, trashed descendants included, decided under row locks after the access-change settle
+fence: `403 { code: purge_needs_edit }` otherwise; `503 { code: purge_unconfirmed }` (retryable) when access changes
+cannot be confirmed as enforced; `409 { code: purge_subtree_changed }` (retryable) when the subtree keeps changing. A
+trash is unchanged.
 
 **Access-narrowing propagation (1.6.0, #501).** A successful response from a route that can take access away
-(`archive`, the member `POST` upsert, `PATCH` and `DELETE` here, and the native restrict/grant/move/member routes
-a platform relays) carries `Authz-Propagation: confirmed | pending` — whether the change is already enforced by the
+(`archive`, the member `POST` upsert, `PATCH` and `DELETE` here, and the native restrict/grant/move routes a
+platform relays) carries `Authz-Propagation: confirmed | pending` — whether the change is already enforced by the
 authorization service (via the optional outbound `/sync/settle` above). It never changes the status or the body.
-An absent header means unknown, never confirmed.
+An absent header means unknown, never confirmed. Since 1.10.0 the native space-member routes are refused in remote
+mode (above): members change through `/api/service/spaces/{id}/members`.
 
 **Page restriction guards (1.7.0, wiki-v2 #493/#545).** In `AUTHZ_MODE=remote` the fork installs database triggers
 that refuse to take a restriction away by anything but an explicit unrestrict or a purge: a native move-to-space of

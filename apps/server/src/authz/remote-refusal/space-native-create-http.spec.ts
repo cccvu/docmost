@@ -28,20 +28,19 @@ import WorkspaceAbilityFactory from '../../core/casl/abilities/workspace-ability
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { PlatformAuditClient } from '../audit/platform-audit.client';
 import { AUTHZ_MODE, AuthzMode } from '../mode/authz-mode';
-import { SpaceHardDeleteInterceptor } from '../space-delete/space-hard-delete.interceptor';
-import { SpaceNativeCreateInterceptor } from './space-native-create.interceptor';
+import { RemoteNativeRefusalInterceptor } from './remote-refusal.interceptor';
 
 /**
  * HTTP-boundary proof of #598 — NOT upstream Docmost code.
  *
- * Boots the REAL upstream SpaceController on Fastify with the REAL refusal interceptors registered the way
- * app.module.ts registers them (global APP_INTERCEPTORs, #502's then #598's) and main.ts's ValidationPipe. The caller
+ * Boots the REAL upstream SpaceController on Fastify with the REAL RemoteNativeRefusalInterceptor registered the way
+ * app.module.ts registers it (a global APP_INTERCEPTOR) and main.ts's ValidationPipe. The caller
  * is an engine OWNER — workspace CASL ALLOWS the create — which is exactly the session remote mode used to rely on
  * never existing. It proves:
  *  - remote: `POST /spaces/create` is a 404 for a valid body, an empty body, a null body and no body — so the refusal
  *    runs before the pipe — and neither CASL nor the service create is ever reached; one refusal row is forwarded.
- *    The #502 delete refusal is unaffected (they compose);
- *  - without the #598 interceptor the same owner request is a 200 (anti-vacuity: the 404 is this interceptor's);
+ *    The #502 delete refusal, another family of the same table, still gives its own row;
+ *  - without the interceptor the same owner request is a 200 (anti-vacuity: the 404 is the interceptor's, not CASL's);
  *  - native (standalone): the upstream route is untouched — the pipe still 400s a bad body, and an owner's valid
  *    request reaches CASL and the create, with no refusal row.
  * The static fitness spec proves the interceptor is keyed to the right route; this proves the wiring denies.
@@ -51,10 +50,13 @@ const WORKSPACE = { id: '0198c2a1-0000-7000-8000-0000000000aa' };
 const SPACE_ID = '0198c2a1-7b3e-7c6d-9f10-2a3b4c5d6e7f';
 const VALID = { name: 'Native Space', slug: 'native-space' };
 
-async function bootApp(mode: AuthzMode, { withCreateRefusal = true } = {}) {
+async function bootApp(mode: AuthzMode, { withRefusal = true } = {}) {
   const createSpace = jest.fn().mockResolvedValue({ id: SPACE_ID, ...VALID, memberCount: 1 });
   const deleteSpace = jest.fn().mockResolvedValue(undefined);
   // An engine owner: workspace CASL ALLOWS Manage Space (upstream `WorkspaceAbilityFactory.createForUser` is sync).
+  // Stubbed to ALLOW so the remote 404 is proven to be the interceptor's alone. The real remote factory (#636,
+  // authz/mode/workspace-ability.ts) would itself deny this owner; that layer is proven in
+  // authz/mode/workspace-ability-http.spec.ts.
   const workspaceCreateForUser = jest.fn(() => ({ cannot: () => false, can: () => true }));
   const spaceCreateForUser = jest.fn().mockResolvedValue({ cannot: () => false, can: () => true });
   const forward = jest.fn().mockResolvedValue(undefined);
@@ -64,8 +66,7 @@ async function bootApp(mode: AuthzMode, { withCreateRefusal = true } = {}) {
     providers: [
       { provide: AUTHZ_MODE, useValue: mode },
       { provide: PlatformAuditClient, useValue: { forward } },
-      { provide: APP_INTERCEPTOR, useClass: SpaceHardDeleteInterceptor },
-      ...(withCreateRefusal ? [{ provide: APP_INTERCEPTOR, useClass: SpaceNativeCreateInterceptor }] : []),
+      ...(withRefusal ? [{ provide: APP_INTERCEPTOR, useClass: RemoteNativeRefusalInterceptor }] : []),
       { provide: SpaceService, useValue: { createSpace, deleteSpace } },
       { provide: SpaceMemberService, useValue: {} },
       { provide: SpaceMemberRepo, useValue: {} },
@@ -134,7 +135,7 @@ describe('native space create — AUTHZ_MODE=remote (#598)', () => {
     expect(JSON.stringify(row)).not.toContain(VALID.slug);
   });
 
-  it('composes with the #502 refusal: the native delete is still a 404 with its own row', async () => {
+  it('the #502 family of the same table: the native delete is still a 404 with its own row', async () => {
     const res = await post(h.app, '/spaces/delete', { spaceId: SPACE_ID });
     expect(res.statusCode).toBe(HttpStatus.NOT_FOUND);
     expect(h.deleteSpace).not.toHaveBeenCalled();
@@ -143,9 +144,9 @@ describe('native space create — AUTHZ_MODE=remote (#598)', () => {
   });
 });
 
-describe('native space create — AUTHZ_MODE=remote WITHOUT the #598 interceptor (anti-vacuity)', () => {
+describe('native space create — AUTHZ_MODE=remote WITHOUT the refusal interceptor (anti-vacuity)', () => {
   it('an owner session creates a space: the 404 above is the interceptor, not CASL', async () => {
-    const h = await bootApp('remote', { withCreateRefusal: false });
+    const h = await bootApp('remote', { withRefusal: false });
     try {
       const res = await post(h.app, '/spaces/create', VALID);
       expect(res.statusCode).toBe(HttpStatus.OK);

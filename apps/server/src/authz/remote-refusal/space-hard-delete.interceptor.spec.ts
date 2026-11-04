@@ -2,18 +2,18 @@ import { CallHandler, ExecutionContext, NotFoundException } from '@nestjs/common
 import { lastValueFrom, of } from 'rxjs';
 import type { AuditIngestEvent, PlatformAuditClient } from '../audit/platform-audit.client';
 import type { AuthzMode } from '../mode/authz-mode';
-import {
-  SPACE_HARD_DELETE_REFUSED_EVENT,
-  SPACE_HARD_DELETE_ROUTES,
-  SpaceHardDeleteInterceptor,
-} from './space-hard-delete.interceptor';
+import { RemoteNativeRefusalInterceptor } from './remote-refusal.interceptor';
+import { routesOf } from './remote-refusal.table';
+
+const SPACE_HARD_DELETE_REFUSED_EVENT = 'space.hard_delete_refused';
 
 /**
- * SpaceHardDeleteInterceptor (#502) — NOT upstream Docmost code.
+ * The #502 family of RemoteNativeRefusalInterceptor — NOT upstream Docmost code.
  *
  * In `AUTHZ_MODE=remote` the engine's native space delete is refused (404) for every caller, before the handler
  * (so before CASL and before the `DELETE FROM spaces`), and the refusal is audited. Everything else — another route,
- * native mode, a non-HTTP context — passes through untouched and writes no row.
+ * native mode, a non-HTTP context — passes through untouched and writes no row. The row keeps the #502 shape: the
+ * attempted space only as a UUID `resourceId`, else `invalidSpaceId`.
  */
 class SpaceController {
   deleteSpace() {}
@@ -52,7 +52,7 @@ const ctx = (target: object, handler: unknown, req: Req, type = 'http'): Executi
 function setup(mode: AuthzMode, forward?: jest.Mock) {
   const fwd = forward ?? jest.fn().mockResolvedValue(undefined);
   const client = { forward: fwd } as unknown as PlatformAuditClient;
-  const interceptor = new SpaceHardDeleteInterceptor(mode, client);
+  const interceptor = new RemoteNativeRefusalInterceptor(mode, client);
   const handler = jest.fn(() => of('handled'));
   const next: CallHandler = { handle: handler };
   return { interceptor, next, handler, forward: fwd };
@@ -60,9 +60,9 @@ function setup(mode: AuthzMode, forward?: jest.Mock) {
 
 const refusedDelete = (req: Req) => ctx(SpaceController, SpaceController.prototype.deleteSpace, req);
 
-describe('SpaceHardDeleteInterceptor (#502)', () => {
+describe('RemoteNativeRefusalInterceptor: the space hard delete (#502)', () => {
   it('refuses exactly SpaceController.deleteSpace', () => {
-    expect([...SPACE_HARD_DELETE_ROUTES]).toEqual(['SpaceController.deleteSpace']);
+    expect([...routesOf('spaceHardDelete')]).toEqual(['SpaceController.deleteSpace']);
   });
 
   describe('AUTHZ_MODE=remote, POST /api/spaces/delete', () => {

@@ -4,47 +4,32 @@ import * as ts from 'typescript';
 import { APP_INTERCEPTOR } from '@nestjs/core';
 import { MODULE_METADATA } from '@nestjs/common/constants';
 import { ownerOf, sourceFiles } from '../route-guard/ast-sink-scan';
-import {
-  PAGE_BREADCRUMBS_CALL_RE,
-  SPACE_MEMBER_MUTATION_CALL_RE,
-  scanRoutes,
-} from '../route-guard/static-route-scan';
+import { handlerCalls, scanRoutes } from '../route-guard/static-route-scan';
 import { BreadcrumbsRedactionInterceptor, PAGE_BREADCRUMBS_ROUTES } from './breadcrumbs-redaction.interceptor';
 import { NativeRouteAuthzModule } from './native-route-authz.module';
-import {
-  NATIVE_SPACE_MEMBER_MUTATION_ROUTES,
-  SpaceMemberMutationInterceptor,
-} from './space-member-mutation.interceptor';
 
 /**
- * Native route authz FITNESS TEST (#542, #574) — NOT upstream Docmost code.
+ * Native route authz FITNESS TEST (#574) — NOT upstream Docmost code.
  *
- * `SpaceMemberMutationInterceptor` and `BreadcrumbsRedactionInterceptor` act by `Controller.handler` key, so each is
- * only as good as its key set and the call graph behind it. This pins both statically (no imports of the real
- * controllers, no boot):
- *  - the refused member routes are EXACTLY the routes whose handler reaches a SpaceMemberService mutation, and the
- *    redacted breadcrumb routes EXACTLY those reaching `.getPageBreadCrumbs(` — both directions;
- *  - every call site of those sinks, per enclosing METHOD (TS AST, so comments never count), and the SpaceMemberRepo
- *    writes behind the member service, so a new path to them fails RED and whoever adds it decides deliberately
- *    whether remote mode must refuse or redact it too;
- *  - NativeRouteAuthzModule is in AuthzModule's imports and registers both interceptors as APP_INTERCEPTORs.
+ * `BreadcrumbsRedactionInterceptor` acts by `Controller.handler` key, so it is only as good as its key set and the
+ * call graph behind it. This pins it statically (no imports of the real controllers, no boot):
+ *  - the redacted breadcrumb routes are EXACTLY the routes whose handler reaches `.getPageBreadCrumbs(`, both
+ *    directions;
+ *  - every call site of that sink, per enclosing METHOD (TS AST, so comments never count), so a new path to it fails
+ *    RED and whoever adds it decides deliberately whether remote mode must redact it too;
+ *  - NativeRouteAuthzModule is in AuthzModule's imports and registers the interceptor as its one APP_INTERCEPTOR.
+ * The native space-member writes (#542) are a remote REFUSAL, pinned with the rest of the refusal table in
+ * `authz/remote-refusal/space-member.fitness.spec.ts` (every `space_members` write, every hop to a route).
  * A static inventory: a sink reached through an unrecognized indirection (a method passed by reference, a dynamic
  * property name) is invisible to it. The `ee` directory is not scanned: it is never initialized in this repo.
  */
 const SRC_ROOT = join(__dirname, '..', '..'); // .../apps/server/src
 
+// Text tell that a handler reaches the unfiltered breadcrumb query (#574): `pageService.getPageBreadCrumbs(`. The
+// leading `.` keeps the handler's own declaration (`getPageBreadcrumbs(`) out.
+export const PAGE_BREADCRUMBS_CALL_RE = /\.getPageBreadCrumbs\s*\(/;
+
 const SINK_METHODS = [
-  // the native member routes' service calls (#542)
-  'addMembersToSpaceBatch',
-  'removeMemberFromSpace',
-  'updateSpaceMemberRole',
-  // the other SpaceMemberService writes (create-space and first-run only)
-  'addUserToSpace',
-  'addGroupToSpace',
-  // the SpaceMemberRepo writes behind every one of them
-  'insertSpaceMember',
-  'updateSpaceMember',
-  'removeSpaceMemberById',
   // the unfiltered ancestor chain (#574)
   'getPageBreadCrumbs',
 ] as const;
@@ -69,7 +54,7 @@ export function scanNativeRouteSinks(fileName: string, source: string): Array<{ 
   return out;
 }
 
-describe('native route authz covers every route that reaches its sink (#542, #574)', () => {
+describe('native route authz covers every route that reaches its sink (#574)', () => {
   const routes = scanRoutes(SRC_ROOT);
   const key = (r: { controller: string; handler: string }) => `${r.controller}.${r.handler}`;
   const routeKeys = new Set(routes.map(key));
@@ -87,54 +72,13 @@ describe('native route authz covers every route that reaches its sink (#542, #57
     expect(files.some((f) => f.sinks.length > 0)).toBe(true);
   });
 
-  describe('space-member mutation (#542)', () => {
-    it('every refused key names a real route', () => {
-      expect([...NATIVE_SPACE_MEMBER_MUTATION_ROUTES.keys()].filter((k) => !routeKeys.has(k))).toEqual([]);
-    });
-
-    it('the refused set is EXACTLY the routes whose handler reaches a member-service mutation', () => {
-      const reaching = routes.filter((r) => r.callsSpaceMemberMutation).map(key).sort();
-      expect(reaching).toEqual([...NATIVE_SPACE_MEMBER_MUTATION_ROUTES.keys()].sort());
-    });
-
-    it('the three member-route mutations are called only by the refused handlers', () => {
-      expect(sitesOf('addMembersToSpaceBatch')).toEqual(['core/space/space.controller.ts:SpaceController.addSpaceMember']);
-      expect(sitesOf('removeMemberFromSpace')).toEqual([
-        'core/space/space.controller.ts:SpaceController.removeSpaceMember',
-      ]);
-      expect(sitesOf('updateSpaceMemberRole')).toEqual([
-        'core/space/space.controller.ts:SpaceController.updateSpaceMemberRole',
-      ]);
-    });
-
-    it('the other member-service adds run only in the native create (#598 refuses it) and first-run setup', () => {
-      const expected = [
-        'core/space/services/space.service.ts:SpaceService.createSpace',
-        'core/workspace/services/workspace.service.ts:WorkspaceService.create',
-      ];
-      expect(sitesOf('addUserToSpace')).toEqual(expected);
-      expect(sitesOf('addGroupToSpace')).toEqual(['core/workspace/services/workspace.service.ts:WorkspaceService.create']);
-    });
-
-    it('the SpaceMemberRepo writes are reached only through SpaceMemberService', () => {
-      const svc = 'core/space/services/space-member.service.ts:SpaceMemberService';
-      expect(sitesOf('insertSpaceMember')).toEqual([
-        `${svc}.addGroupToSpace`,
-        `${svc}.addMembersToSpaceBatch`,
-        `${svc}.addUserToSpace`,
-      ]);
-      expect(sitesOf('updateSpaceMember')).toEqual([`${svc}.updateSpaceMemberRole`]);
-      expect(sitesOf('removeSpaceMemberById')).toEqual([`${svc}.removeMemberFromSpace`]);
-    });
-  });
-
   describe('breadcrumbs (#574)', () => {
     it('every redacted key names a real route', () => {
       expect([...PAGE_BREADCRUMBS_ROUTES].filter((k) => !routeKeys.has(k))).toEqual([]);
     });
 
     it('the redacted set is EXACTLY the routes whose handler reaches .getPageBreadCrumbs(', () => {
-      const reaching = routes.filter((r) => r.callsPageBreadcrumbs).map(key).sort();
+      const reaching = routes.filter((r) => handlerCalls(r, PAGE_BREADCRUMBS_CALL_RE)).map(key).sort();
       expect(reaching).toEqual([...PAGE_BREADCRUMBS_ROUTES].sort());
     });
 
@@ -150,14 +94,13 @@ describe('native route authz covers every route that reaches its sink (#542, #57
       expect(moduleImports(file, src)).toContain('NativeRouteAuthzModule');
     });
 
-    it('NativeRouteAuthzModule registers both interceptors as APP_INTERCEPTORs', () => {
+    it('NativeRouteAuthzModule registers the redaction interceptor as its one APP_INTERCEPTOR', () => {
       const providers = (Reflect.getMetadata(MODULE_METADATA.PROVIDERS, NativeRouteAuthzModule) ?? []) as Array<{
         provide?: unknown;
         useClass?: unknown;
       }>;
       const intercepting = providers.filter((p) => p?.provide === APP_INTERCEPTOR).map((p) => p.useClass);
-      expect(intercepting).toEqual(expect.arrayContaining([SpaceMemberMutationInterceptor, BreadcrumbsRedactionInterceptor]));
-      expect(intercepting).toHaveLength(2);
+      expect(intercepting).toEqual([BreadcrumbsRedactionInterceptor]);
     });
   });
 });
@@ -199,31 +142,24 @@ describe('the native-route sink scanners recognize every sink shape (meta-guard)
   const sites = (src: string) => scanNativeRouteSinks('probe.ts', src).map((s) => `${s.sink}@${s.owner}`);
 
   it('attributes each call to its enclosing method, so a NEW caller in a listed file is caught', () => {
-    const src = `class SpaceController {
-      addSpaceMember() { return this.spaceMemberService.addMembersToSpaceBatch(d, u, w); }
-      importMembers() { return this.spaceMemberService.addMembersToSpaceBatch(d, u, w); }
+    const src = `class PageController {
+      getPageBreadcrumbs() { return this.pageService.getPageBreadCrumbs(id); }
+      exportTrail() { return this.pageService.getPageBreadCrumbs(id); }
     }`;
     expect(sites(src)).toEqual([
-      'addMembersToSpaceBatch@SpaceController.addSpaceMember',
-      'addMembersToSpaceBatch@SpaceController.importMembers',
+      'getPageBreadCrumbs@PageController.getPageBreadcrumbs',
+      'getPageBreadCrumbs@PageController.exportTrail',
     ]);
   });
 
   it('sees a call through any receiver, and never a declaration or a comment', () => {
     expect(sites(`class A { a() { svc.getPageBreadCrumbs(id); } }`)).toEqual(['getPageBreadCrumbs@A.a']);
-    expect(sites(`class S { updateSpaceMemberRole(d) { return this.repo.updateSpaceMember(x); } }`)).toEqual([
-      'updateSpaceMember@S.updateSpaceMemberRole',
-    ]);
+    expect(sites(`class S { getPageBreadCrumbs(id) { return this.repo.findAncestors(id); } }`)).toEqual([]);
     expect(sites(`// this.pageService.getPageBreadCrumbs(id)\nconst x = 1;`)).toEqual([]);
     expect(sites(`class A { a() { this.svc.getPageBreadCrumbsCached(id); } }`)).toEqual([]);
   });
 
-  it('the route tells see the sink calls and not the handler declarations or longer identifiers', () => {
-    expect(SPACE_MEMBER_MUTATION_CALL_RE.test('this.spaceMemberService.addMembersToSpaceBatch(dto, user, ws)')).toBe(true);
-    expect(SPACE_MEMBER_MUTATION_CALL_RE.test('this.spaceMemberService.removeMemberFromSpace (dto, ws)')).toBe(true);
-    expect(SPACE_MEMBER_MUTATION_CALL_RE.test('this.spaceMemberService.updateSpaceMemberRole(dto, ws)')).toBe(true);
-    expect(SPACE_MEMBER_MUTATION_CALL_RE.test('async updateSpaceMemberRole(@Body() dto) {}')).toBe(false);
-    expect(SPACE_MEMBER_MUTATION_CALL_RE.test('this.x.removeMemberFromSpaceLater(dto)')).toBe(false);
+  it('the route tell sees the sink call and not the handler declaration', () => {
     expect(PAGE_BREADCRUMBS_CALL_RE.test('this.pageService.getPageBreadCrumbs(page.id)')).toBe(true);
     expect(PAGE_BREADCRUMBS_CALL_RE.test('async getPageBreadcrumbs(@Body() dto) {}')).toBe(false);
   });

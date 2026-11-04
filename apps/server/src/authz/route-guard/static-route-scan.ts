@@ -51,29 +51,21 @@ export interface StaticRoute {
    */
   mintsNativeSession: boolean;
   /**
-   * The handler BODY calls a `.deleteSpace(` — the service/repo space hard delete (#502). A static (text) tell so
-   * space-hard-delete.fitness.spec.ts can assert that the routes carrying it are EXACTLY the routes remote mode
-   * refuses. Not `deleteSpaceWatch(` (the watcher unwatch). The spec's source inventory pins the indirect callers.
+   * The handler's full source text (decorators included). Family fitness specs test their own text tells against it
+   * through `handlerCalls`, so a new tell is a regex in the spec that owns it, not another boolean here (#636).
    */
-  callsSpaceHardDelete: boolean;
+  handlerText: string;
   /**
-   * The handler BODY calls a `.createSpace(` — the engine's native space create (#598). A static (text) tell so
-   * space-native-create.fitness.spec.ts can assert that the routes carrying it are EXACTLY the routes remote mode
-   * refuses. The spec's source inventory pins the indirect callers and every `spaces` row insert.
+   * The request path as written, under main.ts's global `api` prefix: `'/api/' + @Controller arg + route arg`, with
+   * slashes normalized (`@Post('/')` on `@Controller('groups')` is `/api/groups`). `null` when either decorator's
+   * path is not one static string (an array, a variable). The prefix's exclude list (robots.txt, share pages, mcp)
+   * is not modeled. `remote-refusal.fitness.spec.ts` checks every refused route's audit `route` against it.
    */
-  callsNativeSpaceCreate: boolean;
-  /**
-   * The handler BODY calls a native space-member mutation — `.addMembersToSpaceBatch(`, `.removeMemberFromSpace(` or
-   * `.updateSpaceMemberRole(` (#542). A static (text) tell so native-route-authz.fitness.spec.ts can assert that the
-   * routes carrying it are EXACTLY the routes remote mode refuses. The spec's source inventory pins the callers.
-   */
-  callsSpaceMemberMutation: boolean;
-  /**
-   * The handler BODY calls `.getPageBreadCrumbs(` — the unfiltered ancestor chain (#574). A static (text) tell so
-   * native-route-authz.fitness.spec.ts can assert that the routes carrying it are EXACTLY the redacted routes.
-   */
-  callsPageBreadcrumbs: boolean;
+  httpPath: string | null;
 }
+
+/** Whether a route's handler text matches a family spec's text tell (e.g. `/\.deleteSpace\s*\(/`). */
+export const handlerCalls = (r: StaticRoute, re: RegExp): boolean => re.test(r.handlerText);
 
 // Text tell that a handler body establishes a native session. Matches the session-cookie set — the raw
 // `setCookie('authToken'` / `setCookie("__Host-authToken"` literal (either name, #310), the AuthController
@@ -87,22 +79,7 @@ export interface StaticRoute {
 export const NATIVE_SESSION_MINT_RE =
   /setCookie\(\s*['"](?:__Host-)?authToken['"]|setAuthCookie\s*\(|setDocmostAuthCookie\s*\(|docmostAuthCookieSetOptions\s*\(|createSessionAndToken\s*\(/;
 
-// Text tell that a handler body reaches the space hard delete (#502): `spaceService.deleteSpace(` today, or a direct
-// `spaceRepo.deleteSpace(`. The `(` right after the name keeps `deleteSpaceWatch(` out.
-export const SPACE_HARD_DELETE_CALL_RE = /\.deleteSpace\s*\(/;
-
-// Text tell that a handler body reaches the native space create (#598): `spaceService.createSpace(` today. The `(`
-// right after the name keeps a longer identifier (`createSpaceModal(`) out.
-export const NATIVE_SPACE_CREATE_CALL_RE = /\.createSpace\s*\(/;
-
-// Text tell that a handler body reaches a native space-member mutation (#542): the three SpaceMemberService writes the
-// native routes call. The leading `.` keeps the handler's own declaration (`updateSpaceMemberRole(`) out, and the `(`
-// right after the name keeps a longer identifier out.
-export const SPACE_MEMBER_MUTATION_CALL_RE = /\.(?:addMembersToSpaceBatch|removeMemberFromSpace|updateSpaceMemberRole)\s*\(/;
-
-// Text tell that a handler body reaches the unfiltered breadcrumb query (#574): `pageService.getPageBreadCrumbs(`.
-export const PAGE_BREADCRUMBS_CALL_RE = /\.getPageBreadCrumbs\s*\(/;
-
+const CONTROLLER_DECORATORS = new Set(['Controller']);
 const ROUTE_DECORATORS = new Set(['Get', 'Post', 'Put', 'Patch', 'Delete', 'Options', 'Head', 'All', 'Search']);
 const PUBLIC_DECORATORS = new Set(['Public', 'PlatformPublic']);
 const FORK_AUTHZ_DECORATORS = new Set(['PlatformAuthz']);
@@ -126,6 +103,28 @@ function decoratorName(dec: ts.Decorator): string | undefined {
   if (ts.isCallExpression(expr) && ts.isIdentifier(expr.expression)) return expr.expression.text;
   if (ts.isIdentifier(expr)) return expr.text; // bare `@Public` (no parens) — defensive
   return undefined;
+}
+
+/**
+ * The static path argument of a `@Controller(...)` / route decorator: `''` when absent, the text of a single string
+ * literal, `null` for anything else (an array of paths, a variable, an options object).
+ */
+function decoratorPath(decs: readonly ts.Decorator[], names: ReadonlySet<string>): string | null {
+  const dec = decs.find((d) => {
+    const n = decoratorName(d);
+    return n !== undefined && names.has(n);
+  });
+  if (!dec || !ts.isCallExpression(dec.expression)) return '';
+  const [arg] = dec.expression.arguments;
+  if (arg === undefined) return '';
+  return ts.isStringLiteral(arg) || ts.isNoSubstitutionTemplateLiteral(arg) ? arg.text : null;
+}
+
+/** `/api/<controller>/<route>` with duplicate and trailing slashes collapsed, or null if either part is dynamic. */
+function joinHttpPath(controllerPath: string | null, routePath: string | null): string | null {
+  if (controllerPath === null || routePath === null) return null;
+  const joined = `/api/${controllerPath}/${routePath}`.replace(/\/{2,}/g, '/');
+  return joined.length > 1 ? joined.replace(/\/$/, '') : joined;
 }
 
 /** The trailing identifier of an expression: `JwtAuthGuard` or `guards.JwtAuthGuard` -> "JwtAuthGuard". */
@@ -183,6 +182,7 @@ export function scanRoutes(srcRoot: string): StaticRoute[] {
       const isController = (ts.getDecorators(stmt) ?? []).some((d) => decoratorName(d) === 'Controller');
       if (!isController) continue;
       const controller = stmt.name.text;
+      const controllerPath = decoratorPath(ts.getDecorators(stmt) ?? [], CONTROLLER_DECORATORS);
 
       for (const member of stmt.members) {
         if (!ts.isMethodDeclaration(member) || !member.name || !ts.isIdentifier(member.name)) continue;
@@ -194,6 +194,7 @@ export function scanRoutes(srcRoot: string): StaticRoute[] {
         if (!isRoute) continue;
 
         const methodFacts = readDecorators(member);
+        const handlerText = member.getText(sf);
         routes.push({
           file,
           controller,
@@ -203,11 +204,9 @@ export function scanRoutes(srcRoot: string): StaticRoute[] {
           isSessionScopedRoute:
             classFacts.isSessionScopedRoute || methodFacts.isSessionScopedRoute,
           isClassLevelSessionScoped: classFacts.isSessionScopedRoute,
-          mintsNativeSession: NATIVE_SESSION_MINT_RE.test(member.getText(sf)),
-          callsSpaceHardDelete: SPACE_HARD_DELETE_CALL_RE.test(member.getText(sf)),
-          callsNativeSpaceCreate: NATIVE_SPACE_CREATE_CALL_RE.test(member.getText(sf)),
-          callsSpaceMemberMutation: SPACE_MEMBER_MUTATION_CALL_RE.test(member.getText(sf)),
-          callsPageBreadcrumbs: PAGE_BREADCRUMBS_CALL_RE.test(member.getText(sf)),
+          mintsNativeSession: NATIVE_SESSION_MINT_RE.test(handlerText),
+          handlerText,
+          httpPath: joinHttpPath(controllerPath, decoratorPath(mDecs, ROUTE_DECORATORS)),
           guardNames: [...new Set([...classFacts.guardNames, ...methodFacts.guardNames])],
         });
       }

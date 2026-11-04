@@ -12,6 +12,11 @@
  * `conditionalDelete`), the metadata-only update (`conditionalUpdateMeta` — title/icon change no access), space and group delete,
  * workspace-member delete and deactivate, and the purely widening routes (native add member, add group member).
  * Those still reach live sessions through the relay signal and the sweep.
+ *
+ * The three native membership entries are dead in `AUTHZ_MODE=remote`: the remote refusal table
+ * (`authz/remote-refusal/remote-refusal.table.ts`, #636) 404s those routes before the handler, and the settle runs
+ * only in remote. They stay on purpose, for native mode and so that lifting a refusal brings the settle back with it.
+ * `narrowing-routes.spec.ts` pins the overlap to exactly those three.
  */
 export const NARROWING_ROUTES: ReadonlySet<string> = new Set([
   // page restriction + grants (fork-owned controller)
@@ -26,8 +31,7 @@ export const NARROWING_ROUTES: ReadonlySet<string> = new Set([
   // …and their #616 atomic compare-and-write twins (the platform relays a move carrying If-Match here)
   'ConditionalPageOpsController.conditionalMove',
   'ConditionalPageOpsController.conditionalMoveToSpace',
-  // native space + group membership. The two SpaceController entries are inert in remote mode, where
-  // `SpaceMemberMutationInterceptor` (#542) 404s them before the handler; kept so the settle returns if that lifts.
+  // native space + group membership (refused in remote, #636: see the header)
   'SpaceController.removeSpaceMember',
   'SpaceController.updateSpaceMemberRole',
   'GroupController.removeGroupMember',

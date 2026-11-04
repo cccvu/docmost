@@ -7,6 +7,7 @@ import SpaceAbilityFactory from '../../core/casl/abilities/space-ability.factory
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { AUTHZ_MODE } from '../mode/authz-mode';
 import { HttpAuthzClient } from '../http-authz.client';
+import { AUDIT_SERVICE } from '../../integrations/audit/audit.service';
 import { PageRestrictionModule } from './page-restriction.module';
 import { PageRestrictionService } from './page-restriction.service';
 
@@ -30,6 +31,18 @@ import { PageRestrictionService } from './page-restriction.service';
 })
 class AppGlobalsStub {}
 
+/** The web app's @Global audit sink (PlatformAuditModule). The collaboration app mounts none (#503). */
+const auditSink = { log: jest.fn() };
+@Global()
+@Module({ providers: [{ provide: AUDIT_SERVICE, useValue: auditSink }], exports: [AUDIT_SERVICE] })
+class AuditGlobalStub {}
+
+const compile = (imports: unknown[]) =>
+  Test.createTestingModule({ imports: [...(imports as never[]), PageRestrictionModule] })
+    .overrideGuard(JwtAuthGuard)
+    .useValue({ canActivate: () => true })
+    .compile();
+
 describe('PageRestrictionModule DI wiring (#486)', () => {
   it('resolves PageRestrictionService from the app globals plus its own PDP client', async () => {
     const moduleRef = await Test.createTestingModule({ imports: [AppGlobalsStub, PageRestrictionModule] })
@@ -38,6 +51,21 @@ describe('PageRestrictionModule DI wiring (#486)', () => {
       .compile();
     expect(moduleRef.get(PageRestrictionService)).toBeInstanceOf(PageRestrictionService);
     expect(moduleRef.get(HttpAuthzClient)).toBeInstanceOf(HttpAuthzClient);
+    await moduleRef.close();
+  });
+
+  // #503: the domain-audit sink is the @Global AUDIT_SERVICE when the app provides one (anti-vacuity: without
+  // `@Inject(AUDIT_SERVICE)` Nest resolves the optional parameter by its erased type and injects undefined) …
+  it('injects the app AUDIT_SERVICE into the service as its audit sink', async () => {
+    const moduleRef = await compile([AppGlobalsStub, AuditGlobalStub]);
+    expect((moduleRef.get(PageRestrictionService) as unknown as { audit?: unknown }).audit).toBe(auditSink);
+    await moduleRef.close();
+  });
+
+  // … and its absence (the collaboration app's shape) still compiles, with no sink.
+  it('compiles without an audit provider (the collaboration app) and has no sink', async () => {
+    const moduleRef = await compile([AppGlobalsStub]);
+    expect((moduleRef.get(PageRestrictionService) as unknown as { audit?: unknown }).audit).toBeUndefined();
     await moduleRef.close();
   });
 });

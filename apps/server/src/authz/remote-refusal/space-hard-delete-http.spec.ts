@@ -28,12 +28,12 @@ import WorkspaceAbilityFactory from '../../core/casl/abilities/workspace-ability
 import { JwtAuthGuard } from '../../common/guards/jwt-auth.guard';
 import { PlatformAuditClient } from '../audit/platform-audit.client';
 import { AUTHZ_MODE, AuthzMode } from '../mode/authz-mode';
-import { SpaceHardDeleteInterceptor } from './space-hard-delete.interceptor';
+import { RemoteNativeRefusalInterceptor } from './remote-refusal.interceptor';
 
 /**
  * HTTP-boundary proof of #502 — NOT upstream Docmost code.
  *
- * Boots the REAL upstream SpaceController on Fastify with the REAL SpaceHardDeleteInterceptor registered the way
+ * Boots the REAL upstream SpaceController on Fastify with the REAL RemoteNativeRefusalInterceptor registered the way
  * app.module.ts registers it (a global APP_INTERCEPTOR) and main.ts's ValidationPipe, and proves:
  *  - remote: `POST /spaces/delete` is a 404 for a valid id, an empty body and a null body — so the refusal runs
  *    before the pipe — and neither CASL nor the service delete is ever reached; one refusal row is forwarded;
@@ -55,7 +55,7 @@ async function bootApp(mode: AuthzMode) {
     providers: [
       { provide: AUTHZ_MODE, useValue: mode },
       { provide: PlatformAuditClient, useValue: { forward } },
-      { provide: APP_INTERCEPTOR, useClass: SpaceHardDeleteInterceptor },
+      { provide: APP_INTERCEPTOR, useClass: RemoteNativeRefusalInterceptor },
       { provide: SpaceService, useValue: { deleteSpace } },
       { provide: SpaceMemberService, useValue: {} },
       { provide: SpaceMemberRepo, useValue: {} },

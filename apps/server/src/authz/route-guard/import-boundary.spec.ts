@@ -51,7 +51,7 @@ const CCC_PREFIXES = ['authz', 'service-bridge', 'editor-compat'];
 // to SRC_ROOT, POSIX-separated. Keep in lockstep with UPSTREAM_MODIFICATIONS.md.
 const SEAM_ALLOWLIST = new Set<string>([
   'database/database.module.ts', // seam #1 — the DI rebind (AuthzModule + mode/repo-providers)
-  'app.module.ts', // seam #4 — CollabDisconnectModule + ConditionalPageModule + CommentResolutionModule (#615) + PlatformAuditModule + PlatformAuthorizationGuard + PublicSurfaceThrottlerGuard (#29) + ResponseHeadersModule + SpaceHardDeleteInterceptor (#502) + SpaceNativeCreateInterceptor (#598)
+  'app.module.ts', // seam #4 — CollabDisconnectModule + ConditionalPageModule + CommentResolutionModule (#615) + PlatformAuditModule + PlatformAuthorizationGuard + PublicSurfaceThrottlerGuard (#29) + ResponseHeadersModule + RemoteNativeRefusalInterceptor (#502, #598, #636)
   'core/search/search.module.ts', // seam #5 — PDP-gated search provider
   'integrations/static/static.module.ts', // seam #86 — client capability injection (NATIVE_AUTH_ENABLED, reads authz mode)
   'core/auth/auth.controller.ts', // seam #87 — NativeAuthModeGuard + @SessionScopedRoute() allowlist (collab-token/logout); + #310 session-cookie set/clear via authz/session-cookie
@@ -66,6 +66,7 @@ const SEAM_ALLOWLIST = new Set<string>([
   'integrations/import/services/file-import-task.service.ts', // seam #176 — zip-import Markdown converted via editor-compat/content-parse (#626)
   'collaboration/extensions/persistence.extension.ts', // seam #390 — reconcile-before-store + store-failure signal via authz/page-write/{reconcile-store,store-failure-registry}
   'collaboration/server/collaboration.controller.ts', // seam #163 — CollabServiceSecretGuard on GET /collab/stats in the separate CollabAppModule process (#80)
+  'core/casl/casl.module.ts', // seam #177 — mode-selected WorkspaceAbilityFactory via authz/mode/workspace-ability (remote: users.role confers no workspace authority, #636)
 ]);
 
 const posix = (p: string) => p.split(sep).join('/');
