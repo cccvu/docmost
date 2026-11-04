@@ -58,8 +58,8 @@ d('AuthzChangeFeedService — real-Postgres commit-safety (Group D R2)', () => {
   let feedPg: postgres.Sql<{ bigint: number }>;
   let db: Kysely<any>;
   let feed: AuthzChangeFeedService;
-  let a: postgres.ReservedSql;
-  let b: postgres.ReservedSql;
+  let a: postgres.ReservedSql<{ bigint: number }>;
+  let b: postgres.ReservedSql<{ bigint: number }>;
 
   // Store a REAL jsonb object, exactly as the capture trigger's jsonb_build_object does. (The earlier fixture
   // passed a pre-stringified JSON string to a ::jsonb parameter; postgres.js infers json for that parameter
@@ -67,7 +67,7 @@ d('AuthzChangeFeedService — real-Postgres commit-safety (Group D R2)', () => {
   // string scalar reads back as a string the old feed then parsed, while production's object reads back as
   // an object whose nested keys the app Kysely camelCases.)
   const memberPayload = (space: string) => ({ space_id: space, user_id: 'u', group_id: null, role: 'reader' });
-  const insertMember = (conn: postgres.Sql | postgres.ReservedSql, space: string) =>
+  const insertMember = (conn: postgres.Sql<{ bigint: number }> | postgres.ReservedSql<{ bigint: number }>, space: string) =>
     conn`
       insert into authz_outbox (op, table_name, payload)
       values ('INSERT', 'space_members', ${admin.json(memberPayload(space))})

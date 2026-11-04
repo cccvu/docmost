@@ -2,11 +2,16 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { Cache } from 'cache-manager';
 import { InjectKysely } from 'nestjs-kysely';
-import { KyselyDB } from '@docmost/db/types/kysely.types';
+import { KyselyDB, KyselyTransaction } from '@docmost/db/types/kysely.types';
 import { GroupRepo } from '@docmost/db/repos/group/group.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 import { HttpAuthzClient } from './http-authz.client';
 import { lineageRestricted, readPageLineage } from '../service-bridge/page-lineage';
+import {
+  assertCopyKeepsRestrictions,
+  CopyRestrictionArgs,
+  CopyRestrictionGuard,
+} from './page-copy/copy-restriction.guard';
 
 /** The decision upstream must trust as a DENY: restricted, so it never falls back to the space role. */
 const restrictedNoAccess = () => ({ hasAnyRestriction: true, canAccess: false, canEdit: false });
@@ -19,13 +24,17 @@ const restrictedNoAccess = () => ({ hasAnyRestriction: true, canAccess: false, c
  * page_permissions → `#viewer`/`#editor`), so `hasAnyRestriction` reflects the schema's `locked`
  * permission (page or an ancestor is restricted). Non-overridden methods delegate to upstream.
  *
- * One input comes from the fork's own rows (#524): for a page the PDP has not placed (trashed, so its #space and
- * #parent edges are reaped; or new, restored or re-parented and not projected yet), `locked` cannot see a
- * restriction the page only inherits, so canUserEditPage walks `pages`/`page_access` before it lets upstream fall
- * back to the space role. That read can only turn an answer into a denial, never widen one.
+ * One input comes from the fork's own rows (#524): for a page the PDP has not placed (new or re-parented and not
+ * projected yet — since ADR 0027 Release B a trashed page keeps its #space/#parent edges; only a purge reaps them),
+ * `locked` cannot see a restriction the page only inherits, so canUserEditPage walks `pages`/`page_access` before it
+ * lets upstream fall back to the space role. That read can only turn an answer into a denial, never widen one.
+ *
+ * It also carries the #573 copy guard (`assertCopyKeepsRestrictions`), which the #121 seam in
+ * `PageService.duplicatePage` calls inside the insert's transaction; the stock repo has none, so native mode is
+ * upstream's duplicate.
  */
 @Injectable()
-export class PdpPagePermissionRepo extends PagePermissionRepo {
+export class PdpPagePermissionRepo extends PagePermissionRepo implements CopyRestrictionGuard {
   private readonly logger = new Logger(PdpPagePermissionRepo.name);
 
   constructor(
@@ -64,12 +73,14 @@ export class PdpPagePermissionRepo extends PagePermissionRepo {
     // restricted with no access: upstream then trusts this decision and denies.
     if (!results) return restrictedNoAccess();
     const [canAccess, canEdit, locked] = results;
-    // #524 FAIL CLOSED on a page the PDP has not PLACED. Trashing reaps a page's #space/#parent edges, and a page that
-    // is new, restored or re-parented has none until the relay projects it. The PDP then answers view=false AND
-    // locked=false: `locked` (restricted + parent->locked) cannot see a restriction the page only INHERITS through
-    // the missing #parent. That `locked=false` RELAXES access exactly as in #492 — upstream falls back to the space
-    // role, so every space member could read the page (by id or slug) and every writer edit, restore or move it; a
-    // restore under a trashed ancestor, or a move to the root, then declassifies it for good. So before that
+    // #524 FAIL CLOSED on a page the PDP has not PLACED. A page that is new or re-parented has no #space/#parent
+    // edge until the relay projects it (a trashed page keeps its edges since ADR 0027 Release B; only a purge reaps
+    // them). The PDP then answers view=false AND locked=false: `locked` (restricted + parent->locked) cannot see a
+    // restriction the page only INHERITS through the missing #parent (a subject without space view gets the same
+    // answer for a placed, unrestricted page; the walk below then passes it on to the space role, which decides).
+    // That `locked=false` RELAXES access exactly as in #492 — upstream falls back to the space role, so every space
+    // member could read the page (by id or slug) and every writer edit, restore or move it; a restore under a
+    // trashed ancestor, or a move to the root, then declassifies it for good. So before that
     // fallback, ask the fork's own rows: only a lineage walked to its root with no restriction on it (the page itself
     // included, trashed ancestors included) may fall back. Anything else is restricted with no access, for everyone
     // — as a placed page in a restricted section already is (grants do not cascade). An unrestricted page keeps
@@ -95,6 +106,11 @@ export class PdpPagePermissionRepo extends PagePermissionRepo {
       );
       return true;
     }
+  }
+
+  /** #573: refuse, inside the duplicate's own transaction, a copy that would drop a restriction (see the guard). */
+  assertCopyKeepsRestrictions(trx: KyselyTransaction, args: CopyRestrictionArgs): Promise<void> {
+    return assertCopyKeepsRestrictions(trx, args);
   }
 
   override async filterAccessiblePageIds(opts: {

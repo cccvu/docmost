@@ -155,7 +155,11 @@ const writer = (pageId: string) => ({
   [`page:${pageId}:edit`]: true,
 });
 
-/** A space writer on a page the PDP has not placed: no page view, not locked (trashed, or not projected yet). */
+/**
+ * A space writer on a page the PDP has not placed: no page view, not locked. Since ADR 0027 Release B (#493) a trashed
+ * page keeps its #space/#parent edges, so in production this is a new or re-parented page not projected yet; the
+ * trashed fixture below still models the defensive case (an unplaced page that is also trashed).
+ */
 const unplacedWriter = {
   [`space:${S1}:edit`]: true,
   [`space:${S1}:view`]: true,

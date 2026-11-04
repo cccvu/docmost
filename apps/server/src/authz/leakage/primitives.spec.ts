@@ -97,6 +97,16 @@ describe('PDP repo primitives — deny propagation (leakage backbone)', () => {
     expect(await spaceRepo.getUserSpaceRoles('u1', 'ok-space')).toEqual([{ userId: 'u1', role: 'admin' }]);
   });
 
+  it('#542: getUserSpaceRoles denies (undefined) a binding without space view, even administer + edit', async () => {
+    const noView = {
+      checkBulk: jest.fn(async (_s: any, checks: Array<{ permission: string }>) =>
+        checks.map((c) => c.permission !== 'view'),
+      ),
+    };
+    const repo = new PdpSpaceMemberRepo({} as any, {} as any, {} as any, {} as any, noView as any);
+    expect(await repo.getUserSpaceRoles('u1', 'ok-space')).toBeUndefined();
+  });
+
   it('canUserAccessPage / canUserEditPage deny the confidential page', async () => {
     expect(await pageRepo.canUserAccessPage('u1', CONF_PAGE)).toBe(false);
     // The PDP places no restriction on it and its own rows show none either (#524), so this passes through:
@@ -190,8 +200,8 @@ describe('PDP repo primitives — deny propagation (leakage backbone)', () => {
   });
 
   describe('#524 — a page the PDP has not placed denies when its own rows show a restricted section', () => {
-    // Trashing a page reaps its #space and #parent edges, and a page that is new, restored or re-parented has none
-    // until the relay projects it. For such a page the PDP answers view=false AND locked=false: `locked` cannot see
+    // A page that is new or re-parented has no #space/#parent edges until the relay projects it (since ADR 0027
+    // Release B, #493, trashing KEEPS them). For such a page the PDP answers view=false AND locked=false: `locked` cannot see
     // a restriction the page only INHERITS through a missing #parent. Upstream reads locked=false as "unrestricted"
     // and falls back to the space role — so every space member could read the page and every writer edit, restore
     // or move it. The repo now asks the fork's own rows before that fallback is allowed.

@@ -102,7 +102,7 @@ interface AclRun {
  * half here). It only writes Docmost's own `page_access` / `page_permissions` tables via the existing
  * repo methods; the platform's DB-trigger outbox then projects the change to SpiceDB (`#restricted` /
  * `#viewer` / `#editor`) — so NO SpiceDB/policy logic lives here. Managing restrictions is gated on
- * space-admin (`Manage` on space Settings); refine per product later.
+ * space-admin: the PDP's `space#administer` in remote mode (#542), `Manage` on space Settings in native mode.
  *
  * Self-dealing (#486) — restriction management must never become a way to reach content the actor could not
  * already see, on ANY path (native UI and the platform relay both land here):
@@ -113,7 +113,7 @@ interface AclRun {
  *   - A3: an unrestrict carrying `requireActorCoverage` (the platform relay always sends it) is refused unless
  *     the actor can edit the page and no direct sub-page is unrestricted (it would be exposed). Without the
  *     flag — the native UI — unrestrict is unchanged: the human break-glass for an orphaned page.
- * The PDP is only ever asked space view/edit and page edit here — never `locked` (issue 499).
+ * The PDP is only ever asked space administer/view/edit and page edit here — never `locked` (issue 499).
  *
  * Versioned writes (#616): each of the five writes is ONE transaction under a per-page ACL lock (`aclTx`), with every
  * repo write passed that transaction, so a write lands whole or not at all — outbox rows included, since the capture
@@ -202,10 +202,33 @@ export class PageRestrictionService {
     return res[0];
   }
 
-  /** Load the page and enforce that `user` may manage its restrictions (space admin). */
+  /**
+   * Load the page and enforce that `user` may manage its restrictions (space admin).
+   *
+   * Remote: a STRICT PDP `space#administer` on the page's space (no answer → 503, never a guess). Since #542 the
+   * native space role needs `space#view` (`PdpSpaceMemberRepo.getUserSpaceRoles`), so a view-less space admin (a
+   * `manage_members`-only binding, ADR 0025) has no CASL role at all; deciding here on `administer` keeps the
+   * `/v1` ACL relay (restrict, grant, unrestrict, preview) working for them, as ADR 0025 intends. Before #542 the
+   * two were exactly equivalent (CASL admin ⇔ administer). Self-dealing stays closed by A1–A3 below: A2 retains
+   * nothing for an actor without space view, and A3 needs a strict `page#edit`.
+   *
+   * Native (no PDP): upstream's CASL rule, `Manage` on space Settings, unchanged.
+   */
   private async authorize(pageId: string, user: User): Promise<Page> {
     const page = await this.pageRepo.findById(pageId);
     if (!page) throw new NotFoundException('page not found');
+    if (this.mode === 'remote') {
+      const res = await this.authz.tryCheckBulk(this.subject(user), [
+        { permission: 'administer', resourceType: 'space', resourceId: page.spaceId },
+      ]);
+      if (!res) {
+        throw new ServiceUnavailableException(
+          'authorization is unavailable; the page restrictions were not changed — retry',
+        );
+      }
+      if (res[0] !== true) throw new ForbiddenException('only a space admin may manage page restrictions');
+      return page;
+    }
     const ability = await this.spaceAbility.createForUser(user, page.spaceId);
     if (ability.cannot(SpaceCaslAction.Manage, SpaceCaslSubject.Settings)) {
       throw new ForbiddenException('only a space admin may manage page restrictions');
