@@ -107,9 +107,10 @@ describe('PublicDiscoveryRepo — the authorization filter is present in the SQL
     dialect: new PostgresDialect({ pool: {} as any }),
     plugins: [new CamelCasePlugin()],
   });
-  const repo = new PublicDiscoveryRepo(db as any);
+  const repo = new PublicDiscoveryRepo(db as any, 'remote');
   const compiled = repo.buildListQuery(WS_ID).compile();
   const sql = compiled.sql.toLowerCase();
+  const nativeSql = new PublicDiscoveryRepo(db as any, 'native').buildListQuery(WS_ID).compile().sql.toLowerCase();
 
   it('walks the restriction markers via a recursive CTE and EXCLUDES restricted pages', () => {
     expect(sql).toContain('with recursive');
@@ -129,6 +130,21 @@ describe('PublicDiscoveryRepo — the authorization filter is present in the SQL
 
   it('excludes soft-deleted shares and pages', () => {
     expect(sql).toContain('deleted_at');
+  });
+
+  it('excludes archived spaces (#660: spaces.deleted_at set is never public)', () => {
+    expect(sql).toContain('"spaces"."deleted_at" is null');
+  });
+
+  it('remote: excludes expired shares with the one shared liveness rule (#335)', () => {
+    expect(sql).toContain('from ccc_share_expiry cse where cse.share_id = shares.id');
+    expect(sql).toContain('shares.created_at + make_interval(days => 90)');
+    expect(sql).toMatch(/\) > now\(\)\)/);
+  });
+
+  it('native: no reference to the remote-only expiry table (it does not exist there), every other gate kept', () => {
+    expect(nativeSql).not.toContain('ccc_');
+    expect(sql.replace(/ and \(coalesce\([\s\S]*\) > now\(\)\)$/, '')).toBe(nativeSql);
   });
 
   it('hard-scopes the query to a single tenant (workspace_id parameter)', () => {

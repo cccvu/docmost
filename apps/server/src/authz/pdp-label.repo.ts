@@ -33,8 +33,10 @@ const MAX_LIMIT = 100;
 const DEFAULT_LIMIT = 20;
 /** Below every real uuid: the "nothing checked yet" page cursor for a label (keeps nulls out of the uuid[]). */
 const NIL_UUID = '00000000-0000-0000-0000-000000000000';
-/** Upstream's per-row cursor key (`executeWithCursorPagination({ cursorPerRow })`); stripped before returning. */
-const CURSOR_KEY = '$cursor' as const;
+/** Upstream's per-row cursor key (`executeWithCursorPagination({ cursorPerRow })`); stripped before returning.
+ *  Exported (with `clampLimit`, `scanBudget` and `LABEL_SCAN`) for the other filter-then-retrieve lists that reuse
+ *  this walk — `PdpShareRepo.getShares` (#660) — so the limits are never copied. */
+export const CURSOR_KEY = '$cursor' as const;
 
 export const LABEL_SCAN = {
   PAGE_WINDOW,
@@ -52,7 +54,8 @@ export const LABEL_SCAN = {
 export const scanBudget = (need: number): number =>
   Math.min(HARD_SCAN_CAP, Math.max(BASE_SCAN, need * OVERSCAN));
 
-const clampLimit = (limit: unknown): number =>
+/** The caller's limit, clamped to [1, MAX_LIMIT] (default DEFAULT_LIMIT): sizes a walk, never echoed as meta. */
+export const clampLimit = (limit: unknown): number =>
   Math.min(Math.max(Math.trunc(Number(limit) || DEFAULT_LIMIT), 1), MAX_LIMIT);
 
 /** A candidate row as one keyset window returns it: upstream's own cursor for that row attached. */

@@ -5,6 +5,7 @@ import { NativeRouteAuthzModule } from './native-routes/native-route-authz.modul
 import { PageRestrictionModule } from './page-restriction/page-restriction.module';
 import { PublicDiscoveryModule } from './public-discovery/public-discovery.module';
 import { ServiceBridgeModule } from '../service-bridge/service-bridge.module';
+import { ShareLifecycleModule } from './share-lifecycle/share-lifecycle.module';
 
 /**
  * CCC authorization integration — NOT upstream Docmost code.
@@ -16,7 +17,7 @@ import { ServiceBridgeModule } from '../service-bridge/service-bridge.module';
  * Also mounts the page-restriction write feature and the anonymous public-content discovery feature
  * (their deps are all @Global, so no upstream edit is needed to register the routes — AuthzModule is
  * already in the graph via database.module), and the remote-mode breadcrumb redaction on a native upstream route
- * (NativeRouteAuthzModule, #574).
+ * (NativeRouteAuthzModule, #574), and the public-share expiry feature (ShareLifecycleModule, #335).
  */
 @Module({
   imports: [
@@ -25,6 +26,7 @@ import { ServiceBridgeModule } from '../service-bridge/service-bridge.module';
     PageRestrictionModule,
     PublicDiscoveryModule,
     ServiceBridgeModule,
+    ShareLifecycleModule, // #335: public-share expiry (installer, sweeper, API) — remote only
   ],
   providers: [HttpAuthzClient],
   exports: [AuthzModeModule, HttpAuthzClient],

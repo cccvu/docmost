@@ -41,6 +41,7 @@ import {
   spaceMemberRepoProvider,
   pagePermissionRepoProvider,
   labelRepoProvider,
+  shareRepoProvider,
 } from '../authz/mode/repo-providers';
 
 @Global()
@@ -100,7 +101,7 @@ import {
     UserTokenRepo,
     UserSessionRepo,
     BacklinkRepo,
-    ShareRepo,
+    shareRepoProvider, // CCC mode-selected (#660/#335): remote = PDP-gated list + read-time expiry. See #1.
     NotificationRepo,
     WatcherRepo,
     labelRepoProvider, // CCC mode-selected (#615): remote = PDP-gated label lists. See #1.
