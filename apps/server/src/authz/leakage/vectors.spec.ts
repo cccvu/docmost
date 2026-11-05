@@ -464,7 +464,7 @@ describe('Publish vectors (#704) — changing a page\'s publish state needs page
       expect(SHARE_PUBLISH_ROUTES.has(route)).toBe(true);
     } else {
       const src = readFileSync(join(__dirname, '..', 'share-lifecycle', 'share-expiry.controller.ts'), 'utf8');
-      expect(src).toContain('await this.publishGate.requirePublish(user.id, page.id);');
+      expect(src).toContain('await this.publishGate.requirePublish(user.id, page);');
     }
   });
 
@@ -473,16 +473,28 @@ describe('Publish vectors (#704) — changing a page\'s publish state needs page
   });
 
   it('the gate asks page#share with page#edit, and refuses an editor without share (remote only)', async () => {
-    const tryCheckBulk = jest.fn().mockResolvedValue([true, false]);
+    const tryCheckBulk = jest.fn().mockResolvedValue([true, false, true, false]);
     const gate = new SharePublishGate('remote', { tryCheckBulk } as unknown as HttpAuthzClient);
-    await expect(gate.requirePublish('u-1', 'p-1')).rejects.toMatchObject({
+    await expect(gate.requirePublish('u-1', { id: 'p-1', spaceId: 's-1' })).rejects.toMatchObject({
       response: { code: 'share_not_permitted' },
     });
     expect(tryCheckBulk.mock.calls[0][1]).toEqual([
       { permission: 'edit', resourceType: 'page', resourceId: 'p-1' },
       { permission: SHARE_PUBLISH_PERMISSION, resourceType: 'page', resourceId: 'p-1' },
+      { permission: 'edit', resourceType: 'space', resourceId: 's-1' },
+      { permission: SHARE_PUBLISH_PERMISSION, resourceType: 'space', resourceId: 's-1' },
     ]);
     expect(SHARE_PUBLISH_PERMISSION).toBe('share');
+  });
+
+  it('a page the PDP has not placed (page legs false) is refused on the space its row is in (wiki-v2 #704)', async () => {
+    // The route's own edit check falls back to the space role there (the #524 open-lineage path), so a pass-through
+    // on `page#edit=false` would let a space writer without share publish a new or just-moved page.
+    const tryCheckBulk = jest.fn().mockResolvedValue([false, false, true, false]);
+    const gate = new SharePublishGate('remote', { tryCheckBulk } as unknown as HttpAuthzClient);
+    await expect(gate.requirePublish('u-1', { id: 'p-1', spaceId: 's-1' })).rejects.toMatchObject({
+      response: { code: 'share_not_permitted' },
+    });
   });
 
   // Proven on real rows over HTTP (an absence: the 403 writes nothing).

@@ -191,7 +191,7 @@ describe('every route that changes publish state goes through the share publish 
     const stmts = (body?.statements ?? []).map((s) => squash(s.getText(sf)));
     const at = (needle: string) => stmts.findIndex((s) => s.includes(needle));
     const resolve = at('awaitthis.resolve(dto.shareId,workspace)');
-    const gate = at('awaitthis.publishGate.requirePublish(user.id,page.id);');
+    const gate = at('awaitthis.publishGate.requirePublish(user.id,page);');
     const tx = at('this.bounded(');
     expect(resolve).toBe(0);
     expect(gate).toBe(1);

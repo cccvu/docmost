@@ -20,7 +20,7 @@ import { SHARE_NOT_PERMITTED_MESSAGE, SHARE_PUBLISH_PERMISSION, SharePublishGate
  * Remote mode: share create / update need `page#share` (asked with `page#edit`) on the page the HANDLER would act on,
  * resolved the way the handler resolves it; a raw body the DTO would refuse is a 400 with no PDP call; an unresolved
  * target is the handler's own 404 thrown here (never a pass-through to an ungated handler); an unknown answer is a
- * 503; edit without share is a 403 `share_not_permitted`; everything else reaches the handler unchanged. Native mode,
+ * 503; edit without share (on the page, or on the space its row is in now) is a 403 `share_not_permitted`; everything else reaches the handler unchanged. Native mode,
  * other routes (share delete among them) and non-HTTP contexts are untouched. The expiry route's call is in
  * share-lifecycle.pg.spec.ts.
  */
@@ -41,13 +41,15 @@ const PAGE = '0198c2a1-0000-7000-8000-000000000101';
 const OTHER_PAGE = '0198c2a1-0000-7000-8000-000000000102';
 const FOREIGN_PAGE = '0198c2a1-0000-7000-8000-000000000103';
 const SHARE = '0198c2a1-0000-7000-8000-000000000201';
+const SPACE = '0198c2a1-0000-7000-8000-000000000301';
+const OTHER_SPACE = '0198c2a1-0000-7000-8000-000000000302';
 const FOREIGN_SHARE = '0198c2a1-0000-7000-8000-000000000202';
 
-const PAGES: Record<string, { id: string; workspaceId: string }> = {
-  [PAGE]: { id: PAGE, workspaceId: WS },
-  'slug-page': { id: PAGE, workspaceId: WS },
-  [OTHER_PAGE]: { id: OTHER_PAGE, workspaceId: WS },
-  [FOREIGN_PAGE]: { id: FOREIGN_PAGE, workspaceId: FOREIGN_WS },
+const PAGES: Record<string, { id: string; spaceId: string; workspaceId: string }> = {
+  [PAGE]: { id: PAGE, spaceId: SPACE, workspaceId: WS },
+  'slug-page': { id: PAGE, spaceId: SPACE, workspaceId: WS },
+  [OTHER_PAGE]: { id: OTHER_PAGE, spaceId: OTHER_SPACE, workspaceId: WS },
+  [FOREIGN_PAGE]: { id: FOREIGN_PAGE, spaceId: OTHER_SPACE, workspaceId: FOREIGN_WS },
 };
 // What the injected ShareRepo token resolves: PdpShareRepo answers undefined for an expired share, so it is absent.
 const SHARES: Record<string, { id: string; pageId: string | null; workspaceId: string }> = {
@@ -71,8 +73,11 @@ const req = (body: unknown, o: { user?: unknown; rawWs?: string; userWs?: string
   user: { user: 'user' in o ? o.user : { id: USER }, workspace: { id: o.userWs ?? WS } },
 });
 
-/** `decide(pageId)` → the PDP's `[edit, share]`, or null for "could not answer". */
-function setup(mode: AuthzMode, decide: (pageId: string) => [boolean, boolean] | null) {
+/** `[page#edit, page#share, space#edit, space#share]`, as the gate asks them. */
+type Answer = [boolean, boolean, boolean, boolean];
+
+/** `decide(pageId)` → the PDP's answer, or null for "could not answer". */
+function setup(mode: AuthzMode, decide: (pageId: string) => Answer | null) {
   const tryCheckBulk = jest.fn(async (_s: unknown, checks: Array<{ resourceId: string }>) => decide(checks[0].resourceId));
   const pageRepo = { findById: jest.fn(async (id: string) => PAGES[id]) };
   const shareRepo = { findById: jest.fn(async (id: string) => SHARES[id]) };
@@ -86,8 +91,8 @@ function setup(mode: AuthzMode, decide: (pageId: string) => [boolean, boolean] |
 }
 
 const P = ShareController.prototype;
-const editOnly = (): [boolean, boolean] => [true, false];
-const publisher = (): [boolean, boolean] => [true, true];
+const editOnly = (): Answer => [true, false, true, false];
+const publisher = (): Answer => [true, true, true, true];
 
 describe('SharePublishInterceptor — keys', () => {
   it('gates exactly share create (by pageId) and share update (by shareId)', () => {
@@ -210,18 +215,20 @@ describe('SharePublishInterceptor — resolution (the handler’s own 404, no PD
     expect(h.tryCheckBulk).toHaveBeenCalledWith({ provider: 'docmost', externalId: USER }, [
       { permission: 'edit', resourceType: 'page', resourceId: PAGE },
       { permission: SHARE_PUBLISH_PERMISSION, resourceType: 'page', resourceId: PAGE },
+      { permission: 'edit', resourceType: 'space', resourceId: SPACE },
+      { permission: SHARE_PUBLISH_PERMISSION, resourceType: 'space', resourceId: SPACE },
     ]);
   });
 
   it('update decides on the SHARE’s page and ignores the body pageId (confused deputy)', async () => {
     // The share's page lacks share; the page named in the body has it.
-    const h = setup('remote', (pageId) => (pageId === PAGE ? [true, false] : [true, true]));
+    const h = setup('remote', (pageId) => (pageId === PAGE ? editOnly() : publisher()));
     const err = await h.run(P.update, req({ shareId: SHARE, pageId: OTHER_PAGE, includeSubPages: true })).catch(
       (e: any) => e,
     );
     expect(err).toBeInstanceOf(ForbiddenException);
     expect(h.pageRepo.findById).not.toHaveBeenCalledWith(OTHER_PAGE);
-    expect(h.tryCheckBulk.mock.calls[0][1].map((c: { resourceId: string }) => c.resourceId)).toEqual([PAGE, PAGE]);
+    expect(h.tryCheckBulk.mock.calls[0][1].map((c: { resourceId: string }) => c.resourceId)).toEqual([PAGE, PAGE, SPACE, SPACE]);
     expect(h.handled).not.toHaveBeenCalled();
   });
 });
@@ -249,12 +256,34 @@ describe('SharePublishInterceptor — the decision', () => {
     expect(h.handled).not.toHaveBeenCalled();
   });
 
+  // [page#edit, page#share, space#edit, space#share]
   it.each([
-    ['no edit (the handler answers its own 403)', [false, false]],
-    ['no edit, a stray share', [false, true]],
-    ['edit and share', [true, true]],
+    // The space leg: the route's edit check falls back to the space role on the ROW's space when the page is not
+    // locked, so a page the PDP has not placed (page legs false) or has placed in its OLD space must still be refused.
+    ['an unplaced page: no page edit, space edit without space share', [false, false, true, false]],
+    ['a cross-space move in flight: page edit and share (old space), new space edit without share', [true, true, true, false]],
+    ['page edit and share, no edit at all on the row’s space', [true, true, false, false]],
+    ['page edit without share, space share', [true, false, true, true]],
+  ])('%s → 403 share_not_permitted, handler never runs', async (_n, answer) => {
+    const h = setup('remote', () => answer as Answer);
+    for (const [handler, body] of [
+      [P.create, { pageId: PAGE }],
+      [P.update, { shareId: SHARE }],
+    ] as const) {
+      const err = await h.run(handler, req(body)).catch((e: any) => e);
+      expect(err).toBeInstanceOf(ForbiddenException);
+      expect(err.getResponse()).toEqual({ message: SHARE_NOT_PERMITTED_MESSAGE, code: 'share_not_permitted' });
+    }
+    expect(h.handled).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['no edit anywhere (the handler answers its own 403)', [false, false, false, false]],
+    ['no edit, a stray share', [false, true, false, true]],
+    ['an unplaced page: no page edit, space edit and share (the handler decides)', [false, false, true, true]],
+    ['edit and share on the page and its space', [true, true, true, true]],
   ])('%s → the handler runs', async (_n, answer) => {
-    const h = setup('remote', () => answer as [boolean, boolean]);
+    const h = setup('remote', () => answer as Answer);
     await expect(h.run(P.create, req({ pageId: PAGE }))).resolves.toBe('handler-result');
     await expect(h.run(P.update, req({ shareId: SHARE }))).resolves.toBe('handler-result');
     expect(h.handled).toHaveBeenCalledTimes(2);
@@ -268,17 +297,16 @@ describe('SharePublishGate', () => {
   };
 
   it('native: resolves without asking', async () => {
-    const g = gate('native', [true, false]);
-    await expect(g.gate.requirePublish(USER, PAGE)).resolves.toBeUndefined();
+    const g = gate('native', [true, false, true, false]);
+    await expect(g.gate.requirePublish(USER, { id: PAGE, spaceId: SPACE })).resolves.toBeUndefined();
     expect(g.tryCheckBulk).not.toHaveBeenCalled();
   });
 
   it('a short answer is "unknown" (503), never an allow', async () => {
-    await expect(gate('remote', [true]).gate.requirePublish(USER, PAGE)).rejects.toBeInstanceOf(
-      ServiceUnavailableException,
-    );
-    await expect(gate('remote', []).gate.requirePublish(USER, PAGE)).rejects.toBeInstanceOf(
-      ServiceUnavailableException,
-    );
+    for (const short of [[true, true, true], [true], []]) {
+      await expect(gate('remote', short).gate.requirePublish(USER, { id: PAGE, spaceId: SPACE })).rejects.toBeInstanceOf(
+        ServiceUnavailableException,
+      );
+    }
   });
 });

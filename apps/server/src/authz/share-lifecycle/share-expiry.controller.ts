@@ -97,7 +97,7 @@ export class ShareExpiryController {
   ): Promise<ShareExpiryView> {
     const { share, page } = await this.resolve(dto.shareId, workspace);
     // #704: publish authority, decided before any transaction (and before the edit check, as the interceptor's is).
-    await this.publishGate.requirePublish(user.id, page.id);
+    await this.publishGate.requirePublish(user.id, page);
     await this.pageAccessService.validateCanEdit(page, user);
 
     const { before, after } = await this.bounded(async (trx) => {

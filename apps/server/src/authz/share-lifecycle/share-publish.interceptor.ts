@@ -22,6 +22,9 @@ export const SHARE_PUBLISH_ROUTES: ReadonlyMap<string, 'pageId' | 'shareId'> = n
   ['ShareController.update', 'shareId'],
 ]);
 
+/** What the gate decides on: the resolved page id and the space its row is in now (never the share's `spaceId`). */
+type GatedPage = { id: string; spaceId: string };
+
 /** The parts of the Fastify request this reads: the raw body, the DomainMiddleware workspace, the JwtAuthGuard user. */
 type AuthedRequest = {
   body?: unknown;
@@ -45,7 +48,7 @@ type AuthedRequest = {
  *    `findById(shareId)` in the caller's workspace, else `Share not found`, then ITS page. The body's optional
  *    `pageId` is never read: deciding on it would let a caller authorize on one page and update another's share.
  * The workspace is read as `@AuthWorkspace` reads it (`req.raw.workspace ?? req.user.workspace`). The PDP is asked
- * about the resolved `page.id`, never the raw input. Only after the gate allows does the handler run, with all of
+ * about the resolved `page.id` and its row's `spaceId`, never the raw input. Only after the gate allows does the handler run, with all of
  * its own checks.
  *
  * An APP_INTERCEPTOR of the fork-owned `ShareLifecycleModule` (mounted from AuthzModule, no upstream seam). It runs
@@ -83,23 +86,23 @@ export class SharePublishInterceptor implements NestInterceptor {
       throw new UnauthorizedException();
     }
 
-    const pageId = field === 'pageId' ? await this.pageOf(raw, workspaceId) : await this.pageOfShare(raw, workspaceId);
-    await this.gate.requirePublish(userId, pageId);
+    const page = field === 'pageId' ? await this.pageOf(raw, workspaceId) : await this.pageOfShare(raw, workspaceId);
+    await this.gate.requirePublish(userId, page);
   }
 
-  /** create: the page the handler would share, as its id. */
-  private async pageOf(pageIdOrSlug: string, workspaceId: string): Promise<string> {
+  /** create: the page the handler would share (its id and the space its row is in now). */
+  private async pageOf(pageIdOrSlug: string, workspaceId: string): Promise<GatedPage> {
     const page = await this.pageRepo.findById(pageIdOrSlug);
     if (!page || page.workspaceId !== workspaceId) throw new NotFoundException('Page not found');
-    return page.id;
+    return { id: page.id, spaceId: page.spaceId };
   }
 
   /** update: the page of the share the handler would update (never the body's `pageId`). */
-  private async pageOfShare(shareId: string, workspaceId: string): Promise<string> {
+  private async pageOfShare(shareId: string, workspaceId: string): Promise<GatedPage> {
     const share = await this.shareRepo.findById(shareId);
     if (!share || share.workspaceId !== workspaceId || !share.pageId) throw new NotFoundException('Share not found');
     const page = await this.pageRepo.findById(share.pageId);
     if (!page || page.workspaceId !== workspaceId) throw new NotFoundException('Page not found');
-    return page.id;
+    return { id: page.id, spaceId: page.spaceId };
   }
 }

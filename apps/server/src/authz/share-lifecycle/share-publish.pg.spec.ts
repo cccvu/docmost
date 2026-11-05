@@ -1,6 +1,6 @@
 import * as postgres from 'postgres';
 import { Kysely } from 'kysely';
-import { Logger, ValidationPipe } from '@nestjs/common';
+import { ForbiddenException, Logger, ValidationPipe } from '@nestjs/common';
 import { APP_FILTER, APP_INTERCEPTOR } from '@nestjs/core';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
 import { Test } from '@nestjs/testing';
@@ -54,13 +54,17 @@ import { PG_URL, uuid, mkReadModelPg, bootstrapSchema, mkReadModelDb } from '../
  * APP_INTERCEPTOR) with the REAL SharePublishGate, and the engine's RetryAfterFilter, over the REAL ShareService /
  * PageRepo / PagePermissionRepo on a real Postgres schema, with the `ShareRepo` token bound to the remote
  * `PdpShareRepo` over an installed `ccc_share_expiry` (as seam #1 binds it). The PDP is a recording stub answering
- * `[page#edit, page#share]` per page; the native edit check is a recording stub that allows (its PDP backing is
- * pdp-page-permission.repo's). Proves, on the rows:
+ * `[page#edit, page#share, space#edit, space#share]` per page; the native edit check is a recording stub that allows
+ * (its PDP backing is pdp-page-permission.repo's, whose #524 open-lineage fallback lets a space writer edit a page
+ * the PDP has not placed). Proves, on the rows:
  *  - an editor without `share` → 403 `share_not_permitted`: no `shares` row written (create), the row unchanged
  *    (update), no `ccc_share_expiry` change (expiry), and the handler's own checks never ran;
  *  - a publisher → the handler runs and writes; a slug is decided on the page's uuid;
  *  - the PDP cannot answer → 503 with `Retry-After`, nothing written;
  *  - a publisher on a restricted page still gets the handler's 400 (the gate never answers for it);
+ *  - a page the PDP has not placed (page legs false) is decided on its row's space: a space writer without share
+ *    → 403 with nothing written, even though the route's own edit check would let them through;
+ *  - a caller with no edit anywhere gets the route's own 403 (expiry included), never `share_not_permitted`;
  *  - update decides on the share's page, never the body `pageId`;
  *  - expiry `set` refuses before its transaction (a held row lock does not delay the 403);
  *  - share delete stays edit-only; native mode is unchanged (no PDP call, the edit-only editor publishes).
@@ -87,7 +91,8 @@ const EXPIRED = uuid(5); // (pexpired) shared (S_EXPIRED), expired
 const S_SHARED = uuid(501);
 const S_EXPIRED = uuid(502);
 
-type Decide = (pageId: string) => [boolean, boolean] | null;
+/** `[page#edit, page#share, space#edit, space#share]` for the page, or null for "could not answer". */
+type Decide = (pageId: string) => [boolean, boolean, boolean, boolean] | null;
 
 d('share publish gate over real rows and HTTP (#704)', () => {
   let pg: postgres.Sql;
@@ -97,8 +102,11 @@ d('share publish gate over real rows and HTTP (#704)', () => {
   const access = { validateCanEdit: jest.fn(), validateCanView: jest.fn() };
 
   /** Everyone may edit every page; only OTHER (and whatever a test says) may be published. */
-  const editOnly: Decide = (pageId) => [true, pageId === OTHER];
-  const publisher: Decide = () => [true, true];
+  const editOnly: Decide = (pageId) => [true, pageId === OTHER, true, pageId === OTHER];
+  const publisher: Decide = () => [true, true, true, true];
+  /** A page the PDP has not placed yet: its page legs are false, the space writer's space legs are not. */
+  const unplacedSpaceWriter: Decide = () => [false, false, true, false];
+  const nobody: Decide = () => [false, false, false, false];
 
   const seed = async () => {
     await pg`delete from ccc_share_expiry`;
@@ -248,7 +256,7 @@ d('share publish gate over real rows and HTTP (#704)', () => {
       expect(res.json()).toMatchObject({ message: SHARE_NOT_PERMITTED_MESSAGE, code: 'share_not_permitted' });
       expect(await sharesOf(PAGE)).toEqual([]);
       expect(access.validateCanEdit).not.toHaveBeenCalled();
-      expect(asked()).toEqual([[`edit:${PAGE}`, `share:${PAGE}`]]);
+      expect(asked()).toEqual([[`edit:${PAGE}`, `share:${PAGE}`, `edit:${SP}`, `share:${SP}`]]);
     });
 
     it('a publisher (by slug) → 200 and one shares row; the PDP is asked about the uuid', async () => {
@@ -257,7 +265,7 @@ d('share publish gate over real rows and HTTP (#704)', () => {
       expect(res.statusCode).toBe(200);
       expect(await sharesOf(PAGE)).toEqual([expect.objectContaining({ include_sub_pages: true })]);
       expect(access.validateCanEdit).toHaveBeenCalledTimes(1);
-      expect(asked()).toEqual([[`edit:${PAGE}`, `share:${PAGE}`]]);
+      expect(asked()).toEqual([[`edit:${PAGE}`, `share:${PAGE}`, `edit:${SP}`, `share:${SP}`]]);
     });
 
     it('the PDP cannot answer → 503 with Retry-After, and nothing is written', async () => {
@@ -275,6 +283,26 @@ d('share publish gate over real rows and HTTP (#704)', () => {
       expect(res.statusCode).toBe(400);
       expect(res.json().message).toBe('Cannot share a restricted page');
       expect(await sharesOf(RPAGE)).toEqual([]);
+    });
+
+    it('a page the PDP has not placed: a space writer without share → 403, nothing written, though the route’s edit check would pass', async () => {
+      // The route's edit check (stubbed to allow) is the #524 open-lineage fallback to the space role.
+      decide = unplacedSpaceWriter;
+      const res = await post('/shares/create', { pageId: PAGE, includeSubPages: true });
+      expect(res.statusCode).toBe(403);
+      expect(res.json()).toMatchObject({ code: 'share_not_permitted' });
+      expect(await sharesOf(PAGE)).toEqual([]);
+      expect(access.validateCanEdit).not.toHaveBeenCalled();
+    });
+
+    it('no edit on the page or its space → the route’s own 403 (not share_not_permitted), nothing written', async () => {
+      decide = nobody;
+      access.validateCanEdit.mockRejectedValue(new ForbiddenException());
+      const res = await post('/shares/create', { pageId: PAGE });
+      expect(res.statusCode).toBe(403);
+      expect(res.json().code).toBeUndefined();
+      expect(access.validateCanEdit).toHaveBeenCalledTimes(1);
+      expect(await sharesOf(PAGE)).toEqual([]);
     });
 
     it('an unknown page → the handler’s 404 without a PDP call; a missing pageId → 400 without one', async () => {
@@ -295,7 +323,7 @@ d('share publish gate over real rows and HTTP (#704)', () => {
     it('decides on the SHARE’s page: a body pageId the caller may publish does not unlock it', async () => {
       const res = await post('/shares/update', { shareId: S_SHARED, pageId: OTHER, includeSubPages: true });
       expect(res.statusCode).toBe(403);
-      expect(asked()).toEqual([[`edit:${SHARED}`, `share:${SHARED}`]]);
+      expect(asked()).toEqual([[`edit:${SHARED}`, `share:${SHARED}`, `edit:${SP}`, `share:${SP}`]]);
       expect(await sharesOf(SHARED)).toEqual([expect.objectContaining({ include_sub_pages: false })]);
     });
 
@@ -323,6 +351,27 @@ d('share publish gate over real rows and HTTP (#704)', () => {
       expect(res.json()).toMatchObject({ code: 'share_not_permitted' });
       expect(await expiryOf(S_SHARED)).toEqual(before);
       expect(access.validateCanEdit).not.toHaveBeenCalled();
+    });
+
+    it('a page the PDP has not placed: a space writer without share → 403, the expiry unchanged', async () => {
+      decide = unplacedSpaceWriter;
+      const before = await expiryOf(S_SHARED);
+      const res = await post('/shares/expiry', { shareId: S_SHARED, expiresInDays: null });
+      expect(res.statusCode).toBe(403);
+      expect(res.json()).toMatchObject({ code: 'share_not_permitted' });
+      expect(await expiryOf(S_SHARED)).toEqual(before);
+      expect(access.validateCanEdit).not.toHaveBeenCalled();
+    });
+
+    it('a non-editor → the route’s own 403 (not share_not_permitted), the expiry unchanged', async () => {
+      decide = nobody;
+      access.validateCanEdit.mockRejectedValue(new ForbiddenException());
+      const before = await expiryOf(S_SHARED);
+      const res = await post('/shares/expiry', { shareId: S_SHARED, expiresInDays: null });
+      expect(res.statusCode).toBe(403);
+      expect(res.json().code).toBeUndefined();
+      expect(access.validateCanEdit).toHaveBeenCalledTimes(1);
+      expect(await expiryOf(S_SHARED)).toEqual(before);
     });
 
     it('a publisher → 200 and "Never" is stored', async () => {
