@@ -7,6 +7,7 @@ import { PublicDiscoveryModule } from './public-discovery/public-discovery.modul
 import { ServiceBridgeModule } from '../service-bridge/service-bridge.module';
 import { ShareLifecycleModule } from './share-lifecycle/share-lifecycle.module';
 import { ExportAdmissionModule } from './request-controls/export-admission.module';
+import { RetryAfterModule } from './request-controls/retry-after.module';
 
 /**
  * CCC authorization integration — NOT upstream Docmost code.
@@ -19,7 +20,8 @@ import { ExportAdmissionModule } from './request-controls/export-admission.modul
  * (their deps are all @Global, so no upstream edit is needed to register the routes — AuthzModule is
  * already in the graph via database.module), and the remote-mode breadcrumb redaction on a native upstream route
  * (NativeRouteAuthzModule, #574), and the public-share expiry feature (ShareLifecycleModule, #335), and the native
- * export admission (ExportAdmissionModule, #699: a resource bound, in both modes).
+ * export admission (ExportAdmissionModule, #699: a resource bound, in both modes), and the engine-wide `Retry-After` on
+ * every 503 (RetryAfterModule, #696).
  */
 @Module({
   imports: [
@@ -30,6 +32,7 @@ import { ExportAdmissionModule } from './request-controls/export-admission.modul
     ServiceBridgeModule,
     ShareLifecycleModule, // #335: public-share expiry (installer, sweeper, API) — remote only
     ExportAdmissionModule, // #699: at most 1 heavy export per principal, 8 per process — both modes
+    RetryAfterModule, // #696: every 503 carries Retry-After (kept when already set) — both modes
   ],
   providers: [HttpAuthzClient],
   exports: [AuthzModeModule, HttpAuthzClient],
