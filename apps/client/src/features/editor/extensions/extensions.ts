@@ -97,17 +97,9 @@ import TransclusionView from "@/features/editor/components/transclusion/transclu
 import TransclusionReferenceView from "@/features/editor/components/transclusion/transclusion-reference-view.tsx";
 // CCC #309: the Bases embed (react-table + ee/base) loads on demand; fork-owned wrapper keeps the name.
 import { BaseEmbedView } from "@/features/editor-ux/lazy/base-embed-view-lazy.tsx";
-import { common, createLowlight } from "lowlight";
-import plaintext from "highlight.js/lib/languages/plaintext";
-import powershell from "highlight.js/lib/languages/powershell";
-import abap from "highlightjs-sap-abap";
-import elixir from "highlight.js/lib/languages/elixir";
-import erlang from "highlight.js/lib/languages/erlang";
-import dockerfile from "highlight.js/lib/languages/dockerfile";
-import clojure from "highlight.js/lib/languages/clojure";
-import fortran from "highlight.js/lib/languages/fortran";
-import haskell from "highlight.js/lib/languages/haskell";
-import scala from "highlight.js/lib/languages/scala";
+// CCC #407: an empty lowlight whose grammars load lazily; the loader re-decorates code blocks after.
+import { lowlight } from "@/features/editor-ux/code-highlight/lowlight";
+import { CodeHighlightLoader } from "@/features/editor-ux/code-highlight/code-highlight-loader";
 import mentionRenderItems from "@/features/editor/components/mention/mention-suggestion.ts";
 import { ReactNodeViewRenderer, ReactMarkViewRenderer } from "@tiptap/react";
 import MentionView from "@/features/editor/components/mention/mention-view.tsx";
@@ -120,18 +112,6 @@ import AutoJoiner from "@/features/editor/extensions/autojoiner.ts";
 import GlobalDragHandle from "@/features/editor/extensions/drag-handle.ts";
 import { CleanStyles } from "@/features/editor/extensions/clean-styles.ts";
 import { EmptyDocPlaceholder } from "@/features/editor-ux/placeholder/empty-doc-placeholder";
-
-const lowlight = createLowlight(common);
-lowlight.register("mermaid", plaintext);
-lowlight.register("powershell", powershell);
-lowlight.register("abap", abap);
-lowlight.register("erlang", erlang);
-lowlight.register("elixir", elixir);
-lowlight.register("dockerfile", dockerfile);
-lowlight.register("clojure", clojure);
-lowlight.register("fortran", fortran);
-lowlight.register("haskell", haskell);
-lowlight.register("scala", scala);
 
 // @ts-ignore
 export const mainExtensions = [
@@ -357,6 +337,7 @@ export const mainExtensions = [
       spellcheck: false,
     },
   }),
+  CodeHighlightLoader,
   Selection,
   Attachment.configure({
     view: AttachmentView,

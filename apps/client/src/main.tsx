@@ -3,6 +3,7 @@ import "@mantine/spotlight/styles.css";
 import "@mantine/notifications/styles.css";
 import '@mantine/dates/styles.css';
 import "@/styles/a11y-overrides.css";
+import "@/features/brand/fonts";
 
 import ReactDOM from "react-dom/client";
 import App from "./App.tsx";
@@ -11,22 +12,15 @@ import { MantineProvider } from "@mantine/core";
 import { BrowserRouter } from "react-router-dom";
 import { ModalsProvider } from "@mantine/modals";
 import { Notifications } from "@mantine/notifications";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { createAppQueryClient } from "@/features/request-errors/query-client.ts";
 import { HelmetProvider } from "react-helmet-async";
 import "./i18n";
 import { PostHogAnalytics } from "@/features/analytics/posthog-analytics.tsx";
 import { loadBrandConfig } from "@/features/brand/brand-config.ts";
 
-export const queryClient = new QueryClient({
-  defaultOptions: {
-    queries: {
-      refetchOnMount: false,
-      refetchOnWindowFocus: false,
-      retry: false,
-      staleTime: 5 * 60 * 1000,
-    },
-  },
-});
+// #384: same defaults as before, plus one retry for the fork's short rate limit and a deduped 429 toast.
+export const queryClient = createAppQueryClient();
 
 const container = document.getElementById("root") as HTMLElement;
 const root = (container as any).__reactRoot ??= ReactDOM.createRoot(container);

@@ -7,6 +7,7 @@ import classes from "./code-block.module.css";
 import React from "react";
 import { Suspense } from "react";
 import { useTranslation } from "react-i18next";
+import { useCodeLanguages } from "@/features/editor-ux/code-highlight/use-code-languages";
 
 const MermaidView = React.lazy(
   () => import("@/features/editor/components/code-block/mermaid-view.tsx"),
@@ -55,7 +56,7 @@ export default function CodeBlockView(props: NodeViewProps) {
         <Select
           placeholder="auto"
           checkIconPosition="right"
-          data={extension.options.lowlight.listLanguages().sort()}
+          data={useCodeLanguages()}
           value={languageValue}
           onChange={changeLanguage}
           searchable

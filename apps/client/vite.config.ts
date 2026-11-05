@@ -66,9 +66,11 @@ export default defineConfig(({ mode }) => {
       precompressAndBudget({
         // Budgets (#309): the post-split initial set measured 789,788 B brotli JS / 48,435 B CSS on 2026-09-18.
         // #406 (lazy posthog-js) + #408 (lazy date-fns locales) cut it to 722,673 B JS / 48,435 B CSS on
-        // 2026-09-21, so the JS ceiling is tightened to 790,000 (~9% over the measured set). Raising it is a
-        // deliberate PR decision; a dependency bump that crosses it is a conversation, not a number to bump.
-        budget: { initialJsBrotli: 790_000, initialCssBrotli: 60_000 },
+        // 2026-09-21, so the JS ceiling was tightened to 790,000. #407 (lazy highlight.js grammars) cut it to
+        // 681,334 B JS / 49,001 B CSS (+566 B: the self-hosted @font-face rules, #409) on 2026-11-04, so the JS
+        // ceiling is tightened again to 745,000 (~9% over the measured set). Raising it is a deliberate PR
+        // decision; a dependency bump that crosses it is a conversation, not a number to bump.
+        budget: { initialJsBrotli: 745_000, initialCssBrotli: 60_000 },
         mustStayLazy: [
           "mermaid",
           "@mermaid-js",
@@ -80,10 +82,21 @@ export default defineConfig(({ mode }) => {
           // gated on isCloud() — a self-hosted visitor never downloads it. Guards against a future eager
           // re-import silently re-inflating first paint (matches both core and /react under node_modules/).
           "posthog-js",
+          // #407: highlight.js grammars load in one lazy chunk (features/editor-ux/code-highlight); only the
+          // hljs core + lowlight stay eager. `es/` is what an ESM import resolves `lib/languages/*` to.
+          "highlight.js/es/languages",
+          "highlight.js/lib/languages",
+          "highlightjs-sap-abap",
         ],
       }),
     ],
     build: {
+      // #409: never base64-inline a webfont (a small unicode-range subset is under Vite's 4 KiB default).
+      // Inlined, it would land in the render-blocking initial CSS for every visitor whether the page uses
+      // that subset or not; as a file it is fetched only on demand and cached `immutable` under /assets/.
+      // `undefined` keeps Vite's default for everything else.
+      assetsInlineLimit: (filePath: string) =>
+        /\.woff2?$/i.test(filePath) ? false : undefined,
       rolldownOptions: {
         output: {
           // Rolldown `codeSplitting` (the successor of the deprecated `advancedChunks`, same shape).
@@ -114,6 +127,7 @@ export default defineConfig(({ mode }) => {
                 "@hocuspocus/*",
               ]),
               vendorGroup("vendor-icons", 30, ["@tabler/icons-react"]),
+              // #407: grammars are lazy-only now, so `$initial` leaves just the hljs core + lowlight here.
               vendorGroup("vendor-hljs", 20, [
                 "highlight.js",
                 "lowlight",

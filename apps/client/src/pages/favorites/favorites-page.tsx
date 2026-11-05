@@ -20,10 +20,11 @@ import { useTranslation } from "react-i18next";
 import { getInitialsColor } from "@/lib/get-initials-color";
 import PageListSkeleton from "@/components/ui/page-list-skeleton";
 import rowClasses from "@/components/ui/clickable-table-row.module.css";
+import { RequestErrorText } from "@/features/request-errors/request-error-text";
 
 export default function FavoritesPage() {
   const { t } = useTranslation();
-  const { data, isLoading, isError, hasNextPage, fetchNextPage, isFetchingNextPage } = useFavoritesQuery("page");
+  const { data, isLoading, isError, error, hasNextPage, fetchNextPage, isFetchingNextPage } = useFavoritesQuery("page");
   const favorites = data?.pages.flatMap((p) => p.items) ?? [];
 
   if (isLoading) {
@@ -43,7 +44,7 @@ export default function FavoritesPage() {
         <Title order={3} mb="lg">
           {t("Favorites")}
         </Title>
-        <Text>{t("Failed to fetch favorite pages")}</Text>
+        <RequestErrorText error={error} fallback={t("Failed to fetch favorite pages")} />
       </Container>
     );
   }

@@ -1,5 +1,5 @@
 import type { ServerResponse } from 'node:http';
-import { isAbsolute, relative, sep } from 'node:path';
+import { extname, isAbsolute, relative, sep } from 'node:path';
 import fastifyStatic from '@fastify/static';
 
 /**
@@ -15,24 +15,45 @@ import fastifyStatic from '@fastify/static';
  * everything else (`index.html`, `locales/*.json`, `manifest.json`, icons) under a STABLE name, which must
  * revalidate on every use or a deploy would leave users on the old shell. The client build (the other half
  * of #309) also writes `.br` and `.gz` siblings next to each asset; this module serves them.
+ *
+ * The HTML document is the exception to "stable name = revalidate" (#409): every route that renders the
+ * SPA — `/`, `/index.html` here, and every deep route through upstream's `*` fallback — sends the same
+ * `no-store` policy, because the document is what the back/forward cache (bfcache) restores, and a
+ * signed-in page holds authenticated content. `no-store` is the only cross-browser control for that:
+ * Firefox and Safari never bfcache a no-store document, and Chrome restores one only under its safe
+ * no-store rules (evicted on any cookie change for the URL, e.g. a logout in another tab; never if the
+ * page used a WebSocket, which every editor page does; a 3-minute cap). A `pageshow` revalidation cannot
+ * hide the content in time (a restore may paint the cached frame before any script runs), and
+ * `Clear-Site-Data` reaches bfcache only in some browsers, only if the logout response arrives, and never
+ * for a server-side revocation. Before #409 `/` and `/index.html` were `no-cache` only, so the landing
+ * page was bfcache-eligible while deep routes were not.
  */
 
 /** A year, immutable: the browser never revalidates a content-hashed asset (RFC 8246). */
 export const IMMUTABLE_CACHE_CONTROL = 'public, max-age=31536000, immutable';
 /** Stable-name files: cacheable, but ALWAYS revalidated via the ETag @fastify/send emits (304 when fresh). */
 export const REVALIDATE_CACHE_CONTROL = 'no-cache';
+/**
+ * HTML documents (#409): never stored, so never bfcache-restored outside Chrome's safe no-store rules (see
+ * above). Byte-identical to what upstream's `*` SPA fallback in `static.module.ts` sends — the spec pins
+ * the two together so `/` and a deep route can never drift apart again.
+ */
+export const DOCUMENT_CACHE_CONTROL = 'no-cache, no-store, must-revalidate';
 
 /** Vite's content-hashed output directory (relative to the client dist root). */
 const HASHED_DIR = 'assets';
 const PRECOMPRESSED_SUFFIX = /\.(br|gz)$/;
+const DOCUMENT_EXT = '.html';
 
 /**
  * The policy, pure so it is unit-testable without HTTP. `filePath` is the RESOLVED path @fastify/send chose
- * (so it may be the `.br`/`.gz` sibling); the suffix is normalised away before the directory test. Anything
- * not provably inside `<root>/assets/` — including a path outside the root — revalidates: the safe default.
+ * (so it may be the `.br`/`.gz` sibling); the suffix is normalised away before the tests. An HTML document
+ * is `no-store` wherever it sits — checked first, so the strictest policy wins. Anything else not provably
+ * inside `<root>/assets/` — including a path outside the root — revalidates: the safe default.
  */
 export function cacheControlFor(root: string, filePath: string): string {
   const rel = relative(root, filePath).replace(PRECOMPRESSED_SUFFIX, '');
+  if (extname(rel).toLowerCase() === DOCUMENT_EXT) return DOCUMENT_CACHE_CONTROL;
   if (!rel || isAbsolute(rel) || rel === '..' || rel.startsWith(`..${sep}`)) {
     return REVALIDATE_CACHE_CONTROL;
   }
@@ -64,7 +85,8 @@ export function mergeVary(
  * Registers `@fastify/static` for the client build at `root`. Option by option:
  *
  * - `wildcard: false` — upstream's choice, kept: one explicit route per file on disk, so anything that is
- *   NOT a file falls through to upstream's `app.get('*')` SPA fallback (with ITS no-store policy intact).
+ *   NOT a file falls through to upstream's `app.get('*')` SPA fallback (with its no-store policy intact —
+ *   the same `DOCUMENT_CACHE_CONTROL` the `/` and `/index.html` routes get here).
  * - `preCompressed: true` — negotiate `Accept-Encoding` and serve the `.br`/`.gz` sibling when it exists,
  *   with `Content-Encoding` set and the ORIGINAL file's content type; a file with no matching sibling is
  *   served as identity (never a 404). The negotiation happens per request, so `Vary` is mandatory below.
@@ -78,8 +100,7 @@ export function mergeVary(
  *   Cache-Control decision to `cacheControlFor`.
  * - `setHeaders` — receives the raw Node response and the RESOLVED file path (the sibling when one was
  *   picked) and sets ONLY the Cache-Control from `cacheControlFor`. It runs only for a real file, so a
- *   missing asset keeps the fallback's `no-cache, no-store, must-revalidate` rather than caching a 200
- *   HTML shell for a year. Nothing else sets Cache-Control on these routes, so a raw header is safe here.
+ *   missing asset keeps the fallback's document policy rather than caching a 200 HTML shell for a year. Nothing else sets Cache-Control on these routes, so a raw header is safe here.
  *
  * `Vary: Accept-Encoding` is NOT set in `setHeaders`: any plugin that sets Vary through the reply store
  * (`@fastify/cors` does, with `Vary: Origin`) would clobber a raw one, because Fastify writes reply-store

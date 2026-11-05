@@ -75,7 +75,9 @@ api.interceptors.response.use(
           break;
         case 404:
           // Handle not found error
+          // #384: a 404 with no/array message or an HTML body threw a TypeError out of the interceptor.
           if (
+            typeof error.response.data?.message === "string" &&
             error.response.data.message
               .toLowerCase()
               .includes("workspace not found")

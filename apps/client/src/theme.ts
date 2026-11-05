@@ -149,7 +149,7 @@ export const theme = createTheme({
     blue,
   },
   fontFamily:
-    'Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
+    '"Inter Variable", Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif',
   fontFamilyMonospace:
     'JetBrainsMono, ui-monospace, SFMono-Regular, Menlo, Monaco, "Liberation Mono", monospace',
   // Headings inherit the Inter stack (no serif): a clean, app-first hierarchy
