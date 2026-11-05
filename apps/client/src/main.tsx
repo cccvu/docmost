@@ -46,6 +46,6 @@ void loadBrandConfig().finally(() => {
       </MantineProvider>
     </BrowserRouter>,
   );
-  // #407: fetch the lazy code grammars once idle after first paint, not only at editor mount.
+  // #407: fetch the lazy code grammars at the browser's first idle period, not only at editor mount.
   prefetchCodeGrammarsWhenIdle();
 });

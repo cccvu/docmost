@@ -64,8 +64,9 @@ const PREFETCH_FALLBACK_DELAY_MS = 300;
 let prefetchScheduled = false;
 
 /**
- * Start the grammar fetch once the browser is idle after first paint, so a cold page with code does not
- * wait for the editor mount to begin it (#407: ~205 ms of plain code on Fast-4G). Once per page; a
+ * Start the grammar fetch at the browser's first idle period (on a cold load that can come just before first
+ * contentful paint; FCP measured unchanged), so a cold page with code does not wait for the editor mount to
+ * begin it (#407: ~205 ms of plain code on Fast-4G, 0 ms with this). Once per page; a
  * failure is already logged and un-memoized by `loadCodeGrammars`, and the editor-mount trigger retries.
  */
 export function prefetchCodeGrammarsWhenIdle(): void {
