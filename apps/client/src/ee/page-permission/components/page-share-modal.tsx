@@ -16,6 +16,7 @@ import { usePageQuery } from "@/features/page/queries/page-query";
 import { usePageRestrictionInfoQuery } from "@/ee/page-permission/queries/page-permission-query";
 import { PagePermissionTab } from "@/ee/page-permission";
 import { PublishTab } from "./publish-tab";
+import { ShareExpiry } from "@/features/share-lifecycle/share-expiry";
 import { useShareForPageQuery } from "@/features/share/queries/share-query";
 import { useHasFeature } from "@/ee/hooks/use-feature";
 import { Feature } from "@/ee/features";
@@ -120,6 +121,14 @@ export function PageShareModal({ readOnly }: PageShareModalProps) {
 
           <Tabs.Panel value="publish">
             <PublishTab
+              pageId={pageId}
+              readOnly={readOnly}
+              isRestricted={isRestricted}
+              workspaceSharingDisabled={workspaceSharingDisabled}
+              spaceSharingDisabled={spaceSharingDisabled}
+            />
+            {/* CCC #335: link expiry (fork-owned; remote mode, direct shares only) */}
+            <ShareExpiry
               pageId={pageId}
               readOnly={readOnly}
               isRestricted={isRestricted}

@@ -1,3 +1,6 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { NotFoundException } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { Kysely, PostgresDialect, CamelCasePlugin } from 'kysely';
 import { KYSELY_MODULE_CONNECTION_TOKEN } from 'nestjs-kysely';
@@ -13,10 +16,15 @@ import { PublicDiscoveryRepo } from '../public-discovery/public-discovery.repo';
 import { LabelRepo } from '@docmost/db/repos/label/label.repo';
 import { LabelService } from '../../core/label/label.service';
 import { CursoredRow, PdpLabelRepo, authorizedKeysetPage } from '../pdp-label.repo';
+import { ShareRepo } from '@docmost/db/repos/share/share.repo';
+import { PdpShareRepo } from '../pdp-share.repo';
+import { ShareController } from '../../core/share/share.controller';
+import { AttachmentController } from '../../core/attachment/attachment.controller';
 import { DatabaseModule } from '../../database/database.module';
 import {
   labelRepoProvider,
   pagePermissionRepoProvider,
+  shareRepoProvider,
   spaceMemberRepoProvider,
 } from '../mode/repo-providers';
 
@@ -86,6 +94,7 @@ describe('Indirect-leakage vectors — §8 coverage matrix (every vector maps to
     page: new Set(Object.getOwnPropertyNames(PdpPagePermissionRepo.prototype)),
     space: new Set(Object.getOwnPropertyNames(PdpSpaceMemberRepo.prototype)),
     label: new Set(Object.getOwnPropertyNames(PdpLabelRepo.prototype)),
+    share: new Set(Object.getOwnPropertyNames(PdpShareRepo.prototype)),
   };
   type Repo = keyof typeof own;
   const isOverridden = (repo: Repo, method: string) => own[repo].has(method);
@@ -123,6 +132,14 @@ describe('Indirect-leakage vectors — §8 coverage matrix (every vector maps to
     { vector: 'label names (native vocabulary / picker)', repo: 'label', primitive: 'findLabels' },
     { vector: 'pages by label (+ its paging meta)',       repo: 'label', primitive: 'findPagesByLabelId' },
     { vector: 'label usage count (/labels/info)',         repo: 'label', primitive: 'getLabelPageCountForUser' },
+    // #660: the shares list took its spaces from the local mirror with no page check, so it listed the title of a
+    // page restricted after it was shared. Spaces now come from the PDP and each window is gated by page view.
+    { vector: 'shares list (POST /api/shares)',            repo: 'share', primitive: 'getShares' },
+    // #335: expiry is enforced at READ time by the repo (the sweeper is cleanup only). Every public share read
+    // resolves through one of these two: by id/key directly, or via getShareForPage's re-read of the resolved share.
+    { vector: 'public share by id/key (/shares/info, /tree, transclusion host, share-search) — expiry', repo: 'share', primitive: 'findById' },
+    { vector: 'getShareForPage re-read (page-info, SEO, /for-page, transclusion sources, files/public) — expiry', repo: 'share', primitive: 'findById' },
+    { vector: 'share create reuses the page\'s existing share — never an expired one', repo: 'share', primitive: 'findByPageId' },
   ];
 
   it.each(COVERAGE)('$vector -> $repo.$primitive is PDP-overridden', ({ repo, primitive }) => {
@@ -131,7 +148,7 @@ describe('Indirect-leakage vectors — §8 coverage matrix (every vector maps to
 
   it('documents the full mapping (no silent gaps)', () => {
     const distinct = new Set(COVERAGE.map((c) => `${c.repo}.${c.primitive}`));
-    // The whole indirect backbone reduces to these eleven PDP-overridden primitives.
+    // The whole indirect backbone reduces to these fourteen PDP-overridden primitives.
     expect([...distinct].sort()).toEqual([
       'label.findLabels',
       'label.findPagesByLabelId',
@@ -141,6 +158,9 @@ describe('Indirect-leakage vectors — §8 coverage matrix (every vector maps to
       'page.filterAccessiblePageIds',
       'page.filterAccessiblePageIdsWithPermissions',
       'page.getUserIdsWithPageAccess',
+      'share.findById',
+      'share.findByPageId',
+      'share.getShares',
       'space.getUserIdsWithSpaceAccess',
       'space.getUserSpaceIds',
       'space.getUserSpaceRoles',
@@ -194,26 +214,27 @@ describe('Label-name vector (#615) — a label only on hidden pages never reache
     expect(names).toEqual(['alpha', 'beta', 'gamma', 'zeta']);
   });
 
-  it('seam #1: DatabaseModule binds all three repo tokens to the mode-selected providers (never the stock classes)', () => {
+  it('seam #1: DatabaseModule binds all four repo tokens to the mode-selected providers (never the stock classes)', () => {
     // Pins the REAL module (not a hand-built provider list): an upstream bump that brings back the stock
-    // `LabelRepo,` (or either authorization repo) in database.module.ts would silently restore the leak in
-    // remote mode, while every other spec stays green.
+    // `LabelRepo,` / `ShareRepo,` (or either authorization repo) in database.module.ts would silently restore the
+    // leak (and, for shares, serve expired public shares) in remote mode, while every other spec stays green.
     const providers: unknown[] = Reflect.getMetadata('providers', DatabaseModule);
     const exported: unknown[] = Reflect.getMetadata('exports', DatabaseModule);
-    for (const selected of [labelRepoProvider, spaceMemberRepoProvider, pagePermissionRepoProvider]) {
+    for (const selected of [labelRepoProvider, spaceMemberRepoProvider, pagePermissionRepoProvider, shareRepoProvider]) {
       expect(providers).toContain(selected);
     }
-    for (const stock of [LabelRepo, SpaceMemberRepo, PagePermissionRepo]) {
+    for (const stock of [LabelRepo, SpaceMemberRepo, PagePermissionRepo, ShareRepo]) {
       expect(providers).not.toContain(stock);
       // Still exported by token, so every consumer resolves the mode-selected instance.
       expect(exported).toContain(stock);
     }
     // No second registration of a token anywhere in the providers list (a later entry would win in Nest).
     const tokens = providers.map((p: any) => (p && typeof p === 'object' && 'provide' in p ? p.provide : p));
-    for (const stock of [LabelRepo, SpaceMemberRepo, PagePermissionRepo]) {
+    for (const stock of [LabelRepo, SpaceMemberRepo, PagePermissionRepo, ShareRepo]) {
       expect(tokens.filter((t) => t === stock)).toHaveLength(1);
     }
     expect(PdpLabelRepo.prototype).toBeInstanceOf(LabelRepo);
+    expect(PdpShareRepo.prototype).toBeInstanceOf(ShareRepo);
   });
 
   it('LabelService keeps the authorized page and its meta (its own post-filter can only narrow)', async () => {
@@ -267,7 +288,7 @@ describe('Anonymous public-content discovery vector (issue #26) — restricted p
     dialect: new PostgresDialect({ pool: {} as any }),
     plugins: [new CamelCasePlugin()],
   });
-  const sql = new PublicDiscoveryRepo(db as any)
+  const sql = new PublicDiscoveryRepo(db as any, 'remote')
     .buildListQuery('w1')
     .compile()
     .sql.toLowerCase();
@@ -281,5 +302,147 @@ describe('Anonymous public-content discovery vector (issue #26) — restricted p
   it('lists only owner-opted discoverable shares (search_indexing) with sharing enabled', () => {
     expect(sql).toContain('search_indexing');
     expect(sql.split("->> 'disabled'").length - 1).toBe(2);
+  });
+
+  it('never lists a share in an archived space (#660) or an expired share (#335, remote)', () => {
+    expect(sql).toContain('"spaces"."deleted_at" is null');
+    expect(sql).toContain('from ccc_share_expiry cse where cse.share_id = shares.id');
+  });
+});
+
+/**
+ * Anonymous public-share vectors (#660, #334, #335). Every public share read is decided by one choke point —
+ * `ShareService.getShareForPage` (sharing allowed incl. not archived, the REQUESTED page unrestricted, the share
+ * re-read through `ShareRepo.findById`, the remote repo's expiry veto) — or reads the share by id/key through the
+ * same repo token plus its own workspace/restriction checks. The controller-level gates are pinned here with real
+ * controllers and stub collaborators; the predicates themselves, and the paths that only funnel through the choke
+ * point (SEO, page-info, /for-page, transclusion), are proven over real rows in the pg specs named below — this
+ * suite fails if one of those proofs is removed, so no vector is implicit.
+ */
+describe('Anonymous public-share vectors (#660/#334/#335) — every public read is "public NOW"', () => {
+  const WS = 'ws-1';
+  const SHARE = { id: 'sh-1', key: 'k1', pageId: 'p-1', spaceId: 'sp-1', workspaceId: WS };
+
+  describe('POST /shares/info — workspace match + restricted-ancestor check, one 404 for every deny', () => {
+    const make = (over: { share?: object | undefined; restricted?: boolean; sharingAllowed?: boolean } = {}) => {
+      const shareRepo = { findById: jest.fn().mockResolvedValue('share' in over ? over.share : SHARE) };
+      const pagePermissionRepo = { hasRestrictedAncestor: jest.fn().mockResolvedValue(over.restricted ?? false) };
+      const shareService = { isSharingAllowed: jest.fn().mockResolvedValue(over.sharingAllowed ?? true) };
+      const controller = new ShareController(
+        shareService as any,
+        shareRepo as any,
+        {} as any,
+        pagePermissionRepo as any,
+        {} as any,
+        {} as any,
+        {} as any,
+      );
+      return { controller, pagePermissionRepo };
+    };
+    const info = (c: ShareController, ws = WS) => c.getShare({ shareId: SHARE.id } as any, { id: ws } as any);
+
+    it('control: a live, unrestricted share in this workspace is answered', async () => {
+      await expect(info(make().controller)).resolves.toBe(SHARE);
+    });
+
+    it.each([
+      ['unknown (or expired: the repo veto)', { share: undefined }, WS],
+      ['another workspace', {}, 'ws-other'],
+      ['a (since-)restricted shared page', { restricted: true }, WS],
+      ['sharing disabled or the space archived', { sharingAllowed: false }, WS],
+    ])('%s → the same "Share not found"', async (_n, over, ws) => {
+      const err = await info(make(over).controller, ws).catch((e) => e);
+      expect(err).toBeInstanceOf(NotFoundException);
+      expect(err.message).toBe('Share not found');
+    });
+
+    it('asks about the SHARED page (the share root), not the request', async () => {
+      const { controller, pagePermissionRepo } = make();
+      await info(controller);
+      expect(pagePermissionRepo.hasRestrictedAncestor).toHaveBeenCalledWith(SHARE.pageId);
+    });
+  });
+
+  describe('GET /files/public — the token alone never serves: the page must be public at use time (#334)', () => {
+    const make = (publicNow: boolean) => {
+      const tokenService = {
+        verifyJwt: jest.fn().mockResolvedValue({ attachmentId: ATT, pageId: 'p-1', workspaceId: WS }),
+      };
+      const attachmentRepo = {
+        findById: jest.fn().mockResolvedValue({ id: ATT, pageId: 'p-1', spaceId: 'sp-1', workspaceId: WS }),
+      };
+      const shareService = { getShareForPage: jest.fn().mockResolvedValue(publicNow ? SHARE : undefined) };
+      const controller = new AttachmentController(
+        {} as any, {} as any, {} as any, {} as any, {} as any,
+        attachmentRepo as any, {} as any, tokenService as any, {} as any, {} as any,
+        shareService as any,
+      );
+      const send = jest.spyOn(controller as any, 'sendFileResponse').mockResolvedValue('sent');
+      return { controller, shareService, send };
+    };
+    const ATT = '0b9e9d1c-7d3e-4b0a-9b39-6f3b2a1d4c5e';
+    const get = (c: AttachmentController) => c.getPublicFile({} as any, {} as any, { id: WS } as any, ATT, 'a.png', 'jwt');
+
+    it('control: a page public now is served, uncacheable by shared caches (private, no-cache)', async () => {
+      const { controller, shareService, send } = make(true);
+      await expect(get(controller)).resolves.toBe('sent');
+      expect(shareService.getShareForPage).toHaveBeenCalledWith('p-1', WS);
+      expect(send).toHaveBeenCalledWith(expect.anything(), expect.anything(), expect.anything(), 'private, no-cache');
+    });
+
+    it('a valid token for a page no longer public (unshared/restricted/trashed/archived/expired) → 404, nothing sent', async () => {
+      const { controller, send } = make(false);
+      await expect(get(controller)).rejects.toBeInstanceOf(NotFoundException);
+      expect(send).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('POST /search/share-search (remote) — sharing allowed (incl. not archived) before any search', () => {
+    const make = (o: { share?: object | undefined; allowed?: boolean; noGate?: boolean }) => {
+      const shareRepo = { findById: jest.fn().mockResolvedValue('share' in o ? o.share : SHARE) };
+      const gate = { isSharingAllowed: jest.fn().mockResolvedValue(o.allowed ?? true) };
+      const service = new PdpSearchService(
+        {} as any, {} as any, shareRepo as any, {} as any, {} as any, undefined,
+        o.noGate ? undefined : (gate as any),
+      );
+      const upstream = jest.spyOn(SearchService.prototype, 'searchPage').mockResolvedValue({ items: ['hit'] } as any);
+      return { service, gate, upstream };
+    };
+    const search = (svc: PdpSearchService) =>
+      svc.searchPage({ query: 'roadmap', shareId: SHARE.id } as any, { workspaceId: WS } as any);
+    afterEach(() => jest.restoreAllMocks());
+
+    it('control: a public share delegates to the upstream share search', async () => {
+      const { service, gate, upstream } = make({});
+      expect((await search(service)).items).toEqual(['hit']);
+      expect(gate.isSharingAllowed).toHaveBeenCalledWith(WS, SHARE.spaceId);
+      expect(upstream).toHaveBeenCalled();
+    });
+
+    it.each([
+      ['sharing disabled or the space archived', { allowed: false }],
+      ['an unknown or expired share (the repo veto)', { share: undefined }],
+      ['the gate is missing (fail closed)', { noGate: true }],
+    ])('%s → empty, upstream never runs', async (_n, o) => {
+      const { service, upstream } = make(o);
+      expect(await search(service)).toEqual({ items: [] });
+      expect(upstream).not.toHaveBeenCalled();
+    });
+  });
+
+  // The predicates and the funnel-only consumers, proven on real rows (with a "stock would have leaked" control).
+  const PROOFS: Array<{ vector: string; spec: string; title: string }> = [
+    { vector: 'getShareForPage: restricted (incl. by slug), moved, disabled, archived, trashed, foreign ws', spec: 'share-lifecycle/public-share.pg.spec.ts', title: 'denies $name' },
+    { vector: 'SEO og:title of a since-restricted page', spec: 'share-lifecycle/public-share.pg.spec.ts', title: 'SEO: a shared page gets og:title (control) — a since-restricted root does not leak its title' },
+    { vector: 'archived space: isSharingAllowed', spec: 'share-lifecycle/public-share.pg.spec.ts', title: 'isSharingAllowed: an archived space is never public (control: the same space un-archived is)' },
+    { vector: 'archived space: /info and /tree', spec: 'share-lifecycle/public-share.pg.spec.ts', title: '/info and /tree: an archived space 404s (control: un-archived it answers)' },
+    { vector: 'files/public: an outstanding token after unshare/restrict/trash/archive/disable/move', spec: 'share-lifecycle/public-share.pg.spec.ts', title: '%s → the SAME outstanding token 404s at once' },
+    { vector: 'expiry on every public path at read time, no sweeper', spec: 'share-lifecycle/public-share.pg.spec.ts', title: 'one expired share denies every public path at once, while its row is still in the table' },
+    { vector: 'expiry: the repo veto fails closed', spec: 'pdp-share.repo.pg.spec.ts', title: 'fails CLOSED: an error evaluating expiry throws — never returns the share' },
+    { vector: 'shares list: PDP deny before pagination', spec: 'pdp-share.repo.pg.spec.ts', title: 'a PDP deny is filtered BEFORE pagination: full pages, and meta/cursors only from authorized rows' },
+    { vector: 'discovery: expired share never listed', spec: 'share-lifecycle/share-lifecycle.pg.spec.ts', title: 'lists live and "Never" shares, never an expired one (default or explicit); no sweeper involved' },
+  ];
+  it.each(PROOFS)('$vector — proven in $spec', ({ spec, title }) => {
+    expect(readFileSync(join(__dirname, '..', spec), 'utf8')).toContain(`'${title}'`);
   });
 });

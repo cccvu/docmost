@@ -91,12 +91,21 @@ export class ShareController {
   @Public()
   @HttpCode(HttpStatus.OK)
   @Post('/info')
-  async getShare(@Body() dto: ShareIdDto) {
+  async getShare(
+    @Body() dto: ShareIdDto,
+    @AuthWorkspace() workspace: Workspace,
+  ) {
     const share = await this.shareRepo.findById(dto.shareId, {
       includeSharedPage: true,
     });
 
-    if (!share) {
+    // CCC #660 seam — see UPSTREAM_MODIFICATIONS.md: same 404 as an unknown share for a foreign
+    // workspace or a (since-)restricted shared page, so neither its title nor its existence leaks.
+    if (
+      !share ||
+      share.workspaceId !== workspace.id ||
+      (await this.pagePermissionRepo.hasRestrictedAncestor(share.pageId))
+    ) {
       throw new NotFoundException('Share not found');
     }
 

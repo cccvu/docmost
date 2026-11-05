@@ -2,15 +2,18 @@ import { FactoryProvider } from '@nestjs/common';
 import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 import { LabelRepo } from '@docmost/db/repos/label/label.repo';
+import { ShareRepo } from '@docmost/db/repos/share/share.repo';
 import { SearchService } from '../../core/search/search.service';
 import { PdpSpaceMemberRepo } from '../pdp-space-member.repo';
 import { PdpPagePermissionRepo } from '../pdp-page-permission.repo';
 import { PdpLabelRepo } from '../pdp-label.repo';
+import { PdpShareRepo } from '../pdp-share.repo';
 import { PdpSearchService } from '../search/pdp-search.service';
 import { AUTHZ_MODE } from './authz-mode';
 import {
   labelRepoProvider,
   pagePermissionRepoProvider,
+  shareRepoProvider,
   spaceMemberRepoProvider,
 } from './repo-providers';
 import { searchServiceProvider } from '../search/search.provider';
@@ -28,11 +31,12 @@ const stub = {} as any;
  * pinned by a test.
  */
 describe('mode-selected DI providers', () => {
-  it('all five name AUTHZ_MODE as their first injected dependency', () => {
+  it('all six name AUTHZ_MODE as their first injected dependency', () => {
     for (const p of [
       spaceMemberRepoProvider,
       pagePermissionRepoProvider,
       labelRepoProvider,
+      shareRepoProvider,
       searchServiceProvider,
       workspaceAbilityFactoryProvider,
     ]) {
@@ -77,6 +81,18 @@ describe('mode-selected DI providers', () => {
     });
     it('remote → PdpLabelRepo', () => {
       expect(f('remote', stub, stub, stub)).toBeInstanceOf(PdpLabelRepo);
+    });
+  });
+
+  describe('shareRepoProvider (#660, #335)', () => {
+    const f = (shareRepoProvider as FactoryProvider).useFactory;
+    it('native → stock ShareRepo, never the PDP subclass', () => {
+      const inst = f('native', stub, stub, stub);
+      expect(inst).toBeInstanceOf(ShareRepo);
+      expect(inst).not.toBeInstanceOf(PdpShareRepo);
+    });
+    it('remote → PdpShareRepo', () => {
+      expect(f('remote', stub, stub, stub)).toBeInstanceOf(PdpShareRepo);
     });
   });
 

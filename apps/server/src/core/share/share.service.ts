@@ -203,6 +203,23 @@ export class ShareService {
       return undefined;
     }
 
+    // CCC #660/#334/#335 seam — see UPSTREAM_MODIFICATIONS.md. The one choke point for "publicly
+    // readable now": every public consumer (page-info, transclusion, SEO, /for-page, files/public)
+    // resolves through here, so deny unless sharing is allowed (incl. not archived), the REQUESTED page
+    // (not the share root; `pageId` may be a slug) has no restricted ancestor, and the share repo still
+    // returns the share (the repo's veto point: the remote PdpShareRepo answers undefined when expired).
+    const requestedPageId = isValidUUID(pageId)
+      ? pageId
+      : (await this.pageRepo.findById(pageId))?.id;
+    if (
+      !requestedPageId ||
+      !(await this.isSharingAllowed(workspaceId, share.spaceId)) ||
+      (await this.pagePermissionRepo.hasRestrictedAncestor(requestedPageId)) ||
+      !(await this.shareRepo.findById(share.shareId))
+    ) {
+      return undefined;
+    }
+
     return {
       id: share.shareId,
       key: share.shareKey,
@@ -404,6 +421,7 @@ export class ShareService {
       ])
       .where('workspaces.id', '=', workspaceId)
       .where('spaces.id', '=', spaceId)
+      .where('spaces.deletedAt', 'is', null) // CCC #660 seam: an archived space is never public
       .executeTakeFirst();
 
     if (!result) return false;

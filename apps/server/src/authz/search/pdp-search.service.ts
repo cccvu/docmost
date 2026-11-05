@@ -12,6 +12,7 @@ import { ShareRepo } from '@docmost/db/repos/share/share.repo';
 import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 import { SearchService } from '../../core/search/search.service';
+import type { ShareService } from '../../core/share/share.service';
 import { MAX_SEARCH_QUERY_LENGTH, SearchDTO, SearchSuggestionDTO } from '../../core/search/dto/search.dto';
 import { SearchResponseDto } from '../../core/search/dto/search-response.dto';
 import { normalizeLabelName } from '../../core/label/utils';
@@ -113,6 +114,10 @@ export class PdpSearchService extends SearchService {
   /** The PDP client for the SERVICE leg of an on-behalf-of search (#615). The user leg stays on the rebound
    *  repo above. Absent → a service-leg search refuses (503) rather than run with one leg. */
   private readonly serviceAuthz: Pick<HttpAuthzClient, 'filterResources'> | null;
+  private readonly shareRepository: ShareRepo;
+  /** The public share-search gate (#660): sharing enabled and the space not archived. Absent → the anonymous
+   *  share search answers empty (fail closed), never the upstream path that skips the check. */
+  private readonly shareSharing: Pick<ShareService, 'isSharingAllowed'> | null;
 
   constructor(
     @InjectKysely() db: KyselyDB,
@@ -121,8 +126,11 @@ export class PdpSearchService extends SearchService {
     spaceMemberRepo: SpaceMemberRepo,
     pagePermissionRepo: PagePermissionRepo,
     serviceAuthz?: Pick<HttpAuthzClient, 'filterResources'>,
+    shareSharing?: Pick<ShareService, 'isSharingAllowed'>,
   ) {
     super(db, pageRepo, shareRepo, spaceMemberRepo, pagePermissionRepo);
+    this.shareRepository = shareRepo;
+    this.shareSharing = shareSharing ?? null;
     this.database = db;
     this.pageRepository = pageRepo;
     this.spaceMemberRepository = spaceMemberRepo;
@@ -150,8 +158,20 @@ export class PdpSearchService extends SearchService {
 
     // Anonymous / public-share path: there is no principal, and retrieval is already gated by an
     // explicit page-id set (getPageAndDescendantsExcludingRestricted + the restricted-ancestor check).
-    // Nothing for the per-principal PDP loop to add — defer to upstream unchanged.
+    // Nothing for the per-principal PDP loop to add. Upstream never asks whether the share is still public
+    // (sharing disabled for the workspace or space, or the space archived), so that is decided here first,
+    // in this workspace (#660); then defer to upstream, whose `findById` re-read is the repo's expiry veto.
     if (!opts.userId) {
+      if (searchParams.shareId) {
+        const share = await this.shareRepository.findById(searchParams.shareId);
+        if (
+          !share ||
+          !this.shareSharing ||
+          !(await this.shareSharing.isSharingAllowed(opts.workspaceId, share.spaceId))
+        ) {
+          return { items: [] };
+        }
+      }
       return super.searchPage(searchParams, opts);
     }
 

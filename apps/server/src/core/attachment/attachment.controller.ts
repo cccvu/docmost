@@ -61,6 +61,7 @@ import {
   AUDIT_SERVICE,
   IAuditService,
 } from '../../integrations/audit/audit.service';
+import { ShareService } from '../share/share.service';
 
 @Controller()
 export class AttachmentController {
@@ -77,6 +78,7 @@ export class AttachmentController {
     private readonly tokenService: TokenService,
     private readonly pageAccessService: PageAccessService,
     @Inject(AUDIT_SERVICE) private readonly auditService: IAuditService,
+    private readonly shareService: ShareService,
   ) {}
 
   @UseGuards(JwtAuthGuard)
@@ -210,7 +212,12 @@ export class AttachmentController {
     }
 
     try {
-      return await this.sendFileResponse(req, res, attachment, 'private');
+      return await this.sendFileResponse(
+        req,
+        res,
+        attachment,
+        'private, max-age=3600',
+      );
     } catch (err) {
       this.logger.error(err);
       throw new NotFoundException('File not found');
@@ -257,8 +264,25 @@ export class AttachmentController {
       throw new NotFoundException('File not found');
     }
 
+    // CCC #334 seam — see UPSTREAM_MODIFICATIONS.md: the token only proves it was minted for this
+    // page; serve only while the page is publicly readable NOW (unshare/restrict/trash/archive/expiry
+    // take effect at once), and never let a cache replay it.
+    if (
+      !(await this.shareService.getShareForPage(
+        attachment.pageId,
+        workspace.id,
+      ))
+    ) {
+      throw new NotFoundException('File not found');
+    }
+
     try {
-      return await this.sendFileResponse(req, res, attachment, 'public');
+      return await this.sendFileResponse(
+        req,
+        res,
+        attachment,
+        'private, no-cache',
+      );
     } catch (err) {
       this.logger.error(err);
       throw new NotFoundException('File not found');
@@ -476,7 +500,7 @@ export class AttachmentController {
     req: FastifyRequest,
     res: FastifyReply,
     attachment: Attachment,
-    cacheScope: 'private' | 'public',
+    cacheControl: 'private, max-age=3600' | 'private, no-cache',
   ) {
     const fileSize = Number(attachment.fileSize);
     const rangeHeader = req.headers.range;
@@ -518,7 +542,7 @@ export class AttachmentController {
           'Content-Type': attachment.mimeType,
           'Content-Range': `bytes ${start}-${end}/${fileSize}`,
           'Content-Length': end - start + 1,
-          'Cache-Control': `${cacheScope}, max-age=3600`,
+          'Cache-Control': cacheControl,
         });
 
         return res.send(fileStream);
@@ -531,7 +555,7 @@ export class AttachmentController {
 
     res.headers({
       'Content-Type': attachment.mimeType,
-      'Cache-Control': `${cacheScope}, max-age=3600`,
+      'Cache-Control': cacheControl,
     });
 
     const isSvg = attachment.fileExt === '.svg';

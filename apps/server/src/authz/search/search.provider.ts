@@ -6,6 +6,7 @@ import { ShareRepo } from '@docmost/db/repos/share/share.repo';
 import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 import { SearchService } from '../../core/search/search.service';
+import { ShareService } from '../../core/share/share.service';
 import { AUTHZ_MODE, AuthzMode } from '../mode/authz-mode';
 import { HttpAuthzClient } from '../http-authz.client';
 import { PdpSearchService } from './pdp-search.service';
@@ -23,12 +24,15 @@ import { PdpSearchService } from './pdp-search.service';
  * The remote subclass also gets its own `HttpAuthzClient` for the SERVICE leg of an on-behalf-of search (#615).
  * The client is stateless (env-configured, like the one PageRestrictionModule provides for itself), and injecting
  * it would need an export from the upstream-owned DatabaseModule — so it is constructed here, in fork code.
+ *
+ * `ShareService` (from the ShareModule that search.module.ts imports, #660) gives the remote subclass the
+ * public share-search gate: sharing enabled and the space not archived. Native mode keeps stock upstream.
  */
 const KYSELY = KYSELY_MODULE_CONNECTION_TOKEN();
 
 export const searchServiceProvider: Provider = {
   provide: SearchService,
-  inject: [AUTHZ_MODE, KYSELY, PageRepo, ShareRepo, SpaceMemberRepo, PagePermissionRepo],
+  inject: [AUTHZ_MODE, KYSELY, PageRepo, ShareRepo, SpaceMemberRepo, PagePermissionRepo, ShareService],
   useFactory: (
     mode: AuthzMode,
     db: KyselyDB,
@@ -36,6 +40,7 @@ export const searchServiceProvider: Provider = {
     shareRepo: ShareRepo,
     spaceMemberRepo: SpaceMemberRepo,
     pagePermissionRepo: PagePermissionRepo,
+    shareService: ShareService,
   ): SearchService =>
     mode === 'remote'
       ? new PdpSearchService(
@@ -45,6 +50,7 @@ export const searchServiceProvider: Provider = {
           spaceMemberRepo,
           pagePermissionRepo,
           new HttpAuthzClient(),
+          shareService,
         )
       : new SearchService(db, pageRepo, shareRepo, spaceMemberRepo, pagePermissionRepo),
 };

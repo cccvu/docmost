@@ -1,8 +1,10 @@
-import { Injectable } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import { InjectKysely } from 'nestjs-kysely';
 import { sql } from 'kysely';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
 import { executeWithCursorPagination } from '@docmost/db/pagination/cursor-pagination';
+import { AUTHZ_MODE, AuthzMode } from '../mode/authz-mode';
+import { shareIsLiveSql } from '../share-lifecycle/share-expiry.sql';
 
 /**
  * CCC authorization integration — NOT upstream Docmost code.
@@ -12,9 +14,12 @@ import { executeWithCursorPagination } from '@docmost/db/pagination/cursor-pagin
  * anonymous read path already enforces (share.controller `@Public` handlers → share.service):
  *   1. a `shares` row exists and is not soft-deleted,
  *   2. the owner opted the page into public discovery (`search_indexing = true`; default false),
- *   3. sharing is not disabled at the workspace OR the space (share.service.isSharingAllowed),
+ *   3. sharing is not disabled at the workspace OR the space, and the space is not archived
+ *      (share.service.isSharingAllowed; #660 added the archived-space arm),
  *   4. neither the page nor any ancestor is restricted (page-permission.repo.hasRestrictedAncestor),
- *   5. the page itself is not soft-deleted.
+ *   5. the page itself is not soft-deleted,
+ *   6. in remote mode only, the share has not expired (#335, `shareIsLiveSql` — the same rule `PdpShareRepo` applies
+ *      to every share read; `ccc_share_expiry` exists only in remote mode, so native compiles no reference to it).
  * All filtering happens IN SQL so cursor pagination stays exact (no authorized-k-under-truncation),
  * and the whole query is hard-scoped to a single tenant by `workspaceId`.
  */
@@ -34,7 +39,10 @@ export interface PublicPageListRow {
 
 @Injectable()
 export class PublicDiscoveryRepo {
-  constructor(@InjectKysely() private readonly db: KyselyDB) {}
+  constructor(
+    @InjectKysely() private readonly db: KyselyDB,
+    @Inject(AUTHZ_MODE) private readonly mode: AuthzMode,
+  ) {}
 
   listPublicPages(opts: { workspaceId: string; perPage: number; cursor?: string }) {
     return executeWithCursorPagination(this.buildListQuery(opts.workspaceId), {
@@ -56,7 +64,7 @@ export class PublicDiscoveryRepo {
    * can be asserted offline via `.compile()`. Every WHERE here is load-bearing — see the class docs.
    */
   buildListQuery(workspaceId: string) {
-    return this.db
+    const query = this.db
       // `lockedPages` = every page that is restricted OR has a restricted ancestor, computed as the
       // DOWNWARD closure of the `page_access` restriction markers (a page is locked iff it, or an
       // ancestor, carries a marker). Scoped to the tenant via the base set's workspace filter.
@@ -102,6 +110,8 @@ export class PublicDiscoveryRepo {
       .where(
         sql<boolean>`coalesce((spaces.settings -> 'sharing' ->> 'disabled')::boolean, false) = false`,
       )
+      // an archived space (spaces.deleted_at set) is never public (#660, isSharingAllowed's archived arm)
+      .where('spaces.deletedAt', 'is', null)
       // exclude any page that is restricted or under a restricted ancestor
       .where((eb) =>
         eb.not(
@@ -113,5 +123,7 @@ export class PublicDiscoveryRepo {
           ),
         ),
       );
+    // an expired share is never public (#335); remote only — the expiry table exists only there
+    return this.mode === 'remote' ? query.where(shareIsLiveSql('shares')) : query;
   }
 }

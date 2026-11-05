@@ -8,11 +8,13 @@ import { SpaceRepo } from '@docmost/db/repos/space/space.repo';
 import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 import { LabelRepo } from '@docmost/db/repos/label/label.repo';
+import { ShareRepo } from '@docmost/db/repos/share/share.repo';
 import { AUTHZ_MODE, AuthzMode } from './authz-mode';
 import { HttpAuthzClient } from '../http-authz.client';
 import { PdpSpaceMemberRepo } from '../pdp-space-member.repo';
 import { PdpPagePermissionRepo } from '../pdp-page-permission.repo';
 import { PdpLabelRepo } from '../pdp-label.repo';
+import { PdpShareRepo } from '../pdp-share.repo';
 
 /**
  * CCC authorization integration — NOT upstream Docmost code.
@@ -24,8 +26,11 @@ import { PdpLabelRepo } from '../pdp-label.repo';
  * page repo lists the labels of pages the PDP hides (#615) — so every one keys off the same resolved
  * AUTHZ_MODE.
  *
+ * The share repo (#660, #335) moves with them for the same reason: a stock share repo under a remote page repo
+ * lists the titles of pages the PDP hides, and would serve expired public shares.
+ *
  * Centralizing the selection (and the messy nestjs-kysely connection token / cache / dep plumbing)
- * here shrinks the upstream seam in database.module.ts (#1) to three symbol references.
+ * here shrinks the upstream seam in database.module.ts (#1) to four symbol references.
  */
 const KYSELY = KYSELY_MODULE_CONNECTION_TOKEN();
 
@@ -76,4 +81,23 @@ export const labelRepoProvider: Provider = {
     mode === 'remote'
       ? new PdpLabelRepo(db, spaceMemberRepo, pagePermissionRepo)
       : new LabelRepo(db, spaceMemberRepo),
+};
+
+/**
+ * The shares list and public-share expiry (#660, #335): remote → `PdpShareRepo`, which takes the caller's spaces
+ * from the PDP-backed `SpaceMemberRepo` and gates every candidate window through the PDP-backed `PagePermissionRepo`
+ * resolved here (the providers above, in the same mode), and refuses an expired share on every by-id/by-page read.
+ */
+export const shareRepoProvider: Provider = {
+  provide: ShareRepo,
+  inject: [AUTHZ_MODE, KYSELY, SpaceMemberRepo, PagePermissionRepo],
+  useFactory: (
+    mode: AuthzMode,
+    db: KyselyDB,
+    spaceMemberRepo: SpaceMemberRepo,
+    pagePermissionRepo: PagePermissionRepo,
+  ): ShareRepo =>
+    mode === 'remote'
+      ? new PdpShareRepo(db, spaceMemberRepo, pagePermissionRepo)
+      : new ShareRepo(db, spaceMemberRepo),
 };
