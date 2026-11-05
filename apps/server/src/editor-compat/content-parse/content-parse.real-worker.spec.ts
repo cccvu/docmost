@@ -135,13 +135,16 @@ describe('#626 the real worker enforces the bounds', () => {
   });
 
   it('a payload that blocked the event loop for seconds now leaves it free, and is refused at the deadline', async () => {
-    // Control: the in-process parse of a tenth of the payload blocks the event loop for over a second.
-    const control = '<p>' + '<span></span>'.repeat(5_000) + '</p>';
+    // One table row of many cells: superlinear in ProseMirror's parse (happy-dom 21's selector cache sped up most
+    // dense markup, e.g. the `<span>` flood this test used before, ~15× — but not this).
+    const row = (cells: number) => '<table><tr>' + '<td>x</td>'.repeat(cells) + '</tr></table>';
+    // Control: the in-process parse of under a third of the payload blocks the event loop for over a second.
+    const control = row(12_000);
     expect(await maxLoopLag(() => htmlToJson(control))).toBeGreaterThan(1_000);
 
     const quick = pool({ deadlineMs: 3_000 });
     await quick.parse('<p>warm</p>', 'html', 'user:A'); // load the parsers first, so the deadline is the parse's
-    const payload = '<p>' + '<span></span>'.repeat(50_000) + '</p>'; // ~650 KB; ~15 s to parse in-process
+    const payload = row(40_000); // ~400 KB; 20k cells alone take ~8 s in-process on a dev laptop
     let outcome: unknown;
     const lag = await maxLoopLag(() =>
       quick.parse(payload, 'html', 'user:A').catch((e) => {

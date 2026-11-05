@@ -31,13 +31,15 @@ const DENY_ALL_FETCH: IFetchInterceptor = {
 };
 
 const networkIsolatedSettings = (): IOptionalBrowserSettings => ({
-  // No inline <script>, on* handler or javascript: URL runs. This is already the 20.x default; pinned here.
+  // No inline <script>, on* handler or javascript: URL runs. Already happy-dom's default (20.x and 21.x); pinned here.
   enableJavaScriptEvaluation: false,
   // <script src>, <link rel=modulepreload>, <link rel=preload as=script>.
   disableJavaScriptFileLoading: true,
-  // <link rel=stylesheet>, <link rel=preload as=style>.
+  // <link rel=stylesheet>, <link rel=preload as=style>. Deprecated in 21.x (which also defaults CSS loading off),
+  // but still a gate there: the loader checks `disableCSSFileLoading || !enableCSSFileLoading`.
   disableCSSFileLoading: true,
-  // <iframe src>. Marked deprecated, but it is the flag HTMLIFrameElement still checks in happy-dom 20.x.
+  // <iframe src>. Deprecated in 21.x (which also defaults iframe loading off), but HTMLIFrameElement still checks
+  // `disableIframePageLoading || !enableIframePageLoading`.
   disableIframePageLoading: true,
   navigation: {
     disableMainFrameNavigation: true,
