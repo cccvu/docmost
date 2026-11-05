@@ -512,6 +512,7 @@ describe('#642 the per-principal worker-time budget', () => {
     await expect(pool.toHtml('first', 'user:A', 5_000, undefined, true, turn)).resolves.toBe('<p>first</p>');
     expect(turn.admitted).toBe(true);
     await spend(pool, spawned); // the same human's bucket is now empty, far past what a refill could cover
+    offset += 5_000; // +50 ms of refill: off the -capacity floor, still empty, so the next charge is visible
     const left = pool.budgetLeft('user:A');
     expect(left).toBeLessThanOrEqual(0);
     // The same batch: converted at once, and charged.
@@ -525,6 +526,22 @@ describe('#642 the per-principal worker-time budget', () => {
       pool.toHtml('next import', 'user:A', 5_000, undefined, true, batchConversion('file-task:2', 'A').budgetTurn),
     ).rejects.toBeInstanceOf(ConversionBudgetExhaustedException);
     await expect(pool.parse('x', 'html', 'user:A')).rejects.toBeInstanceOf(ConversionBudgetExhaustedException);
+  });
+
+  it('debt is floored at -capacity: a large admitted batch locks its human out for at most one full refill', async () => {
+    const { pool, spawned } = track(
+      makePool({ deadlineMs: 200, budgetCapacityMs: 100, budgetRefillMsPerMinute: 600 }),
+    );
+    await pool.parse('warm', 'html', 'background');
+    const turn = batchConversion('file-task:1', 'A').budgetTurn!;
+    await expect(pool.toHtml('first', 'user:A', 5_000, undefined, true, turn)).resolves.toBe('<p>first</p>');
+    await spend(pool, spawned); // ≥ 200 ms killed + the reload, charged to a 100 ms bucket
+    for (let i = 0; i < 3; i++) {
+      await pool.toHtml(`sleep:60:p${i}`, 'user:A', 5_000, undefined, true, turn); // ungated, charged
+    }
+    // Without the floor the debt would be ≥ 280 ms; with it, never below -capacity (less a sub-ms refill).
+    expect(pool.budgetLeft('user:A')).toBeGreaterThanOrEqual(-100);
+    expect(pool.budgetLeft('user:A')).toBeLessThan(-90);
   });
 
   it('a batch caller whose wait cannot cover the refill fails with the same 429', async () => {

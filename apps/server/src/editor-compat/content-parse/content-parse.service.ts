@@ -277,7 +277,9 @@ export class ContentParsePool {
   private charge(principal: string, ms: number): void {
     if (isBudgetExempt(principal) || !(ms > 0)) return;
     const now = Date.now();
-    const tokens = this.budgetLeft(principal, now) - ms;
+    // Floor at -capacity: an ungated charge (a zip import admitted once, then charged per page) can never lock its
+    // human out for longer than one full refill (~2 min at the defaults), however large the archive was.
+    const tokens = Math.max(-this.limits.budgetCapacityMs, this.budgetLeft(principal, now) - ms);
     this.buckets.set(principal, { tokens, at: now });
   }
 
