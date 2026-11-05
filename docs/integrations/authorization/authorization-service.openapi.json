@@ -93,7 +93,7 @@
                       "additionalProperties": false,
                       "required": ["permission", "resourceType", "resourceId"],
                       "properties": {
-                        "permission": { "type": "string" },
+                        "permission": { "type": "string", "description": "A permission name in the authorization service's vocabulary (the fork asks e.g. `view`, `edit`, `locked` on `page`, `administer` on `space`). Since 1.12.0 (wiki-v2 #704) the fork also asks `share` on `page`, together with `edit`, before any change to a page's publish state; `edit: true, share: false` refuses the publish with 403, and a failed batch is a retryable 503. A name you do not model must be answered as false or a non-2xx, never true." },
                         "resourceType": { "type": "string" },
                         "resourceId": { "type": "string" }
                       }

@@ -21,6 +21,9 @@ import { PdpShareRepo } from '../pdp-share.repo';
 import { ShareController } from '../../core/share/share.controller';
 import { AttachmentController } from '../../core/attachment/attachment.controller';
 import { DatabaseModule } from '../../database/database.module';
+import { SHARE_PUBLISH_ROUTES } from '../share-lifecycle/share-publish.interceptor';
+import { SHARE_PUBLISH_PERMISSION, SharePublishGate } from '../share-lifecycle/share-publish.gate';
+import type { HttpAuthzClient } from '../http-authz.client';
 import {
   labelRepoProvider,
   pagePermissionRepoProvider,
@@ -441,6 +444,52 @@ describe('Anonymous public-share vectors (#660/#334/#335) — every public read 
     { vector: 'expiry: the repo veto fails closed', spec: 'pdp-share.repo.pg.spec.ts', title: 'fails CLOSED: an error evaluating expiry throws — never returns the share' },
     { vector: 'shares list: PDP deny before pagination', spec: 'pdp-share.repo.pg.spec.ts', title: 'a PDP deny is filtered BEFORE pagination: full pages, and meta/cursors only from authorized rows' },
     { vector: 'discovery: expired share never listed', spec: 'share-lifecycle/share-lifecycle.pg.spec.ts', title: 'lists live and "Never" shares, never an expired one (default or explicit); no sweeper involved' },
+  ];
+  it.each(PROOFS)('$vector — proven in $spec', ({ spec, title }) => {
+    expect(readFileSync(join(__dirname, '..', spec), 'utf8')).toContain(`'${title}'`);
+  });
+});
+
+describe('Publish vectors (#704) — changing a page\'s publish state needs page#share, not page edit alone', () => {
+  // Each route that WIDENS what is public, and how the remote gate reaches it. Unpublishing (share delete) only
+  // narrows, so it stays edit-only. The full route-to-sink inventory is share-publish.fitness.spec.ts.
+  const PUBLISH: Array<{ vector: string; route: string; via: 'interceptor' | 'direct' }> = [
+    { vector: 'share create (POST /api/shares/create)', route: 'ShareController.create', via: 'interceptor' },
+    { vector: 'share update: includeSubPages / searchIndexing (POST /api/shares/update)', route: 'ShareController.update', via: 'interceptor' },
+    { vector: 'share expiry set: Never / a later date (POST /api/shares/expiry)', route: 'ShareExpiryController.set', via: 'direct' },
+  ];
+
+  it.each(PUBLISH)('$vector -> page#share via the $via gate', ({ route, via }) => {
+    if (via === 'interceptor') {
+      expect(SHARE_PUBLISH_ROUTES.has(route)).toBe(true);
+    } else {
+      const src = readFileSync(join(__dirname, '..', 'share-lifecycle', 'share-expiry.controller.ts'), 'utf8');
+      expect(src).toContain('await this.publishGate.requirePublish(user.id, page.id);');
+    }
+  });
+
+  it('share delete (unpublish) is NOT gated on share', () => {
+    expect(SHARE_PUBLISH_ROUTES.has('ShareController.delete')).toBe(false);
+  });
+
+  it('the gate asks page#share with page#edit, and refuses an editor without share (remote only)', async () => {
+    const tryCheckBulk = jest.fn().mockResolvedValue([true, false]);
+    const gate = new SharePublishGate('remote', { tryCheckBulk } as unknown as HttpAuthzClient);
+    await expect(gate.requirePublish('u-1', 'p-1')).rejects.toMatchObject({
+      response: { code: 'share_not_permitted' },
+    });
+    expect(tryCheckBulk.mock.calls[0][1]).toEqual([
+      { permission: 'edit', resourceType: 'page', resourceId: 'p-1' },
+      { permission: SHARE_PUBLISH_PERMISSION, resourceType: 'page', resourceId: 'p-1' },
+    ]);
+    expect(SHARE_PUBLISH_PERMISSION).toBe('share');
+  });
+
+  // Proven on real rows over HTTP (an absence: the 403 writes nothing).
+  const PROOFS: Array<{ vector: string; spec: string; title: string }> = [
+    { vector: 'create without share writes no row', spec: 'share-lifecycle/share-publish.pg.spec.ts', title: 'an editor without share → 403 share_not_permitted, and no shares row is written' },
+    { vector: 'update decides on the share\'s page, never the body pageId', spec: 'share-lifecycle/share-publish.pg.spec.ts', title: 'decides on the SHARE’s page: a body pageId the caller may publish does not unlock it' },
+    { vector: 'expiry set refuses before its row lock', spec: 'share-lifecycle/share-publish.pg.spec.ts', title: 'refuses before its transaction: a row lock held elsewhere does not delay the 403 (no engine_busy)' },
   ];
   it.each(PROOFS)('$vector — proven in $spec', ({ spec, title }) => {
     expect(readFileSync(join(__dirname, '..', spec), 'utf8')).toContain(`'${title}'`);

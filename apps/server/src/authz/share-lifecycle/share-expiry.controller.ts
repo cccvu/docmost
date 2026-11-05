@@ -25,6 +25,7 @@ import { RemoteOnlyGuard } from '../mode/remote-only.guard';
 import { asEngineBusy, boundWaits } from '../../service-bridge/resource-version';
 import { SetShareExpiryDto, ShareExpiryInfoDto } from './share-expiry.dto';
 import { shareIsLiveSql, shareReportedExpirySql } from './share-expiry.sql';
+import { SharePublishGate } from './share-publish.gate';
 
 /**
  * Upstream's `AuditEvent` has no share-update event (it has only `share.created` / `share.deleted`), and adding one
@@ -46,7 +47,10 @@ export interface ShareExpiryView {
  * Both resolve the share through the injected `ShareRepo` token (remote = `PdpShareRepo`, so an expired share is
  * "Share not found"), require it to be in the caller's workspace (else the same 404), and authorize on the shared
  * page exactly as upstream's share routes do: `validateCanView` to read, `validateCanEdit` to change — the gate
- * share update and delete use.
+ * share update and delete use. Changing the expiry changes the publish state (Never, or a later date, keeps a page
+ * public longer), so `set` also needs `page#share` (#704): it calls `SharePublishGate` — the check the upstream share
+ * create and update get from `SharePublishInterceptor` — after resolving the share and before its transaction, so no
+ * row lock is ever held across the PDP call.
  *
  * The write is ONE bounded transaction, in the sweeper's lock order: the `shares` row `FOR UPDATE`, then — in a
  * fresh statement, so a concurrent renewal or sweep that committed before the lock is seen — the liveness re-check
@@ -67,6 +71,7 @@ export class ShareExpiryController {
     private readonly pageRepo: PageRepo,
     private readonly pageAccessService: PageAccessService,
     @Inject(AUDIT_SERVICE) private readonly auditService: IAuditService,
+    private readonly publishGate: SharePublishGate,
   ) {}
 
   @HttpCode(HttpStatus.OK)
@@ -91,6 +96,8 @@ export class ShareExpiryController {
     @AuthWorkspace() workspace: Workspace,
   ): Promise<ShareExpiryView> {
     const { share, page } = await this.resolve(dto.shareId, workspace);
+    // #704: publish authority, decided before any transaction (and before the edit check, as the interceptor's is).
+    await this.publishGate.requirePublish(user.id, page.id);
     await this.pageAccessService.validateCanEdit(page, user);
 
     const { before, after } = await this.bounded(async (trx) => {

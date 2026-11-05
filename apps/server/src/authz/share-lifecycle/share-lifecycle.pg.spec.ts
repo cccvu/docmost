@@ -429,7 +429,16 @@ d('share lifecycle on real Postgres (#335)', () => {
             return { hasRestriction: false };
           }),
         };
-        controller = new ShareExpiryController(db as any, mkRepo(), pageRepo as any, pageAccessService as any, audit as any);
+        // The #704 publish gate allows here (its decisions are share-publish.pg.spec.ts's): this block is the expiry write.
+        const publishGate = { requirePublish: jest.fn(async () => undefined) };
+        controller = new ShareExpiryController(
+          db as any,
+          mkRepo(),
+          pageRepo as any,
+          pageAccessService as any,
+          audit as any,
+          publishGate as any,
+        );
       });
 
       it('info: a viewer reads the effective expiry (default created_at + 90d; Never → null)', async () => {
