@@ -9,6 +9,7 @@ import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
 import { UserSpaceRole } from '@docmost/db/repos/space/types';
 import { SpaceRole } from '../common/helpers/types/permission';
 import { HttpAuthzClient } from './http-authz.client';
+import { authzUnavailable } from './authz-unavailable';
 
 /**
  * CCC authorization integration — NOT upstream Docmost code.
@@ -57,16 +58,20 @@ export class PdpSpaceMemberRepo extends SpaceMemberRepo {
    * Accepted loss (ADR 0025 amendment): an administer + view holder without edit becomes a native READER, so the
    * native-only space settings (space update, icon, comment moderation, native space export) are gone for them.
    *
-   * `checkBulk` denies the whole batch on a PDP error (all false), which reads as no view → no role: fail closed.
-   * `live-access/collab-access.decision.ts` applies the same mapping to open collab connections (pinned by
-   * `collab-access-parity.spec.ts`).
+   * #696: a PDP that could not answer (a transport error, a timeout, a non-2xx, a malformed answer) is a 503, never
+   * a role and never "no role": no role reads to every caller as a permanent deny (`SpaceAbilityFactory` answers 404
+   * "Space permissions not found"), which a client cannot tell from a real one and so never retries. Still fail
+   * closed — a throw grants nothing. `live-access/collab-access.decision.ts` applies the same mapping to open collab
+   * connections (pinned by `collab-access-parity.spec.ts`), where a failure is `unknown` instead.
    */
   override async getUserSpaceRoles(userId: string, spaceId: string): Promise<UserSpaceRole[]> {
-    const [admin, edit, view] = await this.authz.checkBulk(this.subject(userId), [
+    const results = await this.authz.tryCheckBulk(this.subject(userId), [
       { permission: 'administer', resourceType: 'space', resourceId: spaceId },
       { permission: 'edit', resourceType: 'space', resourceId: spaceId },
       { permission: 'view', resourceType: 'space', resourceId: spaceId },
     ]);
+    if (!results) throw authzUnavailable();
+    const [admin, edit, view] = results;
     const role = view ? (edit ? (admin ? SpaceRole.ADMIN : SpaceRole.WRITER) : SpaceRole.READER) : null;
     // Mirror the upstream contract: undefined (not []) when the user has no role in the space.
     return role ? [{ userId, role }] : (undefined as unknown as UserSpaceRole[]);

@@ -4,6 +4,8 @@ import { PdpSpaceMemberRepo } from '../pdp-space-member.repo';
 import { PdpPagePermissionRepo } from '../pdp-page-permission.repo';
 import type { SpaceAuthzPort } from './space-authz.port';
 import type { PageAuthzPort } from './page-authz.port';
+import type { RemoteAuthzClient } from './remote-authz-client.port';
+import { HttpAuthzClient } from '../http-authz.client';
 
 /**
  * Type-level conformance: BOTH adapters — native (the stock upstream repo) and remote (the PDP-backed
@@ -21,6 +23,12 @@ describe('authorization port conformance (compile-time)', () => {
     void _pdpSpace;
     void _page;
     void _pdpPage;
+    expect(true).toBe(true);
+  });
+
+  it('the HTTP transport satisfies RemoteAuthzClient (incl. the null-on-failure try* methods)', () => {
+    const _client: RemoteAuthzClient = null as unknown as HttpAuthzClient;
+    void _client;
     expect(true).toBe(true);
   });
 });

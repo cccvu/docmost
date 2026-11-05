@@ -6,6 +6,7 @@ import { KyselyDB, KyselyTransaction } from '@docmost/db/types/kysely.types';
 import { GroupRepo } from '@docmost/db/repos/group/group.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 import { HttpAuthzClient } from './http-authz.client';
+import { authzUnavailable } from './authz-unavailable';
 import { lineageRestricted, readPageLineage } from '../service-bridge/page-lineage';
 import {
   assertCopyKeepsRestrictions,
@@ -51,8 +52,14 @@ export class PdpPagePermissionRepo extends PagePermissionRepo implements CopyRes
     return { provider: 'docmost', externalId: userId } as const;
   }
 
+  /** #696: a PDP that could not answer is a 503 (`authzUnavailable`), never `false` — upstream answers `false` with a
+   *  403, which a client reads as a permanent deny. Still fail closed: a throw grants nothing. */
   override async canUserAccessPage(userId: string, pageId: string): Promise<boolean> {
-    return this.authz.check(this.subject(userId), 'view', 'page', pageId);
+    const results = await this.authz.tryCheckBulk(this.subject(userId), [
+      { permission: 'view', resourceType: 'page', resourceId: pageId },
+    ]);
+    if (!results) throw authzUnavailable();
+    return results[0] === true;
   }
 
   override async canUserEditPage(
@@ -69,9 +76,10 @@ export class PdpPagePermissionRepo extends PagePermissionRepo implements CopyRes
     ]);
     // #492 FAIL CLOSED on an UNKNOWN restriction state. `locked=false` RELAXES access (upstream then falls back
     // to the space role, which comes from a SEPARATE call that may well have succeeded), so reading a failed
-    // batch as all-false would open a restricted page to every space member during a PDP error. Unknown ⇒
-    // restricted with no access: upstream then trusts this decision and denies.
-    if (!results) return restrictedNoAccess();
+    // batch as all-false would open a restricted page to every space member during a PDP error. #696: unknown is
+    // a 503 — retryable, and never an answer at all (it used to be restricted-with-no-access, a 403 that reads as
+    // a permanent deny). Throwing returns nothing upstream could fall back from.
+    if (!results) throw authzUnavailable();
     const [canAccess, canEdit, locked] = results;
     // #524 FAIL CLOSED on a page the PDP has not PLACED. A page that is new or re-parented has no #space/#parent
     // edge until the relay projects it (a trashed page keeps its edges since ADR 0027 Release B; only a purge reaps
