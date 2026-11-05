@@ -9,6 +9,8 @@ import { PayloadTooLargeException } from '@nestjs/common';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
+import { Readable } from 'stream';
+import * as JSZip from 'jszip';
 import { setFlagsFromString } from 'v8';
 import { runInNewContext } from 'vm';
 
@@ -53,6 +55,8 @@ import {
 import { IMPORT_LIMITS, ImportTaskFailure } from './import-limits';
 import { ImportService } from '../../integrations/import/services/import.service';
 import { FileImportTaskService } from '../../integrations/import/services/file-import-task.service';
+import { FileTaskProcessor } from '../../integrations/import/processors/file-task.processor';
+import { QueueJob } from '../../integrations/queue/constants';
 
 jest.setTimeout(180_000);
 afterAll(() => closeContentParser());
@@ -250,5 +254,93 @@ describe('#643 zip import (seam #176)', () => {
       expect(err.message).not.toContain(extractDir);
       expect(err.message).not.toContain(tmpdir());
     }
+  });
+});
+
+describe('#643 zip import task, end to end: what the file task stores', () => {
+  const TASK = { id: 'task-1', source: 'generic', status: 'processing', filePath: 'ws-1/imports/task-1/a.zip', spaceId: 'space-1', workspaceId: 'ws-1', creatorId: 'user-1' };
+  const zipOf = async (files: Record<string, string | Buffer>) => {
+    const zip = new JSZip();
+    for (const [name, content] of Object.entries(files)) zip.file(name, content);
+    return zip.generateAsync({ type: 'nodebuffer' });
+  };
+  const setup = (readStream: () => Promise<Readable>) => {
+    const db = {
+      selectFrom: () => {
+        const q: any = { selectAll: () => q, select: () => q, where: () => q, executeTakeFirst: async () => TASK };
+        return q;
+      },
+      transaction: jest.fn(),
+    };
+    const service = new FileImportTaskService(
+      { readStream: jest.fn(readStream), delete: jest.fn() } as any,
+      {} as any,
+      {} as any,
+      {} as any,
+      db as any,
+      { processAttachments: jest.fn() } as any,
+      {} as any,
+      { emit: jest.fn() } as any,
+      {} as any,
+    );
+    (service as any).logger = { error: jest.fn(), log: jest.fn(), debug: jest.fn(), warn: jest.fn() };
+    const updateTaskStatus = jest.fn();
+    const processor = new FileTaskProcessor(
+      { updateTaskStatus, getFileTask: async () => null } as any,
+      { delete: jest.fn() } as any,
+      {} as any,
+      {} as any,
+    );
+    (processor as any).logger = { error: jest.fn(), log: jest.fn(), debug: jest.fn() };
+    /** Run the task as the queue does, and return the errorMessage it stores (BullMQ's failedReason = err.message). */
+    const stored = async (): Promise<string> => {
+      const err = await service.processZIpImport(TASK.id).then(
+        () => {
+          throw new Error('the import was expected to fail');
+        },
+        (e) => e,
+      );
+      expect(err).toBeInstanceOf(ImportTaskFailure);
+      await processor.onFailed({ name: QueueJob.IMPORT_TASK, data: { fileTaskId: TASK.id }, failedReason: err.message } as any);
+      expect(updateTaskStatus).toHaveBeenCalledWith(TASK.id, 'failed', err.message);
+      return err.message;
+    };
+    return { db, service, stored };
+  };
+  const noServerPath = (message: string) => {
+    expect(message).not.toContain(tmpdir());
+    expect(message).not.toContain('docmost-extract');
+  };
+
+  it('an oversize page file in a real archive: refused by its archive path, before any transaction', async () => {
+    const zip = await zipOf({ 'docs/ok.md': '# ok', 'docs/big.html': Buffer.alloc(CAP + 1, 97) });
+    const { db, stored } = setup(async () => Readable.from([zip]));
+    const message = await stored();
+    expect(message).toBe("Import failed: 'docs/big.html' is 4.1 MB; each page file in an import is limited to 4 MB");
+    expect(db.transaction).not.toHaveBeenCalled();
+    noServerPath(message);
+  });
+
+  it('an error carrying the extract dir, from anywhere in the import, is stored without it', async () => {
+    const zip = await zipOf({ 'docs/a.md': '# a' });
+    const { service, stored } = setup(async () => Readable.from([zip]));
+    let seen = '';
+    jest.spyOn(service, 'processGenericImport').mockImplementationOnce(async ({ extractDir }) => {
+      seen = extractDir;
+      throw Object.assign(new Error(`EACCES: permission denied, scandir '${extractDir}/docs'`), { code: 'EACCES' });
+    });
+    const message = await stored();
+    expect(seen).toContain('docmost-extract');
+    expect(message).toBe('Import failed: the archive could not be read; try again later');
+    expect(message).not.toContain(seen);
+  });
+
+  it('a download/extract failure is stored as an authored archive message', async () => {
+    const { stored } = setup(async () => {
+      throw new Error(`ENOENT: no such file or directory, open '${tmpdir()}/docmost-import-x.zip'`);
+    });
+    const message = await stored();
+    expect(message).toBe('Import failed: the archive could not be processed');
+    noServerPath(message);
   });
 });
