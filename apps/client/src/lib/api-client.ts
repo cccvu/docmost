@@ -2,6 +2,7 @@ import axios, { AxiosInstance, InternalAxiosRequestConfig } from "axios";
 import APP_ROUTE, { isPublicRoutePath } from "@/lib/app-route.ts";
 import { isCloud } from "@/lib/config.ts";
 import { isNativeAuthEnabled } from "@/features/auth-native/lib/auth-mode.ts";
+import { stepUpRedirectFor } from "@/features/request-errors/step-up.ts";
 
 const api: AxiosInstance = axios.create({
   baseURL: "/api",
@@ -70,9 +71,13 @@ api.interceptors.response.use(
           }
           break;
         }
-        case 403:
-          // Handle forbidden error
+        case 403: {
+          // wiki-v2 #713: a sensitive action whose session sign-in is not recent → the console re-confirms the
+          // human and returns here (features/request-errors/step-up.ts). The error still rejects below.
+          const stepUp = await stepUpRedirectFor(error, window.location);
+          if (stepUp) window.location.assign(stepUp);
           break;
+        }
         case 404:
           // Handle not found error
           // #384: a 404 with no/array message or an HTML body threw a TypeError out of the interceptor.

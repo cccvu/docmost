@@ -209,6 +209,15 @@ describe('service-bridge DTO validation (constraints are load-bearing)', () => {
       // Over the 45-char IPv6-text bound → rejected.
       expect(await errCount(MintSessionDto, { externalId: UUID, clientIp: 'a'.repeat(46) })).toBeGreaterThan(0);
     });
+
+    // #713: the step-up pair is optional integers; the cross-field window is mintFreshness's (session-freshness.spec).
+    it('#713: authTime/freshUntil are optional non-negative integers', async () => {
+      expect(await errCount(MintSessionDto, { externalId: UUID, authTime: 1_800_000_000, freshUntil: 1_800_007_200 })).toBe(0);
+      expect(await errCount(MintSessionDto, { externalId: UUID, authTime: 1.5 })).toBeGreaterThan(0);
+      expect(await errCount(MintSessionDto, { externalId: UUID, freshUntil: '1800007200' })).toBeGreaterThan(0);
+      expect(await errCount(MintSessionDto, { externalId: UUID, authTime: -1 })).toBeGreaterThan(0);
+      expect(await errCount(MintSessionDto, { externalId: UUID, freshUntil: true })).toBeGreaterThan(0);
+    });
   });
 
   /*
