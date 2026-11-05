@@ -7,10 +7,16 @@ import { ExportTooLargeException } from './export-limits';
 /**
  * #699 — the content bound's SQL on a real Postgres: the stored size and the text size the driver parses, over an
  * explicit id set (`= any($1::uuid[])`, one parameter whatever the page count), and the content load. Self-skips
- * without AUTHZ_TEST_PG_URL. NOTE: the CI Postgres lane runs only src/(service-bridge|authz); run this one with
- * `AUTHZ_TEST_PG_URL=… pnpm exec jest src/editor-compat/export/export-content.pg.spec.ts`.
+ * without AUTHZ_TEST_PG_URL; the `docmost-authz-pg` CI job (`src/(service-bridge|authz|editor-compat)`) provides
+ * Postgres.
  */
 const d = PG_URL ? describe : describe.skip;
+
+describe('real-PG export content bound', () => {
+  it('is not vacuous: runs against a real Postgres when the CI lane requires it', () => {
+    if (process.env.AUTHZ_REQUIRE_PG === '1') expect(PG_URL).toBeTruthy();
+  });
+});
 const SCHEMA = 'editor_compat_export_content_pg_spec';
 
 const para = (text: string) => ({ type: 'paragraph', content: [{ type: 'text', text }] });
