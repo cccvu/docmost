@@ -497,6 +497,36 @@ describe('#642 the per-principal worker-time budget', () => {
     ).resolves.toBe('<p>imported</p>');
   });
 
+  it('a batch is gated once: admitted on its first conversion, its later ones are charged but never wait or fail', async () => {
+    // The zip import converts inside its open transaction: a budget wait per page would hold it for minutes.
+    const { pool, spawned } = track(
+      makePool({
+        deadlineMs: 200,
+        budgetCapacityMs: 100,
+        budgetRefillMsPerMinute: 600, // 0.01 worker-ms per ms: no refill fits a 5 s wait
+      }),
+    );
+    await pool.parse('warm', 'html', 'background');
+    const turn = batchConversion('file-task:1', 'A').budgetTurn!;
+    expect(turn).toEqual({ admitted: false });
+    await expect(pool.toHtml('first', 'user:A', 5_000, undefined, true, turn)).resolves.toBe('<p>first</p>');
+    expect(turn.admitted).toBe(true);
+    await spend(pool, spawned); // the same human's bucket is now empty, far past what a refill could cover
+    const left = pool.budgetLeft('user:A');
+    expect(left).toBeLessThanOrEqual(0);
+    // The same batch: converted at once, and charged.
+    await expect(pool.toHtml('sleep:60:second', 'user:A', 5_000, undefined, true, turn)).resolves.toEqual({
+      type: 'doc',
+      label: 'second',
+    });
+    expect(pool.budgetLeft('user:A')).toBeLessThan(left - 30); // ~60 ms of worker time, less a 0.6 ms refill
+    // Controls: a new batch (a second import) by the same human is gated again, and so is an interactive write.
+    await expect(
+      pool.toHtml('next import', 'user:A', 5_000, undefined, true, batchConversion('file-task:2', 'A').budgetTurn),
+    ).rejects.toBeInstanceOf(ConversionBudgetExhaustedException);
+    await expect(pool.parse('x', 'html', 'user:A')).rejects.toBeInstanceOf(ConversionBudgetExhaustedException);
+  });
+
   it('a batch caller whose wait cannot cover the refill fails with the same 429', async () => {
     const { pool, spawned } = track(
       makePool({

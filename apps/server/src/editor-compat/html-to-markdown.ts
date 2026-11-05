@@ -9,8 +9,10 @@
  * five such pages exhausted a 1 GiB heap (a process abort). With a macrotask between calls it survives, at ~0.7–0.8 GiB.
  *
  * This parses the same wrapper Turndown builds itself (`<x-turndown id="turndown-root">…</x-turndown>`), hands
- * Turndown the root ELEMENT (it accepts a node and clones it, RootNode in the same file), and closes the window when
- * the conversion returns. The output is the same (pinned by html-to-markdown.spec.ts against `htmlToMarkdown`). jsdom
+ * Turndown the root ELEMENT, and closes the window when the conversion returns. Turndown deep-clones a node it is
+ * given (`input.cloneNode(true)`, RootNode in the same file), which would hold a second DOM as large as the first at
+ * the peak (measured +102 MiB on a 0.70 MiB page), so the root's `cloneNode` returns the root itself: Turndown then
+ * works on the one DOM, exactly as it does on the document it parses from a string, and nothing else reads it. The output is the same (pinned by html-to-markdown.spec.ts against `htmlToMarkdown`). jsdom
  * is loaded through the exact Turndown that editor-ext uses, so no new dependency and no second jsdom version.
  */
 import { createRequire } from 'node:module';
@@ -36,8 +38,10 @@ export function htmlToMarkdownReleasingDom(html: string): string {
   const Dom = jsdom();
   const dom = new Dom(`<x-turndown id="turndown-root">${html}</x-turndown>`);
   try {
+    const root = dom.window.document.getElementById('turndown-root') as { cloneNode: (deep?: boolean) => unknown };
+    root.cloneNode = () => root; // no second DOM (above)
     // Turndown takes a DOM node as well as a string; editor-ext's signature names only the string.
-    return htmlToMarkdown(dom.window.document.getElementById('turndown-root') as unknown as string);
+    return htmlToMarkdown(root as unknown as string);
   } finally {
     dom.window.close();
   }

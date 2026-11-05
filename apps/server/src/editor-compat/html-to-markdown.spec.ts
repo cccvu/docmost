@@ -3,6 +3,7 @@ import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { createRequire } from 'node:module';
 import * as ts from 'typescript';
 import { jsonToHtml, jsonToMarkdown } from '../collaboration/collaboration.util';
 import { sourceFiles } from '../authz/route-guard/ast-sink-scan';
@@ -88,6 +89,27 @@ describe('htmlToMarkdownReleasingDom (#699)', () => {
       const html = jsonToHtml(realisticDoc(200, seed));
       expect(htmlToMarkdownReleasingDom(html)).toBe(htmlToMarkdown(html));
     }
+  });
+
+  it('hands Turndown a root whose clone is itself, so the conversion never holds a second copy of the DOM', () => {
+    // The exact Turndown editor-ext loads (the helper resolves jsdom through the same path).
+    const fromEditorExt = createRequire(require.resolve('@docmost/editor-ext'));
+    const Turndown = fromEditorExt('@joplin/turndown') as { prototype: { turndown: (input: unknown) => string } };
+    const seen: unknown[] = [];
+    const real = Turndown.prototype.turndown;
+    const spy = jest.spyOn(Turndown.prototype, 'turndown').mockImplementation(function (this: unknown, input: unknown) {
+      seen.push(input);
+      return real.call(this, input);
+    });
+    try {
+      expect(htmlToMarkdownReleasingDom('<p>a <strong>b</strong></p>')).toBe(htmlToMarkdown('<p>a <strong>b</strong></p>'));
+    } finally {
+      spy.mockRestore();
+    }
+    const root = seen[0] as { cloneNode(deep: boolean): unknown; nodeType: number };
+    expect(typeof root).toBe('object'); // a node, not a string (RootNode clones a node it is given)
+    expect(root.nodeType).toBe(1);
+    expect(root.cloneNode(true)).toBe(root); // control: a plain jsdom element's clone is a new node
   });
 
   it('keeps no DOM after it returns, where htmlToMarkdown keeps one per call until the event loop turns (control)', () => {

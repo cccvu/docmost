@@ -24,7 +24,10 @@
  *     `budgetRefillMsPerMinute`), charged on settle with the conversion's wall time — a killed one up to its kill — plus
  *     the reload it caused. A key whose bucket is empty (≤ 0) is refused at admission, before it queues: 429
  *     `conversion_budget_exhausted` with the seconds until it is positive again. A batch caller (`batchConversion`)
- *     waits for the refill within its batch wait instead. Actorless keys (`background`, `batch:<id>`) are exempt.
+ *     is admitted ONCE, on its first conversion, where it waits for the refill within its batch wait instead; its
+ *     later conversions are charged but never gated, because the zip import converts inside its open transaction and
+ *     a budget wait there would hold the connection and the inserted rows (one turn at a time still applies).
+ *     Actorless keys (`background`, `batch:<id>`) are exempt.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import * as fs from 'node:fs';
@@ -217,7 +220,8 @@ export class ContentParsePool {
 
   /**
    * HTML or Markdown → ProseMirror JSON. `waitMs`: how long it may wait for its turn (default `limits.waitMs`).
-   * `batch`: an empty budget is waited out within `waitMs` rather than refused (#642).
+   * `batch`: an empty budget is waited out within `waitMs` rather than refused (#642); with `turn`, only until the
+   * batch's first admission (`BatchBudgetTurn`).
    */
   async parse(
     content: string,
@@ -225,20 +229,28 @@ export class ContentParsePool {
     principal: string,
     waitMs?: number,
     batch = false,
+    turn?: BatchBudgetTurn,
   ): Promise<Record<string, unknown>> {
     const { maxNodes, maxChars } = this.limits;
     const req = { op: 'to-json', format, content, maxNodes, maxChars } as const;
-    return (await this.convert(req, principal, `format=${format}`, waitMs, batch)) as Record<string, unknown>;
+    return (await this.convert(req, principal, `format=${format}`, waitMs, batch, turn)) as Record<string, unknown>;
   }
 
   /**
    * Markdown → HTML only (the importers rewrite the HTML before it is parsed). `maxChars` lowers the cap on the
    * HTML's length for this call (an importer bounds it by its own input cap); it never raises it past the limit.
    */
-  async toHtml(markdown: string, principal: string, waitMs?: number, maxChars?: number, batch = false): Promise<string> {
+  async toHtml(
+    markdown: string,
+    principal: string,
+    waitMs?: number,
+    maxChars?: number,
+    batch = false,
+    turn?: BatchBudgetTurn,
+  ): Promise<string> {
     const cap = Math.min(maxChars ?? this.limits.maxChars, this.limits.maxChars);
     const req = { op: 'markdown-to-html', content: markdown, maxChars: cap } as const;
-    return (await this.convert(req, principal, 'op=markdown-to-html', waitMs, batch)) as string;
+    return (await this.convert(req, principal, 'op=markdown-to-html', waitMs, batch, turn)) as string;
   }
 
   /** #642: the key's worker-time left, in ms, refilled to now (may be negative). Drops a bucket that is full again. */
@@ -279,10 +291,16 @@ export class ContentParsePool {
   /**
    * #642: admit the key only while its bucket is positive. Empty: an interactive caller is refused at once (429 with
    * the seconds until it is positive again); a batch caller waits for the refill if that fits in what is left of its
-   * wait, else is refused the same way.
+   * wait, else is refused the same way. A batch whose `turn` was already admitted is not gated at all (charged only).
    */
-  private async admitBudget(principal: string, batch: boolean, left: () => number, context: string): Promise<void> {
-    if (isBudgetExempt(principal)) return;
+  private async admitBudget(
+    principal: string,
+    batch: boolean,
+    left: () => number,
+    context: string,
+    turn?: BatchBudgetTurn,
+  ): Promise<void> {
+    if (isBudgetExempt(principal) || (batch && turn?.admitted)) return;
     const perMin = this.limits.budgetRefillMsPerMinute;
     for (;;) {
       const tokens = this.budgetLeft(principal);
@@ -307,6 +325,7 @@ export class ContentParsePool {
     what: string,
     waitMs = this.limits.waitMs,
     batch = false,
+    turn?: BatchBudgetTurn,
   ): Promise<unknown> {
     const bytes = Buffer.byteLength(String(req.content ?? ''), 'utf8');
     const admitBy = Date.now() + waitMs;
@@ -314,7 +333,7 @@ export class ContentParsePool {
     const context = `${what} bytes=${bytes}`;
     this.pruneBuckets(Date.now());
     // #642: refused before it queues — an over-budget key never waits in line, nor holds its own turn.
-    await this.admitBudget(principal, batch, left, context);
+    await this.admitBudget(principal, batch, left, context, turn);
 
     let own = this.principals.get(principal);
     if (!own) {
@@ -330,7 +349,8 @@ export class ContentParsePool {
       let reload: Promise<unknown> | null = null;
       try {
         // Again once it is this key's turn: its own previous conversion (just settled) may have spent the budget.
-        await this.admitBudget(principal, batch, left, context);
+        await this.admitBudget(principal, batch, left, context, turn);
+        if (batch && turn) turn.admitted = true; // later conversions of this batch are charged, never gated
         const releaseSlot = await this.slot.acquire(left());
         try {
           const run = await this.run({ ...req, id: this.nextId++ } as ParseRequest);
@@ -524,6 +544,18 @@ export interface ConversionQueue {
   waitMs: number;
   /** #642: work nobody waits on a response for: an empty budget is waited out within `waitMs`, not refused. */
   batch?: boolean;
+  /** #642: a batch's budget admission, shared by all its conversions (`batchConversion` sets it). */
+  budgetTurn?: BatchBudgetTurn;
+}
+
+/**
+ * #642: a batch is admitted against its human's budget once, on its first conversion; after that its conversions are
+ * charged but never gated. The zip import converts every page inside one open transaction, so a budget wait on each
+ * conversion would hold that connection and the inserted rows' locks for minutes. It still takes one turn at a time,
+ * so it can never hold more than one conversion's share of the worker.
+ */
+export interface BatchBudgetTurn {
+  admitted: boolean;
 }
 
 /** A human's admission key: the one key their requests, imports and validations all take their turn under (#642). */
@@ -541,6 +573,7 @@ export function batchConversion(id: string, userId?: string | null): ConversionQ
     principal: userId ? userConversionKey(userId) : `batch:${id}`,
     waitMs: CONTENT_PARSE_LIMITS.batchWaitMs,
     batch: true,
+    budgetTurn: { admitted: false },
   };
 }
 
@@ -577,7 +610,7 @@ export function parseUntrustedContent(
   format: ParseFormat,
   queue: ConversionQueue = requestQueue(),
 ): Promise<Record<string, unknown>> {
-  return pool.parse(content, format, queue.principal, queue.waitMs, queue.batch === true);
+  return pool.parse(content, format, queue.principal, queue.waitMs, queue.batch === true, queue.budgetTurn);
 }
 
 /**
@@ -589,7 +622,7 @@ export function untrustedMarkdownToHtml(
   queue: ConversionQueue = requestQueue(),
   options: { maxChars?: number } = {},
 ): Promise<string> {
-  return pool.toHtml(markdown, queue.principal, queue.waitMs, options.maxChars, queue.batch === true);
+  return pool.toHtml(markdown, queue.principal, queue.waitMs, options.maxChars, queue.batch === true, queue.budgetTurn);
 }
 
 /** Stop the shared worker (tests). */
