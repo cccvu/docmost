@@ -469,8 +469,9 @@ export class FileImportTaskService {
     // Sort levels to process in order
     const sortedLevels = Array.from(pagesByLevel.keys()).sort((a, b) => a - b);
 
-    // CCC #626: this job's own conversion queue, with the batch wait: one busy answer would fail the whole import.
-    const conversions = batchConversion(`file-task:${fileTask.id}`);
+    // CCC #626/#642: the importing user's conversion turn (one key per human), with the batch wait: one busy answer
+    // would fail the whole import.
+    const conversions = batchConversion(`file-task:${fileTask.id}`, fileTask.creatorId);
 
     try {
       await executeTx(this.db, async (trx) => {

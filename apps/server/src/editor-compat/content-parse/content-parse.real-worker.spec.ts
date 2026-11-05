@@ -84,6 +84,14 @@ describe('#626 the real worker converts exactly as the in-process path did', () 
     await expect(untrustedMarkdownToHtml(MARKDOWN)).resolves.toBe(await markdownToHtml(MARKDOWN));
   });
 
+  it('Markdown → HTML with a lower `maxChars` for the call: the worker refuses longer HTML → 422', async () => {
+    const html = await markdownToHtml(MARKDOWN);
+    await expect(untrustedMarkdownToHtml(MARKDOWN, undefined, { maxChars: html.length })).resolves.toBe(html);
+    await expect(untrustedMarkdownToHtml(MARKDOWN, undefined, { maxChars: html.length - 1 })).rejects.toBeInstanceOf(
+      ContentTooComplexException,
+    );
+  });
+
   it('an <iframe srcdoc> bomb converts quickly and yields none of the srcdoc content', async () => {
     const bomb = '<p>before</p>' + '<iframe srcdoc="<p>inner</p>"></iframe>'.repeat(2_000) + '<p>after</p>';
     const json = JSON.stringify(await parseUntrustedContent(bomb, 'html'));

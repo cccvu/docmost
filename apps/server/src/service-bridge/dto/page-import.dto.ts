@@ -4,6 +4,7 @@ import {
   ArrayMinSize,
   IsArray,
   IsIn,
+  IsOptional,
   IsString,
   IsUUID,
   MaxLength,
@@ -45,6 +46,16 @@ export class ValidateContentDto {
   @ValidateNested({ each: true })
   @Type(() => ValidateContentItemDto)
   items!: ValidateContentItemDto[];
+
+  /**
+   * #642: the Docmost user the platform validates FOR (the import's acting human). Only an admission key: these
+   * conversions take that user's turn at the converter, the same key as their own writes, instead of the shared
+   * `background` key. Optional both ways: an older platform omits it (→ `background`), and an older engine's
+   * whitelisting ValidationPipe drops it. Never an identity for authorization: nothing is read or written as them.
+   */
+  @IsOptional()
+  @IsUUID()
+  actorUserId?: string;
 }
 
 export class TitleCandidatesDto {

@@ -21,6 +21,7 @@ import { ServicePageController } from './service-page.controller';
 import { ServicePageLifecycleService } from './service-page-lifecycle.service';
 import { ServicePageImportService } from './service-page-import.service';
 import { spyKysely, SpyQuery } from './kysely-spy.testkit';
+import { requestQueue } from '../editor-compat/content-parse/content-parse.service';
 
 /**
  * CCC service-bridge — NOT upstream Docmost code. Wire-level proof for incident #181.
@@ -473,6 +474,8 @@ describe('service-bridge page-import helpers on the wire (#616)', () => {
   let app: NestFastifyApplication;
   let calls: SpyQuery[];
   const parsed: string[] = [];
+  /** #642: the converter turn each parse would take. */
+  const turns: string[] = [];
 
   beforeAll(async () => {
     const spy = spyKysely((query) =>
@@ -484,6 +487,7 @@ describe('service-bridge page-import helpers on the wire (#616)', () => {
     const parser = {
       parse: async (content: string) => {
         parsed.push(content);
+        turns.push(requestQueue().principal);
         if (content.includes('BROKEN')) throw new Error(`cannot parse: ${content}`);
         return {};
       },
@@ -516,6 +520,22 @@ describe('service-bridge page-import helpers on the wire (#616)', () => {
   beforeEach(() => {
     calls.length = 0;
     parsed.length = 0;
+    turns.length = 0;
+  });
+
+  it("#642 POST validate-content with actorUserId converts on that user's turn; without one, on the shared background turn", async () => {
+    const actorUserId = '33333333-3333-4333-8333-333333333333';
+    const items = [
+      { format: 'markdown', content: '# a' },
+      { format: 'html', content: '<p>b</p>' },
+    ];
+    const named = await app.inject({ method: 'POST', url: '/api/service/pages/validate-content', payload: { items, actorUserId } });
+    expect(named.statusCode).toBe(200);
+    expect(turns).toEqual([`user:${actorUserId}`, `user:${actorUserId}`]);
+    turns.length = 0;
+    const bare = await app.inject({ method: 'POST', url: '/api/service/pages/validate-content', payload: { items } });
+    expect(bare.statusCode).toBe(200);
+    expect(turns).toEqual(['background', 'background']);
   });
 
   it('POST validate-content answers the bare { results } with per-item codes and never echoes content', async () => {
@@ -547,6 +567,7 @@ describe('service-bridge page-import helpers on the wire (#616)', () => {
     ['51 items', { items: Array.from({ length: 51 }, () => ({ format: 'html', content: 'x' })) }],
     ['a json item', { items: [{ format: 'json', content: '{}' }] }],
     ['an item without content', { items: [{ format: 'html' }] }],
+    ['an actorUserId that is not a uuid (#642)', { items: [{ format: 'html', content: 'x' }], actorUserId: 'user:1' }],
   ])('POST validate-content with %s is a 400 that parses nothing', async (_what, payload) => {
     const res = await app.inject({ method: 'POST', url: '/api/service/pages/validate-content', payload });
     expect(res.statusCode).toBe(400);

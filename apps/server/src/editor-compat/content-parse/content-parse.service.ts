@@ -10,13 +10,18 @@
  * Bounds (CONTENT_PARSE_LIMITS), all fail-closed; nothing ever falls back to a parse on the main thread:
  *   - admission: one conversion at a time (`slot`), and at most ONE per principal queued or running (`principals`),
  *     so a principal's concurrent writes wait for each other and can never fill the queue ahead of everyone else.
- *     No slot within `waitMs` → 503 `engine_busy` (retryable; the content was not applied). Work with no request
- *     actor (the zip import's queue job) names its own queue key and may wait `batchWaitMs` (`batchConversion`).
+ *     No slot within `waitMs` → 503 `engine_busy` (retryable; the content was not applied). A principal is a HUMAN
+ *     (`user:<id>`) wherever one is known: their requests, the zip imports they start (`batchConversion`, which may
+ *     wait `batchWaitMs`) and the platform's validate-content on their behalf all share that one key (#642).
+ *   - fairness (#642): `waitMs` > `deadlineMs`, and a principal whose conversion killed the worker keeps its own turn
+ *     until the replacement worker is ready, so one principal can delay another by at most one conversion, never
+ *     past its wait.
  *   - `deadlineMs` from dispatch, enforced with `terminate()` (it stops a synchronous parse; a Promise race cannot),
  *     `memoryMb` heap via `resourceLimits`, and `maxNodes` nodes / `maxChars` characters in the result → 422
  *     `content_too_complex` (not retryable unchanged). A killed worker is replaced at once, not on the next job.
  *   - a worker that crashes or cannot start → 503 `engine_busy`, logged as an error.
  */
+import { AsyncLocalStorage } from 'node:async_hooks';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { Worker } from 'node:worker_threads';
@@ -52,12 +57,15 @@ export interface ContentParseLimits {
 
 /**
  * Measured on a dev laptop; production (Graviton ARM64) is estimated ~2–2.5× slower single-threaded (ADR 0031):
- *   - deadline 10 s: a real 1.25 MiB page of HTML (what ~1 MiB of Markdown becomes; bodies are capped at 1 MiB)
- *     converts in ~2.3 s here, ≤~6 s in production. The same deadline as the MCP attachment-extract worker. Deadline
- *     + wait (15 s) stays under the platform's 20 s content-write relay timeout, except when the worker is loading:
- *     the first conversion after a boot pays ~0.5–3.5 s of load on top (a replacement after a kill is started at
- *     once, so it is usually warm by the next job).
- *   - heap 1 GiB: that page needs ~384 MB; dense 1 MiB markup (99k nodes) 768 MB. The task has 8 GB.
+ *   - deadline 7 s: ~1 MiB of real Markdown (1.28 Mi characters of HTML, 42k nodes) converts in ~0.56 s here with
+ *     happy-dom 21 (it was ~2.0 s on 20.8.9, which re-parsed every CSS selector on every match), so ≤~1.4 s in
+ *     production at idle. Past it is 422 `content_too_complex`.
+ *   - wait 8 s, longer than the deadline (#642): a principal is admitted behind at most one conversion of each
+ *     principal ahead of it, and a killed conversion's principal waits out the worker's reload (`convert`), so one
+ *     principal looping deadline-length conversions can never make another wait past this. Wait + a worker load
+ *     (~0.5–3.5 s) + deadline ≤ 18.5 s stays under the platform's 20 s content-write relay timeout.
+ *   - heap 1 GiB: that page needs ~384 MB; dense 1 MiB markup (99k nodes) 768 MB. The task has 4 GB (ADR 0031), and
+ *     this must equal docmost's process-wide `--max-old-space-size` (check-infra-config §27 reads it from here).
  *   - nodes 100k: dense 1 MiB markup is 99k nodes, the real 1.25 MiB page 61k. It bounds what the main thread does
  *     with the result (clone, validation, Yjs: ~3 µs a node), independently of how fast the parser is.
  *   - characters 8 Mi: what the node cap cannot bound, one long string repeated in many nodes (a Markdown reference
@@ -69,8 +77,8 @@ export interface ContentParseLimits {
  *     failed the whole import. Nobody waits on a response for it, and the worker is ~one job per principal away.
  */
 export const CONTENT_PARSE_LIMITS: Readonly<ContentParseLimits> = Object.freeze({
-  deadlineMs: 10_000,
-  waitMs: 5_000,
+  deadlineMs: 7_000,
+  waitMs: 8_000,
   memoryMb: 1024,
   maxNodes: 100_000,
   maxChars: 8 * 1024 * 1024,
@@ -130,6 +138,14 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 /** What happened to one conversion: the worker's reply, or what the parent saw instead. */
 type Outcome = ParseReply | { ok: false; reason: 'deadline' | 'heap' | 'crashed' | 'unavailable' };
 
+/** One conversion's outcome, its own time, and — when it cost the worker — the replacement's load. */
+interface Run {
+  outcome: Outcome;
+  ms: number;
+  /** Set when this conversion killed or lost the worker: settles once the replacement is ready (or failed to start). */
+  reload: Promise<unknown> | null;
+}
+
 export class ContentParsePool {
   private readonly logger = new Logger('ContentParse');
   /** The one worker: one conversion at a time. */
@@ -154,9 +170,13 @@ export class ContentParsePool {
     return (await this.convert(req, principal, `format=${format}`, waitMs)) as Record<string, unknown>;
   }
 
-  /** Markdown → HTML only (the importers rewrite the HTML before it is parsed). */
-  async toHtml(markdown: string, principal: string, waitMs?: number): Promise<string> {
-    const req = { op: 'markdown-to-html', content: markdown, maxChars: this.limits.maxChars } as const;
+  /**
+   * Markdown → HTML only (the importers rewrite the HTML before it is parsed). `maxChars` lowers the cap on the
+   * HTML's length for this call (an importer bounds it by its own input cap); it never raises it past the limit.
+   */
+  async toHtml(markdown: string, principal: string, waitMs?: number, maxChars?: number): Promise<string> {
+    const cap = Math.min(maxChars ?? this.limits.maxChars, this.limits.maxChars);
+    const req = { op: 'markdown-to-html', content: markdown, maxChars: cap } as const;
     return (await this.convert(req, principal, 'op=markdown-to-html', waitMs)) as string;
   }
 
@@ -175,18 +195,35 @@ export class ContentParsePool {
       own = new OpSemaphore(1, waitMs);
       this.principals.set(principal, own);
     }
+    const forgetIfIdle = (sem: OpSemaphore) => {
+      // Idle means nobody holds it and nobody waits (a release hands the slot to a waiter synchronously).
+      if (sem.inUse === 0 && this.principals.get(principal) === sem) this.principals.delete(principal);
+    };
     try {
       const releaseOwn = await own.acquire(left());
+      let reload: Promise<unknown> | null = null;
       try {
         const releaseSlot = await this.slot.acquire(left());
         try {
-          const { outcome, ms } = await this.run({ ...req, id: this.nextId++ } as ParseRequest);
-          return this.settle(outcome, ms, `principal=${principal} ${what} bytes=${bytes} ms=${ms}`);
+          const run = await this.run({ ...req, id: this.nextId++ } as ParseRequest);
+          reload = run.reload;
+          return this.settle(run.outcome, run.ms, `principal=${principal} ${what} bytes=${bytes} ms=${run.ms}`);
         } finally {
           releaseSlot();
         }
       } finally {
-        releaseOwn();
+        if (reload) {
+          // #642: this conversion cost the worker. Its principal keeps its own turn until the replacement is ready,
+          // so the reload is spent by whoever took the slot meanwhile (outside their wait), never by this principal's
+          // next conversion ahead of them. The answer itself is not held back.
+          const sem = own;
+          void reload.then(() => {
+            releaseOwn();
+            forgetIfIdle(sem);
+          });
+        } else {
+          releaseOwn();
+        }
       }
     } catch (err) {
       if (err instanceof OpSemaphoreTimeout) {
@@ -197,8 +234,7 @@ export class ContentParsePool {
       }
       throw err;
     } finally {
-      // Idle means nobody holds it and nobody waits (a release hands the slot to a waiter synchronously).
-      if (own.inUse === 0 && this.principals.get(principal) === own) this.principals.delete(principal);
+      forgetIfIdle(own);
     }
   }
 
@@ -242,13 +278,13 @@ export class ContentParsePool {
    * Hand one request to the (started) worker and wait for its reply, the deadline, or the worker's death. `ms` is
    * the conversion's own time, from dispatch: loading a new worker counts toward neither it nor the deadline.
    */
-  private async run(req: ParseRequest): Promise<{ outcome: Outcome; ms: number }> {
+  private async run(req: ParseRequest): Promise<Run> {
     let worker: Worker;
     try {
       worker = await this.ready();
     } catch (err) {
       this.logger.error(`CONTENT_PARSE_WORKER_START_FAILED: ${(err as Error).message}; answered 503 engine_busy`);
-      return { outcome: { ok: false, reason: 'unavailable' }, ms: 0 };
+      return { outcome: { ok: false, reason: 'unavailable' }, ms: 0, reload: null };
     }
     const dispatched = Date.now();
     return new Promise((resolve) => {
@@ -258,8 +294,8 @@ export class ContentParsePool {
         worker.off('error', onError);
         worker.off('exit', onExit);
         worker.unref();
-        if (discard) this.replace(worker);
-        resolve({ outcome, ms: Date.now() - dispatched });
+        const reload = discard ? this.replace(worker) : null;
+        resolve({ outcome, ms: Date.now() - dispatched, reload });
       };
       const onMessage = (m: WorkerMessage) => {
         if ('id' in m && m.id === req.id) finish(m, false);
@@ -325,11 +361,14 @@ export class ContentParsePool {
   /**
    * Drop a worker a job killed or lost, and start its replacement now, so the next caller does not pay the load
    * (~0.5–3.5 s) inside its own request. A replacement that cannot start is logged, and the next conversion tries again.
+   * Resolves (never rejects) once the replacement is ready or has failed to start, bounded by `startupMs`.
    */
-  private replace(worker: Worker): void {
+  private replace(worker: Worker): Promise<void> {
     this.discard(worker);
-    this.ready().catch((err: Error) =>
-      this.logger.error(`CONTENT_PARSE_WORKER_START_FAILED: ${err.message}; the next conversion tries again`),
+    return this.ready().then(
+      () => undefined,
+      (err: Error) =>
+        this.logger.error(`CONTENT_PARSE_WORKER_START_FAILED: ${err.message}; the next conversion tries again`),
     );
   }
 
@@ -350,19 +389,40 @@ export interface ConversionQueue {
   waitMs: number;
 }
 
-/**
- * The queue for work with no request actor that nobody waits on a response for: its own key, and the batch wait.
- * `id` names the unit of work (e.g. `file-task:<id>`), so concurrent imports never queue behind each other.
- */
-export function batchConversion(id: string): ConversionQueue {
-  return { principal: `batch:${id}`, waitMs: CONTENT_PARSE_LIMITS.batchWaitMs };
+/** A human's admission key: the one key their requests, imports and validations all take their turn under (#642). */
+export function userConversionKey(userId: string): string {
+  return `user:${userId}`;
 }
 
 /**
- * A request's queue: its actor, with the interactive wait. Work with no actor that has not named a batch queue
- * (validate-content, called by the platform's service principal) shares one `background` key.
+ * The queue for work nobody waits on a response for (the zip import's queue job), with the batch wait. It takes the
+ * turn of the human who started it (`userId`), so their import and their requests are one principal, not two; work
+ * no human started names its own unit (`id`, e.g. `file-task:<id>`).
  */
-function requestQueue(): ConversionQueue {
+export function batchConversion(id: string, userId?: string | null): ConversionQueue {
+  return {
+    principal: userId ? userConversionKey(userId) : `batch:${id}`,
+    waitMs: CONTENT_PARSE_LIMITS.batchWaitMs,
+  };
+}
+
+/**
+ * An east-west call made FOR a human (validate-content: the platform names the acting user): conversions run inside
+ * `fn` take that human's turn, with the interactive wait. Without a user, `fn` runs with no override (the request
+ * queue below).
+ */
+const onBehalfOf = new AsyncLocalStorage<string>();
+export function convertOnBehalfOf<T>(userId: string | null | undefined, fn: () => Promise<T>): Promise<T> {
+  return userId ? onBehalfOf.run(userConversionKey(userId), fn) : fn();
+}
+
+/**
+ * A request's queue: its actor, with the interactive wait — or the human an east-west caller named
+ * (`convertOnBehalfOf`). Only work with neither shares the one `background` key.
+ */
+export function requestQueue(): ConversionQueue {
+  const named = onBehalfOf.getStore();
+  if (named) return { principal: named, waitMs: CONTENT_PARSE_LIMITS.waitMs };
   const ctx = ClsServiceManager.getClsService()?.get<AuditContext>(AUDIT_CONTEXT_KEY);
   const principal = ctx?.actorId ? `${ctx.actorType}:${ctx.actorId}` : 'background';
   return { principal, waitMs: CONTENT_PARSE_LIMITS.waitMs };
@@ -381,9 +441,16 @@ export function parseUntrustedContent(
   return pool.parse(content, format, queue.principal, queue.waitMs);
 }
 
-/** Convert untrusted Markdown to HTML, off the event loop, with the same bounds and errors. */
-export function untrustedMarkdownToHtml(markdown: string, queue: ConversionQueue = requestQueue()): Promise<string> {
-  return pool.toHtml(markdown, queue.principal, queue.waitMs);
+/**
+ * Convert untrusted Markdown to HTML, off the event loop, with the same bounds and errors. `options.maxChars` lowers
+ * the cap on the HTML's length for this call (never past `CONTENT_PARSE_LIMITS.maxChars`).
+ */
+export function untrustedMarkdownToHtml(
+  markdown: string,
+  queue: ConversionQueue = requestQueue(),
+  options: { maxChars?: number } = {},
+): Promise<string> {
+  return pool.toHtml(markdown, queue.principal, queue.waitMs, options.maxChars);
 }
 
 /** Stop the shared worker (tests). */

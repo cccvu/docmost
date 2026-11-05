@@ -596,10 +596,12 @@ describe('service-bridge.openapi.json page-import helpers (#616)', () => {
   const keysOf = <T,>(m: Record<keyof T, true>): string[] => Object.keys(m).sort();
   const sorted = (o: object): string[] => Object.keys(o).sort();
 
-  it('ValidateContentRequest: the DTO keys, 1..MAX items of { format (the DTO formats), content }', () => {
+  it('ValidateContentRequest: the DTO keys (items required, #642 actorUserId optional), 1..MAX items of { format, content }', () => {
     const req = S.components.schemas.ValidateContentRequest;
     expect(req.additionalProperties).toBe(false);
-    expect(sorted(req.properties)).toEqual(keysOf<ValidateContentDto>({ items: true }));
+    expect(sorted(req.properties)).toEqual(keysOf<ValidateContentDto>({ items: true, actorUserId: true }));
+    expect(req.required).toEqual(['items']);
+    expect(req.properties.actorUserId).toMatchObject({ type: 'string', format: 'uuid' });
     expect(req.properties.items).toMatchObject({ minItems: 1, maxItems: PAGE_IMPORT_MAX_ITEMS });
     const item = req.properties.items.items;
     expect(item.additionalProperties).toBe(false);
