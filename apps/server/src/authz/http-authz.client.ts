@@ -189,6 +189,38 @@ export class HttpAuthzClient {
     return [...allowed];
   }
 
+  /**
+   * {@link filterResources} that reports FAILURE distinctly — `null` — instead of collapsing it into "none allowed".
+   * Required wherever an empty answer would be read as a real one: search would otherwise answer "no results" during
+   * an authorization outage, and keep scanning (#696). `null` covers a transport error, timeout, non-2xx, and a
+   * malformed envelope (a non-array `ids` or a non-string element) in ANY chunk.
+   */
+  async tryFilterResources(
+    subject: AuthzSubject,
+    permission: string,
+    resourceType: string,
+    candidateIds: string[],
+  ): Promise<string[] | null> {
+    if (candidateIds.length === 0) return [];
+    const allowed = new Set<string>();
+    for (let i = 0; i < candidateIds.length; i += FILTER_CHUNK) {
+      const batch = candidateIds.slice(i, i + FILTER_CHUNK);
+      const r = await this.post<{ ids: unknown }>('/authz/filter-resources', {
+        subject,
+        permission,
+        resourceType,
+        candidateIds: batch,
+      });
+      if (!r) return null;
+      if (!Array.isArray(r.ids) || !r.ids.every((id): id is string => typeof id === 'string')) {
+        this.logger.error('authz /authz/filter-resources -> malformed ids envelope');
+        return null;
+      }
+      for (const id of r.ids) allowed.add(id);
+    }
+    return [...allowed];
+  }
+
   async lookupResources(
     subject: AuthzSubject,
     permission: string,
