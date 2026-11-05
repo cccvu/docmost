@@ -49,12 +49,15 @@ function walk(dir: string): string[] {
 describe('RAG/retrieval contract (ADR 0005) — filter-then-retrieve is the only retrieval path', () => {
   const files = walk(SRC);
 
-  it('the search retrieval gate is actually wired (PdpSearchService uses filterAccessiblePageIds)', () => {
+  it('the search retrieval gate is actually wired (PdpSearchService gates through collectAuthorized → the PDP)', () => {
     const svc = fs.readFileSync(
       path.join(SRC, 'authz/search/pdp-search.service.ts'),
       'utf8',
     );
-    expect(svc).toMatch(/filterAccessiblePageIds/);
+    // #696: the gate asks the PDP itself (`tryFilterResources`, the decision `filterAccessiblePageIds` makes, but
+    // reporting failure), and both entry points hand their candidates to `collectAuthorized` before any slice.
+    expect(svc).toMatch(/this\.pdp!?\.tryFilterResources\(/);
+    expect(svc.match(/await this\.collectAuthorized\(candidates,/g)).toHaveLength(2);
   });
 
   it('no vector / page_embeddings retrieval exists outside the authorized-set gate', () => {

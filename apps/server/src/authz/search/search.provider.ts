@@ -21,8 +21,9 @@ import { PdpSearchService } from './pdp-search.service';
  * is a MODULE-LOCAL provider, so the selection must be bound in search.module.ts (a @Global rebind
  * cannot win over the module-local injection) — see UPSTREAM_MODIFICATIONS.md #5.
  *
- * The remote subclass also gets its own `HttpAuthzClient` for the SERVICE leg of an on-behalf-of search (#615).
- * The client is stateless (env-configured, like the one PageRestrictionModule provides for itself), and injecting
+ * The remote subclass also gets its own `HttpAuthzClient`: its gate asks the PDP through it for BOTH legs (the user,
+ * and the service account of an on-behalf-of search, #615), with `tryFilterResources`, so an authorization outage is a
+ * 503 rather than an empty result (#696). The client is stateless (env-configured, like the one PageRestrictionModule provides for itself), and injecting
  * it would need an export from the upstream-owned DatabaseModule — so it is constructed here, in fork code.
  *
  * `ShareService` (from the ShareModule that search.module.ts imports, #660) gives the remote subclass the
