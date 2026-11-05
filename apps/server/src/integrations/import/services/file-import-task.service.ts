@@ -20,6 +20,13 @@ import { generateJitteredKeyBetween } from 'fractional-indexing-jittered';
 import { FileTask, InsertablePage } from '@docmost/db/types/entity.types';
 // CCC #626 (UPSTREAM_MODIFICATIONS, file-import-task.service.ts): Markdown is converted off the event loop.
 import { batchConversion, untrustedMarkdownToHtml } from '../../../editor-compat/content-parse/content-parse.service';
+// CCC #643 (UPSTREAM_MODIFICATIONS, file-import-task.service.ts): per-file caps, and messages that name no server path.
+import {
+  assertImportHtmlWithinBounds,
+  assertZipPageFilesWithinCap,
+  IMPORT_LIMITS,
+  importTaskError,
+} from '../../../editor-compat/content-parse/import-limits';
 import { getProsemirrorContent } from '../../../common/helpers/prosemirror/utils';
 import { formatImportHtml } from '../utils/import-formatter';
 import {
@@ -102,7 +109,7 @@ export class FileImportTaskService {
       await cleanupTmpFile();
       await cleanupTmpDir();
 
-      throw err;
+      throw importTaskError(err, { logger: this.logger }); // CCC #643: never the server's path
     }
 
     try {
@@ -153,7 +160,7 @@ export class FileImportTaskService {
       await cleanupTmpFile();
       await cleanupTmpDir();
 
-      throw err;
+      throw importTaskError(err, { logger: this.logger }); // CCC #643: never the server's path
     }
   }
 
@@ -164,6 +171,7 @@ export class FileImportTaskService {
     const { extractDir, fileTask } = opts;
     const isNotion = fileTask.source === FileImportSource.Notion;
     const allFiles = await collectMarkdownAndHtmlFiles(extractDir);
+    await assertZipPageFilesWithinCap(extractDir, allFiles); // CCC #643: before the transaction and any upload
     const attachmentCandidates = await buildAttachmentCandidates(extractDir);
     const docmostMetadata = await readDocmostMetadata(extractDir);
 
@@ -472,6 +480,7 @@ export class FileImportTaskService {
     // CCC #626/#642: the importing user's conversion turn (one key per human), with the batch wait: one busy answer
     // would fail the whole import.
     const conversions = batchConversion(`file-task:${fileTask.id}`, fileTask.creatorId);
+    let currentFile: string | null = null; // CCC #643: the page a failure names
 
     try {
       await executeTx(this.db, async (trx) => {
@@ -480,6 +489,7 @@ export class FileImportTaskService {
           const levelPages = pagesByLevel.get(level)!;
 
           for (const [filePath, page] of levelPages) {
+            currentFile = filePath;
             const absPath = path.join(extractDir, filePath);
             let content = '';
 
@@ -489,7 +499,9 @@ export class FileImportTaskService {
               content = await fs.readFile(absPath, 'utf-8');
 
               if (page.fileExtension.toLowerCase() === '.md') {
-                content = await untrustedMarkdownToHtml(content, conversions);
+                content = await untrustedMarkdownToHtml(content, conversions, {
+                  maxChars: IMPORT_LIMITS.maxMarkdownHtmlChars,
+                });
               }
             } catch (err: any) {
               if (err?.code === 'ENOENT') {
@@ -500,6 +512,7 @@ export class FileImportTaskService {
               }
             }
 
+            assertImportHtmlWithinBounds(content, this.logger); // CCC #643: before the first cheerio pass
             const htmlContent =
               await this.importAttachmentService.processAttachments({
                 html: content,
@@ -557,6 +570,7 @@ export class FileImportTaskService {
             }
           }
         }
+        currentFile = null;
 
         const filteredBacklinks = allBacklinks.filter(
           ({ sourcePageId, targetPageId }) =>
@@ -612,7 +626,7 @@ export class FileImportTaskService {
       }
     } catch (error) {
       this.logger.error('Failed to import files:', error);
-      throw new Error(`File import failed: ${error?.['message']}`);
+      throw importTaskError(error, { file: currentFile, logger: this.logger }); // CCC #643
     }
   }
 
