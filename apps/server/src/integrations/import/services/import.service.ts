@@ -28,6 +28,14 @@ import {
   parseUntrustedContent,
   untrustedMarkdownToHtml,
 } from '../../../editor-compat/content-parse/content-parse.service';
+// CCC #643 (UPSTREAM_MODIFICATIONS #147): what one imported page file may cost the main thread, and honest 413s.
+import {
+  assertImportHtmlWithinBounds,
+  assertImportPageFileSize,
+  IMPORT_LIMITS,
+  isImportPageFile,
+  readImportUpload,
+} from '../../../editor-compat/content-parse/import-limits';
 import {
   FileTaskStatus,
   FileTaskType,
@@ -62,11 +70,12 @@ export class ImportService {
     workspaceId: string,
   ) {
     const file = await filePromise;
-    const fileBuffer = await file.toBuffer();
+    const fileBuffer = await readImportUpload(file); // CCC #643: the 413 names the limit; a truncated file fails closed
     const fileExtension = path.extname(file.filename).toLowerCase();
     const fileName = sanitizeFileName(
       path.basename(file.filename, fileExtension),
     );
+    if (isImportPageFile(fileExtension)) assertImportPageFileSize(fileBuffer.length, file.filename); // CCC #643: before decoding
     const fileContent = fileBuffer.toString();
 
     let prosemirrorState = null;
@@ -153,7 +162,10 @@ export class ImportService {
 
   async processMarkdown(markdownInput: string): Promise<any> {
     try {
-      const html = await untrustedMarkdownToHtml(markdownInput);
+      // CCC #643: the worker refuses HTML past 2× the per-file cap (422) before any cheerio pass sees it.
+      const html = await untrustedMarkdownToHtml(markdownInput, undefined, {
+        maxChars: IMPORT_LIMITS.maxMarkdownHtmlChars,
+      });
       return this.processHTML(html);
     } catch (err) {
       throw err;
@@ -163,9 +175,15 @@ export class ImportService {
   // CCC #626: `queue` — the zip import's own batch queue; a request's import uses its actor's (the default).
   async processHTML(htmlInput: string, queue?: ConversionQueue): Promise<any> {
     try {
-      const $ = load(htmlInput);
-      normalizeImportHtml($, $.root());
-      return await parseUntrustedContent($.html() || '', 'html', queue);
+      // CCC #643: bound the markup before cheerio loads it, and keep the DOM inside a synchronous scope: an async
+      // frame keeps `$` alive across the await below, so every import waiting for the worker would hold its DOM.
+      assertImportHtmlWithinBounds(htmlInput, this.logger);
+      const html = ((): string => {
+        const $ = load(htmlInput);
+        normalizeImportHtml($, $.root());
+        return $.html() || '';
+      })();
+      return await parseUntrustedContent(html, 'html', queue);
     } catch (err) {
       throw err;
     }

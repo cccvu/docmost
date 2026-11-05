@@ -1,6 +1,6 @@
 import { PdpSpaceMemberRepo } from './pdp-space-member.repo';
 import SpaceAbilityFactory from '../core/casl/abilities/space-ability.factory';
-import { NotFoundException } from '@nestjs/common';
+import { NotFoundException, ServiceUnavailableException } from '@nestjs/common';
 import { SpaceCaslAction, SpaceCaslSubject } from '../core/casl/interfaces/space-ability.type';
 
 /**
@@ -8,13 +8,14 @@ import { SpaceCaslAction, SpaceCaslSubject } from '../core/casl/interfaces/space
  *
  * #542: the native space role is synthesized from the PDP's space administer/edit/view STRICTLY, so the native
  * engine (CASL and the collab connect) never grants more than the PDP does. No view → no role; view without edit →
- * reader; admin needs all three. Every one of the eight combinations is pinned, plus the fail-closed PDP error.
+ * reader; admin needs all three. Every one of the eight combinations is pinned, plus the fail-closed PDP error
+ * (#696: a 503, never a role and never the deny-shaped "no role").
  */
 const USER = 'u1';
 const SPACE = 's1';
 
-function repoAnswering(answer: (checks: Array<{ permission: string }>) => boolean[]) {
-  const authz = { checkBulk: jest.fn(async (_s: unknown, checks: Array<{ permission: string }>) => answer(checks)) };
+function repoAnswering(answer: (checks: Array<{ permission: string }>) => boolean[] | null) {
+  const authz = { tryCheckBulk: jest.fn(async (_s: unknown, checks: Array<{ permission: string }>) => answer(checks)) };
   const repo = new PdpSpaceMemberRepo({} as any, {} as any, {} as any, {} as any, authz as any);
   return { repo, authz };
 }
@@ -44,22 +45,25 @@ describe('PdpSpaceMemberRepo.getUserSpaceRoles — the native role is the PDP bi
     } else {
       expect(roles).toEqual([{ userId: USER, role: expected }]);
     }
-    expect(authz.checkBulk).toHaveBeenCalledTimes(1);
-    expect(authz.checkBulk).toHaveBeenCalledWith({ provider: 'docmost', externalId: USER }, [
+    expect(authz.tryCheckBulk).toHaveBeenCalledTimes(1);
+    expect(authz.tryCheckBulk).toHaveBeenCalledWith({ provider: 'docmost', externalId: USER }, [
       { permission: 'administer', resourceType: 'space', resourceId: SPACE },
       { permission: 'edit', resourceType: 'space', resourceId: SPACE },
       { permission: 'view', resourceType: 'space', resourceId: SPACE },
     ]);
   });
 
-  it('a PDP failure (checkBulk denies the whole batch) is no role — fail closed', async () => {
-    // HttpAuthzClient.checkBulk turns a transport error or malformed answer into all-false.
-    const { repo } = repoAnswering((checks) => checks.map(() => false));
-    expect(await repo.getUserSpaceRoles(USER, SPACE)).toBeUndefined();
+  it('#696: a PDP that could not answer (tryCheckBulk → null) is a 503 — never a role, never "no role"', async () => {
+    // HttpAuthzClient.tryCheckBulk reports a transport error, timeout, non-2xx or malformed answer as null.
+    const { repo } = repoAnswering(() => null);
+    const err = await repo.getUserSpaceRoles(USER, SPACE).catch((e) => e);
+    expect(err).toBeInstanceOf(ServiceUnavailableException);
+    expect(err.getStatus()).toBe(503);
+    expect(err.message).toBe('authorization is temporarily unavailable; retry shortly');
   });
 
   it('a thrown PDP error propagates (never read as a role)', async () => {
-    const authz = { checkBulk: jest.fn(async () => Promise.reject(new Error('pdp down'))) };
+    const authz = { tryCheckBulk: jest.fn(async () => Promise.reject(new Error('pdp down'))) };
     const repo = new PdpSpaceMemberRepo({} as any, {} as any, {} as any, {} as any, authz as any);
     await expect(repo.getUserSpaceRoles(USER, SPACE)).rejects.toThrow('pdp down');
   });
@@ -78,6 +82,13 @@ describe('PdpSpaceMemberRepo.getUserSpaceRoles — the native role is the PDP bi
       expect(ability.can(SpaceCaslAction.Read, SpaceCaslSubject.Page)).toBe(true);
       expect(ability.can(SpaceCaslAction.Manage, SpaceCaslSubject.Page)).toBe(false);
       expect(ability.can(SpaceCaslAction.Manage, SpaceCaslSubject.Settings)).toBe(false);
+    });
+
+    it('#696: a PDP that could not answer is a 503 there too — not the 404 "Space permissions not found"', async () => {
+      const { repo } = repoAnswering(() => null);
+      await expect(new SpaceAbilityFactory(repo).createForUser({ id: USER } as any, SPACE)).rejects.toBeInstanceOf(
+        ServiceUnavailableException,
+      );
     });
 
     it('control: administer + edit + view is a full space admin (the test is not vacuous)', async () => {

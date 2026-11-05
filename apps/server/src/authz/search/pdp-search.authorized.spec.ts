@@ -1,82 +1,27 @@
 import { BadRequestException, ServiceUnavailableException } from '@nestjs/common';
-import {
-  CamelCasePlugin,
-  CompiledQuery,
-  DatabaseConnection,
-  Driver,
-  Kysely,
-  PostgresAdapter,
-  PostgresIntrospector,
-  PostgresQueryCompiler,
-  QueryResult,
-} from 'kysely';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
 import { PdpSearchService, SearchCandidateFilters } from './pdp-search.service';
+import { pdpStub, searchDb, SearchRow, serviceLegCalls, userLegCalls } from './search-db.testkit';
 
 /**
  * CCC authorization integration test (fork compatibility suite) — `PdpSearchService.searchAuthorized` (#615): the
  * service-bridge search behind `POST /v1/search`.
  *
- *   - FILTERS ARE CANDIDATE SQL: every #615 filter is a predicate of the very query each window runs, so a filtered
- *     page fills from the filtered stream. The DB here is a real Kysely (Postgres compiler + the production
+ *   - FILTERS ARE CANDIDATE SQL: every #615 filter is a predicate of the one candidate statement (#696), so a
+ *     filtered page fills from the filtered stream. The DB here is a real Kysely (Postgres compiler + the production
  *     CamelCasePlugin) over a recording driver, so the assertions read the SQL that would reach Postgres.
  *   - `hasMore` is a one-row PEEK past the page (never a count), measured against the CLAMPED limit.
  *   - The on-behalf-of SERVICE leg gates every window: a hit the service account cannot see never takes a slot (the
- *     next authorized hit fills it), and `hasMore` is service ∩ user too. Both legs fail closed.
+ *     next authorized hit fills it), and `hasMore` is service ∩ user too. A deny on either leg drops the hit; a leg
+ *     that cannot answer aborts the search with a 503 (#696).
  *   - The native `searchPage` keeps its `{ items }` shape.
  *
  * The real-SQL twin (the predicates against real Postgres rows) is pdp-search.pg.spec.ts.
  */
 
-type Row = { id: string; title: string; highlight: string | null };
+type Row = SearchRow;
 const mkRows = (ids: string[]): Row[] => ids.map((id) => ({ id, title: `t-${id}`, highlight: `hi\n${id}` }));
-
-/**
- * A Kysely over a driver that RECORDS every compiled query and answers the candidate stream windowed by the query's
- * own `limit`/`offset` parameters (i.e. whatever the SQL says, the rows are the next window of `candidates`).
- */
-function recordingDb(candidates: Row[]) {
-  const queries: CompiledQuery[] = [];
-  const connection: DatabaseConnection = {
-    async executeQuery<R>(cq: CompiledQuery): Promise<QueryResult<R>> {
-      queries.push(cq);
-      const param = (kw: string): number => {
-        const m = new RegExp(`${kw} \\$(\\d+)`).exec(cq.sql);
-        return m ? Number(cq.parameters[Number(m[1]) - 1]) : NaN;
-      };
-      const limit = param('limit');
-      const offset = param('offset');
-      const rows = Number.isNaN(limit) ? [] : candidates.slice(offset || 0, (offset || 0) + limit);
-      return { rows: rows as unknown as R[] };
-    },
-    // eslint-disable-next-line require-yield
-    async *streamQuery() {
-      throw new Error('not used');
-    },
-  };
-  const driver: Driver = {
-    async init() {},
-    async acquireConnection() {
-      return connection;
-    },
-    async beginTransaction() {},
-    async commitTransaction() {},
-    async rollbackTransaction() {},
-    async releaseConnection() {},
-    async destroy() {},
-  };
-  const db = new Kysely<any>({
-    dialect: {
-      createAdapter: () => new PostgresAdapter(),
-      createDriver: () => driver,
-      createIntrospector: (k) => new PostgresIntrospector(k),
-      createQueryCompiler: () => new PostgresQueryCompiler(),
-    },
-    plugins: [new CamelCasePlugin()],
-  });
-  return { db, queries };
-}
 
 const WS = '00000000-0000-4000-8000-00000000000a';
 const USER = '00000000-0000-4000-8000-0000000000b1';
@@ -87,15 +32,10 @@ function build(opts: {
   candidates: Row[];
   userDenied?: Set<string>;
   serviceDenied?: Set<string>;
-  withServiceClient?: boolean;
+  withPdp?: boolean;
 }) {
-  const { db, queries } = recordingDb(opts.candidates);
-  const filterAccessiblePageIds = jest.fn(async ({ pageIds }: { pageIds: string[] }) =>
-    pageIds.filter((id) => !(opts.userDenied ?? new Set()).has(id)),
-  );
-  const filterResources = jest.fn(async (_s: unknown, _p: string, _t: string, ids: string[]) =>
-    ids.filter((id) => !(opts.serviceDenied ?? new Set()).has(id)),
-  );
+  const { db, queries, candidateQueries, hydrateQueries } = searchDb({ candidates: opts.candidates });
+  const pdp = pdpStub({ userDenied: opts.userDenied, serviceDenied: opts.serviceDenied });
   // The real repos: `withSpace` / `getUserSpaceIdsQuery` only build SQL over `db`.
   const pageRepo = new PageRepo(db as any, {} as any, {} as any);
   const spaceMemberRepo = new SpaceMemberRepo(db as any, {} as any, {} as any, {} as any);
@@ -104,11 +44,10 @@ function build(opts: {
     pageRepo,
     {} as any,
     spaceMemberRepo,
-    { filterAccessiblePageIds } as any,
-    opts.withServiceClient === false ? undefined : ({ filterResources } as any),
+    {} as any,
+    opts.withPdp === false ? undefined : pdp,
   );
-  const candidateQueries = () => queries.filter((q) => /from "pages"/.test(q.sql) && /ts_rank/.test(q.sql));
-  return { service, queries, candidateQueries, filterAccessiblePageIds, filterResources };
+  return { service, queries, candidateQueries, hydrateQueries, pdp };
 }
 
 const ids = (n: number, p = 'a') => Array.from({ length: n }, (_, i) => `${p}${i}`);
@@ -125,12 +64,13 @@ describe('PdpSearchService.searchAuthorized — #615 filters are candidate SQL (
     updatedUntil: '2026-02-01T00:00:00.000Z',
   };
 
-  it('puts every filter into EVERY window query, with its value bound (not interpolated)', async () => {
-    // 200 authorized candidates, offset 50 + limit 100 (+1 peek) → two 128-row windows: both carry every predicate.
-    const { service, candidateQueries } = build({ candidates: mkRows(ids(200)) });
+  it('puts every filter into THE candidate statement, with its value bound (not interpolated)', async () => {
+    // 200 authorized candidates, offset 50 + limit 100 (+1 peek) → two 128-id PDP windows, ONE statement (#696).
+    const { service, candidateQueries, pdp } = build({ candidates: mkRows(ids(200)) });
     await run(service, { limit: 100, offset: 50 }, FILTERS);
     const windows = candidateQueries();
-    expect(windows).toHaveLength(2);
+    expect(windows).toHaveLength(1);
+    expect(userLegCalls(pdp)).toHaveLength(2);
     for (const q of windows) {
       expect(q.sql).toMatch(/"creator_id" = \$\d+/);
       expect(q.sql).toMatch(/"last_updated_by_id" = \$\d+/);
@@ -144,7 +84,7 @@ describe('PdpSearchService.searchAuthorized — #615 filters are candidate SQL (
       // Live pages of this workspace only, rank-ordered with an id tiebreak.
       expect(q.sql).toMatch(/"deleted_at" is null/);
       expect(q.sql).toMatch(/"workspace_id" = \$\d+/);
-      expect(q.sql).toMatch(/order by "rank" desc, "id" asc limit \$\d+ offset \$\d+$/);
+      expect(q.sql).toMatch(/order by "rank" desc, "id" asc limit \$\d+$/);
       // Bound values: the label is normalized as Docmost stores it; nothing is spliced into the SQL text.
       expect(q.parameters).toEqual(
         expect.arrayContaining([
@@ -239,12 +179,13 @@ describe('PdpSearchService.searchAuthorized — hasMore is a one-row peek past t
   });
 
   it('the peek walks past a window when the page ends exactly on it (the 129th candidate decides)', async () => {
-    // limit 100, offset 28 → need 129: the peek row sits in the SECOND 128-row window.
-    const { service, candidateQueries } = build({ candidates: mkRows(ids(129)) });
+    // limit 100, offset 28 → need 129: the peek row sits in the SECOND 128-id PDP window (one statement).
+    const { service, candidateQueries, pdp } = build({ candidates: mkRows(ids(129)) });
     const page = await run(service, { limit: 100, offset: 28 });
     expect(page.items).toHaveLength(100);
     expect(page.hasMore).toBe(true);
-    expect(candidateQueries()).toHaveLength(2);
+    expect(userLegCalls(pdp).map((c) => c[3].length)).toEqual([128, 1]);
+    expect(candidateQueries()).toHaveLength(1);
   });
 
   it('a scan-budget stop never turns into hasMore=true (the peek alone decides; the stop is only logged)', async () => {
@@ -308,24 +249,31 @@ describe('PdpSearchService.searchAuthorized — hasMore is a one-row peek past t
   });
 
   it('an empty query answers an empty page without touching the DB or the PDP', async () => {
-    const { service, queries, filterAccessiblePageIds } = build({ candidates: mkRows(ids(3)) });
+    const { service, queries, pdp } = build({ candidates: mkRows(ids(3)) });
     expect(await run(service, { query: '' })).toEqual({ items: [], hasMore: false });
     expect(queries).toHaveLength(0);
-    expect(filterAccessiblePageIds).not.toHaveBeenCalled();
+    expect(pdp.tryFilterResources).not.toHaveBeenCalled();
   });
 });
 
 describe('PdpSearchService.searchAuthorized — the on-behalf-of SERVICE leg (service ∩ user)', () => {
   it('a window hit the service account cannot see is skipped and the next authorized hit fills the page', async () => {
-    const { service, filterResources } = build({
+    const { service, pdp } = build({
       candidates: mkRows(['a0', 'hidden', 'a1', 'a2', 'a3']),
       serviceDenied: new Set(['hidden']),
     });
     const page = await run(service, { limit: 3 }, {}, { serviceSubjectId: SA });
     expect(page.items.map((r: any) => r.id)).toEqual(['a0', 'a1', 'a2']);
     expect(page.hasMore).toBe(true); // a3: visible to both
-    // The service leg names the SERVICE ACCOUNT (never a user subject) and asks for page view.
-    expect(filterResources).toHaveBeenCalledWith(
+    // The service leg names the SERVICE ACCOUNT (never a user subject) and asks for page view; the user leg names
+    // the Docmost user exactly as PdpPagePermissionRepo.filterAccessiblePageIds does.
+    expect(pdp.tryFilterResources).toHaveBeenCalledWith(
+      { provider: 'docmost', externalId: USER },
+      'view',
+      'page',
+      expect.any(Array),
+    );
+    expect(pdp.tryFilterResources).toHaveBeenCalledWith(
       { principalId: SA, subjectType: 'service' },
       'view',
       'page',
@@ -334,12 +282,12 @@ describe('PdpSearchService.searchAuthorized — the on-behalf-of SERVICE leg (se
   });
 
   it('the service leg only sees ids the USER leg already admitted (never the raw window)', async () => {
-    const { service, filterResources } = build({
+    const { service, pdp } = build({
       candidates: mkRows(['a0', 'u-denied', 'a1']),
       userDenied: new Set(['u-denied']),
     });
     await run(service, { limit: 10 }, {}, { serviceSubjectId: SA });
-    expect(filterResources.mock.calls.map((c) => c[3])).toEqual([['a0', 'a1']]);
+    expect(serviceLegCalls(pdp).map((c) => c[3])).toEqual([['a0', 'a1']]);
   });
 
   it('a hit only the USER can see is neither an item nor the hasMore peek', async () => {
@@ -363,30 +311,41 @@ describe('PdpSearchService.searchAuthorized — the on-behalf-of SERVICE leg (se
     expect(page.hasMore).toBe(false);
   });
 
-  it('fails CLOSED: a service-leg error (the client answers none) yields an empty page, not the user-only hits', async () => {
-    const { service, filterResources } = build({ candidates: mkRows(ids(5)) });
-    filterResources.mockResolvedValue([]);
+  it('a service leg that DENIES everything yields an empty page, not the user-only hits', async () => {
+    const { service } = build({ candidates: mkRows(ids(5)), serviceDenied: new Set(ids(5)) });
     expect(await run(service, { limit: 5 }, {}, { serviceSubjectId: SA })).toEqual({ items: [], hasMore: false });
   });
 
-  it('refuses (503) to run an on-behalf-of search when no service-leg client is wired, before any SQL', async () => {
-    const { service, queries } = build({ candidates: mkRows(ids(5)), withServiceClient: false });
+  it('#696: a service leg that CANNOT answer aborts with a 503 — never the user-only hits, never an empty page', async () => {
+    const { service, pdp, hydrateQueries } = build({ candidates: mkRows(ids(5)) });
+    pdp.tryFilterResources.mockImplementation(async (s: any, _p: string, _t: string, l: string[]) =>
+      s.subjectType === 'service' ? null : l,
+    );
+    jest.spyOn((service as any).logger, 'warn').mockImplementation();
     await expect(run(service, { limit: 5 }, {}, { serviceSubjectId: SA })).rejects.toBeInstanceOf(
       ServiceUnavailableException,
     );
-    expect(queries).toHaveLength(0);
+    expect(hydrateQueries()).toHaveLength(0);
+  });
+
+  it('refuses (503) to run any search when no PDP client is wired, before any SQL', async () => {
+    for (const extra of [{ serviceSubjectId: SA }, {}]) {
+      const { service, queries } = build({ candidates: mkRows(ids(5)), withPdp: false });
+      await expect(run(service, { limit: 5 }, {}, extra)).rejects.toBeInstanceOf(ServiceUnavailableException);
+      expect(queries).toHaveLength(0);
+    }
   });
 
   it('no serviceSubjectId → no service-leg call at all (a session / self-acting credential)', async () => {
-    const { service, filterResources } = build({ candidates: mkRows(ids(5)) });
+    const { service, pdp } = build({ candidates: mkRows(ids(5)) });
     await run(service, { limit: 5 });
-    expect(filterResources).not.toHaveBeenCalled();
+    expect(serviceLegCalls(pdp)).toHaveLength(0);
   });
 });
 
 describe('PdpSearchService.searchPage — the native route keeps its shape', () => {
   it('returns exactly { items } (no hasMore), gated for the user only, with the creator filter in SQL', async () => {
-    const { service, candidateQueries, filterResources } = build({ candidates: mkRows(ids(30)) });
+    const { service, candidateQueries, pdp } = build({ candidates: mkRows(ids(30)) });
     const creatorId = '00000000-0000-4000-8000-000000000101';
     const out = await service.searchPage({ query: 'roadmap', limit: 25, creatorId } as any, {
       userId: USER,
@@ -394,7 +353,7 @@ describe('PdpSearchService.searchPage — the native route keeps its shape', () 
     });
     expect(Object.keys(out)).toEqual(['items']);
     expect(out.items).toHaveLength(25);
-    expect(filterResources).not.toHaveBeenCalled();
+    expect(serviceLegCalls(pdp)).toHaveLength(0);
     expect(candidateQueries()[0].sql).toMatch(/"creator_id" = \$\d+/);
     expect(candidateQueries()[0].parameters).toContain(creatorId);
   });

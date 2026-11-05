@@ -40,7 +40,6 @@ import {
   Columns,
   Column,
   Status,
-  htmlToMarkdown,
   TransclusionSource,
   TransclusionReference,
   BaseEmbed,
@@ -60,6 +59,7 @@ import { Logger } from '@nestjs/common';
 import { backfillAttachmentIds } from '../editor-compat/attachment-id-backfill';
 // #626: fork-owned linear replacement for editor-ext's O(n²) `addUniqueIdsToDoc`; this seam only calls it.
 import { addUniqueIds } from '../editor-compat/unique-ids';
+import { htmlToMarkdownReleasingDom } from '../editor-compat/html-to-markdown'; // CCC seam #61 (#699): Turndown's jsdom window closed
 
 export const tiptapExtensions = [
   StarterKit.configure({
@@ -244,5 +244,5 @@ export function prosemirrorNodeToYElement(node: any): Y.XmlElement | Y.XmlText {
 
 export function jsonToMarkdown(tiptapJson: any): string {
   const html = jsonToHtml(tiptapJson);
-  return htmlToMarkdown(html);
+  return htmlToMarkdownReleasingDom(html); // CCC seam #61 (#699)
 }

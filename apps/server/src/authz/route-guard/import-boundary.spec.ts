@@ -60,10 +60,11 @@ const SEAM_ALLOWLIST = new Set<string>([
   'ws/ws.gateway.ts', // seam #310 — socket.io handshake reads the session cookie under its resolved (__Host-) name via authz/session-cookie
   'collaboration/collaboration.gateway.ts', // seam #3f — account-disable force-disconnect delegates to authz/collab/disconnect-user-connections (importless predicate, unit-testable outside lib0 ESM) (#455)
   'collaboration/collaboration.handler.ts', // seam #2 — conditional content write compares via authz/page-write/stable-hash (#282); flushPageContent reads authz/page-write/store-failure-registry (#390); the keyed content write checks/records via authz/page-write/write-idem (#429)
-  'collaboration/collaboration.util.ts', // seam #61 — htmlToJson imports the #392 attachmentId backfill and the #626 linear unique-id pass from editor-compat/
+  'collaboration/collaboration.util.ts', // seam #61 — htmlToJson imports the #392 attachmentId backfill and the #626 linear unique-id pass, jsonToMarkdown the #699 DOM-releasing Markdown helper, from editor-compat/
   'core/page/services/page.service.ts', // seam #121 — parseProsemirrorContent converts HTML/Markdown off the event loop via editor-compat/content-parse (#626); duplicatePage's insert asks authz/page-copy's copy guard inside its transaction (#573)
   'integrations/import/services/import.service.ts', // seam #147 — imported Markdown/HTML converted via editor-compat/content-parse (#626)
   'integrations/import/services/file-import-task.service.ts', // seam #176 — zip-import Markdown converted via editor-compat/content-parse (#626)
+  'integrations/export/export.service.ts', // seam #183 (#699) — bounded export: content + attachments decided before the first byte, attachments streamed, via editor-compat/export
   'collaboration/extensions/persistence.extension.ts', // seam #390 — reconcile-before-store + store-failure signal via authz/page-write/{reconcile-store,store-failure-registry}
   'collaboration/server/collaboration.controller.ts', // seam #163 — CollabServiceSecretGuard on GET /collab/stats in the separate CollabAppModule process (#80)
   'core/casl/casl.module.ts', // seam #177 — mode-selected WorkspaceAbilityFactory via authz/mode/workspace-ability (remote: users.role confers no workspace authority, #636)

@@ -18,15 +18,13 @@ import { PdpSearchService } from './pdp-search.service';
  *   - offset/limit must paginate over the AUTHORIZED set with no skip/dup even when accessible
  *     matches are SPARSE and interleaved across multiple windows.
  *
- * PASS iff the windowed gate is correct (invariant I5). No DB, no containers — the FTS query is a
- * chainable db mock windowing a fixed rank-ordered candidate stream; the authorization decision is
- * the `filterAccessiblePageIds` gate (the PDP-rebound repo) stubbed to deny a known set. Mirrors the
- * mock harness in pdp-search.service.spec.ts (CANDIDATE_WINDOW=128).
+ * PASS iff the windowed gate is correct (invariant I5). No DB, no containers — the candidate statement and the
+ * hydrate answer a fixed rank-ordered stream (search-db.testkit.ts); the authorization decision is the PDP's
+ * `tryFilterResources` stubbed to deny a known set. Same harness as pdp-search.service.spec.ts (CANDIDATE_WINDOW=128).
  */
+import { pdpStub, searchDb, SearchRow, userLegCalls } from './search-db.testkit';
 
-type Row = { id: string; rank: number; title: string; highlight: string };
-
-const mkRows = (ids: string[]): Row[] =>
+const mkRows = (ids: string[]): SearchRow[] =>
   ids.map((id, i) => ({
     id,
     rank: 1 - i / 1000,
@@ -34,104 +32,19 @@ const mkRows = (ids: string[]): Row[] =>
     highlight: `hi\n${id}`,
   }));
 
-/**
- * A chainable Kysely-like mock. Every builder method returns the same proxy; `selectFrom` resets the
- * active table + window, `limit`/`offset` capture the window, and `execute` returns
- * `candidatesFor(table).slice(offset, offset+limit)` — i.e. it models a rank-ordered candidate stream
- * that the gate walks in bounded windows.
- */
-function makeDb(candidatesFor: (table: string) => Row[]) {
-  let table = '';
-  let _limit = Number.MAX_SAFE_INTEGER;
-  let _offset = 0;
-  const proxy: any = new Proxy(
-    {},
-    {
-      get(_t, prop: string) {
-        if (prop === 'selectFrom')
-          return (t: string) => {
-            table = t;
-            _limit = Number.MAX_SAFE_INTEGER;
-            _offset = 0;
-            return proxy;
-          };
-        if (prop === 'limit')
-          return (n: number) => {
-            _limit = n;
-            return proxy;
-          };
-        if (prop === 'offset')
-          return (n: number) => {
-            _offset = n;
-            return proxy;
-          };
-        if (prop === 'execute')
-          return async () =>
-            candidatesFor(table).slice(_offset, _offset + _limit);
-        // select / where / $if / orderBy / ... → keep chaining (callback args are never invoked).
-        return (..._args: any[]) => proxy;
-      },
-    },
-  );
-  return proxy;
-}
-
-/**
- * A chainable mock that returns PRE-DEFINED successive windows per `execute()` (ignoring limit/offset),
- * so a test can model explicit windows — e.g. windows 1–2 wholly denied, the authorized rows only in
- * window 3. windowsByTable[table][callIndex] is returned for the Nth execute on that table.
- */
-function makeSeqDb(windowsByTable: Record<string, Row[][]>) {
-  let table = '';
-  const counters: Record<string, number> = {};
-  const proxy: any = new Proxy(
-    {},
-    {
-      get(_t, prop: string) {
-        if (prop === 'selectFrom')
-          return (t: string) => {
-            table = t;
-            return proxy;
-          };
-        if (prop === 'execute')
-          return async () => {
-            const list = windowsByTable[table] || [];
-            const i = counters[table] ?? 0;
-            counters[table] = i + 1;
-            return list[i] ?? [];
-          };
-        return (..._args: any[]) => proxy;
-      },
-    },
-  );
-  return proxy;
-}
-
-const build = (opts: {
-  pageCandidates: Row[];
-  denied: Set<string>;
-  userSpaceIds?: string[];
-}) => {
-  const filterAccessiblePageIds = jest.fn(
-    async ({ pageIds }: { pageIds: string[] }) =>
-      pageIds.filter((id) => !opts.denied.has(id)),
-  );
-  const db = makeDb((table) => (table === 'pages' ? opts.pageCandidates : []));
-  const pageRepo = { withSpace: () => ({}) };
-  const shareRepo = {};
-  const spaceMemberRepo = {
-    getUserSpaceIdsQuery: () => ({}),
-    getUserSpaceIds: jest.fn(async () => opts.userSpaceIds ?? ['space-1']),
-  };
-  const pagePermissionRepo = { filterAccessiblePageIds };
+/** The candidate statement and the hydrate over a fixed rank-ordered stream (search-db.testkit.ts). */
+const build = (opts: { pageCandidates: SearchRow[]; denied: Set<string> }) => {
+  const sdb = searchDb({ candidates: opts.pageCandidates });
+  const pdp = pdpStub({ userDenied: opts.denied });
   const service = new PdpSearchService(
-    db as any,
-    pageRepo as any,
-    shareRepo as any,
-    spaceMemberRepo as any,
-    pagePermissionRepo as any,
+    sdb.db as any,
+    { withSpace: (eb: any) => eb.lit(null).as('space') } as any,
+    {} as any,
+    { getUserSpaceIdsQuery: () => sdb.db.selectFrom('space_members').select('spaceId') } as any,
+    {} as any,
+    pdp,
   );
-  return { service, filterAccessiblePageIds, spaceMemberRepo };
+  return { service, pdp, ...sdb };
 };
 
 describe('PdpSearchService — filter-then-retrieve COMPLETENESS beyond the first window (I5)', () => {
@@ -148,7 +61,7 @@ describe('PdpSearchService — filter-then-retrieve COMPLETENESS beyond the firs
       i === 299 ? AUTH : `d${i}`,
     );
     const denied = new Set(ids.filter((id) => id !== AUTH));
-    const { service, filterAccessiblePageIds } = build({
+    const { service, pdp, candidateQueries } = build({
       pageCandidates: mkRows(ids),
       denied,
     });
@@ -164,32 +77,22 @@ describe('PdpSearchService — filter-then-retrieve COMPLETENESS beyond the firs
     // …and it is the FULL page record (title + newline-normalized highlight), not a stripped stub.
     expect(items[0].title).toBe(`title-${AUTH}`);
     expect(items[0].highlight).toBe(`hi ${AUTH}`);
-    // Load-bearing: the gate had to scan all three windows (128 + 128 + 44) to reach candidate #300.
-    // A single-window (naive-LIMIT) gate would have called the PDP once and returned empty.
-    expect(filterAccessiblePageIds).toHaveBeenCalledTimes(3);
+    // Load-bearing: the gate had to walk all three windows (128 + 128 + 44) to reach candidate #300.
+    // A single-window (naive-LIMIT) gate would have called the PDP once and returned empty. #696: still ONE
+    // candidate statement — the windows are over the list it returned, in memory.
+    expect(userLegCalls(pdp).map((c) => c[3].length)).toEqual([128, 128, 44]);
+    expect(candidateQueries()).toHaveLength(1);
   });
 
-  it('walks PAST two wholly-denied windows to fill a full authorized page from window 3 (explicit windows)', async () => {
-    // Same I5 property with explicit non-slicing windows: windows 1 & 2 are full (128 rows) and every
-    // row is denied; window 3 carries the accessible matches. The gate must not stop at the spent
+  it('walks PAST two wholly-denied windows to fill a full authorized page from window 3', async () => {
+    // Same I5 property: windows 1 & 2 are full (128 ids) and every id is denied; window 3 carries the
+    // accessible matches. The gate must not stop at the spent
     // windows — it must keep walking and return a FULL page (== limit) of authorized rows. Task #16.
-    const w1 = mkRows(Array.from({ length: 128 }, (_, i) => `d${i}`));
-    const w2 = mkRows(Array.from({ length: 128 }, (_, i) => `d${128 + i}`));
-    const w3 = mkRows(['a0', 'a1', 'a2', 'a3', 'a4']); // partial window → loop breaks after it
-    const denied = new Set(
-      Array.from({ length: 256 }, (_, i) => `d${i}`),
-    );
-    const filterAccessiblePageIds = jest.fn(
-      async ({ pageIds }: { pageIds: string[] }) =>
-        pageIds.filter((id) => !denied.has(id)),
-    );
-    const service = new PdpSearchService(
-      makeSeqDb({ pages: [w1, w2, w3] }) as any,
-      { withSpace: () => ({}) } as any,
-      {} as any,
-      { getUserSpaceIdsQuery: () => ({}), getUserSpaceIds: async () => ['s1'] } as any,
-      { filterAccessiblePageIds } as any,
-    );
+    const denied = new Set(Array.from({ length: 256 }, (_, i) => `d${i}`));
+    const { service, pdp } = build({
+      pageCandidates: mkRows([...denied, 'a0', 'a1', 'a2', 'a3', 'a4']),
+      denied,
+    });
 
     const { items } = await service.searchPage(
       { query: 'foo', limit: 3 } as any,
@@ -200,7 +103,7 @@ describe('PdpSearchService — filter-then-retrieve COMPLETENESS beyond the firs
     expect(items.map((i: any) => i.id)).toEqual(['a0', 'a1', 'a2']);
     expect(items.every((i: any) => !denied.has(i.id))).toBe(true);
     // Proof it walked past both denied windows before reaching the accessible one.
-    expect(filterAccessiblePageIds).toHaveBeenCalledTimes(3);
+    expect(pdp.tryFilterResources).toHaveBeenCalledTimes(3);
   });
 
   it('paginates over the AUTHORIZED set with no skip/dup when accessible matches are sparse and interleaved across windows', async () => {

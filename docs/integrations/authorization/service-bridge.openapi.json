@@ -830,7 +830,7 @@
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" },
           "429": { "$ref": "#/components/responses/RateLimited" },
-          "503": { "$ref": "#/components/responses/Unconfigured" }
+          "503": { "description": "As Unconfigured; or (1.11.0, wiki-v2 #696) the search was shed: its per-process bulkhead or the caller's two in-flight searches were full, a statement ran past its bound, or the 6 s search deadline passed. Then the body carries code `engine_busy`. Also answered (no code) when the authorization service could not answer: the search did not run, and is never answered as an empty result. Nothing was changed; a retry may succeed.", "content": { "application/json": { "schema": { "anyOf": [{ "$ref": "#/components/schemas/Error" }, { "$ref": "#/components/schemas/EngineBusyError" }] } } } }
         }
       }
     },
@@ -1771,7 +1771,8 @@
                 "content": { "type": "string", "description": "Up to 524288 UTF-8 bytes; larger is answered per item as `too_large` (the request body limit bounds the call)." }
               }
             }
-          }
+          },
+          "actorUserId": { "type": "string", "format": "uuid", "description": "Optional (wiki-v2 #642). The Docmost user the integrator validates FOR (the import's acting human). Only an admission key at the content converter: the conversions take that user's turn, the same as their own writes, instead of the shared turn of actorless work. Never used for authorization; nothing is read or written as that user. An engine before this field ignores it (whitelisting validation drops unknown keys)." }
         }
       },
       "ContentValidationResult": {

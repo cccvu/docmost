@@ -88,3 +88,44 @@ describe('#626 untrusted content is converted only in the bounded worker', () =>
     expect(offenders).toEqual([]);
   });
 });
+
+/**
+ * #642: one human = one admission key. A batch queue that names no human gives its work a turn of its own beside that
+ * human's requests, so every `batchConversion(...)` call outside content-parse must pass the user who started the
+ * work as its second argument (the zip import: the file task's creator).
+ */
+describe('#642 every batch conversion names the human who started it', () => {
+  const batchCalls = (file: string, text = readFileSync(file, 'utf8')): Array<{ line: number; args: string[] }> => {
+    const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
+    const found: Array<{ line: number; args: string[] }> = [];
+    const visit = (node: ts.Node) => {
+      if (ts.isCallExpression(node) && ts.isIdentifier(node.expression) && node.expression.text === 'batchConversion') {
+        found.push({
+          line: sf.getLineAndCharacterOfPosition(node.getStart()).line + 1,
+          args: node.arguments.map((a) => a.getText(sf)),
+        });
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(sf);
+    return found;
+  };
+  const files = walk(SRC_ROOT, []).filter((f) => !f.includes(`${sep}editor-compat${sep}content-parse${sep}`));
+  const calls = files.flatMap((file) =>
+    batchCalls(file).map((c) => ({ ...c, file: relative(SRC_ROOT, file).split(sep).join('/') })),
+  );
+
+  it('the zip import passes the file task creator', () => {
+    expect(calls).toContainEqual(
+      expect.objectContaining({
+        file: 'integrations/import/services/file-import-task.service.ts',
+        args: ['`file-task:${fileTask.id}`', 'fileTask.creatorId'],
+      }),
+    );
+  });
+
+  it('no call leaves the human out', () => {
+    expect(batchCalls('probe.ts', 'batchConversion(`file-task:${id}`);')).toHaveLength(1); // anti-vacuity
+    expect(calls.filter((c) => c.args.length < 2).map((c) => `${c.file}:${c.line}`)).toEqual([]);
+  });
+});

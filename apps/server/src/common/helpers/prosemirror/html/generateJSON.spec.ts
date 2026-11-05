@@ -11,7 +11,9 @@
  *   - a spy on `http.request`/`https.request` that records every attempt and refuses any target other than
  *     that listener, so no case can reach a real host even if the hardening regresses.
  *
- * A control case shows a default happy-dom window does fetch, so the detectors are not vacuous. A separate block
+ * Control cases show a window with every loader switched ON does fetch, so the detectors are not vacuous, and each
+ * isolation setting is shown to stop its loaders on its own against that window (happy-dom 21 already switches CSS
+ * and iframe loading off by default, so a default window would prove nothing). A separate block
  * pins the parse and serialize output for ordinary media content, so the hardening is proven to change nothing
  * a page author can see.
  */
@@ -27,7 +29,7 @@ import {
 } from '../../../../collaboration/collaboration.util';
 import { getSchema } from '@tiptap/core';
 import { DOMParser as PMDOMParser } from '@tiptap/pm/model';
-import { Window } from 'happy-dom';
+import { type IOptionalBrowserSettings, Window } from 'happy-dom';
 import BrowserFrameFactory from 'happy-dom/lib/browser/utilities/BrowserFrameFactory.js';
 import { createNetworkIsolatedWindow, generateJSON } from './generateJSON';
 
@@ -223,28 +225,156 @@ describe('#621 happy-dom parsing never reaches the network', () => {
   });
 });
 
-describe('#621 the parse window refuses requests at its fetch layer', () => {
-  // The loaders are switched off above. This proves the layer under them refuses as well, so a loader a later
-  // happy-dom adds or turns back on still cannot reach the network.
+/**
+ * Each isolation setting is load-bearing on its own.
+ *
+ * happy-dom 21 switched CSS and iframe loading OFF by default, so a default window no longer shows that anything
+ * would load, and a setting that only repeats a default proves nothing. Every control and proof here therefore
+ * starts from LOADERS_ON: each loader switched ON explicitly, as a later happy-dom (or a changed default) could
+ * have it. One isolation setting is then applied ALONE, with the value the real parse window has (read back from
+ * `createNetworkIsolatedWindow()`, not restated here), and must stop its loaders by itself. Dropping a setting from
+ * the parse window, or a happy-dom that stops reading one, turns its row red.
+ */
+describe('#621 each isolation setting stops its loaders on its own (on a window with every loader on)', () => {
+  const LOADERS_ON: IOptionalBrowserSettings = {
+    enableJavaScriptEvaluation: true,
+    suppressInsecureJavaScriptEnvironmentWarning: true, // the probes below are this file's own, never content
+    enableCSSFileLoading: true,
+    enableIframePageLoading: true,
+  };
 
-  it('control: a default happy-dom window loads what it parses (the detectors work)', async () => {
-    // The pre-#621 setup, left open so the loads are not raced by teardown.
-    const w = new Window();
+  /** Adds one loader to a live window, aimed under `base`. */
+  type Probe = (w: Window, base: string) => void;
+  const element =
+    (tag: string, attrs: (base: string) => Record<string, string>, text?: (base: string) => string): Probe =>
+    (w, base) => {
+      const el = w.document.createElement(tag);
+      for (const [k, v] of Object.entries(attrs(base))) el.setAttribute(k, v);
+      if (text) el.textContent = text(base);
+      w.document.body.appendChild(el);
+    };
+  const PROBES = {
+    'link rel=stylesheet': element('link', (b) => ({ rel: 'stylesheet', href: `${b}/css` })),
+    'iframe src': element('iframe', (b) => ({ src: `${b}/iframe` })),
+    // `async`: a blocking script is fetched synchronously from a child process, which would deadlock against the
+    // in-process listener instead of failing.
+    'script src': element('script', (b) => ({ async: '', src: `${b}/script.js` })),
+    'inline script fetch()': element('script', () => ({}), (b) => `fetch('${b}/inline-fetch')`),
+    'window.open() popup': element('script', () => ({}), (b) => `window.open('${b}/popup')`),
+  } satisfies Record<string, Probe>;
+  type ProbeName = keyof typeof PROBES;
+  const PATH: Record<ProbeName, string> = {
+    'link rel=stylesheet': '/css',
+    'iframe src': '/iframe',
+    'script src': '/script.js',
+    'inline script fetch()': '/inline-fetch',
+    'window.open() popup': '/popup',
+  };
+  const ALL = Object.keys(PROBES) as ProbeName[];
+
+  /** The parse window's effective value at `path` (e.g. `navigation.disableChildFrameNavigation`). */
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- a settings leaf of any type
+  const isolated = (path: string): any => {
+    const w = createNetworkIsolatedWindow();
     try {
-      new w.DOMParser().parseFromString(
-        `<!DOCTYPE html><html><body><iframe src="${origin}/control-iframe"></iframe><link rel="stylesheet" href="${origin}/control-css"></body></html>`,
-        'text/html',
-      );
+      return path.split('.').reduce<any>((o, k) => o?.[k], w.happyDOM.settings);
+    } finally {
+      void w.happyDOM.close();
+    }
+  };
+  /** `LOADERS_ON`, plus ONE setting at `path` with `value`. */
+  const withOne = (path: string, value: unknown): IOptionalBrowserSettings => {
+    const [head, tail] = path.split('.');
+    return { ...LOADERS_ON, ...(tail ? { [head]: { [tail]: value } } : { [head]: value }) } as IOptionalBrowserSettings;
+  };
+
+  /** Runs one probe in a fresh window, aimed under `<origin><prefix>`; answers what the listener received. */
+  const run = async (settings: IOptionalBrowserSettings, probe: ProbeName, prefix: string): Promise<string[]> => {
+    received.length = 0;
+    attempted.length = 0;
+    const w = new Window({ url: `${origin}/`, settings });
+    try {
+      PROBES[probe](w, `${origin}${prefix}`);
       await settle();
     } finally {
       await w.happyDOM.close();
     }
-    expect([...received].sort()).toEqual([
-      'GET /control-css',
-      'GET /control-iframe',
-    ]);
-    receivedEver.length = 0; // the control's requests are the only ones this file expects
+    return [...received];
+  };
+
+  it.each(ALL.map((p) => [p]))('control: %s loads on a window with every loader on (the detectors work)', async (probe) => {
+    expect(await run(LOADERS_ON, probe, '/control')).toEqual([`GET /control${PATH[probe]}`]);
   });
+
+  /**
+   * Each isolation setting, and the probes it must stop alone. `enableJavaScriptEvaluation: false` is also happy-dom's
+   * own default (20.x and 21.x), so dropping that line alone stays green; its row reds the day a default flips.
+   */
+  const SETTINGS: Array<[string, ProbeName[]]> = [
+    ['enableJavaScriptEvaluation', ['inline script fetch()', 'script src', 'window.open() popup']],
+    ['disableJavaScriptFileLoading', ['script src']],
+    ['disableCSSFileLoading', ['link rel=stylesheet']],
+    ['disableIframePageLoading', ['iframe src']],
+    ['navigation.disableChildFrameNavigation', ['iframe src']],
+    ['navigation.disableMainFrameNavigation', ['window.open() popup']], // the popup's own main frame
+    ['navigation.disableChildPageNavigation', ['window.open() popup']],
+    ['fetch.interceptor', ALL], // the layer under every loader: it refuses even with all of them on
+  ];
+
+  it.each(SETTINGS.flatMap(([path, probes]) => probes.map((p) => [path, p] as const)))(
+    '%s alone stops: %s',
+    async (path, probe) => {
+      expect(await run(withOne(path, isolated(path)), probe, '/proof')).toEqual([]);
+    },
+  );
+
+  it('navigation.disableFallbackToSetURL: a refused navigation leaves the URL as it was', async () => {
+    const settings: IOptionalBrowserSettings = {
+      ...LOADERS_ON,
+      navigation: {
+        disableMainFrameNavigation: isolated('navigation.disableMainFrameNavigation'),
+        disableFallbackToSetURL: isolated('navigation.disableFallbackToSetURL'),
+      },
+    };
+    const w = new Window({ url: `${origin}/`, settings });
+    try {
+      element('script', () => ({}), (b) => `location.href = '${b}/moved'`)(w, origin);
+      await settle();
+      expect(w.location.href).toBe(`${origin}/`);
+    } finally {
+      await w.happyDOM.close();
+    }
+  });
+
+  it("proves every setting the parse window changes from happy-dom's defaults", async () => {
+    /** Settings flattened one level deep (`navigation.x`), the depth the parse window sets them at. */
+    const flat = (s: Record<string, any>): Record<string, unknown> =>
+      Object.fromEntries(
+        Object.entries(s).flatMap(([k, v]) =>
+          v && typeof v === 'object' && !Array.isArray(v) && Object.getPrototypeOf(v) === Object.prototype
+            ? Object.entries(v).map(([k2, v2]) => [`${k}.${k2}`, v2])
+            : [[k, v]],
+        ),
+      );
+    const plain = new Window();
+    const parse = createNetworkIsolatedWindow();
+    try {
+      const defaults = flat(plain.happyDOM.settings as any);
+      const changed = Object.entries(flat(parse.happyDOM.settings as any))
+        .filter(([k, v]) => defaults[k] !== v)
+        .map(([k]) => k);
+      const proven = [...SETTINGS.map(([p]) => p), 'navigation.disableFallbackToSetURL'];
+      expect(changed.length).toBeGreaterThan(0);
+      expect(changed.filter((k) => !proven.includes(k))).toEqual([]);
+    } finally {
+      await Promise.all([plain.happyDOM.close(), parse.happyDOM.close()]);
+    }
+  });
+});
+
+describe('#621 the parse window refuses requests at its fetch layer', () => {
+  // The loaders are switched off above. This proves the layer under them refuses as well, so a loader a later
+  // happy-dom adds or turns back on still cannot reach the network (the block above shows it with every loader on).
 
   it('an async fetch resolves to a network error without a request', async () => {
     const w = createNetworkIsolatedWindow();
@@ -456,9 +586,9 @@ describe('#626 the detached parse gives the same output as the document parse it
 
 // Last in the file on purpose: a request that lands after its own test's wait still fails the file.
 describe('#621 late arrivals', () => {
-  it('no request reached the listener at any point (apart from the control)', async () => {
+  it('no request reached the listener at any point (apart from the controls)', async () => {
     await settle();
-    expect(receivedEver).toEqual([]);
+    expect(receivedEver.filter((r) => !r.startsWith('GET /control/'))).toEqual([]);
   });
 });
 

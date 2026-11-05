@@ -17,6 +17,7 @@ import {
   closeContentParser,
   ContentParseBusyException,
   ContentTooComplexException,
+  ConversionBudgetExhaustedException,
 } from '../editor-compat/content-parse/content-parse.service';
 
 /**
@@ -173,6 +174,17 @@ describe('validate-content — budgets and codes', () => {
       { idx: 2, ok: false, code: 'parse_budget_exceeded' },
     ]);
     expect(t.parsed).toEqual(['a', 'b']); // c was never handed to the converter
+  });
+
+  it("#642: the acting human's spent converter budget fails the whole call with 429 + its refill time, never a per-item verdict", async () => {
+    const t = make(async (content) => {
+      if (content === 'b') throw new ConversionBudgetExhaustedException(7);
+    });
+    const r = await status(
+      t.svc.validateContent({ items: ['a', 'b', 'c'].map((content) => ({ format: 'markdown' as const, content })) }),
+    );
+    expect(r).toMatchObject({ status: 429, body: { code: 'conversion_budget_exhausted' } });
+    expect(t.parsed).toEqual(['a', 'b']);
   });
 
   it('the byte budget still wins when both are spent at the same item (too_large: the request itself is too big)', async () => {

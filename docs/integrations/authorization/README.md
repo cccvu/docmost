@@ -113,6 +113,14 @@ You only implement a *caller* for these; the fork is the server. They fall into 
   narrowing access change and narrow the ones that lost access, #501; it replaced the per-page
   `force-disconnect` in 1.5.0) and `POST /api/collab/force-disconnect-user` (account disable, #455).
 
+**Bounded engine workloads (1.11.0; wiki-v2 #696, #642).** `POST /api/service/content/search` answers `503` instead of
+an empty result when the authorization service cannot answer, and `503 { code: engine_busy }` when the search is shed
+(the per-process search bulkhead or the caller's two in-flight searches are full, a statement runs past its bound, or
+the 6 s search deadline passes). Both are retryable; nothing was changed. `POST /api/service/pages/validate-content`
+takes an optional `actorUserId` (the Docmost user the integrator validates for): its conversions take that user's
+turn at the content converter, the same as the user's own writes. It is an admission key only, never used for
+authorization. An engine before 1.11.0 drops the unknown field and validates on the shared actorless turn.
+
 **Native routes refused in remote mode (1.10.0; wiki-v2 #502, #598, #636).** In `AUTHZ_MODE=remote` the engine
 answers `404` to every authenticated caller of the native routes below, before any permission check, and forwards one
 audit row per refusal (its event in brackets) to `/audit/ingest`. A session minted before the switch to remote (an

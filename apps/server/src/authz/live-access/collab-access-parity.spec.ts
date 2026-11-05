@@ -1,4 +1,4 @@
-import { NotFoundException, UnauthorizedException } from '@nestjs/common';
+import { NotFoundException, ServiceUnavailableException, UnauthorizedException } from '@nestjs/common';
 
 // collaboration.util pulls in tiptap/@docmost/editor-ext/yjs, which jest cannot load; the extension only needs
 // getPageId from it.
@@ -81,7 +81,7 @@ function authzFor(c: Case) {
     checkBulk: async (
       _s: unknown,
       items: { permission: string; resourceType: string }[],
-    ) => (c.pdpFails ? items.map(() => false) : answer(items)), // the real client's fail-closed all-false
+    ) => (c.pdpFails ? items.map(() => false) : answer(items)), // the real client's fail-closed all-false (no repo uses it since #696)
     tryCheckBulk: async (
       _s: unknown,
       items: { permission: string; resourceType: string }[],
@@ -114,7 +114,13 @@ async function connectDecision(c: Case): Promise<CollabAccess> {
   try {
     await ext.onAuthenticate(data);
   } catch (e) {
-    if (e instanceof UnauthorizedException || e instanceof NotFoundException)
+    // Hocuspocus refuses the connection on ANY throw from onAuthenticate. #696: a PDP that could not answer is a
+    // 503 (retryable), which refuses the connect exactly as a deny does.
+    if (
+      e instanceof UnauthorizedException ||
+      e instanceof NotFoundException ||
+      e instanceof ServiceUnavailableException
+    )
       return 'deny';
     throw e;
   }
@@ -251,6 +257,24 @@ describe('collab access parity: decideCollabAccess ⇔ AuthenticationExtension.o
     };
     expect(await connectDecision(c)).toBe('deny');
     expect(revalidateDecision(c)).toBe('unknown');
+  });
+
+  it('#696: the connect-time PDP failure is a 503 (retryable), never a deny-shaped Unauthorized/NotFound', async () => {
+    const c: Case = {
+      name: 'pdp down',
+      grants: { edit: true, view: true, pageView: true, pageEdit: true },
+      pdpFails: true,
+    };
+    const authz = authzFor(c) as any;
+    const ext = new AuthenticationExtension(
+      { verifyJwt: async () => ({ sub: USER, workspaceId: WS }) } as any,
+      { findById: async () => liveUser } as any,
+      { findById: async () => livePage } as any,
+      new PdpSpaceMemberRepo({} as any, {} as any, {} as any, {} as any, authz),
+      new PdpPagePermissionRepo(dbFor(c), {} as any, {} as any, authz),
+    );
+    const data = { documentName: `page.${PAGE}`, token: 't', connectionConfig: { readOnly: false } } as any;
+    await expect(ext.onAuthenticate(data)).rejects.toBeInstanceOf(ServiceUnavailableException);
   });
 
   it('#524: a failed lineage read on an unplaced page is DENY at connect but UNKNOWN on revalidation', async () => {

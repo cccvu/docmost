@@ -90,6 +90,11 @@ export interface SnapshotOutcome {
  * Returns the same shape as `POST /api/pages/update` — canonical JSON content, no markdown/HTML echo — and
  * keeps the upstream `{ data, success }` envelope (no `@SkipTransform`), because the platform reaches it
  * through the ordinary relay, which unwraps that envelope.
+ *
+ * wiki-v2#696: the platform also sends every markdown/html `/v1` content write here, with neither a digest nor a
+ * key. That call must stay the native write minus the echo (the upstream route converts the whole stored page back to
+ * the request's format on the event loop, which the platform discarded): no compare, no dedup — only the same edit
+ * check, parser, content operation, store and `PageService.update` as `PageController.update`. Keep it so.
  */
 @UseGuards(JwtAuthGuard)
 @Controller('pages')
