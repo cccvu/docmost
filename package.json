@@ -135,7 +135,8 @@
       "langsmith": "0.7.0",
       "follow-redirects": "1.16.0",
       "protobufjs": "7.5.8",
-      "ip-address": "10.1.1"
+      "ip-address": "10.1.1",
+      "happy-dom": "21.0.4"
     },
     "neverBuiltDependencies": []
   }

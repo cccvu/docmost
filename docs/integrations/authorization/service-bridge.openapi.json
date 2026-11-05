@@ -1771,7 +1771,8 @@
                 "content": { "type": "string", "description": "Up to 524288 UTF-8 bytes; larger is answered per item as `too_large` (the request body limit bounds the call)." }
               }
             }
-          }
+          },
+          "actorUserId": { "type": "string", "format": "uuid", "description": "Optional (wiki-v2 #642). The Docmost user the integrator validates FOR (the import's acting human). Only an admission key at the content converter: the conversions take that user's turn, the same as their own writes, instead of the shared turn of actorless work. Never used for authorization; nothing is read or written as that user. An engine before this field ignores it (whitelisting validation drops unknown keys)." }
         }
       },
       "ContentValidationResult": {

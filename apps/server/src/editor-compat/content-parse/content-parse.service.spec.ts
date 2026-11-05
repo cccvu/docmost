@@ -8,9 +8,14 @@ import * as path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import { BadRequestException } from '@nestjs/common';
 import {
+  batchConversion,
+  CONTENT_PARSE_LIMITS,
   ContentParseBusyException,
   ContentParsePool,
   ContentTooComplexException,
+  convertOnBehalfOf,
+  requestQueue,
+  userConversionKey,
   type ContentParseLimits,
   type SpawnWorker,
 } from './content-parse.service';
@@ -85,6 +90,15 @@ describe('#626 conversion results', () => {
     await expect(pool.parse('b', 'markdown', 'user:1')).resolves.toEqual({ type: 'doc', label: 'b' });
     await expect(pool.toHtml('c', 'user:2')).resolves.toBe('<p>c</p>');
     expect(spawned).toHaveLength(1);
+  });
+
+  it('Markdown → HTML: `maxChars` lowers the cap for one call (→ 422), and never raises it past the limit', async () => {
+    const { pool } = track(makePool({ maxChars: 100 }));
+    const md = (n: number) => 'x'.repeat(n); // the fixture answers `<p>${md}</p>`: n + 7 characters
+    await expect(pool.toHtml(md(23), 'user:1', undefined, 30)).resolves.toBe(`<p>${md(23)}</p>`);
+    await expect(pool.toHtml(md(24), 'user:1', undefined, 30)).rejects.toBeInstanceOf(ContentTooComplexException);
+    await expect(pool.toHtml(md(93), 'user:1')).resolves.toBe(`<p>${md(93)}</p>`); // the limit, by default
+    await expect(pool.toHtml(md(94), 'user:1', undefined, 10_000)).rejects.toBeInstanceOf(ContentTooComplexException);
   });
 
   it('content that does not convert is 400 "Invalid content format" (as before)', async () => {
@@ -205,6 +219,105 @@ describe('#626 admission and fairness', () => {
     const { pool } = track(makePool());
     await Promise.all([pool.parse('a', 'html', 'user:A'), pool.parse('b', 'html', 'user:B')]);
     await pool.parse('crash', 'html', 'user:C').catch(() => undefined);
-    expect((pool as unknown as { principals: Map<string, unknown> }).principals.size).toBe(0);
+    // C's turn is released once the replacement worker is ready (#642), then C is forgotten too.
+    const principals = (pool as unknown as { principals: Map<string, unknown> }).principals;
+    await until(() => principals.size === 0);
+  });
+});
+
+describe('#642 one principal never causes another principal\'s 503', () => {
+  it('the production limits: wait > deadline, and wait + a worker load (≤3.5 s) + deadline fits the 20 s relay', () => {
+    const { waitMs, deadlineMs } = CONTENT_PARSE_LIMITS;
+    expect(waitMs).toBeGreaterThan(deadlineMs);
+    expect(waitMs + 3_500 + deadlineMs).toBeLessThan(20_000); // the platform's content-write relay timeout
+  });
+
+  it("a conversion that killed the worker keeps its principal's turn until the replacement is ready: a newcomer goes first", async () => {
+    // The replacement loads for longer than the newcomer may wait.
+    const { pool, spawned } = track(makePool({ deadlineMs: 300, waitMs: 500 }, ['normal', 'slow-ready:700']));
+    await pool.parse('warm', 'html', 'user:A');
+    const order: string[] = [];
+    const a1 = pool.parse('hang', 'html', 'user:A').catch((e) => e);
+    // A's next conversion is already waiting for A's turn (with a wait long enough to outlast the reload).
+    const a2 = pool.parse('sleep:50', 'html', 'user:A', 5_000).then(() => order.push('a2'));
+    await until(() => spawned.length === 2); // a1 was killed at the deadline; its replacement is loading
+    const b = pool.parse('sleep:50', 'html', 'user:B').then(() => order.push('b'));
+    await expect(a1).resolves.toBeInstanceOf(ContentTooComplexException);
+    // Without the hold, a2 takes the free slot and waits out the load inside it, and b gets 503 behind it.
+    await b;
+    await a2;
+    expect(order).toEqual(['b', 'a2']);
+  });
+
+  it('the killed conversion is answered at once, not after the reload', async () => {
+    const { pool } = track(makePool({ deadlineMs: 300 }, ['normal', 'slow-ready:1500']));
+    await pool.parse('warm', 'html', 'user:A');
+    const started = Date.now();
+    await expect(pool.parse('hang', 'html', 'user:A')).rejects.toBeInstanceOf(ContentTooComplexException);
+    expect(Date.now() - started).toBeLessThan(1_200);
+    // …and the principal is forgotten once the reload releases its turn.
+    const principals = (pool as unknown as { principals: Map<string, unknown> }).principals;
+    expect(principals.has('user:A')).toBe(true);
+    await until(() => !principals.has('user:A'), 5_000);
+  });
+
+  it('a principal looping deadline-length conversions, with slow reloads, never gets a newcomer refused', async () => {
+    const deadlineMs = 300;
+    const { pool, spawned } = track(makePool({ deadlineMs, waitMs: 400 }, ['normal', 'slow-ready:250']));
+    await pool.parse('warm', 'html', 'user:A');
+    let stop = false;
+    // A closed loop, three deep: every conversion runs to the deadline and kills the worker.
+    const abuse = async () => {
+      while (!stop) await pool.parse('hang', 'html', 'user:A', 5_000).catch(() => undefined);
+    };
+    const loops = [abuse(), abuse(), abuse()];
+    const outcomes: string[] = [];
+    const newcomer = (i: number) =>
+      pool.parse('sleep:20', 'html', `user:N${i}`).then(
+        () => 'ok',
+        (e: Error) => e.constructor.name,
+      );
+    try {
+      for (let i = 0; i < 5; i++) {
+        // The worst moment: just after a kill, while the replacement loads.
+        const killed = spawned.length;
+        await until(() => spawned.length > killed, 5_000);
+        outcomes.push(await newcomer(i));
+      }
+      for (let i = 5; i < 9; i++) {
+        await new Promise((r) => setTimeout(r, 40 + 70 * (i - 5))); // other moments of the cycle
+        outcomes.push(await newcomer(i));
+      }
+    } finally {
+      stop = true;
+      await Promise.all(loops);
+    }
+    expect(outcomes).toEqual(Array(9).fill('ok'));
+  }, 30_000);
+
+  it("one human's request, zip import and validate-content share ONE key: another principal waits behind one of them", async () => {
+    const direct = userConversionKey('U');
+    const validation = await convertOnBehalfOf('U', async () => requestQueue());
+    const zip = batchConversion('file-task:1', 'U');
+    expect([validation.principal, zip.principal]).toEqual([direct, direct]);
+    expect(validation.waitMs).toBe(CONTENT_PARSE_LIMITS.waitMs);
+    expect(zip.waitMs).toBe(CONTENT_PARSE_LIMITS.batchWaitMs); // the import keeps its long wait
+
+    const { pool } = track(makePool({ deadlineMs: 2_000, waitMs: 500 }));
+    const u = [
+      pool.parse('sleep:350', 'html', direct, 5_000),
+      pool.parse('sleep:350', 'html', validation.principal, 5_000),
+      pool.parse('sleep:350', 'html', zip.principal, 5_000),
+    ];
+    await new Promise((r) => setTimeout(r, 20));
+    // Under three keys B would queue behind all three (1050 ms > its 500 ms wait).
+    await expect(pool.parse('b', 'html', 'user:B')).resolves.toEqual({ type: 'doc', label: 'b' });
+    await Promise.all(u);
+  });
+
+  it('work no human started keeps its own key; a request with no actor and no named human is `background`', async () => {
+    expect(batchConversion('file-task:1', null).principal).toBe('batch:file-task:1');
+    expect(requestQueue().principal).toBe('background');
+    expect((await convertOnBehalfOf(undefined, async () => requestQueue())).principal).toBe('background');
   });
 });
