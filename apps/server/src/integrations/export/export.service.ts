@@ -38,9 +38,9 @@ import {
   getAttachmentIds,
   getProsemirrorContent,
 } from '../../common/helpers/prosemirror/utils';
-import { htmlToMarkdown } from '@docmost/editor-ext';
-// CCC seam (#699): bounded export — content and attachments decided before the first byte, attachments streamed
-import { ExportAttachmentPlan, loadExportContent } from '../../editor-compat/export';
+// CCC seam (#699): bounded export — content and attachments decided before the first byte, attachments streamed;
+// Markdown through htmlToMarkdown with its jsdom window closed (it was kept until the whole export had converted)
+import { ExportAttachmentPlan, htmlToMarkdownReleasingDom, loadExportContent } from '../../editor-compat/export';
 
 type AllowedAttachment = {
   id: string;
@@ -104,7 +104,7 @@ export class ExportService {
         /<colgroup[^>]*>[\s\S]*?<\/colgroup>/gim,
         '',
       );
-      return htmlToMarkdown(newPageHtml);
+      return htmlToMarkdownReleasingDom(newPageHtml); // CCC seam (#699)
     }
 
     return;

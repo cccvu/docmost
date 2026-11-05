@@ -16,7 +16,9 @@
  *     measured as the JSON text the driver parses (`octet_length(content::text)`). Measured (Node 24, realistic
  *     ProseMirror pages): the parsed documents retain ~1.9 B of heap per text byte and the HTML each page becomes
  *     another ~1.9 B, all held until the archive has streamed, so 16 MiB costs ~60 MiB of heap and the 8 exports the
- *     admission allows at once stay under ~0.5 GiB of the 1 GiB heap. `pg_column_size` alone is not a heap bound:
+ *     admission allows at once stay under ~0.5 GiB of the 1 GiB heap. That holds for Markdown only because the
+ *     export converts it with the jsdom window released (html-to-markdown.ts): Turndown otherwise kept every page's
+ *     DOM, ~150× its HTML, until the whole export had converted. `pg_column_size` alone is not a heap bound:
  *     pglz stores realistic pages at ~2.7× and repetitive ones at ~60× smaller (measured, PG 18), so it is only the
  *     cheap first refusal (export-content.ts).
  *   - maxDurationMs (EXPORT_MAX_DURATION_MS, default 30 min): from the start of the export to the end of the archive.

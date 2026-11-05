@@ -22,6 +22,19 @@ const loadSpy = jest.fn(async (_db: unknown, pages: Array<{ id: string; content?
   for (const p of pages) p.content = CONTENT[p.id] ?? null;
   return pages;
 });
+// Every Markdown conversion must go through htmlToMarkdownReleasingDom, which hands Turndown a DOM node (and closes
+// its window); a bare string here is upstream's leaking call.
+const htmlToMarkdownSpy = jest.fn();
+jest.mock('@docmost/editor-ext', () => {
+  const actual = jest.requireActual('@docmost/editor-ext');
+  return {
+    ...actual,
+    htmlToMarkdown: (input: unknown) => {
+      htmlToMarkdownSpy(typeof input);
+      return actual.htmlToMarkdown(input);
+    },
+  };
+});
 // ESM-only; used solely to slug page-mention links, which these fixtures do not have.
 jest.mock('@sindresorhus/slugify', () => ({ __esModule: true, default: (s: string) => s.toLowerCase() }));
 jest.mock('./index', () => ({ ...jest.requireActual('./index'), loadExportContent: (...a: [unknown, any[]]) => loadSpy(...a) }));
@@ -225,6 +238,23 @@ describe('ExportService #699 seam', () => {
     expect(loadSpy.mock.calls[0][1].map((p) => p.id)).toEqual(['root']);
     const zip = await unzip(out.fileStream as Readable);
     expect(await zip.file(`/files/${A}/a.png`)!.async('string')).toBe('AAAA');
+  });
+
+  it('Markdown is converted with the jsdom window released (never upstream\'s string call)', async () => {
+    const f = fixture(1000);
+    const storage = storageStub({ 'ws/a/a.png': 'AAAA' });
+    const { svc } = service({ ...f, storage });
+    htmlToMarkdownSpy.mockClear();
+    const result = await svc.exportPages('root', 'markdown', false, true, 'user-1');
+    const zip = await unzip((result as { stream: Readable }).stream);
+    expect(await zip.file('Root.md')!.async('string')).toContain('# Root');
+    expect(htmlToMarkdownSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(htmlToMarkdownSpy.mock.calls.every(([t]) => t === 'object')).toBe(true);
+
+    htmlToMarkdownSpy.mockClear();
+    const single = await svc.exportPages('root', 'markdown', false, false, 'user-1');
+    expect(single.type).toBe('file');
+    expect(htmlToMarkdownSpy.mock.calls).toEqual([['object']]);
   });
 
   it('the /v1 single-page export (no children, no attachments) is unchanged: a plain file, no zip, no content bound', async () => {
