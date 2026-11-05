@@ -1,4 +1,6 @@
+import { Logger } from '@nestjs/common';
 import {
+  FAILURE_LOG_THROTTLE_MS,
   HttpAuthzClient,
   sanitizeAuthzTimeoutMs,
   SETTLE_MARGIN_MS,
@@ -140,6 +142,133 @@ describe('HttpAuthzClient', () => {
         'c',
       ]),
     ).toEqual(['a', 'c']);
+  });
+
+  describe('tryFilterResources (#696 — failure is null, never "none of these")', () => {
+    const subject = { principalId: 'p1' };
+
+    it('returns the allowed candidates in candidate order, once each, on a well-formed 200', async () => {
+      fetchMock.mockResolvedValueOnce(ok({ ids: ['c', 'a', 'a'] }));
+      expect(
+        await client.tryFilterResources(subject, 'view', 'page', ['a', 'b', 'c']),
+      ).toEqual(['a', 'c']);
+      const [url, init] = fetchMock.mock.calls[0];
+      expect(url).toBe('http://platform.test/authz/filter-resources');
+      expect(JSON.parse(init.body)).toEqual({
+        subject,
+        permission: 'view',
+        resourceType: 'page',
+        candidateIds: ['a', 'b', 'c'],
+      });
+    });
+
+    it('an empty allowed set is [] (a real "none"), distinct from a failure', async () => {
+      fetchMock.mockResolvedValueOnce(ok({ ids: [] }));
+      expect(
+        await client.tryFilterResources(subject, 'view', 'page', ['a']),
+      ).toEqual([]);
+    });
+
+    it('returns [] for no candidates without calling the platform', async () => {
+      expect(await client.tryFilterResources(subject, 'view', 'page', [])).toEqual([]);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('never returns an id the caller did not offer (a Byzantine platform cannot widen the set)', async () => {
+      fetchMock.mockResolvedValueOnce(ok({ ids: ['a', 'not-asked'] }));
+      expect(
+        await client.tryFilterResources(subject, 'view', 'page', ['a', 'b']),
+      ).toEqual(['a']);
+    });
+
+    it('chunks over the 1000 cap and unions the chunks', async () => {
+      const ids = Array.from({ length: 1001 }, (_, i) => `p${i}`);
+      fetchMock
+        .mockResolvedValueOnce(ok({ ids: ['p999'] }))
+        .mockResolvedValueOnce(ok({ ids: ['p1000'] }));
+      expect(await client.tryFilterResources(subject, 'view', 'page', ids)).toEqual([
+        'p999',
+        'p1000',
+      ]);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it('a failure on ANY chunk is null — never the partial union', async () => {
+      const ids = Array.from({ length: 1001 }, (_, i) => `p${i}`);
+      fetchMock
+        .mockResolvedValueOnce(ok({ ids: ['p0'] }))
+        .mockRejectedValueOnce(new Error('down'));
+      expect(await client.tryFilterResources(subject, 'view', 'page', ids)).toBeNull();
+    });
+
+    it.each([
+      ['a network error', () => fetchMock.mockRejectedValueOnce(new Error('down'))],
+      [
+        'a non-200',
+        () =>
+          fetchMock.mockResolvedValueOnce({
+            ok: false,
+            status: 503,
+            json: async () => ({}),
+          }),
+      ],
+      ['a non-array `ids`', () => fetchMock.mockResolvedValueOnce(ok({ ids: 'abc' }))],
+      ['a missing `ids`', () => fetchMock.mockResolvedValueOnce(ok({}))],
+      ['a non-string element', () => fetchMock.mockResolvedValueOnce(ok({ ids: ['a', 7] }))],
+      ['a null body', () => fetchMock.mockResolvedValueOnce(ok(null))],
+    ])('returns null on %s', async (_label, arrange) => {
+      arrange();
+      expect(
+        await client.tryFilterResources(subject, 'view', 'page', ['a', 'b']),
+      ).toBeNull();
+    });
+  });
+
+  describe('failure logging is throttled per path (#696 — a brown-out must not log at request rate)', () => {
+    let errorSpy: jest.SpyInstance;
+    beforeEach(() => {
+      errorSpy = jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    });
+    afterEach(() => {
+      errorSpy.mockRestore();
+      jest.useRealTimers();
+    });
+
+    it('one ERROR per path per window, then the next line carries the suppressed count', async () => {
+      jest.useFakeTimers({ now: 1_000_000 });
+      fetchMock.mockRejectedValue(new Error('ECONNREFUSED'));
+      for (let i = 0; i < 5; i++) await client.check({ principalId: 'p1' }, 'view', 'page', 'x');
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(errorSpy.mock.calls[0][0]).toBe('authz /authz/check failed: ECONNREFUSED');
+
+      // Another path has its own window.
+      await client.tryCheckBulk({ principalId: 'p1' }, [
+        { permission: 'view', resourceType: 'page', resourceId: 'x' },
+      ]);
+      expect(errorSpy).toHaveBeenCalledTimes(2);
+      expect(errorSpy.mock.calls[1][0]).toContain('authz /authz/check-bulk failed');
+
+      jest.setSystemTime(1_000_000 + FAILURE_LOG_THROTTLE_MS);
+      await client.check({ principalId: 'p1' }, 'view', 'page', 'x');
+      expect(errorSpy).toHaveBeenCalledTimes(3);
+      expect(errorSpy.mock.calls[2][0]).toBe(
+        'authz /authz/check failed: ECONNREFUSED (+4 more failures suppressed)',
+      );
+      fetchMock.mockReset();
+    });
+
+    it('the decision is still fail-closed on every throttled call (only the log is suppressed)', async () => {
+      fetchMock.mockRejectedValue(new Error('down'));
+      for (let i = 0; i < 3; i++) {
+        expect(await client.check({ principalId: 'p1' }, 'view', 'page', 'x')).toBe(false);
+        expect(
+          await client.tryCheckBulk({ principalId: 'p1' }, [
+            { permission: 'view', resourceType: 'page', resourceId: 'x' },
+          ]),
+        ).toBeNull();
+      }
+      fetchMock.mockReset();
+    });
   });
 
   // #615: the service leg of an on-behalf-of search names the SERVICE ACCOUNT. The subject must cross verbatim —

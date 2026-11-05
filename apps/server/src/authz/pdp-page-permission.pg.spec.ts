@@ -1,6 +1,6 @@
 import * as postgres from 'postgres';
 import { Kysely } from 'kysely';
-import { ForbiddenException } from '@nestjs/common';
+import { ForbiddenException, ServiceUnavailableException } from '@nestjs/common';
 import { PdpPagePermissionRepo } from './pdp-page-permission.repo';
 import { PageAccessService } from '../core/page/page-access/page-access.service';
 import {
@@ -204,6 +204,18 @@ d('PdpPagePermissionRepo lineage check on real Postgres (#524)', () => {
 
   it('a page with no row denies', async () => {
     expect(await check(uuid(99))).toEqual(DENY);
+  });
+
+  it('#696: a PDP that could not answer is a 503 — in a restricted section or not, never a decision to fall back from', async () => {
+    const [R, C] = [uuid(95), uuid(96)];
+    await page(R, null);
+    await restrict(R);
+    await page(C, R);
+    pdp = null;
+    await expect(check(C)).rejects.toBeInstanceOf(ServiceUnavailableException);
+    await expect(check(R)).rejects.toBeInstanceOf(ServiceUnavailableException);
+    await expect(access.validateCanEdit(asPage(C), user)).rejects.toBeInstanceOf(ServiceUnavailableException);
+    await expect(access.validateCanView(asPage(C), user)).rejects.toBeInstanceOf(ServiceUnavailableException);
   });
 
   it('control: a PDP answer that shows or locks the page is trusted as-is', async () => {

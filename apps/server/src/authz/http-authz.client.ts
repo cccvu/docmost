@@ -6,7 +6,8 @@ import { Injectable, Logger } from '@nestjs/common';
  * A typed client for the wiki-v2 platform's Authorization API (the external PDP). All policy —
  * SpiceDB semantics, identity translation, the schema — lives in the platform; this is only a
  * client. FAIL-CLOSED: any transport error or non-200 resolves to "denied" (false / empty), so a
- * platform outage cannot silently grant access.
+ * platform outage cannot silently grant access. The `try*` methods report that same failure as `null`
+ * instead, for callers that must answer "unknown" (a retryable 503, #696) rather than a deny-shaped status.
  */
 export type AuthzSubject =
   // A platform principal. `subjectType: 'service'` names a SERVICE ACCOUNT (the platform resolves it to its
@@ -32,6 +33,10 @@ const DEFAULT_TIMEOUT_MS = 1500;
  *  confirm step after the fence is reached (a dead-letter read, a fully consistent SpiceDB check with its own
  *  1.2 s deadline, a Redis write). Equal to the interceptor's live-session reserve, so the request budget holds. */
 export const SETTLE_MARGIN_MS = 1500;
+/** At most one ERROR line per authz path per window. During a PDP brown-out every request fails, so an unthrottled
+ *  line per call floods the logs at request rate; one per path per window (with the count it stood for) keeps the
+ *  signal. Mirrors the platform's own per-op WARN throttle (pdp.service.ts). */
+export const FAILURE_LOG_THROTTLE_MS = 5000;
 /** A pending reason as the fork will log it: a short kebab-case word. Anything else from the authorization
  *  service (a third party may implement /sync/settle) is replaced, so it cannot shape the fork's log lines. */
 const REASON_RE = /^[a-z][a-z-]{0,31}$/;
@@ -64,6 +69,25 @@ export class HttpAuthzClient {
     DEFAULT_TIMEOUT_MS,
   );
 
+  private readonly lastFailureLogMs = new Map<string, number>();
+  private readonly suppressedFailures = new Map<string, number>();
+
+  /** Log a failed authz call at ERROR, throttled per path (the key set is the client's own fixed paths). */
+  private logFailure(path: string, what: string): void {
+    const now = Date.now();
+    const last = this.lastFailureLogMs.get(path);
+    if (last !== undefined && now - last < FAILURE_LOG_THROTTLE_MS) {
+      this.suppressedFailures.set(path, (this.suppressedFailures.get(path) ?? 0) + 1);
+      return;
+    }
+    const suppressed = this.suppressedFailures.get(path) ?? 0;
+    this.lastFailureLogMs.set(path, now);
+    this.suppressedFailures.set(path, 0);
+    this.logger.error(
+      `authz ${path} ${what}${suppressed > 0 ? ` (+${suppressed} more failures suppressed)` : ''}`,
+    );
+  }
+
   private async post<T>(path: string, body: unknown): Promise<T | null> {
     // Bound the call: abort after `timeoutMs` so a hung platform can't hang the wiki request. The
     // AbortError lands in the catch below → returns null → the caller fails closed (deny / empty).
@@ -81,12 +105,12 @@ export class HttpAuthzClient {
         signal: controller.signal,
       });
       if (!res.ok) {
-        this.logger.error(`authz ${path} -> HTTP ${res.status}`);
+        this.logFailure(path, `-> HTTP ${res.status}`);
         return null;
       }
       return (await res.json()) as T;
     } catch (e) {
-      this.logger.error(`authz ${path} failed: ${(e as Error).message}`);
+      this.logFailure(path, `failed: ${(e as Error).message}`);
       return null;
     } finally {
       clearTimeout(timer);
@@ -121,9 +145,7 @@ export class HttpAuthzClient {
     if (Array.isArray(r?.results) && r.results.length === checks.length)
       return r.results;
     if (r)
-      this.logger.error(
-        'authz /authz/check-bulk -> malformed results envelope',
-      );
+      this.logFailure('/authz/check-bulk', '-> malformed results envelope');
     return null;
   }
 
@@ -155,9 +177,7 @@ export class HttpAuthzClient {
     const results = await this.bulkResults(subject, checks);
     if (!results) return null;
     if (!results.every((x): x is boolean => typeof x === 'boolean')) {
-      this.logger.error(
-        'authz /authz/check-bulk -> non-boolean result element',
-      );
+      this.logFailure('/authz/check-bulk', '-> non-boolean result element');
       return null;
     }
     return results;
@@ -187,6 +207,46 @@ export class HttpAuthzClient {
         for (const id of r.ids) if (typeof id === 'string') allowed.add(id);
     }
     return [...allowed];
+  }
+
+  /**
+   * {@link filterResources} that reports FAILURE distinctly — `null` — instead of collapsing a failed chunk into
+   * "none of these" (#696). For a caller that must not read "the PDP could not answer" as "nothing is authorized"
+   * (search would otherwise scan on, and answer an empty 200, during a brown-out). `null` covers a transport error,
+   * timeout, non-2xx, and a malformed 200 (a non-array `ids` or a non-string element) on ANY chunk. On success the
+   * answer is the allowed candidates in the caller's order, each once: an id the caller did not offer is never
+   * returned.
+   */
+  async tryFilterResources(
+    subject: AuthzSubject,
+    permission: string,
+    resourceType: string,
+    candidateIds: string[],
+  ): Promise<string[] | null> {
+    if (candidateIds.length === 0) return [];
+    const allowed = new Set<string>();
+    for (let i = 0; i < candidateIds.length; i += FILTER_CHUNK) {
+      const batch = candidateIds.slice(i, i + FILTER_CHUNK);
+      const r = await this.post<{ ids: unknown }>('/authz/filter-resources', {
+        subject,
+        permission,
+        resourceType,
+        candidateIds: batch,
+      });
+      if (!r) return null;
+      const ids = r.ids;
+      if (!Array.isArray(ids) || !ids.every((id): id is string => typeof id === 'string')) {
+        this.logFailure('/authz/filter-resources', '-> malformed ids');
+        return null;
+      }
+      for (const id of ids) allowed.add(id);
+    }
+    // In the caller's candidate order, once each: an id the caller did not offer is dropped.
+    const out: string[] = [];
+    for (const id of candidateIds) {
+      if (allowed.delete(id)) out.push(id);
+    }
+    return out;
   }
 
   async lookupResources(

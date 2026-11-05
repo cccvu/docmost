@@ -1,6 +1,6 @@
 import { PdpPagePermissionRepo } from '../pdp-page-permission.repo';
 import { PdpSpaceMemberRepo } from '../pdp-space-member.repo';
-import { ForbiddenException } from '@nestjs/common';
+import { ForbiddenException, ServiceUnavailableException } from '@nestjs/common';
 import { PageAccessService } from '../../core/page/page-access/page-access.service';
 import { spyKysely } from '../../service-bridge/kysely-spy.testkit';
 import { LIFECYCLE_MAX_DEPTH } from '../../service-bridge/page-lineage';
@@ -99,7 +99,7 @@ describe('PDP repo primitives — deny propagation (leakage backbone)', () => {
 
   it('#542: getUserSpaceRoles denies (undefined) a binding without space view, even administer + edit', async () => {
     const noView = {
-      checkBulk: jest.fn(async (_s: any, checks: Array<{ permission: string }>) =>
+      tryCheckBulk: jest.fn(async (_s: any, checks: Array<{ permission: string }>) =>
         checks.map((c) => c.permission !== 'view'),
       ),
     };
@@ -131,8 +131,9 @@ describe('PDP repo primitives — deny propagation (leakage backbone)', () => {
     expect(pageDb.calls).toHaveLength(0);
   });
 
-  describe('FAIL CLOSED when the platform is unreachable (client returns empty/false)', () => {
-    // Mirrors HttpAuthzClient's fail-closed contract: outage -> deny everything.
+  describe('FAIL CLOSED when the platform is unreachable (client returns empty/false, or null from try*)', () => {
+    // Mirrors HttpAuthzClient's fail-closed contract: outage -> deny everything. #696: a POINT decision that could
+    // not be made is a 503 (never an answer); the list primitives stay empty.
     const down = {
       check: jest.fn(async () => false),
       checkBulk: jest.fn(async (_s: any, checks: any[]) => checks.map(() => false)),
@@ -152,18 +153,14 @@ describe('PDP repo primitives — deny propagation (leakage backbone)', () => {
       expect(await page.filterAccessiblePageIds({ pageIds: ['a', 'b'], userId: 'u1' })).toEqual([]);
       expect(await page.filterAccessiblePageIdsWithPermissions(['a', 'b'], 'u1')).toEqual([]);
       expect(await page.getUserIdsWithPageAccess('p', ['u1', 'u2'])).toEqual([]);
-      expect(await page.canUserAccessPage('u1', 'p')).toBe(false);
-      // #492: an unknown `locked` must read as RESTRICTED (never the relaxing `false`), so upstream trusts the
-      // (deny) page decision instead of falling back to a space role fetched by a separate, possibly-healthy call.
-      expect(await page.canUserEditPage('u1', 'p')).toEqual({
-        hasAnyRestriction: true,
-        canAccess: false,
-        canEdit: false,
-      });
+      // #696: the point decisions throw a 503 — never `false`/no role (a deny-shaped 403/404), and never an answer
+      // upstream could fall back from. #492: in particular never the relaxing `locked=false`.
+      await expect(page.canUserAccessPage('u1', 'p')).rejects.toBeInstanceOf(ServiceUnavailableException);
+      await expect(page.canUserEditPage('u1', 'p')).rejects.toBeInstanceOf(ServiceUnavailableException);
+      await expect(space.getUserSpaceRoles('u1', 's')).rejects.toBeInstanceOf(ServiceUnavailableException);
       expect(downDb.calls).toHaveLength(0);
       expect([...(await space.getUserIdsWithSpaceAccess(['u1'], 's'))]).toEqual([]);
       expect(await space.getUserSpaceIds('u1')).toEqual([]);
-      expect(await space.getUserSpaceRoles('u1', 's')).toBeUndefined();
     });
   });
   describe('#492 — a failed page check denies even when the space role (a separate call) allows', () => {
@@ -184,9 +181,12 @@ describe('PDP repo primitives — deny propagation (leakage backbone)', () => {
     const page = { id: 'restricted-page', spaceId: 's1' } as any;
     const user = { id: 'u1' } as any;
 
-    it('validateCanEdit and validateCanViewWithPermissions deny', async () => {
-      await expect(access.validateCanEdit(page, user)).rejects.toBeInstanceOf(ForbiddenException);
-      await expect(access.validateCanViewWithPermissions(page, user)).rejects.toBeInstanceOf(ForbiddenException);
+    it('validateCanEdit, validateCanView and validateCanViewWithPermissions refuse (#696: a retryable 503)', async () => {
+      await expect(access.validateCanEdit(page, user)).rejects.toBeInstanceOf(ServiceUnavailableException);
+      await expect(access.validateCanView(page, user)).rejects.toBeInstanceOf(ServiceUnavailableException);
+      await expect(access.validateCanViewWithPermissions(page, user)).rejects.toBeInstanceOf(
+        ServiceUnavailableException,
+      );
     });
 
     it('control: the pre-fix all-false reading WOULD have fallen through to the space role (the test is not vacuous)', async () => {
