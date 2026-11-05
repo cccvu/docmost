@@ -66,9 +66,11 @@ const parse = parseUntrustedContent as jest.Mock;
 const toHtml = untrustedMarkdownToHtml as jest.Mock;
 const DOC = { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'hi' }] }] };
 
+const actual = jest.requireActual('./content-parse.service');
 beforeEach(() => {
-  parse.mockClear();
-  toHtml.mockClear();
+  // mockReset also drops a once-implementation a failed test left unconsumed; then back to the real functions.
+  parse.mockReset().mockImplementation((...a: unknown[]) => actual.parseUntrustedContent(...a));
+  toHtml.mockReset().mockImplementation((...a: unknown[]) => actual.untrustedMarkdownToHtml(...a));
   doms.length = 0;
 });
 
