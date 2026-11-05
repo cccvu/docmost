@@ -1,4 +1,11 @@
-import { ACL_AUDIT_EVENT, ACL_AUDIT_LIST_CAP, AclAuditAction, aclAuditPayload } from './acl-audit';
+import {
+  ACL_AUDIT_EVENT,
+  ACL_AUDIT_LIST_CAP,
+  AclAuditAction,
+  aclAuditPayload,
+  aclRefusalAuditPayload,
+} from './acl-audit';
+import { AuditEvent } from '../../common/events/audit-events';
 import { AclEffect, AclGrant } from './acl-state';
 import { MAX_PAGE_GRANTEES } from './dto';
 
@@ -118,5 +125,39 @@ describe('aclAuditPayload (#503)', () => {
       expect(json).not.toContain('zq9');
       expect(json).not.toContain('title');
     }
+  });
+});
+
+describe('aclRefusalAuditPayload (#673)', () => {
+  it.each<[AclAuditAction, string]>([
+    ['add', 'self_grant'],
+    ['update', 'self_grant'],
+    ['unrestrict', 'actor_cannot_edit'],
+  ])('%s refused %s → one page.acl_write_refused row: ids, the action and the reason, nothing else', (action, reason) => {
+    expect(aclRefusalAuditPayload(action, PAGE, reason)).toEqual({
+      event: 'page.acl_write_refused',
+      resourceType: 'page',
+      resourceId: PAGE.id,
+      spaceId: PAGE.spaceId,
+      metadata: { surface: 'engine', outcome: 'denied', action, reason },
+    });
+  });
+
+  it.each(['exposes_subpages', 'not_restricted', 'precondition_failed', 'grant_not_found', 'engine_busy', ''])(
+    'a state refusal (%p) is not audited: undefined',
+    (reason) => {
+      expect(aclRefusalAuditPayload('unrestrict', PAGE, reason)).toBeUndefined();
+    },
+  );
+
+  it('is not an upstream event name (no upstream event is reused for a denial)', () => {
+    expect(Object.values(AuditEvent)).not.toContain('page.acl_write_refused');
+  });
+
+  it('never carries the page title (or any other page field)', () => {
+    const page = { ...PAGE, title: 'Confidential merger plan zq9', slugId: 'slug-zq9', workspaceId: 'ws-zq9' } as never;
+    const json = JSON.stringify(aclRefusalAuditPayload('unrestrict', page, 'actor_cannot_edit'));
+    expect(json).not.toContain('zq9');
+    expect(json).not.toContain('title');
   });
 });

@@ -42,7 +42,8 @@ import {
 } from '../../service-bridge/resource-version';
 import { AclEffect, AclState, aclVersionOf, diffAcl, isNoop, noEffect, readAclState } from './acl-state';
 import { AUDIT_SERVICE, IAuditService } from '../../integrations/audit/audit.service';
-import { AclAuditAction, aclAuditPayload } from './acl-audit';
+import { AuditLogPayload } from '../../common/events/audit-events';
+import { AclAuditAction, aclAuditPayload, aclRefusalAuditPayload } from './acl-audit';
 
 /** A1 (#486): the 403 body carries a machine-readable `code`, the same one rule M uses on the bridge. */
 const selfGrant = () =>
@@ -85,6 +86,8 @@ export interface AclPreviewResult {
 interface RunOptions {
   expectedVersion?: string;
   preview?: boolean;
+  /** Set by `authorize` once the page is loaded and the actor passed the gate: what a refusal-audit row names. */
+  page?: Page;
 }
 
 interface AclRun {
@@ -106,15 +109,20 @@ interface AclRun {
  * `#viewer` / `#editor`) — so NO SpiceDB/policy logic lives here. Managing restrictions is gated on
  * space-admin: the PDP's `space#administer` in remote mode (#542), `Manage` on space Settings in native mode.
  *
- * Self-dealing (#486) — restriction management must never become a way to reach content the actor could not
- * already see, on ANY path (native UI and the platform relay both land here):
+ * Self-dealing (#486, #673) — restriction management must never become a way to reach content the actor could not
+ * already see, on ANY path (a raw native `/api/pages/*` call and the platform relay both land here), in either mode:
  *   - A1: a grant or re-role that names the actor, or a group the actor is in, is refused (403 `self_grant`);
  *     revoking your own grant stays allowed.
  *   - A2: restrict keeps only the access the actor already had — the auto-grant role is decided from a STRICT
  *     PDP read before anything is written (remote mode; native keeps upstream's writer self-grant).
- *   - A3: an unrestrict carrying `requireActorCoverage` (the platform relay always sends it) is refused unless
- *     the actor can edit the page and no direct sub-page is unrestricted (it would be exposed). Without the
- *     flag — the native UI — unrestrict is unchanged: the human break-glass for an orphaned page.
+ *   - A3: EVERY unrestrict is refused unless the actor can edit the page (403 `actor_cannot_edit`) and no direct
+ *     sub-page is unrestricted (409 `exposes_subpages`: it would be exposed). Decided here, server-side, never by a
+ *     client flag: `requireActorCoverage` is accepted and ignored (dto.ts). There is no admin bypass — a space
+ *     admin is not a page editor. #673: the flag-less native route used to skip A3, so any space admin, even a
+ *     view-less one, could declassify a page they could not see to the whole space.
+ * Recovering a page nobody can manage is a two-identity re-grant, never a one-admin lift: a space or workspace
+ * admin grants writer to a DIFFERENT admin (A1 refuses a self-grant), who lifts or edits it under A3; the binding is
+ * removed afterwards, and every step is audited (ADR 0025, #673/#504 amendment).
  * The PDP is only ever asked space administer/view/edit and page edit here — never `locked` (issue 499).
  *
  * Versioned writes (#616): each of the five writes is ONE transaction under a per-page ACL lock (`aclTx`), with every
@@ -126,8 +134,10 @@ interface AclRun {
  * `version` and its `effect`; `preview` runs the same code and rolls it back.
  *
  * Audit (#503): each APPLIED write emits exactly one domain-audit row (`acl-audit.ts`: upstream event names, ids and
- * roles only, `metadata.surface: 'engine'`) after its transaction commits. A no-op, a refusal, a busy or failed
- * transaction and a preview emit nothing; a broken audit sink never fails a committed write.
+ * roles only, `metadata.surface: 'engine'`) after its transaction commits. A write REFUSED as self-dealing
+ * (`self_grant`, `actor_cannot_edit`; #673) emits exactly one `page.acl_write_refused` row instead (ids only), and
+ * still answers its 403. A no-op, any other refusal, a busy or failed transaction and a preview emit nothing; a
+ * broken audit sink never fails a committed write and never changes a refusal.
  */
 @Injectable()
 export class PageRestrictionService {
@@ -194,9 +204,8 @@ export class PageRestrictionService {
 
   /**
    * A3 (a): may the actor edit the page right now? Remote: a STRICT PDP `page#edit` (no answer → 503, never a
-   * guess). Native (no PDP; the platform never sends the flag there, but a caller may): upstream's own rule —
-   * the actor already passed `authorize` (space admin ⊇ space edit), so it reduces to the page-level grant
-   * when the page or an ancestor is restricted.
+   * guess). Native (no PDP): upstream's own rule — the actor already passed `authorize` (space admin ⊇ space
+   * edit), so it reduces to the page-level grant when the page or an ancestor is restricted.
    */
   private async actorCanEdit(page: Page, user: User): Promise<boolean> {
     if (this.mode !== 'remote') {
@@ -224,7 +233,7 @@ export class PageRestrictionService {
    *
    * Native (no PDP): upstream's CASL rule, `Manage` on space Settings, unchanged.
    */
-  private async authorize(pageId: string, user: User): Promise<Page> {
+  private async authorize(pageId: string, user: User, run: RunOptions): Promise<Page> {
     const page = await this.pageRepo.findById(pageId);
     if (!page) throw new NotFoundException('page not found');
     if (this.mode === 'remote') {
@@ -237,12 +246,14 @@ export class PageRestrictionService {
         );
       }
       if (res[0] !== true) throw new ForbiddenException('only a space admin may manage page restrictions');
+      run.page = page;
       return page;
     }
     const ability = await this.spaceAbility.createForUser(user, page.spaceId);
     if (ability.cannot(SpaceCaslAction.Manage, SpaceCaslSubject.Settings)) {
       throw new ForbiddenException('only a space admin may manage page restrictions');
     }
+    run.page = page;
     return page;
   }
 
@@ -298,11 +309,11 @@ export class PageRestrictionService {
    * out — and nothing more. The role is decided BEFORE any lock or write.
    */
   async restrict(pageId: string, user: User, opts: AclWriteOptions = {}): Promise<AclWriteResult> {
-    return this.settle('restrict', await this.runRestrict(pageId, user, { expectedVersion: opts.expectedVersion }));
+    return this.write('restrict', { expectedVersion: opts.expectedVersion }, (run) => this.runRestrict(pageId, user, run));
   }
 
   private async runRestrict(pageId: string, user: User, run: RunOptions): Promise<AclRun> {
-    const page = await this.authorize(pageId, user);
+    const page = await this.authorize(pageId, user, run);
     if (run.expectedVersion === undefined && (await this.pagePermissionRepo.findPageAccessByPageId(pageId))) {
       // Already restricted: nothing is written and the PDP is not asked (today's behaviour).
       const { state, version } = await this.committedAcl(page.id, page.workspaceId);
@@ -345,56 +356,47 @@ export class PageRestrictionService {
   }
 
   /**
-   * Remove restriction — page_access delete cascades all grants (and the platform clears the tuples). With
-   * `requireActorCoverage` (A3) it is refused unless the actor can edit the page (403) and every DIRECT
-   * sub-page carries its own restriction (409): an unrestricted child of a restricted page is locked through
-   * its parent and cannot hold grants of its own, so nobody can see it — lifting the parent would expose it.
+   * Remove restriction — page_access delete cascades all grants (and the platform clears the tuples). A3, on every
+   * call (#673): refused unless the actor can edit the page (403 `actor_cannot_edit`) and every DIRECT sub-page
+   * carries its own restriction (409 `exposes_subpages`): an unrestricted child of a restricted page is locked
+   * through its parent and cannot hold grants of its own, so nobody can see it — lifting the parent would expose it.
    * Direct children suffice: a deeper page is unlocked only via an unrestricted chain, whose top is a direct
    * child. Trashed children count (they can be restored). The child check runs inside the transaction.
    */
-  async unrestrict(
-    pageId: string,
-    user: User,
-    opts: { requireActorCoverage?: boolean } & AclWriteOptions = {},
-  ): Promise<AclWriteResult> {
-    return this.settle(
-      'unrestrict',
-      await this.runUnrestrict(pageId, user, opts.requireActorCoverage === true, { expectedVersion: opts.expectedVersion }),
+  async unrestrict(pageId: string, user: User, opts: AclWriteOptions = {}): Promise<AclWriteResult> {
+    return this.write('unrestrict', { expectedVersion: opts.expectedVersion }, (run) =>
+      this.runUnrestrict(pageId, user, run),
     );
   }
 
-  private async runUnrestrict(pageId: string, user: User, requireActorCoverage: boolean, run: RunOptions): Promise<AclRun> {
-    const page = await this.authorize(pageId, user);
-    if (requireActorCoverage) {
-      if (!(await this.actorCanEdit(page, user))) {
-        throw refusal(
-          new ForbiddenException('you can only remove the restriction from a page you can edit'),
-          'actor_cannot_edit',
-        );
-      }
+  private async runUnrestrict(pageId: string, user: User, run: RunOptions): Promise<AclRun> {
+    const page = await this.authorize(pageId, user, run);
+    if (!(await this.actorCanEdit(page, user))) {
+      throw refusal(
+        new ForbiddenException('you can only remove the restriction from a page you can edit'),
+        'actor_cannot_edit',
+      );
     }
     return this.aclTx(page.id, !!run.preview, async (trx) => {
       const before = await readAclState(trx, page.id, page.workspaceId);
       const versionBefore = aclVersionOf(page.id, before);
       assertExpectedVersion(run.expectedVersion, versionBefore);
-      if (requireActorCoverage) {
-        const exposed = await trx
-          .selectFrom('pages as c')
-          .select('c.id')
-          .where('c.parentPageId', '=', page.id)
-          .where((eb) =>
-            eb.not(eb.exists(eb.selectFrom('pageAccess as pa').select('pa.id').whereRef('pa.pageId', '=', 'c.id'))),
-          )
-          .limit(1)
-          .executeTakeFirst();
-        if (exposed) {
-          throw refusal(
-            new ConflictException(
-              'the page has sub-pages that are not restricted; unrestricting it would expose them — restrict them first or use the wiki UI',
-            ),
-            'exposes_subpages',
-          );
-        }
+      const exposed = await trx
+        .selectFrom('pages as c')
+        .select('c.id')
+        .where('c.parentPageId', '=', page.id)
+        .where((eb) =>
+          eb.not(eb.exists(eb.selectFrom('pageAccess as pa').select('pa.id').whereRef('pa.pageId', '=', 'c.id'))),
+        )
+        .limit(1)
+        .executeTakeFirst();
+      if (exposed) {
+        throw refusal(
+          new ConflictException(
+            'the page has sub-pages that are not restricted; unrestricting it would expose them — restrict those sub-pages first',
+          ),
+          'exposes_subpages',
+        );
       }
       await this.pagePermissionRepo.deletePageAccess(page.id, trx);
       const after = await readAclState(trx, page.id, page.workspaceId);
@@ -404,11 +406,11 @@ export class PageRestrictionService {
 
   /** Grant users/groups access to a restricted page (idempotent: replaces any existing grant). */
   async addPermission(dto: AddPagePermissionDto, user: User): Promise<AclWriteResult> {
-    return this.settle('add', await this.runAddPermission(dto, user, { expectedVersion: dto.expectedVersion }));
+    return this.write('add', { expectedVersion: dto.expectedVersion }, (run) => this.runAddPermission(dto, user, run));
   }
 
   private async runAddPermission(dto: AddPagePermissionDto, user: User, run: RunOptions): Promise<AclRun> {
-    const page = await this.authorize(dto.pageId, user);
+    const page = await this.authorize(dto.pageId, user, run);
     await this.requireAccessId(dto.pageId);
     const userIds = dto.userIds ?? [];
     const groupIds = dto.groupIds ?? [];
@@ -437,11 +439,11 @@ export class PageRestrictionService {
 
   /** Revoke users'/groups' access to a restricted page (revoking your own grant is always allowed). */
   async removePermission(dto: RemovePagePermissionDto, user: User): Promise<AclWriteResult> {
-    return this.settle('remove', await this.runRemovePermission(dto, user, { expectedVersion: dto.expectedVersion }));
+    return this.write('remove', { expectedVersion: dto.expectedVersion }, (run) => this.runRemovePermission(dto, user, run));
   }
 
   private async runRemovePermission(dto: RemovePagePermissionDto, user: User, run: RunOptions): Promise<AclRun> {
-    const page = await this.authorize(dto.pageId, user);
+    const page = await this.authorize(dto.pageId, user, run);
     await this.requireAccessId(dto.pageId);
     return this.aclTx(page.id, !!run.preview, async (trx) => {
       const before = await readAclState(trx, page.id, page.workspaceId);
@@ -465,14 +467,14 @@ export class PageRestrictionService {
    * to answer success. The grant row is found and locked in this transaction, then updated by its id.
    */
   async updatePermission(dto: UpdatePagePermissionDto, user: User): Promise<AclWriteResult> {
-    return this.settle('update', await this.runUpdatePermission(dto, user, { expectedVersion: dto.expectedVersion }));
+    return this.write('update', { expectedVersion: dto.expectedVersion }, (run) => this.runUpdatePermission(dto, user, run));
   }
 
   private async runUpdatePermission(dto: UpdatePagePermissionDto, user: User, run: RunOptions): Promise<AclRun> {
     if (!dto.userId === !dto.groupId) {
       throw new BadRequestException('exactly one of userId or groupId is required');
     }
-    const page = await this.authorize(dto.pageId, user);
+    const page = await this.authorize(dto.pageId, user, run);
     await this.refuseSelfGrant(user, dto.userId ? [dto.userId] : [], dto.groupId ? [dto.groupId] : []);
     await this.requireAccessId(dto.pageId);
     return this.aclTx(page.id, !!run.preview, async (trx) => {
@@ -523,7 +525,7 @@ export class PageRestrictionService {
           r = await this.runRestrict(dto.pageId, user, run);
           break;
         case 'unrestrict':
-          r = await this.runUnrestrict(dto.pageId, user, dto.requireActorCoverage === true, run);
+          r = await this.runUnrestrict(dto.pageId, user, run);
           break;
         case 'add':
           r = await this.runAddPermission(
@@ -568,27 +570,47 @@ export class PageRestrictionService {
   }
 
   /**
+   * One PUBLIC write (never a preview, which calls the `run*` functions itself): run it, then `settle` it. A refusal
+   * the audit names (`aclRefusalAuditPayload`: self-dealing, #673) emits its one row here and is rethrown unchanged.
+   */
+  private async write(action: AclAuditAction, run: RunOptions, fn: (run: RunOptions) => Promise<AclRun>): Promise<AclWriteResult> {
+    let result: AclRun;
+    try {
+      result = await fn(run);
+    } catch (err) {
+      const reason = refusalCodeOf(err);
+      // `run.page` is set only once `authorize` passed, so a refusal before it (404, 403 not an admin) names no page.
+      const row = reason && run.page ? aclRefusalAuditPayload(action, run.page, reason) : undefined;
+      if (row) this.emitAudit(action, row);
+      throw err;
+    }
+    return this.settle(action, result);
+  }
+
+  /**
    * After the COMMIT: the socket.io plane's "does this space have any restriction" cache. Dropped only after a
    * restrict actually committed — inside the transaction a concurrent reader could re-cache the pre-commit answer —
    * and never for a preview (which never reaches here). A cache failure never fails the write (the entry expires).
    * Then the write's one domain-audit row (#503), for an applied write only: emitted here, after the commit, so a
-   * row never describes a write that rolled back. Fire-and-forget — a sink that throws or rejects is logged, never
-   * surfaced: the write has already committed.
+   * row never describes a write that rolled back. Fire-and-forget (`emitAudit`) — a sink that throws or rejects is
+   * logged, never surfaced: the write has already committed.
    */
   private async settle(action: AclAuditAction, run: AclRun): Promise<AclWriteResult> {
     if (run.outcome === 'applied' && run.invalidateSpace) {
       await this.wsService?.invalidateSpaceRestrictionCache(run.invalidateSpace).catch(() => undefined);
     }
-    if (run.outcome === 'applied' && this.audit) {
-      try {
-        void Promise.resolve(this.audit.log(aclAuditPayload(action, run.page, run.effect))).catch((err) =>
-          this.auditFailed(action, err),
-        );
-      } catch (err) {
-        this.auditFailed(action, err);
-      }
-    }
+    if (run.outcome === 'applied') this.emitAudit(action, aclAuditPayload(action, run.page, run.effect));
     return { version: run.version, effect: run.effect };
+  }
+
+  /** Hand one row to the sink, fire-and-forget: a sink that throws or rejects is logged, never surfaced. */
+  private emitAudit(action: AclAuditAction, row: AuditLogPayload): void {
+    if (!this.audit) return;
+    try {
+      void Promise.resolve(this.audit.log(row)).catch((err) => this.auditFailed(action, err));
+    } catch (err) {
+      this.auditFailed(action, err);
+    }
   }
 
   private auditFailed(action: AclAuditAction, err: unknown): void {

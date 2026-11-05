@@ -7,6 +7,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
+import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { PageRestrictionService } from './page-restriction.service';
 import {
   PG_URL,
@@ -21,9 +22,11 @@ import {
  * Real-Postgres proof of the page-restriction self-dealing SQL (#486). The unit spec
  * (`page-restriction.service.spec.ts`) pins these statements through a Kysely spy, which cannot tell a correct
  * correlated subquery from a wrong one — so the queries that decide a refusal run here against real tables:
- *   - A3: an agent-path unrestrict (`requireActorCoverage`) is refused (409) while a DIRECT sub-page has no
- *     `page_access` row of its own — a trashed one included (it can be restored) — and allowed when every direct
- *     child is restricted, whatever lies deeper; without the flag (the native UI) it is unchanged;
+ *   - A3: EVERY unrestrict (#673: with or without `requireActorCoverage`) is refused (409) while a DIRECT sub-page has
+ *     no `page_access` row of its own — a trashed one included (it can be restored) — and allowed when every direct
+ *     child is restricted, whatever lies deeper; the dark-subtree procedure (restrict the child, then lift the
+ *     parent) leaves the child restricted, and works for a trashed child (restrict accepts it, through the real
+ *     upstream `PageRepo.findById`, which reads trashed rows);
  *   - A1: a grant or re-role naming a group the actor belongs to is refused, found through `group_users`;
  *   - A2: restricting under a restricted ancestor keeps the actor nothing (upstream's recursive
  *     `hasRestrictedAncestor`, read-only), and asks the PDP nothing;
@@ -56,6 +59,8 @@ d('PageRestrictionService self-dealing SQL on real Postgres (#486)', () => {
   let appPg: postgres.Sql;
   let db: Kysely<any>;
   let svc: PageRestrictionService;
+  /** The same service over the REAL upstream `PageRepo` (its `findById` is what a trashed page must get through). */
+  let svcRealPages: PageRestrictionService;
   let pdpAnswer: boolean[] | null;
   const pdpCalls: unknown[] = [];
   const actor = { id: ACTOR, workspaceId: WS } as any;
@@ -89,6 +94,9 @@ d('PageRestrictionService self-dealing SQL on real Postgres (#486)', () => {
     await pg`alter table page_permissions add column added_by_id uuid,
              add column updated_at timestamptz not null default now()`;
     await pg`create table group_users (user_id uuid not null, group_id uuid not null, primary key (user_id, group_id))`;
+    // The rest of upstream `PageRepo.findById`'s base fields, so the real repo can run here.
+    await pg`alter table pages add column cover_photo varchar, add column is_locked boolean not null default false,
+             add column is_base boolean not null default false, add column contributor_ids uuid[]`;
     await pg`insert into group_users (user_id, group_id) values (${ACTOR}, ${MY_GROUP}), (${OTHER}, ${THEIR_GROUP})`;
     db = mkReadModelDb(appPg);
 
@@ -126,6 +134,14 @@ d('PageRestrictionService self-dealing SQL on real Postgres (#486)', () => {
       'remote',
       authz as any,
     );
+    svcRealPages = new PageRestrictionService(
+      db as any,
+      new PageRepo(db as any, {} as any, {} as any),
+      permissionRepo,
+      spaceAbility as any,
+      'remote',
+      authz as any,
+    );
   });
 
   afterAll(async () => {
@@ -139,7 +155,7 @@ d('PageRestrictionService self-dealing SQL on real Postgres (#486)', () => {
     pdpCalls.length = 0;
   });
 
-  describe('A3: unrestrict with requireActorCoverage', () => {
+  describe('A3: every unrestrict (#486, #673)', () => {
     const P = uuid(200);
     const C1 = uuid(201);
     const C2 = uuid(202);
@@ -152,7 +168,7 @@ d('PageRestrictionService self-dealing SQL on real Postgres (#486)', () => {
       await restrictRow(P);
       await restrictRow(C1); // C2 is dark: locked only through P
       await expect(
-        svc.unrestrict(P, actor, { requireActorCoverage: true }),
+        svc.unrestrict(P, actor),
       ).rejects.toBeInstanceOf(ConflictException);
       expect(await isRestricted(P)).toBe(true);
     });
@@ -162,7 +178,7 @@ d('PageRestrictionService self-dealing SQL on real Postgres (#486)', () => {
       await page(C1, P, { trashed: true });
       await restrictRow(P);
       await expect(
-        svc.unrestrict(P, actor, { requireActorCoverage: true }),
+        svc.unrestrict(P, actor),
       ).rejects.toBeInstanceOf(ConflictException);
       expect(await isRestricted(P)).toBe(true);
     });
@@ -173,7 +189,7 @@ d('PageRestrictionService self-dealing SQL on real Postgres (#486)', () => {
       await page(G, C1); // unrestricted, but still locked through C1 after P is lifted
       await restrictRow(P);
       await restrictRow(C1);
-      await svc.unrestrict(P, actor, { requireActorCoverage: true });
+      await svc.unrestrict(P, actor);
       expect(await isRestricted(P)).toBe(false);
       expect(await isRestricted(C1)).toBe(true);
     });
@@ -181,7 +197,7 @@ d('PageRestrictionService self-dealing SQL on real Postgres (#486)', () => {
     it('allows a leaf page', async () => {
       await page(P, null);
       await restrictRow(P);
-      await svc.unrestrict(P, actor, { requireActorCoverage: true });
+      await svc.unrestrict(P, actor);
       expect(await isRestricted(P)).toBe(false);
     });
 
@@ -191,7 +207,7 @@ d('PageRestrictionService self-dealing SQL on real Postgres (#486)', () => {
       await page(Q, null);
       await page(C1, Q); // an unrestricted child of a DIFFERENT page
       await restrictRow(P);
-      await svc.unrestrict(P, actor, { requireActorCoverage: true });
+      await svc.unrestrict(P, actor);
       expect(await isRestricted(P)).toBe(false);
     });
 
@@ -200,17 +216,60 @@ d('PageRestrictionService self-dealing SQL on real Postgres (#486)', () => {
       await page(P, null);
       await restrictRow(P);
       await expect(
-        svc.unrestrict(P, actor, { requireActorCoverage: true }),
+        svc.unrestrict(P, actor),
       ).rejects.toBeInstanceOf(ForbiddenException);
       expect(await isRestricted(P)).toBe(true);
     });
 
-    it('without the flag (the native UI) lifts it even over an unrestricted sub-page — the human break-glass', async () => {
+    it('#673: a flag-less call (the native route) is refused (409) over an unrestricted sub-page — no break-glass, rows unchanged', async () => {
       await page(P, null);
       await page(C1, P);
       await restrictRow(P);
+      await pg`insert into page_permissions (page_access_id, user_id, role)
+               select id, ${OTHER}, 'writer' from page_access where page_id = ${P}`;
+      const rows = async () => ({
+        access: await pg`select id, page_id from page_access order by id`,
+        perms: await pg`select id, page_access_id, user_id, group_id, role from page_permissions order by id`,
+      });
+      const before = await rows();
+      await expect(svc.unrestrict(P, actor)).rejects.toMatchObject({ status: 409 });
+      await expect(
+        svc.unrestrict(P, actor, { requireActorCoverage: false } as never), // a stale caller's explicit opt-out
+      ).rejects.toBeInstanceOf(ConflictException);
+      expect(await rows()).toEqual(before);
+    });
+
+    it('the dark-subtree procedure: restrict the sub-page, then lift the parent — the sub-page stays restricted', async () => {
+      await page(P, null);
+      await page(C1, P);
+      await restrictRow(P);
+      await expect(svc.unrestrict(P, actor)).rejects.toBeInstanceOf(ConflictException);
+      // Restricting C1 under a restricted P keeps the actor nothing (A2) and asks the PDP nothing.
+      pdpCalls.length = 0;
+      await svc.restrict(C1, actor);
+      expect(pdpCalls).toEqual([]);
+      expect(await isRestricted(C1)).toBe(true);
       await svc.unrestrict(P, actor);
       expect(await isRestricted(P)).toBe(false);
+      expect(await isRestricted(C1)).toBe(true);
+      expect(await grants(C1)).toEqual([]);
+    });
+
+    it('the procedure includes a TRASHED sub-page: restrict accepts it (upstream findById reads trashed rows), then the parent lifts', async () => {
+      // The recovery runbook says "restrict each unrestricted direct child first, trashed ones included": that only
+      // works if restrict accepts a page with deleted_at set. Through the real upstream PageRepo, not the stub.
+      await page(P, null);
+      await page(C1, P, { trashed: true });
+      await page(C2, P);
+      await restrictRow(P);
+      await restrictRow(C2);
+      await expect(svcRealPages.unrestrict(P, actor)).rejects.toBeInstanceOf(ConflictException); // the trashed child counts
+      await svcRealPages.restrict(C1, actor);
+      expect(await isRestricted(C1)).toBe(true);
+      await svcRealPages.unrestrict(P, actor);
+      expect(await isRestricted(P)).toBe(false);
+      expect(await isRestricted(C1)).toBe(true);
+      expect((await pg`select deleted_at from pages where id = ${C1}`)[0].deleted_at).not.toBeNull(); // still trashed
     });
   });
 

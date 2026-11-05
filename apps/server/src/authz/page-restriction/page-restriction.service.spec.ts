@@ -16,9 +16,11 @@ import {
   MAX_PAGE_GRANTEES,
   RemovePagePermissionDto,
   RemoveRestrictionDto,
+  RestrictionPreviewDto,
   RestrictPageDto,
   UpdatePagePermissionDto,
 } from './dto';
+import { refusalCodeOf } from '../../service-bridge/resource-version';
 import { User } from '@docmost/db/types/entity.types';
 import { spyKysely, SpyQuery } from '../../service-bridge/kysely-spy.testkit';
 
@@ -731,32 +733,38 @@ describe('PageRestrictionService — A2: restrict keeps only the access the acto
   });
 });
 
-describe('PageRestrictionService — A3: covered unrestrict (#486)', () => {
+describe('PageRestrictionService — A3: every unrestrict is covered, on every path (#486, #673)', () => {
+  // #673: A3 used to run only when the CLIENT sent `requireActorCoverage` (the platform relay always did). A raw call
+  // to the native route without it let any space admin — even a view-less one — lift a restriction on a page they
+  // cannot edit. A3 is now unconditional: the flag is accepted and ignored. These go through the real controller so
+  // the body a native caller sends is what is under test.
   const unrestrictAs = (opts: Parameters<typeof makeService>[0]) =>
     makeService({ role: 'admin', mode: 'remote', ...opts });
-  const covered = { requireActorCoverage: true };
+  const PAGE_EDIT = [{ permission: 'edit', resourceType: 'page', resourceId: PAGE_ID }];
+  const ME = { provider: 'docmost', externalId: ADMIN_ID };
+  const BODIES = [
+    ['no flag (a raw native call)', { pageId: PAGE_ID }],
+    ['requireActorCoverage: false', { pageId: PAGE_ID, requireActorCoverage: false }],
+    ['requireActorCoverage: true (the platform relay)', { pageId: PAGE_ID, requireActorCoverage: true }],
+  ] as const;
+  const removeVia = (service: PageRestrictionService, body: object, user = userOf(ADMIN_ID)) =>
+    new PageRestrictionController(service).removeRestriction(body as RemoveRestrictionDto, user);
 
-  it('without the flag, unrestrict is unchanged: no PDP call, no child probe', async () => {
-    const { service, pagePermissionRepo, contentChecks, spy } = unrestrictAs({ pdp: [false], darkChild: true });
-    await expect(service.unrestrict(PAGE_ID, userOf(ADMIN_ID))).resolves.toEqual(WRITTEN);
-    expect(contentChecks()).toHaveLength(0); // only the space-admin gate (#542) was asked
-    // #616: the write is now one transaction (ACL lock + re-read), so "no query at all" became "no child probe".
-    expect(spy.calls.some((c) => c.sql.includes('from "pages" as "c"'))).toBe(false);
-    expect(pagePermissionRepo.deletePageAccess).toHaveBeenCalledWith(PAGE_ID, expect.anything() /* #616: the write's transaction */);
-  });
-
-  it('with the flag, 403s when the actor cannot edit the page (strict page#edit), nothing deleted', async () => {
-    const { service, pagePermissionRepo, authz } = unrestrictAs({ pdp: [false] });
-    await expect(service.unrestrict(PAGE_ID, userOf(ADMIN_ID), covered)).rejects.toThrow(ForbiddenException);
-    expect(authz.tryCheckBulk).toHaveBeenCalledWith({ provider: 'docmost', externalId: ADMIN_ID }, [
-      { permission: 'edit', resourceType: 'page', resourceId: PAGE_ID },
-    ]);
+  it.each(BODIES)('%s: asks the PDP page#edit and 403s actor_cannot_edit when it is denied, nothing deleted', async (_l, body) => {
+    const { service, pagePermissionRepo, authz, spy } = unrestrictAs({ pdp: [false] });
+    const err = await removeVia(service, body).catch((e) => e);
+    expect(err).toBeInstanceOf(ForbiddenException);
+    expect(refusalCodeOf(err)).toBe('actor_cannot_edit');
+    expect(authz.tryCheckBulk).toHaveBeenCalledWith(ME, PAGE_EDIT);
     expect(pagePermissionRepo.deletePageAccess).not.toHaveBeenCalled();
+    expect(spy.calls).toHaveLength(0); // refused before any transaction
   });
 
-  it('with the flag, 409s when a direct sub-page is unrestricted (it would be exposed), nothing deleted', async () => {
+  it.each(BODIES)('%s: 409s exposes_subpages when a direct sub-page is unrestricted, nothing deleted', async (_l, body) => {
     const { service, pagePermissionRepo, spy } = unrestrictAs({ pdp: [true], darkChild: true });
-    await expect(service.unrestrict(PAGE_ID, userOf(ADMIN_ID), covered)).rejects.toThrow(ConflictException);
+    const err = await removeVia(service, body).catch((e) => e);
+    expect(err).toBeInstanceOf(ConflictException);
+    expect(refusalCodeOf(err)).toBe('exposes_subpages');
     const probe = spy.calls.find((c) => c.sql.includes('from "pages" as "c"'))!;
     expect(probe.sql).toContain('"c"."parent_page_id" =');
     expect(probe.sql).toContain('not exists');
@@ -765,32 +773,92 @@ describe('PageRestrictionService — A3: covered unrestrict (#486)', () => {
     expect(pagePermissionRepo.deletePageAccess).not.toHaveBeenCalled();
   });
 
-  it('with the flag, removes the restriction when the actor can edit and every sub-page is restricted', async () => {
-    const { service, pagePermissionRepo } = unrestrictAs({ pdp: [true], darkChild: false });
-    await expect(service.unrestrict(PAGE_ID, userOf(ADMIN_ID), covered)).resolves.toEqual(WRITTEN);
-    expect(pagePermissionRepo.deletePageAccess).toHaveBeenCalledWith(PAGE_ID, expect.anything() /* #616: the write's transaction */);
-  });
-
-  it('with the flag, a PDP failure is a 503 and nothing is deleted', async () => {
-    const { service, pagePermissionRepo } = unrestrictAs({ pdp: null });
-    await expect(service.unrestrict(PAGE_ID, userOf(ADMIN_ID), covered)).rejects.toThrow(ServiceUnavailableException);
+  it('a view-less space admin (space#administer, no page#edit) cannot lift a restriction (#673)', async () => {
+    const { service, pagePermissionRepo, authz } = unrestrictAs({ role: undefined, pdpAdmin: true, pdp: [false] });
+    const err = await removeVia(service, { pageId: PAGE_ID }).catch((e) => e);
+    expect(err).toBeInstanceOf(ForbiddenException);
+    expect(refusalCodeOf(err)).toBe('actor_cannot_edit');
+    expect(authz.tryCheckBulk.mock.calls.map((c) => c[1])).toEqual([
+      [{ permission: 'administer', resourceType: 'space', resourceId: SPACE_ID }],
+      PAGE_EDIT,
+    ]);
     expect(pagePermissionRepo.deletePageAccess).not.toHaveBeenCalled();
   });
 
-  it('native mode decides page edit with upstream semantics (no PDP call)', async () => {
+  it('removes the restriction when the actor can edit and every sub-page is restricted', async () => {
+    const { service, pagePermissionRepo, authz } = unrestrictAs({ pdp: [true], darkChild: false });
+    await expect(service.unrestrict(PAGE_ID, userOf(ADMIN_ID))).resolves.toEqual(WRITTEN);
+    expect(authz.tryCheckBulk).toHaveBeenCalledWith(ME, PAGE_EDIT);
+    expect(pagePermissionRepo.deletePageAccess).toHaveBeenCalledWith(PAGE_ID, expect.anything() /* #616: the write's transaction */);
+  });
+
+  it('a PDP failure on page#edit is a 503 and nothing is deleted (never a guess)', async () => {
+    const { service, pagePermissionRepo, spy } = unrestrictAs({ pdp: null });
+    await expect(service.unrestrict(PAGE_ID, userOf(ADMIN_ID))).rejects.toThrow(ServiceUnavailableException);
+    expect(pagePermissionRepo.deletePageAccess).not.toHaveBeenCalled();
+    expect(spy.calls).toHaveLength(0);
+  });
+
+  it('native mode decides page edit with upstream semantics (no PDP call), with no flag', async () => {
     const { service, pagePermissionRepo, authz } = unrestrictAs({
       mode: 'native',
       nativeEdit: { hasAnyRestriction: true, canAccess: true, canEdit: false },
     });
-    await expect(service.unrestrict(PAGE_ID, userOf(ADMIN_ID), covered)).rejects.toThrow(ForbiddenException);
+    const err = await service.unrestrict(PAGE_ID, userOf(ADMIN_ID)).catch((e) => e);
+    expect(err).toBeInstanceOf(ForbiddenException);
+    expect(refusalCodeOf(err)).toBe('actor_cannot_edit');
     expect(authz.tryCheckBulk).not.toHaveBeenCalled();
     expect(pagePermissionRepo.canUserEditPage).toHaveBeenCalledWith(ADMIN_ID, PAGE_ID);
+    expect(pagePermissionRepo.deletePageAccess).not.toHaveBeenCalled();
+  });
+
+  it('native mode refuses an exposed sub-page too (409), with no flag', async () => {
+    const { service, pagePermissionRepo } = unrestrictAs({ mode: 'native', darkChild: true });
+    await expect(service.unrestrict(PAGE_ID, userOf(ADMIN_ID))).rejects.toThrow(ConflictException);
+    expect(pagePermissionRepo.deletePageAccess).not.toHaveBeenCalled();
   });
 
   it('the space-admin gate still runs first: a writer is Forbidden before any coverage check', async () => {
     const { service, contentChecks } = unrestrictAs({ role: 'writer' });
-    await expect(service.unrestrict(PAGE_ID, userOf(WRITER_ID), covered)).rejects.toThrow(ForbiddenException);
+    await expect(service.unrestrict(PAGE_ID, userOf(WRITER_ID))).rejects.toThrow(ForbiddenException);
     expect(contentChecks()).toHaveLength(0);
+  });
+
+  describe('the preview mirrors the write, whatever flag it carries', () => {
+    const previewAs = (service: PageRestrictionService, extra: object = {}, user = userOf(ADMIN_ID)) =>
+      service.preview({ pageId: PAGE_ID, action: 'unrestrict', ...extra } as RestrictionPreviewDto, user);
+
+    it.each([[{}], [{ requireActorCoverage: false }], [{ requireActorCoverage: true }]])(
+      '%j: page#edit denied → refused actor_cannot_edit, nothing deleted',
+      async (extra) => {
+        const { service, pagePermissionRepo, authz } = unrestrictAs({ pdp: [false], accessSeq: [{ id: ACCESS_ID }] });
+        await expect(previewAs(service, extra)).resolves.toMatchObject({ outcome: 'refused', code: 'actor_cannot_edit' });
+        expect(authz.tryCheckBulk).toHaveBeenCalledWith(ME, PAGE_EDIT);
+        expect(pagePermissionRepo.deletePageAccess).not.toHaveBeenCalled();
+      },
+    );
+
+    it('a view-less space admin → refused actor_cannot_edit', async () => {
+      const { service } = unrestrictAs({ role: undefined, pdpAdmin: true, pdp: [false], accessSeq: [{ id: ACCESS_ID }] });
+      await expect(previewAs(service)).resolves.toMatchObject({ outcome: 'refused', code: 'actor_cannot_edit' });
+    });
+
+    it('an unrestricted direct sub-page → refused exposes_subpages', async () => {
+      const { service } = unrestrictAs({ pdp: [true], darkChild: true, accessSeq: [{ id: ACCESS_ID }] });
+      await expect(previewAs(service)).resolves.toMatchObject({ outcome: 'refused', code: 'exposes_subpages' });
+    });
+
+    it('a PDP failure on page#edit is a 503, as the write answers', async () => {
+      const { service } = unrestrictAs({ pdp: null, accessSeq: [{ id: ACCESS_ID }] });
+      await expect(previewAs(service)).rejects.toThrow(ServiceUnavailableException);
+    });
+
+    it('covered and clean → not refused (the delete ran, then rolled back)', async () => {
+      const { service, pagePermissionRepo } = unrestrictAs({ pdp: [true], accessSeq: [{ id: ACCESS_ID }] });
+      // The spy's ACL re-read cannot model the delete, so the effect reads as a no-op: what matters is not refused.
+      await expect(previewAs(service)).resolves.toMatchObject({ outcome: expect.stringMatching(/^(would_apply|noop)$/) });
+      expect(pagePermissionRepo.deletePageAccess).toHaveBeenCalledTimes(1); // ran, then rolled back
+    });
   });
 });
 
@@ -925,15 +993,25 @@ describe('PageRestrictionController (auth guard + delegation)', () => {
     await expect(
       controller.removeRestriction({ pageId: PAGE_ID } as RemoveRestrictionDto, admin),
     ).resolves.toEqual({ restricted: false });
-    expect(service.unrestrict).toHaveBeenCalledWith(PAGE_ID, admin, { requireActorCoverage: false });
+    expect(service.unrestrict).toHaveBeenCalledWith(PAGE_ID, admin, {});
   });
 
-  it('remove-restriction forwards requireActorCoverage only when it is literally true (#486 A3)', async () => {
-    const { controller, service } = makeController();
-    const admin = userOf(ADMIN_ID);
-    await controller.removeRestriction({ pageId: PAGE_ID, requireActorCoverage: true } as RemoveRestrictionDto, admin);
-    expect(service.unrestrict).toHaveBeenLastCalledWith(PAGE_ID, admin, { requireActorCoverage: true });
-  });
+  // #673: A3 is unconditional, so the flag no longer reaches the service — whatever a caller sends, the service decides.
+  it.each([[undefined], [false], [true]])(
+    'remove-restriction ignores requireActorCoverage=%p (accepted for rolling-deploy compatibility, never forwarded)',
+    async (flag) => {
+      const { controller, service } = makeController();
+      const admin = userOf(ADMIN_ID);
+      await controller.removeRestriction({ pageId: PAGE_ID, requireActorCoverage: flag } as RemoveRestrictionDto, admin);
+      expect(service.unrestrict).toHaveBeenLastCalledWith(PAGE_ID, admin, {});
+      const v = 'a'.repeat(64);
+      await controller.removeRestriction(
+        { pageId: PAGE_ID, requireActorCoverage: flag, expectedVersion: v } as RemoveRestrictionDto,
+        admin,
+      );
+      expect(service.unrestrict).toHaveBeenLastCalledWith(PAGE_ID, admin, { expectedVersion: v });
+    },
+  );
 
   it('add-permission delegates the dto + user and returns {success:true}', async () => {
     const { controller, service } = makeController();

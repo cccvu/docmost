@@ -22,9 +22,11 @@ export class RestrictPageDto {
 }
 
 /**
- * #486 (A3): `requireActorCoverage` makes unrestrict refuse unless the actor can edit the page and no direct
- * sub-page would be exposed. The platform relay always sends it (the agent path); the native UI omits it. The
- * flag can only TIGHTEN — omitting it is today's behaviour.
+ * `requireActorCoverage` is ACCEPTED AND IGNORED (#673). It used to switch A3 on (unrestrict refused unless the actor
+ * can edit the page and no direct sub-page would be exposed); A3 now runs on every unrestrict, whatever the body says.
+ * The field stays declared — validated as a boolean — so the platform relay, which keeps sending `true`, validates
+ * against this fork in both directions of a rolling deploy (an old platform against a new fork, and a new platform
+ * against an old fork that still needs it). Never read it: a client flag must not decide an authorization.
  */
 export class RemoveRestrictionDto extends RestrictPageDto {
   @IsOptional() @IsBoolean() requireActorCoverage?: boolean;
@@ -72,6 +74,7 @@ export class RestrictionPreviewDto {
   @IsOptional() @IsArray() @ArrayMaxSize(MAX_PAGE_GRANTEES) @IsUUID('all', { each: true }) groupIds?: string[];
   @IsOptional() @IsUUID() userId?: string;
   @IsOptional() @IsUUID() groupId?: string;
+  /** Accepted and ignored, as on `RemoveRestrictionDto` (#673): the preview runs A3 on every unrestrict. */
   @IsOptional() @IsBoolean() requireActorCoverage?: boolean;
   @IsExpectedVersion() expectedVersion?: string;
 }

@@ -374,6 +374,7 @@ d('PageRestrictionService versioned writes on real Postgres (#616)', () => {
       await restrictRow(P, [[U1, 'reader']]);
       const busy: string[] = [];
       const seen = new Set<string>();
+      const unrestricts = new Set<string>();
       for (let round = 0; round < 8; round++) {
         const results = await Promise.all([
           outcome(svc.addPermission({ pageId: P, role: 'reader', userIds: [U2] } as never, actor)),
@@ -386,12 +387,16 @@ d('PageRestrictionService versioned writes on real Postgres (#616)', () => {
         ]);
         if (process.env.DEBUG_STRESS) console.log(results.join(' '));
         // Every ACL write really ran (no pre-check short-circuit); a move may be refused by g2 (23514: it would take Y
-        // out from under a restricted Q) — that is the guard working, not a lock problem.
-        [0, 2, 3, 5, 6].forEach((i) => seen.add(results[i]));
+        // out from under a restricted Q) — that is the guard working, not a lock problem. Likewise unrestrict(Q) is
+        // refused by A3 (#673: on every call) while the unrestricted Y sits under Q: its 409 `exposes_subpages` is
+        // decided by the child probe INSIDE the transaction, under the ACL lock, so it ran too.
+        [0, 2, 3, 5].forEach((i) => seen.add(results[i]));
+        unrestricts.add(results[6]);
         busy.push(...results.filter((r) => r.startsWith('503') || r.includes('40P01') || r.includes('55P03')));
       }
       expect(busy).toEqual([]);
       expect([...seen]).toEqual(['applied']);
+      expect([...unrestricts].filter((r) => r !== 'applied' && r !== '409:')).toEqual([]);
     });
   });
 
@@ -507,14 +512,18 @@ d('PageRestrictionService versioned writes on real Postgres (#616)', () => {
       expect(invalidations).toEqual([]);
     });
 
-    it('A3 with requireActorCoverage: an exposed sub-page is refused in the preview exactly as in the write', async () => {
-      await page(uuid(5), P); // unrestricted child of P
-      await restrictRow(P);
-      await expect(
-        svc.preview({ pageId: P, action: 'unrestrict', requireActorCoverage: true } as never, actor),
-      ).resolves.toMatchObject({ outcome: 'refused', code: 'exposes_subpages' });
-      expect(await outcome(svc.unrestrict(P, actor, { requireActorCoverage: true }))).toBe('409:');
-      expect(await isRestricted(P)).toBe(true);
-    });
+    it.each([[{}], [{ requireActorCoverage: false }], [{ requireActorCoverage: true }]])(
+      'A3 (%j, #673: the flag is ignored): an exposed sub-page is refused in the preview exactly as in the write',
+      async (flag) => {
+        await page(uuid(5), P); // unrestricted child of P
+        await restrictRow(P);
+        await expect(svc.preview({ pageId: P, action: 'unrestrict', ...flag } as never, actor)).resolves.toMatchObject({
+          outcome: 'refused',
+          code: 'exposes_subpages',
+        });
+        expect(await outcome(svc.unrestrict(P, actor))).toBe('409:');
+        expect(await isRestricted(P)).toBe(true);
+      },
+    );
   });
 });

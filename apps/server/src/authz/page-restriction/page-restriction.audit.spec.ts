@@ -15,6 +15,9 @@ import { aclVersionOf } from './acl-state';
  * #503 — every APPLIED native page-ACL write emits exactly one domain-audit row, after its transaction commits;
  * a no-op, a refusal, a busy engine and a preview emit nothing; a broken sink never fails the committed write; and
  * the service works with no sink at all (the collaboration app's wiring).
+ * #673 — the exception: a write REFUSED as self-dealing (`self_grant`, `actor_cannot_edit`) emits exactly one
+ * `page.acl_write_refused` row (ids only), from the real write and never from its preview, and still answers 403
+ * whatever the sink does.
  */
 const PAGE_ID = '11111111-1111-4111-8111-111111111111';
 const SPACE_ID = '22222222-2222-4222-8222-222222222222';
@@ -102,7 +105,12 @@ function make(opts: {
     spaceAbility,
     opts.mode ?? 'native',
     {
-      tryCheckBulk: jest.fn(async (_s: unknown, c: unknown[]) => (opts.pdp === undefined ? c.map(() => true) : opts.pdp)),
+      tryCheckBulk: jest.fn(async (_s: unknown, c: unknown[]) => {
+        // Remote mode's space-admin gate (#542) allows unless the PDP is down; `pdp` answers A2/A3's checks.
+        const gate = c.length === 1 && (c[0] as { permission: string }).permission === 'administer';
+        if (gate) return opts.pdp === null ? null : [true];
+        return opts.pdp === undefined ? c.map(() => true) : opts.pdp;
+      }),
     } as never,
     undefined,
     audit as never,
@@ -235,24 +243,11 @@ describe('page-ACL domain audit (#503)', () => {
       q.sql.includes('pg_advisory_xact_lock') ? Object.assign(new Error('busy'), { code: '55P03' }) : undefined;
     const wouldApply = { after: { restricted: true, grants: [reader(TARGET)] } };
     it.each<[string, Parameters<typeof make>[0], (s: PageRestrictionService) => Promise<unknown>, number]>([
-      ['not a space admin (403)', { role: 'reader', ...wouldApply }, (s) => s.addPermission(addDto(), admin), 403],
-      ['a self-grant (403 self_grant)', wouldApply, (s) => s.addPermission(addDto({ userIds: [ADMIN_ID] }), admin), 403],
-      [
-        'a group self-grant (403 self_grant)',
-        { inGroup: true, ...wouldApply },
-        (s) => s.addPermission(addDto({ userIds: [], groupIds: [GROUP] }), admin),
-        403,
-      ],
-      [
-        'unrestrict the actor cannot edit (403 actor_cannot_edit)',
-        { nativeCanEdit: false, after: { restricted: false, grants: [] } },
-        (s) => s.unrestrict(PAGE_ID, admin, { requireActorCoverage: true }),
-        403,
-      ],
+      ['not a space admin (403, before the page is authorized)', { role: 'reader', ...wouldApply }, (s) => s.addPermission(addDto(), admin), 403],
       [
         'unrestrict exposing a sub-page (409 exposes_subpages)',
         { darkChild: true, after: { restricted: false, grants: [] } },
-        (s) => s.unrestrict(PAGE_ID, admin, { requireActorCoverage: true }),
+        (s) => s.unrestrict(PAGE_ID, admin),
         409,
       ],
       [
@@ -279,6 +274,101 @@ describe('page-ACL domain audit (#503)', () => {
       const { service, audit } = make(world);
       await expect(op(service)).rejects.toMatchObject({ status });
       expect(audit!.log).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('#673: a write refused as self-dealing emits exactly one page.acl_write_refused row', () => {
+    const wouldApply = { after: { restricted: true, grants: [reader(TARGET)] } };
+    const cases: Array<[string, Parameters<typeof make>[0], (s: PageRestrictionService) => Promise<unknown>, string, string]> = [
+      ['add naming the actor', wouldApply, (s) => s.addPermission(addDto({ userIds: [ADMIN_ID] }), admin), 'add', 'self_grant'],
+      [
+        "add naming the actor's group",
+        { inGroup: true, ...wouldApply },
+        (s) => s.addPermission(addDto({ userIds: [], groupIds: [GROUP] }), admin),
+        'add',
+        'self_grant',
+      ],
+      ['update re-roling the actor', { grants: [reader(ADMIN_ID)] }, (s) => s.updatePermission(updateDto({ userId: ADMIN_ID }), admin), 'update', 'self_grant'],
+      ['unrestrict, native: the actor cannot edit', { nativeCanEdit: false }, (s) => s.unrestrict(PAGE_ID, admin), 'unrestrict', 'actor_cannot_edit'],
+      [
+        'unrestrict, remote: the PDP denies page#edit (a view-less admin)',
+        { mode: 'remote', pdp: [false] },
+        (s) => s.unrestrict(PAGE_ID, admin),
+        'unrestrict',
+        'actor_cannot_edit',
+      ],
+    ];
+
+    it.each(cases)('%s → 403, one row, nothing written', async (_l, world, op, action, reason) => {
+      const { service, audit, spy, repo } = make(world);
+      const err = await op(service).catch((e) => e);
+      expect(err).toMatchObject({ status: 403 });
+      expect(audit!.log).toHaveBeenCalledTimes(1);
+      expect(audit!.log).toHaveBeenCalledWith({
+        event: 'page.acl_write_refused',
+        resourceType: 'page',
+        resourceId: PAGE_ID,
+        spaceId: SPACE_ID,
+        metadata: { surface: 'engine', outcome: 'denied', action, reason },
+      });
+      expect(JSON.stringify(audit!.log.mock.calls)).not.toContain('zq9'); // never the title
+      expect(spy.tx).toEqual([]); // refused before any transaction
+      expect(repo.deletePageAccess).not.toHaveBeenCalled();
+      expect(repo.insertPagePermissions).not.toHaveBeenCalled();
+    });
+
+    it.each(cases)('%s: its preview reports the refusal and emits no row', async (_l, world, _op, action, reason) => {
+      const { service, audit } = make(world);
+      const body: Record<string, Partial<RestrictionPreviewDto>> = {
+        add: _l.includes('group') ? { action: 'add', role: 'reader', groupIds: [GROUP] } : { action: 'add', role: 'reader', userIds: [ADMIN_ID] },
+        update: { action: 'update', role: 'writer', userId: ADMIN_ID },
+        unrestrict: { action: 'unrestrict' },
+      };
+      await expect(service.preview({ pageId: PAGE_ID, ...body[action] } as RestrictionPreviewDto, admin)).resolves.toMatchObject({
+        outcome: 'refused',
+        code: reason,
+      });
+      expect(audit!.log).not.toHaveBeenCalled();
+    });
+
+    it('a sink that throws never changes the 403', async () => {
+      const log = jest.fn(() => {
+        throw new Error('sink down');
+      });
+      const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      try {
+        const { service } = make({ nativeCanEdit: false, audit: { log } });
+        const err = await service.unrestrict(PAGE_ID, admin).catch((e) => e);
+        expect(err).toMatchObject({ status: 403, message: 'you can only remove the restriction from a page you can edit' });
+        expect(log).toHaveBeenCalledTimes(1);
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('PAGE_ACL_AUDIT_FAILED action=unrestrict'));
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('a sink that rejects never changes the 403 (and is not an unhandled rejection)', async () => {
+      const log = jest.fn(async () => {
+        throw new Error('sink down');
+      });
+      const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      try {
+        const { service } = make({ ...wouldApply, audit: { log } });
+        await expect(service.addPermission(addDto({ userIds: [ADMIN_ID] }), admin)).rejects.toMatchObject({
+          status: 403,
+          response: { code: 'self_grant' },
+        });
+        await new Promise((r) => setImmediate(r)); // drain microtasks: the rejection's .catch has run
+        expect(log).toHaveBeenCalledTimes(1);
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining('PAGE_ACL_AUDIT_FAILED action=add'));
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    it('without a sink (the collaboration app), the refusal is still a 403', async () => {
+      const { service } = make({ audit: null, nativeCanEdit: false });
+      await expect(service.unrestrict(PAGE_ID, admin)).rejects.toMatchObject({ status: 403 });
     });
   });
 
