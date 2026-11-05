@@ -5,7 +5,7 @@ import { spyKysely, SpyQuery } from '../../service-bridge/kysely-spy.testkit';
 jest.mock('../../collaboration/collaboration.gateway', () => ({ CollaborationGateway: class {} }));
 
 import { pageEtagOpaque } from '../page-write/page-etag';
-import { RemoteTrashService } from './remote-trash.service';
+import { RemoteTrashService, TRASH_MAX_CONCURRENT } from './remote-trash.service';
 
 /**
  * #661 / #634 / #670 — the remote trash routine, request-level (mocked PDP and settle; the real-Postgres locking and
@@ -56,6 +56,8 @@ type Opts = {
   trashedNow?: string[];
   lockError?: unknown;
   canEdit?: boolean;
+  /** Awaited inside every PDP call (the decision holds its transaction, locks and slot until it resolves). */
+  pdpGate?: Promise<void>;
 };
 
 const build = (opts: Opts = {}) => {
@@ -127,6 +129,7 @@ const build = (opts: Opts = {}) => {
     tryCheckBulk: jest.fn(async (subject: Subject, checks: { permission: string; resourceType: string; resourceId: string }[]) => {
       const who = subject.subjectType === 'service' ? 'sa' : 'human';
       calls.push(`decide:${who}:${checks.map((c) => c.resourceId).join(',')}`);
+      if (opts.pdpGate) await opts.pdpGate;
       if (opts.edit === null) return null;
       return checks.map((c) => (opts.edit ? opts.edit(subject, c.resourceId) : true));
     }),
@@ -362,6 +365,42 @@ describe('RemoteTrashService — refusals change nothing', () => {
     const t = build({ lockError: Object.assign(new Error('boom'), { code: '42P01' }) });
     await expect(t.service.trash(USER, 'page-a', WS)).rejects.toThrow('boom');
     nothingChanged(t);
+  });
+});
+
+describe('RemoteTrashService — a slot per attempt (each holds a pooled connection and row locks across its PDP calls)', () => {
+  const slotsInUse = (t: ReturnType<typeof build>) => (t.service as unknown as { slots: { inUse: number } }).slots.inUse;
+
+  it(`at most ${TRASH_MAX_CONCURRENT} attempts in flight: one more waits, then 503 engine_busy with no transaction opened`, async () => {
+    let open!: () => void;
+    const t = build({ pdpGate: new Promise<void>((r) => (open = r)) });
+    const held = Array.from({ length: TRASH_MAX_CONCURRENT }, () => t.service.trash(USER, 'page-a', WS));
+    await new Promise((r) => setImmediate(r));
+    expect(slotsInUse(t)).toBe(TRASH_MAX_CONCURRENT);
+    const begun = t.spy.tx.filter((x) => x === 'begin').length;
+
+    expect(await refusal(t.service.trash(USER, 'page-a', WS))).toMatchObject({ status: 503, body: { code: 'engine_busy' } });
+    expect(t.spy.tx.filter((x) => x === 'begin').length).toBe(begun); // the refused trash never began a transaction
+
+    open();
+    expect((await Promise.all(held)).map((r) => r.outcome)).toEqual(Array(TRASH_MAX_CONCURRENT).fill('applied'));
+    expect(slotsInUse(t)).toBe(0);
+  }, 10_000);
+
+  it('the settle between the two attempts holds no slot; each attempt holds one; every slot is freed after a 403', async () => {
+    const seen: string[] = [];
+    const t = build({ edit: () => false });
+    t.authz.tryCheckBulk.mockImplementation(async (_s: Subject, checks: { resourceId: string }[]) => {
+      seen.push(`decide:${slotsInUse(t)}`);
+      return checks.map(() => false);
+    });
+    t.authz.settleProjection.mockImplementation(async () => {
+      seen.push(`settle:${slotsInUse(t)}`);
+      return { status: 'confirmed' as const };
+    });
+    expect(await refusal(t.service.trash(USER, 'page-a', WS))).toMatchObject({ status: 403 });
+    expect(seen).toEqual(['decide:1', 'settle:0', 'decide:1']);
+    expect(slotsInUse(t)).toBe(0);
   });
 });
 

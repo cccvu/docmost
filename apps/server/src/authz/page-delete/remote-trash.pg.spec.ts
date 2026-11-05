@@ -2,6 +2,7 @@ import * as postgres from 'postgres';
 import { Kysely } from 'kysely';
 import { HttpException } from '@nestjs/common';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
+import { EventName } from '../../common/events/event.contants';
 import { PageService } from '../../core/page/services/page.service';
 import { AuthzOutboxInstaller } from '../../service-bridge/authz-outbox.installer';
 import { PageCycleGuardInstaller } from '../../service-bridge/page-cycle-guard.installer';
@@ -24,6 +25,7 @@ import { RemoteTrashService } from './remote-trash.service';
  *  - F2: a concurrent restore of a trashed descendant WAITS for the trash, and nothing undecided is trashed;
  *  - F5: a restrict during the trash is NOT blocked (FOR NO KEY UPDATE, never FOR UPDATE);
  *  - a child inserted during the trash is not trashed undecided (the decided set, never a re-walk);
+ *  - seam #172's side effects cover exactly the rows trashed: their share links revoked, one `page.soft_deleted`;
  *  - the delegated service account is decided under the same locks; a lock past lock_timeout is a 503.
  * Self-skips without AUTHZ_TEST_PG_URL; the `docmost-authz-pg` CI job provides Postgres.
  */
@@ -62,6 +64,7 @@ d('RemoteTrashService on real Postgres (#661)', () => {
   let pageRepo: PageRepo;
   let trash: RemoteTrashService;
   const audits: string[] = [];
+  const emitted: { name: string; payload: unknown }[] = [];
 
   /** The fake platform: a relay cursor, the pages it has placed, the projected locks, and what it was asked. */
   const platform = {
@@ -211,7 +214,7 @@ d('RemoteTrashService on real Postgres (#661)', () => {
     await new PageCycleGuardInstaller(db as never, 'remote').install();
     await new PageRestrictionGuardInstaller(db as never, 'remote').install();
 
-    const events = { emit: () => true };
+    const events = { emit: (name: string, payload: unknown) => (emitted.push({ name, payload }), true) };
     pageRepo = new PageRepo(db as never, {} as never, events as never);
     const queue = { add: async () => undefined };
     const pages = new PageService(
@@ -256,6 +259,8 @@ d('RemoteTrashService on real Postgres (#661)', () => {
     platform.settles.length = 0;
     platform.saCannotEdit.clear();
     audits.length = 0;
+    emitted.length = 0;
+    await pg`delete from shares`;
     await pg`delete from page_access`;
     await pg`delete from pages`;
     await pg`delete from authz_outbox`;
@@ -306,6 +311,35 @@ d('RemoteTrashService on real Postgres (#661)', () => {
       await restrictSql(pg, uuid(9)); // an outbox row past the cursor (outside the subtree)
       expect(await outcome(trash.trash(ACTOR, uuid(1), WS))).toBe('503:trash_unconfirmed');
       expect(await state(...LIVE, uuid(5))).toEqual(Object.fromEntries([...LIVE, uuid(5)].map((id) => [id, 'live'])));
+    });
+
+    it('seam #172: the trashed rows lose their share links and are announced once; a page left live keeps its link', async () => {
+      const share = (id: string) => pg`insert into shares (page_id, space_id) values (${id}, ${S1})`;
+      for (const id of [uuid(1), uuid(3), uuid(9)]) await share(id);
+      platform.atDecide = async () => {
+        // Inserted (with its link) after the live walk: undecided, so it must stay live AND keep its link.
+        await sideTx(async (x) => {
+          await insertChild(x, uuid(5), uuid(2));
+          await x`insert into shares (page_id, space_id) values (${uuid(5)}, ${S1})`;
+        }, '3s');
+      };
+      expect(await outcome(trash.trash(ACTOR, uuid(1), WS))).toBe('applied');
+      const left = await pg<{ pageId: string }[]>`select page_id as "pageId" from shares order by page_id`;
+      expect(left.map((r) => r.pageId)).toEqual([uuid(5), uuid(9)].sort());
+      const softDeleted = emitted.filter((e) => e.name === EventName.PAGE_SOFT_DELETED);
+      expect(softDeleted).toHaveLength(1);
+      const payload = softDeleted[0].payload as { pageIds: string[]; workspaceId: string };
+      expect([...payload.pageIds].sort()).toEqual(LIVE);
+      expect(payload.workspaceId).toBe(WS);
+    });
+
+    it('a refused trash revokes no link and announces nothing', async () => {
+      await pg`insert into shares (page_id, space_id) values (${uuid(1)}, ${S1})`;
+      await restrictSql(pg, uuid(3));
+      await project();
+      expect(await outcome(trash.trash(ACTOR, uuid(1), WS))).toBe('403:trash_needs_edit');
+      expect(await pg`select 1 from shares where page_id = ${uuid(1)}`).toHaveLength(1);
+      expect(emitted.filter((e) => e.name === EventName.PAGE_SOFT_DELETED)).toEqual([]);
     });
 
     it('an already-trashed target → noop: nothing asked, nothing written, no audit', async () => {

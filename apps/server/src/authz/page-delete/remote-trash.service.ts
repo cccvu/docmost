@@ -9,13 +9,24 @@ import { PageAccessService } from '../../core/page/page-access/page-access.servi
 import { AuditEvent, AuditResource } from '../../common/events/audit-events';
 import { AUDIT_SERVICE, IAuditService } from '../../integrations/audit/audit.service';
 import { getPageTitle } from '../../common/helpers';
-import { asEngineBusy, boundWaits } from '../../service-bridge/resource-version';
+import { asEngineBusy, boundWaits, engineBusy } from '../../service-bridge/resource-version';
 import { HttpAuthzClient } from '../http-authz.client';
+import { OpSemaphore, OpSemaphoreTimeout } from '../page-write/op-semaphore';
 import { assertExpectedEtags, lockSubtree, readTarget, SUBTREE_MAX_PASSES, walkLive } from './page-subtree';
-import { Decision, decideAll, humanSubject, purgeSettleWaitMs, serviceSubject, settle } from './page-delete-decision';
+import { DECIDE_CHUNK, Decision, decideAll, humanSubject, purgeSettleWaitMs, serviceSubject, settle } from './page-delete-decision';
 import { trashNeedsEdit, trashSubtreeChanged, trashUnconfirmed } from './page-delete-errors';
 
 export type TrashOutcome = 'applied' | 'noop';
+
+/**
+ * Trash attempts in flight per fork process, and how long one waits for a slot (then a retryable 503 `engine_busy`).
+ * Each attempt holds a pooled connection, its subtree's row locks and an xid across its PDP calls (one per
+ * {@link DECIDE_CHUNK} pages, per leg), so the cap keeps a slow PDP from draining the pool every other request uses
+ * (`DATABASE_MAX_POOL`, default 10; the purge and the conditional ops hold 2 more each). The settle between the two
+ * attempts runs with no slot held.
+ */
+export const TRASH_MAX_CONCURRENT = 2;
+export const TRASH_SLOT_WAIT_MS = 2000;
 
 export interface TrashResult {
   outcome: TrashOutcome;
@@ -68,8 +79,9 @@ const sameSet = (a: readonly string[], b: readonly string[]) => {
  * 5. A child created during the trash, after the live walk, is left live under the trashed parent (upstream's restore
  *    re-roots such a page). Retention never purges a live page (`RemoteTrashRetentionService`).
  *
- * No slot semaphore (a trash holds its locks for one PDP round trip, like the native one). Busy SQLSTATEs are a
- * retryable 503 `engine_busy`. Native mode never reaches this class. Entry points (`remote-purge.fitness.spec.ts`
+ * Each attempt runs in a slot ({@link TRASH_MAX_CONCURRENT} per process): unlike the native trash, it holds its
+ * transaction and locks across its PDP calls — up to two legs of ceil(n / 256) bulk checks. A full semaphore and busy
+ * SQLSTATEs are a retryable 503 `engine_busy`. Native mode never reaches this class. Entry points (`remote-purge.fitness.spec.ts`
  * pins them): `RemotePurgeInterceptor` (native `POST /api/pages/delete`, trash branch) and
  * `ConditionalPageOpsController.conditionalDelete` (its remote trash branch).
  */
@@ -77,6 +89,7 @@ const sameSet = (a: readonly string[], b: readonly string[]) => {
 export class RemoteTrashService {
   private readonly logger = new Logger(RemoteTrashService.name);
   private readonly settleMs = purgeSettleWaitMs();
+  private readonly slots = new OpSemaphore(TRASH_MAX_CONCURRENT, TRASH_SLOT_WAIT_MS);
 
   constructor(
     @InjectKysely() private readonly db: KyselyDB,
@@ -123,7 +136,7 @@ export class RemoteTrashService {
       }
       result = attempt.result;
     } catch (err) {
-      const busy = asEngineBusy(err);
+      const busy = err instanceof OpSemaphoreTimeout ? engineBusy() : asEngineBusy(err);
       if (busy) {
         this.logger.warn(
           `REMOTE_TRASH_BUSY code=${(err as { code?: string }).code ?? (err as Error).name}: answered 503 engine_busy`,
@@ -154,7 +167,10 @@ export class RemoteTrashService {
     return result;
   }
 
-  /** Steps 1–5 in one bounded transaction. A deny rolls it back and is answered as `{ kind: 'denied' }`. */
+  /**
+   * Steps 1–5 in one bounded transaction, holding a slot. A deny rolls it back and is answered as
+   * `{ kind: 'denied' }`.
+   */
   private async attempt(
     user: User,
     pageId: string,
@@ -163,10 +179,12 @@ export class RemoteTrashService {
     serviceSubjectId: string | undefined,
   ): Promise<Attempt> {
     try {
-      const result = await executeTx(this.db, async (trx) => {
-        await boundWaits(trx);
-        return this.decideAndTrash(trx, user, pageId, workspaceId, expectedEtags, serviceSubjectId);
-      });
+      const result = await this.slots.run(() =>
+        executeTx(this.db, async (trx) => {
+          await boundWaits(trx);
+          return this.decideAndTrash(trx, user, pageId, workspaceId, expectedEtags, serviceSubjectId);
+        }),
+      );
       return { kind: 'done', result };
     } catch (err) {
       if (err instanceof TrashDenied) return { kind: 'denied' };
