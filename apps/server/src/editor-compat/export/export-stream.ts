@@ -25,10 +25,12 @@
 import { InternalServerErrorException, Logger } from '@nestjs/common';
 import { finished, PassThrough, Readable } from 'node:stream';
 import {
+  EXPORT_LIMIT_DEFAULTS,
   ExportLimits,
   ExportStorageException,
   ExportTimeoutException,
   ExportTooLargeException,
+  withStorageTimeout,
 } from './export-limits';
 
 export type ExportAbortReason = 'wall_cap' | 'byte_cap' | 'storage_error' | 'zip_error';
@@ -63,7 +65,8 @@ export class LazyAttachmentStream extends Readable {
     this.started = true;
     let opening: Promise<Readable>;
     try {
-      opening = this.open();
+      // A hung open would otherwise wait for the wall-clock cap; a stream that arrives too late is released at once.
+      opening = withStorageTimeout(this.open(), this.registry.storageTimeoutMs, 'opening the object', (late) => late.destroy());
     } catch (err) {
       opening = Promise.reject(err);
     }
@@ -122,7 +125,7 @@ export class ExportStreamRegistry {
   constructor(
     /** Names the export in logs, e.g. `page:<id>` or `space:<id>`. */
     readonly label: string,
-    private readonly limits: Pick<ExportLimits, 'attachmentBytes' | 'maxDurationMs'>,
+    private readonly limits: Pick<ExportLimits, 'attachmentBytes' | 'maxDurationMs'> & Partial<Pick<ExportLimits, 'storageTimeoutMs'>>,
     private readonly logger: Pick<Logger, 'warn' | 'error'> = new Logger('Export'),
     private readonly now: () => number = Date.now,
   ) {
@@ -135,6 +138,11 @@ export class ExportStreamRegistry {
     this.lazies.add(s);
     if (this.failure || this.disposed) s.destroy();
     return s;
+  }
+
+  /** How long one storage open may take (EXPORT_STORAGE_TIMEOUT_MS). */
+  get storageTimeoutMs(): number {
+    return this.limits.storageTimeoutMs ?? EXPORT_LIMIT_DEFAULTS.storageTimeoutMs;
   }
 
   get failed(): Error | null {

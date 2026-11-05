@@ -1,7 +1,14 @@
 import * as JSZip from 'jszip';
 import { Readable } from 'node:stream';
 import { ExportAttachmentPlan, isMissingObjectError, MISSING_ATTACHMENTS_FILE, zipEntryNames } from './export-attachment-plan';
-import { EXPORT_LIMIT_DEFAULTS, ExportLimits, ExportStorageException, ExportTooLargeException } from './export-limits';
+import {
+  EXPORT_LIMIT_DEFAULTS,
+  ExportLimits,
+  ExportStorageException,
+  ExportTooLargeException,
+  StorageTimeoutError,
+  withStorageTimeout,
+} from './export-limits';
 
 /** #699 — what an export decides about its attachments before the first byte. Fork-owned. */
 
@@ -222,5 +229,37 @@ describe('ExportAttachmentPlan (#699)', () => {
     await plan.seal(zip);
     expect(store.exists).toHaveBeenCalledTimes(40);
     expect(max).toBe(8);
+  });
+
+  it('a HUNG exists() (the S3 client sets no request timeout) fails 503 within EXPORT_STORAGE_TIMEOUT_MS, not never', async () => {
+    const store = { exists: jest.fn(() => new Promise<boolean>(() => undefined)), readStream: jest.fn() };
+    const log = logger();
+    const plan = new ExportAttachmentPlan(store, 'page:p', limits({ storageTimeoutMs: 100 }), log);
+    const zip = new JSZip();
+    plan.add(zip, '/files/a1/x', att('a1'), page);
+    const t0 = Date.now();
+    const err = await plan.seal(zip).catch((e) => e);
+    expect(err).toBeInstanceOf(ExportStorageException);
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(log.error).toHaveBeenCalledWith(
+      expect.stringMatching(/^EXPORT_ABORTED reason=storage_error export=page:p phase=precheck: exists\(\) did not answer within 100 ms/),
+    );
+  });
+});
+
+describe('withStorageTimeout', () => {
+  it('answers in time: the value; too late: a StorageTimeoutError, and the late value goes to onLate', async () => {
+    await expect(withStorageTimeout(Promise.resolve(1), 50, 'x')).resolves.toBe(1);
+    let resolveLate!: (v: string) => void;
+    const late = jest.fn();
+    const p = withStorageTimeout(new Promise<string>((r) => (resolveLate = r)), 20, 'open', late);
+    await expect(p).rejects.toBeInstanceOf(StorageTimeoutError);
+    resolveLate('stream');
+    await new Promise((r) => setTimeout(r, 5));
+    expect(late).toHaveBeenCalledWith('stream');
+  });
+
+  it('a storage timeout is a failure, never "no such object"', () => {
+    expect(isMissingObjectError(new StorageTimeoutError('exists()', 10))).toBe(false);
   });
 });

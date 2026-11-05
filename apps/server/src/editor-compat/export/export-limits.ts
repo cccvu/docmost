@@ -23,6 +23,10 @@
  *     cheap first refusal (export-content.ts).
  *   - maxDurationMs (EXPORT_MAX_DURATION_MS, default 30 min): from the start of the export to the end of the archive.
  *     A client that reads slowly holds its admission slot and one storage socket; past this the export is aborted.
+ *   - storageTimeoutMs (EXPORT_STORAGE_TIMEOUT_MS, default 10 s): the most one storage call may take to answer, an
+ *     `exists()` before the first byte or the open of an attachment's object while streaming. The S3 client sets no
+ *     request timeout, so a hung HEAD would otherwise hold the request, and its admission slot, indefinitely. Past it
+ *     the export fails like any other storage error (503 `export_storage_unavailable` before the first byte).
  *   - existsConcurrency 8: storage HEADs in flight while missing objects are decided (the S3 pool has 50 sockets,
  *     shared with every attachment download and upload).
  */
@@ -36,6 +40,7 @@ export interface ExportLimits {
   maxEntries: number;
   contentBytes: number;
   maxDurationMs: number;
+  storageTimeoutMs: number;
   existsConcurrency: number;
 }
 
@@ -45,6 +50,7 @@ export const EXPORT_LIMIT_CEILINGS = Object.freeze({
   maxEntries: 65_000,
   contentBytes: 64 * MiB,
   maxDurationMs: 6 * 60 * 60 * 1000,
+  storageTimeoutMs: 5 * 60 * 1000,
 });
 
 export const EXPORT_LIMIT_DEFAULTS: Readonly<ExportLimits> = Object.freeze({
@@ -52,6 +58,7 @@ export const EXPORT_LIMIT_DEFAULTS: Readonly<ExportLimits> = Object.freeze({
   maxEntries: 65_000,
   contentBytes: 16 * MiB,
   maxDurationMs: 30 * 60 * 1000,
+  storageTimeoutMs: 10_000,
   existsConcurrency: 8,
 });
 
@@ -73,6 +80,7 @@ export function exportLimits(env: NodeJS.ProcessEnv = process.env): ExportLimits
     maxEntries: EXPORT_LIMIT_DEFAULTS.maxEntries,
     contentBytes: envInt(env, 'EXPORT_CONTENT_MAX_BYTES', EXPORT_LIMIT_DEFAULTS.contentBytes, EXPORT_LIMIT_CEILINGS.contentBytes),
     maxDurationMs: envInt(env, 'EXPORT_MAX_DURATION_MS', EXPORT_LIMIT_DEFAULTS.maxDurationMs, EXPORT_LIMIT_CEILINGS.maxDurationMs),
+    storageTimeoutMs: envInt(env, 'EXPORT_STORAGE_TIMEOUT_MS', EXPORT_LIMIT_DEFAULTS.storageTimeoutMs, EXPORT_LIMIT_CEILINGS.storageTimeoutMs),
     existsConcurrency: EXPORT_LIMIT_DEFAULTS.existsConcurrency,
   };
 }
@@ -139,4 +147,35 @@ export class ExportTimeoutException extends ServiceUnavailableException {
       code: 'export_timeout',
     });
   }
+}
+
+/** A storage call that did not answer within `storageTimeoutMs`. A storage failure, never "no such object". */
+export class StorageTimeoutError extends Error {
+  constructor(what: string, ms: number) {
+    super(`${what} did not answer within ${ms} ms`);
+    this.name = 'StorageTimeoutError';
+  }
+}
+
+/**
+ * Race a storage call against `ms`. The call itself cannot be cancelled (the storage interface takes no signal), so a
+ * late answer is ignored by the caller; `onLate` releases what it brings (an opened stream).
+ */
+export function withStorageTimeout<T>(call: Promise<T>, ms: number, what: string, onLate?: (value: T) => void): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let timedOut = false;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      reject(new StorageTimeoutError(what, ms));
+    }, ms);
+    (timer as { unref?: () => void }).unref?.();
+  });
+  call.then(
+    (v) => {
+      if (timedOut) onLate?.(v);
+    },
+    () => undefined, // a late rejection is moot; never unhandled
+  );
+  return Promise.race([call, timeout]).finally(() => clearTimeout(timer));
 }

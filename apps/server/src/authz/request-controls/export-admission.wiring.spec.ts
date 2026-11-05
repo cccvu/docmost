@@ -29,7 +29,7 @@ import { ExportAdmissionModule } from './export-admission.module';
  * `res.send(stream)`), and the module under test is the real `ExportAdmissionModule`.
  */
 
-type Scenario = 'hold' | 'ok' | 'too-large' | 'precheck-error' | 'midstream-error' | 'slow-handler';
+type Scenario = 'hold' | 'ok' | 'too-large' | 'precheck-error' | 'midstream-error' | 'slow-handler' | 'hung-exists';
 type ExportBody = { key: string; scenario: Scenario; includeChildren?: boolean; includeAttachments?: boolean };
 
 /** Held sources by request key: each sends one chunk, then waits for `release(key)`. */
@@ -40,6 +40,7 @@ function storageFor(body: ExportBody) {
   return {
     exists: async () => {
       if (body.scenario === 'precheck-error') throw Object.assign(new Error('AccessDenied'), { name: 'AccessDenied' });
+      if (body.scenario === 'hung-exists') return new Promise<boolean>(() => undefined); // a HEAD that never answers
       return true;
     },
     readStream: async (): Promise<Readable> => {
@@ -77,7 +78,7 @@ const finishWork = (key: string) => working.get(key)?.();
 async function exportZip(body: ExportBody, res: FastifyReply): Promise<void> {
   if (body.scenario === 'too-large') throw new ExportTooLargeException('attachments', 10, 1);
   if (body.scenario === 'slow-handler') await new Promise<void>((r) => working.set(body.key, r));
-  const plan = new ExportAttachmentPlan(storageFor(body), `space:${body.key}`, { ...EXPORT_LIMIT_DEFAULTS }, { warn: () => undefined, error: () => undefined });
+  const plan = new ExportAttachmentPlan(storageFor(body), `space:${body.key}`, { ...EXPORT_LIMIT_DEFAULTS, storageTimeoutMs: 200 }, { warn: () => undefined, error: () => undefined });
   const zip = new JSZip();
   zip.file('Home.md', '# home');
   plan.add(zip, '/files/a1/f.bin', { id: 'a1', fileName: 'f.bin', filePath: 'p/f.bin', fileSize: 10 }, { id: 'home', title: 'Home' });
@@ -285,6 +286,15 @@ describe('export admission on a real server (#699)', () => {
     expect(body).toMatchObject({ code: 'export_storage_unavailable' });
     expect(JSON.stringify(body)).not.toContain('AccessDenied');
     await admittedWithin('user-5', 500);
+  });
+
+  it('a HUNG storage check answers 503 within EXPORT_STORAGE_TIMEOUT_MS and releases the slot', async () => {
+    const t0 = Date.now();
+    const a = await post('/spaces/export', { key: 'p8', scenario: 'hung-exists' }, 'user-8');
+    expect(a.status).toBe(503);
+    expect(Date.now() - t0).toBeLessThan(3000);
+    expect(JSON.parse((await drain(a)).body.toString())).toMatchObject({ code: 'export_storage_unavailable' });
+    await admittedWithin('user-8', 500);
   });
 
   it('a storage error after the first byte destroys the connection: never a clean, short 200', async () => {

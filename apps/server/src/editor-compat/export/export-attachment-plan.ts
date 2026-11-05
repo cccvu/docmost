@@ -20,7 +20,13 @@
 import { Logger } from '@nestjs/common';
 import type * as JSZip from 'jszip';
 import type { Readable } from 'node:stream';
-import { exportLimits, ExportLimits, ExportStorageException, ExportTooLargeException } from './export-limits';
+import {
+  exportLimits,
+  ExportLimits,
+  ExportStorageException,
+  ExportTooLargeException,
+  withStorageTimeout,
+} from './export-limits';
 import { ExportStreamRegistry } from './export-stream';
 
 export const MISSING_ATTACHMENTS_FILE = 'missing-attachments.txt';
@@ -195,7 +201,7 @@ export class ExportAttachmentPlan {
       while (failed === null && next < paths.length) {
         const p = paths[next++];
         try {
-          if (await this.storage.exists(p)) present.add(p);
+          if (await withStorageTimeout(this.storage.exists(p), this.limits.storageTimeoutMs, 'exists()')) present.add(p);
         } catch (err) {
           if (isMissingObjectError(err)) continue;
           if (failed === null) failed = err;

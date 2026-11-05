@@ -202,6 +202,24 @@ describe('LazyAttachmentStream + ExportStreamRegistry over real JSZip (#699)', (
     expect(await destroyedWith(out)).toBeInstanceOf(ExportStorageException);
   });
 
+  it('a HUNG open fails the archive after EXPORT_STORAGE_TIMEOUT_MS, and a stream that arrives later is released', async () => {
+    const log = logger();
+    const reg = new ExportStreamRegistry('page:p1', { ...LIMITS, storageTimeoutMs: 100 }, log);
+    const zip = new JSZip();
+    let arrive!: (s: Readable) => void;
+    zip.file('/files/a0/f.bin', reg.lazy('a0', () => new Promise<Readable>((r) => (arrive = r))), { binary: true, compression: 'STORE' });
+    const out = reg.attach(generate(zip));
+    out.on('data', () => undefined);
+    const t0 = Date.now();
+    expect(await destroyedWith(out, 3000)).toBeInstanceOf(ExportStorageException);
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(log.error).toHaveBeenCalledWith(expect.stringMatching(/reason=storage_error .*attachment=a0 .*did not answer within 100 ms/));
+    const late = synthetic(MiB);
+    arrive(late); // the GetObject answers after all: its socket must not stay held
+    await tick(20);
+    expect(late.destroyed).toBe(true);
+  });
+
   it('a source that closes before its end (premature close, no error) fails the archive', async () => {
     const reg = new ExportStreamRegistry('page:p1', LIMITS, logger());
     const zip = new JSZip();
