@@ -4,6 +4,7 @@ import {
   Body,
   Controller,
   ForbiddenException,
+  Headers,
   HttpCode,
   HttpStatus,
   Inject,
@@ -49,6 +50,8 @@ import { QueueName } from '../../integrations/queue/constants';
 import { getPageTitle } from '../../common/helpers';
 import { AUTHZ_MODE, AuthzMode } from '../mode/authz-mode';
 import { RemotePurgeService } from '../page-delete/remote-purge.service';
+import { RemoteTrashService } from '../page-delete/remote-trash.service';
+import { ACTING_SERVICE_HEADER, parseActingService } from '../page-delete/acting-service';
 import { queuePageAttachmentDeletion } from '../page-delete/page-attachment-jobs';
 import { pageEtagOpaque } from './page-etag';
 import { OpSemaphore, OpSemaphoreTimeout } from './op-semaphore';
@@ -185,9 +188,11 @@ export function toEngineBusy(err: unknown): ServiceUnavailableException | null {
  * #545 guard refusals map to 409 through the global `PageGuardConflictInterceptor`; busy SQLSTATEs map to 503
  * `engine_busy` here. Keeps the upstream `{ data, success }` envelope.
  *
- * In `AUTHZ_MODE=remote` a PERMANENT delete is not decided here: it runs `RemotePurgeService.purge` (#636 W6), the
- * one remote purge routine the native route also runs — space admin AND `page#edit` on every page removed, under
- * locks, after a settle fence. Native mode keeps the replica below.
+ * In `AUTHZ_MODE=remote` a delete is not decided here: a PERMANENT delete runs `RemotePurgeService.purge` (#636 W6)
+ * and a trash runs `RemoteTrashService.trash` (#661) — the remote removal routines the native route also runs, which
+ * decide on EVERY page removed, under locks. The platform's `x-ccc-acting-service` header (#670) is parsed there and
+ * passed to both, so a delegated service account's checks run under the same locks. Native mode keeps the replica
+ * below and ignores the header.
  */
 @UseGuards(JwtAuthGuard)
 @Controller('pages')
@@ -205,6 +210,7 @@ export class ConditionalPageOpsController {
     @InjectQueue(QueueName.ATTACHMENT_QUEUE) private readonly attachmentQueue: Queue,
     @Inject(AUTHZ_MODE) private readonly mode: AuthzMode,
     private readonly remotePurge: RemotePurgeService,
+    private readonly remoteTrash: RemoteTrashService,
   ) {}
 
   /** Replicates `PageController.delete`. Trash converges on an already-trashed page; a permanent delete never does. */
@@ -214,11 +220,18 @@ export class ConditionalPageOpsController {
     @Body() dto: ConditionalDeletePageDto,
     @AuthUser() user: User,
     @AuthWorkspace() workspace: Workspace,
+    @Headers(ACTING_SERVICE_HEADER) actingService?: unknown,
   ): Promise<ConditionalOpResult> {
-    if (dto.permanentlyDelete && this.mode === 'remote') {
-      // #636 W6: the remote purge routine — its own slot, transaction, compare, decision, jobs and `page.deleted` audit.
-      const purged = await this.remotePurge.purge(user, dto.pageId, workspace.id, dto.expectedEtags);
-      return { outcome: 'applied', pageId: purged.page.id };
+    if (this.mode === 'remote') {
+      // The remote removal routines (#636 W6, #661) — each its own transaction, compare, decision and audit; the
+      // delegated service account (#670), parsed strictly, only adds checks.
+      const actingServiceId = parseActingService(actingService);
+      if (dto.permanentlyDelete) {
+        const purged = await this.remotePurge.purge(user, dto.pageId, workspace.id, dto.expectedEtags, actingServiceId);
+        return { outcome: 'applied', pageId: purged.page.id };
+      }
+      const trashed = await this.remoteTrash.trash(user, dto.pageId, workspace.id, dto.expectedEtags, actingServiceId);
+      return { outcome: trashed.outcome, pageId: trashed.page.id };
     }
     const done = await this.guarded(async (trx) => {
       const page = await this.lockPage(trx, dto.pageId, workspace.id, { allowTrashed: true });

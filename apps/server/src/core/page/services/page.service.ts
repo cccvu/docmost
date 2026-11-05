@@ -1084,8 +1084,9 @@ export class PageService {
     userId: string,
     workspaceId: string,
     trx?: KyselyTransaction, // CCC seam #121 (#616): optional caller trx
-  ): Promise<void> {
-    await this.pageRepo.removePage(pageId, userId, workspaceId, trx);
+    opts?: { pageIds?: readonly string[] }, // CCC seam #121/#172 (#661): the decided set; returns the trashed ids
+  ): Promise<string[]> {
+    return this.pageRepo.removePage(pageId, userId, workspaceId, trx, opts);
   }
 
   // CCC integration seam (UPSTREAM_MODIFICATIONS.md #121): visibility widened from `private` to `public`

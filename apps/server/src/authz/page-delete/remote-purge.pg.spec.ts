@@ -42,7 +42,9 @@ describe('real-PG remote purge gate', () => {
 const SCHEMA = 'remote_purge_pg_spec';
 const WS = uuid(100);
 const S1 = uuid(50);
+const S2 = uuid(51);
 const USER = uuid(900);
+const SA = uuid(950);
 const ACTOR = { id: USER } as never;
 
 /** "<xact_id>.<id>" → comparable pair (the platform's `comparePositions`). */
@@ -73,6 +75,11 @@ d('RemotePurgeService on real Postgres (#636 W6)', () => {
     cursor: '0.0',
     locked: new Set<string>(),
     asked: [] as string[],
+    /** `<subject>:<space>` pairs asked for `space#administer`, and the spaces each subject does NOT administer. */
+    askedSpaces: [] as string[],
+    notAdmin: new Map<string, Set<string>>(),
+    /** Pages the service account cannot edit (on top of the projected locks). */
+    saCannotEdit: new Set<string>(),
     settles: [] as string[],
     /** Runs inside the purge at the fence — i.e. while it holds every subtree lock — once. */
     atFence: null as null | (() => Promise<void>),
@@ -89,9 +96,19 @@ d('RemotePurgeService on real Postgres (#636 W6)', () => {
         ? ({ status: 'confirmed' } as const)
         : ({ status: 'pending', reason: 'timeout' } as const);
     },
-    tryCheckBulk: async (_subject: unknown, checks: { resourceId: string }[]) => {
-      platform.asked.push(...checks.map((c) => c.resourceId));
-      return checks.map((c) => !platform.locked.has(c.resourceId));
+    tryCheckBulk: async (
+      subject: { externalId?: string; principalId?: string; subjectType?: string },
+      checks: { resourceType: string; resourceId: string }[],
+    ) => {
+      const who = subject.subjectType === 'service' ? `sa:${subject.principalId}` : 'human';
+      if (checks[0]?.resourceType === 'space') {
+        platform.askedSpaces.push(...checks.map((c) => `${who}:${c.resourceId}`));
+        return checks.map((c) => !platform.notAdmin.get(who)?.has(c.resourceId));
+      }
+      if (who === 'human') platform.asked.push(...checks.map((c) => c.resourceId));
+      return checks.map(
+        (c) => !platform.locked.has(c.resourceId) && !(who !== 'human' && platform.saCannotEdit.has(c.resourceId)),
+      );
     },
   };
   /** The relay catches up: everything committed is projected (a restricted page locks its whole subtree). */
@@ -171,7 +188,8 @@ d('RemotePurgeService on real Postgres (#636 W6)', () => {
     db = mkReadModelDb(appPg);
     await pg`create table users (id uuid primary key, email varchar, name varchar, avatar_url varchar, role varchar, deleted_at timestamptz)`;
     await pg`create table groups (id uuid primary key, name varchar)`;
-    await pg`create table spaces (id uuid primary key, name varchar, slug varchar, workspace_id uuid not null, deleted_at timestamptz)`;
+    await pg`create table spaces (id uuid primary key, name varchar, slug varchar, workspace_id uuid not null,
+                                  updated_at timestamptz not null default now(), deleted_at timestamptz)`;
     await pg`
       create table space_members (
         id uuid primary key default gen_random_uuid(), user_id uuid, group_id uuid,
@@ -201,7 +219,7 @@ d('RemotePurgeService on real Postgres (#636 W6)', () => {
         user_id uuid, group_id uuid, role varchar not null
       )`;
     await pg`insert into users (id, name) values (${USER}, 'Actor')`;
-    await pg`insert into spaces (id, workspace_id) values (${S1}, ${WS})`;
+    await pg`insert into spaces (id, workspace_id) values (${S1}, ${WS}), (${S2}, ${WS})`;
 
     await (new AuthzOutboxInstaller(db as never, 'remote') as unknown as { install(): Promise<void> }).install();
     await new PageCycleGuardInstaller(db as never, 'remote').install();
@@ -252,11 +270,15 @@ d('RemotePurgeService on real Postgres (#636 W6)', () => {
     jest.restoreAllMocks();
     platform.atFence = null;
     platform.asked.length = 0;
+    platform.askedSpaces.length = 0;
+    platform.notAdmin.clear();
+    platform.saCannotEdit.clear();
     platform.settles.length = 0;
     jobs.length = 0;
     audits.length = 0;
     await pg`delete from page_access`;
     await pg`delete from pages`;
+    await pg`update spaces set deleted_at = null`;
     await pg`delete from authz_outbox`;
   });
 
@@ -407,6 +429,99 @@ d('RemotePurgeService on real Postgres (#636 W6)', () => {
       expect(await running).toBe('applied');
       expect([...platform.asked].sort()).toEqual([...SUBTREE, uuid(5)].sort());
       expect(await exists(...SUBTREE, uuid(5))).toEqual([]);
+    });
+  });
+
+  describe('#618: space admin on EVERY space of the subtree, by the PDP', () => {
+    it('a descendant left in another space the human does not administer → upstream’s 403, nothing deleted', async () => {
+      await pg`update pages set space_id = ${S2} where id = ${uuid(3)}`; // a page a move-to-space skipped
+      platform.notAdmin.set('human', new Set([S2]));
+      await project();
+      expect(await outcome(purge.purge(ACTOR, uuid(1), WS))).toBe('403:');
+      expect([...platform.askedSpaces].sort()).toEqual([`human:${S1}`, `human:${S2}`].sort());
+      expect(platform.asked).toEqual([]); // edit is never asked once space admin is refused
+      expect(await exists(...SUBTREE)).toEqual([...SUBTREE].sort());
+      expect(jobs).toEqual([]);
+      expect(audits).toEqual([]);
+    });
+
+    it('control: admin of both spaces → the cross-space subtree is purged', async () => {
+      await pg`update pages set space_id = ${S2} where id = ${uuid(3)}`;
+      await project();
+      expect(await outcome(purge.purge(ACTOR, uuid(1), WS))).toBe('applied');
+      expect(await exists(...SUBTREE)).toEqual([]);
+    });
+  });
+
+  describe('#589: an archived space is frozen against a purge', () => {
+    it('the root’s space archived → 409 space_archived before any lock or settle; nothing deleted', async () => {
+      await pg`update spaces set deleted_at = now() where id = ${S1}`;
+      expect(await outcome(purge.purge(ACTOR, uuid(1), WS))).toBe('409:space_archived');
+      expect(platform.settles).toEqual([]);
+      expect(await exists(...SUBTREE)).toEqual([...SUBTREE].sort());
+    });
+
+    it('a descendant’s space archived → 409 under the locks; nothing deleted', async () => {
+      await pg`update pages set space_id = ${S2} where id = ${uuid(3)}`;
+      await pg`update spaces set deleted_at = now() where id = ${S2}`;
+      expect(await outcome(purge.purge(ACTOR, uuid(1), WS))).toBe('409:space_archived');
+      expect(platform.settles).toEqual([]);
+      expect(platform.asked).toEqual([]);
+      expect(await exists(...SUBTREE)).toEqual([...SUBTREE].sort());
+    });
+
+    it('an archive that starts while the purge holds its FOR SHARE lock waits for the purge', async () => {
+      const order: string[] = [];
+      let archive!: Promise<string>;
+      platform.atFence = async () => {
+        archive = sideTx((x) => x`update spaces set deleted_at = now() where id = ${S1}`).then(
+          (r) => (order.push('archive-done'), r),
+        );
+        await waitForLockWaiter(); // blocked on our FOR SHARE on the space row
+        order.push('archive-waiting');
+      };
+      const result = await outcome(purge.purge(ACTOR, uuid(1), WS)).then((o) => (order.push('purge-done'), o));
+      expect(result).toBe('applied');
+      expect(await archive).toBe('committed');
+      expect(order).toEqual(['archive-waiting', 'purge-done', 'archive-done']);
+    });
+
+    it('control: a page insert into the space is NOT blocked by the FOR SHARE (it takes only KEY SHARE)', async () => {
+      let insert!: string;
+      platform.atFence = async () => {
+        insert = await sideTx((x) => x`
+          insert into pages (id, workspace_id, space_id, parent_page_id, position) values (${uuid(20)}, ${WS}, ${S1}, ${uuid(9)}, 'a0000')`);
+      };
+      expect(await outcome(purge.purge(ACTOR, uuid(1), WS))).toBe('applied');
+      expect(insert).toBe('committed');
+    });
+  });
+
+  describe('#670: the delegated service account, decided under the same locks', () => {
+    it('the service account cannot edit one descendant → 403 purge_needs_edit, nothing deleted; the human was decided first', async () => {
+      platform.saCannotEdit.add(uuid(3));
+      expect(await outcome(purge.purge(ACTOR, uuid(1), WS, undefined, SA))).toBe('403:purge_needs_edit');
+      expect(platform.asked.sort()).toEqual([...SUBTREE].sort());
+      expect(platform.askedSpaces).toEqual([`human:${S1}`, `sa:${SA}:${S1}`]);
+      expect(await exists(...SUBTREE)).toEqual([...SUBTREE].sort());
+    });
+
+    it('the service account does not administer the space → 403, nothing deleted', async () => {
+      platform.notAdmin.set(`sa:${SA}`, new Set([S1]));
+      expect(await outcome(purge.purge(ACTOR, uuid(1), WS, undefined, SA))).toBe('403:');
+      expect(await exists(...SUBTREE)).toEqual([...SUBTREE].sort());
+    });
+
+    it('anti-bypass: a human the PDP refuses is never decided for the service account', async () => {
+      await restrictSql(pg, uuid(2));
+      await project();
+      expect(await outcome(purge.purge(ACTOR, uuid(1), WS, undefined, SA))).toBe('403:purge_needs_edit');
+      expect(platform.askedSpaces.filter((a) => a.startsWith('sa:'))).toEqual([]);
+    });
+
+    it('both allowed → purged', async () => {
+      expect(await outcome(purge.purge(ACTOR, uuid(1), WS, undefined, SA))).toBe('applied');
+      expect(await exists(...SUBTREE)).toEqual([]);
     });
   });
 

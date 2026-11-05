@@ -5,7 +5,11 @@ import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { PageService } from '../../core/page/services/page.service';
 import { AuthzOutboxInstaller } from '../../service-bridge/authz-outbox.installer';
 import { CYCLE_LOCK_CLASS, PageCycleGuardInstaller } from '../../service-bridge/page-cycle-guard.installer';
-import { PageRestrictionGuardInstaller, RESTRICTED_SPACE_MOVE } from '../../service-bridge/page-restriction-guard.installer';
+import {
+  ARCHIVED_SPACE_MOVE,
+  PageRestrictionGuardInstaller,
+  RESTRICTED_SPACE_MOVE,
+} from '../../service-bridge/page-restriction-guard.installer';
 import { PG_URL, uuid, mkReadModelPg, bootstrapSchema, mkReadModelDb } from '../../service-bridge/read-model-pg.testkit';
 
 // PageService imports the collab gateway, whose lib0/hocuspocus ESM graph jest cannot load; the paths driven here
@@ -176,7 +180,8 @@ d('ConditionalPageOpsController on real Postgres (#616)', () => {
       { createForUser: async () => allow } as never,
       { log: (p: { event: string }) => audits.push(p.event) } as never,
       { add: async (_j: string, data: { pageId: string }) => void controllerJobs.push(data.pageId) } as never,
-      'native', // the native replica; the remote permanent delete is RemotePurgeService's (remote-purge.pg.spec.ts)
+      'native', // the native replica; the remote removals are RemotePurgeService's / RemoteTrashService's (their pg specs)
+      {} as never,
       {} as never,
     );
   });
@@ -461,6 +466,24 @@ d('ConditionalPageOpsController on real Postgres (#616)', () => {
       ).toBe(`error:${RESTRICTED_SPACE_MOVE}`);
       expect(await row(uuid(3))).toMatchObject({ spaceId: S1 });
       expect(await outboxCount()).toBe(outboxBefore);
+    });
+
+    it('move-to-space OUT of an archived space (#589): the g1 guard refuses, the whole write rolls back', async () => {
+      await page(uuid(1), null);
+      await page(uuid(2), uuid(1));
+      await pg`update spaces set deleted_at = now() where id = ${S1}`;
+      try {
+        const outboxBefore = await outboxCount();
+        expect(
+          await outcome(controller.conditionalMoveToSpace({ pageId: uuid(1), spaceId: S2, expectedEtags: ['*'] } as never, ACTOR, WORKSPACE)),
+        ).toBe(`error:${ARCHIVED_SPACE_MOVE}`);
+        expect(await row(uuid(1))).toMatchObject({ spaceId: S1, parentPageId: null });
+        expect(await row(uuid(2))).toMatchObject({ spaceId: S1, parentPageId: uuid(1) });
+        expect(await outboxCount()).toBe(outboxBefore);
+        expect(audits).toEqual([]);
+      } finally {
+        await pg`update spaces set deleted_at = null where id = ${S1}`;
+      }
     });
 
     it('a slug resolves to the page and the retry of an applied move converges', async () => {

@@ -139,8 +139,19 @@ ability on every route gated on workspace permissions (1.10.0, #636).
 /api/pages/delete {permanentlyDelete: true}`, `POST /api/pages/conditional-delete`) also requires `page#edit` for the
 caller on every page it removes, trashed descendants included, decided under row locks after the access-change settle
 fence: `403 { code: purge_needs_edit }` otherwise; `503 { code: purge_unconfirmed }` (retryable) when access changes
-cannot be confirmed as enforced; `409 { code: purge_subtree_changed }` (retryable) when the subtree keeps changing. A
-trash is unchanged.
+cannot be confirmed as enforced; `409 { code: purge_subtree_changed }` (retryable) when the subtree keeps changing.
+
+**Remote page removal decides on every page (1.11.0, wiki-v2 #661, #618, #589, #670).** In remote mode a TRASH
+(`POST /api/pages/delete`, `POST /api/pages/conditional-delete`, without `permanentlyDelete`) needs `page#edit` on
+every live page it moves to the trash and moves exactly those: `403 { code: trash_needs_edit }`, retryable
+`503 { code: trash_unconfirmed }` / `409 { code: trash_subtree_changed }`. A permanent delete also needs
+`space#administer` on EVERY space its subtree touches (`403`), and is refused while any of them is archived
+(`409 { code: space_archived }`); a move-to-space out of an archived space is the guard's
+`409 { code: ccc_page_archived_space_move }`, and the trash retention never purges a subtree that still has a live or
+unexpired page or touches an archived space. A platform relaying these for an on-behalf-of service principal may send
+`x-ccc-acting-service: <the service account's principal id>`: the fork then also decides the same checks for that
+service account (`{principalId, subjectType: 'service'}`), under the same locks, after the caller's. It only ever
+narrows; a malformed value is `400 { code: acting_service_invalid }`; native mode ignores it.
 
 **Access-narrowing propagation (1.6.0, #501).** A successful response from a route that can take access away
 (`archive`, the member `POST` upsert, `PATCH` and `DELETE` here, and the native restrict/grant/move routes a
@@ -156,7 +167,8 @@ one already in the target space (upstream deletes every moved page's restriction
 re-parent or restore-detach that takes an unrestricted page out from under its last restricted ancestor. A
 restriction written takes the same lock and its `space_id` from the page, so a restrict and a move serialize. The
 native routes answer a refusal — and a move cycle — with `409 { message, code }`, `code` one of
-`ccc_page_no_cycle`, `ccc_page_restricted_space_move`, `ccc_page_restriction_strip`, and the refused statement's
+`ccc_page_no_cycle`, `ccc_page_restricted_space_move`, `ccc_page_restriction_strip`, `ccc_page_archived_space_move` (a
+move-to-space out of an archived space, wiki-v2 #589), and the refused statement's
 transaction rolls back. A move rolls back whole; upstream's restore is not transactional, so on a refused detach the
 un-trash has already committed and the page stays under its trashed, restricted parent (never declassified;
 wiki-v2 issue 556).

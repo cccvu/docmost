@@ -1,13 +1,4 @@
-import {
-  ConflictException,
-  ForbiddenException,
-  Inject,
-  Injectable,
-  Logger,
-  NotFoundException,
-  PreconditionFailedException,
-  ServiceUnavailableException,
-} from '@nestjs/common';
+import { Inject, Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectKysely } from 'nestjs-kysely';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
@@ -22,81 +13,53 @@ import { AuditEvent, AuditResource } from '../../common/events/audit-events';
 import { AUDIT_SERVICE, IAuditService } from '../../integrations/audit/audit.service';
 import { QueueName } from '../../integrations/queue/constants';
 import { getPageTitle } from '../../common/helpers';
-import { maxCommittedPosition } from '../../service-bridge/authz-change-feed.service';
 import { asEngineBusy, boundWaits, engineBusy } from '../../service-bridge/resource-version';
-import { HttpAuthzClient } from '../http-authz.client';
+import { AuthzSubject, HttpAuthzClient } from '../http-authz.client';
 import { OpSemaphore, OpSemaphoreTimeout } from '../page-write/op-semaphore';
-import { pageEtagOpaque } from '../page-write/page-etag';
 import { queuePageAttachmentDeletion } from './page-attachment-jobs';
+import {
+  assertExpectedEtags,
+  lockSpacesShared,
+  lockSubtree,
+  readTarget,
+  spacesOf,
+  SUBTREE_MAX_PASSES,
+} from './page-subtree';
+import {
+  decideAll,
+  DECIDE_CHUNK,
+  humanSubject,
+  purgeSettleWaitMs,
+  serviceSubject,
+  settle,
+  SETTLE_MAX_MS,
+} from './page-delete-decision';
+import {
+  purgeNeedsEdit,
+  purgeSubtreeChanged,
+  purgeUnconfirmed,
+  spaceAdminRequired,
+  spaceArchived,
+} from './page-delete-errors';
+
+export { purgeSettleWaitMs } from './page-delete-decision';
+export { purgeNeedsEdit, purgeSubtreeChanged, purgeUnconfirmed } from './page-delete-errors';
 
 /** Subtree recomputations under the locks before the purge gives up with a retryable 409. */
-export const PURGE_MAX_PASSES = 3;
+export const PURGE_MAX_PASSES = SUBTREE_MAX_PASSES;
 /** The longest the purge waits, holding its locks, for the platform to confirm the settle fence. */
-export const PURGE_SETTLE_MAX_MS = 3000;
+export const PURGE_SETTLE_MAX_MS = SETTLE_MAX_MS;
 /** The platform's `/authz/check-bulk` caps `checks` at @ArrayMaxSize(256); larger subtrees are decided in chunks. */
-export const PURGE_CHECK_CHUNK = 256;
+export const PURGE_CHECK_CHUNK = DECIDE_CHUNK;
 /** Purges in flight per fork process (each holds a pooled connection and row locks), and how long one waits. */
 export const PURGE_MAX_CONCURRENT = 2;
 export const PURGE_SLOT_WAIT_MS = 2000;
-
-/**
- * The settle wait: the SAME knob as the narrowing routes (`AUTHZ_NARROWING_SETTLE_TIMEOUT_MS`, parsed exactly as
- * `narrowingSettleTimeoutMs` in `live-access/narrowing-settle.interceptor.ts` — the spec cross-checks the two), capped
- * at {@link PURGE_SETTLE_MAX_MS}. `0` (the narrowing rollback switch) means no fence can be proven, so purges are
- * refused. Not imported: that module pulls the live-session revalidator's gateway graph into every importer.
- */
-export function purgeSettleWaitMs(raw = process.env.AUTHZ_NARROWING_SETTLE_TIMEOUT_MS): number {
-  const fallback = 3000;
-  let ms = fallback;
-  if (raw !== undefined && raw.trim() !== '') {
-    const n = Number(raw);
-    ms = Number.isFinite(n) && n >= 0 ? Math.min(Math.trunc(n), 5000) : fallback;
-  }
-  return Math.min(ms, PURGE_SETTLE_MAX_MS);
-}
 
 export interface PurgeResult {
   /** The target row as locked (the audit's `before`). */
   page: Page;
   /** Every page the purge removed: the target and all its descendants, trashed ones included. */
   deletedIds: string[];
-}
-
-/** What the purge reads of the locked target: the ETag material and the audit payload. */
-const TARGET_FIELDS = [
-  'id',
-  'slugId',
-  'title',
-  'spaceId',
-  'workspaceId',
-  'parentPageId',
-  'updatedAt',
-  'lastUpdatedById',
-  'deletedAt',
-  'content',
-] as const;
-
-export function purgeNeedsEdit(): ForbiddenException {
-  return new ForbiddenException({
-    message: 'a permanent delete needs edit access to every page it removes',
-    code: 'purge_needs_edit',
-  });
-}
-
-/** 503, retryable: the purge could not establish its authorization (fence unconfirmed, PDP unreachable). Nothing changed. */
-export function purgeUnconfirmed(): ServiceUnavailableException {
-  return new ServiceUnavailableException({
-    message: 'access changes could not be confirmed as enforced; nothing was deleted — retry shortly',
-    code: 'purge_unconfirmed',
-  });
-}
-
-/** 409, retryable: the subtree kept changing under the purge. Nothing changed. */
-export function purgeSubtreeChanged(): ConflictException {
-  return new ConflictException({
-    message: 'the page tree changed while it was being deleted; nothing was deleted — retry',
-    code: 'purge_subtree_changed',
-  });
 }
 
 const sameSet = (a: readonly string[], b: ReadonlySet<string>) => a.length === b.size && a.every((id) => b.has(id));
@@ -111,10 +74,13 @@ const sameSet = (a: readonly string[], b: ReadonlySet<string>) => a.length === b
  * needs an affirmative PDP `page#edit` for the human on EVERY page it removes, decided under locks after a settle
  * fence, so no access change can slip between the check and the delete:
  *
- *   slot (≤2 per process) → pre-check (404, space admin: a fast refusal that takes no lock) → BEGIN → SET LOCAL
- *   lock_timeout/statement_timeout → 1. lock the subtree → 2. 404 / ETag on the locked target → 3. settle fence →
- *   4. decide (space admin again, then `page#edit` on every locked id) → 5. `forceDelete(trx)` and verify the deleted
- *   set IS the locked set → COMMIT → attachment jobs → the native `page.deleted` audit.
+ *   slot (≤2 per process) → pre-check (404, space admin, the root's space archived → 409: fast refusals that take
+ *   no lock) → BEGIN → SET LOCAL lock_timeout/statement_timeout → 1. lock the subtree → 2. 404 / ETag on the locked
+ *   target → 2b. hold every space of the locked rows `FOR SHARE`; any archived → 409 `space_archived` → 3. settle
+ *   fence → 4. decide (space CASL again; then for the human PDP `space#administer` on EVERY space of the subtree and
+ *   `page#edit` on every locked id; then the same two for a delegated service account, when the platform named one)
+ *   → 5. `forceDelete(trx)` and verify the deleted set IS the locked set → COMMIT → attachment jobs → the native
+ *   `page.deleted` audit.
  *
  * 1. `SELECT … FOR UPDATE` every subtree row (the `forceDelete` walk, trashed pages included), in id order, then walk
  *    again under the locks; a new row (a child committed while we waited) is locked too, and a tree still changing
@@ -137,8 +103,14 @@ const sameSet = (a: readonly string[], b: ReadonlySet<string>) => a.length === b
  *    and the locks stop any new one on these pages; a change committed after `P` on another object (a membership) is
  *    ordered after the purge — the semantics of every other check. While our transaction holds its xid, the relay
  *    cannot pass a row from a LATER transaction, so a busy outbox can make the fence time out: a 503, never a pass.
+ * 2b. An archived space is frozen against irreversible removal (#589): a direct space admin keeps `edit` there, and a
+ *    workspace admin's restore must bring the space back whole. `FOR SHARE` makes an archive that starts now wait for
+ *    the purge; a page insert or move only takes `FOR KEY SHARE` on the space, which it does not block.
  * 4. A page the PDP has not placed (a create in flight) has no `edit`, so it is refused — #524's rule. A PDP failure is
- *    distinguished from a deny (`tryCheckBulk`) and is a 503, never a 403 and never a pass.
+ *    distinguished from a deny (`tryCheckBulk`) and is a 503, never a 403 and never a pass. A subtree can span spaces
+ *    (a move-to-space leaves a page it skipped behind), so space admin is decided on EVERY space it touches (#618), by
+ *    the PDP — not CASL, which turns a PDP outage into a 404. The service leg (#670, `acting-service.ts`) only narrows:
+ *    it runs after every human check passed, so it is never consulted for a human the PDP denied.
  *
  * Upstream's space-admin check is kept, never replaced. Native mode never reaches this class: the native handler and
  * the conditional delete keep their upstream behaviour there. Entry points (`remote-purge.fitness.spec.ts` pins them):
@@ -162,27 +134,57 @@ export class RemotePurgeService {
   ) {}
 
   /**
-   * Permanently delete `ref` (an id or slug) and its whole subtree for `user`, or refuse with nothing changed: 404
-   * (missing, other workspace), 403 (not a space admin; `purge_needs_edit`), 412 (`expectedEtags` given and none
-   * matches), 409 (`purge_subtree_changed`), 503 (`engine_busy`, `purge_unconfirmed`).
+   * Permanently delete `ref` (an id or slug) and its whole subtree for `user` — and for the delegated service account
+   * `serviceSubjectId`, when the platform named one — or refuse with nothing changed: 404 (missing, other workspace),
+   * 403 (not a space admin of every space; `purge_needs_edit`), 409 (`space_archived`, `purge_subtree_changed`), 412
+   * (`expectedEtags` given and none matches), 503 (`engine_busy`, `purge_unconfirmed`).
    */
-  async purge(user: User, ref: string, workspaceId: string, expectedEtags?: string[]): Promise<PurgeResult> {
+  async purge(
+    user: User,
+    ref: string,
+    workspaceId: string,
+    expectedEtags?: string[],
+    serviceSubjectId?: string,
+  ): Promise<PurgeResult> {
     const done = await this.run(async () => {
       const resolved = await this.pageRepo.findById(ref);
       if (!resolved || resolved.workspaceId !== workspaceId) throw new NotFoundException('Page not found');
-      // Fast refusal before any lock: a caller who is not a space admin never holds the subtree or waits on a settle.
+      // Fast refusals before any lock: a caller who is not a space admin never holds the subtree or waits on a
+      // settle, and a purge in an archived space is refused outright (#589; re-checked under the locks below).
       await this.requireSpaceAdmin(user, resolved.spaceId);
+      if (await this.rootSpaceArchived(resolved.spaceId, workspaceId)) {
+        this.logger.warn(`REMOTE_PURGE_ARCHIVED page=${resolved.id} stage=pre-check: answered 409`);
+        throw spaceArchived();
+      }
       return this.inTx(async (trx) => {
-        const ids = await this.lockSubtree(trx, resolved.id, workspaceId);
-        const page = await this.readTarget(trx, resolved.id, workspaceId);
+        const rows = await lockSubtree(trx, resolved.id, workspaceId, 'update');
+        if (rows === null) {
+          this.logger.warn(`REMOTE_PURGE_UNSTABLE page=${resolved.id} passes=${PURGE_MAX_PASSES}: answered 409`);
+          throw purgeSubtreeChanged();
+        }
+        const ids = new Set(rows.map((r) => r.id));
+        const page = await readTarget(trx, resolved.id, workspaceId);
         if (!page || !ids.has(page.id)) throw new NotFoundException('Page not found');
-        if (expectedEtags) assertExpected(expectedEtags, page);
+        if (expectedEtags) assertExpectedEtags(expectedEtags, page);
+
+        // Every space the subtree touches, held FOR SHARE until the commit: an archive waits for us (#589).
+        const spaceIds = spacesOf(rows);
+        const spaces = await lockSpacesShared(trx, spaceIds, workspaceId);
+        if (spaces === null || spaces.some((s) => s.deletedAt != null)) {
+          this.logger.warn(`REMOTE_PURGE_ARCHIVED page=${page.id} stage=locked: answered 409`);
+          throw spaceArchived();
+        }
 
         await this.fence(trx);
-        // The authoritative decisions, on the settled PDP: the space-admin check again (the page may have moved, a
-        // binding may have been revoked), then edit on every page the purge will remove.
+        // The authoritative decisions, on the settled PDP: upstream's space-admin check again (the page may have
+        // moved, a binding may have been revoked), then for the human and then for the delegated service account:
+        // space admin on EVERY space of the subtree (#618), and edit on every page the purge will remove.
         await this.requireSpaceAdmin(user, page.spaceId);
-        await this.requireEditOnAll(user, [...ids].sort());
+        const sortedIds = [...ids].sort();
+        await this.requirePurgeRights(humanSubject(user), spaceIds, sortedIds, 'human');
+        if (serviceSubjectId !== undefined) {
+          await this.requirePurgeRights(serviceSubject(serviceSubjectId), spaceIds, sortedIds, 'service');
+        }
 
         const deletedIds = await this.pageService.forceDelete(page.id, workspaceId, trx);
         if (!sameSet(deletedIds, ids)) {
@@ -241,75 +243,24 @@ export class RemotePurgeService {
     });
   }
 
-  /** The ids `forceDelete` would remove (its recursive walk: no workspace or trash filter), as of this statement. */
-  protected async walk(trx: KyselyTransaction, rootId: string): Promise<string[]> {
-    const rows = await trx
-      .withRecursive('page_descendants', (db) =>
-        db
-          .selectFrom('pages')
-          .select(['id'])
-          .where('id', '=', rootId)
-          .unionAll((exp) =>
-            exp
-              .selectFrom('pages as p')
-              .select(['p.id'])
-              .innerJoin('page_descendants as pd', 'pd.id', 'p.parentPageId'),
-          ),
-      )
-      .selectFrom('page_descendants')
-      .select(['id'])
-      .execute();
-    return rows.map((r) => r.id);
-  }
-
-  /** Step 1: lock every subtree row `FOR UPDATE` in id order, re-walking until the walk adds nothing; else 409. */
-  protected async lockSubtree(trx: KyselyTransaction, rootId: string, workspaceId: string): Promise<Set<string>> {
-    const locked = new Set<string>();
-    let ids = await this.walk(trx, rootId);
-    for (let pass = 1; ; pass++) {
-      const fresh = ids.filter((id) => !locked.has(id));
-      if (fresh.length > 0) {
-        const rows = await trx
-          .selectFrom('pages')
-          .select(['id'])
-          .where('id', 'in', fresh)
-          .where('workspaceId', '=', workspaceId)
-          .orderBy('id')
-          .forUpdate()
-          .execute();
-        for (const r of rows) locked.add(r.id);
-      }
-      const again = await this.walk(trx, rootId);
-      // Stable: every page the delete would now remove is locked (a row moved out meanwhile stays locked, harmlessly).
-      if (again.every((id) => locked.has(id))) return new Set(again);
-      if (pass >= PURGE_MAX_PASSES) {
-        this.logger.warn(`REMOTE_PURGE_UNSTABLE page=${rootId} passes=${pass}: answered 409`);
-        throw purgeSubtreeChanged();
-      }
-      ids = again;
-    }
-  }
-
-  /** Step 2's read: the target as locked, workspace-scoped (trashed pages included — purging trash is the usual case). */
-  protected async readTarget(trx: KyselyTransaction, id: string, workspaceId: string): Promise<Page | undefined> {
-    return (await trx
-      .selectFrom('pages')
-      .select([...TARGET_FIELDS])
-      .where('id', '=', id)
+  /** The root's space is archived (or gone): read without a lock, a fast refusal only — re-checked under the locks. */
+  private async rootSpaceArchived(spaceId: string, workspaceId: string): Promise<boolean> {
+    const space = await this.db
+      .selectFrom('spaces')
+      .select(['deletedAt'])
+      .where('id', '=', spaceId)
       .where('workspaceId', '=', workspaceId)
-      .executeTakeFirst()) as Page | undefined;
+      .executeTakeFirst();
+    return !space || space.deletedAt != null;
   }
 
   /** Step 3: settle to the max committed outbox position read now (after the locks); anything but `confirmed` → 503. */
   protected async fence(trx: KyselyTransaction): Promise<void> {
-    if (this.settleMs === 0) {
-      this.logger.warn('REMOTE_PURGE_UNCONFIRMED reason=settle-disabled: answered 503');
-      throw purgeUnconfirmed();
-    }
-    const position = await maxCommittedPosition(trx);
-    const settled = await this.authz.settleProjection(position, this.settleMs);
-    if (settled.status !== 'confirmed') {
-      this.logger.warn(`REMOTE_PURGE_UNCONFIRMED reason=${settled.reason} position=${position}: answered 503`);
+    const settled = await settle(this.authz, trx, this.settleMs);
+    if (!settled.ok) {
+      this.logger.warn(
+        `REMOTE_PURGE_UNCONFIRMED reason=${settled.reason}${settled.position ? ` position=${settled.position}` : ''}: answered 503`,
+      );
       throw purgeUnconfirmed();
     }
   }
@@ -318,32 +269,30 @@ export class RemotePurgeService {
   private async requireSpaceAdmin(user: User, spaceId: string): Promise<void> {
     const ability = await this.spaceAbility.createForUser(user, spaceId);
     if (ability.cannot(SpaceCaslAction.Manage, SpaceCaslSubject.Settings)) {
-      throw new ForbiddenException('Only space admins can permanently delete pages');
+      throw spaceAdminRequired();
     }
   }
 
-  /** Step 4: an affirmative `page#edit` for the human on every id. A deny → 403; a failed or malformed answer → 503. */
-  private async requireEditOnAll(user: User, ids: string[]): Promise<void> {
-    const subject = { provider: 'docmost', externalId: user.id } as const;
-    for (let i = 0; i < ids.length; i += PURGE_CHECK_CHUNK) {
-      const batch = ids.slice(i, i + PURGE_CHECK_CHUNK);
-      const results = await this.authz.tryCheckBulk(
-        subject,
-        batch.map((resourceId) => ({ permission: 'edit', resourceType: 'page', resourceId })),
-      );
-      if (results === null) {
-        this.logger.warn(`REMOTE_PURGE_UNCONFIRMED reason=pdp-unavailable pages=${ids.length}: answered 503`);
-        throw purgeUnconfirmed();
-      }
-      if (results.length !== batch.length || results.some((allowed) => allowed !== true)) throw purgeNeedsEdit();
-    }
+  /**
+   * Step 4, for one subject: PDP `space#administer` on every space of the subtree (#618; a deny → upstream's 403), then
+   * an affirmative `page#edit` on every id (a deny → 403 `purge_needs_edit`). A failed or malformed answer → 503.
+   */
+  private async requirePurgeRights(
+    subject: AuthzSubject,
+    spaceIds: string[],
+    ids: string[],
+    leg: 'human' | 'service',
+  ): Promise<void> {
+    const admin = await decideAll(this.authz, subject, 'administer', 'space', spaceIds);
+    if (admin === 'unavailable') this.unavailable(leg, ids.length);
+    if (admin === 'denied') throw spaceAdminRequired();
+    const edit = await decideAll(this.authz, subject, 'edit', 'page', ids);
+    if (edit === 'unavailable') this.unavailable(leg, ids.length);
+    if (edit === 'denied') throw purgeNeedsEdit();
   }
-}
 
-/** `["*"]` passes on any row; otherwise one of the tags must equal the locked row's version (the conditional delete's compare). */
-function assertExpected(expectedEtags: string[], page: Page): void {
-  if (expectedEtags.length === 1 && expectedEtags[0] === '*') return;
-  if (!expectedEtags.includes(pageEtagOpaque(page))) {
-    throw new PreconditionFailedException({ message: 'page changed', code: 'precondition_failed' });
+  private unavailable(leg: 'human' | 'service', pages: number): never {
+    this.logger.warn(`REMOTE_PURGE_UNCONFIRMED reason=pdp-unavailable leg=${leg} pages=${pages}: answered 503`);
+    throw purgeUnconfirmed();
   }
 }

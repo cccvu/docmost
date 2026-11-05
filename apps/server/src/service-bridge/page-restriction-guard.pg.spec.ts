@@ -7,6 +7,7 @@ import { PageService } from '../core/page/services/page.service';
 import { CYCLE_LOCK_CLASS, PageCycleGuardInstaller } from './page-cycle-guard.installer';
 import { AuthzOutboxInstaller } from './authz-outbox.installer';
 import {
+  ARCHIVED_SPACE_MOVE,
   PageRestrictionGuardInstaller,
   RESTRICTED_SPACE_MOVE,
   RESTRICTION_STRIP,
@@ -247,6 +248,56 @@ d('PageRestrictionGuardInstaller on real Postgres, through the real upstream wri
       expect(await row(uuid(2))).toMatchObject({ spaceId: S2, parentPageId: uuid(1) });
       expect(await row(uuid(3))).toMatchObject({ spaceId: S1, parentPageId: null });
       expect(await accessRows()).toEqual([{ pageId: uuid(3), spaceId: S1 }]);
+    });
+  });
+
+  describe('g1 (#589): no page leaves an ARCHIVED space (an archived space is frozen against irreversible removal)', () => {
+    const archive = (space: string) => pg`update spaces set deleted_at = now() where id = ${space}`;
+    afterEach(async () => {
+      await pg`update spaces set deleted_at = null`;
+    });
+
+    it('refuses the native move-to-space of a page out of an archived space — the whole write rolls back', async () => {
+      await page(uuid(1), null);
+      await page(uuid(2), uuid(1));
+      await archive(S1);
+      const outboxBefore = await outboxCount();
+      expect(await outcome(moveToSpace(uuid(1), S2))).toBe(ARCHIVED_SPACE_MOVE);
+      expect(await row(uuid(1))).toMatchObject({ spaceId: S1, parentPageId: null });
+      expect(await row(uuid(2))).toMatchObject({ spaceId: S1, parentPageId: uuid(1) });
+      expect(await outboxCount()).toBe(outboxBefore);
+    });
+
+    it('refuses a raw space_id change too (every write path, not just the engine’s)', async () => {
+      await page(uuid(1), null);
+      await archive(S1);
+      expect(await outcome(pg`update pages set space_id = ${S2} where id = ${uuid(1)}`)).toBe(ARCHIVED_SPACE_MOVE);
+    });
+
+    it('allows a move WITHIN the archived space, a space_id write that does not change it, and a move INTO one', async () => {
+      await page(uuid(1), null);
+      await page(uuid(2), null);
+      await page(uuid(3), null, { space: S2 });
+      await archive(S1);
+      expect(await outcome(move(uuid(2), uuid(1)))).toBe('resolved');
+      expect(await outcome(pg`update pages set space_id = ${S1} where id = ${uuid(1)}`)).toBe('resolved');
+      expect(await outcome(moveToSpace(uuid(3), S1))).toBe('resolved');
+      expect(await row(uuid(3))).toMatchObject({ spaceId: S1 });
+    });
+
+    it('control: the same move out of a LIVE space is allowed', async () => {
+      await page(uuid(1), null);
+      expect(await outcome(moveToSpace(uuid(1), S2))).toBe('resolved');
+    });
+
+    it('the real driver error maps to a 409 with a fixed body (no ids)', async () => {
+      await page(uuid(1), null);
+      await archive(S1);
+      const err = await moveToSpace(uuid(1), S2).then(() => null, (e) => e);
+      const mapped = toPageGuardConflict(err);
+      expect(mapped).toBeInstanceOf(ConflictException);
+      expect(mapped!.getResponse()).toEqual({ message: expect.any(String), code: ARCHIVED_SPACE_MOVE });
+      expect(JSON.stringify(mapped!.getResponse())).not.toContain(uuid(1));
     });
   });
 
