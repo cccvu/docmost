@@ -18,6 +18,7 @@ import { HelmetProvider } from "react-helmet-async";
 import "./i18n";
 import { PostHogAnalytics } from "@/features/analytics/posthog-analytics.tsx";
 import { loadBrandConfig } from "@/features/brand/brand-config.ts";
+import { prefetchCodeGrammarsWhenIdle } from "@/features/editor-ux/code-highlight/lowlight.ts";
 
 // #384: same defaults as before, plus one retry for the fork's short rate limit and a deduped 429 toast.
 export const queryClient = createAppQueryClient();
@@ -45,4 +46,6 @@ void loadBrandConfig().finally(() => {
       </MantineProvider>
     </BrowserRouter>,
   );
+  // #407: fetch the lazy code grammars once idle after first paint, not only at editor mount.
+  prefetchCodeGrammarsWhenIdle();
 });
