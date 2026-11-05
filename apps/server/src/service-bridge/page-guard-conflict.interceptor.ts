@@ -1,6 +1,6 @@
 import { CallHandler, ConflictException, ExecutionContext, Injectable, NestInterceptor } from '@nestjs/common';
 import { Observable, catchError, throwError } from 'rxjs';
-import { RESTRICTED_SPACE_MOVE, RESTRICTION_STRIP } from './page-restriction-guard.installer';
+import { ARCHIVED_SPACE_MOVE, RESTRICTED_SPACE_MOVE, RESTRICTION_STRIP } from './page-restriction-guard.installer';
 
 /** The database page guards' refusals (SQLSTATE 23514) and what a person is told. A closed set: nothing else maps. */
 export const PAGE_GUARD_CONFLICTS: Readonly<Record<string, string>> = {
@@ -9,6 +9,7 @@ export const PAGE_GUARD_CONFLICTS: Readonly<Record<string, string>> = {
     'A restricted page, or a page in a restricted section, cannot be moved to another space. Remove the restriction first.',
   [RESTRICTION_STRIP]:
     'This move would take the page out of its restricted section. Restrict the page itself first, or move it within the section.',
+  [ARCHIVED_SPACE_MOVE]: 'A page in an archived space cannot be moved to another space. Restore the space first.',
 };
 
 /**

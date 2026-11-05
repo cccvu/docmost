@@ -9,7 +9,7 @@ import { Test } from '@nestjs/testing';
 import { ApiAccessAuditInterceptor } from '../authz/request-controls/api-access-audit.interceptor';
 import { ApiAccessAuditService } from '../authz/request-controls/api-access-audit.service';
 import { PageGuardConflictInterceptor, PAGE_GUARD_CONFLICTS, toPageGuardConflict } from './page-guard-conflict.interceptor';
-import { RESTRICTED_SPACE_MOVE, RESTRICTION_STRIP } from './page-restriction-guard.installer';
+import { ARCHIVED_SPACE_MOVE, RESTRICTED_SPACE_MOVE, RESTRICTION_STRIP } from './page-restriction-guard.installer';
 import { ServiceBridgeModule } from './service-bridge.module';
 
 /** What postgres.js throws for a trigger's `raise ... using errcode = 'check_violation', constraint = ...`. */
@@ -21,7 +21,7 @@ const pgError = (constraint: string, code = '23514') =>
   });
 
 describe('toPageGuardConflict', () => {
-  it.each([RESTRICTED_SPACE_MOVE, RESTRICTION_STRIP, 'ccc_page_no_cycle'])('maps %s to a 409 with a fixed body', (c) => {
+  it.each([RESTRICTED_SPACE_MOVE, RESTRICTION_STRIP, ARCHIVED_SPACE_MOVE, 'ccc_page_no_cycle'])('maps %s to a 409 with a fixed body', (c) => {
     const e = toPageGuardConflict(pgError(c));
     expect(e).toBeInstanceOf(ConflictException);
     expect(e!.getResponse()).toEqual({ message: PAGE_GUARD_CONFLICTS[c], code: c });

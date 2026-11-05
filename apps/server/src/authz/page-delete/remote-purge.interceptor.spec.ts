@@ -21,11 +21,17 @@ class OtherController {
 const USER = { id: 'user-1' };
 const WORKSPACE = { id: 'ws-1' };
 
-const ctx = (opts: { cls?: new () => object; handler?: string; type?: string; body?: unknown; user?: unknown } = {}) => {
+const ctx = (
+  opts: { cls?: new () => object; handler?: string; type?: string; body?: unknown; user?: unknown; headers?: Record<string, unknown> } = {},
+) => {
   const cls = opts.cls ?? PageController;
   const handler = (cls.prototype as Record<string, () => void>)[opts.handler ?? 'delete'];
   const res = { statusCode: 200 };
-  const req = { body: 'body' in opts ? opts.body : { pageId: 'page-1', permanentlyDelete: true }, user: 'user' in opts ? opts.user : { user: USER, workspace: WORKSPACE } };
+  const req = {
+    body: 'body' in opts ? opts.body : { pageId: 'page-1', permanentlyDelete: true },
+    user: 'user' in opts ? opts.user : { user: USER, workspace: WORKSPACE },
+    headers: opts.headers ?? {},
+  };
   return {
     getType: () => opts.type ?? 'http',
     getClass: () => cls,
@@ -34,12 +40,18 @@ const ctx = (opts: { cls?: new () => object; handler?: string; type?: string; bo
   } as never;
 };
 
-const build = (mode: 'native' | 'remote', purge: (...a: unknown[]) => Promise<unknown> = async () => ({})) => {
+const build = (
+  mode: 'native' | 'remote',
+  purge: (...a: unknown[]) => Promise<unknown> = async () => ({}),
+  trash: (...a: unknown[]) => Promise<unknown> = async () => ({ outcome: 'applied', page: { id: 'page-1' } }),
+) => {
   const service = { purge: jest.fn(purge) };
+  const trashService = { trash: jest.fn(trash) };
   const next = { handle: jest.fn(() => of('handler-result')) };
-  const interceptor = new RemotePurgeInterceptor(mode, service as never, new Reflector());
-  return { interceptor, service, next };
+  const interceptor = new RemotePurgeInterceptor(mode, service as never, trashService as never, new Reflector());
+  return { interceptor, service, trashService, next };
 };
+const SA = '0198c2a1-0000-7000-8000-00000000005a';
 
 describe('RemotePurgeInterceptor', () => {
   it('is keyed to the native delete only', () => {
@@ -53,7 +65,32 @@ describe('RemotePurgeInterceptor', () => {
       success: true,
       status: 200,
     });
-    expect(t.service.purge).toHaveBeenCalledWith(USER, 'page-1', 'ws-1');
+    expect(t.service.purge).toHaveBeenCalledWith(USER, 'page-1', 'ws-1', undefined, undefined);
+    expect(t.trashService.trash).not.toHaveBeenCalled();
+    expect(t.next.handle).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['absent', { pageId: 'page-1' }],
+    ['false', { pageId: 'page-1', permanentlyDelete: false }],
+    ['null', { pageId: 'page-1', permanentlyDelete: null }],
+  ])('remote + a trash (flag %s) → the trash routine, never the handler; the envelope is upstream’s (#661)', async (_l, body) => {
+    const t = build('remote');
+    await expect(firstValueFrom(t.interceptor.intercept(ctx({ body }), t.next))).resolves.toEqual({
+      data: undefined,
+      success: true,
+      status: 200,
+    });
+    expect(t.trashService.trash).toHaveBeenCalledWith(USER, 'page-1', 'ws-1', undefined, undefined);
+    expect(t.service.purge).not.toHaveBeenCalled();
+    expect(t.next.handle).not.toHaveBeenCalled();
+  });
+
+  it('a trash refusal propagates (and the handler still never runs)', async () => {
+    const t = build('remote', undefined, async () => Promise.reject(new ForbiddenException({ code: 'trash_needs_edit' })));
+    await expect(
+      firstValueFrom(t.interceptor.intercept(ctx({ body: { pageId: 'page-1' } }), t.next)),
+    ).rejects.toBeInstanceOf(ForbiddenException);
     expect(t.next.handle).not.toHaveBeenCalled();
   });
 
@@ -71,18 +108,16 @@ describe('RemotePurgeInterceptor', () => {
 
   it.each([
     ['native mode', 'native' as const, {}],
+    ['native mode, a trash', 'native' as const, { body: { pageId: 'page-1' } }],
+    ['native mode ignores the acting-service header, even a malformed one', 'native' as const, { headers: { 'x-ccc-acting-service': 'not-an-id' } }],
     ['a non-http context', 'remote' as const, { type: 'ws' }],
     ['a sibling handler', 'remote' as const, { handler: 'restore' }],
     ['the same handler name on another class', 'remote' as const, { cls: OtherController }],
-    ['a trash (absent flag)', 'remote' as const, { body: { pageId: 'page-1' } }],
-    ['a trash (false)', 'remote' as const, { body: { pageId: 'page-1', permanentlyDelete: false } }],
-    ['a trash (null)', 'remote' as const, { body: { pageId: 'page-1', permanentlyDelete: null } }],
-    ['a null body (the pipe refuses it)', 'remote' as const, { body: null }],
-    ['an array body (the pipe refuses it)', 'remote' as const, { body: [{ pageId: 'p', permanentlyDelete: true }] }],
   ])('passes through: %s', async (_l, mode, o) => {
     const t = build(mode);
     await expect(firstValueFrom(t.interceptor.intercept(ctx(o), t.next))).resolves.toBe('handler-result');
     expect(t.service.purge).not.toHaveBeenCalled();
+    expect(t.trashService.trash).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -92,11 +127,51 @@ describe('RemotePurgeInterceptor', () => {
     ['no pageId', { permanentlyDelete: true }],
     ['an empty pageId', { pageId: '', permanentlyDelete: true }],
     ['a non-string pageId', { pageId: ['page-1'], permanentlyDelete: true }],
-  ])('fails closed with a 400 on %s: neither the purge nor the handler', async (_l, body) => {
+    ['a trash with no pageId', {}],
+    ['a trash with an empty pageId', { pageId: '' }],
+    ['a trash with a non-string pageId', { pageId: 42, permanentlyDelete: false }],
+    ['a null body', null],
+    ['an array body', [{ pageId: 'p', permanentlyDelete: true }]],
+  ])('fails closed with a 400 on %s: neither routine nor the handler', async (_l, body) => {
     const t = build('remote');
     await expect(firstValueFrom(t.interceptor.intercept(ctx({ body }), t.next))).rejects.toBeInstanceOf(BadRequestException);
     expect(t.service.purge).not.toHaveBeenCalled();
+    expect(t.trashService.trash).not.toHaveBeenCalled();
     expect(t.next.handle).not.toHaveBeenCalled();
+  });
+
+  describe('the acting-service header (#670): parsed before either branch, passed only as the service leg', () => {
+    it.each([
+      ['a purge', { pageId: 'page-1', permanentlyDelete: true }, 'purge'],
+      ['a trash', { pageId: 'page-1' }, 'trash'],
+    ])('a valid id reaches %s as its service account', async (_l, body, which) => {
+      const t = build('remote');
+      await firstValueFrom(t.interceptor.intercept(ctx({ body, headers: { 'x-ccc-acting-service': SA } }), t.next));
+      const fn = which === 'purge' ? t.service.purge : t.trashService.trash;
+      expect(fn).toHaveBeenCalledWith(USER, 'page-1', 'ws-1', undefined, SA);
+    });
+
+    it.each([
+      ['empty', ''],
+      ['duplicated (an array)', [SA, SA]],
+      ['duplicated (comma-joined)', `${SA}, ${SA}`],
+      ['not a principal id', 'service-account-1'],
+      ['padded', ` ${SA}`],
+      ['a number', 42],
+    ])('%s → 400 acting_service_invalid for a purge AND a trash; nothing runs', async (_l, value) => {
+      for (const body of [{ pageId: 'page-1', permanentlyDelete: true }, { pageId: 'page-1' }]) {
+        const t = build('remote');
+        const err = await firstValueFrom(
+          t.interceptor.intercept(ctx({ body, headers: { 'x-ccc-acting-service': value } }), t.next),
+        ).catch((e) => e);
+        expect(err).toBeInstanceOf(BadRequestException);
+        expect((err as BadRequestException).getResponse()).toMatchObject({ code: 'acting_service_invalid' });
+        expect(JSON.stringify((err as BadRequestException).getResponse())).not.toContain('service-account-1');
+        expect(t.service.purge).not.toHaveBeenCalled();
+        expect(t.trashService.trash).not.toHaveBeenCalled();
+        expect(t.next.handle).not.toHaveBeenCalled();
+      }
+    });
   });
 
   it('no authenticated user → 401, never a purge without a subject', async () => {
@@ -104,6 +179,7 @@ describe('RemotePurgeInterceptor', () => {
       const t = build('remote');
       await expect(firstValueFrom(t.interceptor.intercept(ctx({ user }), t.next))).rejects.toBeInstanceOf(UnauthorizedException);
       expect(t.service.purge).not.toHaveBeenCalled();
+      expect(t.trashService.trash).not.toHaveBeenCalled();
     }
   });
 });

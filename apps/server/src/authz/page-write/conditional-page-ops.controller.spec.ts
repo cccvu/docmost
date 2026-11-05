@@ -71,6 +71,7 @@ const build = (opts: {
   holdEdit?: Promise<void>;
   mode?: 'native' | 'remote';
   purge?: (...args: unknown[]) => Promise<unknown>;
+  trash?: (...args: unknown[]) => Promise<unknown>;
 } = {}) => {
   const calls: string[] = [];
   const row = opts.row === null ? null : { ...ROW, ...(opts.row ?? {}) };
@@ -139,6 +140,12 @@ const build = (opts: {
       return opts.purge ? opts.purge(...args) : { page: { id: 'page-uuid-1' }, deletedIds: ['page-uuid-1'] };
     }),
   };
+  const remoteTrash = {
+    trash: jest.fn(async (...args: unknown[]) => {
+      calls.push('remoteTrash');
+      return opts.trash ? opts.trash(...args) : { outcome: 'applied', page: { id: 'page-uuid-1' } };
+    }),
+  };
   const controller = new ConditionalPageOpsController(
     spy.db,
     pageRepo as never,
@@ -149,8 +156,21 @@ const build = (opts: {
     attachmentQueue as never,
     opts.mode ?? 'native',
     remotePurge as never,
+    remoteTrash as never,
   );
-  return { controller, calls, spy, pageRepo, pageService, pageAccessService, spaceAbility, auditService, attachmentQueue, remotePurge };
+  return {
+    controller,
+    calls,
+    spy,
+    pageRepo,
+    pageService,
+    pageAccessService,
+    spaceAbility,
+    auditService,
+    attachmentQueue,
+    remotePurge,
+    remoteTrash,
+  };
 };
 
 const del = (over: Partial<ConditionalDeletePageDto> = {}) =>
@@ -290,22 +310,25 @@ describe('conditional-delete (trash / permanent)', () => {
     await expect(t.controller.conditionalDelete(del({ expectedEtags: ['*'] }), USER, WS)).resolves.toMatchObject({ outcome: 'applied' });
   });
 
-  it('native mode never consults the remote purge (the replica above decides)', async () => {
+  it('native mode never consults the remote routines (the replica above decides), and ignores the acting-service header', async () => {
     const t = build();
-    await t.controller.conditionalDelete(del({ permanentlyDelete: true }), USER, WS);
+    await t.controller.conditionalDelete(del({ permanentlyDelete: true }), USER, WS, 'not-an-id');
+    await t.controller.conditionalDelete(del(), USER, WS, ['a', 'b']);
     expect(t.remotePurge.purge).not.toHaveBeenCalled();
+    expect(t.remoteTrash.trash).not.toHaveBeenCalled();
     expect(t.pageService.forceDelete).toHaveBeenCalled();
+    expect(t.pageService.removePage).toHaveBeenCalled();
   });
 });
 
-describe('conditional-delete in AUTHZ_MODE=remote (#636 W6)', () => {
+describe('conditional-delete in AUTHZ_MODE=remote (#636 W6, #661, #670)', () => {
   it('permanent → the remote purge routine with the caller, the page ref, the workspace and the tags; nothing else runs here', async () => {
     const t = build({ mode: 'remote' });
     await expect(t.controller.conditionalDelete(del({ permanentlyDelete: true, pageId: 'slug-1' }), USER, WS)).resolves.toEqual({
       outcome: 'applied',
       pageId: 'page-uuid-1',
     });
-    expect(t.remotePurge.purge).toHaveBeenCalledWith(USER, 'slug-1', 'ws-1', [FRESH]);
+    expect(t.remotePurge.purge).toHaveBeenCalledWith(USER, 'slug-1', 'ws-1', [FRESH], undefined);
     // The service owns the slot, the transaction, the decision, the jobs and the audit: none of them run twice.
     expect(t.calls).toEqual(['remotePurge']);
     expect(t.spy.tx).toEqual([]);
@@ -327,11 +350,59 @@ describe('conditional-delete in AUTHZ_MODE=remote (#636 W6)', () => {
     }
   });
 
-  it('a trash in remote mode is unchanged: the native replica, never the purge', async () => {
+  it('a trash → the remote trash routine with the caller, the page ref, the workspace and the tags; nothing else runs here', async () => {
+    for (const outcome of ['applied', 'noop'] as const) {
+      const t = build({ mode: 'remote', trash: async () => ({ outcome, page: { id: 'page-uuid-1' } }) });
+      await expect(t.controller.conditionalDelete(del({ pageId: 'slug-1' }), USER, WS)).resolves.toEqual({
+        outcome,
+        pageId: 'page-uuid-1',
+      });
+      expect(t.remoteTrash.trash).toHaveBeenCalledWith(USER, 'slug-1', 'ws-1', [FRESH], undefined);
+      expect(t.calls).toEqual(['remoteTrash']);
+      expect(t.spy.tx).toEqual([]);
+      expect(t.remotePurge.purge).not.toHaveBeenCalled();
+      expect(t.pageService.removePage).not.toHaveBeenCalled();
+      expect(t.pageAccessService.validateCanEdit).not.toHaveBeenCalled();
+      expect(t.auditService.log).not.toHaveBeenCalled();
+    }
+  });
+
+  it('a trash refusal passes through unchanged (403 trash_needs_edit, 409, 503)', async () => {
+    for (const err of [
+      new ForbiddenException({ message: 'x', code: 'trash_needs_edit' }),
+      new PreconditionFailedException({ message: 'page changed', code: 'precondition_failed' }),
+      new ServiceUnavailableException({ message: 'x', code: 'trash_unconfirmed' }),
+    ]) {
+      const t = build({ mode: 'remote', trash: async () => Promise.reject(err) });
+      const r = await codeOf(t.controller.conditionalDelete(del(), USER, WS));
+      expect(r).toEqual({ status: err.getStatus(), body: err.getResponse() });
+      expect(t.pageService.removePage).not.toHaveBeenCalled();
+    }
+  });
+
+  it('the acting-service header reaches both routines as the service account', async () => {
+    const SA = '0198c2a1-0000-7000-8000-00000000005a';
     const t = build({ mode: 'remote' });
-    await expect(t.controller.conditionalDelete(del(), USER, WS)).resolves.toEqual({ outcome: 'applied', pageId: 'page-uuid-1' });
-    expect(t.remotePurge.purge).not.toHaveBeenCalled();
-    expect(t.pageService.removePage).toHaveBeenCalled();
+    await t.controller.conditionalDelete(del({ permanentlyDelete: true }), USER, WS, SA);
+    await t.controller.conditionalDelete(del(), USER, WS, SA);
+    expect(t.remotePurge.purge).toHaveBeenCalledWith(USER, 'page-uuid-1', 'ws-1', [FRESH], SA);
+    expect(t.remoteTrash.trash).toHaveBeenCalledWith(USER, 'page-uuid-1', 'ws-1', [FRESH], SA);
+  });
+
+  it.each([
+    ['empty', ''],
+    ['repeated (an array)', ['0198c2a1-0000-7000-8000-00000000005a', '0198c2a1-0000-7000-8000-00000000005a']],
+    ['comma-joined', '0198c2a1-0000-7000-8000-00000000005a,0198c2a1-0000-7000-8000-00000000005a'],
+    ['not a principal id', 'svc'],
+  ])('a malformed acting-service header (%s) → 400 acting_service_invalid before either routine', async (_l, value) => {
+    for (const dto of [del({ permanentlyDelete: true }), del()]) {
+      const t = build({ mode: 'remote' });
+      const r = await codeOf(t.controller.conditionalDelete(dto, USER, WS, value));
+      expect(r).toMatchObject({ status: 400, body: { code: 'acting_service_invalid' } });
+      expect(t.remotePurge.purge).not.toHaveBeenCalled();
+      expect(t.remoteTrash.trash).not.toHaveBeenCalled();
+      expect(t.spy.tx).toEqual([]);
+    }
   });
 });
 

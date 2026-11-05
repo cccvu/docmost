@@ -67,6 +67,7 @@ const SEAM_ALLOWLIST = new Set<string>([
   'collaboration/extensions/persistence.extension.ts', // seam #390 — reconcile-before-store + store-failure signal via authz/page-write/{reconcile-store,store-failure-registry}
   'collaboration/server/collaboration.controller.ts', // seam #163 — CollabServiceSecretGuard on GET /collab/stats in the separate CollabAppModule process (#80)
   'core/casl/casl.module.ts', // seam #177 — mode-selected WorkspaceAbilityFactory via authz/mode/workspace-ability (remote: users.role confers no workspace authority, #636)
+  'core/page/page.module.ts', // seam #183 — mode-selected trash retention via authz/page-delete/trash-retention.provider (remote: the locked, archive-aware RemoteTrashRetentionService, #589)
 ]);
 
 const posix = (p: string) => p.split(sep).join('/');

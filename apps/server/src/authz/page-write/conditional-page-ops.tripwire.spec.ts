@@ -68,10 +68,11 @@ const squash = (s: string) => s.replace(/\s+/g, '').replace(/,([}\])])/g, '$1');
  * Pinned at upstream v0.95.0 (page.controller.ts is not a seam file — the fork does not modify it).
  */
 const PINNED: Record<string, { replica: string; digest: string }> = {
-  // The permanent branch is also replicated, in remote mode, by RemotePurgeService.purge (authz/page-delete/, #636 W6):
-  // the same space Manage-Settings refusal and the same `page.deleted` audit payload.
+  // In remote mode both branches are also replicated in authz/page-delete/: the permanent one by RemotePurgeService.purge
+  // (#636 W6: the same space Manage-Settings refusal and `page.deleted` audit payload), the trash by
+  // RemoteTrashService.trash (#661: the same root `validateCanEdit` and `page.trashed` audit payload).
   'PageController.delete': {
-    replica: 'ConditionalPageOpsController.conditionalDelete + RemotePurgeService.purge',
+    replica: 'ConditionalPageOpsController.conditionalDelete + RemotePurgeService.purge + RemoteTrashService.trash',
     digest: '4ff686296be38b1d',
   },
   'PageController.movePage': { replica: 'ConditionalPageOpsController.conditionalMove', digest: '983e3fcf4aa37308' },

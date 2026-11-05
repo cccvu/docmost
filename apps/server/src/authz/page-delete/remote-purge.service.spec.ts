@@ -51,11 +51,24 @@ type Opts = {
   admin?: boolean[];
   deleted?: string[];
   lockError?: unknown;
+  /** The space of each page (default `space-1`). */
+  spaceOf?: (id: string) => string;
+  /** The root's space as the unlocked pre-check reads it (default live). */
+  rootSpace?: { deletedAt: Date | null } | null;
+  /** Archived spaces, as the FOR SHARE lock reads them; `missing` spaces are absent from its answer. */
+  archived?: string[];
+  missing?: string[];
+  /** PDP `space#administer` per (subject, space) (default all true), or null for a failed call. */
+  spaceAdmin?: ((subject: Subject, spaceId: string) => boolean) | null;
+  /** PDP `page#edit` per (subject, page) — overrides `edit` when given. */
+  editBy?: ((subject: Subject, id: string) => boolean) | null;
 };
+type Subject = { provider?: string; externalId?: string; principalId?: string; subjectType?: string };
 
 const build = (opts: Opts = {}) => {
   const calls: string[] = [];
   const walks = opts.walks ?? [['page-a', 'page-b', 'page-c']];
+  const spaceOf = opts.spaceOf ?? (() => 'space-1');
   let walk = 0;
   const spy = spyKysely((q: SpyQuery) => {
     if (/set local/i.test(q.sql)) {
@@ -71,7 +84,24 @@ const build = (opts: Opts = {}) => {
       if (opts.lockError) throw opts.lockError;
       const ids = q.parameters.filter((p) => typeof p === 'string' && p !== WS) as string[];
       calls.push(`lock:${ids.join(',')}`);
-      return (opts.lockable ? opts.lockable(ids) : ids).map((id) => ({ id }));
+      return (opts.lockable ? opts.lockable(ids) : ids).map((id) => ({
+        id,
+        spaceId: spaceOf(id),
+        workspaceId: WS,
+        parentPageId: null,
+        deletedAt: null,
+      }));
+    }
+    if (/from "spaces"/i.test(q.sql) && /for share/i.test(q.sql)) {
+      const ids = q.parameters.filter((p) => typeof p === 'string' && p !== WS) as string[];
+      calls.push(`lock-spaces:${ids.join(',')}`);
+      return ids
+        .filter((id) => !(opts.missing ?? []).includes(id))
+        .map((id) => ({ id, deletedAt: (opts.archived ?? []).includes(id) ? new Date() : null, updatedAt: new Date(0) }));
+    }
+    if (/from "spaces"/i.test(q.sql)) {
+      calls.push(`space-read:${spy.tx.join('>') || 'no-tx'}`);
+      return opts.rootSpace === null ? [] : [opts.rootSpace ?? { deletedAt: null }];
     }
     if (/from "authz_outbox"|from authz_outbox/i.test(q.sql)) {
       calls.push('fence-read');
@@ -103,10 +133,17 @@ const build = (opts: Opts = {}) => {
       calls.push(`settle:${position}:${waitMs}`);
       return opts.settle ?? { status: 'confirmed' as const };
     }),
-    tryCheckBulk: jest.fn(async (subject: unknown, checks: { permission: string; resourceType: string; resourceId: string }[]) => {
-      calls.push(`decide:${checks.length}`);
-      if (opts.edit === null) return null;
-      return checks.map((c) => (opts.edit ? opts.edit(c.resourceId) : true));
+    tryCheckBulk: jest.fn(async (subject: Subject, checks: { permission: string; resourceType: string; resourceId: string }[]) => {
+      const who = subject.subjectType === 'service' ? `sa:${subject.principalId}` : `human:${subject.externalId}`;
+      calls.push(`decide:${who}:${checks[0].resourceType}#${checks[0].permission}:${checks.length}`);
+      if (checks[0].resourceType === 'space') {
+        if (opts.spaceAdmin === null) return null;
+        return checks.map((c) => (opts.spaceAdmin ? opts.spaceAdmin(subject, c.resourceId) : true));
+      }
+      if (opts.edit === null || opts.editBy === null) return null;
+      return checks.map((c) =>
+        opts.editBy ? opts.editBy(subject, c.resourceId) : opts.edit ? opts.edit(c.resourceId) : true,
+      );
     }),
   };
   const pageService = {
@@ -150,7 +187,7 @@ const nothingChanged = (t: ReturnType<typeof build>, tx: string[] = ['begin', 'r
 };
 
 describe('RemotePurgeService — the order of the routine', () => {
-  it('pre-check → bounds → lock → re-walk → target → fence → space admin → edit on all → forceDelete(trx) → commit → jobs → audit', async () => {
+  it('pre-check → bounds → lock → re-walk → target → spaces FOR SHARE → fence → space admin → edit on all → forceDelete(trx) → commit → jobs → audit', async () => {
     const t = build();
     await expect(t.service.purge(USER, 'slug-a', WS)).resolves.toMatchObject({
       page: { id: 'page-a' },
@@ -158,17 +195,20 @@ describe('RemotePurgeService — the order of the routine', () => {
     });
     expect(t.calls).toEqual([
       'resolve:slug-a',
-      'casl:space-1:no-tx', // the fast refusal takes no lock
+      'casl:space-1:no-tx', // the fast refusals take no lock
+      'space-read:no-tx',
       "sql:SET LOCAL lock_timeout = '2s'",
       "sql:SET LOCAL statement_timeout = '15s'",
       'walk',
       'lock:page-a,page-b,page-c',
       'walk',
       'read-target',
+      'lock-spaces:space-1', // every space of the locked rows, FOR SHARE (#589)
       'fence-read',
       'settle:900.7:3000',
       'casl:space-1:begin', // the authoritative check, on the settled PDP
-      'decide:3',
+      'decide:human:user-1:space#administer:1', // #618: every space, by the PDP
+      'decide:human:user-1:page#edit:3',
       'forceDelete:page-a:ws-1:trx',
       'job:page-a:begin>commit',
       'job:page-b:begin>commit',
@@ -184,7 +224,7 @@ describe('RemotePurgeService — the order of the routine', () => {
     expect(lock.sql).not.toMatch(/no key update/i);
     expect(lock.sql).toMatch(/order by "id"/i);
     expect(lock.sql).toMatch(/"workspace_id" = \$\d/);
-    const [subject, checks] = t.authz.tryCheckBulk.mock.calls[0];
+    const [subject, checks] = t.authz.tryCheckBulk.mock.calls[1];
     expect(subject).toEqual({ provider: 'docmost', externalId: 'user-1' });
     expect(checks).toEqual(['page-a', 'page-b', 'page-c'].map((resourceId) => ({ permission: 'edit', resourceType: 'page', resourceId })));
   });
@@ -211,7 +251,7 @@ describe('RemotePurgeService — the order of the routine', () => {
       'lock:page-new',
       'walk',
     ]);
-    expect(t.authz.tryCheckBulk.mock.calls[0][1].map((c: { resourceId: string }) => c.resourceId)).toEqual([
+    expect(t.authz.tryCheckBulk.mock.calls[1][1].map((c: { resourceId: string }) => c.resourceId)).toEqual([
       'page-a',
       'page-b',
       'page-new',
@@ -222,7 +262,7 @@ describe('RemotePurgeService — the order of the routine', () => {
     const ids = ['page-a', ...Array.from({ length: PURGE_CHECK_CHUNK + 43 }, (_, i) => `p-${String(i).padStart(4, '0')}`)];
     const t = build({ walks: [ids] });
     await t.service.purge(USER, 'page-a', WS);
-    expect(t.authz.tryCheckBulk.mock.calls.map((c) => c[1].length)).toEqual([PURGE_CHECK_CHUNK, 44]);
+    expect(t.authz.tryCheckBulk.mock.calls.map((c) => c[1].length)).toEqual([1, PURGE_CHECK_CHUNK, 44]);
   });
 
   it('compares the ETag on the locked target: any matching tag (or `*`) passes, before the fence', async () => {
@@ -352,6 +392,136 @@ describe('RemotePurgeService — refusals change nothing', () => {
     t.attachmentQueue.add.mockRejectedValue(new Error('redis down'));
     await expect(t.service.purge(USER, 'page-a', WS)).resolves.toBeDefined();
     expect(t.auditService.log).toHaveBeenCalled();
+  });
+});
+
+const SA = '0198c2a1-0000-7000-8000-00000000005a';
+const saCalls = (t: ReturnType<typeof build>) =>
+  t.authz.tryCheckBulk.mock.calls.filter(([subject]) => (subject as Subject).subjectType === 'service');
+
+describe('RemotePurgeService — an archived space is frozen (#589)', () => {
+  it('the root’s space archived → 409 space_archived before any lock, settle or decision', async () => {
+    const t = build({ rootSpace: { deletedAt: new Date() } });
+    expect(await refusal(t.service.purge(USER, 'page-a', WS))).toMatchObject({ status: 409, body: { code: 'space_archived' } });
+    expect(t.calls.some((c) => c.startsWith('lock:') || c === 'walk')).toBe(false);
+    expect(t.authz.settleProjection).not.toHaveBeenCalled();
+    expect(t.authz.tryCheckBulk).not.toHaveBeenCalled();
+    nothingChanged(t, []);
+  });
+
+  it('the root’s space missing → 409 too (fail closed)', async () => {
+    const t = build({ rootSpace: null });
+    expect((await refusal(t.service.purge(USER, 'page-a', WS))).status).toBe(409);
+    nothingChanged(t, []);
+  });
+
+  it('a descendant’s space archived (seen under the FOR SHARE lock) → 409, rolled back, nothing asked', async () => {
+    const t = build({ spaceOf: (id) => (id === 'page-c' ? 'space-2' : 'space-1'), archived: ['space-2'] });
+    expect(await refusal(t.service.purge(USER, 'page-a', WS))).toMatchObject({ status: 409, body: { code: 'space_archived' } });
+    expect(t.calls).toContain('lock-spaces:space-1,space-2');
+    expect(t.authz.settleProjection).not.toHaveBeenCalled();
+    expect(t.authz.tryCheckBulk).not.toHaveBeenCalled();
+    nothingChanged(t);
+  });
+
+  it('a space row the lock cannot read (gone, other workspace) → 409, never a pass', async () => {
+    const t = build({ spaceOf: (id) => (id === 'page-c' ? 'space-2' : 'space-1'), missing: ['space-2'] });
+    expect((await refusal(t.service.purge(USER, 'page-a', WS))).status).toBe(409);
+    nothingChanged(t);
+  });
+
+  it('the spaces lock is FOR SHARE, in id order, workspace-scoped', async () => {
+    const t = build({ spaceOf: (id) => (id === 'page-a' ? 'space-z' : 'space-b') });
+    await t.service.purge(USER, 'page-a', WS);
+    const lock = t.spy.calls.find((q) => /from "spaces"/.test(q.sql) && /for share/i.test(q.sql))!;
+    expect(lock.sql).toMatch(/order by "id"/i);
+    expect(lock.sql).toMatch(/"workspace_id" = \$\d/);
+    expect(lock.parameters.slice(0, 2)).toEqual(['space-b', 'space-z']);
+  });
+});
+
+describe('RemotePurgeService — space admin on EVERY space of the subtree (#618)', () => {
+  const crossSpace = { spaceOf: (id: string) => (id === 'page-c' ? 'space-2' : 'space-1') };
+
+  it('asks the PDP space#administer for every distinct space, for the human', async () => {
+    const t = build(crossSpace);
+    await t.service.purge(USER, 'page-a', WS);
+    const [subject, checks] = t.authz.tryCheckBulk.mock.calls[0];
+    expect(subject).toEqual({ provider: 'docmost', externalId: 'user-1' });
+    expect(checks).toEqual(['space-1', 'space-2'].map((resourceId) => ({ permission: 'administer', resourceType: 'space', resourceId })));
+  });
+
+  it('admin of the root space only (CASL allows) but not of a descendant’s space → upstream’s 403, nothing deleted', async () => {
+    const t = build({ ...crossSpace, spaceAdmin: (_s, space) => space !== 'space-2' });
+    expect(await refusal(t.service.purge(USER, 'page-a', WS))).toEqual({
+      status: 403,
+      body: expect.objectContaining({ message: 'Only space admins can permanently delete pages' }),
+    });
+    expect(t.authz.tryCheckBulk).toHaveBeenCalledTimes(1); // edit never asked
+    nothingChanged(t);
+  });
+
+  it('a PDP failure on the space check → 503 purge_unconfirmed (never a 404, never a pass)', async () => {
+    const t = build({ ...crossSpace, spaceAdmin: null });
+    expect(await refusal(t.service.purge(USER, 'page-a', WS))).toMatchObject({ status: 503, body: { code: 'purge_unconfirmed' } });
+    nothingChanged(t);
+  });
+});
+
+describe('RemotePurgeService — the delegated service account only narrows (#670)', () => {
+  it('absent → no service-account check at all', async () => {
+    const t = build();
+    await t.service.purge(USER, 'page-a', WS);
+    expect(saCalls(t)).toEqual([]);
+  });
+
+  it('present → after every human check, the same two checks for the service account; allowed → purged', async () => {
+    const t = build();
+    await expect(t.service.purge(USER, 'page-a', WS, undefined, SA)).resolves.toBeDefined();
+    expect(t.calls.filter((c) => c.startsWith('decide:'))).toEqual([
+      'decide:human:user-1:space#administer:1',
+      'decide:human:user-1:page#edit:3',
+      `decide:sa:${SA}:space#administer:1`,
+      `decide:sa:${SA}:page#edit:3`,
+    ]);
+    expect(saCalls(t)[0][0]).toEqual({ principalId: SA, subjectType: 'service' });
+    expect(t.pageService.forceDelete).toHaveBeenCalled();
+  });
+
+  it.each([
+    ['the service account is not admin of a space', { spaceAdmin: (s: Subject) => s.subjectType !== 'service' }, 403, undefined],
+    ['the service account cannot edit a page', { editBy: (s: Subject, id: string) => s.subjectType !== 'service' || id !== 'page-b' }, 403, 'purge_needs_edit'],
+  ])('%s → 403, nothing deleted', async (_l, o, status, code) => {
+    const t = build(o);
+    const r = await refusal(t.service.purge(USER, 'page-a', WS, undefined, SA));
+    expect(r.status).toBe(status);
+    if (code) expect(r.body).toMatchObject({ code });
+    nothingChanged(t);
+  });
+
+  it('a PDP failure on the service leg → 503, nothing deleted', async () => {
+    const t = build();
+    t.authz.tryCheckBulk.mockImplementation(async (subject: Subject, checks: { resourceType: string }[]) =>
+      subject.subjectType === 'service' ? null : checks.map(() => true),
+    );
+    expect(await refusal(t.service.purge(USER, 'page-a', WS, undefined, SA))).toMatchObject({ status: 503, body: { code: 'purge_unconfirmed' } });
+    nothingChanged(t);
+  });
+
+  it.each([
+    ['the human is not a space admin (PDP)', { spaceAdmin: (s: Subject) => s.subjectType === 'service' }],
+    ['the human cannot edit a page', { editBy: (s: Subject, id: string) => s.subjectType === 'service' || id !== 'page-c' }],
+  ])('anti-bypass: %s and the service account can do everything → still 403, and the service account is never asked', async (_l, o) => {
+    const t = build(o);
+    expect((await refusal(t.service.purge(USER, 'page-a', WS, undefined, SA))).status).toBe(403);
+    expect(saCalls(t)).toEqual([]);
+    nothingChanged(t);
+  });
+
+  it('a human refused by CASL before any lock: the service account is never asked', async () => {
+    const t = build({ admin: [false] });
+    expect((await refusal(t.service.purge(USER, 'page-a', WS, undefined, SA))).status).toBe(403);
+    expect(t.authz.tryCheckBulk).not.toHaveBeenCalled();
   });
 });
 

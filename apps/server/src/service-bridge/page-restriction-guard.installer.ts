@@ -13,6 +13,8 @@ const INSTALL_LOCK_KEY = 545545001;
 /** The constraint names the guard raises (SQLSTATE 23514); `PageGuardConflictInterceptor` maps them to a 409. */
 export const RESTRICTED_SPACE_MOVE = 'ccc_page_restricted_space_move';
 export const RESTRICTION_STRIP = 'ccc_page_restriction_strip';
+/** g1's #589 refusal: a page may not be moved OUT of an archived space (an archived space is frozen). */
+export const ARCHIVED_SPACE_MOVE = 'ccc_page_archived_space_move';
 
 const sanitizeInt = (raw: string | undefined, def: number, min: number): number => {
   const n = Number.parseInt(raw ?? '', 10);
@@ -49,6 +51,10 @@ $fn$`;
  *    re-roots the page (#493 G2) — including a page whose `space_id` already equals the target (a descendant left
  *    in that space by an earlier move that skipped it while trashed, then restored and restricted). So "the value
  *    did not change" is no reason to skip the check.
+ *    And (#589, red-team F1) a REAL space change of a page whose OLD space is archived is refused with its own code:
+ *    an archived space is frozen against irreversible removal, and a direct space admin (who keeps `edit` there)
+ *    could otherwise move its pages out and purge them from the live space. A move WITHIN the archived space, and a
+ *    move into one, are not this rule's business.
  *  - g2 (`'parent'`, only on a REAL parent change): refused when it takes a page with no restriction of its own out
  *    from under its last restricted ancestor (an unfinished walk counts as restricted before the move and as
  *    unrestricted after it).
@@ -74,6 +80,11 @@ begin
       from ccc_page_lineage_facts(old.parent_page_id, new.workspace_id) f;
   end if;
   if tg_argv[0] = 'space' then
+    if new.space_id is distinct from old.space_id
+       and exists (select 1 from spaces s where s.id = old.space_id and s.deleted_at is not null) then
+      raise exception 'page % is in an archived space and cannot move to another space', new.id
+        using errcode = 'check_violation', constraint = '${ARCHIVED_SPACE_MOVE}';
+    end if;
     if own or before_restricted or not before_complete then
       raise exception 'page % is restricted or in a restricted section and cannot move to another space', new.id
         using errcode = 'check_violation', constraint = '${RESTRICTED_SPACE_MOVE}';

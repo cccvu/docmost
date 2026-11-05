@@ -199,10 +199,15 @@ export class PageRepo {
     deletedById: string,
     workspaceId: string,
     trx?: KyselyTransaction,
-  ): Promise<void> {
+    // CCC seam #172 (#661): a caller that decided the exact set passes it; the walk is skipped, and only those
+    // still-live rows are trashed. Returns the ids this call trashed.
+    opts?: { pageIds?: readonly string[] },
+  ): Promise<string[]> {
     const currentDate = new Date();
 
-    const descendants = await dbOrTx(this.db, trx)
+    const descendants = opts?.pageIds
+      ? opts.pageIds.map((id) => ({ id }))
+      : await dbOrTx(this.db, trx)
       .withRecursive('page_descendants', (db) =>
         db
           .selectFrom('pages')
@@ -222,10 +227,13 @@ export class PageRepo {
       .execute();
 
     const pageIds = descendants.map((d) => d.id);
+    let trashedIds: string[] = [];
+    // CCC seam #172 (#661): with a decided set, the side effects cover exactly the rows trashed here.
+    const affected = () => (opts?.pageIds ? trashedIds : pageIds);
 
     if (pageIds.length > 0) {
       await executeTx(this.db, async (trx) => {
-        await trx
+        const trashed = await trx
           .updateTable('pages')
           .set({
             deletedById: deletedById,
@@ -233,16 +241,23 @@ export class PageRepo {
           })
           .where('id', 'in', pageIds)
           .where('deletedAt', 'is', null)
+          .returning('id')
           .execute();
+        trashedIds = trashed.map((r) => r.id);
 
-        await trx.deleteFrom('shares').where('pageId', 'in', pageIds).execute();
+        if (affected().length > 0) {
+          await trx.deleteFrom('shares').where('pageId', 'in', affected()).execute();
+        }
       }, trx);
 
-      this.eventEmitter.emit(EventName.PAGE_SOFT_DELETED, {
-        pageIds: pageIds,
-        workspaceId,
-      });
+      if (affected().length > 0) {
+        this.eventEmitter.emit(EventName.PAGE_SOFT_DELETED, {
+          pageIds: affected(),
+          workspaceId,
+        });
+      }
     }
+    return trashedIds;
   }
 
   async restorePage(pageId: string, workspaceId: string): Promise<void> {
