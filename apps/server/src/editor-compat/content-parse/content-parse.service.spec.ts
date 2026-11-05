@@ -13,7 +13,10 @@ import {
   ContentParseBusyException,
   ContentParsePool,
   ContentTooComplexException,
+  ConversionBudgetExhaustedException,
   convertOnBehalfOf,
+  isBudgetExempt,
+  isContentParseRefusal,
   requestQueue,
   userConversionKey,
   type ContentParseLimits,
@@ -30,6 +33,9 @@ const LIMITS: ContentParseLimits = {
   maxChars: 1_000,
   batchWaitMs: 5_000,
   startupMs: 5_000,
+  // Out of the way of the #626/#642 admission specs; the budget has its own block below.
+  budgetCapacityMs: 1e12,
+  budgetRefillMsPerMinute: 1e12,
 };
 
 /**
@@ -319,5 +325,213 @@ describe('#642 one principal never causes another principal\'s 503', () => {
     expect(batchConversion('file-task:1', null).principal).toBe('batch:file-task:1');
     expect(requestQueue().principal).toBe('background');
     expect((await convertOnBehalfOf(undefined, async () => requestQueue())).principal).toBe('background');
+  });
+});
+
+/**
+ * #642 worker-time budget. After the echo fix, one abuser looping deadline-length conversions still kept the single
+ * worker busy back to back (7 s + kill + reload > the 8 s wait) and 35% of another person's small writes were refused
+ * busy. Each human key now has a bucket of worker time; an empty one is refused at admission with 429 + Retry-After.
+ * Real fixture workers; time past a refill is advanced by offsetting `Date.now` (worker threads do not run under fake
+ * timers).
+ */
+describe('#642 the per-principal worker-time budget', () => {
+  let offset = 0;
+  beforeEach(() => {
+    offset = 0;
+    const realNow = Date.now.bind(Date);
+    jest.spyOn(Date, 'now').mockImplementation(() => realNow() + offset);
+  });
+  afterEach(() => jest.restoreAllMocks());
+
+  /** Spend `user:A`'s budget with one conversion killed at the deadline; resolves once its reload is charged too. */
+  const spend = async (pool: ContentParsePool, spawned: Worker[]) => {
+    await expect(pool.parse('hang', 'html', 'user:A')).rejects.toBeInstanceOf(
+      ContentTooComplexException,
+    );
+    await until(() => spawned.length === 2);
+    await pool.parse('warm', 'html', 'background'); // the replacement is ready, so its reload has been charged
+  };
+
+  it('the production budget: 30 s burst, 15 s a minute; a 1 MiB page every 20 s at the deadline-length worst case per minute fits', () => {
+    expect(CONTENT_PARSE_LIMITS.budgetCapacityMs).toBe(30_000);
+    expect(CONTENT_PARSE_LIMITS.budgetRefillMsPerMinute).toBe(15_000);
+    // A legit heavy writer: ~1 MiB every 20 s at ≤4 s a conversion in production uses ≤12 s a minute.
+    expect(3 * 4_000).toBeLessThan(
+      CONTENT_PARSE_LIMITS.budgetRefillMsPerMinute,
+    );
+    // The burst holds at least four deadline-length conversions with a worst-case 3.5 s reload each.
+    expect(CONTENT_PARSE_LIMITS.budgetCapacityMs).toBeLessThanOrEqual(
+      4 * (CONTENT_PARSE_LIMITS.deadlineMs + 3_500),
+    );
+  });
+
+  it('a killed conversion is charged up to its kill, and the reload it caused is charged once the worker is back', async () => {
+    const deadlineMs = 200;
+    const { pool, spawned } = track(
+      makePool(
+        { deadlineMs, budgetCapacityMs: 10_000, budgetRefillMsPerMinute: 0 },
+        ['normal', 'slow-ready:150'],
+      ),
+    );
+    await pool.parse('warm', 'html', 'background');
+    const hang = pool.parse('hang', 'html', 'user:A').catch((e) => e);
+    await expect(hang).resolves.toBeInstanceOf(ContentTooComplexException);
+    const afterRun = pool.budgetLeft('user:A');
+    expect(afterRun).toBeLessThanOrEqual(10_000 - deadlineMs); // the conversion, to its kill
+    await until(() => pool.budgetLeft('user:A') < afterRun - 100, 5_000); // + the ~150 ms reload
+    expect(pool.budgetLeft('user:A')).toBeGreaterThan(
+      10_000 - deadlineMs - 1_500,
+    );
+  });
+
+  it('an ordinary conversion is charged its wall time; exempt keys are never charged', async () => {
+    const { pool } = track(
+      makePool({ budgetCapacityMs: 10_000, budgetRefillMsPerMinute: 0 }),
+    );
+    await pool.parse('sleep:120', 'html', 'user:A');
+    expect(pool.budgetLeft('user:A')).toBeLessThanOrEqual(10_000 - 120);
+    await pool.parse('sleep:120', 'html', 'background');
+    await pool.parse('sleep:120', 'html', 'batch:file-task:1');
+    expect(pool.budgetLeft('background')).toBe(10_000);
+    expect(pool.budgetLeft('batch:file-task:1')).toBe(10_000);
+    expect(
+      isBudgetExempt('background') &&
+        isBudgetExempt('batch:x') &&
+        !isBudgetExempt('user:1'),
+    ).toBe(true);
+  });
+
+  it('once over budget the abuser is refused at once with 429 conversion_budget_exhausted + Retry-After; another principal is admitted at once (no 503)', async () => {
+    // 60 s a minute = 1 worker-ms per ms, so the debt of one ~200 ms kill + reload is a sub-second refill.
+    const { pool, spawned } = track(
+      makePool({
+        deadlineMs: 200,
+        waitMs: 400,
+        budgetCapacityMs: 100,
+        budgetRefillMsPerMinute: 60_000,
+      }),
+    );
+    await pool.parse('warm', 'html', 'background');
+    await spend(pool, spawned);
+    expect(pool.budgetLeft('user:A')).toBeLessThanOrEqual(0);
+
+    const started = Date.now();
+    const err = await pool.parse('sleep:10', 'html', 'user:A').catch((e) => e);
+    expect(Date.now() - started).toBeLessThan(100); // refused before it queues, never after a wait
+    expect(err).toBeInstanceOf(ConversionBudgetExhaustedException);
+    expect(err.getStatus()).toBe(429);
+    expect(err.getResponse()).toMatchObject({
+      code: 'conversion_budget_exhausted',
+    });
+    expect(err.getResponse().message).toMatch(
+      /^this account is using the content converter heavily; retry in \d+ s$/,
+    );
+    expect(err.retryAfterSeconds).toBeGreaterThanOrEqual(1);
+    expect(isContentParseRefusal(err)).toBe(true); // importers pass it on as is
+
+    // B was never charged for A's use: admitted and served straight away.
+    await expect(pool.parse('b', 'html', 'user:B')).resolves.toEqual({
+      type: 'doc',
+      label: 'b',
+    });
+  });
+
+  it('Retry-After is the whole seconds until the bucket is positive again, at least 1', async () => {
+    const { pool, spawned } = track(
+      makePool({
+        deadlineMs: 200,
+        budgetCapacityMs: 100,
+        budgetRefillMsPerMinute: 6_000,
+      }), // 0.1 worker-ms per ms
+    );
+    await pool.parse('warm', 'html', 'background');
+    await spend(pool, spawned);
+    const debt = -pool.budgetLeft('user:A');
+    const err = await pool.parse('x', 'html', 'user:A').catch((e) => e);
+    expect(err).toBeInstanceOf(ConversionBudgetExhaustedException);
+    // debt / 0.1 per ms → ms, rounded up to seconds (a few ms of real time may have refilled meanwhile).
+    const expected = Math.ceil((debt * 10 + 1) / 1000);
+    expect(err.retryAfterSeconds).toBeLessThanOrEqual(expected);
+    expect(err.retryAfterSeconds).toBeGreaterThanOrEqual(
+      Math.max(1, expected - 1),
+    );
+  });
+
+  it('the refill restores admission', async () => {
+    const { pool, spawned } = track(
+      makePool({
+        deadlineMs: 200,
+        budgetCapacityMs: 100,
+        budgetRefillMsPerMinute: 6_000,
+      }),
+    );
+    await pool.parse('warm', 'html', 'background');
+    await spend(pool, spawned);
+    const err = await pool.parse('x', 'html', 'user:A').catch((e) => e);
+    expect(err).toBeInstanceOf(ConversionBudgetExhaustedException);
+    offset += err.retryAfterSeconds * 1000; // the time it was told to wait
+    await expect(pool.parse('again', 'html', 'user:A')).resolves.toEqual({
+      type: 'doc',
+      label: 'again',
+    });
+  });
+
+  it('a batch caller (the zip import) waits for the refill within its batch wait instead of failing', async () => {
+    const { pool, spawned } = track(
+      makePool({
+        deadlineMs: 200,
+        budgetCapacityMs: 100,
+        budgetRefillMsPerMinute: 60_000,
+      }),
+    );
+    await pool.parse('warm', 'html', 'background');
+    await spend(pool, spawned);
+    expect(pool.budgetLeft('user:A')).toBeLessThanOrEqual(0);
+    // Interactive: refused. Batch, same key, a wait longer than the refill: served once the bucket is positive.
+    await expect(pool.parse('x', 'html', 'user:A')).rejects.toBeInstanceOf(
+      ConversionBudgetExhaustedException,
+    );
+    await expect(
+      pool.toHtml('imported', 'user:A', 5_000, undefined, true),
+    ).resolves.toBe('<p>imported</p>');
+  });
+
+  it('a batch caller whose wait cannot cover the refill fails with the same 429', async () => {
+    const { pool, spawned } = track(
+      makePool({
+        deadlineMs: 200,
+        budgetCapacityMs: 100,
+        budgetRefillMsPerMinute: 600,
+      }), // 0.01 worker-ms per ms
+    );
+    await pool.parse('warm', 'html', 'background');
+    await spend(pool, spawned);
+    const started = Date.now();
+    const err = await pool
+      .toHtml('imported', 'user:A', 1_000, undefined, true)
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(ConversionBudgetExhaustedException);
+    expect(Date.now() - started).toBeLessThan(200); // decided up front, not after waiting out its batch wait
+    expect(batchConversion('file-task:1', 'U').batch).toBe(true); // the zip import is a batch caller
+    expect(requestQueue().batch).toBeUndefined(); // a request is not
+  });
+
+  it('idle keys do not accumulate: a bucket that has refilled is dropped (on read, and by the periodic sweep)', async () => {
+    const { pool } = track(
+      makePool({ budgetCapacityMs: 1_000, budgetRefillMsPerMinute: 60_000 }),
+    );
+    for (let i = 0; i < 20; i++)
+      await pool.parse('sleep:5', 'html', `user:P${i}`);
+    expect(pool.budgetKeys).toBe(20);
+    offset += 61_000; // every bucket is full again, and the sweep is due
+    await pool.parse('trigger', 'html', 'background'); // exempt: sweeps, charges nothing
+    expect(pool.budgetKeys).toBe(0);
+    // A full bucket read directly is dropped too.
+    await pool.parse('sleep:5', 'html', 'user:Q');
+    expect(pool.budgetKeys).toBe(1);
+    offset += 2_000;
+    expect(pool.budgetLeft('user:Q')).toBe(1_000);
+    expect(pool.budgetKeys).toBe(0);
   });
 });

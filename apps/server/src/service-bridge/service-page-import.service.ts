@@ -9,6 +9,7 @@ import { OpSemaphore, OpSemaphoreTimeout } from '../authz/page-write/op-semaphor
 import {
   ContentParseBusyException,
   ContentTooComplexException,
+  ConversionBudgetExhaustedException,
   convertOnBehalfOf,
 } from '../editor-compat/content-parse/content-parse.service';
 import {
@@ -166,6 +167,11 @@ export class ServicePageImportService {
         await this.parser.parse(content, format);
         results.push({ idx, ok: true });
       } catch (err) {
+        if (err instanceof ConversionBudgetExhaustedException) {
+          // #642: the acting human's converter budget is spent — about them, not this item. The whole call answers 429
+          // with the refill time (RetryAfterFilter), never a per-item verdict.
+          throw err;
+        }
         if (err instanceof ContentParseBusyException) {
           // #626: no conversion could run in time — the engine's load, not this item: it and every later one are
           // answered unchecked, exactly like the time budget.

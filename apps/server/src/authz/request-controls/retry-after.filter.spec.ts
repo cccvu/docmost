@@ -16,7 +16,10 @@ import { Test } from '@nestjs/testing';
 import type { FastifyReply } from 'fastify';
 import { authzUnavailable } from '../authz-unavailable';
 import { engineBusy } from '../../service-bridge/resource-version';
-import { ContentParseBusyException } from '../../editor-compat/content-parse/content-parse.service';
+import {
+  ContentParseBusyException,
+  ConversionBudgetExhaustedException,
+} from '../../editor-compat/content-parse/content-parse.service';
 import { RetryAfterModule } from './retry-after.module';
 import { AuthzModule } from '../authz.module';
 import {
@@ -59,6 +62,15 @@ class ProbeController {
   @Get('preset') preset(@Res({ passthrough: true }) res: FastifyReply): never {
     res.header('Retry-After', '30'); // export admission sets its own
     throw new ServiceUnavailableException('busy');
+  }
+  @Get('budget') budget(): never {
+    throw new ConversionBudgetExhaustedException(17); // #642: the converter budget's own refill time
+  }
+  @Get('budget-preset') budgetPreset(
+    @Res({ passthrough: true }) res: FastifyReply,
+  ): never {
+    res.header('Retry-After', '99');
+    throw new ConversionBudgetExhaustedException(17);
   }
   @Get('not-found') nf(): never {
     throw new NotFoundException('gone');
@@ -127,6 +139,22 @@ describe('RetryAfterFilter (wiki-v2#696): every engine 503 says when to come bac
     const res = await app.inject({ method: 'GET', url: '/preset' });
     expect(res.statusCode).toBe(503);
     expect(res.headers['retry-after']).toBe('30');
+  });
+
+  it('#642: the converter-budget 429 carries its own refill time as Retry-After; body as Nest renders it', async () => {
+    const res = await app.inject({ method: 'GET', url: '/budget' });
+    const ref = await bare.inject({ method: 'GET', url: '/budget' });
+    expect(res.statusCode).toBe(429);
+    expect(res.headers['retry-after']).toBe('17');
+    expect(ref.headers['retry-after']).toBeUndefined();
+    expect(res.body).toBe(ref.body);
+    expect(res.json()).toMatchObject({ code: 'conversion_budget_exhausted' });
+    // Never over a value already set.
+    expect(
+      (await app.inject({ method: 'GET', url: '/budget-preset' })).headers[
+        'retry-after'
+      ],
+    ).toBe('99');
   });
 
   it('never on another status', async () => {

@@ -20,6 +20,11 @@
  *     `memoryMb` heap via `resourceLimits`, and `maxNodes` nodes / `maxChars` characters in the result → 422
  *     `content_too_complex` (not retryable unchanged). A killed worker is replaced at once, not on the next job.
  *   - a worker that crashes or cannot start → 503 `engine_busy`, logged as an error.
+ *   - budget (#642): each human's key has a token bucket of WORKER time (`budgetCapacityMs`, refilled at
+ *     `budgetRefillMsPerMinute`), charged on settle with the conversion's wall time — a killed one up to its kill — plus
+ *     the reload it caused. A key whose bucket is empty (≤ 0) is refused at admission, before it queues: 429
+ *     `conversion_budget_exhausted` with the seconds until it is positive again. A batch caller (`batchConversion`)
+ *     waits for the refill within its batch wait instead. Actorless keys (`background`, `batch:<id>`) are exempt.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import * as fs from 'node:fs';
@@ -27,6 +32,8 @@ import * as path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import {
   BadRequestException,
+  HttpException,
+  HttpStatus,
   Logger,
   ServiceUnavailableException,
   UnprocessableEntityException,
@@ -53,6 +60,10 @@ export interface ContentParseLimits {
   batchWaitMs: number;
   /** How long a fresh worker may take to load the parsers. */
   startupMs: number;
+  /** #642: a human key's bucket of worker time, in ms: how much it may use in a burst. */
+  budgetCapacityMs: number;
+  /** #642: worker ms a key's bucket regains per minute: its sustained share of the one worker. */
+  budgetRefillMsPerMinute: number;
 }
 
 /**
@@ -75,6 +86,12 @@ export interface ContentParseLimits {
  *     convert within the deadline anyway.
  *   - batch wait 60 s: a zip import converts every page inside one transaction with no retry, so one busy answer
  *     failed the whole import. Nobody waits on a response for it, and the worker is ~one job per principal away.
+ *   - budget 30 s, refilled 15 s a minute (#642): the fairness rerun after the echo fix had one abuser looping
+ *     deadline-length conversions on the single worker (7 s + kill + reload > the 8 s wait), and 35% of a second
+ *     person's small writes were refused busy. 15 s a minute is a quarter of the worker per human, sustained; the 30 s
+ *     burst is four deadline-length conversions with their reloads. A legitimate heavy writer — a ~1 MiB page every
+ *     20 s at ~1.4–4 s a conversion — uses 4–12 s a minute and is never refused. An abuser, once spent, gets ~one
+ *     deadline-length conversion every 40 s, so the worker is free for everyone else most of the time.
  */
 export const CONTENT_PARSE_LIMITS: Readonly<ContentParseLimits> = Object.freeze({
   deadlineMs: 7_000,
@@ -84,6 +101,8 @@ export const CONTENT_PARSE_LIMITS: Readonly<ContentParseLimits> = Object.freeze(
   maxChars: 8 * 1024 * 1024,
   batchWaitMs: 60_000,
   startupMs: 30_000,
+  budgetCapacityMs: 30_000,
+  budgetRefillMsPerMinute: 15_000,
 });
 
 /** 422: the content is beyond what one write may convert. Deterministic for the same content: split it, never retry. */
@@ -105,10 +124,40 @@ export class ContentParseBusyException extends ServiceUnavailableException {
   }
 }
 
-/** A conversion refused on its bounds (422) or its capacity (503) — an answer to pass on as is, never to relabel. */
-export function isContentParseRefusal(err: unknown): err is ContentTooComplexException | ContentParseBusyException {
-  return err instanceof ContentTooComplexException || err instanceof ContentParseBusyException;
+/**
+ * 429 (#642): this key has used its share of the converter's time. Refused at admission (nothing queued, nothing
+ * applied); `retryAfterSeconds` is when its bucket is positive again. RetryAfterFilter turns it into `Retry-After`.
+ */
+export class ConversionBudgetExhaustedException extends HttpException {
+  constructor(readonly retryAfterSeconds: number) {
+    super(
+      {
+        message: `this account is using the content converter heavily; retry in ${retryAfterSeconds} s`,
+        code: 'conversion_budget_exhausted',
+      },
+      HttpStatus.TOO_MANY_REQUESTS,
+    );
+  }
 }
+
+/** A conversion refused on its bounds (422), its capacity (503) or its budget (429) — passed on as is, never relabeled. */
+export function isContentParseRefusal(
+  err: unknown,
+): err is ContentTooComplexException | ContentParseBusyException | ConversionBudgetExhaustedException {
+  return (
+    err instanceof ContentTooComplexException ||
+    err instanceof ContentParseBusyException ||
+    err instanceof ConversionBudgetExhaustedException
+  );
+}
+
+/** #642: keys with no human behind them share no budget — actorless requests and imports nobody started. */
+export function isBudgetExempt(principal: string): boolean {
+  return principal === 'background' || principal.startsWith('batch:');
+}
+
+/** How often idle (full) buckets are swept, at most. Buckets are also dropped whenever they are read full. */
+const BUDGET_PRUNE_EVERY_MS = 60_000;
 
 export type SpawnWorker = (memoryMb: number) => Worker;
 
@@ -152,6 +201,9 @@ export class ContentParsePool {
   private readonly slot: OpSemaphore;
   /** One conversion queued or running per principal. Entries are dropped when idle. */
   private readonly principals = new Map<string, OpSemaphore>();
+  /** #642: worker-time buckets of the keys that are below capacity. A missing key is full. */
+  private readonly buckets = new Map<string, { tokens: number; at: number }>();
+  private lastPrune = 0;
   private current: Worker | null = null;
   private starting: Promise<Worker> | null = null;
   private nextId = 1;
@@ -163,21 +215,90 @@ export class ContentParsePool {
     this.slot = new OpSemaphore(1, limits.waitMs);
   }
 
-  /** HTML or Markdown → ProseMirror JSON. `waitMs`: how long it may wait for its turn (default `limits.waitMs`). */
-  async parse(content: string, format: ParseFormat, principal: string, waitMs?: number): Promise<Record<string, unknown>> {
+  /**
+   * HTML or Markdown → ProseMirror JSON. `waitMs`: how long it may wait for its turn (default `limits.waitMs`).
+   * `batch`: an empty budget is waited out within `waitMs` rather than refused (#642).
+   */
+  async parse(
+    content: string,
+    format: ParseFormat,
+    principal: string,
+    waitMs?: number,
+    batch = false,
+  ): Promise<Record<string, unknown>> {
     const { maxNodes, maxChars } = this.limits;
     const req = { op: 'to-json', format, content, maxNodes, maxChars } as const;
-    return (await this.convert(req, principal, `format=${format}`, waitMs)) as Record<string, unknown>;
+    return (await this.convert(req, principal, `format=${format}`, waitMs, batch)) as Record<string, unknown>;
   }
 
   /**
    * Markdown → HTML only (the importers rewrite the HTML before it is parsed). `maxChars` lowers the cap on the
    * HTML's length for this call (an importer bounds it by its own input cap); it never raises it past the limit.
    */
-  async toHtml(markdown: string, principal: string, waitMs?: number, maxChars?: number): Promise<string> {
+  async toHtml(markdown: string, principal: string, waitMs?: number, maxChars?: number, batch = false): Promise<string> {
     const cap = Math.min(maxChars ?? this.limits.maxChars, this.limits.maxChars);
     const req = { op: 'markdown-to-html', content: markdown, maxChars: cap } as const;
-    return (await this.convert(req, principal, 'op=markdown-to-html', waitMs)) as string;
+    return (await this.convert(req, principal, 'op=markdown-to-html', waitMs, batch)) as string;
+  }
+
+  /** #642: the key's worker-time left, in ms, refilled to now (may be negative). Drops a bucket that is full again. */
+  budgetLeft(principal: string, now = Date.now()): number {
+    const { budgetCapacityMs: cap, budgetRefillMsPerMinute: perMin } = this.limits;
+    const b = this.buckets.get(principal);
+    if (!b) return cap;
+    const tokens = Math.min(cap, b.tokens + ((now - b.at) * perMin) / 60_000);
+    if (tokens >= cap) {
+      this.buckets.delete(principal);
+      return cap;
+    }
+    b.tokens = tokens;
+    b.at = now;
+    return tokens;
+  }
+
+  /** How many keys hold a bucket below capacity (tests, diagnostics). */
+  get budgetKeys(): number {
+    return this.buckets.size;
+  }
+
+  /** #642: charge `ms` of worker time to the key (on settle). Exempt keys are never charged. */
+  private charge(principal: string, ms: number): void {
+    if (isBudgetExempt(principal) || !(ms > 0)) return;
+    const now = Date.now();
+    const tokens = this.budgetLeft(principal, now) - ms;
+    this.buckets.set(principal, { tokens, at: now });
+  }
+
+  /** Sweep the buckets that have refilled, at most once a `BUDGET_PRUNE_EVERY_MS`, so idle keys do not accumulate. */
+  private pruneBuckets(now: number): void {
+    if (now - this.lastPrune < BUDGET_PRUNE_EVERY_MS) return;
+    this.lastPrune = now;
+    for (const key of [...this.buckets.keys()]) this.budgetLeft(key, now);
+  }
+
+  /**
+   * #642: admit the key only while its bucket is positive. Empty: an interactive caller is refused at once (429 with
+   * the seconds until it is positive again); a batch caller waits for the refill if that fits in what is left of its
+   * wait, else is refused the same way.
+   */
+  private async admitBudget(principal: string, batch: boolean, left: () => number, context: string): Promise<void> {
+    if (isBudgetExempt(principal)) return;
+    const perMin = this.limits.budgetRefillMsPerMinute;
+    for (;;) {
+      const tokens = this.budgetLeft(principal);
+      if (tokens > 0) return;
+      // ms until the bucket is strictly positive again.
+      const needMs = perMin > 0 ? Math.floor((-tokens * 60_000) / perMin) + 1 : Number.POSITIVE_INFINITY;
+      if (batch && needMs <= left()) {
+        await new Promise<void>((resolve) => setTimeout(resolve, needMs));
+        continue;
+      }
+      const retryAfter = Number.isFinite(needMs) ? Math.max(1, Math.ceil(needMs / 1000)) : 60;
+      this.logger.warn(
+        `CONTENT_PARSE_BUDGET principal=${principal} ${context} budgetMs=${Math.round(tokens)}: worker-time budget spent; answered 429 conversion_budget_exhausted retryAfter=${retryAfter}`,
+      );
+      throw new ConversionBudgetExhaustedException(retryAfter);
+    }
   }
 
   private async convert(
@@ -185,10 +306,15 @@ export class ContentParsePool {
     principal: string,
     what: string,
     waitMs = this.limits.waitMs,
+    batch = false,
   ): Promise<unknown> {
     const bytes = Buffer.byteLength(String(req.content ?? ''), 'utf8');
     const admitBy = Date.now() + waitMs;
     const left = () => Math.max(0, admitBy - Date.now());
+    const context = `${what} bytes=${bytes}`;
+    this.pruneBuckets(Date.now());
+    // #642: refused before it queues — an over-budget key never waits in line, nor holds its own turn.
+    await this.admitBudget(principal, batch, left, context);
 
     let own = this.principals.get(principal);
     if (!own) {
@@ -203,10 +329,19 @@ export class ContentParsePool {
       const releaseOwn = await own.acquire(left());
       let reload: Promise<unknown> | null = null;
       try {
+        // Again once it is this key's turn: its own previous conversion (just settled) may have spent the budget.
+        await this.admitBudget(principal, batch, left, context);
         const releaseSlot = await this.slot.acquire(left());
         try {
           const run = await this.run({ ...req, id: this.nextId++ } as ParseRequest);
           reload = run.reload;
+          // #642: charged on settle — the conversion's own wall time (a killed one up to its kill)…
+          this.charge(principal, run.ms);
+          if (reload) {
+            // …and the reload it caused, once the replacement worker is ready.
+            const reloadFrom = Date.now();
+            void reload.then(() => this.charge(principal, Date.now() - reloadFrom));
+          }
           return this.settle(run.outcome, run.ms, `principal=${principal} ${what} bytes=${bytes} ms=${run.ms}`);
         } finally {
           releaseSlot();
@@ -387,6 +522,8 @@ const pool = new ContentParsePool();
 export interface ConversionQueue {
   principal: string;
   waitMs: number;
+  /** #642: work nobody waits on a response for: an empty budget is waited out within `waitMs`, not refused. */
+  batch?: boolean;
 }
 
 /** A human's admission key: the one key their requests, imports and validations all take their turn under (#642). */
@@ -403,6 +540,7 @@ export function batchConversion(id: string, userId?: string | null): ConversionQ
   return {
     principal: userId ? userConversionKey(userId) : `batch:${id}`,
     waitMs: CONTENT_PARSE_LIMITS.batchWaitMs,
+    batch: true,
   };
 }
 
@@ -430,15 +568,16 @@ export function requestQueue(): ConversionQueue {
 
 /**
  * Convert untrusted HTML or Markdown to ProseMirror JSON, off the event loop. Throws `BadRequestException('Invalid
- * content format')` for content that does not convert, `ContentTooComplexException` (422) past the bounds, and
- * `ContentParseBusyException` (503) when no conversion can run in time. This call never writes anything.
+ * content format')` for content that does not convert, `ContentTooComplexException` (422) past the bounds,
+ * `ContentParseBusyException` (503) when no conversion can run in time, and `ConversionBudgetExhaustedException` (429)
+ * when the caller's worker-time budget is spent (#642). This call never writes anything.
  */
 export function parseUntrustedContent(
   content: string,
   format: ParseFormat,
   queue: ConversionQueue = requestQueue(),
 ): Promise<Record<string, unknown>> {
-  return pool.parse(content, format, queue.principal, queue.waitMs);
+  return pool.parse(content, format, queue.principal, queue.waitMs, queue.batch === true);
 }
 
 /**
@@ -450,7 +589,7 @@ export function untrustedMarkdownToHtml(
   queue: ConversionQueue = requestQueue(),
   options: { maxChars?: number } = {},
 ): Promise<string> {
-  return pool.toHtml(markdown, queue.principal, queue.waitMs, options.maxChars);
+  return pool.toHtml(markdown, queue.principal, queue.waitMs, options.maxChars, queue.batch === true);
 }
 
 /** Stop the shared worker (tests). */

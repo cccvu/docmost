@@ -9,7 +9,7 @@ import * as bytes from 'bytes';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
-import { CONTENT_PARSE_LIMITS, ContentTooComplexException } from './content-parse.service';
+import { CONTENT_PARSE_LIMITS, ContentTooComplexException, ConversionBudgetExhaustedException } from './content-parse.service';
 import {
   assertImportHtmlWithinBounds,
   assertImportPageFileSize,
@@ -159,6 +159,16 @@ describe('#643 importTaskError: a zip task fails only with messages we wrote', (
   const extractDir = '/tmp/docmost-extract-AbC123';
   const fsError = (code: string) =>
     Object.assign(new Error(`${code}: failed, open '${extractDir}/docs/a.md'`), { code, path: `${extractDir}/docs/a.md` });
+
+  it('#642: a converter budget the batch wait could not cover is an authored failure naming the zip entry, never a tmp path', () => {
+    const log = logger();
+    const err = importTaskError(new ConversionBudgetExhaustedException(40), { file: 'docs/a.md', logger: log });
+    expect(err).toBeInstanceOf(ImportTaskFailure);
+    expect(err.message).toBe(
+      'Import failed: docs/a.md: this account is using the content converter heavily; retry in 40 s',
+    );
+    expect(err.message).not.toContain(extractDir);
+  });
 
   it('an fs error becomes "Import failed: <path>: <reason>"; the raw error is logged, never shown', () => {
     const log = logger();

@@ -5,6 +5,7 @@ import {
 } from '@nestjs/common';
 import { BaseExceptionFilter } from '@nestjs/core';
 import type { FastifyReply } from 'fastify';
+import { ConversionBudgetExhaustedException } from '../../editor-compat/content-parse/content-parse.service';
 
 /**
  * CCC request control — NOT upstream Docmost code (wiki-v2#696).
@@ -16,7 +17,10 @@ import type { FastifyReply } from 'fastify';
  * when it relays one, so this is also what a `/v1` caller is told.
  *
  * Rules: a `Retry-After` already on the reply is kept (export admission sets its own 30 s); otherwise the jittered PDP
- * brown-out window, 2–5 s, so retrying clients do not return in step. The body is untouched: the response is then
+ * brown-out window, 2–5 s, so retrying clients do not return in step.
+ *
+ * Also the one 429 the engine raises itself (#642): `ConversionBudgetExhaustedException` carries the seconds until the
+ * caller's converter budget is positive again, and that is its `Retry-After` (again, never over a value already set). The body is untouched: the response is then
  * rendered by Nest's own `BaseExceptionFilter`, exactly as without this filter.
  *
  * A filter, not an interceptor, so that it also sees a 503 thrown by a guard or by an interceptor registered outside
@@ -33,16 +37,23 @@ export function defaultRetryAfterSec(
   return RETRY_AFTER_MIN_SEC + Math.min(span - 1, Math.floor(random() * span));
 }
 
-@Catch(ServiceUnavailableException)
+@Catch(ServiceUnavailableException, ConversionBudgetExhaustedException)
 export class RetryAfterFilter extends BaseExceptionFilter {
-  catch(exception: ServiceUnavailableException, host: ArgumentsHost): void {
+  catch(
+    exception: ServiceUnavailableException | ConversionBudgetExhaustedException,
+    host: ArgumentsHost,
+  ): void {
     if (host.getType() !== 'http') throw exception;
     const reply = host.switchToHttp().getResponse<FastifyReply>();
     if (
       typeof reply?.getHeader === 'function' &&
       reply.getHeader('retry-after') === undefined
     ) {
-      reply.header('Retry-After', String(defaultRetryAfterSec()));
+      const seconds =
+        exception instanceof ConversionBudgetExhaustedException
+          ? exception.retryAfterSeconds
+          : defaultRetryAfterSec();
+      reply.header('Retry-After', String(seconds));
     }
     super.catch(exception, host);
   }
