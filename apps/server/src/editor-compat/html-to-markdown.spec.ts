@@ -1,7 +1,11 @@
 import { htmlToMarkdown } from '@docmost/editor-ext';
 import { setFlagsFromString } from 'node:v8';
 import { runInNewContext } from 'node:vm';
-import { jsonToHtml } from '../collaboration/collaboration.util';
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import * as ts from 'typescript';
+import { jsonToHtml, jsonToMarkdown } from '../collaboration/collaboration.util';
+import { sourceFiles } from '../authz/route-guard/ast-sink-scan';
 import { htmlToMarkdownReleasingDom } from './html-to-markdown';
 
 /**
@@ -106,4 +110,49 @@ describe('htmlToMarkdownReleasingDom (#699)', () => {
     expect(upstream).toBeGreaterThan(runs * html.length * 20); // the leak this replaces: ~150× the HTML per call
     expect(ours).toBeLessThan(upstream / 10);
   }, 120_000);
+
+  it('jsonToMarkdown (page info/update/create in markdown, the MCP reads) is byte-identical to upstream', () => {
+    for (const seed of [4, 5]) {
+      const doc = realisticDoc(150, seed);
+      expect(jsonToMarkdown(doc)).toBe(htmlToMarkdown(jsonToHtml(doc)));
+    }
+  });
+
+  it('jsonToMarkdown keeps no DOM after it returns (seam #61), where the upstream composition keeps one per call', () => {
+    const doc = realisticDoc(1500, 9);
+    const html = jsonToHtml(doc);
+    const runs = 4;
+
+    let before = heapAfterGc();
+    for (let i = 0; i < runs; i++) jsonToMarkdown(doc);
+    const ours = heapAfterGc() - before;
+
+    before = heapAfterGc();
+    for (let i = 0; i < runs; i++) htmlToMarkdown(jsonToHtml(doc));
+    const upstream = heapAfterGc() - before;
+
+    console.log(
+      `#699 jsonToMarkdown: ${runs} × ${(html.length / MiB).toFixed(2)} MiB HTML — retained ${(ours / MiB).toFixed(1)} MiB ` +
+        `vs ${(upstream / MiB).toFixed(1)} MiB (upstream composition)`,
+    );
+    expect(upstream).toBeGreaterThan(runs * html.length * 20);
+    expect(ours).toBeLessThan(upstream / 10);
+  }, 120_000);
+
+  it('no server code calls editor-ext htmlToMarkdown except this helper (every path releases its DOM)', () => {
+    const SRC = join(__dirname, '..');
+    const offenders: string[] = [];
+    for (const full of sourceFiles(SRC)) {
+      const rel = full.slice(SRC.length + 1).split('\\').join('/');
+      const sf = ts.createSourceFile(rel, readFileSync(full, 'utf8'), ts.ScriptTarget.Latest, true);
+      const visit = (n: ts.Node): void => {
+        // a named import of htmlToMarkdown, or a property access `x.htmlToMarkdown`, from anywhere
+        if (ts.isImportSpecifier(n) && (n.propertyName ?? n.name).text === 'htmlToMarkdown') offenders.push(`${rel}: import`);
+        if (ts.isPropertyAccessExpression(n) && n.name.text === 'htmlToMarkdown') offenders.push(`${rel}: ${n.getText(sf)}`);
+        ts.forEachChild(n, visit);
+      };
+      visit(sf);
+    }
+    expect(offenders).toEqual(['editor-compat/html-to-markdown.ts: import']);
+  });
 });
