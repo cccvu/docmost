@@ -24,6 +24,7 @@ vi.mock("@/lib/app-route.ts", () => ({
       SIGNUP: "/signup",
       MFA_CHALLENGE: "/mfa",
       MFA_SETUP_REQUIRED: "/mfa-setup",
+      SETUP: "/setup/register",
     },
     HOME: "/",
   },
@@ -31,6 +32,7 @@ vi.mock("@/lib/app-route.ts", () => ({
 }));
 vi.mock("@/lib/config.ts", () => ({ isCloud: () => false }));
 
+import { AxiosError } from "axios";
 import api from "@/lib/api-client";
 
 const RESP_URL = "https://wiki.example/api/pages/info";
@@ -144,5 +146,61 @@ describe("api-client 401 self-heal (#310)", () => {
 
     expect(openDocmostSession).not.toHaveBeenCalled();
     expect(window.location.href).toBe(""); // public experience renders; no /login bounce
+  });
+});
+
+/**
+ * #384: the 404 branch read `data.message.toLowerCase()` unguarded, so a 404 with no message, an array
+ * message (validation shape) or an HTML body threw a TypeError out of the interceptor and the caller saw that
+ * instead of the real AxiosError (and its status).
+ */
+describe("api-client 404 handling (#384)", () => {
+  function notFound(data: unknown) {
+    return async (config: any) => {
+      throw new AxiosError("Request failed with status code 404", "ERR_BAD_REQUEST", config, {
+        responseURL: RESP_URL,
+      }, {
+        status: 404,
+        statusText: "Not Found",
+        data,
+        headers: {},
+        config,
+      });
+    };
+  }
+
+  beforeEach(() => {
+    Object.defineProperty(window, "location", {
+      value: { pathname: "/home", href: "" },
+      writable: true,
+      configurable: true,
+    });
+  });
+  afterEach(() => {
+    api.defaults.adapter = originalAdapter;
+  });
+
+  it.each([
+    ["no message", {}],
+    ["no body", undefined],
+    ["an array message", { message: ["id must be a UUID"] }],
+    ["an HTML string body", "<html><body>Not Found</body></html>"],
+  ])("a 404 with %s rejects with the original AxiosError", async (_name, data) => {
+    setAdapter(notFound(data));
+
+    const error = await api.get("/pages/info").catch((e) => e);
+
+    expect(error).toBeInstanceOf(AxiosError);
+    expect(error.response.status).toBe(404);
+    expect(window.location.href).toBe("");
+  });
+
+  it("'workspace not found' still sends a self-hosted install to setup", async () => {
+    setAdapter(notFound({ message: "Workspace not found" }));
+
+    const error = await api.get("/pages/info").catch((e) => e);
+
+    expect(error).toBeInstanceOf(AxiosError);
+    expect(window.location.href).toBe("/setup/register");
   });
 });

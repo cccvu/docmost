@@ -37,6 +37,9 @@ function registered(aliasOrLanguage: string) {
   return Boolean(highlight.getLanguage(aliasOrLanguage));
 }
 
+// #407: meta-only refresh dispatched once lazily loaded grammars register.
+export const LOWLIGHT_REFRESH_META = 'lowlightRefresh';
+
 // Max characters to sample for auto-detection to avoid performance issues with large code blocks
 const AUTO_DETECT_SAMPLE_SIZE = 3000;
 
@@ -139,6 +142,15 @@ export function LowlightPlugin({
           defaultLanguage,
         }),
       apply: (transaction, decorationSet, oldState, newState) => {
+        // #407: grammars registered after init; no doc change to key off.
+        if (transaction.getMeta(LOWLIGHT_REFRESH_META)) {
+          return getDecorations({
+            doc: transaction.doc,
+            name,
+            lowlight,
+            defaultLanguage,
+          });
+        }
         const oldNodeName = oldState.selection.$head.parent.type.name;
         const newNodeName = newState.selection.$head.parent.type.name;
         const oldNodes = findChildren(

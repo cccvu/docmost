@@ -17,6 +17,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { brotliCompressSync, gzipSync } from 'node:zlib';
 import {
+  DOCUMENT_CACHE_CONTROL,
   IMMUTABLE_CACHE_CONTROL,
   REVALIDATE_CACHE_CONTROL,
   cacheControlFor,
@@ -36,10 +37,27 @@ import {
  * reply store — a stand-in for a plugin such as @fastify/cors. Fastify writes reply-store headers over raw
  * ones, so a naive raw `res.setHeader('Vary', …)` inside @fastify/static's `setHeaders` would be clobbered
  * by it; the Vary assertions below therefore prove an append-merge, on static files ONLY.
+ *
+ * #409: every HTML document — `/`, `/index.html` and every deep route through the `*` fallback — sends ONE
+ * no-store policy (see client-static.ts for the bfcache reasoning). The stand-in fallback below sends the
+ * literal read from upstream's static.module.ts source, and a pin asserts it equals DOCUMENT_CACHE_CONTROL,
+ * so the fork-owned constant and the upstream fallback cannot drift apart.
  */
 
-/** What upstream static.module.ts sets on its `app.get('*')` SPA fallback — must stay byte-identical. */
-const FALLBACK_CACHE_CONTROL = 'no-cache, no-store, must-revalidate';
+const UPSTREAM_STATIC_MODULE = join(__dirname, '..', '..', 'integrations', 'static', 'static.module.ts');
+
+/** The Cache-Control literal upstream's `app.get('*')` SPA fallback sends, read from its source text. */
+function upstreamFallbackCacheControl(): string {
+  const src = readFileSync(UPSTREAM_STATIC_MODULE, 'utf8');
+  const hits = [...src.matchAll(/\.header\(\s*'Cache-Control'\s*,\s*'([^']+)'\s*\)/g)];
+  if (hits.length !== 1) {
+    throw new Error(`expected exactly one Cache-Control literal in static.module.ts, found ${hits.length}`);
+  }
+  return hits[0][1];
+}
+
+/** What upstream static.module.ts sets on its `app.get('*')` SPA fallback (read from source, not copied). */
+const FALLBACK_CACHE_CONTROL = upstreamFallbackCacheControl();
 const BROWSER_ACCEPT = 'gzip, deflate, br';
 /** What the cors-like stand-in sets on every response, before the static routes exist. */
 const FOREIGN_VARY = 'Origin';
@@ -251,24 +269,46 @@ describe('registerClientStatic — SPA asset delivery (issue #309)', () => {
     });
   });
 
-  describe('documents that must always revalidate', () => {
-    it('GET /index.html is no-cache (never immutable) and is the real file, not a stale sibling', async () => {
+  describe('HTML documents are no-store everywhere (#409)', () => {
+    it('DOCUMENT_CACHE_CONTROL is byte-identical to the literal upstream static.module.ts sends on `*`', () => {
+      expect(DOCUMENT_CACHE_CONTROL).toBe(FALLBACK_CACHE_CONTROL);
+      expect(DOCUMENT_CACHE_CONTROL).toBe('no-cache, no-store, must-revalidate');
+    });
+
+    it('GET /index.html is no-store (never immutable) and is the real file, not a stale sibling', async () => {
       const res = await inject('/index.html', { 'accept-encoding': BROWSER_ACCEPT });
       expect(res.statusCode).toBe(200);
       expect(res.headers['content-type']).toMatch(/^text\/html/);
-      expect(res.headers['cache-control']).toBe(REVALIDATE_CACHE_CONTROL);
-      expect(res.headers['cache-control']).toBe('no-cache');
+      expect(res.headers['cache-control']).toBe(DOCUMENT_CACHE_CONTROL);
       expect(res.headers['content-encoding']).toBeUndefined();
       expect(res.payload).toContain('<!--window-config-->');
     });
 
-    it('GET / serves index.html under the same revalidate policy', async () => {
+    it('GET / serves index.html under the same document policy', async () => {
       const res = await inject('/', { 'accept-encoding': BROWSER_ACCEPT });
       expect(res.statusCode).toBe(200);
       expect(res.headers['content-type']).toMatch(/^text\/html/);
-      expect(res.headers['cache-control']).toBe('no-cache');
+      expect(res.headers['cache-control']).toBe(DOCUMENT_CACHE_CONTROL);
       expect(res.payload).toContain('<!--window-config-->');
     });
+
+    it('HEAD / carries the document policy too', async () => {
+      const res = await inject('/', { 'accept-encoding': BROWSER_ACCEPT }, 'HEAD');
+      expect(res.statusCode).toBe(200);
+      expect(res.headers['cache-control']).toBe(DOCUMENT_CACHE_CONTROL);
+      expect(res.rawPayload.length).toBe(0);
+    });
+
+    it('a deep SPA route (the `*` fallback) sends the same document policy as /', async () => {
+      const res = await inject('/s/general/p/some-page-abc123', { 'accept-encoding': BROWSER_ACCEPT });
+      expect(res.statusCode).toBe(200);
+      expect(res.headers['content-type']).toMatch(/^text\/html/);
+      expect(res.payload).toBe('<html>fallback</html>');
+      expect(res.headers['cache-control']).toBe(DOCUMENT_CACHE_CONTROL);
+    });
+  });
+
+  describe('stable-name files that must always revalidate', () => {
 
     it('locale bundles are served precompressed but revalidated, and honour If-None-Match', async () => {
       const res = await inject('/locales/en-US/translation.json', { 'accept-encoding': BROWSER_ACCEPT });
@@ -276,6 +316,7 @@ describe('registerClientStatic — SPA asset delivery (issue #309)', () => {
       expect(res.headers['content-encoding']).toBe('br');
       expect(res.rawPayload.equals(file('locales/en-US/translation.json.br'))).toBe(true);
       expect(res.headers['cache-control']).toBe('no-cache');
+      expect(res.headers['etag']).toBeTruthy();
       expectStaticVary(res);
 
       const again = await inject('/locales/en-US/translation.json', {
@@ -292,6 +333,7 @@ describe('registerClientStatic — SPA asset delivery (issue #309)', () => {
       expect(res.headers['content-encoding']).toBeUndefined();
       expect(res.rawPayload.equals(file('manifest.json'))).toBe(true);
       expect(res.headers['cache-control']).toBe('no-cache');
+      expect(res.headers['etag']).toBeTruthy();
     });
 
     it('icons are identity + no-cache', async () => {
@@ -315,11 +357,13 @@ describe('registerClientStatic — SPA asset delivery (issue #309)', () => {
 
     it('a MISSING asset falls through to the SPA fallback and KEEPS its no-store policy (GET)', async () => {
       // Load-bearing regression: a blanket immutable policy on the /assets prefix would let a 404 HTML
-      // fallback be cached for a year under an asset URL. The policy must ride on real files only.
+      // fallback be cached for a year under an asset URL. The policy must ride on real files only. This is
+      // also the stale-chunk case after a deploy (an old hashed URL the new build no longer has).
       const res = await inject('/assets/does-not-exist.js', { 'accept-encoding': BROWSER_ACCEPT });
       expect(res.statusCode).toBe(200);
       expect(res.payload).toBe('<html>fallback</html>');
       expect(res.headers['cache-control']).toBe(FALLBACK_CACHE_CONTROL);
+      expect(res.headers['cache-control']).toBe(DOCUMENT_CACHE_CONTROL);
       expect(res.headers['cache-control']).not.toContain('immutable');
     });
 
@@ -351,9 +395,17 @@ describe('registerClientStatic — SPA asset delivery (issue #309)', () => {
       expect(cacheControlFor(root, join(root, 'assets', 'x.js.gz'))).toBe(IMMUTABLE_CACHE_CONTROL);
     });
 
-    it('is no-cache for index.html and locale bundles', () => {
-      expect(cacheControlFor(root, join(root, 'index.html'))).toBe('no-cache');
+    it('is the no-store document policy for an HTML document, wherever it sits (#409)', () => {
+      expect(cacheControlFor(root, join(root, 'index.html'))).toBe(DOCUMENT_CACHE_CONTROL);
+      expect(cacheControlFor(root, join(root, 'INDEX.HTML'))).toBe(DOCUMENT_CACHE_CONTROL);
+      // Strictest policy wins: an HTML file is never immutable, even under assets/ or as a sibling.
+      expect(cacheControlFor(root, join(root, 'assets', 'x.html'))).toBe(DOCUMENT_CACHE_CONTROL);
+      expect(cacheControlFor(root, join(root, 'index.html.br'))).toBe(DOCUMENT_CACHE_CONTROL);
+    });
+
+    it('is no-cache for locale bundles and the manifest', () => {
       expect(cacheControlFor(root, join(root, 'locales', 'en-US', 'translation.json'))).toBe('no-cache');
+      expect(cacheControlFor(root, join(root, 'manifest.json'))).toBe('no-cache');
       expect(REVALIDATE_CACHE_CONTROL).toBe('no-cache');
     });
 

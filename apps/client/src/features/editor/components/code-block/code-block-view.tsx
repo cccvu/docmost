@@ -7,6 +7,8 @@ import classes from "./code-block.module.css";
 import React from "react";
 import { Suspense } from "react";
 import { useTranslation } from "react-i18next";
+import { useCodeLanguages } from "@/features/editor-ux/code-highlight/use-code-languages";
+import { useEditorEditable } from "@/features/editor-ux/use-editor-editable";
 
 const MermaidView = React.lazy(
   () => import("@/features/editor/components/code-block/mermaid-view.tsx"),
@@ -20,6 +22,8 @@ export default function CodeBlockView(props: NodeViewProps) {
     language || null,
   );
   const [isSelected, setIsSelected] = useState(false);
+  // CCC (#407 follow-up): reactive; a ReactNodeView does not re-render on editor.setEditable().
+  const isEditable = useEditorEditable(editor);
 
   useEffect(() => {
     const updateSelection = () => {
@@ -55,13 +59,13 @@ export default function CodeBlockView(props: NodeViewProps) {
         <Select
           placeholder="auto"
           checkIconPosition="right"
-          data={extension.options.lowlight.listLanguages().sort()}
+          data={useCodeLanguages()}
           value={languageValue}
           onChange={changeLanguage}
           searchable
           style={{ maxWidth: "130px" }}
           classNames={{ input: classes.selectInput }}
-          disabled={!editor.isEditable}
+          disabled={!isEditable}
         />
 
         <CopyButton value={node?.textContent} timeout={2000}>
@@ -86,7 +90,7 @@ export default function CodeBlockView(props: NodeViewProps) {
       <pre
         spellCheck="false"
         hidden={
-          ((language === "mermaid" && !editor.isEditable) ||
+          ((language === "mermaid" && !isEditable) ||
             (language === "mermaid" && !isSelected)) &&
           node.textContent.length > 0
         }

@@ -18,6 +18,7 @@ import { getSpaceUrl } from "@/lib/config.ts";
 import { useTranslation } from "react-i18next";
 import { getInitialsColor } from "@/lib/get-initials-color.ts";
 import rowClasses from "@/components/ui/clickable-table-row.module.css";
+import { RequestErrorText } from "@/features/request-errors/request-error-text.tsx";
 
 interface Props {
   spaceId?: string;
@@ -25,7 +26,7 @@ interface Props {
 
 export default function RecentChanges({ spaceId }: Props) {
   const { t } = useTranslation();
-  const { data, isLoading, isError, hasNextPage, fetchNextPage, isFetchingNextPage } = useRecentChangesQuery(spaceId);
+  const { data, isLoading, isError, error, hasNextPage, fetchNextPage, isFetchingNextPage } = useRecentChangesQuery(spaceId);
   const pages = data?.pages.flatMap((p) => p.items) ?? [];
 
   if (isLoading) {
@@ -33,7 +34,7 @@ export default function RecentChanges({ spaceId }: Props) {
   }
 
   if (isError) {
-    return <Text>{t("Failed to fetch recent pages")}</Text>;
+    return <RequestErrorText error={error} fallback={t("Failed to fetch recent pages")} />;
   }
 
   return pages.length > 0 ? (

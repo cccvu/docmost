@@ -8,7 +8,8 @@
 #      space they were never made a member of, while the owner reads it (200),
 #   4. no CCC services (platform / spicedb) are present,
 #   5. the SPA build is delivered precompressed (br / gzip negotiated on Accept-Encoding) with an immutable
-#      Cache-Control on the content-hashed bundle and a revalidate policy on index.html (#309).
+#      Cache-Control on the content-hashed bundle (#309), and every SPA document (`/`, `/index.html`, a deep
+#      route, a missing asset) is the injected shell under the no-store document policy (#409).
 #
 # Run from anywhere; the script cds to the fork root. Requires docker (compose v2), curl, jq.
 #   docmost/deploy/standalone/smoke.sh
@@ -240,21 +241,46 @@ else
   bad "could not discover the entry script from GET / (HTTP $shell_code, asset='${asset_path}'); asset probes skipped"
 fi
 
-# index.html: served with the window.CONFIG injection (an encoded body would be a stale pre-injection sibling)
-# and a REVALIDATE policy, never the immutable one — a deploy must not leave users on the old shell.
-idx_code="$(probe "${BASE}/index.html" 'gzip, deflate, br' "$TMP/index")"
-idx_cc="$(hdr "$TMP/index.h" cache-control)"
-if [ "$idx_code" = "200" ]; then
-  case "$idx_cc" in
-    *immutable*) bad "index.html cache-control='$idx_cc' contains immutable (must revalidate)" ;;
-    *) pass "index.html -> 200 with a revalidate cache-control ('$idx_cc', no immutable)" ;;
+# Documents (#409): every route that renders the SPA — `/`, `/index.html` and a deep client-side route
+# through the `*` fallback — is the injected shell (an encoded body would be a stale pre-injection sibling)
+# under ONE no-store policy: a signed-in page must never be stored or bfcache-restored outside Chrome's safe
+# no-store rules (authz/http-headers/client-static.ts DOCUMENT_CACHE_CONTROL), and never immutable — a
+# deploy must not leave users on the old shell.
+DOC_CC="no-cache, no-store, must-revalidate"
+# doc_check <label> <path> <dump-prefix>: 200 text/html, exact document policy, identity body with window.CONFIG
+doc_check() {
+  local code cc ct
+  code="$(probe "${BASE}$2" 'gzip, deflate, br' "$3")"
+  cc="$(hdr "$3.h" cache-control)"
+  ct="$(hdr "$3.h" content-type)"
+  if [ "$code" != "200" ]; then
+    bad "GET $2 ($1) -> HTTP $code (expected 200)"
+    return
+  fi
+  case "$ct" in
+    text/html*) pass "$1 -> 200 text/html" ;;
+    *) bad "$1 content-type='$ct' (expected text/html)" ;;
   esac
-  [ -z "$(hdr "$TMP/index.h" content-encoding)" ] && grep -q 'window.CONFIG=' "$TMP/index.body" \
-    && pass "index.html is the injected shell (identity body carries window.CONFIG, no stale precompressed sibling)" \
-    || bad "index.html content-encoding='$(hdr "$TMP/index.h" content-encoding)' / window.CONFIG present: $(grep -c 'window.CONFIG=' "$TMP/index.body" || true) (expected identity + injected)"
-else
-  bad "GET /index.html -> HTTP $idx_code (expected 200)"
-fi
+  [ "$cc" = "$DOC_CC" ] \
+    && pass "$1 cache-control is exactly '$DOC_CC'" \
+    || bad "$1 cache-control='$cc' (expected exactly '$DOC_CC')"
+  [ -z "$(hdr "$3.h" content-encoding)" ] && grep -q 'window.CONFIG=' "$3.body" \
+    && pass "$1 is the injected shell (identity body carries window.CONFIG, no stale precompressed sibling)" \
+    || bad "$1 content-encoding='$(hdr "$3.h" content-encoding)' / window.CONFIG present: $(grep -c 'window.CONFIG=' "$3.body" || true) (expected identity + injected)"
+}
+doc_check "/" "/" "$TMP/doc_root"
+doc_check "/index.html" "/index.html" "$TMP/doc_index"
+doc_check "a deep SPA route" "/s/smoke-space/p/smoke-page-abc123" "$TMP/doc_deep"
+
+# A MISSING hashed asset (a stale chunk URL after a deploy) falls through to the shell and must carry the
+# document policy, never immutable — or the browser caches HTML under a .js URL for a year.
+miss_code="$(probe "${BASE}/assets/does-not-exist.js" 'gzip, deflate, br' "$TMP/missing")"
+miss_cc="$(hdr "$TMP/missing.h" cache-control)"
+case "$miss_cc" in
+  *immutable*) bad "missing /assets/does-not-exist.js cache-control='$miss_cc' contains immutable" ;;
+  "$DOC_CC") pass "missing /assets/does-not-exist.js -> HTTP $miss_code with the document policy (not immutable)" ;;
+  *) bad "missing /assets/does-not-exist.js -> HTTP $miss_code cache-control='$miss_cc' (expected exactly '$DOC_CC')" ;;
+esac
 
 log "RESULT"
 if [ "$fail" = "0" ]; then

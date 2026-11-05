@@ -18,6 +18,7 @@ import { getSpaceUrl } from "@/lib/config";
 import { useTranslation } from "react-i18next";
 import { getInitialsColor } from "@/lib/get-initials-color";
 import rowClasses from "@/components/ui/clickable-table-row.module.css";
+import { RequestErrorText } from "@/features/request-errors/request-error-text";
 
 interface Props {
   spaceId?: string;
@@ -29,6 +30,7 @@ export default function FavoritesPages({ spaceId }: Props) {
     data,
     isLoading,
     isError,
+    error,
     hasNextPage,
     fetchNextPage,
     isFetchingNextPage,
@@ -41,7 +43,7 @@ export default function FavoritesPages({ spaceId }: Props) {
   }
 
   if (isError) {
-    return <Text>{t("Failed to fetch starred pages")}</Text>;
+    return <RequestErrorText error={error} fallback={t("Failed to fetch starred pages")} />;
   }
 
   return favorites.length > 0 ? (

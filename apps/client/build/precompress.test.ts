@@ -16,6 +16,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { brotliDecompressSync, gunzipSync } from "node:zlib";
 
 import {
@@ -275,6 +276,47 @@ describe("findLazyViolations", () => {
     expect(findLazyViolations(bundle, initialSet(bundle), lazy)).toHaveLength(
       1,
     );
+  });
+  // #407: the grammars are lazy, the hljs core stays eager (lowlight needs it), so the entries name the
+  // grammar SUBPATHS rather than the package. ESM resolves `highlight.js/lib/languages/*` to `es/languages/`.
+  describe("highlight.js grammar subpaths (#407)", () => {
+    const hljsLazy = [
+      "highlight.js/es/languages",
+      "highlight.js/lib/languages",
+      "highlightjs-sap-abap",
+    ];
+    const withModule = (id: string) => {
+      const bundle = syntheticBundle();
+      const vendor = bundle["assets/vendor-b.js"] as Extract<
+        BundleLike[string],
+        { type: "chunk" }
+      >;
+      vendor.moduleIds.push(id);
+      return bundle;
+    };
+    it("flags a grammar module in the initial set", () => {
+      const bundle = withModule(
+        "/repo/node_modules/.pnpm/highlight.js@11.11.1/node_modules/highlight.js/es/languages/javascript.js",
+      );
+      const v = findLazyViolations(bundle, initialSet(bundle), hljsLazy);
+      expect(v).toHaveLength(1);
+      expect(v[0]).toContain('"highlight.js/es/languages"');
+    });
+    it("does not flag the hljs core", () => {
+      const bundle = withModule(
+        "/repo/node_modules/.pnpm/highlight.js@11.11.1/node_modules/highlight.js/es/core.js",
+      );
+      expect(findLazyViolations(bundle, initialSet(bundle), hljsLazy)).toEqual(
+        [],
+      );
+    });
+    it("are the entries vite.config.ts actually enforces", () => {
+      const config = readFileSync(
+        fileURLToPath(new URL("../vite.config.ts", import.meta.url)),
+        "utf8",
+      );
+      for (const entry of hljsLazy) expect(config).toContain(`"${entry}",`);
+    });
   });
 });
 
