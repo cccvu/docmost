@@ -1,9 +1,9 @@
 import * as postgres from 'postgres';
 import { Kysely } from 'kysely';
-import { BadRequestException } from '@nestjs/common';
+import { BadRequestException, ServiceUnavailableException } from '@nestjs/common';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
-import { PdpSearchService, SearchCandidateFilters } from './pdp-search.service';
+import { PdpSearchService, SearchCandidateFilters, SearchLimits } from './pdp-search.service';
 import {
   PG_URL,
   uuid,
@@ -60,22 +60,34 @@ d('PdpSearchService.searchAuthorized over real rows (#615)', () => {
   let pg: postgres.Sql;
   let db: Kysely<any>;
 
-  const build = (opts: { userDenied?: string[]; serviceDenied?: string[] } = {}) => {
-    const filterAccessiblePageIds = jest.fn(async ({ pageIds }: { pageIds: string[] }) =>
-      pageIds.filter((id) => !(opts.userDenied ?? []).includes(id)),
-    );
-    const filterResources = jest.fn(async (_s: unknown, _p: string, _t: string, ids: string[]) =>
-      ids.filter((id) => !(opts.serviceDenied ?? []).includes(id)),
-    );
+  const build = (
+    opts: {
+      userDenied?: string[];
+      serviceDenied?: string[];
+      /** Runs inside the user-leg PDP call — i.e. BETWEEN the candidate statement and the hydrate. */
+      duringGate?: () => Promise<void>;
+      limits?: Partial<SearchLimits>;
+    } = {},
+  ) => {
+    const pdp = {
+      tryFilterResources: jest.fn(async (subject: any, _p: string, _t: string, ids: string[]) => {
+        const service = subject?.subjectType === 'service';
+        if (!service && opts.duringGate) await opts.duringGate();
+        const denied = (service ? opts.serviceDenied : opts.userDenied) ?? [];
+        return ids.filter((id) => !denied.includes(id));
+      }),
+    };
     const service = new PdpSearchService(
       db as any,
       new PageRepo(db as any, {} as any, {} as any),
       {} as any,
       new SpaceMemberRepo(db as any, {} as any, {} as any, {} as any),
-      { filterAccessiblePageIds } as any,
-      { filterResources } as any,
+      {} as any,
+      pdp,
+      undefined,
+      opts.limits,
     );
-    return { service, filterAccessiblePageIds, filterResources };
+    return { service, pdp };
   };
 
   const search = async (
@@ -187,5 +199,97 @@ d('PdpSearchService.searchAuthorized over real rows (#615)', () => {
     const out = await search({ parentPageId: ROOT }, { spaceId: SPACE, limit: 1 }, { serviceSubjectId: SA, serviceDenied: [P1] });
     expect(out.ids).toEqual([P2]);
     expect(out.hasMore).toBe(false);
+  });
+
+  // ---- #696: one candidate statement, a hydrate of the authorized slice, statement timeouts ----------------------
+
+  describe('#696 hydrate and timeouts over real rows', () => {
+    // A space of its own (no member: every search names it), so the #615 cases above never see these pages.
+    const HSPACE = uuid(60);
+    // Rank order H1 > H2 > H4 > H3 is the REVERSE of id order and of insertion (heap) order, so a hydrate that kept
+    // the SQL row order instead of the candidate order would come back reversed.
+    const H1 = uuid(44); // 'kestrel' ×4 → the highest rank
+    const H2 = uuid(43); // ×3
+    const H4 = uuid(42); // ×2, trashed BETWEEN the gate and the hydrate in one case
+    const H3 = uuid(41); // ×1, its match only past the 64 KiB headline input cap
+    const deep = 'filler '.repeat(10_000); // 70,000 chars
+
+    beforeAll(async () => {
+      await pg`insert into spaces (id, name, slug, workspace_id) values (${HSPACE}, 'Birds', 'birds', ${WS})`;
+      const page = (id: string, text: string) => pg`
+        insert into pages (id, slug_id, title, space_id, workspace_id, creator_id, tsv, text_content)
+        values (${id}, ${'h' + id.slice(-4)}, ${'Bird ' + id.slice(-4)}, ${HSPACE}, ${WS}, ${ALICE},
+                to_tsvector('english', ${text}), ${text})`;
+      await page(H3, deep + ' kestrel');
+      await page(H4, 'a kestrel, a kestrel');
+      await page(H2, 'the kestrel hovers; a kestrel nests by a kestrel');
+      await page(H1, 'kestrel\nkestrel and\r\nmore kestrel  in a long\n\nbody about falcons and a kestrel');
+    });
+
+    const hsearch = (b: ReturnType<typeof build>, params: object = {}) =>
+      b.service.searchAuthorized({ query: 'kestrel', spaceId: HSPACE, limit: 25, ...params } as any, {}, {
+        userId: ALICE,
+        workspaceId: WS,
+      });
+
+    it('returns the hydrated page in rank order, with the native columns, the space and a normalized headline', async () => {
+      const { items, hasMore } = await hsearch(build());
+      expect(items.map((r: any) => r.id)).toEqual([H1, H2, H4, H3]);
+      expect(hasMore).toBe(false);
+      const ranks = items.map((r: any) => r.rank);
+      expect(new Set(ranks).size).toBe(4);
+      expect([...ranks].sort((a, b) => b - a)).toEqual(ranks);
+      const top: any = items[0];
+      expect(top).toMatchObject({ slugId: 'h0044', title: 'Bird 0044', creatorId: ALICE, parentPageId: null, icon: null });
+      expect(top.space).toEqual({ id: HSPACE, name: 'Birds', slug: 'birds' });
+      expect(top.createdAt).toBeInstanceOf(Date);
+      expect(top.highlight).toContain('<b>kestrel</b>');
+      expect(top.highlight).not.toMatch(/[\r\n]|\s{2}/);
+    });
+
+    it('the headline reads at most 64 KiB of text: a match past the cap gets the leading snippet, not a highlight', async () => {
+      const { items } = await hsearch(build());
+      const h3: any = items.find((r: any) => r.id === H3);
+      expect(h3.highlight).not.toContain('<b>');
+      expect(h3.highlight).toMatch(/^filler filler/);
+      // Control: the same row's match IS found by the candidate statement (tsv), only the headline is capped.
+      expect(items.map((r: any) => r.id)).toContain(H3);
+    });
+
+    it('a page trashed BETWEEN the gate and the hydrate is dropped — the page shrinks, nothing ungated fills it', async () => {
+      const b = build({
+        duringGate: async () => {
+          await pg`update pages set deleted_at = now() where id = ${H4}`;
+        },
+      });
+      try {
+        const { items } = await hsearch(b, { limit: 4 });
+        expect(items.map((r: any) => r.id)).toEqual([H1, H2, H3]);
+        expect(b.pdp.tryFilterResources).toHaveBeenCalledTimes(1); // gated once, before the trash
+      } finally {
+        await pg`update pages set deleted_at = null where id = ${H4}`;
+      }
+    });
+
+    it('a statement past its statement_timeout is SQLSTATE 57014 → 503 engine_busy (and the next search works)', async () => {
+      // f_unaccent sleeping 300 ms makes the candidate statement outlive a 100 ms statement_timeout.
+      await pg`create or replace function f_unaccent(text) returns text language plpgsql immutable as
+        $$ begin perform pg_sleep(0.3); return $1; end $$`;
+      const slow = build({ limits: { statementTimeoutMs: 100, minStatementMs: 1 } });
+      const warn = jest.spyOn((slow.service as any).logger, 'warn').mockImplementation();
+      try {
+        const err: any = await hsearch(slow).catch((e) => e);
+        expect(err).toBeInstanceOf(ServiceUnavailableException);
+        expect(err.getResponse()).toMatchObject({ code: 'engine_busy' });
+        expect(warn.mock.calls.map((c) => c[0]).join('\n')).toMatch(/SEARCH_SHED reason=sqlstate code=57014/);
+        expect(slow.pdp.tryFilterResources).not.toHaveBeenCalled();
+      } finally {
+        await pg`create or replace function f_unaccent(text) returns text language sql immutable as $$ select $1 $$`;
+      }
+      // The SET LOCAL ended with its transaction: the pooled connections carry no leftover timeout.
+      expect((await hsearch(build())).items).toHaveLength(4);
+      const settings = await Promise.all([1, 2, 3, 4].map(() => pg`show statement_timeout`));
+      expect(settings.map((r) => r[0].statement_timeout)).toEqual(['0', '0', '0', '0']);
+    });
   });
 });
