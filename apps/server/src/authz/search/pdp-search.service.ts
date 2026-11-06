@@ -396,8 +396,10 @@ export class PdpSearchService extends SearchService {
   }
 
   /**
-   * The share search itself, mirroring upstream `SearchService.searchPage`'s share branch (v0.95.0), every statement
-   * in its own short transaction under `statement_timeout` (#716). The two confidentiality reads are upstream's OWN
+   * The share search itself, mirroring upstream `SearchService.searchPage`'s share branch (v0.95.0). Its three heavy
+   * statements (the restricted-ancestor read, the descendant walk and the full-text query) each run in their own short
+   * transaction under `statement_timeout` (#716). The share lookup and the sharing check before them are indexed point
+   * reads through the injected repos, outside that bound. The two confidentiality reads are upstream's OWN
    * methods (`hasRestrictedAncestor`, `getPageAndDescendantsExcludingRestricted`), run on that transaction through
    * repos built over it — so the restriction semantics are never copied and cannot drift. Both read only `this.db`
    * (pinned by pdp-search.service.spec.ts); should either start using another dependency, it would throw here

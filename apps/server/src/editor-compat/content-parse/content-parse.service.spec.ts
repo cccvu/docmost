@@ -573,7 +573,7 @@ describe('#642 the per-principal worker-time budget', () => {
   });
 
   it('debt is floored at -capacity: a large admitted batch locks its human out for at most one full refill', async () => {
-    // #716 I8 (the flaky case, run 42068618775): a 200 ms deadline under 60 ms sleeps was killed by a stalled CI
+    // #716 I8 (the flaky case seen in CI): a 200 ms deadline under 60 ms sleeps was killed by a stalled CI
     // timer. Now: a deadline 33× the sleeps, no refill, and an EXACT expectation.
     const { pool } = track(makePool({ deadlineMs: 5_000, budgetCapacityMs: 100, budgetRefillMsPerMinute: 0 }));
     await pool.parse('warm', 'html', q('background'));
