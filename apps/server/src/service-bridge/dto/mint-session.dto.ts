@@ -1,4 +1,4 @@
-import { IsOptional, IsString, Matches, MaxLength } from 'class-validator';
+import { IsInt, IsOptional, IsString, Matches, MaxLength, Min } from 'class-validator';
 
 /** CCC service-bridge — NOT upstream Docmost code. Input for `POST /api/service/session`. */
 export class MintSessionDto {
@@ -32,4 +32,21 @@ export class MintSessionDto {
   @IsString()
   @MaxLength(45)
   clientIp?: string;
+
+  /**
+   * OPTIONAL step-up freshness (wiki-v2 #713), epoch seconds: when the human last authenticated to the platform (the
+   * OIDC `auth_time` of the platform token asking for this mint) and until when that counts as recent. Both or
+   * neither; the window rules (`authTime <= now + 60s`, `authTime < freshUntil <= authTime + 24h`) are checked by
+   * `mintFreshness` (authz/step-up/session-freshness.ts) and a violation is a 400. Absent ⇒ the session is not fresh,
+   * and `RemoteStepUpInterceptor` refuses its admin-tier routes with `403 step_up_required`.
+   */
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  authTime?: number;
+
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  freshUntil?: number;
 }

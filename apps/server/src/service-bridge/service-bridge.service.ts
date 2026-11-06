@@ -1,4 +1,4 @@
-import { ForbiddenException, Injectable, Logger } from '@nestjs/common';
+import { ForbiddenException, Injectable, InternalServerErrorException, Logger } from '@nestjs/common';
 import { InjectKysely } from 'nestjs-kysely';
 import { randomBytes } from 'crypto';
 import { isIP } from 'node:net';
@@ -17,6 +17,8 @@ import {
 import { ProvisionUserDto } from './dto/provision-user.dto';
 import { isShadowEmail, shadowEmailFor } from './shadow-user';
 import { WorkspaceResolver } from './workspace-resolver';
+import { SessionFreshness, stampSessionFreshness } from '../authz/step-up/session-freshness';
+import { decode as decodeJwt } from 'jsonwebtoken';
 
 /**
  * CCC service-bridge — NOT upstream Docmost code.
@@ -160,7 +162,7 @@ export class ServiceBridgeService {
    * a row be tampered/mis-provisioned) outside the shadow namespace. Refusals are a uniform 403 (no
    * enumeration); the specific reason is logged, not returned.
    */
-  async mintSession(externalId: string, clientIp?: string): Promise<string> {
+  async mintSession(externalId: string, clientIp?: string, freshness?: SessionFreshness): Promise<string> {
     const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
     const email = shadowEmailFor(externalId);
     const user = await this.userRepo.findByEmail(email, workspaceId);
@@ -176,8 +178,30 @@ export class ServiceBridgeService {
     // the CLS audit context (session.service.ts).
     this.applyClientIp(clientIp);
     const authToken = await this.sessionService.createSessionAndToken(user);
-    this.logger.log(`minted session for shadow member ${user.id} ws=${workspaceId}`);
+    if (freshness) await this.recordFreshness(authToken, user, freshness);
+    this.logger.log(
+      `minted session for shadow member ${user.id} ws=${workspaceId}${freshness ? ` freshUntil=${freshness.freshUntil}` : ''}`,
+    );
     return authToken;
+  }
+
+  /**
+   * #713: record the platform's step-up freshness on the row `createSessionAndToken` just inserted — named by the
+   * token's own `sessionId`, so exactly that row and never another session of the user. The token has not left this
+   * process yet, so nobody can use the row before it is stamped. If it cannot be stamped, the session is revoked and
+   * the mint fails: handing back a session the platform believes fresh but the fork reads as stale would loop the
+   * human through step-up forever.
+   */
+  private async recordFreshness(authToken: string, user: User, freshness: SessionFreshness): Promise<void> {
+    const payload = decodeJwt(authToken, { json: true });
+    const sessionId = typeof payload?.sessionId === 'string' ? payload.sessionId : undefined;
+    const stamped = sessionId ? await stampSessionFreshness(this.db, sessionId, user.id, freshness) : false;
+    if (stamped) return;
+    if (sessionId) {
+      await this.userSessionRepo.revokeById(sessionId, user.id, user.workspaceId).catch(() => undefined);
+    }
+    this.logger.error(`service/session could not record step-up freshness for shadow member ${user.id}`);
+    throw new InternalServerErrorException('session freshness could not be recorded');
   }
 
   /**

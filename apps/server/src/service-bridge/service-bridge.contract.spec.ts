@@ -39,6 +39,12 @@ import {
 } from './dto/content-activity.dto';
 import { AuthzChangeEvent, AuthzChangeEventType } from './authz-change-event';
 import { ChangesResult } from './authz-change-feed.service';
+import { MintSessionDto } from './dto/mint-session.dto';
+import {
+  AUTH_TIME_SKEW_SECONDS,
+  MAX_FRESH_WINDOW_SECONDS,
+  mintFreshness,
+} from '../authz/step-up/session-freshness';
 import { SnapshotResult } from './authz-snapshot.service';
 import {
   PageAncestors,
@@ -173,21 +179,33 @@ describe('service-bridge.openapi.json is the canonical inbound contract (provide
     expect(req.limit.maximum).toBe(CONTENT_LIST_MAX_LIMIT);
   });
 
-  // #330: the mint request carries the platform-resolved client IP. The endpoint accepts an undeclared body
-  // field silently (whitelist strips it), so without pinning the schema the contract could quietly forbid the
-  // field the fork now reads (the #320 step-6b "prose to CI" trap). Assert the schema declares it (closed set)
-  // AND the request example exercises it within the DTO's bound.
-  it('#330: MintSessionRequest declares the optional clientIp and the example exercises it', () => {
+  // #330 / wiki-v2 #713: the mint request carries the platform-resolved client IP and the step-up freshness pair. The
+  // endpoint accepts an undeclared body field silently (the whitelist pipe strips it), so a field the fork reads but
+  // the contract does not declare — or a rename on either side — would quietly strip the platform's freshness and leave
+  // every wiki session stale (the #320 step-6b "prose to CI" trap). So the closed schema key set is pinned to the DTO's
+  // OWN keys (`Record<keyof MintSessionDto, true>`: a DTO-side rename fails to compile, a document-side one fails the
+  // comparison), the relational window rules are pinned to the constants `mintFreshness` enforces, and the example
+  // exercises every optional field within the DTO's bounds.
+  it('#330/#713: MintSessionRequest declares exactly the DTO keys, the freshness window, and an example exercising them', () => {
     const schema = SPEC.components.schemas.MintSessionRequest;
+    const dtoKeys: Record<keyof MintSessionDto, true> = { externalId: true, clientIp: true, authTime: true, freshUntil: true };
     expect(schema.additionalProperties).toBe(false);
-    expect(Object.keys(schema.properties).sort()).toEqual(['clientIp', 'externalId']);
-    expect(schema.required).toEqual(['externalId']); // clientIp is optional
+    expect(Object.keys(schema.properties).sort()).toEqual(Object.keys(dtoKeys).sort());
+    expect(schema.required).toEqual(['externalId']); // everything else is optional
     expect(SPEC.components.schemas.ClientIp.maxLength).toBe(45); // matches MintSessionDto @MaxLength(45)
+    for (const k of ['authTime', 'freshUntil']) {
+      expect(schema.properties[k]).toMatchObject({ type: 'integer', minimum: 0 }); // MintSessionDto @IsInt @Min(0)
+    }
+    expect(schema['x-maxFreshWindowSeconds']).toBe(MAX_FRESH_WINDOW_SECONDS);
+    expect(schema['x-authTimeSkewSeconds']).toBe(AUTH_TIME_SKEW_SECONDS);
     const example = (SPEC.paths['/api/service/session'] as any).post.requestBody.content[
       'application/json'
     ].example;
+    expect(Object.keys(example).sort()).toEqual(Object.keys(dtoKeys).sort());
     expect(typeof example.clientIp).toBe('string');
     expect(example.clientIp.length).toBeLessThanOrEqual(45);
+    // The example is a pair `mintFreshness` accepts at its own authTime (no window violation).
+    expect(() => mintFreshness(example.authTime, example.freshUntil, example.authTime)).not.toThrow();
   });
 
   // ---- Feed-schema tether, provider half (issue #179) -----------------------------------------------------

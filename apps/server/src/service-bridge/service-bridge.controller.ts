@@ -21,6 +21,7 @@ import { ResolveUserDto } from './dto/resolve-user.dto';
 import { LookupUsersDto } from './dto/lookup-users.dto';
 import { WorkspaceResolver } from './workspace-resolver';
 import { setDocmostAuthCookie } from '../authz/session-cookie/docmost-auth-cookie';
+import { mintFreshness } from '../authz/step-up/session-freshness';
 
 /**
  * CCC service-bridge — NOT upstream Docmost code.
@@ -81,7 +82,9 @@ export class ServiceBridgeController {
     @Body() dto: MintSessionDto,
     @Res({ passthrough: true }) res: FastifyReply,
   ) {
-    const authToken = await this.service.mintSession(dto.externalId, dto.clientIp);
+    // #713: the step-up freshness is validated BEFORE anything is minted, so a 400 leaves no session behind.
+    const freshness = mintFreshness(dto.authTime, dto.freshUntil);
+    const authToken = await this.service.mintSession(dto.externalId, dto.clientIp, freshness);
     // Mirror AuthController.setAuthCookie so the caller can relay the Set-Cookie to the browser exactly as it
     // did for native login: over https `__Host-authToken` + Secure + host-only + Path=/ (#310), scoped to
     // the workspace's configured session lifetime. No legacy-cookie eviction here — the mint response is also

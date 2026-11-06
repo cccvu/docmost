@@ -42,6 +42,9 @@ export function safeRedirectPath(input: unknown): string | null {
   try {
     const resolved = new URL(input, window.location.origin);
     if (resolved.origin !== window.location.origin) return null;
+    // wiki-v2 #713: re-check the NORMALIZED path. Dot segments collapse, so "/.//evil.com", "/..//evil.com",
+    // "/%2e//evil.com" and "/a/..//evil.com" pass the raw checks yet resolve to "//evil.com" (protocol-relative).
+    if (!resolved.pathname.startsWith("/") || resolved.pathname.startsWith("//")) return null;
     return resolved.pathname + resolved.search + resolved.hash;
   } catch {
     return null;
