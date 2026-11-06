@@ -16,6 +16,7 @@ import {
   spawnContentParseWorker,
   untrustedMarkdownToHtml,
   type ContentParseLimits,
+  type ConversionQueue,
 } from './content-parse.service';
 import { countChars } from './content-parse.worker';
 
@@ -68,6 +69,9 @@ const HTML = [
 
 const MARKDOWN = ['# Title', '', 'Some *text* and a [link](https://example.com).', '', '- [x] done', '- [ ] todo', '', '| a | b |', '|---|---|', '| 1 | 2 |', '', '```js', 'x()', '```'].join('\n');
 
+/** #716 M9: the pool takes a queue object. */
+const q = (principal: string): ConversionQueue => ({ principal });
+
 describe('#626 the real worker converts exactly as the in-process path did', () => {
   it('HTML → JSON', async () => {
     const json = await parseUntrustedContent(HTML, 'html');
@@ -104,8 +108,8 @@ describe('#626 the real worker converts exactly as the in-process path did', () 
 describe('#626 the real worker enforces the bounds', () => {
   it('more nodes than the cap → 422', async () => {
     const small = pool({ maxNodes: 500 });
-    await expect(small.parse('<p>x</p>'.repeat(1_000), 'html', 'user:A')).rejects.toBeInstanceOf(ContentTooComplexException);
-    await expect(small.parse('<p>x</p>'.repeat(10), 'html', 'user:A')).resolves.toMatchObject({ type: 'doc' });
+    await expect(small.parse('<p>x</p>'.repeat(1_000), 'html', q('user:A'))).rejects.toBeInstanceOf(ContentTooComplexException);
+    await expect(small.parse('<p>x</p>'.repeat(10), 'html', q('user:A'))).resolves.toMatchObject({ type: 'doc' });
   });
 
   it.each([
@@ -151,11 +155,11 @@ describe('#626 the real worker enforces the bounds', () => {
     expect(await maxLoopLag(() => htmlToJson(control))).toBeGreaterThan(1_000);
 
     const quick = pool({ deadlineMs: 3_000 });
-    await quick.parse('<p>warm</p>', 'html', 'user:A'); // load the parsers first, so the deadline is the parse's
+    await quick.parse('<p>warm</p>', 'html', q('user:A')); // load the parsers first, so the deadline is the parse's
     const payload = row(40_000); // ~400 KB; 20k cells alone take ~8 s in-process on a dev laptop
     let outcome: unknown;
     const lag = await maxLoopLag(() =>
-      quick.parse(payload, 'html', 'user:A').catch((e) => {
+      quick.parse(payload, 'html', q('user:A')).catch((e) => {
         outcome = e;
       }),
     );

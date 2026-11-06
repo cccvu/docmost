@@ -1,8 +1,11 @@
 import {
   ForbiddenException,
+  HttpException,
+  InternalServerErrorException,
   NotFoundException,
   PreconditionFailedException,
   ServiceUnavailableException,
+  UnprocessableEntityException,
 } from '@nestjs/common';
 import { plainToInstance } from 'class-transformer';
 import { validate } from 'class-validator';
@@ -45,8 +48,30 @@ describe('ConditionalPageController.conditionalUpdate', () => {
     /** #485: the row content at snapshot time and the newest history version's content. */
     current?: unknown;
     lastHistory?: { id: string; title?: string | null; content: unknown } | null;
+    /** #716: the page's stored ydoc size (`octet_length`), or the error its query throws. Default: tiny. */
+    ydocBytes?: number | Error | (() => number);
   }) => {
     const calls: string[] = [];
+    // #716: a Kysely-shaped fake for the page-size query; records its SQL so a spec can pin what it reads.
+    const sizeQueries: string[] = [];
+    const db = {
+      selectFrom: (table: string) => {
+        const q = {
+          select: (sel: { toOperationNode?: () => unknown }) => {
+            sizeQueries.push(`${table}:${JSON.stringify(sel?.toOperationNode?.() ?? sel)}`);
+            return q;
+          },
+          where: () => q,
+          executeTakeFirst: async () => {
+            calls.push('size');
+            if (opts.ydocBytes instanceof Error) throw opts.ydocBytes;
+            if (typeof opts.ydocBytes === 'function') return { bytes: opts.ydocBytes() };
+            return { bytes: opts.ydocBytes ?? 100 };
+          },
+        };
+        return q;
+      },
+    };
     const pageRepo = {
       findById: jest.fn(async (_id: string, o?: { includeContent?: boolean }) => {
         calls.push('findById');
@@ -89,10 +114,12 @@ describe('ConditionalPageController.conditionalUpdate', () => {
       pageAccessService as never,
       gateway as never,
       pageHistoryRepo as never,
+      db as never,
     );
     return {
       controller,
       calls,
+      sizeQueries,
       pageHistoryRepo,
       pageRepo,
       pageAccessService,
@@ -217,6 +244,20 @@ describe('ConditionalPageController.conditionalUpdate', () => {
     await expect(
       controller.conditionalUpdate(dto(), USER),
     ).rejects.toBeInstanceOf(ServiceUnavailableException);
+  });
+
+  it('#716: an unrecognized reason (a newer collab node) is 500 write_outcome_unknown, never a retryable 503', async () => {
+    for (const reason of ['applied_partially', 'some_future_reason']) {
+      const { controller, pageService } = build({ apply: { applied: false, reason } });
+      const err = await controller.conditionalUpdate(dto(), USER).catch((e) => e);
+      expect(err).toBeInstanceOf(InternalServerErrorException);
+      expect((err as HttpException).getResponse()).toMatchObject({ code: 'write_outcome_unknown' });
+      expect(pageService.update).not.toHaveBeenCalled();
+    }
+    for (const reason of ['error', 'unknown']) {
+      const { controller } = build({ apply: { applied: false, reason } });
+      await expect(controller.conditionalUpdate(dto(), USER)).rejects.toBeInstanceOf(ServiceUnavailableException);
+    }
   });
 
   it('never treats a malformed outcome as applied', async () => {
@@ -553,6 +594,184 @@ describe('ConditionalPageController.conditionalUpdate', () => {
     it('validates snapshotBefore as a boolean', async () => {
       const bad = plainToInstance(ConditionalUpdatePageDto, { pageId: 'p', snapshotBefore: 'yes' });
       expect((await validate(bad)).map((e) => e.property)).toContain('snapshotBefore');
+    });
+  });
+
+  /**
+   * #716 T1: the platform sends EVERY markdown/html `/v1` content write here with neither a digest nor a key (#696).
+   * That request must stay the native write minus the echo: edit check, (size check for an append), parse, apply,
+   * metadata update — no compare, no dedup, no snapshot, no markdown/HTML echo.
+   */
+  it.each(['markdown', 'html'] as const)(
+    'T1: the unkeyed, digest-less %s append is the native write minus the echo',
+    async (format) => {
+      const t = build({});
+      const content = format === 'markdown' ? '# hi' : '<h1>hi</h1>';
+      const res = await t.controller.conditionalUpdate(
+        dto({ expectedContentHash: undefined, format, content, operation: 'append' }),
+        USER,
+      );
+      // #716: the entry size check, the parse, then the re-check under the page's growth lock, then the apply.
+      expect(t.calls).toEqual(['findById', 'validateCanEdit', 'size', 'parse', 'size', 'conditionalApply', 'update']);
+      expect(t.pageService.parseProsemirrorContent).toHaveBeenCalledWith(content, format);
+      expect(t.gateway.conditionalUpdatePageContent).toHaveBeenCalledWith('page-uuid-1', {
+        prosemirrorJson: content,
+        operation: 'append',
+        user: USER,
+        expectedContentHash: undefined,
+        idempotencyKey: undefined,
+      });
+      const metadata = t.pageService.update.mock.calls[0][1] as Record<string, unknown>;
+      expect(metadata).not.toHaveProperty('content');
+      expect(metadata).not.toHaveProperty('format');
+      expect(metadata).not.toHaveProperty('operation');
+      expect(res).not.toHaveProperty('snapshot');
+      expect(JSON.stringify(res)).not.toContain(content); // no markdown/HTML echo
+    },
+  );
+
+  describe('#716 the API page-size cap (append/prepend only)', () => {
+    const OVER = 3 * 1024 * 1024; // = the default cap: at the cap is over
+
+    it('an unkeyed append to a page at the cap → 422 page_too_large, before the parse; nothing applied', async () => {
+      const t = build({ ydocBytes: OVER });
+      const err = await t.controller.conditionalUpdate(dto({ operation: 'append' }), USER).catch((e) => e);
+      expect(err).toBeInstanceOf(UnprocessableEntityException);
+      expect((err as HttpException).getResponse()).toMatchObject({ code: 'page_too_large' });
+      expect(t.calls).toEqual(['findById', 'validateCanEdit', 'size']);
+      expect(t.pageHistoryRepo.insertPageHistory).not.toHaveBeenCalled();
+    });
+
+    it('prepend is capped the same way; just under the cap is applied', async () => {
+      await expect(
+        build({ ydocBytes: OVER }).controller.conditionalUpdate(dto({ operation: 'prepend' }), USER),
+      ).rejects.toBeInstanceOf(UnprocessableEntityException);
+      const t = build({ ydocBytes: OVER - 1 });
+      await t.controller.conditionalUpdate(dto({ operation: 'append' }), USER);
+      expect(t.gateway.conditionalUpdatePageContent).toHaveBeenCalledWith(
+        'page-uuid-1',
+        expect.not.objectContaining({ refuseOverCap: true }),
+      );
+    });
+
+    it('a replace on a page over the cap is applied, and issues no size query (the escape hatch)', async () => {
+      const t = build({ ydocBytes: 50 * 1024 * 1024 });
+      await t.controller.conditionalUpdate(dto({ operation: 'replace' }), USER);
+      expect(t.calls).not.toContain('size');
+      expect(t.calls).toContain('conditionalApply');
+    });
+
+    it('a caller who may not edit gets 403, never 422 (and no size query): authorization comes first', async () => {
+      const t = build({ ydocBytes: OVER, canEdit: 'deny' });
+      await expect(t.controller.conditionalUpdate(dto({ operation: 'append' }), USER)).rejects.toBeInstanceOf(
+        ForbiddenException,
+      );
+      expect(t.calls).toEqual(['findById', 'validateCanEdit']);
+    });
+
+    it('a size-query DB error refuses (503, nothing parsed or applied) — never reads as 0', async () => {
+      const t = build({ ydocBytes: new Error('connection reset') });
+      const err = await t.controller.conditionalUpdate(dto({ operation: 'append' }), USER).catch((e) => e);
+      expect(err).toBeInstanceOf(ServiceUnavailableException);
+      expect(t.calls).toEqual(['findById', 'validateCanEdit', 'size']);
+    });
+
+    it('reads octet_length(ydoc) only — never the page bytes themselves', async () => {
+      const t = build({});
+      await t.controller.conditionalUpdate(dto({ operation: 'append' }), USER);
+      expect(t.sizeQueries).toHaveLength(2); // the entry check and the re-check under the growth lock
+      for (const q of t.sizeQueries) {
+        expect(q).toMatch(/^pages:/);
+        expect(q).toContain('octet_length(ydoc)');
+      }
+    });
+
+    it('keyed: the handler decides AFTER its dedup and CAS — a duplicate (an applied retry) replays 200', async () => {
+      const t = build({ ydocBytes: OVER, apply: { applied: false, reason: 'duplicate' } });
+      const res = await t.controller.conditionalUpdate(dto({ operation: 'append', idempotencyKey: 'K' }), USER);
+      expect(t.gateway.conditionalUpdatePageContent).toHaveBeenCalledWith(
+        'page-uuid-1',
+        expect.objectContaining({ refuseOverCap: true, idempotencyKey: 'K' }),
+      );
+      expect(res).toMatchObject({ id: 'page-uuid-1' });
+    });
+
+    it('keyed and over the cap: the content is NOT parsed (no worker time) and the handler gets no content', async () => {
+      const t = build({ ydocBytes: OVER, apply: { applied: false, reason: 'too_large' } });
+      await t.controller.conditionalUpdate(dto({ operation: 'append', idempotencyKey: 'K' }), USER).catch(() => undefined);
+      expect(t.pageService.parseProsemirrorContent).not.toHaveBeenCalled();
+      expect(t.calls).toEqual(['findById', 'validateCanEdit', 'size', 'conditionalApply']);
+      expect(t.gateway.conditionalUpdatePageContent).toHaveBeenCalledWith(
+        'page-uuid-1',
+        expect.objectContaining({ prosemirrorJson: undefined, refuseOverCap: true }),
+      );
+    });
+
+    it('concurrent appends that both passed the entry check are decided one after another (overshoot stays one write)', async () => {
+      // `bytes` is what the row holds: the first append's store moves it past the cap before it releases the lock.
+      let bytes = OVER - 1;
+      let releaseFirst!: () => void;
+      const firstHeld = new Promise<void>((r) => (releaseFirst = r));
+      const t = build({ ydocBytes: () => bytes });
+      let applies = 0;
+      t.gateway.conditionalUpdatePageContent.mockImplementation(async () => {
+        applies++;
+        t.calls.push('conditionalApply');
+        if (applies === 1) {
+          await firstHeld;
+          bytes = OVER; // the first append's store
+        }
+        return { applied: true };
+      });
+      const first = t.controller.conditionalUpdate(dto({ operation: 'append', expectedContentHash: undefined }), USER);
+      const second = t.controller.conditionalUpdate(dto({ operation: 'append', expectedContentHash: undefined }), USER);
+      // Let both run up to where they block: the first inside its apply, the second on the page's growth lock.
+      for (let i = 0; i < 10; i++) await new Promise<void>((r) => setImmediate(r));
+      expect(applies).toBe(1);
+      expect(t.calls.filter((c) => c === 'parse')).toHaveLength(2); // the second passed the entry check and parsed
+      releaseFirst();
+      await expect(first).resolves.toMatchObject({ id: 'page-uuid-1' });
+      const err = await second.catch((e) => e);
+      expect(err).toBeInstanceOf(UnprocessableEntityException);
+      expect((err as HttpException).getResponse()).toMatchObject({ code: 'page_too_large' });
+      expect(applies).toBe(1);
+      const { growthLockCount } = await import('./page-size');
+      expect(growthLockCount()).toBe(0);
+    });
+
+    it('keyed: a fresh append to a page at the cap → too_large → 422, no metadata written', async () => {
+      const t = build({ ydocBytes: OVER, apply: { applied: false, reason: 'too_large' } });
+      const err = await t.controller
+        .conditionalUpdate(dto({ operation: 'append', idempotencyKey: 'K', title: 'T2' }), USER)
+        .catch((e) => e);
+      expect(err).toBeInstanceOf(UnprocessableEntityException);
+      expect((err as HttpException).getResponse()).toMatchObject({ code: 'page_too_large' });
+      expect(t.pageService.update).not.toHaveBeenCalled();
+    });
+
+    it('the refusal message derives the configured size and names the way out', () => {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const { PageTooLargeException } = require('./page-size');
+      const msg = (new PageTooLargeException(5 * 1024 * 1024).getResponse() as { message: string }).message;
+      expect(msg).toContain('5 MiB');
+      expect(msg).toMatch(/new page and link to it|replace this page/);
+    });
+  });
+
+  describe('#716 O2/R4 an applied-but-unconfirmed write', () => {
+    it('answers 500 write_outcome_unknown — NOT a retryable 503 — and writes no metadata', async () => {
+      const t = build({ apply: { applied: false, reason: 'applied_unconfirmed' } });
+      const err = await t.controller
+        .conditionalUpdate(dto({ operation: 'append', expectedContentHash: undefined, title: 'T2' }), USER)
+        .catch((e) => e);
+      expect(err).toBeInstanceOf(InternalServerErrorException);
+      expect(err).not.toBeInstanceOf(ServiceUnavailableException);
+      expect((err as HttpException).getStatus()).toBe(500);
+      expect((err as HttpException).getResponse()).toEqual({
+        message: expect.any(String),
+        code: 'write_outcome_unknown',
+      });
+      expect(t.pageService.update).not.toHaveBeenCalled();
     });
   });
 });

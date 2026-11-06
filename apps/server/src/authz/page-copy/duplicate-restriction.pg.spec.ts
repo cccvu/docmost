@@ -5,6 +5,7 @@ import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 import { PageService } from '../../core/page/services/page.service';
 import { PdpPagePermissionRepo } from '../pdp-page-permission.repo';
+import { HttpAuthzClient } from '../http-authz.client';
 import { AuthzOutboxInstaller } from '../../service-bridge/authz-outbox.installer';
 import { CYCLE_LOCK_CLASS, PageCycleGuardInstaller } from '../../service-bridge/page-cycle-guard.installer';
 import { PageRestrictionGuardInstaller } from '../../service-bridge/page-restriction-guard.installer';
@@ -16,11 +17,12 @@ jest.mock('../../collaboration/collaboration.gateway', () => ({ CollaborationGat
 
 /**
  * Real-Postgres proof of #573: the REAL upstream `PageService.duplicatePage` over the REAL `PdpPagePermissionRepo`
- * (the PDP stubbed at `HttpAuthzClient.filterResources`), with the REAL #485/#545 guard DDL installed so the
+ * (the PDP stubbed at `HttpAuthzClient.tryFilterResources`), with the REAL #485/#545 guard DDL installed so the
  * per-workspace lock is the one g0/g1/g2 take. A copy that would drop a restriction is refused inside the insert's
  * transaction — zero pages, zero outbox rows, no PAGE_CREATED — including when the restriction lands after upstream
  * read the tree (a stale PDP allow, or a restrict committed while the duplicate is in flight). A copy that keeps
- * every restriction it could see still works, and never carries a page the PDP hid. Self-skips without
+ * every restriction it could see still works, and never carries a page the PDP hid. A page filter the PDP could not
+ * answer (#716, on any chunk) is a 503 with nothing written, never a copy of part of the tree. Self-skips without
  * AUTHZ_TEST_PG_URL; the `docmost-authz-pg` CI job provides Postgres.
  */
 const d = PG_URL ? describe : describe.skip;
@@ -57,6 +59,13 @@ d('PageService.duplicatePage refuses a copy that would drop a restriction (#573)
   let visible: Set<string> | null = null;
   /** Runs inside the PDP call, i.e. after upstream read the tree and before its insert. */
   let duringPdp: (() => Promise<void>) | null = null;
+  /** #716: the page filter could not answer (the client's `null`). Point decisions are not involved here. */
+  let filterDown = false;
+  let filterCalls = 0;
+  /** The same service over the REAL HttpAuthzClient (fetch stubbed), so the client's 1000-id chunking is exercised. */
+  let remoteRealClient: PageService;
+  const fetchMock = jest.fn();
+  const realFetch = global.fetch;
   const events: string[] = [];
 
   const doc = (text: string) => ({ type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text }] }] });
@@ -171,9 +180,11 @@ d('PageService.duplicatePage refuses a copy that would drop a restriction (#573)
     const emitter = { emit: (name: string) => (events.push(name), true) };
     pageRepo = new PageRepo(db as never, {} as never, emitter as never);
     const pdp = {
-      filterResources: async (_subject: unknown, permission: string, type: string, ids: string[]) => {
+      tryFilterResources: async (_subject: unknown, permission: string, type: string, ids: string[]) => {
         expect([permission, type]).toEqual(['view', 'page']);
+        filterCalls++;
         if (duringPdp) await duringPdp();
+        if (filterDown) return null;
         return visible ? ids.filter((id) => visible!.has(id)) : ids;
       },
     };
@@ -198,6 +209,9 @@ d('PageService.duplicatePage refuses a copy that would drop a restriction (#573)
       );
     remote = build(pdpRepo);
     native = build(stockRepo);
+    process.env.PLATFORM_AUTHZ_URL = 'http://platform.test';
+    process.env.PLATFORM_AUTHZ_SERVICE_SECRET = 'sekret';
+    remoteRealClient = build(new PdpPagePermissionRepo(db as never, {} as never, {} as never, new HttpAuthzClient()));
   });
 
   beforeEach(async () => {
@@ -213,6 +227,10 @@ d('PageService.duplicatePage refuses a copy that would drop a restriction (#573)
   afterEach(async () => {
     visible = null;
     duringPdp = null;
+    filterDown = false;
+    filterCalls = 0;
+    fetchMock.mockReset();
+    global.fetch = realFetch;
     events.length = 0;
     seeded.clear();
     await pg`delete from page_access`;
@@ -259,6 +277,35 @@ d('PageService.duplicatePage refuses a copy that would drop a restriction (#573)
       visible = new Set([C, D, G]);
       const e = await refusedWith(duplicate(remote, R));
       expect(e).toBeInstanceOf(ServiceUnavailableException);
+    });
+  });
+
+  describe('#716 the page filter could not answer: a 503 with nothing written, never a partial copy', () => {
+    it('the filter returns null (point decisions are not consulted here): 503, zero pages, zero outbox rows', async () => {
+      filterDown = true;
+      const e = await refusedWith(duplicate(remote, R));
+      expect(e).toBeInstanceOf(ServiceUnavailableException);
+      expect(filterCalls).toBe(1); // the filter ran and was what failed
+      expect(await copies()).toEqual([]);
+    });
+
+    it('over the real client, the SECOND 1000-id chunk fails: 503, never a copy of the first chunk', async () => {
+      // R's subtree is R, C, D, G + 997 more children = 1001 ids → two filter-resources chunks.
+      await pg`
+        insert into pages (id, slug_id, title, workspace_id, space_id, parent_page_id, position)
+        select gen_random_uuid(), 'bulk-' || g, 'bulk ' || g, ${WS}, ${S1}, ${R}, 'a0' from generate_series(1, 997) g`;
+      for (const r of await pg<{ id: string }[]>`select id from pages where slug_id like 'bulk-%'`) seeded.add(r.id);
+      const ok = (body: unknown) => ({ ok: true, status: 200, json: async () => body });
+      fetchMock.mockImplementationOnce(async (_url: string, init: { body: string }) =>
+        ok({ ids: JSON.parse(init.body).candidateIds }),
+      );
+      fetchMock.mockResolvedValueOnce({ ok: false, status: 503, json: async () => ({}) });
+      (global as unknown as { fetch: jest.Mock }).fetch = fetchMock;
+      const e = await refusedWith(duplicate(remoteRealClient, R));
+      expect(e).toBeInstanceOf(ServiceUnavailableException);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body).candidateIds).toHaveLength(1000);
+      expect(await copies()).toEqual([]);
     });
   });
 

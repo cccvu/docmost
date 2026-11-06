@@ -1,6 +1,6 @@
 import * as postgres from 'postgres';
 import { Kysely } from 'kysely';
-import { CallHandler, ExecutionContext, Logger } from '@nestjs/common';
+import { CallHandler, ExecutionContext, Logger, ServiceUnavailableException } from '@nestjs/common';
 import { lastValueFrom, of } from 'rxjs';
 import { PageService } from '../../core/page/services/page.service';
 import type { HttpAuthzClient } from '../http-authz.client';
@@ -43,14 +43,15 @@ d('BreadcrumbsRedactionInterceptor on the real getPageBreadCrumbs query', () => 
   let appPg: postgres.Sql;
   let db: Kysely<any>;
   let pages: PageService;
-  /** What the stubbed PDP answers for `filterResources(view)`: the viewable ids, or an error. */
-  let pdp: Set<string> | Error;
+  /** What the stubbed PDP answers for `tryFilterResources(view)`: the viewable ids, or `'down'` (the client's `null`:
+   *  the PDP could not answer). */
+  let pdp: Set<string> | 'down';
   const filterResources = jest.fn(async (_s: unknown, _p: string, _t: string, ids: string[]) => {
-    if (pdp instanceof Error) throw pdp;
+    if (pdp === 'down') return null;
     return ids.filter((id) => (pdp as Set<string>).has(id));
   });
   const interceptor = () =>
-    new BreadcrumbsRedactionInterceptor('remote', { filterResources } as unknown as HttpAuthzClient);
+    new BreadcrumbsRedactionInterceptor('remote', { tryFilterResources: filterResources } as unknown as HttpAuthzClient);
 
   const page = (n: number, parent: number | null, opts: { trashed?: boolean } = {}) => pg`
     insert into pages (id, slug_id, title, workspace_id, space_id, parent_page_id, position, deleted_at)
@@ -184,8 +185,14 @@ d('BreadcrumbsRedactionInterceptor on the real getPageBreadCrumbs query', () => 
     expect(ids(out)).toEqual(keptInUpstreamOrder(body, [3, 4]));
   });
 
-  it('PDP error: fails closed to [self]', async () => {
-    pdp = new Error('pdp down');
+  it('#716 PDP could not answer: a 503, never [self] (which the client renders as a root page)', async () => {
+    pdp = 'down';
+    await expect(redact(await upstream(uuid(4)), uuid(4))).rejects.toBeInstanceOf(ServiceUnavailableException);
+    expect(filterResources).toHaveBeenCalledTimes(1);
+  });
+
+  it('no ancestor viewable (a healthy, empty answer): [self] with its parent withheld', async () => {
+    pdp = new Set();
     const out = await redact(await upstream(uuid(4)), uuid(4));
     expect(ids(out)).toEqual([uuid(4)]);
     expect(out.data[0].parentPageId).toBeNull();

@@ -1,4 +1,4 @@
-import { CallHandler, ExecutionContext, InternalServerErrorException, Logger } from '@nestjs/common';
+import { CallHandler, ExecutionContext, InternalServerErrorException, Logger, ServiceUnavailableException } from '@nestjs/common';
 import { lastValueFrom, of, throwError } from 'rxjs';
 import type { HttpAuthzClient } from '../http-authz.client';
 import type { AuthzMode } from '../mode/authz-mode';
@@ -8,8 +8,8 @@ import { BreadcrumbsRedactionInterceptor, PAGE_BREADCRUMBS_ROUTES } from './brea
  * BreadcrumbsRedactionInterceptor (#574) — NOT upstream Docmost code.
  *
  * Remote mode: the breadcrumb chain is cut at the first ancestor the caller cannot view (walking `parentPageId` from
- * the requested page, never array order), the topmost kept row's `parentPageId` is nulled when cut, a PDP failure
- * answers `[self]`, a fully viewable chain is returned untouched, `data: []` passes, and any body this cannot fully
+ * the requested page, never array order), the topmost kept row's `parentPageId` is nulled when cut, a PDP that could
+ * not answer is a 503 (#716; an empty answer is a real deny and answers `[self]`), a fully viewable chain is returned untouched, `data: []` passes, and any body this cannot fully
  * understand is a 500 rather than an unredacted pass-through. Native mode and other routes are untouched.
  */
 class PageController {
@@ -53,7 +53,9 @@ const ctx = (target: object, handler: unknown, req: object, type = 'http'): Exec
 const req = (pageId: unknown = id(4)) => ({ body: { pageId }, user: { user: { id: USER_ID } } });
 
 function setup(mode: AuthzMode, filter: jest.Mock) {
-  const authz = { filterResources: filter } as unknown as HttpAuthzClient;
+  // #716: the interceptor asks the null-on-failure `tryFilterResources`; the fail-closed `filterResources` would read an
+  // outage as "no ancestor is viewable". A stub with only the latter would throw a TypeError, so it is pinned too.
+  const authz = { tryFilterResources: filter } as unknown as HttpAuthzClient;
   return new BreadcrumbsRedactionInterceptor(mode, authz);
 }
 
@@ -134,13 +136,20 @@ describe('BreadcrumbsRedactionInterceptor (#574)', () => {
       expect(rows[3].parentPageId).toBe(id(3));
     });
 
-    it.each([
-      ['rejects', jest.fn().mockRejectedValue(new Error('pdp down'))],
-      ['returns no ids (the client’s own fail-closed answer)', jest.fn().mockResolvedValue([])],
-      ['returns a non-array', jest.fn().mockResolvedValue('nope' as unknown)],
-    ])('a PDP that %s answers [self]', async (_label, filter) => {
-      const out = (await run(wrap(chain()), filter)) as { data: any[] };
+    it('a PDP that answers no ids (a real deny on every ancestor) answers [self]', async () => {
+      const out = (await run(wrap(chain()), jest.fn().mockResolvedValue([]))) as { data: any[] };
       expect(out.data).toEqual([{ ...crumb(4, 3), parentPageId: null }]);
+    });
+
+    it('#716: a PDP that could not answer (null) is a 503, never [self] (which reads as "a root page")', async () => {
+      const filter = jest.fn().mockResolvedValue(null);
+      await expect(run(wrap(chain()), filter)).rejects.toBeInstanceOf(ServiceUnavailableException);
+      expect(filter).toHaveBeenCalledWith({ provider: 'docmost', externalId: USER_ID }, 'view', 'page', [id(3), id(2), id(1)]);
+    });
+
+    it('#716: a client rejection (a bug: tryFilterResources never rejects) propagates, never [self]', async () => {
+      const boom = new Error('pdp client bug');
+      await expect(run(wrap(chain()), jest.fn().mockRejectedValue(boom))).rejects.toBe(boom);
     });
 
     it('no resolved user: never asks the PDP and answers [self]', async () => {

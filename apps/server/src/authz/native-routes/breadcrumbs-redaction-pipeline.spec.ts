@@ -47,7 +47,8 @@ class PageController {
   }
 }
 
-async function boot(mode: AuthzMode, viewable: string[], opts: { wrap?: boolean } = {}) {
+async function boot(mode: AuthzMode, viewable: string[] | null, opts: { wrap?: boolean } = {}) {
+  // #716: the interceptor asks `tryFilterResources` (null = the PDP could not answer).
   const filterResources = jest.fn().mockResolvedValue(viewable);
 
   @Global()
@@ -77,7 +78,7 @@ async function boot(mode: AuthzMode, viewable: string[], opts: { wrap?: boolean 
     ],
   })
     .overrideProvider(HttpAuthzClient)
-    .useValue({ filterResources })
+    .useValue({ tryFilterResources: filterResources })
     .compile();
 
   const app = moduleRef.createNestApplication<NestFastifyApplication>(new FastifyAdapter());
@@ -133,6 +134,15 @@ describe('breadcrumbs redaction in the Nest pipeline (#574)', () => {
     expect(remoteBody).toBe(nativeBody);
     expect(JSON.parse(nativeBody).data).toHaveLength(3);
     expect(native.filterResources).not.toHaveBeenCalled();
+  });
+
+  it('#716 remote, the PDP could not answer: a 503 on the wire, no ancestor and no self row', async () => {
+    const h = await boot('remote', null);
+    app = h.app;
+    const res = await breadcrumbs(app, id(3));
+    expect(res.statusCode).toBe(503);
+    expect(res.payload).not.toContain('Title');
+    expect(h.filterResources).toHaveBeenCalledTimes(1);
   });
 
   it('anti-vacuity: without the response wrapper the interceptor sees a bare array and fails closed (500)', async () => {

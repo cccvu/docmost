@@ -17,9 +17,13 @@ import {
   convertOnBehalfOf,
   isBudgetExempt,
   isContentParseRefusal,
+  humanConversionKey,
+  identityConversionKey,
   requestQueue,
   userConversionKey,
+  type BatchBudgetTurn,
   type ContentParseLimits,
+  type ConversionQueue,
   type SpawnWorker,
 } from './content-parse.service';
 
@@ -36,7 +40,23 @@ const LIMITS: ContentParseLimits = {
   // Out of the way of the #626/#642 admission specs; the budget has its own block below.
   budgetCapacityMs: 1e12,
   budgetRefillMsPerMinute: 1e12,
+  batchOverdraftMs: 1e12,
+  // #716: the small class is off here (no fixture input is empty); its own block below turns it on.
+  smallInputBytes: 0,
+  smallAgingMs: 400,
+  // #716: no reload credit unless a spec turns it on (then a reload stops the waiters' clocks, capped per waiter).
+  reloadCreditMs: 0,
 };
+
+/** #716 M9: an interactive queue (`waitMs` absent = the pool's own wait). */
+const q = (principal: string, waitMs?: number): ConversionQueue => ({ principal, waitMs });
+/** #716 M9: a batch queue always carries its turn; a fresh one when the caller has none. */
+const bq = (principal: string, waitMs: number, budgetTurn: BatchBudgetTurn = { admitted: false, overdraftMs: 0 }): ConversionQueue => ({
+  principal,
+  waitMs,
+  batch: true,
+  budgetTurn,
+});
 
 /**
  * A pool over the fixture that counts how many workers it started. `mode` is the fixture's start-up behavior; a list
@@ -92,31 +112,31 @@ const track = <T extends { pool: ContentParsePool }>(t: T): T => {
 describe('#626 conversion results', () => {
   it('returns the worker result, and reuses one warm worker across conversions', async () => {
     const { pool, spawned } = track(makePool());
-    await expect(pool.parse('a', 'html', 'user:1')).resolves.toEqual({ type: 'doc', label: 'a' });
-    await expect(pool.parse('b', 'markdown', 'user:1')).resolves.toEqual({ type: 'doc', label: 'b' });
-    await expect(pool.toHtml('c', 'user:2')).resolves.toBe('<p>c</p>');
+    await expect(pool.parse('a', 'html', q('user:1'))).resolves.toEqual({ type: 'doc', label: 'a' });
+    await expect(pool.parse('b', 'markdown', q('user:1'))).resolves.toEqual({ type: 'doc', label: 'b' });
+    await expect(pool.toHtml('c', q('user:2'))).resolves.toBe('<p>c</p>');
     expect(spawned).toHaveLength(1);
   });
 
   it('Markdown → HTML: `maxChars` lowers the cap for one call (→ 422), and never raises it past the limit', async () => {
     const { pool } = track(makePool({ maxChars: 100 }));
     const md = (n: number) => 'x'.repeat(n); // the fixture answers `<p>${md}</p>`: n + 7 characters
-    await expect(pool.toHtml(md(23), 'user:1', undefined, 30)).resolves.toBe(`<p>${md(23)}</p>`);
-    await expect(pool.toHtml(md(24), 'user:1', undefined, 30)).rejects.toBeInstanceOf(ContentTooComplexException);
-    await expect(pool.toHtml(md(93), 'user:1')).resolves.toBe(`<p>${md(93)}</p>`); // the limit, by default
-    await expect(pool.toHtml(md(94), 'user:1', undefined, 10_000)).rejects.toBeInstanceOf(ContentTooComplexException);
+    await expect(pool.toHtml(md(23), q('user:1'), 30)).resolves.toBe(`<p>${md(23)}</p>`);
+    await expect(pool.toHtml(md(24), q('user:1'), 30)).rejects.toBeInstanceOf(ContentTooComplexException);
+    await expect(pool.toHtml(md(93), q('user:1'))).resolves.toBe(`<p>${md(93)}</p>`); // the limit, by default
+    await expect(pool.toHtml(md(94), q('user:1'), 10_000)).rejects.toBeInstanceOf(ContentTooComplexException);
   });
 
   it('content that does not convert is 400 "Invalid content format" (as before)', async () => {
     const { pool } = track(makePool());
-    const err = await pool.parse('invalid', 'html', 'user:1').catch((e) => e);
+    const err = await pool.parse('invalid', 'html', q('user:1')).catch((e) => e);
     expect(err).toBeInstanceOf(BadRequestException);
     expect(err.message).toBe('Invalid content format');
   });
 
   it('too many nodes (or nesting too deep) is 422 content_too_complex', async () => {
     const { pool } = track(makePool());
-    const err = await pool.parse('too-complex', 'html', 'user:1').catch((e) => e);
+    const err = await pool.parse('too-complex', 'html', q('user:1')).catch((e) => e);
     expect(err).toBeInstanceOf(ContentTooComplexException);
     expect(err.getStatus()).toBe(422);
     expect(err.getResponse()).toMatchObject({ code: 'content_too_complex' });
@@ -127,30 +147,30 @@ describe('#626 the bounds', () => {
   it('a conversion past the deadline is stopped (even a synchronous loop) → 422; the event loop never blocks; the next one gets a fresh worker', async () => {
     const { pool, spawned } = track(makePool());
     const started = Date.now();
-    const hang = pool.parse('hang', 'html', 'user:1');
+    const hang = pool.parse('hang', 'html', q('user:1'));
     const lag = await maxLoopLag(hang);
     await expect(hang).rejects.toBeInstanceOf(ContentTooComplexException);
     expect(Date.now() - started).toBeLessThan(LIMITS.deadlineMs + 3_000);
     expect(lag).toBeLessThan(200);
-    await expect(pool.parse('after', 'html', 'user:1')).resolves.toEqual({ type: 'doc', label: 'after' });
+    await expect(pool.parse('after', 'html', q('user:1'))).resolves.toEqual({ type: 'doc', label: 'after' });
     expect(spawned).toHaveLength(2);
   });
 
   it('a conversion that exhausts the heap cap kills only the worker → 422; this process carries on', async () => {
     const { pool, spawned } = track(makePool({ deadlineMs: 20_000 }));
-    const err = await pool.parse('oom', 'html', 'user:1').catch((e) => e);
+    const err = await pool.parse('oom', 'html', q('user:1')).catch((e) => e);
     expect(err).toBeInstanceOf(ContentTooComplexException);
-    await expect(pool.parse('after', 'html', 'user:1')).resolves.toEqual({ type: 'doc', label: 'after' });
+    await expect(pool.parse('after', 'html', q('user:1'))).resolves.toEqual({ type: 'doc', label: 'after' });
     expect(spawned).toHaveLength(2);
   }, 30_000);
 
   it('a worker that dies mid-conversion is 503 engine_busy (retryable), and is replaced', async () => {
     const { pool, spawned } = track(makePool());
-    const err = await pool.parse('crash', 'html', 'user:1').catch((e) => e);
+    const err = await pool.parse('crash', 'html', q('user:1')).catch((e) => e);
     expect(err).toBeInstanceOf(ContentParseBusyException);
     expect(err.getStatus()).toBe(503);
     expect(err.getResponse()).toMatchObject({ code: 'engine_busy' });
-    await expect(pool.parse('after', 'html', 'user:1')).resolves.toEqual({ type: 'doc', label: 'after' });
+    await expect(pool.parse('after', 'html', q('user:1'))).resolves.toEqual({ type: 'doc', label: 'after' });
     expect(spawned).toHaveLength(2);
   });
 
@@ -158,7 +178,7 @@ describe('#626 the bounds', () => {
     'a worker that cannot start (%s) fails closed with 503 — never a conversion on the main thread',
     async (mode) => {
       const { pool } = track(makePool({ startupMs: 300 }, mode));
-      await expect(pool.parse('a', 'html', 'user:1')).rejects.toBeInstanceOf(ContentParseBusyException);
+      await expect(pool.parse('a', 'html', q('user:1'))).rejects.toBeInstanceOf(ContentParseBusyException);
     },
   );
 });
@@ -166,25 +186,25 @@ describe('#626 the bounds', () => {
 describe('#626 the worker is replaced whenever it is lost', () => {
   it('a worker that failed to start is dropped: the next conversion starts a new one and succeeds', async () => {
     const { pool, spawned } = track(makePool({ startupMs: 300 }, ['throw-on-load', 'normal']));
-    await expect(pool.parse('a', 'html', 'user:1')).rejects.toBeInstanceOf(ContentParseBusyException);
-    await expect(pool.parse('b', 'html', 'user:1')).resolves.toEqual({ type: 'doc', label: 'b' });
+    await expect(pool.parse('a', 'html', q('user:1'))).rejects.toBeInstanceOf(ContentParseBusyException);
+    await expect(pool.parse('b', 'html', q('user:1'))).resolves.toEqual({ type: 'doc', label: 'b' });
     expect(spawned).toHaveLength(2);
   });
 
   it('a worker that dies while idle is replaced, so the next conversion is not handed to a dead worker', async () => {
     const { pool, spawned } = track(makePool({ deadlineMs: 5_000 }));
-    await pool.parse('a', 'html', 'user:1');
+    await pool.parse('a', 'html', q('user:1'));
     await spawned[0].terminate();
     const started = Date.now();
     // Handed to the dead worker, this would wait out the deadline and answer a wrong 422.
-    await expect(pool.parse('b', 'html', 'user:1')).resolves.toEqual({ type: 'doc', label: 'b' });
+    await expect(pool.parse('b', 'html', q('user:1'))).resolves.toEqual({ type: 'doc', label: 'b' });
     expect(Date.now() - started).toBeLessThan(2_000);
     expect(spawned).toHaveLength(2);
   });
 
   it('a worker killed by a job is replaced at once, before any next conversion asks for one', async () => {
     const { pool, spawned } = track(makePool());
-    await expect(pool.parse('hang', 'html', 'user:1')).rejects.toBeInstanceOf(ContentTooComplexException);
+    await expect(pool.parse('hang', 'html', q('user:1'))).rejects.toBeInstanceOf(ContentTooComplexException);
     await until(() => spawned.length === 2);
   });
 });
@@ -192,9 +212,9 @@ describe('#626 the worker is replaced whenever it is lost', () => {
 describe('#626 admission and fairness', () => {
   it('no turn within the wait budget → 503 engine_busy; nothing is queued behind it', async () => {
     const { pool } = track(makePool({ waitMs: 150, deadlineMs: 5_000 }));
-    const long = pool.parse('sleep:800', 'html', 'user:A');
+    const long = pool.parse('sleep:800', 'html', q('user:A'));
     const started = Date.now();
-    await expect(pool.parse('b', 'html', 'user:B')).rejects.toBeInstanceOf(ContentParseBusyException);
+    await expect(pool.parse('b', 'html', q('user:B'))).rejects.toBeInstanceOf(ContentParseBusyException);
     expect(Date.now() - started).toBeLessThan(1_000);
     await expect(long).resolves.toMatchObject({ type: 'doc' });
   });
@@ -202,11 +222,11 @@ describe('#626 admission and fairness', () => {
   it("one principal's concurrent conversions wait for each other, so another principal is served in between", async () => {
     const { pool } = track(makePool({ deadlineMs: 5_000, waitMs: 5_000 }));
     const done: string[] = [];
-    const a1 = pool.parse('sleep:200:a1', 'html', 'user:A').then(() => done.push('a1'));
-    const a2 = pool.parse('sleep:200:a2', 'html', 'user:A').then(() => done.push('a2'));
-    const a3 = pool.parse('sleep:200:a3', 'html', 'user:A').then(() => done.push('a3'));
+    const a1 = pool.parse('sleep:200:a1', 'html', q('user:A')).then(() => done.push('a1'));
+    const a2 = pool.parse('sleep:200:a2', 'html', q('user:A')).then(() => done.push('a2'));
+    const a3 = pool.parse('sleep:200:a3', 'html', q('user:A')).then(() => done.push('a3'));
     await new Promise((r) => setTimeout(r, 20)); // B arrives after all of A's are submitted
-    const b = pool.parse('sleep:200:b', 'html', 'user:B').then(() => done.push('b'));
+    const b = pool.parse('sleep:200:b', 'html', q('user:B')).then(() => done.push('b'));
     await Promise.all([a1, a2, a3, b]);
     // Without the per-principal gate, B would wait behind all three of A's (FIFO on the worker).
     expect(done.indexOf('b')).toBeLessThan(done.indexOf('a3'));
@@ -215,16 +235,16 @@ describe('#626 admission and fairness', () => {
 
   it('a batch queue may wait longer than a request: it is served where a request would get 503', async () => {
     const { pool } = track(makePool({ waitMs: 150, deadlineMs: 5_000 }));
-    const long = pool.parse('sleep:800', 'html', 'user:A');
-    await expect(pool.parse('b', 'html', 'user:B')).rejects.toBeInstanceOf(ContentParseBusyException);
-    await expect(pool.parse('c', 'html', 'batch:file-task:1', 3_000)).resolves.toEqual({ type: 'doc', label: 'c' });
+    const long = pool.parse('sleep:800', 'html', q('user:A'));
+    await expect(pool.parse('b', 'html', q('user:B'))).rejects.toBeInstanceOf(ContentParseBusyException);
+    await expect(pool.parse('c', 'html', q('batch:file-task:1', 3_000))).resolves.toEqual({ type: 'doc', label: 'c' });
     await long;
   });
 
   it('forgets a principal once it has nothing queued or running (no per-principal state leaks)', async () => {
     const { pool } = track(makePool());
-    await Promise.all([pool.parse('a', 'html', 'user:A'), pool.parse('b', 'html', 'user:B')]);
-    await pool.parse('crash', 'html', 'user:C').catch(() => undefined);
+    await Promise.all([pool.parse('a', 'html', q('user:A')), pool.parse('b', 'html', q('user:B'))]);
+    await pool.parse('crash', 'html', q('user:C')).catch(() => undefined);
     // C's turn is released once the replacement worker is ready (#642), then C is forgotten too.
     const principals = (pool as unknown as { principals: Map<string, unknown> }).principals;
     await until(() => principals.size === 0);
@@ -232,24 +252,50 @@ describe('#626 admission and fairness', () => {
 });
 
 describe('#642 one principal never causes another principal\'s 503', () => {
-  it('the production limits: wait > deadline, and wait + a worker load (≤3.5 s) + deadline fits the 20 s relay', () => {
-    const { waitMs, deadlineMs } = CONTENT_PARSE_LIMITS;
-    expect(waitMs).toBeGreaterThan(deadlineMs);
-    expect(waitMs + 3_500 + deadlineMs).toBeLessThan(20_000); // the platform's content-write relay timeout
+  it('the production limits: wait > deadline + lag, a reload is credited (≤3.5 s), and all of it fits the 20 s relay', () => {
+    const { waitMs, deadlineMs, reloadCreditMs } = CONTENT_PARSE_LIMITS;
+    // #716: a killed conversion holds the worker until its replacement is ready, and that reload stops the waiters'
+    // clocks (credited up to reloadCreditMs), so the wait itself only has to cover one deadline-length conversion + lag.
+    expect(reloadCreditMs).toBe(3_500);
+    expect(waitMs).toBeGreaterThanOrEqual(deadlineMs + 1_000);
+    expect(waitMs + deadlineMs).toBeLessThanOrEqual(15_000); // no reload: the pre-#716 worst case, not raised
+    expect(waitMs + reloadCreditMs + deadlineMs).toBeLessThan(20_000); // with one reload: the relay's 20 s
+  });
+
+  it('#716: a reload is credited to the waiters — served, where without the credit the same wait is a 503', async () => {
+    // A's conversion is killed at 300 ms and the replacement loads for 600 ms: B waits ~900 ms of wall time with a
+    // 500 ms wait. Credited (cap 1 s): its clock stopped for the reload, so it is served.
+    const credited = track(makePool({ deadlineMs: 300, waitMs: 500, reloadCreditMs: 1_000 }, ['normal', 'slow-ready:600']));
+    await credited.pool.parse('warm', 'html', q('user:A'));
+    const a = credited.pool.parse('hang', 'html', q('user:A')).catch((e) => e);
+    await new Promise((r) => setTimeout(r, 20)); // A holds the worker
+    await expect(credited.pool.parse('sleep:10', 'html', q('user:B'))).resolves.toMatchObject({ type: 'doc' });
+    await expect(a).resolves.toBeInstanceOf(ContentTooComplexException);
+  });
+
+  it('#716: the credit is capped per waiter (a reload longer than reloadCreditMs still counts the rest)', async () => {
+    // Same, with a 100 ms cap: B's clock runs for 500 of the 600 ms reload → 300 + 500 > 500 → 503.
+    const capped = track(makePool({ deadlineMs: 300, waitMs: 500, reloadCreditMs: 100 }, ['normal', 'slow-ready:600']));
+    await capped.pool.parse('warm', 'html', q('user:A'));
+    const a = capped.pool.parse('hang', 'html', q('user:A')).catch((e) => e);
+    await new Promise((r) => setTimeout(r, 20));
+    await expect(capped.pool.parse('sleep:10', 'html', q('user:B'))).rejects.toBeInstanceOf(ContentParseBusyException);
+    await expect(a).resolves.toBeInstanceOf(ContentTooComplexException);
   });
 
   it("a conversion that killed the worker keeps its principal's turn until the replacement is ready: a newcomer goes first", async () => {
-    // The replacement loads for longer than the newcomer may wait.
-    const { pool, spawned } = track(makePool({ deadlineMs: 300, waitMs: 500 }, ['normal', 'slow-ready:700']));
-    await pool.parse('warm', 'html', 'user:A');
+    // The replacement loads for 700 ms. #716: the newcomer now spends that reload inside its wait (the slot is held
+    // until the replacement is ready), so its wait is sized to cover it: the bound the production limits pin.
+    const { pool, spawned } = track(makePool({ deadlineMs: 300, waitMs: 1_500 }, ['normal', 'slow-ready:700']));
+    await pool.parse('warm', 'html', q('user:A'));
     const order: string[] = [];
-    const a1 = pool.parse('hang', 'html', 'user:A').catch((e) => e);
+    const a1 = pool.parse('hang', 'html', q('user:A')).catch((e) => e);
     // A's next conversion is already waiting for A's turn (with a wait long enough to outlast the reload).
-    const a2 = pool.parse('sleep:50', 'html', 'user:A', 5_000).then(() => order.push('a2'));
+    const a2 = pool.parse('sleep:50', 'html', q('user:A', 5_000)).then(() => order.push('a2'));
     await until(() => spawned.length === 2); // a1 was killed at the deadline; its replacement is loading
-    const b = pool.parse('sleep:50', 'html', 'user:B').then(() => order.push('b'));
+    const b = pool.parse('sleep:50', 'html', q('user:B')).then(() => order.push('b'));
     await expect(a1).resolves.toBeInstanceOf(ContentTooComplexException);
-    // Without the hold, a2 takes the free slot and waits out the load inside it, and b gets 503 behind it.
+    // Without the hold, a2 takes the slot ahead of b once the load is done, and b waits a whole extra conversion.
     await b;
     await a2;
     expect(order).toEqual(['b', 'a2']);
@@ -257,9 +303,9 @@ describe('#642 one principal never causes another principal\'s 503', () => {
 
   it('the killed conversion is answered at once, not after the reload', async () => {
     const { pool } = track(makePool({ deadlineMs: 300 }, ['normal', 'slow-ready:1500']));
-    await pool.parse('warm', 'html', 'user:A');
+    await pool.parse('warm', 'html', q('user:A'));
     const started = Date.now();
-    await expect(pool.parse('hang', 'html', 'user:A')).rejects.toBeInstanceOf(ContentTooComplexException);
+    await expect(pool.parse('hang', 'html', q('user:A'))).rejects.toBeInstanceOf(ContentTooComplexException);
     expect(Date.now() - started).toBeLessThan(1_200);
     // …and the principal is forgotten once the reload releases its turn.
     const principals = (pool as unknown as { principals: Map<string, unknown> }).principals;
@@ -269,17 +315,18 @@ describe('#642 one principal never causes another principal\'s 503', () => {
 
   it('a principal looping deadline-length conversions, with slow reloads, never gets a newcomer refused', async () => {
     const deadlineMs = 300;
-    const { pool, spawned } = track(makePool({ deadlineMs, waitMs: 400 }, ['normal', 'slow-ready:250']));
-    await pool.parse('warm', 'html', 'user:A');
+    // #716: the reload is inside the newcomer's wait now, so the wait covers deadline + reload (300 + 250) with margin.
+    const { pool, spawned } = track(makePool({ deadlineMs, waitMs: 900 }, ['normal', 'slow-ready:250']));
+    await pool.parse('warm', 'html', q('user:A'));
     let stop = false;
     // A closed loop, three deep: every conversion runs to the deadline and kills the worker.
     const abuse = async () => {
-      while (!stop) await pool.parse('hang', 'html', 'user:A', 5_000).catch(() => undefined);
+      while (!stop) await pool.parse('hang', 'html', q('user:A', 5_000)).catch(() => undefined);
     };
     const loops = [abuse(), abuse(), abuse()];
     const outcomes: string[] = [];
     const newcomer = (i: number) =>
-      pool.parse('sleep:20', 'html', `user:N${i}`).then(
+      pool.parse('sleep:20', 'html', q(`user:N${i}`)).then(
         () => 'ok',
         (e: Error) => e.constructor.name,
       );
@@ -303,7 +350,7 @@ describe('#642 one principal never causes another principal\'s 503', () => {
 
   it("one human's request, zip import and validate-content share ONE key: another principal waits behind one of them", async () => {
     const direct = userConversionKey('U');
-    const validation = await convertOnBehalfOf('U', async () => requestQueue());
+    const validation = await convertOnBehalfOf(userConversionKey('U'), async () => requestQueue());
     const zip = batchConversion('file-task:1', 'U');
     expect([validation.principal, zip.principal]).toEqual([direct, direct]);
     expect(validation.waitMs).toBe(CONTENT_PARSE_LIMITS.waitMs);
@@ -311,13 +358,13 @@ describe('#642 one principal never causes another principal\'s 503', () => {
 
     const { pool } = track(makePool({ deadlineMs: 2_000, waitMs: 500 }));
     const u = [
-      pool.parse('sleep:350', 'html', direct, 5_000),
-      pool.parse('sleep:350', 'html', validation.principal, 5_000),
-      pool.parse('sleep:350', 'html', zip.principal, 5_000),
+      pool.parse('sleep:350', 'html', q(direct, 5_000)),
+      pool.parse('sleep:350', 'html', q(validation.principal, 5_000)),
+      pool.parse('sleep:350', 'html', q(zip.principal, 5_000)),
     ];
     await new Promise((r) => setTimeout(r, 20));
     // Under three keys B would queue behind all three (1050 ms > its 500 ms wait).
-    await expect(pool.parse('b', 'html', 'user:B')).resolves.toEqual({ type: 'doc', label: 'b' });
+    await expect(pool.parse('b', 'html', q('user:B'))).resolves.toEqual({ type: 'doc', label: 'b' });
     await Promise.all(u);
   });
 
@@ -346,11 +393,11 @@ describe('#642 the per-principal worker-time budget', () => {
 
   /** Spend `user:A`'s budget with one conversion killed at the deadline; resolves once its reload is charged too. */
   const spend = async (pool: ContentParsePool, spawned: Worker[]) => {
-    await expect(pool.parse('hang', 'html', 'user:A')).rejects.toBeInstanceOf(
+    await expect(pool.parse('hang', 'html', q('user:A'))).rejects.toBeInstanceOf(
       ContentTooComplexException,
     );
     await until(() => spawned.length === 2);
-    await pool.parse('warm', 'html', 'background'); // the replacement is ready, so its reload has been charged
+    await pool.parse('warm', 'html', q('background')); // the replacement is ready, so its reload has been charged
   };
 
   it('the production budget: 30 s burst, 15 s a minute; a 1 MiB page every 20 s at the deadline-length worst case per minute fits', () => {
@@ -374,8 +421,8 @@ describe('#642 the per-principal worker-time budget', () => {
         ['normal', 'slow-ready:150'],
       ),
     );
-    await pool.parse('warm', 'html', 'background');
-    const hang = pool.parse('hang', 'html', 'user:A').catch((e) => e);
+    await pool.parse('warm', 'html', q('background'));
+    const hang = pool.parse('hang', 'html', q('user:A')).catch((e) => e);
     await expect(hang).resolves.toBeInstanceOf(ContentTooComplexException);
     const afterRun = pool.budgetLeft('user:A');
     expect(afterRun).toBeLessThanOrEqual(10_000 - deadlineMs); // the conversion, to its kill
@@ -389,10 +436,10 @@ describe('#642 the per-principal worker-time budget', () => {
     const { pool } = track(
       makePool({ budgetCapacityMs: 10_000, budgetRefillMsPerMinute: 0 }),
     );
-    await pool.parse('sleep:120', 'html', 'user:A');
+    await pool.parse('sleep:120', 'html', q('user:A'));
     expect(pool.budgetLeft('user:A')).toBeLessThanOrEqual(10_000 - 120);
-    await pool.parse('sleep:120', 'html', 'background');
-    await pool.parse('sleep:120', 'html', 'batch:file-task:1');
+    await pool.parse('sleep:120', 'html', q('background'));
+    await pool.parse('sleep:120', 'html', q('batch:file-task:1'));
     expect(pool.budgetLeft('background')).toBe(10_000);
     expect(pool.budgetLeft('batch:file-task:1')).toBe(10_000);
     expect(
@@ -412,12 +459,12 @@ describe('#642 the per-principal worker-time budget', () => {
         budgetRefillMsPerMinute: 60_000,
       }),
     );
-    await pool.parse('warm', 'html', 'background');
+    await pool.parse('warm', 'html', q('background'));
     await spend(pool, spawned);
     expect(pool.budgetLeft('user:A')).toBeLessThanOrEqual(0);
 
     const started = Date.now();
-    const err = await pool.parse('sleep:10', 'html', 'user:A').catch((e) => e);
+    const err = await pool.parse('sleep:10', 'html', q('user:A')).catch((e) => e);
     expect(Date.now() - started).toBeLessThan(100); // refused before it queues, never after a wait
     expect(err).toBeInstanceOf(ConversionBudgetExhaustedException);
     expect(err.getStatus()).toBe(429);
@@ -431,7 +478,7 @@ describe('#642 the per-principal worker-time budget', () => {
     expect(isContentParseRefusal(err)).toBe(true); // importers pass it on as is
 
     // B was never charged for A's use: admitted and served straight away.
-    await expect(pool.parse('b', 'html', 'user:B')).resolves.toEqual({
+    await expect(pool.parse('b', 'html', q('user:B'))).resolves.toEqual({
       type: 'doc',
       label: 'b',
     });
@@ -445,10 +492,10 @@ describe('#642 the per-principal worker-time budget', () => {
         budgetRefillMsPerMinute: 6_000,
       }), // 0.1 worker-ms per ms
     );
-    await pool.parse('warm', 'html', 'background');
+    await pool.parse('warm', 'html', q('background'));
     await spend(pool, spawned);
     const debt = -pool.budgetLeft('user:A');
-    const err = await pool.parse('x', 'html', 'user:A').catch((e) => e);
+    const err = await pool.parse('x', 'html', q('user:A')).catch((e) => e);
     expect(err).toBeInstanceOf(ConversionBudgetExhaustedException);
     // debt / 0.1 per ms → ms, rounded up to seconds (a few ms of real time may have refilled meanwhile).
     const expected = Math.ceil((debt * 10 + 1) / 1000);
@@ -466,12 +513,12 @@ describe('#642 the per-principal worker-time budget', () => {
         budgetRefillMsPerMinute: 6_000,
       }),
     );
-    await pool.parse('warm', 'html', 'background');
+    await pool.parse('warm', 'html', q('background'));
     await spend(pool, spawned);
-    const err = await pool.parse('x', 'html', 'user:A').catch((e) => e);
+    const err = await pool.parse('x', 'html', q('user:A')).catch((e) => e);
     expect(err).toBeInstanceOf(ConversionBudgetExhaustedException);
     offset += err.retryAfterSeconds * 1000; // the time it was told to wait
-    await expect(pool.parse('again', 'html', 'user:A')).resolves.toEqual({
+    await expect(pool.parse('again', 'html', q('user:A'))).resolves.toEqual({
       type: 'doc',
       label: 'again',
     });
@@ -485,63 +532,76 @@ describe('#642 the per-principal worker-time budget', () => {
         budgetRefillMsPerMinute: 60_000,
       }),
     );
-    await pool.parse('warm', 'html', 'background');
+    await pool.parse('warm', 'html', q('background'));
     await spend(pool, spawned);
     expect(pool.budgetLeft('user:A')).toBeLessThanOrEqual(0);
     // Interactive: refused. Batch, same key, a wait longer than the refill: served once the bucket is positive.
-    await expect(pool.parse('x', 'html', 'user:A')).rejects.toBeInstanceOf(
+    await expect(pool.parse('x', 'html', q('user:A'))).rejects.toBeInstanceOf(
       ConversionBudgetExhaustedException,
     );
     await expect(
-      pool.toHtml('imported', 'user:A', 5_000, undefined, true),
+      pool.toHtml('imported', bq('user:A', 5_000)),
     ).resolves.toBe('<p>imported</p>');
   });
 
   it('a batch is gated once: admitted on its first conversion, its later ones are charged but never wait or fail', async () => {
     // The zip import converts inside its open transaction: a budget wait per page would hold it for minutes.
-    const { pool, spawned } = track(
-      makePool({
-        deadlineMs: 200,
-        budgetCapacityMs: 100,
-        budgetRefillMsPerMinute: 600, // 0.01 worker-ms per ms: no refill fits a 5 s wait
-      }),
-    );
-    await pool.parse('warm', 'html', 'background');
-    const turn = batchConversion('file-task:1', 'A').budgetTurn!;
-    expect(turn).toEqual({ admitted: false });
-    await expect(pool.toHtml('first', 'user:A', 5_000, undefined, true, turn)).resolves.toBe('<p>first</p>');
+    // #716 I8: deterministic — no refill (exact charges) and a deadline far past every fixture sleep, so the CI
+    // runner's timer stalls can no longer turn a 60 ms sleep into a deadline kill (the observed flake).
+    const { pool } = track(makePool({ deadlineMs: 5_000, budgetCapacityMs: 200, budgetRefillMsPerMinute: 0 }));
+    await pool.parse('warm', 'html', q('background'));
+    const turn = batchConversion('file-task:1', 'A').budgetTurn;
+    expect(turn).toEqual({ admitted: false, overdraftMs: 0 });
+    await expect(pool.toHtml('first', bq('user:A', 5_000, turn))).resolves.toBe('<p>first</p>');
     expect(turn.admitted).toBe(true);
-    await spend(pool, spawned); // the same human's bucket is now empty, far past what a refill could cover
-    offset += 5_000; // +50 ms of refill: off the -capacity floor, still empty, so the next charge is visible
+    // The same batch spends the human's bucket below zero: charged, never gated.
+    await pool.toHtml('sleep:250:spend', bq('user:A', 5_000, turn));
     const left = pool.budgetLeft('user:A');
-    expect(left).toBeLessThanOrEqual(0);
-    // The same batch: converted at once, and charged.
-    await expect(pool.toHtml('sleep:60:second', 'user:A', 5_000, undefined, true, turn)).resolves.toEqual({
+    expect(left).toBeLessThan(0);
+    expect(left).toBeGreaterThan(-200); // above the floor, so the next charge is visible in full
+    // The same batch: converted at once, and charged (a 60 ms fixture sleep is at least 60 ms of worker time).
+    await expect(pool.toHtml('sleep:60:second', bq('user:A', 5_000, turn))).resolves.toEqual({
       type: 'doc',
       label: 'second',
     });
-    expect(pool.budgetLeft('user:A')).toBeLessThan(left - 30); // ~60 ms of worker time, less a 0.6 ms refill
+    expect(pool.budgetLeft('user:A')).toBeLessThanOrEqual(left - 60);
     // Controls: a new batch (a second import) by the same human is gated again, and so is an interactive write.
     await expect(
-      pool.toHtml('next import', 'user:A', 5_000, undefined, true, batchConversion('file-task:2', 'A').budgetTurn),
+      pool.toHtml('next import', bq('user:A', 5_000, batchConversion('file-task:2', 'A').budgetTurn)),
     ).rejects.toBeInstanceOf(ConversionBudgetExhaustedException);
-    await expect(pool.parse('x', 'html', 'user:A')).rejects.toBeInstanceOf(ConversionBudgetExhaustedException);
+    await expect(pool.parse('x', 'html', q('user:A'))).rejects.toBeInstanceOf(ConversionBudgetExhaustedException);
   });
 
   it('debt is floored at -capacity: a large admitted batch locks its human out for at most one full refill', async () => {
-    const { pool, spawned } = track(
-      makePool({ deadlineMs: 200, budgetCapacityMs: 100, budgetRefillMsPerMinute: 600 }),
-    );
-    await pool.parse('warm', 'html', 'background');
-    const turn = batchConversion('file-task:1', 'A').budgetTurn!;
-    await expect(pool.toHtml('first', 'user:A', 5_000, undefined, true, turn)).resolves.toBe('<p>first</p>');
-    await spend(pool, spawned); // ≥ 200 ms killed + the reload, charged to a 100 ms bucket
+    // #716 I8 (the flaky case, run 42068618775): a 200 ms deadline under 60 ms sleeps was killed by a stalled CI
+    // timer. Now: a deadline 33× the sleeps, no refill, and an EXACT expectation.
+    const { pool } = track(makePool({ deadlineMs: 5_000, budgetCapacityMs: 100, budgetRefillMsPerMinute: 0 }));
+    await pool.parse('warm', 'html', q('background'));
+    const turn = batchConversion('file-task:1', 'A').budgetTurn;
+    await expect(pool.toHtml('first', bq('user:A', 5_000, turn))).resolves.toBe('<p>first</p>');
     for (let i = 0; i < 3; i++) {
-      await pool.toHtml(`sleep:60:p${i}`, 'user:A', 5_000, undefined, true, turn); // ungated, charged
+      await pool.toHtml(`sleep:150:p${i}`, bq('user:A', 5_000, turn)); // ungated, charged: ≥ 450 ms in all
     }
-    // Without the floor the debt would be ≥ 280 ms; with it, never below -capacity (less a sub-ms refill).
-    expect(pool.budgetLeft('user:A')).toBeGreaterThanOrEqual(-100);
-    expect(pool.budgetLeft('user:A')).toBeLessThan(-90);
+    // Without the floor the debt would be ≤ -350 ms; with it, exactly -capacity.
+    expect(pool.budgetLeft('user:A')).toBe(-100);
+  });
+
+  it('#716 I3: an admitted batch overdrawn past batchOverdraftMs is refused 429 before any more work', async () => {
+    const { pool } = track(
+      makePool({ deadlineMs: 5_000, budgetCapacityMs: 100, budgetRefillMsPerMinute: 0, batchOverdraftMs: 100 }),
+    );
+    await pool.parse('warm', 'html', q('background'));
+    const turn = batchConversion('file-task:1', 'A').budgetTurn;
+    await pool.toHtml('first', bq('user:A', 5_000, turn));
+    await pool.toHtml('sleep:150:a', bq('user:A', 5_000, turn)); // to about -50: on the books, no overdraft yet
+    expect(turn.overdraftMs).toBe(0);
+    await pool.toHtml('sleep:150:b', bq('user:A', 5_000, turn)); // past the floor by ≥ 100 ms: the overdraft
+    expect(turn.overdraftMs).toBeGreaterThan(100);
+    const started = Date.now();
+    const err = await pool.toHtml('sleep:2000:never', bq('user:A', 5_000, turn)).catch((e) => e);
+    expect(err).toBeInstanceOf(ConversionBudgetExhaustedException);
+    expect(Date.now() - started).toBeLessThan(1_000); // refused up front: the 2 s conversion never ran
+    expect(pool.budgetLeft('user:A')).toBe(-100); // and nothing more was charged
   });
 
   it('a batch caller whose wait cannot cover the refill fails with the same 429', async () => {
@@ -552,16 +612,20 @@ describe('#642 the per-principal worker-time budget', () => {
         budgetRefillMsPerMinute: 600,
       }), // 0.01 worker-ms per ms
     );
-    await pool.parse('warm', 'html', 'background');
+    await pool.parse('warm', 'html', q('background'));
     await spend(pool, spawned);
     const started = Date.now();
     const err = await pool
-      .toHtml('imported', 'user:A', 1_000, undefined, true)
+      .toHtml('imported', bq('user:A', 1_000))
       .catch((e) => e);
     expect(err).toBeInstanceOf(ConversionBudgetExhaustedException);
     expect(Date.now() - started).toBeLessThan(200); // decided up front, not after waiting out its batch wait
     expect(batchConversion('file-task:1', 'U').batch).toBe(true); // the zip import is a batch caller
     expect(requestQueue().batch).toBeUndefined(); // a request is not
+    // #716 M9: a batch queue without its turn does not compile (it would be gated on every conversion).
+    // @ts-expect-error — `budgetTurn` is required on a batch queue
+    const bad: ConversionQueue = { principal: 'user:A', waitMs: 1, batch: true };
+    expect(bad.batch).toBe(true);
   });
 
   it('idle keys do not accumulate: a bucket that has refilled is dropped (on read, and by the periodic sweep)', async () => {
@@ -569,16 +633,167 @@ describe('#642 the per-principal worker-time budget', () => {
       makePool({ budgetCapacityMs: 1_000, budgetRefillMsPerMinute: 60_000 }),
     );
     for (let i = 0; i < 20; i++)
-      await pool.parse('sleep:5', 'html', `user:P${i}`);
+      await pool.parse('sleep:5', 'html', q(`user:P${i}`));
     expect(pool.budgetKeys).toBe(20);
     offset += 61_000; // every bucket is full again, and the sweep is due
-    await pool.parse('trigger', 'html', 'background'); // exempt: sweeps, charges nothing
+    await pool.parse('trigger', 'html', q('background')); // exempt: sweeps, charges nothing
     expect(pool.budgetKeys).toBe(0);
     // A full bucket read directly is dropped too.
-    await pool.parse('sleep:5', 'html', 'user:Q');
+    await pool.parse('sleep:5', 'html', q('user:Q'));
     expect(pool.budgetKeys).toBe(1);
     offset += 2_000;
     expect(pool.budgetLeft('user:Q')).toBe(1_000);
     expect(pool.budgetKeys).toBe(0);
+  });
+});
+
+describe('#716 M8/I6 the admission keys', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('M8: a request actor converts under userConversionKey, whatever its actorType says', () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { ClsServiceManager } = require('nestjs-cls');
+    jest
+      .spyOn(ClsServiceManager, 'getClsService')
+      .mockReturnValue({ get: () => ({ actorType: 'api_key', actorId: 'U' }) } as never);
+    expect(requestQueue().principal).toBe(userConversionKey('U'));
+  });
+
+  it('I6: an east-west human converts as their Docmost user, else their platform identity — never `background`', async () => {
+    expect(humanConversionKey('U', 'I')).toBe('user:U'); // a provisioned human keeps their one key
+    expect(humanConversionKey(undefined, 'I')).toBe(identityConversionKey('I'));
+    expect(identityConversionKey('I')).toBe('identity:I');
+    expect(humanConversionKey(null, null)).toBeUndefined();
+    expect(isBudgetExempt(identityConversionKey('I'))).toBe(false); // their own bucket
+    const named = await convertOnBehalfOf(humanConversionKey(undefined, 'I'), async () => requestQueue());
+    expect(named.principal).toBe('identity:I');
+  });
+
+  it('budgetKey: admitted and charged under its own key, while the turn stays the principal', async () => {
+    const { pool } = track(makePool({ budgetCapacityMs: 10_000, budgetRefillMsPerMinute: 0 }));
+    await pool.parse('sleep:50', 'html', { principal: 'user:A', budgetKey: 'user:A:export' });
+    expect(pool.budgetLeft('user:A')).toBe(10_000);
+    expect(pool.budgetLeft('user:A:export')).toBeLessThanOrEqual(10_000 - 50);
+  });
+});
+
+/**
+ * #716 small interactive inputs: one worker (a second breaks the §27 memory budget), so fairness is a priority class.
+ * Fixture inputs are classed by their byte length: `smallInputBytes: 12` makes 'sleep:20:s' (10 bytes) small and
+ * anything padded past 12 bytes large.
+ */
+describe('#716 small interactive conversions', () => {
+  const LARGE = (ms: number, tag: string) => `sleep:${ms}:${tag}-${'x'.repeat(16)}`;
+  const SMALL = (ms: number, tag: string) => `sleep:${ms}:${tag}`;
+
+  it('the production class: ≤ 32 KiB, priority only (no deadline or wait of its own), aging 3 s within a wait', () => {
+    const { smallInputBytes, smallAgingMs, deadlineMs, waitMs, reloadCreditMs } = CONTENT_PARSE_LIMITS;
+    expect(smallInputBytes).toBe(32 * 1024);
+    expect(smallAgingMs).toBe(3_000);
+    // #716 load run: a 3 s small deadline answered a 3.3 s 17 KB edit 422. A small input keeps the normal bounds.
+    expect(CONTENT_PARSE_LIMITS).not.toHaveProperty('smallDeadlineMs');
+    expect(CONTENT_PARSE_LIMITS).not.toHaveProperty('smallWaitMs');
+    // Worst case, small or large: wait + a credited reload + the deadline stays inside the 20 s relay.
+    expect(waitMs + reloadCreditMs + deadlineMs).toBeLessThan(20_000);
+    // An aged large waiter + one small conversion of up to 4 s + lag still fits its own wait (reloads credited).
+    expect(smallAgingMs + 4_000 + 1_000).toBeLessThanOrEqual(waitMs);
+  });
+
+  it('a small write is served ahead of a large one that queued before it', async () => {
+    const { pool } = track(makePool({ smallInputBytes: 12, smallAgingMs: 2_000, deadlineMs: 5_000, waitMs: 5_000 }));
+    const order: string[] = [];
+    const running = pool.parse(LARGE(200, 'l1'), 'html', q('user:L1')).then(() => order.push('l1'));
+    await new Promise((r) => setTimeout(r, 20)); // l1 holds the worker
+    const l2 = pool.parse(LARGE(20, 'l2'), 'html', q('user:L2')).then(() => order.push('l2'));
+    const s = pool.parse(SMALL(20, 's'), 'html', q('user:S')).then(() => order.push('s'));
+    await Promise.all([running, l2, s]);
+    expect(order).toEqual(['l1', 's', 'l2']);
+  });
+
+  it('aging: a large waiter that has waited smallAgingMs goes before a small one', async () => {
+    const { pool } = track(makePool({ smallInputBytes: 12, smallAgingMs: 50, deadlineMs: 5_000, waitMs: 5_000 }));
+    const order: string[] = [];
+    const running = pool.parse(LARGE(400, 'l1'), 'html', q('user:L1')).then(() => order.push('l1'));
+    await new Promise((r) => setTimeout(r, 20));
+    const l2 = pool.parse(LARGE(20, 'l2'), 'html', q('user:L2')).then(() => order.push('l2'));
+    const s = pool.parse(SMALL(20, 's'), 'html', q('user:S')).then(() => order.push('s'));
+    await Promise.all([running, l2, s]);
+    expect(order).toEqual(['l1', 'l2', 's']); // l2 waited ~380 ms ≥ 50 ms when l1 finished
+  });
+
+  it('a batch conversion is never small, however short its input', async () => {
+    const { pool } = track(makePool({ smallInputBytes: 12, smallAgingMs: 2_000, deadlineMs: 5_000, waitMs: 5_000 }));
+    const order: string[] = [];
+    const running = pool.parse(LARGE(200, 'l1'), 'html', q('user:L1')).then(() => order.push('l1'));
+    await new Promise((r) => setTimeout(r, 20));
+    const b = pool.toHtml(SMALL(20, 'b'), bq('user:B', 5_000)).then(() => order.push('b'));
+    const s = pool.parse(SMALL(20, 's'), 'html', q('user:S')).then(() => order.push('s'));
+    await Promise.all([running, b, s]);
+    expect(order).toEqual(['l1', 's', 'b']);
+  });
+
+  it('a small conversion slower than the aging bound but under the deadline succeeds (no deadline of its own)', async () => {
+    const { pool } = track(makePool({ smallInputBytes: 12, smallAgingMs: 100, deadlineMs: 2_000 }));
+    await expect(pool.parse(SMALL(400, 's'), 'html', q('user:S'))).resolves.toMatchObject({ type: 'doc' });
+    // …and past the shared deadline it is 422 like any other conversion.
+    const started = Date.now();
+    await expect(pool.parse('hang', 'html', q('user:S'))).rejects.toBeInstanceOf(ContentTooComplexException);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(1_900);
+  });
+
+  it('the #716 load case at production bounds: a small input taking 3.3 s converts (it was a 422 at a 3 s deadline)', async () => {
+    const { smallInputBytes, smallAgingMs, deadlineMs, waitMs } = CONTENT_PARSE_LIMITS;
+    const { pool } = track(makePool({ smallInputBytes, smallAgingMs, deadlineMs, waitMs }));
+    await expect(pool.parse(SMALL(3_300, 's17k'), 'html', q('user:S'))).resolves.toMatchObject({ type: 'doc' });
+  }, 10_000);
+
+  it('a deadline kill logs how late the main-thread timer fired (lateMs: the event loop\'s lag at that moment)', async () => {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const { Logger } = require('@nestjs/common');
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    try {
+      const { pool } = track(makePool({ deadlineMs: 150 }));
+      await expect(pool.parse('hang', 'html', q('user:S'))).rejects.toBeInstanceOf(ContentTooComplexException);
+      const line = warn.mock.calls.map((c) => String(c[0])).find((m) => m.startsWith('CONTENT_PARSE_TOO_COMPLEX'));
+      expect(line).toMatch(/^CONTENT_PARSE_TOO_COMPLEX reason=deadline lateMs=-?\d+ principal=user:S format=html bytes=4 /);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('a small conversion waits no longer than a large one (the same waitMs: past it, 503)', async () => {
+    const { pool } = track(makePool({ smallInputBytes: 12, smallAgingMs: 100, deadlineMs: 5_000, waitMs: 150 }));
+    const running = pool.parse(LARGE(500, 'l1'), 'html', q('user:L1'));
+    await new Promise((r) => setTimeout(r, 20));
+    await expect(pool.parse(LARGE(10, 'l2'), 'html', q('user:L2'))).rejects.toBeInstanceOf(ContentParseBusyException);
+    await expect(pool.parse(SMALL(10, 's'), 'html', q('user:S'))).rejects.toBeInstanceOf(ContentParseBusyException);
+    await running;
+  });
+
+  it('the reload is counted inside the wait: the worker is handed on only once the replacement is ready', async () => {
+    const { pool, spawned } = track(
+      makePool({ smallInputBytes: 12, smallAgingMs: 100, deadlineMs: 100, waitMs: 300 }, ['normal', 'slow-ready:800']),
+    );
+    await pool.parse('warm', 'html', q('user:A'));
+    const killed = pool.parse('hang', 'html', q('user:A')).catch((e) => e); // killed at the 100 ms deadline
+    await until(() => spawned.length === 2); // the replacement is loading (800 ms > the 300 ms wait)
+    const err = await pool.parse(SMALL(10, 's'), 'html', q('user:S')).catch((e) => e);
+    expect(err).toBeInstanceOf(ContentParseBusyException); // the reload was spent inside its wait
+    await expect(killed).resolves.toBeInstanceOf(ContentTooComplexException);
+  });
+
+  it('two small principals behind a killed conversion are both served within the wait (scaled bound)', async () => {
+    // Bound: the running conversion + its reload + one small job per small principal ahead.
+    const { pool, spawned } = track(
+      makePool({ smallInputBytes: 12, smallAgingMs: 1_000, deadlineMs: 300, waitMs: 1_500 }, ['normal', 'slow-ready:300']),
+    );
+    await pool.parse('warm', 'html', q('user:A'));
+    const killed = pool.parse(`hang:${'x'.repeat(16)}`, 'html', q('user:A')).catch((e) => e); // large: killed at 300 ms
+    await new Promise((r) => setTimeout(r, 20));
+    const s1 = pool.parse(SMALL(100, 's1'), 'html', q('user:S1'));
+    const s2 = pool.parse(SMALL(100, 's2'), 'html', q('user:S2'));
+    await expect(Promise.all([s1, s2])).resolves.toHaveLength(2);
+    await expect(killed).resolves.toBeInstanceOf(ContentTooComplexException);
+    expect(spawned.length).toBe(2);
   });
 });

@@ -1,4 +1,4 @@
-import { PdpSearchService } from './pdp-search.service';
+import { PdpSearchService, SearchLimits } from './pdp-search.service';
 
 /**
  * CCC authorization integration test (fork compatibility suite) — the CORE filter-then-retrieve
@@ -20,7 +20,9 @@ import { PdpSearchService } from './pdp-search.service';
  *
  * PASS iff the windowed gate is correct (invariant I5). No DB, no containers — the candidate statement and the
  * hydrate answer a fixed rank-ordered stream (search-db.testkit.ts); the authorization decision is the PDP's
- * `tryFilterResources` stubbed to deny a known set. Same harness as pdp-search.service.spec.ts (CANDIDATE_WINDOW=128).
+ * `tryFilterResources` stubbed to deny a known set. Same harness as pdp-search.service.spec.ts. The window-counting
+ * cases pin fixed 128-id windows (#716 sizes the first window from the page, doubling after); one case runs the default
+ * window sizes over the same stream.
  */
 import { pdpStub, searchDb, SearchRow, userLegCalls } from './search-db.testkit';
 
@@ -33,7 +35,10 @@ const mkRows = (ids: string[]): SearchRow[] =>
   }));
 
 /** The candidate statement and the hydrate over a fixed rank-ordered stream (search-db.testkit.ts). */
-const build = (opts: { pageCandidates: SearchRow[]; denied: Set<string> }) => {
+/** Fixed 128-id windows (the pre-#716 shape these cases count). */
+const FIXED_128: Partial<SearchLimits> = { pdpWindowMin: 128, pdpWindowMax: 128 };
+
+const build = (opts: { pageCandidates: SearchRow[]; denied: Set<string>; limits?: Partial<SearchLimits> }) => {
   const sdb = searchDb({ candidates: opts.pageCandidates });
   const pdp = pdpStub({ userDenied: opts.denied });
   const service = new PdpSearchService(
@@ -43,6 +48,8 @@ const build = (opts: { pageCandidates: SearchRow[]; denied: Set<string> }) => {
     { getUserSpaceIdsQuery: () => sdb.db.selectFrom('space_members').select('spaceId') } as any,
     {} as any,
     pdp,
+    undefined,
+    opts.limits ?? FIXED_128,
   );
   return { service, pdp, ...sdb };
 };
@@ -81,6 +88,21 @@ describe('PdpSearchService — filter-then-retrieve COMPLETENESS beyond the firs
     // A single-window (naive-LIMIT) gate would have called the PDP once and returned empty. #696: still ONE
     // candidate statement — the windows are over the list it returned, in memory.
     expect(userLegCalls(pdp).map((c) => c[3].length)).toEqual([128, 128, 44]);
+    expect(candidateQueries()).toHaveLength(1);
+  });
+
+  it('#716: with the DEFAULT window sizes the gate still reaches candidate #300 (more, smaller windows; one statement)', async () => {
+    const AUTH = 'a-only';
+    const ids = Array.from({ length: 300 }, (_, i) => (i === 299 ? AUTH : `d${i}`));
+    const { service, pdp, candidateQueries } = build({
+      pageCandidates: mkRows(ids),
+      denied: new Set(ids.filter((id) => id !== AUTH)),
+      limits: {},
+    });
+    const { items } = await service.searchPage({ query: 'foo', limit: 25 } as any, { userId: USER, workspaceId: WS });
+    expect(items.map((i: any) => i.id)).toEqual([AUTH]);
+    // The defaults cap every window at 32 ids (need 26 → 52, capped): nine 32s, then the last 12, to the end of the list.
+    expect(userLegCalls(pdp).map((c) => c[3].length)).toEqual([...Array(9).fill(32), 12]);
     expect(candidateQueries()).toHaveLength(1);
   });
 

@@ -41,6 +41,18 @@ export type ConditionalUpdateOutcome = {
    * 2xx no-op (NOT a 412/503) — it is a successful retry, not a conflict or a failure. Anything else means
    * we could not establish the precondition at all (→ 503); only `'duplicate'` and `applied:true` are
    * successes, and `'precondition'`/`'error'`/`'unknown'` may never be read as "applied".
+   *
+   * #716: `'too_large'` — the page is at the API size cap, and this append/prepend was neither a duplicate nor a
+   * stale write, so it was refused unapplied (→ 422 `page_too_large`). `'applied_unconfirmed'` — the mutation began
+   * (or applied) on the live document but a throw or a failed store left it unconfirmed as saved: NEITHER applied
+   * nor not-applied, so never a retryable 503 (→ 500 `write_outcome_unknown`, which the platform answers 504 "may
+   * have been applied"). A keyed retry is still safe: the key rides the live document with the content.
    */
-  reason?: 'precondition' | 'error' | 'unknown' | 'duplicate';
+  reason?:
+    | 'precondition'
+    | 'error'
+    | 'unknown'
+    | 'duplicate'
+    | 'too_large'
+    | 'applied_unconfirmed';
 };

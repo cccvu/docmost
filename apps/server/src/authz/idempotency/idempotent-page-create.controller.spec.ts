@@ -280,6 +280,20 @@ describe('a fresh keyed create', () => {
     }
   });
 
+  it('#716 no echo: a markdown/html create answers the canonical JSON it stored, never a main-thread conversion', async () => {
+    const stored = { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'hi' }] }] };
+    for (const format of ['markdown', 'html'] as const) {
+      const t = build();
+      t.pageService.create.mockImplementationOnce(async () => ({ ...PAGE, content: stored }) as never);
+      const res = (await t.controller.create(body({ content: '# hi', format }), USER, WS)) as { content: unknown };
+      expect(res.content).toBe(stored); // the very object stored: no serialization ran
+    }
+    // A replay answers the same way (the existing page's canonical JSON).
+    const r = build({ reservation: { outcome: 'replay', resourceId: 'page-old' }, replayed: { ...PAGE, id: 'page-old', content: stored } });
+    const replay = (await r.controller.create(body({ content: '# hi', format: 'markdown' }), USER, WS)) as { content: unknown };
+    expect(replay.content).toBe(stored);
+  });
+
   it('echoes the native body: no content on the create response, so no format conversion', async () => {
     const t = build();
     const res = await t.controller.create(body({ content: '# hi', format: 'markdown' }), USER, WS);

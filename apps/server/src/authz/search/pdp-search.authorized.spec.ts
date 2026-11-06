@@ -1,7 +1,7 @@
 import { BadRequestException, ServiceUnavailableException } from '@nestjs/common';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { SpaceMemberRepo } from '@docmost/db/repos/space/space-member.repo';
-import { PdpSearchService, SearchCandidateFilters } from './pdp-search.service';
+import { PdpSearchService, SearchCandidateFilters, SearchLimits } from './pdp-search.service';
 import { pdpStub, searchDb, SearchRow, serviceLegCalls, userLegCalls } from './search-db.testkit';
 
 /**
@@ -33,6 +33,7 @@ function build(opts: {
   userDenied?: Set<string>;
   serviceDenied?: Set<string>;
   withPdp?: boolean;
+  limits?: Partial<SearchLimits>;
 }) {
   const { db, queries, candidateQueries, hydrateQueries } = searchDb({ candidates: opts.candidates });
   const pdp = pdpStub({ userDenied: opts.userDenied, serviceDenied: opts.serviceDenied });
@@ -46,11 +47,15 @@ function build(opts: {
     spaceMemberRepo,
     {} as any,
     opts.withPdp === false ? undefined : pdp,
+    undefined,
+    opts.limits,
   );
   return { service, queries, candidateQueries, hydrateQueries, pdp };
 }
 
 const ids = (n: number, p = 'a') => Array.from({ length: n }, (_, i) => `${p}${i}`);
+/** Fixed 128-id windows: the cases below that count windows predate #716's page-sized first window. */
+const FIXED_128: Partial<SearchLimits> = { pdpWindowMin: 128, pdpWindowMax: 128 };
 const run = (service: PdpSearchService, params: any, filters: SearchCandidateFilters = {}, extra: any = {}) =>
   service.searchAuthorized({ query: 'roadmap', ...params }, filters, { userId: USER, workspaceId: WS, ...extra });
 
@@ -66,7 +71,7 @@ describe('PdpSearchService.searchAuthorized — #615 filters are candidate SQL (
 
   it('puts every filter into THE candidate statement, with its value bound (not interpolated)', async () => {
     // 200 authorized candidates, offset 50 + limit 100 (+1 peek) → two 128-id PDP windows, ONE statement (#696).
-    const { service, candidateQueries, pdp } = build({ candidates: mkRows(ids(200)) });
+    const { service, candidateQueries, pdp } = build({ candidates: mkRows(ids(200)), limits: FIXED_128 });
     await run(service, { limit: 100, offset: 50 }, FILTERS);
     const windows = candidateQueries();
     expect(windows).toHaveLength(1);
@@ -180,7 +185,7 @@ describe('PdpSearchService.searchAuthorized — hasMore is a one-row peek past t
 
   it('the peek walks past a window when the page ends exactly on it (the 129th candidate decides)', async () => {
     // limit 100, offset 28 → need 129: the peek row sits in the SECOND 128-id PDP window (one statement).
-    const { service, candidateQueries, pdp } = build({ candidates: mkRows(ids(129)) });
+    const { service, candidateQueries, pdp } = build({ candidates: mkRows(ids(129)), limits: FIXED_128 });
     const page = await run(service, { limit: 100, offset: 28 });
     expect(page.items).toHaveLength(100);
     expect(page.hasMore).toBe(true);

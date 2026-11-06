@@ -44,6 +44,11 @@ jest.mock('../../integrations/import/utils/import-formatter', () => ({
   unwrapFromParagraph: jest.fn(),
 }));
 jest.mock('../../core/page/services/page.service', () => ({ PageService: class {} }));
+// #716 I1: the seam computes its levels through the linear helper (its own spec pins it linear and upstream-equal).
+jest.mock('../import/import-page-levels', () => {
+  const actual = jest.requireActual('../import/import-page-levels');
+  return { importPageLevels: jest.fn((...a: unknown[]) => actual.importPageLevels(...a)) };
+});
 jest.mock('../../integrations/import/services/import-attachment.service', () => ({ ImportAttachmentService: class {} }));
 
 import {
@@ -57,6 +62,7 @@ import { ImportService } from '../../integrations/import/services/import.service
 import { FileImportTaskService } from '../../integrations/import/services/file-import-task.service';
 import { FileTaskProcessor } from '../../integrations/import/processors/file-task.processor';
 import { QueueJob } from '../../integrations/queue/constants';
+import { importPageLevels } from '../import/import-page-levels';
 
 jest.setTimeout(180_000);
 afterAll(() => closeContentParser());
@@ -162,14 +168,30 @@ describe('#643 zip import (seam #176)', () => {
   const write = (rel: string, content: string | Buffer) => writeFileSync(join(extractDir, rel), content);
 
   const setup = () => {
-    const trx = { insertInto: () => ({ values: () => ({ execute: async () => undefined }) }) };
+    const inserted: Array<{ id: string; parentPageId: string | null; title: string }> = [];
+    const trx = {
+      insertInto: () => ({
+        values: (v: { id: string; parentPageId: string | null; title: string }) => {
+          inserted.push(v);
+          return { execute: async () => undefined };
+        },
+      }),
+    };
     const db = {
       selectFrom: jest.fn(() => {
-        const q: any = { select: () => q, where: () => q, executeTakeFirst: async () => ({ slug: 's' }) };
+        // #716 I2: `execute` is the rollback's "which attempted pages exist?" check (none, by default: rolled back).
+        const q: any = {
+          select: () => q,
+          where: () => q,
+          executeTakeFirst: async () => ({ slug: 's' }),
+          execute: async () => existingPages(),
+        };
         return q;
       }),
       transaction: jest.fn(() => ({ execute: (fn: (t: unknown) => unknown) => fn(trx) })),
     };
+    let existingPages: () => Array<{ id: string }> = () => [];
+    const setExisting = (f: () => Array<{ id: string }>) => (existingPages = f);
     const importAttachmentService = { processAttachments: jest.fn(async ({ html }: { html: string }) => html) };
     const importService = {
       processHTML: jest.fn(async () => DOC),
@@ -177,6 +199,7 @@ describe('#643 zip import (seam #176)', () => {
       createYdoc: async () => null,
     };
     const logger = { error: jest.fn(), log: jest.fn(), debug: jest.fn(), warn: jest.fn() };
+    const attachmentQueue = { add: jest.fn(async () => undefined) }; // #716 I2
     const service = new FileImportTaskService(
       {} as any, // storageService
       importService as any,
@@ -187,11 +210,13 @@ describe('#643 zip import (seam #176)', () => {
       {} as any, // moduleRef
       { emit: jest.fn() } as any,
       { logBatchWithContext: jest.fn() } as any,
+      attachmentQueue as any,
     );
     (service as any).logger = logger;
     const fileTask = { id: 'task-1', source: 'generic', spaceId: 'space-1', workspaceId: 'ws-1', creatorId: 'user-1' };
     const run = () => service.processGenericImport({ extractDir, fileTask: fileTask as any });
-    return { db, importAttachmentService, importService, logger, run };
+    const setAudit = (audit: unknown) => ((service as any).auditService = audit);
+    return { db, importAttachmentService, importService, logger, run, attachmentQueue, inserted, setAudit, setExisting };
   };
 
   it('refuses an oversize page file by its path in the archive, before the transaction and any upload', async () => {
@@ -257,6 +282,119 @@ describe('#643 zip import (seam #176)', () => {
       expect(err.message).not.toContain(tmpdir());
     }
   });
+
+  it('#716 I5: one shared batch queue for the whole import — the creator’s turn, admitted once', async () => {
+    write('docs/a.md', '# a');
+    write('docs/b.md', '# b');
+    write('docs/c.md', '# c');
+    const { importService, run } = setup();
+    await run();
+    expect(toHtml).toHaveBeenCalledTimes(3);
+    const queues = new Set([...toHtml.mock.calls.map((c) => c[1]), ...importService.processHTML.mock.calls.map((c: unknown[]) => c[1])]);
+    expect(queues.size).toBe(1); // the SAME object for every conversion of the import
+    const [queue] = [...queues] as Array<{ principal: string; batch: boolean; budgetTurn: { admitted: boolean } }>;
+    expect(queue).toMatchObject({ principal: 'user:user-1', batch: true });
+    expect(queue.budgetTurn.admitted).toBe(true); // the real pool admitted it, once, and the turn is shared
+  });
+
+  it('#716 I1: nested folders insert every parent before its child (linear levels)', async () => {
+    mkdirSync(join(extractDir, 'docs', 'x', 'y'), { recursive: true });
+    write('docs/x/y/z.html', '<p>z</p>');
+    write('docs/x/y.html', '<p>y</p>');
+    write('docs/x.html', '<p>x</p>');
+    write('docs/top.html', '<p>t</p>');
+    const { inserted, run } = setup();
+    await run();
+    const at = new Map(inserted.map((p, i) => [p.id, i]));
+    const withParent = inserted.filter((p) => p.parentPageId);
+    expect(withParent).toHaveLength(2); // y under x, z under y
+    for (const p of withParent) expect(at.get(p.parentPageId!)).toBeLessThan(at.get(p.id)!);
+    expect(importPageLevels).toHaveBeenCalled(); // through the linear helper, not upstream's O(N²) BFS
+  });
+
+  it('#716 I2: a rolled-back import queues the attachment deletion of every page it uploaded for', async () => {
+    write('docs/a.html', '<p>a</p>');
+    write('docs/b.html', '<p>b</p>');
+    write('docs/c.html', '<p>c</p>');
+    const { importAttachmentService, importService, attachmentQueue, run } = setup();
+    importService.processHTML.mockResolvedValueOnce(DOC).mockRejectedValueOnce(new Error('boom on page 2'));
+    const err = await run().catch((e) => e);
+    expect(err).toBeInstanceOf(ImportTaskFailure);
+    const attempted = importAttachmentService.processAttachments.mock.calls.map((c) => (c[0] as unknown as { pageId: string }).pageId);
+    expect(attempted).toHaveLength(2); // page 3 was never reached
+    expect(attachmentQueue.add.mock.calls).toEqual(
+      attempted.map((id: string) => [
+        QueueJob.DELETE_PAGE_ATTACHMENTS,
+        { pageId: id },
+        expect.objectContaining({ jobId: `delete-page-attachments-${id}` }),
+      ]),
+    );
+  });
+
+  it('#716 I2: a committed import queues no deletion, and a refusal before any upload queues none', async () => {
+    write('docs/a.html', '<p>a</p>');
+    const ok = setup();
+    await ok.run();
+    expect(ok.importAttachmentService.processAttachments).toHaveBeenCalledTimes(1);
+    expect(ok.attachmentQueue.add).not.toHaveBeenCalled();
+
+    write('docs/big.html', Buffer.alloc(CAP + 1, 97));
+    const refused = setup();
+    await expect(refused.run()).rejects.toBeInstanceOf(PayloadTooLargeException);
+    expect(refused.attachmentQueue.add).not.toHaveBeenCalled();
+  });
+
+  it('#716 I2: a failure AFTER the commit never deletes the committed pages’ attachments', async () => {
+    write('docs/a.html', '<p>a</p>');
+    const t = setup();
+    const audit = {
+      logBatchWithContext: jest.fn(() => {
+        throw new Error('audit sink down');
+      }),
+    };
+    t.setAudit(audit);
+    await t.run().catch(() => undefined);
+    expect(t.importAttachmentService.processAttachments).toHaveBeenCalledTimes(1);
+    expect(audit.logBatchWithContext).toHaveBeenCalled(); // the transaction committed, then the audit threw
+    expect(t.attachmentQueue.add).not.toHaveBeenCalled();
+  });
+
+  it('#716 I2: an ambiguous COMMIT failure (the pages exist) deletes only the attachments of pages that do not', async () => {
+    write('docs/a.html', '<p>a</p>');
+    write('docs/b.html', '<p>b</p>');
+    const t = setup();
+    // The transaction "fails" after the server committed page a only (stands for a reset on COMMIT).
+    t.importService.processHTML.mockResolvedValueOnce(DOC).mockRejectedValueOnce(new Error('connection reset'));
+    t.setExisting(() => [{ id: (t.importAttachmentService.processAttachments.mock.calls[0][0] as unknown as { pageId: string }).pageId }]);
+    await t.run().catch(() => undefined);
+    const [committedId, rolledBackId] = t.importAttachmentService.processAttachments.mock.calls.map(
+      (c) => (c[0] as unknown as { pageId: string }).pageId,
+    );
+    expect((t.attachmentQueue.add.mock.calls as unknown[][]).map((c) => (c[1] as { pageId: string }).pageId)).toEqual([rolledBackId]);
+    expect(committedId).not.toBe(rolledBackId);
+  });
+
+  it('#716 I2: when the existence check fails, nothing is deleted (logged): leaking beats deleting real attachments', async () => {
+    write('docs/a.html', '<p>a</p>');
+    const t = setup();
+    t.importService.processHTML.mockRejectedValueOnce(new Error('boom'));
+    t.setExisting(() => {
+      throw new Error('db down');
+    });
+    await expect(t.run()).rejects.toBeInstanceOf(ImportTaskFailure);
+    expect(t.attachmentQueue.add).not.toHaveBeenCalled();
+    expect(t.logger.error).toHaveBeenCalledWith(expect.stringContaining('PAGE_ATTACHMENT_CLEANUP_ENQUEUE_FAILED import:'));
+  });
+
+  it('#716 I2: a failing queue never masks the import error (logged, best effort)', async () => {
+    write('docs/a.html', '<p>a</p>');
+    const { importService, attachmentQueue, logger, run } = setup();
+    importService.processHTML.mockRejectedValueOnce(new Error('boom'));
+    attachmentQueue.add.mockRejectedValueOnce(new Error('redis down'));
+    const err = await run().catch((e) => e);
+    expect(err).toBeInstanceOf(ImportTaskFailure);
+    expect(logger.error).toHaveBeenCalledWith(expect.stringContaining('PAGE_ATTACHMENT_CLEANUP_ENQUEUE_FAILED'));
+  });
 });
 
 describe('#643 zip import task, end to end: what the file task stores', () => {
@@ -284,6 +422,7 @@ describe('#643 zip import task, end to end: what the file task stores', () => {
       {} as any,
       { emit: jest.fn() } as any,
       {} as any,
+      { add: jest.fn(async () => undefined) } as any, // #716 I2: attachment queue
     );
     (service as any).logger = { error: jest.fn(), log: jest.fn(), debug: jest.fn(), warn: jest.fn() };
     const updateTaskStatus = jest.fn();

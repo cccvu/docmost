@@ -19,8 +19,9 @@ Rules that a future change must not break:
    never inferred from availability, request content, headers, cookies, URLs, or client state.
 2. **No runtime switch.** The mode is fixed for the life of the process; changing it requires a redeploy.
 3. **No downgrade fallback.** In `remote` mode an unreachable or failing authorization service results in
-   deny/empty (fail-closed), never a fall back to native decisions. Falling back would grant whatever the
-   local mirror allows, which the external service may have revoked.
+   a retryable 503 for decisions and lists alike (fail-closed; #696, #716), never a fall back to native
+   decisions and never an empty or partial list. Falling back would grant whatever the local mirror allows,
+   which the external service may have revoked.
 4. **`remote` disables native credentials for ALL callers.** The native credential routes return 404 in
    remote mode even to a caller presenting the service secret; sessions are minted only through the service
    bridge (see below).

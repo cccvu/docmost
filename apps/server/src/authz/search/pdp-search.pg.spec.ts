@@ -201,6 +201,54 @@ d('PdpSearchService.searchAuthorized over real rows (#615)', () => {
     expect(out.hasMore).toBe(false);
   });
 
+  // ---- #716: the page-sized first window changes how many ids each PDP call carries, never the answer -------------
+
+  describe('#716 the default windows find what fixed 128-id windows find', () => {
+    const WSPACE = uuid(61);
+    const wrens = Array.from({ length: 150 }, (_, i) => uuid(2000 + i));
+    // A sparse authorized set (50 of 150), spread over the whole rank order, so a page needs several windows.
+    const denied = wrens.filter((_, i) => i % 3 !== 0);
+
+    beforeAll(async () => {
+      await pg`insert into spaces (id, name, slug, workspace_id) values (${WSPACE}, 'Wrens', 'wrens', ${WS})`;
+      for (const [i, id] of wrens.entries()) {
+        const text = 'wren '.repeat((i % 5) + 1); // five rank levels; equal ranks are id-ordered
+        await pg`
+          insert into pages (id, slug_id, title, space_id, workspace_id, creator_id, tsv, text_content)
+          values (${id}, ${'w' + id.slice(-4)}, ${'Wren ' + i}, ${WSPACE}, ${WS}, ${ALICE},
+                  to_tsvector('english', ${text}), ${text})`;
+      }
+    });
+
+    const page = async (offset: number, limits: Partial<SearchLimits>) => {
+      const b = build({ userDenied: denied, limits });
+      const out = await b.service.searchAuthorized(
+        { query: 'wren', spaceId: WSPACE, limit: 10, offset } as any,
+        {},
+        { userId: ALICE, workspaceId: WS },
+      );
+      return {
+        answer: { ids: out.items.map((r: any) => r.id), hasMore: out.hasMore },
+        windows: b.pdp.tryFilterResources.mock.calls.map((c) => c[3].length),
+      };
+    };
+
+    it('the same items and hasMore on every page, over real rows', async () => {
+      const seen: string[] = [];
+      for (const offset of [0, 10, 20, 30, 40, 50]) {
+        const dflt = await page(offset, {});
+        const fixed = await page(offset, { pdpWindowMin: 128, pdpWindowMax: 128 });
+        expect(dflt.answer).toEqual(fixed.answer);
+        seen.push(...dflt.answer.ids);
+      }
+      // Non-vacuous: every authorized page came back exactly once, and the default windows really were smaller.
+      expect(seen.sort()).toEqual(wrens.filter((id) => !denied.includes(id)).sort());
+      expect((await page(40, {})).answer.hasMore).toBe(false);
+      expect((await page(0, {})).windows[0]).toBe(32);
+      expect((await page(0, { pdpWindowMin: 128, pdpWindowMax: 128 })).windows[0]).toBe(128);
+    });
+  });
+
   // ---- #696: one candidate statement, a hydrate of the authorized slice, statement timeouts ----------------------
 
   describe('#696 hydrate and timeouts over real rows', () => {

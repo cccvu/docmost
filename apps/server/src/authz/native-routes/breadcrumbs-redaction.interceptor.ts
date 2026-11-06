@@ -12,6 +12,7 @@ import { Observable, mergeMap } from 'rxjs';
 import { validate as isValidUUID } from 'uuid';
 import { AUTHZ_MODE, AuthzMode } from '../mode/authz-mode';
 import { HttpAuthzClient } from '../http-authz.client';
+import { authzUnavailable } from '../authz-unavailable';
 
 /** The upstream routes that return a page's ancestor chain (`Controller.handler`). `native-route-authz.fitness.spec.ts`
  *  pins this set to exactly the routes whose handler reaches `.getPageBreadCrumbs(`. */
@@ -57,9 +58,11 @@ interface WrappedBody {
  * this can reason about and the request fails closed. Array order is never trusted (the recursive CTE has no
  * ORDER BY), but the response keeps upstream's order for whatever it keeps.
  *
- * Decision. One `filterResources(view)` over the ancestor ids. The client is fail-closed (a failed or malformed
- * chunk adds no ids) and a throw is treated the same, so a PDP outage answers `[self]`. A caller who can view the
- * whole chain gets the handler's body back untouched (the same object), so the response is byte-identical.
+ * Decision. One `tryFilterResources(view)` over the ancestor ids. A PDP that could not answer (a failed or malformed
+ * chunk) is a 503 (`authzUnavailable`, #716), never `[self]`: a chain cut at the requested page reads as "this page
+ * has no visible parents", which the client renders as a root page. A rejection from the client (it never rejects, so
+ * that is a bug) propagates as the error it is. An empty answer is a real deny and keeps `[self]`. A caller who can
+ * view the whole chain gets the handler's body back untouched (the same object), so the response is byte-identical.
  *
  * Registered by the fork-owned `NativeRouteAuthzModule` (no upstream seam). Native mode keeps the upstream response:
  * the stock `canUserAccessPage` already requires access through every restricted ancestor.
@@ -130,17 +133,14 @@ export class BreadcrumbsRedactionInterceptor implements NestInterceptor {
   }
 
   private async viewable(userId: string, ancestors: Crumb[]): Promise<Set<string>> {
-    try {
-      const ids = await this.authz.filterResources(
-        { provider: 'docmost', externalId: userId },
-        'view',
-        'page',
-        ancestors.map((r) => r.id),
-      );
-      return new Set(Array.isArray(ids) ? ids.filter((id): id is string => typeof id === 'string') : []);
-    } catch {
-      return new Set();
-    }
+    const ids = await this.authz.tryFilterResources(
+      { provider: 'docmost', externalId: userId },
+      'view',
+      'page',
+      ancestors.map((r) => r.id),
+    );
+    if (ids === null) throw authzUnavailable();
+    return new Set(ids);
   }
 
   private unexpected(why: string): InternalServerErrorException {

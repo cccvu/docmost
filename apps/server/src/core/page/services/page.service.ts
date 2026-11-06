@@ -54,6 +54,8 @@ import {
 import { parseUntrustedContent } from '../../../editor-compat/content-parse/content-parse.service';
 // CCC #573 (UPSTREAM_MODIFICATIONS #121): remote mode refuses a duplicate that would drop a restriction.
 import { hasCopyRestrictionGuard } from '../../../authz/page-copy/copy-restriction.guard';
+// CCC #716 (UPSTREAM_MODIFICATIONS #121): an append/prepend to a page already at the API size cap is refused 422.
+import { applyWithinPageCap, assertPageCanGrow } from '../../../authz/page-write/page-size';
 import { WatcherService } from '../../watcher/watcher.service';
 import { sql } from 'kysely';
 import { TransclusionService } from '../transclusion/transclusion.service';
@@ -229,6 +231,10 @@ export class PageService {
     user: User,
     trx?: KyselyTransaction,
   ): Promise<Page> {
+    // CCC #716: refuse an append/prepend to a page at the cap BEFORE the row write, so a refused write renames nothing.
+    if (updatePageDto.content && updatePageDto.operation && updatePageDto.format) {
+      await assertPageCanGrow(this.db, page.id, updatePageDto.operation);
+    }
     const contributors = new Set<string>(page.contributorIds);
     contributors.add(user.id);
     const contributorIds = Array.from(contributors);
@@ -290,10 +296,13 @@ export class PageService {
     const prosemirrorJson = await this.parseProsemirrorContent(content, format);
 
     const documentName = `page.${pageId}`;
-    await this.collaborationGateway.handleYjsEvent(
-      'updatePageContent',
-      documentName,
-      { operation, prosemirrorJson, user },
+    // CCC #716: an append/prepend re-checks the page cap and applies under the page's growth lock. A replace just applies.
+    await applyWithinPageCap(this.db, pageId, operation, () =>
+      this.collaborationGateway.handleYjsEvent(
+        'updatePageContent',
+        documentName,
+        { operation, prosemirrorJson, user },
+      ),
     );
   }
 

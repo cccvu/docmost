@@ -232,7 +232,8 @@ describe('ExportAttachmentPlan (#699)', () => {
   });
 
   it('a HUNG exists() (the S3 client sets no request timeout) fails 503 within EXPORT_STORAGE_TIMEOUT_MS, not never', async () => {
-    const store = { exists: jest.fn(() => new Promise<boolean>(() => undefined)), readStream: jest.fn() };
+    let finish: (v: boolean) => void = () => undefined;
+    const store = { exists: jest.fn(() => new Promise<boolean>((r) => (finish = r))), readStream: jest.fn() };
     const log = logger();
     const plan = new ExportAttachmentPlan(store, 'page:p', limits({ storageTimeoutMs: 100 }), log);
     const zip = new JSZip();
@@ -244,6 +245,8 @@ describe('ExportAttachmentPlan (#699)', () => {
     expect(log.error).toHaveBeenCalledWith(
       expect.stringMatching(/^EXPORT_ABORTED reason=storage_error export=page:p phase=precheck: exists\(\) did not answer within 100 ms/),
     );
+    finish(false); // #716: the hung HEAD holds its process-wide slot until it settles; let it, so no later spec inherits it
+    await new Promise((r) => setImmediate(r));
   });
 });
 
@@ -261,5 +264,113 @@ describe('withStorageTimeout', () => {
 
   it('a storage timeout is a failure, never "no such object"', () => {
     expect(isMissingObjectError(new StorageTimeoutError('exists()', 10))).toBe(false);
+  });
+});
+
+describe('#716 M4: storage HEADs are bounded across every export in the process', () => {
+  /** A storage whose every exists() waits until `releaseAll()`; counts what is in flight. */
+  function gatedStorage() {
+    let inFlight = 0;
+    let max = 0;
+    const waiting: Array<() => void> = [];
+    let open = false;
+    const exists = jest.fn(async () => {
+      inFlight++;
+      max = Math.max(max, inFlight);
+      if (!open) await new Promise<void>((r) => waiting.push(r));
+      inFlight--;
+      return true;
+    });
+    return {
+      exists,
+      readStream: jest.fn(async () => Readable.from([Buffer.from('x')])),
+      max: () => max,
+      releaseAll: () => {
+        open = true;
+        waiting.splice(0).forEach((r) => r());
+      },
+    };
+  }
+  const settle = async () => {
+    for (let i = 0; i < 20; i++) await new Promise((r) => setImmediate(r));
+  };
+
+  it('three exports at 8 each never have more than 16 HEADs — or 16 storage timers — in flight', async () => {
+    const storage = gatedStorage();
+    const limitsModule = jest.requireActual('./export-limits') as typeof import('./export-limits');
+    const timed = jest.spyOn(limitsModule, 'withStorageTimeout');
+    const plans = [0, 1, 2].map((n) => {
+      const plan = new ExportAttachmentPlan(storage, `page:p${n}`, limits(), logger());
+      const zip = new JSZip();
+      for (let i = 0; i < 10; i++) plan.add(zip, `/files/a${n}-${i}/x.png`, att(`a${n}-${i}`), page);
+      return plan.seal(zip);
+    });
+    await settle();
+    expect(storage.exists).toHaveBeenCalledTimes(16); // 24 wanted to run (3 × 8)
+    expect(storage.max()).toBe(16);
+    // The storage timeout starts only once a HEAD holds its slot: time queued for a slot is never a storage 503.
+    expect(timed).toHaveBeenCalledTimes(16);
+    storage.releaseAll();
+    await Promise.all(plans);
+    expect(storage.exists).toHaveBeenCalledTimes(30);
+    expect(storage.max()).toBeLessThanOrEqual(16);
+    timed.mockRestore();
+  });
+
+  it('#716: a HEAD that outlives its storage timeout keeps its slot until it settles (the socket is still busy)', async () => {
+    const storage = gatedStorage();
+    // Two exports start 16 HEADs that hang; each export gives up on them at its 50 ms storage timeout (503).
+    const failed = [0, 1].map((n) => {
+      const plan = new ExportAttachmentPlan(storage, `page:slow${n}`, limits({ storageTimeoutMs: 50 }), logger());
+      const zip = new JSZip();
+      for (let i = 0; i < 8; i++) plan.add(zip, `/files/s${n}-${i}/x.png`, att(`s${n}-${i}`), page);
+      return plan.seal(zip).catch((e) => e);
+    });
+    for (const f of failed) await expect(f).resolves.toBeInstanceOf(ExportStorageException);
+    expect(storage.exists).toHaveBeenCalledTimes(16);
+    // Those 16 HEADs are still running against storage: a third export starts none until they settle.
+    const next = new ExportAttachmentPlan(storage, 'page:next', limits(), logger());
+    const zip2 = new JSZip();
+    for (let i = 0; i < 8; i++) next.add(zip2, `/files/n-${i}/x.png`, att(`n-${i}`), page);
+    const sealing = next.seal(zip2);
+    await settle();
+    expect(storage.exists).toHaveBeenCalledTimes(16);
+    expect(storage.max()).toBe(16);
+    storage.releaseAll();
+    await sealing;
+    expect(storage.exists).toHaveBeenCalledTimes(24);
+  });
+
+  it('#716: no HEAD slot in time (not a build stop) is a busy engine (503 engine_busy), not a storage error', async () => {
+    jest.useFakeTimers();
+    try {
+      const storage = gatedStorage();
+      const slow = limits({ storageTimeoutMs: 300_000 }); // the holders' HEADs neither time out nor hit the backstop here
+      // Two exports take all 16 process-wide slots with HEADs that hang until released.
+      const holders = [0, 1].map((n) => {
+        const plan = new ExportAttachmentPlan(storage, `page:hold${n}`, slow, logger());
+        const z = new JSZip();
+        for (let i = 0; i < 8; i++) plan.add(z, `/files/g${n}-${i}/x.png`, att(`g${n}-${i}`), page);
+        return plan.seal(z);
+      });
+      await jest.advanceTimersByTimeAsync(0);
+      expect(storage.max()).toBe(16);
+      const log = logger();
+      const waiter = new ExportAttachmentPlan(storage, 'page:w', limits(), log);
+      const z = new JSZip();
+      waiter.add(z, '/files/w/x.png', att('w'), page);
+      const err = waiter.seal(z).catch((e) => e);
+      await jest.advanceTimersByTimeAsync(60_001); // EXISTS_SLOT_MAX_WAIT_MS outside a build
+      const e = await err;
+      expect(e).not.toBeInstanceOf(ExportStorageException);
+      expect(e.getStatus()).toBe(503);
+      expect(e.getResponse()).toMatchObject({ code: 'engine_busy' });
+      expect(log.warn).toHaveBeenCalledWith(expect.stringMatching(/^EXPORT_BUSY scope=storage_heads export=page:w /));
+      expect(log.error).not.toHaveBeenCalled();
+      storage.releaseAll();
+      await Promise.all(holders);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 });

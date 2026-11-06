@@ -1,7 +1,7 @@
 import * as postgres from 'postgres';
 import { Kysely } from 'kysely';
 import { Readable } from 'node:stream';
-import { Logger, ValidationPipe } from '@nestjs/common';
+import { Logger, ServiceUnavailableException, ValidationPipe } from '@nestjs/common';
 import { FastifyAdapter, NestFastifyApplication } from '@nestjs/platform-fastify';
 import { Test } from '@nestjs/testing';
 import { JwtService } from '@nestjs/jwt';
@@ -646,6 +646,76 @@ d('public share reads over real rows (#660/#334)', () => {
       expect(ids(await search(uuid(599)))).toEqual([]);
       jest.spyOn(shareRepo, 'findById').mockResolvedValue(undefined as any);
       expect(ids(await search(S_ROOT))).toEqual([]);
+    });
+
+    // #716: the fork runs the share search itself — upstream's own restriction reads on its transaction, then a
+    // capped-headline full-text statement — so every statement has a statement_timeout. It must find exactly what
+    // the stock upstream search finds. Ranks are equal in this fixture and the headline is capped, so the id SET is
+    // compared (the order and the highlight are pinned separately).
+    const stockIds = async (shareId: string) => {
+      const stock = new SearchService(db, pageRepo, shareRepo, {} as any, pagePermissionRepo);
+      const { items } = await stock.searchPage({ query: 'roadmap', shareId } as any, { workspaceId: WS });
+      return items.map((i: any) => i.id).sort();
+    };
+
+    it.each([
+      ['includeSubPages over a restricted child and its grandchild', S_ROOT, [ROOT, CHILD]],
+      ['includeSubPages=false (the child is not searched)', S_NOSUB, [NOSUB]],
+      ['a direct share', S_DIRECT, [DIRECT]],
+      ['a trashed shared page', S_TR, []],
+    ])('#716 %s: the same pages as the stock upstream search', async (_n, shareId, want) => {
+      expect(await stockIds(shareId)).toEqual([...want].sort());
+      expect(ids(await search(shareId))).toEqual([...want].sort());
+    });
+
+    it('#716 a share whose page moved under a restricted parent: empty, as stock (control: both find it before the move)', async () => {
+      expect(await stockIds(S_MV)).toEqual([MV]);
+      expect(ids(await search(S_MV))).toEqual([MV]);
+      await pg`update pages set parent_page_id = ${RPARENT} where id = ${MV}`;
+      expect(await stockIds(S_MV)).toEqual([]);
+      expect(ids(await search(S_MV))).toEqual([]);
+    });
+
+    it('#716 limit/offset page through the share deterministically (id tiebreak on equal ranks), with no space and a capped highlight', async () => {
+      const page = async (offset: number) =>
+        (await post('/search/share-search', { query: 'roadmap', shareId: S_ROOT, limit: 1, offset })).json().items;
+      const [p0, p1, p2] = [await page(0), await page(1), await page(2)];
+      expect([...p0, ...p1, ...p2].map((i: any) => i.id)).toEqual([ROOT, CHILD]);
+      expect(p0[0]).not.toHaveProperty('space');
+      expect(p0[0].highlight).toBe('<b>roadmap</b> body');
+    });
+
+    it('#716 every share statement runs under statement_timeout: a lock-blocked restriction read and a slow full-text statement are 503 engine_busy (57014)', async () => {
+      const svc = new PdpSearchService(db, pageRepo, shareRepo, {} as any, pagePermissionRepo, undefined, shareService, {
+        statementTimeoutMs: 150,
+        minStatementMs: 1,
+      });
+      const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+      const run = () => svc.searchPage({ query: 'roadmap', shareId: S_DIRECT } as any, { workspaceId: WS });
+      const expectBusy = async () => {
+        const err: any = await run().catch((e) => e);
+        expect(err).toBeInstanceOf(ServiceUnavailableException);
+        expect(err.getResponse()).toMatchObject({ code: 'engine_busy' });
+      };
+      // The restricted-ancestor read (upstream's own method, on the search's transaction) waits on a held lock: its
+      // statement_timeout cancels it. Without the timeout it would wait as long as the lock is held.
+      await pg.begin(async (tx) => {
+        await tx.unsafe('lock table page_access in access exclusive mode');
+        await expectBusy();
+      });
+      // The full-text statement: f_unaccent sleeping 300 ms outlives the 150 ms statement_timeout.
+      await pg`create or replace function f_unaccent(text) returns text language plpgsql immutable as
+        $$ begin perform pg_sleep(0.3); return $1; end $$`;
+      try {
+        await expectBusy();
+      } finally {
+        await pg`create or replace function f_unaccent(text) returns text language sql immutable as $$ select $1 $$`;
+      }
+      expect(warn.mock.calls.filter((c) => /SEARCH_SHED reason=sqlstate code=57014 kind=share/.test(String(c[0])))).toHaveLength(2);
+      // Control: the same search answers once nothing blocks it, and the pooled connections keep no timeout.
+      expect((await run()).items.map((i: any) => i.id)).toEqual([DIRECT]);
+      const settings = await Promise.all([1, 2, 3, 4].map(() => pg`show statement_timeout`));
+      expect(settings.map((r) => r[0].statement_timeout)).toEqual(['0', '0', '0', '0']);
     });
   });
   describe('expiry at READ time, end to end (real PdpShareRepo, no sweeper) (#335)', () => {

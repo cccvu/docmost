@@ -77,17 +77,27 @@ export class PdpSpaceMemberRepo extends SpaceMemberRepo {
     return role ? [{ userId, role }] : (undefined as unknown as UserSpaceRole[]);
   }
 
-  /** Reverse index: the space ids this user may view, straight from the PDP. */
+  /**
+   * Reverse index: the space ids this user may view, straight from the PDP. #716: a PDP that could not answer is a
+   * 503, never `[]` — upstream reads `[]` as "member of no space" (an empty favorites, labels, shares or suggestions
+   * list, and a 403 from the favorites space check). The socket.io connect is the one caller that degrades instead
+   * (`ws-connection/ws-space-rooms.ts`): a throw there would kill the socket for the session.
+   */
   override async getUserSpaceIds(userId: string): Promise<string[]> {
-    return this.authz.lookupResources(this.subject(userId), 'view', 'space');
+    const ids = await this.authz.tryLookupResources(this.subject(userId), 'view', 'space');
+    if (ids === null) throw authzUnavailable();
+    return ids;
   }
 
   /**
    * Reverse index (recipient filter): of `userIds`, which may VIEW the space — from the PDP, not the
-   * local mirror. Powers notification/digest fan-out. Bounded candidate list → subject-side filter.
+   * local mirror. Powers notification/digest fan-out. Bounded candidate list → subject-side filter. #716: a PDP that
+   * could not answer is a 503, never a partial or empty recipient set.
    */
   override async getUserIdsWithSpaceAccess(userIds: string[], spaceId: string): Promise<Set<string>> {
     if (userIds.length === 0) return new Set();
-    return new Set(await this.authz.filterSubjects('view', 'space', spaceId, userIds));
+    const ids = await this.authz.tryFilterSubjects('view', 'space', spaceId, userIds);
+    if (ids === null) throw authzUnavailable();
+    return new Set(ids);
   }
 }

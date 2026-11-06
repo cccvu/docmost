@@ -11,6 +11,7 @@ import {
   ContentTooComplexException,
   ConversionBudgetExhaustedException,
   convertOnBehalfOf,
+  humanConversionKey,
 } from '../editor-compat/content-parse/content-parse.service';
 import {
   PAGE_IMPORT_ITEM_MAX_BYTES,
@@ -93,8 +94,8 @@ export class PageContentParser {
  * (#626: its deadline, heap, node count or nesting) is `too_large`; a converter too busy to take it stops the call like
  * the time budget (`parse_budget_exceeded` for it and every later item). At most
  * PAGE_IMPORT_PARSE_MAX_CONCURRENT calls parse at once per process; a call that gets no slot in time is 503 `engine_busy`.
- * The platform names the acting human (`actorUserId`, #642): the conversions take that human's turn at the converter,
- * the same as their own writes; a call without one shares the `background` key.
+ * The platform names the acting human (`actorUserId`, #642; else `actorIdentityId`, #716 I6): the conversions take that
+ * human's turn at the converter, the same as their own writes; only a call naming neither shares the `background` key.
  *
  * title-candidates: the LIVE direct children of one parent (or of the space root) whose title is exactly an input title
  * or `<title> (n)` with n ≥ 2, as `{titleIdx, pageId, suffix}`. Case-sensitive and untrimmed, compared in memory (no
@@ -118,7 +119,9 @@ export class ServicePageImportService {
   async validateContent(dto: ValidateContentDto): Promise<ValidateContentResult> {
     try {
       // #642: the conversions take the acting human's turn (one key per human); only an actorless call is `background`.
-      return await convertOnBehalfOf(dto.actorUserId, () => this.parseSlots.run(() => this.validateAll(dto)));
+      // #716 I6: a human with no Docmost user yet converts under their platform identity, never `background`.
+      const key = humanConversionKey(dto.actorUserId, dto.actorIdentityId);
+      return await convertOnBehalfOf(key, () => this.parseSlots.run(() => this.validateAll(dto)));
     } catch (err) {
       if (err instanceof OpSemaphoreTimeout) {
         this.logger.warn('PAGE_IMPORT_VALIDATE_BUSY: no parse slot in time; answered 503 engine_busy');

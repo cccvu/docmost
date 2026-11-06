@@ -3,6 +3,7 @@ import {
   Controller,
   HttpCode,
   HttpStatus,
+  InternalServerErrorException,
   NotFoundException,
   Post,
   PreconditionFailedException,
@@ -19,8 +20,11 @@ import { PageService } from '../../core/page/services/page.service';
 import { PageAccessService } from '../../core/page/page-access/page-access.service';
 import { UpdatePageDto } from '../../core/page/dto/update-page.dto';
 import { CollaborationGateway } from '../../collaboration/collaboration.gateway';
+import { InjectKysely } from 'nestjs-kysely';
+import type { KyselyDB } from '@docmost/db/types/kysely.types';
 import { ConditionalUpdateOutcome } from './collab-outcomes';
 import { stableHash } from './stable-hash';
+import { isOverPageCap, PageTooLargeException, withPageGrowthLock } from './page-size';
 
 /**
  * EXTENDS `UpdatePageDto` deliberately, rather than restating its fields. The fork's global
@@ -61,6 +65,9 @@ export class ConditionalUpdatePageDto extends UpdatePageDto {
    */
   @IsOptional() @IsBoolean() snapshotBefore?: boolean;
 }
+
+/** Not-applied reasons this build knows mean "nothing was applied" (a retryable 503). Any other reason string: 500. */
+const KNOWN_NOT_APPLIED: ReadonlySet<string> = new Set(['error', 'unknown']);
 
 /** What a `snapshotBefore` write reports back (#485). `historyId` is the version that holds the prior content. */
 export interface SnapshotOutcome {
@@ -105,6 +112,7 @@ export class ConditionalPageController {
     private readonly pageAccessService: PageAccessService,
     private readonly gateway: CollaborationGateway,
     private readonly pageHistoryRepo?: PageHistoryRepo, // #485 snapshotBefore (appended)
+    @InjectKysely() private readonly db?: KyselyDB, // #716 page cap (appended; absent ⇒ an append is refused 503)
   ) {}
 
   @HttpCode(HttpStatus.OK)
@@ -149,19 +157,28 @@ export class ConditionalPageController {
       (k) => k !== 'pageId' && (rest as Record<string, unknown>)[k] !== undefined,
     );
 
+    // #716 page cap: an append/prepend to a page whose stored Yjs state is already at the cap. AFTER the edit check (a
+    // caller who may not edit learns nothing about the page's size), BEFORE the parse — keyed or not, a write over the
+    // cap is never parsed (no worker time, no main-thread walk). Unkeyed: refused here. Keyed: the handler decides it
+    // (on the resident document without opening a connection, when there is one) only after its dedup and CAS, so the
+    // retry of an append that already applied still replays as the duplicate 200 (#429), never a false 422.
+    const operation = dto.operation ?? 'replace';
+    let overCap = dto.content ? await isOverPageCap(this.db, page.id, operation) : false;
+    if (overCap && !dto.idempotencyKey) throw new PageTooLargeException();
+
     // TRUTHINESS, matching upstream `PageService.update` (`updatePageDto.content && …`). A falsy
     // `content` ("" / null) is "no content supplied" there, so treating it as supplied here would make
     // the same request wipe the page on this route while no-opping on the ordinary one — a difference
     // decided by whether anyone has the page open.
     if (dto.content) {
-      const prosemirrorJson = await this.pageService.parseProsemirrorContent(
-        dto.content,
-        dto.format ?? 'json',
-      );
+      // Over the cap, the content is never applied: the handler only dedups / compares / refuses. Not parsed.
+      const prosemirrorJson = overCap
+        ? undefined
+        : await this.pageService.parseProsemirrorContent(dto.content, dto.format ?? 'json');
       // #485: snapshot AFTER the edit check and the parse (a refused or malformed write saves nothing), BEFORE
       // the apply. A replace that then 412s leaves a version equal to the unchanged page — harmless, and the
       // next attempt reports it as `unchanged` rather than saving a duplicate.
-      if (dto.snapshotBefore && (dto.operation ?? 'replace') === 'replace') {
+      if (dto.snapshotBefore && operation === 'replace') {
         snapshot = await this.snapshotCurrent(page.id, prosemirrorJson, dto.title);
       }
       // `page.id`, NEVER `dto.pageId`. `PageRepo.findById` resolves a non-UUID as a slugId, and live
@@ -169,15 +186,26 @@ export class ConditionalPageController {
       // precondition would find nothing resident and silently apply unconditionally, and the direct
       // connection would fork a second RedisSync-owned Y.Doc over the same row, whose store races the
       // real one. Upstream normalizes the same way (`PageService.update` → `updatePageContent(page.id)`).
-      const result = (await this.gateway.conditionalUpdatePageContent(page.id, {
-        prosemirrorJson,
-        operation: dto.operation ?? 'replace',
-        user,
-        expectedContentHash: dto.expectedContentHash,
-        idempotencyKey: dto.idempotencyKey,
-        // Typed from the handler's own return shape: `reason` is a literal union there, so renaming a
-        // discriminator fails to compile at BOTH ends instead of silently changing what this branches on.
-      })) as ConditionalUpdateOutcome | undefined;
+      //
+      // #716: an append/prepend re-checks the cap and applies under the page's growth lock (a no-op wrapper for a
+      // replace), so concurrent appends that all passed the entry check are decided one after another against the
+      // bytes each predecessor stored: the overshoot stays one write, not one per concurrent caller.
+      const result = await withPageGrowthLock(page.id, operation, async () => {
+        if (!overCap) {
+          overCap = await isOverPageCap(this.db, page.id, operation);
+          if (overCap && !dto.idempotencyKey) throw new PageTooLargeException();
+        }
+        return (await this.gateway.conditionalUpdatePageContent(page.id, {
+          prosemirrorJson,
+          operation,
+          user,
+          expectedContentHash: dto.expectedContentHash,
+          idempotencyKey: dto.idempotencyKey,
+          ...(overCap ? { refuseOverCap: true } : {}),
+          // Typed from the handler's own return shape: `reason` is a literal union there, so renaming a
+          // discriminator fails to compile at BOTH ends instead of silently changing what this branches on.
+        })) as ConditionalUpdateOutcome | undefined;
+      });
 
       if (result?.reason === 'duplicate') {
         // #429: this exact content already applied within the idempotency window → a SUCCESSFUL retry, not
@@ -198,9 +226,29 @@ export class ConditionalPageController {
         if (result?.reason === 'precondition') {
           throw new PreconditionFailedException('page content changed');
         }
-        // Anything else — a collab node that errored, or RedisSync disabled (which resolves to undefined) —
+        if (result?.reason === 'too_large') throw new PageTooLargeException();
+        if (result?.reason === 'applied_unconfirmed') {
+          // #716 O2/R4: the live document holds the write but it was not confirmed as saved. NOT a 503: that would
+          // say "not applied, retry" and invite a second append. A 500 with a code (so the fork's every-503-has-a-
+          // Retry-After rule is untouched); the platform answers it 504 upstream_timeout, "may have been applied".
+          throw new InternalServerErrorException({
+            message: 'the content was applied to the live page but could not be confirmed as saved',
+            code: 'write_outcome_unknown',
+          });
+        }
+        // A collab node that errored before mutating (`error`), or RedisSync disabled (which resolves to undefined),
         // means we could NOT establish the precondition. Refuse rather than fall back to an unconditional
         // write: silently downgrading an atomicity guarantee is invisible to the caller.
+        // #716: but a reason STRING this build does not know (a newer collab node during a rolling deploy) may mean
+        // "applied": never a retryable 503 that would invite a second append — the outcome is unknown, and said so.
+        const reason: unknown = result?.reason;
+        if (typeof reason === 'string' && !KNOWN_NOT_APPLIED.has(reason)) {
+          throw new InternalServerErrorException({
+            message:
+              'the conditional content write ended in a state this engine does not recognize; it may have been applied',
+            code: 'write_outcome_unknown',
+          });
+        }
         throw new ServiceUnavailableException(
           'could not apply the conditional content write',
         );

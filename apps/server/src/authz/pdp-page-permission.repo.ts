@@ -121,19 +121,29 @@ export class PdpPagePermissionRepo extends PagePermissionRepo implements CopyRes
     return assertCopyKeepsRestrictions(trx, args);
   }
 
+  /**
+   * The viewable subset of `pageIds`, from the PDP. #716: a PDP that could not answer ANY chunk is a 503
+   * (`authzUnavailable`), never an empty or partial list. Upstream reads the answer as the complete set: a list route
+   * shows "you have nothing", export refuses "no accessible pages", and `movePageToSpace` / `duplicatePage` move or
+   * copy only that subset, leaving the rest of the tree in the old space or orphaned. Both call this before their
+   * transaction opens, so the throw writes nothing.
+   */
   override async filterAccessiblePageIds(opts: {
     pageIds: string[];
     userId: string;
     spaceId?: string;
   }): Promise<string[]> {
     if (opts.pageIds.length === 0) return [];
-    return this.authz.filterResources(this.subject(opts.userId), 'view', 'page', opts.pageIds);
+    const ids = await this.authz.tryFilterResources(this.subject(opts.userId), 'view', 'page', opts.pageIds);
+    if (ids === null) throw authzUnavailable();
+    return ids;
   }
 
   /**
    * Sidebar / tree listing: the viewable subset of `pageIds` WITH their edit capability — from the
    * PDP, not the local mirror (closes the sidebar leakage vector). Two checks per page (view, edit),
-   * chunked under the platform's 256-check bulk cap; a page is included only if view passes.
+   * chunked under the platform's 256-check bulk cap; a page is included only if view passes. #716: any chunk the
+   * PDP could not answer is a 503 for the whole call, never a partial sidebar.
    */
   override async filterAccessiblePageIdsWithPermissions(
     pageIds: string[],
@@ -149,9 +159,10 @@ export class PdpPagePermissionRepo extends PagePermissionRepo implements CopyRes
         { permission: 'view', resourceType: 'page', resourceId: id },
         { permission: 'edit', resourceType: 'page', resourceId: id },
       ]);
-      const results = await this.authz.checkBulk(subject, checks);
+      const results = await this.authz.tryCheckBulk(subject, checks);
+      if (!results) throw authzUnavailable();
       batch.forEach((id, j) => {
-        if (results[j * 2]) out.push({ id, canEdit: !!results[j * 2 + 1] });
+        if (results[j * 2] === true) out.push({ id, canEdit: results[j * 2 + 1] === true });
       });
     }
     return out;
@@ -159,10 +170,13 @@ export class PdpPagePermissionRepo extends PagePermissionRepo implements CopyRes
 
   /**
    * Reverse index (recipient filter): of `userIds`, which may VIEW the page — from the PDP, not the
-   * local mirror. Powers comment/mention/update/verification notification fan-out.
+   * local mirror. Powers comment/mention/update/verification notification fan-out. #716: a PDP that could not answer
+   * is a 503, never a partial or empty recipient list (a notification job then retries; a realtime event is dropped).
    */
   override async getUserIdsWithPageAccess(pageId: string, userIds: string[]): Promise<string[]> {
     if (userIds.length === 0) return [];
-    return this.authz.filterSubjects('view', 'page', pageId, userIds);
+    const ids = await this.authz.tryFilterSubjects('view', 'page', pageId, userIds);
+    if (ids === null) throw authzUnavailable();
+    return ids;
   }
 }

@@ -6,12 +6,18 @@
  * stops even a synchronous parse), a heap cap (`resourceLimits`), and the node and character caps below. Loaded once and reused:
  * loading the parsers takes ~0.5–1.4 s, too much to pay on every write.
  *
+ * #716: it also SERIALIZES a stored page for the native export (`serialize`: ProseMirror JSON → the export's HTML or
+ * Markdown), which built a happy-dom window and, for Markdown, a jsdom one per page on the main thread: ~0.9 s for the
+ * legit 990 KB page on a laptop, ~2.5 s for a table-heavy one (WS5 step 0). Everything it needs was already loaded
+ * here (editor-ext imports Turndown, which loads jsdom), so no new heap.
+ *
  * Protocol: posts `{ ready: true }` once loaded, then answers each `ParseRequest` with one `ParseReply` carrying the
  * same `id`. Never throws across the boundary: every failure is a reply.
  */
 import { parentPort } from 'node:worker_threads';
 import { markdownToHtml } from '@docmost/editor-ext';
-import { htmlToJson } from '../../collaboration/collaboration.util';
+import { htmlToJson, jsonToHtml } from '../../collaboration/collaboration.util';
+import { htmlToMarkdownReleasingDom } from '../html-to-markdown';
 
 export type ParseFormat = 'html' | 'markdown';
 
@@ -19,7 +25,13 @@ export type ParseRequest =
   /** HTML or Markdown → ProseMirror JSON, as a page write stores it. */
   | { id: number; op: 'to-json'; format: ParseFormat; content: string; maxNodes: number; maxChars: number }
   /** Markdown → HTML only: the importers rewrite the HTML before it is converted to JSON. */
-  | { id: number; op: 'markdown-to-html'; content: string; maxChars: number };
+  | { id: number; op: 'markdown-to-html'; content: string; maxChars: number }
+  /**
+   * #716: a stored page (ProseMirror JSON) → the native export's HTML or Markdown, exactly as `ExportService.exportPage`
+   * composed it upstream (the Markdown drops `<colgroup>` first). The output is capped at `maxChars` with an O(1)
+   * length check, before and after Turndown.
+   */
+  | { id: number; op: 'serialize'; format: ParseFormat; json: unknown; maxChars: number };
 
 export type ParseReply =
   | { id: number; ok: true; result: unknown; nodes?: number }
@@ -27,6 +39,18 @@ export type ParseReply =
   | { id: number; ok: false; reason: 'too_complex'; detail: 'nodes' | 'chars' | 'depth' };
 
 export type WorkerMessage = { ready: true } | ParseReply;
+
+/** Upstream's export strip (export.service.ts, before #716): tables' `<colgroup>` has no Markdown form. */
+const COLGROUP_RE = /<colgroup[^>]*>[\s\S]*?<\/colgroup>/gim;
+
+/** #716: the export's serialization of one page, on this thread. Pure: the real-worker spec compares it in-process. */
+export function serializeForExport(json: unknown, format: ParseFormat, maxChars: number): string | null {
+  const html = jsonToHtml(json);
+  if (html.length > maxChars) return null;
+  if (format === 'html') return html;
+  const markdown = htmlToMarkdownReleasingDom(html.replace(COLGROUP_RE, ''));
+  return markdown.length > maxChars ? null : markdown;
+}
 
 /** Nodes in a ProseMirror JSON tree, counting no further than `limit + 1`. */
 export function countNodes(json: unknown, limit: number): number {
@@ -62,6 +86,11 @@ export function countChars(json: unknown, limit: number): number {
 
 async function convert(req: ParseRequest): Promise<ParseReply> {
   try {
+    if (req.op === 'serialize') {
+      const out = serializeForExport(req.json, req.format, req.maxChars);
+      if (out === null) return { id: req.id, ok: false, reason: 'too_complex', detail: 'chars' };
+      return { id: req.id, ok: true, result: out };
+    }
     if (req.op === 'markdown-to-html') {
       const html = await markdownToHtml(req.content);
       if (html.length > req.maxChars) return { id: req.id, ok: false, reason: 'too_complex', detail: 'chars' };

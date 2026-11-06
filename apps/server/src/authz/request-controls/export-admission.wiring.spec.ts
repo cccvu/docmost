@@ -17,6 +17,7 @@ import * as http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { PassThrough, Readable } from 'node:stream';
 import * as JSZip from 'jszip';
+import { AuthUser } from '../../common/decorators/auth-user.decorator';
 import { ExportAttachmentPlan } from '../../editor-compat/export/export-attachment-plan';
 import { EXPORT_LIMIT_DEFAULTS, ExportTooLargeException } from '../../editor-compat/export/export-limits';
 import { EXPORT_ADMISSION } from './export-admission.interceptor';
@@ -61,15 +62,23 @@ function storageFor(body: ExportBody) {
   };
 }
 
-/** Mimics JwtAuthGuard: the verified principal from a header. */
+/**
+ * The real JwtAuthGuard's contract: an authenticated request carries `req.user = { user, workspace }`
+ * (jwt.strategy.ts `validate`). The probe handlers read it back through the REAL `@AuthUser()` decorator and echo the
+ * id, so the tests pin that the principal the admission limit counts is the one the handlers act as (#716 T2): if the
+ * shape moved, `@AuthUser()` would 400 and the echo assertions go red, instead of this fake staying green on its own.
+ */
 @Injectable()
 class FakeAuthGuard implements CanActivate {
   canActivate(ctx: ExecutionContext): boolean {
     const req = ctx.switchToHttp().getRequest();
-    req.user = { user: { id: String(req.headers['x-user'] ?? 'user-1') } };
+    req.user = { user: { id: String(req.headers['x-user'] ?? 'user-1') }, workspace: { id: 'ws1' } };
     return true;
   }
 }
+
+/** The principal header each probe handler echoes (the id `@AuthUser()` resolved). */
+const PRINCIPAL_HEADER = 'x-principal';
 
 /** Handlers still working (the pages being converted), by request key: each waits for `finishWork(key)`. */
 const working = new Map<string, () => void>();
@@ -92,7 +101,8 @@ class ExportController {
   @UseGuards(FakeAuthGuard)
   @HttpCode(200)
   @Post('pages/export')
-  async exportPage(@Body() body: ExportBody, @Res() res: FastifyReply) {
+  async exportPage(@Body() body: ExportBody, @AuthUser() user: { id: string }, @Res() res: FastifyReply) {
+    res.header(PRINCIPAL_HEADER, user.id);
     if (!body.includeChildren && !body.includeAttachments) {
       res.send('# a single page'); // the /v1 export job's shape: a plain file
       return;
@@ -103,7 +113,8 @@ class ExportController {
   @UseGuards(FakeAuthGuard)
   @HttpCode(200)
   @Post('spaces/export')
-  async exportSpace(@Body() body: ExportBody, @Res() res: FastifyReply) {
+  async exportSpace(@Body() body: ExportBody, @AuthUser() user: { id: string }, @Res() res: FastifyReply) {
+    res.header(PRINCIPAL_HEADER, user.id);
     await exportZip(body, res);
   }
 }
@@ -192,6 +203,7 @@ describe('export admission on a real server (#699)', () => {
   it('one export per principal: a second concurrent one gets 503 engine_busy + Retry-After; released when it ends', async () => {
     const first = await post('/spaces/export', { key: 'p1', scenario: 'hold' });
     expect(first.status).toBe(200);
+    expect(first.headers[PRINCIPAL_HEADER]).toBe('user-1'); // the handler acts as the principal the slot is keyed on
     const second = await post('/spaces/export', { key: 'p1b', scenario: 'ok' });
     expect(second.status).toBe(503);
     expect(second.headers['retry-after']).toBe(String(EXPORT_ADMISSION.retryAfterSeconds));
@@ -227,6 +239,7 @@ describe('export admission on a real server (#699)', () => {
     for (let i = 0; i < EXPORT_ADMISSION.global; i++) {
       const a = await post('/spaces/export', { key: `g${i}`, scenario: 'hold' }, `user-g${i}`);
       expect(a.status).toBe(200);
+      expect(a.headers[PRINCIPAL_HEADER]).toBe(`user-g${i}`); // distinct principals, as @AuthUser() resolves them
       holders.push(a);
     }
     const refused = await post('/spaces/export', { key: 'gx', scenario: 'ok' }, 'user-gx');

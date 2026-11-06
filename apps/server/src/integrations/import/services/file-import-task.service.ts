@@ -50,6 +50,13 @@ import {
   AUDIT_SERVICE,
   IAuditService,
 } from '../../../integrations/audit/audit.service';
+// CCC #716 (UPSTREAM_MODIFICATIONS, file-import-task.service.ts): linear page levels (I1); a rolled-back import queues
+// the deletion of the attachments it uploaded (I2).
+import { InjectQueue } from '@nestjs/bullmq';
+import { Queue } from 'bullmq';
+import { QueueName } from '../../queue/constants';
+import { importPageLevels } from '../../../editor-compat/import/import-page-levels';
+import { queueRolledBackImportAttachmentDeletion } from '../../../editor-compat/import/import-rollback';
 
 @Injectable()
 export class FileImportTaskService {
@@ -65,6 +72,8 @@ export class FileImportTaskService {
     private moduleRef: ModuleRef,
     private eventEmitter: EventEmitter2,
     @Inject(AUDIT_SERVICE) private readonly auditService: IAuditService,
+    // CCC #716 I2: the queue PageService.forceDelete uses for a page's attachment files and rows
+    @InjectQueue(QueueName.ATTACHMENT_QUEUE) private readonly attachmentQueue: Queue,
   ) {}
 
   async processZIpImport(fileTaskId: string): Promise<void> {
@@ -422,49 +431,8 @@ export class FileImportTaskService {
     });
 
     // Group pages by level (topological sort for parent-child relationships)
-    const pagesByLevel = new Map<number, Array<[string, ImportPageNode]>>();
-    const pageLevel = new Map<string, number>();
-
-    // Calculate levels using BFS
-    const calculateLevels = () => {
-      const queue: Array<{ filePath: string; level: number }> = [];
-
-      // Start with root pages (no parent)
-      for (const [filePath, page] of pagesMap.entries()) {
-        if (!page.parentPageId) {
-          queue.push({ filePath, level: 0 });
-          pageLevel.set(filePath, 0);
-        }
-      }
-
-      // BFS to assign levels
-      while (queue.length > 0) {
-        const { filePath, level } = queue.shift()!;
-        const currentPage = pagesMap.get(filePath)!;
-
-        // Find children of current page
-        for (const [childFilePath, childPage] of pagesMap.entries()) {
-          if (
-            childPage.parentPageId === currentPage.id &&
-            !pageLevel.has(childFilePath)
-          ) {
-            pageLevel.set(childFilePath, level + 1);
-            queue.push({ filePath: childFilePath, level: level + 1 });
-          }
-        }
-      }
-
-      // Group pages by level
-      for (const [filePath, page] of pagesMap.entries()) {
-        const level = pageLevel.get(filePath) || 0;
-        if (!pagesByLevel.has(level)) {
-          pagesByLevel.set(level, []);
-        }
-        pagesByLevel.get(level)!.push([filePath, page]);
-      }
-    };
-
-    calculateLevels();
+    // CCC #716 I1: the same BFS in linear time (upstream rescanned every page for each page, O(N²)).
+    const pagesByLevel = importPageLevels(pagesMap);
 
     if (pagesMap.size < 1) return;
 
@@ -481,6 +449,8 @@ export class FileImportTaskService {
     // would fail the whole import.
     const conversions = batchConversion(`file-task:${fileTask.id}`, fileTask.creatorId);
     let currentFile: string | null = null; // CCC #643: the page a failure names
+    const attempted = new Set<string>(); // CCC #716 I2: pages whose attachments were uploaded (committed outside trx)
+    let committed = false; // CCC #716 I2
 
     try {
       await executeTx(this.db, async (trx) => {
@@ -513,6 +483,7 @@ export class FileImportTaskService {
             }
 
             assertImportHtmlWithinBounds(content, this.logger); // CCC #643: before the first cheerio pass
+            attempted.add(page.id); // CCC #716 I2
             const htmlContent =
               await this.importAttachmentService.processAttachments({
                 html: content,
@@ -604,6 +575,7 @@ export class FileImportTaskService {
           `Successfully imported ${totalPagesProcessed} pages with ${filteredBacklinks.length} backlinks`,
         );
       });
+      committed = true; // CCC #716 I2
 
       if (validPageIds.size > 0) {
         const auditPayloads = Array.from(validPageIds).map((pageId) => ({
@@ -626,6 +598,9 @@ export class FileImportTaskService {
       }
     } catch (error) {
       this.logger.error('Failed to import files:', error);
+      // CCC #716 I2: the rolled-back pages' attachment rows and objects were written outside the transaction (only pages
+      // that do not exist: an ambiguous COMMIT failure may have committed them)
+      if (!committed) await queueRolledBackImportAttachmentDeletion(this.db, this.attachmentQueue, [...attempted], this.logger);
       throw importTaskError(error, { file: currentFile, logger: this.logger }); // CCC #643
     }
   }

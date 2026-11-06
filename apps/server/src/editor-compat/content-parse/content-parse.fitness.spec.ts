@@ -1,5 +1,6 @@
 /**
- * #626 fitness function: untrusted HTML/Markdown is converted ONLY inside the conversion worker.
+ * #626 + #716 fitness function: untrusted HTML/Markdown is converted, and stored pages are serialized back to
+ * HTML/Markdown, ONLY inside the conversion worker.
  *
  * On the main thread these conversions have no bound (seconds to minutes of blocked event loop, or an exhausted
  * heap, for one write). `parseUntrustedContent` / `untrustedMarkdownToHtml` run them in the bounded worker; a new
@@ -22,6 +23,19 @@ const ALLOWED: Record<string, string[]> = {
   markdownToHtml: ['editor-compat/content-parse/content-parse.worker.ts'],
   // generateJSON is htmlToJson's own first step.
   generateJSON: ['collaboration/collaboration.util.ts'],
+  // #716: the serializations (a happy-dom window, and for Markdown a jsdom one, per page). The worker runs them for
+  // the export (`serialize`); collaboration.util composes them. page.controller.ts keeps upstream's `format` echo for
+  // NATIVE (standalone) mode only: in remote mode a non-json `format` on /api/pages/info|create|update is refused before
+  // the handler (authz/native-format), and nothing on the platform side sends one.
+  jsonToHtml: [
+    'editor-compat/content-parse/content-parse.worker.ts',
+    'collaboration/collaboration.util.ts', // jsonToMarkdown's own first step
+    'core/page/page.controller.ts',
+  ],
+  jsonToMarkdown: ['core/page/page.controller.ts'],
+  htmlToMarkdownReleasingDom: ['editor-compat/content-parse/content-parse.worker.ts', 'collaboration/collaboration.util.ts'],
+  // jsonToHtml's own first step.
+  generateHTML: ['collaboration/collaboration.util.ts'],
 };
 
 const walk = (dir: string, out: string[]): string[] => {
@@ -56,7 +70,7 @@ const usesIn = (file: string, text = readFileSync(file, 'utf8')): Array<{ name: 
   return found;
 };
 
-describe('#626 untrusted content is converted only in the bounded worker', () => {
+describe('#626/#716 untrusted content is converted, and pages serialized, only in the bounded worker', () => {
   const files = walk(SRC_ROOT, []);
   const uses = files.flatMap((file) =>
     usesIn(file).map((u) => ({ ...u, file: relative(SRC_ROOT, file).split(sep).join('/') })),
@@ -76,15 +90,20 @@ describe('#626 untrusted content is converted only in the bounded worker', () =>
       `export { markdownToHtml } from '@docmost/editor-ext';`,
       `import * as util from '../../collaboration/collaboration.util'; util.htmlToJson('<p>x</p>');`,
       `const { generateJSON: g } = require('../../common/helpers/prosemirror/html');`,
+      // #716: a main-thread serialization, however it is reached.
+      `import { jsonToMarkdown } from '../../collaboration/collaboration.util'; jsonToMarkdown(x);`,
+      `export { htmlToMarkdownReleasingDom } from '../html-to-markdown';`,
+      `import { generateHTML } from '../../common/helpers/prosemirror/html'; generateHTML(doc, ext);`,
     ];
     for (const source of cases) expect(usesIn('probe.ts', source)).not.toEqual([]);
     // Anti-vacuity: the same shapes naming something else are not uses.
     expect(usesIn('probe.ts', `import { jsonToText as t } from '../../collaboration/collaboration.util';`)).toEqual([]);
   });
 
-  it('no other server code calls htmlToJson, markdownToHtml or generateJSON', () => {
+  it('no other server code calls a conversion or a serialization (htmlToJson … jsonToMarkdown, generateHTML)', () => {
     const offenders = uses.filter((u) => !ALLOWED[u.name].includes(u.file)).map((u) => `${u.file}:${u.line} ${u.name}`);
-    // Convert through parseUntrustedContent / untrustedMarkdownToHtml (editor-compat/content-parse) instead.
+    // Convert through parseUntrustedContent / untrustedMarkdownToHtml, serialize through serializePageContent
+    // (editor-compat/content-parse) instead.
     expect(offenders).toEqual([]);
   });
 });

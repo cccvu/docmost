@@ -27,6 +27,7 @@
 import { HttpException, type Logger, PayloadTooLargeException } from '@nestjs/common';
 import { promises as fs } from 'node:fs';
 import * as path from 'node:path';
+import { IMPORT_PAGE_FILE_BYTES } from '@docmost/editor-ext';
 import { ContentTooComplexException } from './content-parse.service';
 
 export interface ImportLimits {
@@ -40,7 +41,8 @@ export interface ImportLimits {
   maxHtmlTags: number;
 }
 
-const MAX_PAGE_FILE_BYTES = 4 * 1024 * 1024;
+// #716 I7: one number for the engine and the SPA's import modal (packages/editor-ext lib/ccc/import).
+const MAX_PAGE_FILE_BYTES = IMPORT_PAGE_FILE_BYTES;
 
 export const IMPORT_LIMITS: Readonly<ImportLimits> = Object.freeze({
   singleFileBytes: 30 * 1024 * 1024,

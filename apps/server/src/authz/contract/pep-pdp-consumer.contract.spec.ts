@@ -21,7 +21,8 @@ import { PlatformAuditClient } from '../audit/platform-audit.client';
  *   (a) each method emits the exact canonical request: POST, correct path, x-authz-service-secret
  *       header, and an exact body shape (toEqual — no extra/renamed/missing fields);
  *   (b) given the canonical response, the client returns the correctly parsed result;
- *   (c) the client FAILS CLOSED (false / empty) on any non-200 or transport error;
+ *   (c) the client FAILS CLOSED (false / empty) on any non-200 or transport error, and its try* methods report
+ *       that same failure as `null` (#696, #716), never as an empty answer;
  *   (d) the audit client POSTs {events:[...]} to /audit/ingest with the secret and is
  *       fire-and-forget — it never throws, even on failure.
  *
@@ -375,6 +376,57 @@ describe('PEP↔PDP consumer contract — real clients over a loopback PDP (#13)
     it('FAILS CLOSED to [] on a transport error', async () => {
       nextResponse = { destroy: true };
       expect(await authz.filterSubjects('view', 'page', 'pg-1', ['u1', 'u2', 'u3'])).toEqual([]);
+    });
+  });
+
+  // ---------------------------------------------------------------------------------------------
+  // try* list methods (#696, #716): the same canonical request and parse, with failure reported as null
+  // (the PDP repos turn it into a retryable 503), never as the fail-closed empty answer above.
+  // ---------------------------------------------------------------------------------------------
+  describe('tryFilterResources() / tryLookupResources() / tryFilterSubjects() (#716)', () => {
+    const R = CONTRACT.filterResources;
+    const L = CONTRACT.lookupResources;
+    const S = CONTRACT.filterSubjects;
+
+    it('emit the SAME canonical requests and parse the canonical responses like the fail-closed originals', async () => {
+      nextResponse = { status: 200, body: R.response };
+      expect(
+        await authz.tryFilterResources(R.request.subject, R.request.permission, R.request.resourceType, [...R.request.candidateIds]),
+      ).toEqual(R.expected);
+      expectEnvelope(R.path);
+      expect(captured!.body).toEqual(R.request);
+
+      nextResponse = { status: 200, body: L.response };
+      expect(await authz.tryLookupResources(L.request.subject, L.request.permission, L.request.resourceType)).toEqual(
+        L.expected,
+      );
+      expectEnvelope(L.path);
+      expect(captured!.body).toEqual(L.request);
+
+      nextResponse = { status: 200, body: S.response };
+      expect(
+        await authz.tryFilterSubjects(S.request.permission, S.request.resourceType, S.request.resourceId, [...S.inputUserIds]),
+      ).toEqual(S.expected);
+      expectEnvelope(S.path);
+      expect(captured!.body).toEqual(S.request);
+    });
+
+    it.each([
+      ['a non-200', { status: 503, body: {} } as NextResponse],
+      ['a transport error', { destroy: true } as NextResponse],
+      ['a malformed 200', { status: 200, body: { ids: 'x', subjects: 'x' } } as NextResponse],
+    ])('report %s as null (unknown), never as [] (none)', async (_label, response) => {
+      nextResponse = response;
+      expect(await authz.tryFilterResources(R.request.subject, 'view', 'page', [...R.request.candidateIds])).toBeNull();
+      expect(await authz.tryLookupResources(L.request.subject, 'view', 'space')).toBeNull();
+      expect(await authz.tryFilterSubjects('view', 'page', 'pg-1', ['u1', 'u2'])).toBeNull();
+    });
+
+    it('a healthy empty answer stays [] (a real "none")', async () => {
+      nextResponse = { status: 200, body: { ids: [], subjects: [] } };
+      expect(await authz.tryFilterResources(R.request.subject, 'view', 'page', ['a'])).toEqual([]);
+      expect(await authz.tryLookupResources(L.request.subject, 'view', 'space')).toEqual([]);
+      expect(await authz.tryFilterSubjects('view', 'page', 'pg-1', ['u1'])).toEqual([]);
     });
   });
 

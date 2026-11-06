@@ -110,8 +110,9 @@ export class PageAccessService {
     try {
       await this.validateCanEdit(page, user);
       return;
-    } catch {
+    } catch (err) {
       // User cannot edit — check if reader commenting is enabled
+      if (!(err instanceof ForbiddenException)) throw err; // CCC #716: a 503 (PDP could not answer) is not "cannot edit"
     }
 
     await this.validateCanView(page, user);

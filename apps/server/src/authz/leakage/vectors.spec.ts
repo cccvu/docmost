@@ -412,21 +412,27 @@ describe('Anonymous public-share vectors (#660/#334/#335) — every public read 
       svc.searchPage({ query: 'roadmap', shareId: SHARE.id } as any, { workspaceId: WS } as any);
     afterEach(() => jest.restoreAllMocks());
 
-    it('control: a public share delegates to the upstream share search', async () => {
+    it('control: a public share runs the share search (after the gate), never the upstream one', async () => {
       const { service, gate, upstream } = make({});
-      expect((await search(service)).items).toEqual(['hit']);
+      // #716: the fork runs the share statements itself (restricted ancestor, then full-text), never upstream.
+      const statements = jest.spyOn(service as any, 'txStatement')
+        .mockResolvedValueOnce(false).mockResolvedValueOnce([{ id: 'hit' }]);
+      expect((await search(service)).items.map((i: any) => i.id)).toEqual(['hit']);
       expect(gate.isSharingAllowed).toHaveBeenCalledWith(WS, SHARE.spaceId);
-      expect(upstream).toHaveBeenCalled();
+      expect(statements.mock.calls.map((c) => c[1])).toEqual(['share-ancestor', 'share-search']);
+      expect(upstream).not.toHaveBeenCalled();
     });
 
     it.each([
       ['sharing disabled or the space archived', { allowed: false }],
       ['an unknown or expired share (the repo veto)', { share: undefined }],
       ['the gate is missing (fail closed)', { noGate: true }],
-    ])('%s → empty, upstream never runs', async (_n, o) => {
+    ])('%s → empty, no share statement and upstream never runs', async (_n, o) => {
       const { service, upstream } = make(o);
+      const statements = jest.spyOn(service as any, 'txStatement');
       expect(await search(service)).toEqual({ items: [] });
       expect(upstream).not.toHaveBeenCalled();
+      expect(statements).not.toHaveBeenCalled();
     });
   });
 

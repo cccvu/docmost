@@ -2,8 +2,10 @@ import {
   CanActivate,
   Controller,
   Get,
+  Headers,
   Injectable,
   NotFoundException,
+  Post,
   Res,
   ServiceUnavailableException,
   UseGuards,
@@ -27,6 +29,8 @@ import {
   RETRY_AFTER_MAX_SEC,
   RETRY_AFTER_MIN_SEC,
   RetryAfterFilter,
+  UNKEYED_CREATE_OUTCOME_UNKNOWN_MESSAGE,
+  UNKEYED_CREATE_ROUTE,
 } from './retry-after.filter';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -77,6 +81,41 @@ class ProbeController {
   }
 }
 
+/**
+ * wiki-v2#716: the native page routes, raised as production raises them. `create` is the upstream route path
+ * (`PageController` @Controller('pages') @Post('create') under the global 'api' prefix); `x-probe` picks the throw.
+ */
+@Controller('api/pages')
+class NativePageProbeController {
+  private raise(probe: string | undefined): never {
+    switch (probe) {
+      case 'after-insert':
+        // page.controller.ts: `validateCanViewWithPermissions` AFTER `pageService.create` committed.
+        throw authzUnavailable();
+      case 'before-insert':
+        // The same uncoded 503 thrown BEFORE the insert (the parent/space check): indistinguishable on the wire.
+        throw authzUnavailable();
+      case 'parse-busy':
+        throw new ContentParseBusyException(); // coded engine_busy: no conversion slot, nothing was created
+      case 'engine-busy':
+        throw engineBusy();
+      case 'budget':
+        throw new ConversionBudgetExhaustedException(7);
+      default:
+        throw new NotFoundException('gone');
+    }
+  }
+  @Post('create') create(@Headers('x-probe') probe?: string): never {
+    return this.raise(probe);
+  }
+  @Get('create') createGet(@Headers('x-probe') probe?: string): never {
+    return this.raise(probe); // same url, another method: not the create
+  }
+  @Post('update') update(@Headers('x-probe') probe?: string): never {
+    return this.raise(probe);
+  }
+}
+
 const ROUTES = [
   'authz-unavailable',
   'search-unauthorized',
@@ -88,7 +127,7 @@ const ROUTES = [
 async function boot(withFilter: boolean): Promise<NestFastifyApplication> {
   const moduleRef = await Test.createTestingModule({
     imports: withFilter ? [RetryAfterModule] : [],
-    controllers: [ProbeController],
+    controllers: [ProbeController, NativePageProbeController],
     providers: [Busy503Guard],
   }).compile();
   const app = moduleRef.createNestApplication<NestFastifyApplication>(
@@ -163,6 +202,54 @@ describe('RetryAfterFilter (wiki-v2#696): every engine 503 says when to come bac
     expect(res.headers['retry-after']).toBeUndefined();
   });
 
+  describe('wiki-v2#716: the native unkeyed create’s uncoded 503 is outcome-unknown', () => {
+    const create = (probe: string, method: 'POST' | 'GET' = 'POST', url = '/api/pages/create') =>
+      app.inject({ method, url, headers: { 'x-probe': probe } });
+
+    it.each(['after-insert', 'before-insert'])(
+      '%s: still a 503, but NO Retry-After and the "may have been created" message',
+      async (probe) => {
+        const res = await create(probe);
+        expect(res.statusCode).toBe(503);
+        expect(res.headers['retry-after']).toBeUndefined();
+        expect(res.json()).toEqual({
+          statusCode: 503,
+          error: 'Service Unavailable',
+          message: UNKEYED_CREATE_OUTCOME_UNKNOWN_MESSAGE,
+        });
+      },
+    );
+
+    it.each(['parse-busy', 'engine-busy'])(
+      'a CODED 503 (%s) on the create changed nothing: it keeps its body and the default Retry-After',
+      async (probe) => {
+        const res = await create(probe);
+        expect(res.statusCode).toBe(503);
+        expect(inWindow(res.headers['retry-after'])).toBe(true);
+        expect(res.json()).toMatchObject({ code: 'engine_busy' });
+      },
+    );
+
+    it('the converter-budget 429 on the create keeps its own Retry-After', async () => {
+      const res = await create('budget');
+      expect(res.statusCode).toBe(429);
+      expect(res.headers['retry-after']).toBe('7');
+    });
+
+    it('any other route (or method) keeps the default: /api/pages/update, GET /api/pages/create', async () => {
+      for (const res of [
+        await create('after-insert', 'POST', '/api/pages/update'),
+        await create('after-insert', 'GET'),
+      ]) {
+        expect(res.statusCode).toBe(503);
+        expect(inWindow(res.headers['retry-after'])).toBe(true);
+        expect(res.json().message).not.toBe(
+          UNKEYED_CREATE_OUTCOME_UNKNOWN_MESSAGE,
+        );
+      }
+    });
+  });
+
   it('re-throws outside HTTP (what Nest does there without a filter)', () => {
     const e = new ServiceUnavailableException('x');
     expect(() =>
@@ -191,5 +278,19 @@ describe('RetryAfterFilter (wiki-v2#696): every engine 503 says when to come bac
       'utf8',
     );
     expect(src).not.toMatch(/RetryAfter/);
+  });
+});
+
+describe('the unkeyed-create exception names the real native route (#716 review)', () => {
+  // The filter keys on the literal Fastify route URL. If upstream renamed the controller prefix, the handler path or the
+  // global prefix, the exception would silently stop matching and the native create's may-have-committed 503 would
+  // carry a Retry-After again. Pin the literal against the sources it is built from.
+  it("is 'api' + PageController's @Controller('pages') + its @Post('create')", () => {
+    const main = readFileSync(join(__dirname, '..', '..', 'main.ts'), 'utf8');
+    const ctrl = readFileSync(join(__dirname, '..', '..', 'core', 'page', 'page.controller.ts'), 'utf8');
+    expect(main).toMatch(/app\.setGlobalPrefix\('api',/);
+    expect(ctrl).toMatch(/@Controller\('pages'\)\s*export class PageController\b/);
+    expect(ctrl).toMatch(/@Post\('create'\)\s*async create\(/);
+    expect(UNKEYED_CREATE_ROUTE).toEqual({ method: 'POST', url: '/api/pages/create' });
   });
 });

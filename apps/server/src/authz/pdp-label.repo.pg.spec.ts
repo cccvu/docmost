@@ -1,4 +1,5 @@
 import * as postgres from 'postgres';
+import { ServiceUnavailableException } from '@nestjs/common';
 import { Kysely } from 'kysely';
 import { LabelRepo, LabelType } from '@docmost/db/repos/label/label.repo';
 import { emptyCursorPaginationResult } from '@docmost/db/pagination/cursor-pagination';
@@ -64,7 +65,10 @@ d('PdpLabelRepo on real Postgres (#615)', () => {
   let db: Kysely<any>;
   let repo: PdpLabelRepo;
   let viewable: Set<string>;
-  let userSpaces: string[];
+  /** The caller's PDP spaces, or `null`: the PDP could not answer (what `tryLookupResources` reports, #716). */
+  let userSpaces: string[] | null;
+  /** `true`: the page filter could not answer (`tryFilterResources` → null). */
+  let pageOutage: boolean;
   let filterCalls: string[][];
 
   const page = (id: string, space: string, updatedAt: string, opts: { trashed?: boolean } = {}) =>
@@ -80,7 +84,7 @@ d('PdpLabelRepo on real Postgres (#615)', () => {
   const stock = () =>
     new LabelRepo(db as any, {
       getUserSpaceIdsQuery: () =>
-        db.selectFrom('spaces').select('spaces.id').where('spaces.id', 'in', userSpaces),
+        db.selectFrom('spaces').select('spaces.id').where('spaces.id', 'in', userSpaces as string[]),
     } as any);
 
   /** `count` live pages in the caller's space, ids uuid(first)…, all carrying `labelId`. */
@@ -129,13 +133,14 @@ d('PdpLabelRepo on real Postgres (#615)', () => {
     db = mkReadModelDb(appPg);
 
     // The platform, stubbed at the HTTP-client seam: lookup-resources (the caller's spaces) and filter-resources
-    // (page view). Everything above it is the real remote-mode wiring.
+    // (page view). Everything above it is the real remote-mode wiring. An outage is what the client's try* methods
+    // return on any failure: null (#716).
     const authz = {
-      lookupResources: async () => userSpaces,
-      filterResources: async (_s: unknown, permission: string, type: string, ids: string[]) => {
+      tryLookupResources: async () => userSpaces,
+      tryFilterResources: async (_s: unknown, permission: string, type: string, ids: string[]) => {
         expect([permission, type]).toEqual(['view', 'page']);
         filterCalls.push(ids);
-        return ids.filter((id) => viewable.has(id));
+        return pageOutage ? null : ids.filter((id) => viewable.has(id));
       },
     } as any;
     repo = new PdpLabelRepo(
@@ -148,6 +153,7 @@ d('PdpLabelRepo on real Postgres (#615)', () => {
   beforeEach(async () => {
     viewable = new Set([P_OPEN, P_OPEN_2, P_TRASHED, P_OTHER_SPACE]); // P_RESTRICTED is hidden by the PDP
     userSpaces = [SPACE_A];
+    pageOutage = false;
     filterCalls = [];
     await pg`insert into spaces (id, name, slug, logo, workspace_id) values
       (${SPACE_A}, 'Space A', 'space-a', null, ${WS}), (${SPACE_B}, 'Space B', 'space-b', null, ${WS})`;
@@ -265,12 +271,23 @@ d('PdpLabelRepo on real Postgres (#615)', () => {
       }
     });
 
-    it('a PDP outage (no spaces, nothing viewable) lists nothing', async () => {
+    it('healthy empty answers (no spaces, nothing viewable) list nothing', async () => {
       userSpaces = [];
       expect(await listLabels({})).toEqual(emptyCursorPaginationResult(20));
       userSpaces = [SPACE_A];
       viewable = new Set();
       expect(await listLabels({})).toEqual(emptyCursorPaginationResult(20));
+    });
+
+    it('#716 a PDP outage (spaces or page filter could not answer) is a 503, never an empty list', async () => {
+      userSpaces = null;
+      await expect(listLabels({})).rejects.toBeInstanceOf(ServiceUnavailableException);
+      await expect(labelPages(L_ALPHA, {})).rejects.toBeInstanceOf(ServiceUnavailableException);
+      userSpaces = [SPACE_A];
+      pageOutage = true;
+      await expect(listLabels({})).rejects.toBeInstanceOf(ServiceUnavailableException);
+      await expect(labelPages(L_ALPHA, {})).rejects.toBeInstanceOf(ServiceUnavailableException);
+      expect(filterCalls.length).toBeGreaterThan(0); // the page filter ran and was the one that failed
     });
   });
 
