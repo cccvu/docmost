@@ -7,8 +7,8 @@ import { isWsConnectionLive } from './ws-connection-live';
  * CCC authorization fitness test (#455).
  *
  * `isWsConnectionLive` (the notifications/collab connect gate) deliberately RE-IMPLEMENTS the liveness core
- * of `jwt.strategy.validate` (the `/api/*` guard): re-read the fork user → reject `isUserDisabled`, then, if
- * the token carries a `sessionId`, re-read the session row and reject a missing / cross-user / cross-ws one.
+ * of `jwt.strategy.validate` (the `/api/*` guard): re-read the fork user → reject `isUserDisabled`, reject a
+ * token with no `sessionId` (#133), then re-read the session row and reject a missing / cross-user / cross-ws one.
  * It is a SECURITY predicate where divergence fails OPEN — if the two planes ever disagree, one keeps
  * honoring a revoked identity. A prose "must mirror" comment cannot catch that; THIS test can. It drives the
  * SAME liveness scenarios through BOTH implementations and asserts they agree in lockstep, so changing the
@@ -81,7 +81,8 @@ describe('liveness parity: isWsConnectionLive ⇔ jwt.strategy.validate (#455 fa
     expected: boolean;
   }> = [
     { name: 'live user + matching live session', user: liveUser, session: liveSession, expected: true },
-    { name: 'live user, no sessionId in token', user: liveUser, session: liveSession, payload: { sessionId: undefined }, expected: true },
+    // #133: an access token must name a session on both planes; a live user does not rescue one without it.
+    { name: 'live user, no sessionId in token', user: liveUser, session: liveSession, payload: { sessionId: undefined }, expected: false },
     { name: 'DEACTIVATED user', user: { ...liveUser, deactivatedAt: new Date() }, session: liveSession, expected: false },
     { name: 'DELETED user', user: { ...liveUser, deletedAt: new Date() }, session: liveSession, expected: false },
     { name: 'missing user', user: undefined, session: liveSession, expected: false },

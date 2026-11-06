@@ -15,9 +15,10 @@ import {
  *
  *   (2) NO CCC-owned code (authz/, service-bridge/, editor-compat/) imports `apps/server/src/ee/` — the
  *       closed EE gitlink (CLAUDE.md hard-rule #1). Upstream Docmost imports `ee/` pervasively (mfa, api-key,
- *       licence, typesense, imports…) — that is Docmost's own EE integration, out of scope here; and
- *       *initializing* the empty gitlink is already caught by `check-upstream-boundary.sh` (the gitlink is a
- *       tracked diff). This rule keeps OUR code decoupled from the closed EE.
+ *       licence, typesense, imports…) — that is Docmost's own EE integration, out of scope here. A local
+ *       *init* of the empty gitlink is NOT a tracked diff (the gitlink commit is unchanged), so
+ *       `check-upstream-boundary.sh` cannot see it; the engine refuses to boot instead when `ee/` holds
+ *       anything (`authz/mode/enterprise-code.ts`, #133). This rule keeps OUR code decoupled from the closed EE.
  *   (4) NO relative import escapes the fork root (`docmost/`) — a `../…/services/…` climb RESOLVES in a super
  *       checkout (docmost/ is a subdir there) so it passes the fork build yet breaks a standalone clone. This
  *       is the real "fork depends on the super repo"; the AGPL out-of-process direction (services ↛ docmost)

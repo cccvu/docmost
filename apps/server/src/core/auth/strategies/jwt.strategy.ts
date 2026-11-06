@@ -67,15 +67,18 @@ export class JwtStrategy extends PassportStrategy(Strategy, 'jwt') {
       throw new UnauthorizedException();
     }
 
-    if ((payload as JwtPayload).sessionId) {
-      const sessionId = (payload as JwtPayload).sessionId;
-      const session = await this.userSessionRepo.findActiveById(sessionId);
-      if (!session || session.userId !== payload.sub || session.workspaceId !== payload.workspaceId) {
-        throw new UnauthorizedException();
-      }
-      req.raw.sessionId = sessionId;
-      this.sessionActivityService.trackActivity(sessionId, payload.sub, payload.workspaceId);
+    // CCC seam (UPSTREAM_MODIFICATIONS.md #160, wiki-v2 #133): every access token must name a revocable
+    // session. Upstream skipped the session-row check when `sessionId` was absent.
+    const sessionId = (payload as JwtPayload).sessionId;
+    if (!sessionId) {
+      throw new UnauthorizedException();
     }
+    const session = await this.userSessionRepo.findActiveById(sessionId);
+    if (!session || session.userId !== payload.sub || session.workspaceId !== payload.workspaceId) {
+      throw new UnauthorizedException();
+    }
+    req.raw.sessionId = sessionId;
+    this.sessionActivityService.trackActivity(sessionId, payload.sub, payload.workspaceId);
 
     return { user, workspace };
   }

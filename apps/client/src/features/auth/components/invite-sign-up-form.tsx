@@ -19,6 +19,7 @@ import { useGetInvitationQuery } from "@/features/workspace/queries/workspace-qu
 import { useRedirectIfAuthenticated } from "@/features/auth/hooks/use-redirect-if-authenticated.ts";
 import { useTranslation } from "react-i18next";
 import SsoLogin from "@/ee/components/sso-login.tsx";
+import { isEnterpriseLoginEnabled } from "@/features/auth-native/lib/enterprise-login.ts";
 import { AuthLayout } from "./auth-layout.tsx";
 
 const formSchema = z.object({
@@ -74,7 +75,8 @@ export function InviteSignUpForm() {
           {t("Join the workspace")}
         </Title>
 
-        <SsoLogin />
+        {/* CCC seam (#133): EE SSO/LDAP login is unsupported (ADR 0035). */}
+        {isEnterpriseLoginEnabled() && <SsoLogin />}
 
         {!invitation.enforceSso && (
           <Stack align="stretch" justify="center" gap="xl">

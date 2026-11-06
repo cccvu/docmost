@@ -1,6 +1,7 @@
 import { Global, Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { AUTHZ_MODE, resolveAuthzMode } from './authz-mode';
+import { assertNoEnterpriseCode } from './enterprise-code';
 import { NativeAuthModeGuard } from './native-auth-mode.guard';
 import { RemoteOnlyGuard } from './remote-only.guard';
 
@@ -12,6 +13,10 @@ import { RemoteOnlyGuard } from './remote-only.guard';
  * truth and no per-concern drift. Reading ConfigService (not process.env) keeps it consistent with the
  * rest of the app's config and testable. A bad value throws here → Nest aborts boot (defense-in-depth
  * with the boot-time env validation in integrations/environment/environment.validation.ts).
+ *
+ * The same factory refuses to boot, in EVERY mode, when any Docmost EE code is present (`enterprise-code.ts`,
+ * wiki-v2 #133, ADR 0035): EE authentication is unsupported in this fork. It runs first, before the mode is
+ * resolved or used, so there is no mode branch to get wrong and no env override.
  *
  * Registered in the graph via AuthzModule (which database.module.ts already imports). Being @Global,
  * one registration makes AUTHZ_MODE injectable everywhere, including the module-local search seam.
@@ -28,8 +33,10 @@ import { RemoteOnlyGuard } from './remote-only.guard';
     {
       provide: AUTHZ_MODE,
       inject: [ConfigService],
-      useFactory: (config: ConfigService) =>
-        resolveAuthzMode(config.get<string>('AUTHZ_MODE')),
+      useFactory: (config: ConfigService) => {
+        assertNoEnterpriseCode();
+        return resolveAuthzMode(config.get<string>('AUTHZ_MODE'));
+      },
     },
     NativeAuthModeGuard,
     RemoteOnlyGuard,
