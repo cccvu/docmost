@@ -64,6 +64,27 @@ PLATFORM_AUTHZ_SERVICE_SECRET=<a shared secret, >= 16 chars>
   fork never sends unknown keys or over-cap arrays, so a faithful implementation is strict but never triggers
   those paths in normal operation.
 
+**Publishing needs `share` (1.12.0, wiki-v2 #704). Behaviour-relevant for implementers.** In remote mode, every
+change to a page's publish state asks `/authz/check-bulk`, in one batch, for the caller's `edit` and `share` on the
+page (resource type `page`, the page's uuid; a slug is resolved first) and `edit` and `share` on the space the page's
+row is in now (resource type `space`): creating its public share (`POST /api/shares/create`), updating it
+(`POST /api/shares/update`: `includeSubPages`, `searchIndexing`; decided on the share's own page, never a `pageId` in
+the body) and setting its expiry (`POST /api/shares/expiry`). The fork refuses with
+`403 { message, code: share_not_permitted }` and writes nothing when you answer page `edit: true, share: false`, or
+`edit: true` on the page or on the space with space `share: false`. The space pair is not redundant: for a page you
+have not placed yet (new, or moved to another space), the route's own edit check falls back to the caller's role in
+the page's current space. If the batch fails (a non-2xx, a timeout, a malformed or short body), it answers a
+retryable `503` with `Retry-After`. Any other answer (no `edit` on the page or its space) leaves the route's own
+checks to decide, unchanged: its `403` without `edit`, and its `400` for a restricted page. Unpublishing
+(`POST /api/shares/delete`) still needs `edit` only. Native mode is unchanged.
+
+`share` is a NEW permission name. An implementer that does not know it denies everyone publishing (a deny gives
+`403`) or blocks publishing (a non-2xx gives `503`) until it models it. Grant it wherever your policy lets a principal
+put pages on the public web. The reference model grants it to space writers and admins and to the workspace admin
+cascade. It also grants it to a role with both `edit` and `share` bound at space scope, never in an archived space,
+and always requires `edit`. A fork before 1.12.0 never asks for `share`. The reference stub's demo policy grants no
+`share` tuple, because the replacement smoke publishes nothing.
+
 ### Reference stub
 
 A zero-dependency Node reference implementation lives at
