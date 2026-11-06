@@ -29,6 +29,8 @@ vi.mock("@/lib/app-route.ts", () => ({
     HOME: "/",
   },
   isPublicRoutePath,
+  // #713: the step-up helper validates its return path with this; same-origin paths only, as the real one.
+  safeRedirectPath: (p: string) => (p.startsWith("/") && !p.startsWith("//") ? p : null),
 }));
 vi.mock("@/lib/config.ts", () => ({ isCloud: () => false }));
 
@@ -202,5 +204,71 @@ describe("api-client 404 handling (#384)", () => {
 
     expect(error).toBeInstanceOf(AxiosError);
     expect(window.location.href).toBe("/setup/register");
+  });
+});
+
+/**
+ * wiki-v2 #713: the engine answers a sensitive action on a not-recently-signed-in session with
+ * `403 {code: "step_up_required"}`. The interceptor sends the browser to the console confirm page (which re-mints the
+ * session fresh and returns), never re-mints itself (a re-mint from the same platform session is just as stale), and
+ * still rejects with the original error so the caller's own error handling runs.
+ */
+describe("api-client 403 step-up (#713)", () => {
+  const assign = vi.fn();
+  function forbidden(data: unknown) {
+    return async (config: any) => {
+      throw new AxiosError("Request failed with status code 403", "ERR_BAD_REQUEST", config, {
+        responseURL: "https://wiki.example/api/pages/delete",
+      }, {
+        status: 403,
+        statusText: "Forbidden",
+        data,
+        headers: {},
+        config,
+      });
+    };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    isPublicRoutePath.mockReturnValue(false);
+    Object.defineProperty(window, "location", {
+      value: { pathname: "/s/eng/p/abc", search: "?x=1", href: "", assign },
+      writable: true,
+      configurable: true,
+    });
+  });
+  afterEach(() => {
+    api.defaults.adapter = originalAdapter;
+  });
+
+  it("step_up_required: navigates to /console/confirm with the current path, and still rejects", async () => {
+    setAdapter(forbidden({ message: "Recent sign-in required", code: "step_up_required" }));
+
+    const error = await api.post("/pages/delete", { pageId: "p", permanentlyDelete: true }).catch((e) => e);
+
+    expect(error).toBeInstanceOf(AxiosError);
+    expect(error.response.status).toBe(403);
+    expect(assign).toHaveBeenCalledTimes(1);
+    expect(assign).toHaveBeenCalledWith(`/console/confirm?return=${encodeURIComponent("/s/eng/p/abc?x=1")}`);
+    expect(openDocmostSession).not.toHaveBeenCalled();
+  });
+
+  it("a plain 403 (a permission deny) does not navigate", async () => {
+    setAdapter(forbidden({ message: "Forbidden", statusCode: 403 }));
+
+    const error = await api.post("/pages/delete", {}).catch((e) => e);
+
+    expect(error).toBeInstanceOf(AxiosError);
+    expect(assign).not.toHaveBeenCalled();
+    expect(window.location.href).toBe("");
+  });
+
+  it("a public route never navigates", async () => {
+    isPublicRoutePath.mockReturnValue(true);
+    setAdapter(forbidden({ code: "step_up_required" }));
+
+    await expect(api.post("/pages/delete", {})).rejects.toBeInstanceOf(AxiosError);
+    expect(assign).not.toHaveBeenCalled();
   });
 });

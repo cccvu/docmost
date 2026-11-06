@@ -49,6 +49,7 @@ import { PrincipalRateLimitInterceptor } from './authz/request-controls/principa
 // CCC seam (#502, #598, #636): remote mode refuses the engine's native admin routes (space hard delete and create,
 // workspace/group/space-member admin, email change) — a table in authz/remote-refusal/.
 import { RemoteNativeRefusalInterceptor } from './authz/remote-refusal/remote-refusal.interceptor';
+import { RemoteStepUpInterceptor } from './authz/step-up/remote-step-up.interceptor';
 // CCC seam (#636 W6): remote mode runs a permanent page delete through the locked, fenced purge routine.
 import { PageDeleteModule } from './authz/page-delete/page-delete.module';
 import { RemotePurgeInterceptor } from './authz/page-delete/remote-purge.interceptor';
@@ -147,8 +148,9 @@ try {
     // (above) stamps the CLS actor first; ApiAccessAuditInterceptor wraps the request so it records the
     // final outcome INCLUDING a 429 the rate limiter raises; PrincipalRateLimitInterceptor rejects before the
     // handler runs. RemoteNativeRefusalInterceptor (#502, #598, #636) is registered after these, so its 404s are
-    // rate-limited and land in the access row too. RemotePurgeInterceptor (#636 W6) is registered after them too,
-    // so a remote purge is rate-limited and lands in the access row. Do not reorder.
+    // rate-limited and land in the access row too. RemoteStepUpInterceptor (wiki-v2 #713) follows it and must stay
+    // BEFORE RemotePurgeInterceptor (#636 W6), which never calls the handler, so a purge is step-up checked first;
+    // the purge is registered after them too, so it is rate-limited and lands in the access row. Do not reorder.
     ApiAccessAuditService,
     {
       provide: APP_INTERCEPTOR,
@@ -161,6 +163,10 @@ try {
     {
       provide: APP_INTERCEPTOR,
       useClass: RemoteNativeRefusalInterceptor,
+    },
+    {
+      provide: APP_INTERCEPTOR,
+      useClass: RemoteStepUpInterceptor,
     },
     {
       provide: APP_INTERCEPTOR,
