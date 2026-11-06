@@ -459,12 +459,33 @@ describe('#642 the per-principal worker-time budget', () => {
   });
 
   it('#734 a conversion that replies after the kill timer re-armed keeps its worker: the re-armed timer is cleared', async () => {
-    // 170 ms: past the first (early) timer at ~150 ms, so the reply lands while a re-armed one is pending.
-    const deadlineMs = 200;
+    // Ordered by the event loop, not by a timing window: the kill timer's FIRST fire is forced to 0 ms (libuv runs
+    // expired timers before it polls for the worker's reply), so it re-arms for the ~1 s left long before the 50 ms
+    // reply is read, and the reply then lands with that re-armed timer pending.
+    const deadlineMs = 1_000;
     const { pool, spawned } = track(makePool({ deadlineMs, budgetCapacityMs: 10_000, budgetRefillMsPerMinute: 0 }));
     await pool.parse('warm', 'html', q('background'));
-    await expect(withEarlyTimers(() => pool.parse('sleep:170', 'html', q('user:A')))).resolves.toBeDefined();
-    await new Promise((r) => setTimeout(r, deadlineMs)); // a leftover timer would have fired by now
+    const real = global.setTimeout;
+    let forced = false;
+    const armedAfter: number[] = [];
+    const spy = jest
+      .spyOn(global, 'setTimeout')
+      .mockImplementation(((fn: (...a: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+        if (!forced && ms === deadlineMs) {
+          forced = true; // the kill timer's first arm fires at once
+          return real(fn, 0, ...args);
+        }
+        if (forced) armedAfter.push(ms ?? 0);
+        return real(fn, ms, ...args);
+      }) as typeof setTimeout);
+    try {
+      await expect(pool.parse('sleep:50', 'html', q('user:A'))).resolves.toEqual({ type: 'doc', label: '' });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(forced).toBe(true);
+    expect(armedAfter.some((ms) => ms > deadlineMs - 100 && ms <= deadlineMs)).toBe(true); // it did re-arm
+    await new Promise((r) => setTimeout(r, deadlineMs + 100)); // a leftover re-armed timer would have fired by now
     expect(spawned.length).toBe(1); // never discarded and replaced
     await expect(pool.parse('after', 'html', q('background'))).resolves.toEqual({ type: 'doc', label: 'after' });
   });
@@ -472,14 +493,25 @@ describe('#642 the per-principal worker-time budget', () => {
   it('#734 a wall clock that steps backward neither postpones the kill nor undercharges it: the deadline is monotonic', async () => {
     // ADR 0031: the deadline is the one bound on the single worker. Date.now() steps back 3 s just after dispatch
     // (an NTP/chrony step); a kill decided on it would land at ~3.2 s and hold the worker for everyone that long.
+    // The step is taken when the kill timer is armed, i.e. after dispatch by construction, never on a timing guess.
     const deadlineMs = 200;
     const { pool } = track(makePool({ deadlineMs, budgetCapacityMs: 10_000, budgetRefillMsPerMinute: 0 }));
     await pool.parse('warm', 'html', q('background'));
-    const step = setTimeout(() => (offset -= 3_000), 20); // `offset` steers this describe's Date.now spy
+    const real = global.setTimeout;
+    const spy = jest
+      .spyOn(global, 'setTimeout')
+      .mockImplementation(((fn: (...a: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+        if (ms === deadlineMs && offset === 0) offset -= 3_000; // `offset` steers this describe's Date.now spy
+        return real(fn, ms, ...args);
+      }) as typeof setTimeout);
     const started = performance.now();
-    const err = await pool.parse('hang', 'html', q('user:A')).catch((e) => e);
+    let err: unknown;
+    try {
+      err = await pool.parse('hang', 'html', q('user:A')).catch((e) => e);
+    } finally {
+      spy.mockRestore();
+    }
     const took = performance.now() - started;
-    clearTimeout(step);
     expect(offset).toBe(-3_000); // the step happened, mid-conversion
     expect(err).toBeInstanceOf(ContentTooComplexException);
     expect(took).toBeGreaterThanOrEqual(deadlineMs);
