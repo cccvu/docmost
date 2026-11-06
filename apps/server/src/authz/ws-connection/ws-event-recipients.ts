@@ -7,7 +7,7 @@ const logger = new Logger('WsEventRecipients');
  * CCC authorization integration — NOT upstream Docmost code.
  *
  * Who of a room's connected users may receive a realtime event about a page (`ws.service.ts`
- * `broadcastToAuthorizedUsers`, seam #196). In remote mode `getUserIdsWithPageAccess` is the PDP, and since #716 a PDP
+ * `broadcastToAuthorizedUsers`, seam #197). In remote mode `getUserIdsWithPageAccess` is the PDP, and since #716 a PDP
  * that could not answer is a 503 (`authzUnavailable`) instead of `[]`. That is right for every request path, but this
  * one is fire-and-forget: upstream's comment create/update/delete call `emitCommentEvent` without awaiting it, so the
  * 503 would surface as a process-level UnhandledRejection on every restricted-page comment during an outage. So a 503

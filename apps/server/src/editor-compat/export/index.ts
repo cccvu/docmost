@@ -1,5 +1,5 @@
 /**
- * #699 — the bounded native export (fork-owned). The upstream `ExportService` seam (§195) imports only from here.
+ * #699 — the bounded native export (fork-owned). The upstream `ExportService` seam (§196) imports only from here.
  * #716: pages are serialized in the conversion worker (`renderExportPage`) inside one build scope per export
  * (`withExportConversion`); the main-thread Markdown helper is no longer re-exported, so the seam cannot reach it.
  */

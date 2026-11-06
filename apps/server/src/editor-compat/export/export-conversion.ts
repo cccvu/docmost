@@ -1,7 +1,7 @@
 /**
  * #716 — the native export serializes its pages in the conversion worker, inside a build deadline. Fork-owned.
  *
- * `ExportService.exportPage` (seam §195) turned every page into HTML (`jsonToHtml`, a happy-dom window) and, for
+ * `ExportService.exportPage` (seam §196) turned every page into HTML (`jsonToHtml`, a happy-dom window) and, for
  * Markdown, into Markdown (Turndown on a jsdom window) on the MAIN thread, with no yield between pages: ~0.9 s for the
  * legit 990 KB page and ~2.5 s for a table-heavy one on a laptop (×~2.5 on Graviton), per page, blocking every other
  * request. `renderExportPage` now hands that to the bounded worker (`serializePageContent`): the same composition, the
@@ -144,7 +144,7 @@ export function exportBuildMsLeft(): number {
 }
 
 /**
- * One page as the native export writes it (`ExportService.exportPage`, seam §195): HTML in upstream's document
+ * One page as the native export writes it (`ExportService.exportPage`, seam §196): HTML in upstream's document
  * template, or Markdown (upstream's `<colgroup>` strip, then Turndown with its DOM released), serialized in the worker.
  * Any other format is `undefined`, as upstream returned.
  */
