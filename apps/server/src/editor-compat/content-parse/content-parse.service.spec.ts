@@ -432,6 +432,26 @@ describe('#642 the per-principal worker-time budget', () => {
     );
   });
 
+  it('#734 a deadline timer that fires early re-arms: a conversion is never killed before its full deadline', async () => {
+    // A main-thread setTimeout can fire ~1 ms early by Date.now(); here every one fires 50 ms early, so the kill
+    // timer is only honored if it re-checks the elapsed time (without the re-arm: killed and charged at ~150 ms).
+    const deadlineMs = 200;
+    const { pool } = track(makePool({ deadlineMs, budgetCapacityMs: 10_000, budgetRefillMsPerMinute: 0 }));
+    await pool.parse('warm', 'html', q('background'));
+    const real = global.setTimeout;
+    const early = jest
+      .spyOn(global, 'setTimeout')
+      .mockImplementation(((fn: () => void, ms?: number) => real(fn, Math.max(0, (ms ?? 0) - 50))) as typeof setTimeout);
+    let err: unknown;
+    try {
+      err = await pool.parse('hang', 'html', q('user:A')).catch((e) => e);
+    } finally {
+      early.mockRestore();
+    }
+    expect(err).toBeInstanceOf(ContentTooComplexException);
+    expect(pool.budgetLeft('user:A')).toBeLessThanOrEqual(10_000 - deadlineMs);
+  });
+
   it('an ordinary conversion is charged its wall time; exempt keys are never charged', async () => {
     const { pool } = track(
       makePool({ budgetCapacityMs: 10_000, budgetRefillMsPerMinute: 0 }),
@@ -555,11 +575,13 @@ describe('#642 the per-principal worker-time budget', () => {
     await expect(pool.toHtml('first', bq('user:A', 5_000, turn))).resolves.toBe('<p>first</p>');
     expect(turn.admitted).toBe(true);
     // The same batch spends the human's bucket below zero: charged, never gated.
-    await pool.toHtml('sleep:250:spend', bq('user:A', 5_000, turn));
+    // #734: 210 ms (was 250): still below zero, and 130 ms of slack before the next charge reaches the floor.
+    await pool.toHtml('sleep:210:spend', bq('user:A', 5_000, turn));
     const left = pool.budgetLeft('user:A');
     expect(left).toBeLessThan(0);
-    expect(left).toBeGreaterThan(-200); // above the floor, so the next charge is visible in full
-    // The same batch: converted at once, and charged (a 60 ms fixture sleep is at least 60 ms of worker time).
+    expect(left - 60).toBeGreaterThan(-200); // above the floor even after the next charge, so it is visible in full
+    // The same batch: converted at once, and charged (a 60 ms fixture sleep is at least 60 ms of worker time: the
+    // fixture's sleep never ends early by the pool's clock, #734).
     await expect(pool.toHtml('sleep:60:second', bq('user:A', 5_000, turn))).resolves.toEqual({
       type: 'doc',
       label: 'second',
@@ -593,9 +615,12 @@ describe('#642 the per-principal worker-time budget', () => {
     await pool.parse('warm', 'html', q('background'));
     const turn = batchConversion('file-task:1', 'A').budgetTurn;
     await pool.toHtml('first', bq('user:A', 5_000, turn));
-    await pool.toHtml('sleep:150:a', bq('user:A', 5_000, turn)); // to about -50: on the books, no overdraft yet
+    // #734: 100 + 250 ms (was 150 + 150, which put the overdraft exactly on the 100 ms limit when the conversions
+    // measured exactly their sleeps). The fixture's sleeps never end early by the pool's clock, so the overdraft is
+    // ≥ 150 ms; and `a` leaves ~100 ms of slack before the floor for a late timer.
+    await pool.toHtml('sleep:100:a', bq('user:A', 5_000, turn)); // to about 0: on the books, no overdraft yet
     expect(turn.overdraftMs).toBe(0);
-    await pool.toHtml('sleep:150:b', bq('user:A', 5_000, turn)); // past the floor by ≥ 100 ms: the overdraft
+    await pool.toHtml('sleep:250:b', bq('user:A', 5_000, turn)); // past the floor by ≥ 150 ms: the overdraft
     expect(turn.overdraftMs).toBeGreaterThan(100);
     const started = Date.now();
     const err = await pool.toHtml('sleep:2000:never', bq('user:A', 5_000, turn)).catch((e) => e);

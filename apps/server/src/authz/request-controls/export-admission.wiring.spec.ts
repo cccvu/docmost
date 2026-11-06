@@ -36,6 +36,16 @@ type ExportBody = { key: string; scenario: Scenario; includeChildren?: boolean; 
 /** Held sources by request key: each sends one chunk, then waits for `release(key)`. */
 const held = new Map<string, PassThrough>();
 const release = (key: string) => held.get(key)?.end();
+/** Callers waiting in `heldSource` for a key's storage object to be opened. */
+const opening = new Map<string, (s: PassThrough) => void>();
+/**
+ * #734: resolves with `key`'s held source once the export has opened it. The archive opens it lazily, when JSZip
+ * pulls the entry, which can come after the response head; a fixed sleep stood in for that and flaked under load.
+ */
+const heldSource = (key: string): Promise<PassThrough> => {
+  const s = held.get(key);
+  return s ? Promise.resolve(s) : new Promise((resolve) => opening.set(key, resolve));
+};
 
 function storageFor(body: ExportBody) {
   return {
@@ -49,6 +59,8 @@ function storageFor(body: ExportBody) {
         const s = new PassThrough();
         s.write(Buffer.alloc(256 * 1024, 1));
         held.set(body.key, s);
+        opening.get(body.key)?.(s);
+        opening.delete(body.key);
         return s;
       }
       if (body.scenario === 'midstream-error') {
@@ -140,6 +152,7 @@ describe('export admission on a real server (#699)', () => {
   afterEach(() => {
     for (const k of [...held.keys()]) release(k);
     held.clear();
+    opening.clear();
     for (const k of [...working.keys()]) finishWork(k);
     working.clear();
     for (const r of open.splice(0)) r.destroy();
@@ -255,8 +268,7 @@ describe('export admission on a real server (#699)', () => {
   it('a client that goes away releases its slot and the open storage object', async () => {
     const a = await post('/spaces/export', { key: 'p3', scenario: 'hold' }, 'user-3');
     expect(a.status).toBe(200);
-    await new Promise((r) => setTimeout(r, 20));
-    const source = held.get('p3')!;
+    const source = await heldSource('p3'); // the storage object is open (never opened: the test times out)
     expect(source.destroyed).toBe(false);
     a.req.destroy(); // the browser tab closes
     await admittedWithin('user-3');

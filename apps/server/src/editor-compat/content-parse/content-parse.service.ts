@@ -487,10 +487,17 @@ export class ContentParsePool {
         finish({ ok: false, reason: err.code === 'ERR_WORKER_OUT_OF_MEMORY' ? 'heap' : 'crashed' }, true);
       const onExit = () => finish({ ok: false, reason: 'crashed' }, true);
       // The timer runs on this (main) thread, so it fires late by the event loop's lag; `lateMs` logs by how much.
-      const timer = setTimeout(
-        () => finish({ ok: false, reason: 'deadline', lateMs: Date.now() - dispatched - deadlineMs }, true),
-        deadlineMs,
-      );
+      // #734: it can also fire about 1 ms EARLY by Date.now() (libuv's ms-truncated loop time), so it re-arms for the
+      // remainder: a conversion is never killed, or charged, before its full deadline.
+      let timer: NodeJS.Timeout;
+      const arm = (ms: number) => {
+        timer = setTimeout(() => {
+          const elapsed = Date.now() - dispatched;
+          if (elapsed < deadlineMs) return arm(deadlineMs - elapsed);
+          finish({ ok: false, reason: 'deadline', lateMs: elapsed - deadlineMs }, true);
+        }, ms);
+      };
+      arm(deadlineMs);
       worker.on('message', onMessage);
       worker.on('error', onError);
       worker.on('exit', onExit);

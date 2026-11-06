@@ -6,6 +6,22 @@ const { parentPort, workerData } = require('node:worker_threads');
 
 if (workerData && workerData.mode === 'throw-on-load') throw new Error('fixture: failed to load');
 
+/**
+ * #734: call `done` once at least `ms` have passed on `Date.now()`, the clock the pool charges with. A bare
+ * setTimeout(ms) can fire about 1 ms early by that clock (libuv starts the timer from its cached, ms-truncated loop
+ * time), so a 60 ms sleep was sometimes charged 59 and the "charged at least <ms>" specs flaked. The pool's own clock
+ * starts before it posts the request, so ending at or after `until` makes the conversion it measures ≥ `ms`.
+ */
+function sleepAtLeast(ms, done) {
+  const until = Date.now() + ms;
+  const check = () => {
+    const left = until - Date.now();
+    if (left > 0) setTimeout(check, left);
+    else done();
+  };
+  setTimeout(check, ms);
+}
+
 parentPort.on('message', (req) => {
   const reply = (r) => parentPort.postMessage({ id: req.id, ...r });
   // #716: a `serialize` request carries its script in `json.script` (it has no `content`).
@@ -23,7 +39,7 @@ parentPort.on('message', (req) => {
   if (sleep) {
     const label = sleep[2] ?? '';
     const result = req.op === 'serialize' ? `serialized:${label}` : { type: 'doc', label };
-    return setTimeout(() => reply({ ok: true, result, nodes: 1 }), Number(sleep[1]));
+    return sleepAtLeast(Number(sleep[1]), () => reply({ ok: true, result, nodes: 1 }));
   }
   if (req.op === 'markdown-to-html') {
     const html = `<p>${content}</p>`;
