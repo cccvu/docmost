@@ -7,7 +7,9 @@ import { Injectable, Logger } from '@nestjs/common';
  * SpiceDB semantics, identity translation, the schema — lives in the platform; this is only a
  * client. FAIL-CLOSED: any transport error or non-200 resolves to "denied" (false / empty), so a
  * platform outage cannot silently grant access. The `try*` methods report that same failure as `null`
- * instead, for callers that must answer "unknown" (a retryable 503, #696) rather than a deny-shaped status.
+ * instead, for callers that must answer "unknown" (a retryable 503, #696) rather than a deny-shaped status. Since
+ * #716 every PDP repo list primitive uses them too (an empty list reads as "you have nothing"); the fail-closed
+ * originals stay for the contract/round-trip specs and any caller for which empty is the right answer.
  */
 export type AuthzSubject =
   // A platform principal. `subjectType: 'service'` names a SERVICE ACCOUNT (the platform resolves it to its
@@ -27,7 +29,10 @@ export interface AuthzCheckItem {
  *  DROPPING authorized objects. So over-cap arrays are chunked to this size and the results unioned. */
 const FILTER_CHUNK = 1000;
 /** Bounded per-request timeout (ms) so a slow/hung platform cannot hang the wiki request; on timeout the
- *  call aborts and resolves fail-closed. Overridable via PLATFORM_AUTHZ_TIMEOUT_MS. */
+ *  call aborts and resolves fail-closed. Overridable via PLATFORM_AUTHZ_TIMEOUT_MS. #716: keep it LONGER than the
+ *  platform's per-check SpiceDB deadline (SPICEDB_TIMEOUT_MS, 1200 ms): the search PDP lane frees a slot when this
+ *  call settles, and the platform's checks for an aborted call keep running until their own deadline, so the lane
+ *  bounds SpiceDB work only while inner < outer (pinned by the super repo's check-infra-config §28). */
 const DEFAULT_TIMEOUT_MS = 1500;
 /** How much longer than the platform's own settle wait the fork's request may take: network, plus the platform's
  *  confirm step after the fence is reached (a dead-letter read, a fully consistent SpiceDB check with its own
@@ -266,9 +271,36 @@ export class HttpAuthzClient {
   }
 
   /**
+   * {@link lookupResources} that reports FAILURE distinctly — `null` — instead of collapsing it into "no resources"
+   * (#716). For the PDP repos' list primitives, where an empty answer reads as "you have nothing" (a blank sidebar, a
+   * 403 on a favorite, an empty suggestion list) when the PDP merely could not answer. `null` covers a transport
+   * error, timeout, non-2xx, and a malformed 200 (a non-array `ids` or any non-string element). On success: each id
+   * once, in the platform's order.
+   */
+  async tryLookupResources(
+    subject: AuthzSubject,
+    permission: string,
+    resourceType: string,
+  ): Promise<string[] | null> {
+    const r = await this.post<{ ids: unknown }>('/authz/lookup-resources', {
+      subject,
+      permission,
+      resourceType,
+    });
+    if (!r) return null;
+    const ids = r.ids;
+    if (!Array.isArray(ids) || !ids.every((id): id is string => typeof id === 'string')) {
+      this.logFailure('/authz/lookup-resources', '-> malformed ids');
+      return null;
+    }
+    return [...new Set(ids)];
+  }
+
+  /**
    * The subject-side filter: of these Docmost user ids, which hold `permission` on the resource?
    * Backs the reverse-index recipient filters (`getUserIdsWith*Access`). The platform echoes the
-   * passing subject refs back, so we recover Docmost user ids directly. FAIL-CLOSED → empty on error.
+   * passing subject refs back, so we recover Docmost user ids directly. FAIL-CLOSED → empty on error (a failed
+   * chunk is skipped). The PDP repos use {@link tryFilterSubjects} instead (#716).
    */
   async filterSubjects(
     permission: string,
@@ -301,6 +333,51 @@ export class HttpAuthzClient {
         if (s && typeof s.externalId === 'string') allowed.add(s.externalId);
     }
     return [...allowed];
+  }
+
+  /**
+   * {@link filterSubjects} that reports FAILURE distinctly — `null` — instead of skipping a failed chunk (#716): a
+   * dropped chunk silently removes its users from a recipient list, and an all-failed call reads as "nobody may see
+   * this". `null` covers a transport error, timeout, non-2xx, and a malformed 200 (a non-array `subjects`, or any
+   * element without a string `externalId`) on ANY chunk. On success: the allowed candidates in the caller's order,
+   * each once; a subject the caller did not offer is never returned.
+   */
+  async tryFilterSubjects(
+    permission: string,
+    resourceType: string,
+    resourceId: string,
+    candidateUserIds: string[],
+  ): Promise<string[] | null> {
+    if (candidateUserIds.length === 0) return [];
+    const allowed = new Set<string>();
+    for (let i = 0; i < candidateUserIds.length; i += FILTER_CHUNK) {
+      const batch = candidateUserIds.slice(i, i + FILTER_CHUNK);
+      const r = await this.post<{ subjects: unknown }>('/authz/filter-subjects', {
+        permission,
+        resourceType,
+        resourceId,
+        candidates: batch.map((externalId) => ({ provider: 'docmost', externalId })),
+      });
+      if (!r) return null;
+      const subjects = r.subjects;
+      if (
+        !Array.isArray(subjects) ||
+        !subjects.every(
+          (s): s is { externalId: string } =>
+            !!s && typeof s === 'object' && typeof (s as { externalId?: unknown }).externalId === 'string',
+        )
+      ) {
+        this.logFailure('/authz/filter-subjects', '-> malformed subjects');
+        return null;
+      }
+      for (const s of subjects) allowed.add(s.externalId);
+    }
+    // In the caller's candidate order, once each: a subject the caller did not offer is dropped.
+    const out: string[] = [];
+    for (const id of candidateUserIds) {
+      if (allowed.delete(id)) out.push(id);
+    }
+    return out;
   }
 
   /**

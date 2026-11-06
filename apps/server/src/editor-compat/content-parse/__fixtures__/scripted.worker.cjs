@@ -8,8 +8,10 @@ if (workerData && workerData.mode === 'throw-on-load') throw new Error('fixture:
 
 parentPort.on('message', (req) => {
   const reply = (r) => parentPort.postMessage({ id: req.id, ...r });
-  const content = String(req.content);
-  if (content === 'hang') for (;;); // a synchronous parse that never ends
+  // #716: a `serialize` request carries its script in `json.script` (it has no `content`).
+  const content = String(req.op === 'serialize' ? req.json && req.json.script : req.content);
+  // 'hang:<padding>' (#716): the same, with an input long enough to be classed large.
+  if (content === 'hang' || content.startsWith('hang:')) for (;;); // a synchronous parse that never ends
   if (content === 'oom') {
     const hoard = [];
     for (;;) hoard.push(new Array(1e6).fill(Math.random()));
@@ -19,7 +21,9 @@ parentPort.on('message', (req) => {
   if (content === 'too-complex') return reply({ ok: false, reason: 'too_complex', detail: 'nodes' });
   const sleep = /^sleep:(\d+)(?::(.*))?$/.exec(content);
   if (sleep) {
-    return setTimeout(() => reply({ ok: true, result: { type: 'doc', label: sleep[2] ?? '' }, nodes: 1 }), Number(sleep[1]));
+    const label = sleep[2] ?? '';
+    const result = req.op === 'serialize' ? `serialized:${label}` : { type: 'doc', label };
+    return setTimeout(() => reply({ ok: true, result, nodes: 1 }), Number(sleep[1]));
   }
   if (req.op === 'markdown-to-html') {
     const html = `<p>${content}</p>`;

@@ -1,5 +1,6 @@
 import { PdpPagePermissionRepo } from '../pdp-page-permission.repo';
 import { PdpSpaceMemberRepo } from '../pdp-space-member.repo';
+import { HttpAuthzClient } from '../http-authz.client';
 import { ForbiddenException, ServiceUnavailableException } from '@nestjs/common';
 import { PageAccessService } from '../../core/page/page-access/page-access.service';
 import { spyKysely } from '../../service-bridge/kysely-spy.testkit';
@@ -12,7 +13,9 @@ import { LIFECYCLE_MAX_DEPTH } from '../../service-bridge/page-lineage';
  * notifications, exports, previews, history, attachments — architecture §8) funnels through a small
  * set of PDP-backed repo primitives. These tests prove the primitives EXCLUDE a confidential
  * page/space (and its non-member recipients) — so any vector routed through them cannot leak it — and
- * that they FAIL CLOSED when the platform is unreachable (the client returns empty/false).
+ * that they FAIL CLOSED when the platform is unreachable: every primitive, point decision or list, throws the
+ * retryable 503 (`authzUnavailable`, #696 / #716). A list never answers empty or a partial subset on an outage —
+ * upstream reads that as the complete answer ("you have nothing", or a move/duplicate of part of a tree).
  */
 describe('PDP repo primitives — deny propagation (leakage backbone)', () => {
   const CONF_PAGE = 'conf-page';
@@ -37,13 +40,14 @@ describe('PDP repo primitives — deny propagation (leakage backbone)', () => {
 
   const authz = {
     check: jest.fn(async (_s: any, _p: string, rt: string, rid: string) => !denies(rt, rid)),
-    checkBulk: jest.fn(async (_s: any, checks: Parameters<typeof decide>[0]) => decide(checks)),
     tryCheckBulk: jest.fn(async (_s: any, checks: Parameters<typeof decide>[0]) => decide(checks)),
-    filterResources: jest.fn(async (_s: any, _p: string, _rt: string, ids: string[]) =>
+    // #716: the repos call only the null-on-failure `try*` list methods. The fail-closed originals are absent here
+    // on purpose, so a repo that went back to one of them fails these healthy cases too.
+    tryFilterResources: jest.fn(async (_s: any, _p: string, _rt: string, ids: string[]) =>
       ids.filter((id) => id !== CONF_PAGE),
     ),
-    lookupResources: jest.fn(async () => ['ok-space-1', 'ok-space-2']), // never CONF_SPACE
-    filterSubjects: jest.fn(async (_p: string, _rt: string, rid: string, users: string[]) =>
+    tryLookupResources: jest.fn(async () => ['ok-space-1', 'ok-space-2']), // never CONF_SPACE
+    tryFilterSubjects: jest.fn(async (_p: string, _rt: string, rid: string, users: string[]) =>
       rid === CONF_PAGE || rid === CONF_SPACE ? [] : users.filter((u) => u !== BANNED_USER),
     ),
   };
@@ -131,9 +135,10 @@ describe('PDP repo primitives — deny propagation (leakage backbone)', () => {
     expect(pageDb.calls).toHaveLength(0);
   });
 
-  describe('FAIL CLOSED when the platform is unreachable (client returns empty/false, or null from try*)', () => {
-    // Mirrors HttpAuthzClient's fail-closed contract: outage -> deny everything. #696: a POINT decision that could
-    // not be made is a 503 (never an answer); the list primitives stay empty.
+  describe('FAIL CLOSED when the platform is unreachable (the try* methods answer null → a 503)', () => {
+    // Mirrors HttpAuthzClient: an outage is `null` from every try* method (and empty/false from the fail-closed
+    // originals, kept here so a repo that went back to one of them would answer [] and fail). #696: a POINT
+    // decision that could not be made is a 503. #716: so is a LIST — never empty, which reads as "you have nothing".
     const down = {
       check: jest.fn(async () => false),
       checkBulk: jest.fn(async (_s: any, checks: any[]) => checks.map(() => false)),
@@ -141,6 +146,9 @@ describe('PDP repo primitives — deny propagation (leakage backbone)', () => {
       filterResources: jest.fn(async () => []),
       lookupResources: jest.fn(async () => []),
       filterSubjects: jest.fn(async () => []),
+      tryFilterResources: jest.fn(async () => null),
+      tryLookupResources: jest.fn(async () => null),
+      tryFilterSubjects: jest.fn(async () => null),
     };
     // #524: an unknown PDP answer denies BEFORE the fork's rows are read, so an outage adds no DB load.
     const downDb = spyKysely(() => {
@@ -149,18 +157,134 @@ describe('PDP repo primitives — deny propagation (leakage backbone)', () => {
     const page = new PdpPagePermissionRepo(downDb.db, {} as any, {} as any, down as any);
     const space = new PdpSpaceMemberRepo({} as any, {} as any, {} as any, {} as any, down as any);
 
-    it('every primitive denies on outage', async () => {
-      expect(await page.filterAccessiblePageIds({ pageIds: ['a', 'b'], userId: 'u1' })).toEqual([]);
-      expect(await page.filterAccessiblePageIdsWithPermissions(['a', 'b'], 'u1')).toEqual([]);
-      expect(await page.getUserIdsWithPageAccess('p', ['u1', 'u2'])).toEqual([]);
+    it('every primitive is a 503 on outage — a list never answers empty', async () => {
+      // #716: the list primitives. Upstream reads an empty answer as the complete one: a blank sidebar, recent, trash,
+      // favorites (or a 403 from its space check), labels, shares, suggestions, an export refused as "no accessible
+      // pages", and a move-to-space / duplicate that moves or copies the root alone.
+      await expect(page.filterAccessiblePageIds({ pageIds: ['a', 'b'], userId: 'u1' })).rejects.toBeInstanceOf(
+        ServiceUnavailableException,
+      );
+      await expect(page.filterAccessiblePageIdsWithPermissions(['a', 'b'], 'u1')).rejects.toBeInstanceOf(
+        ServiceUnavailableException,
+      );
+      await expect(page.getUserIdsWithPageAccess('p', ['u1', 'u2'])).rejects.toBeInstanceOf(ServiceUnavailableException);
+      await expect(space.getUserIdsWithSpaceAccess(['u1'], 's')).rejects.toBeInstanceOf(ServiceUnavailableException);
+      await expect(space.getUserSpaceIds('u1')).rejects.toBeInstanceOf(ServiceUnavailableException);
+      // The fail-closed originals are never consulted (each would answer [] / all-false).
+      for (const m of [down.checkBulk, down.filterResources, down.lookupResources, down.filterSubjects]) {
+        expect(m).not.toHaveBeenCalled();
+      }
       // #696: the point decisions throw a 503 — never `false`/no role (a deny-shaped 403/404), and never an answer
       // upstream could fall back from. #492: in particular never the relaxing `locked=false`.
       await expect(page.canUserAccessPage('u1', 'p')).rejects.toBeInstanceOf(ServiceUnavailableException);
       await expect(page.canUserEditPage('u1', 'p')).rejects.toBeInstanceOf(ServiceUnavailableException);
       await expect(space.getUserSpaceRoles('u1', 's')).rejects.toBeInstanceOf(ServiceUnavailableException);
       expect(downDb.calls).toHaveLength(0);
-      expect([...(await space.getUserIdsWithSpaceAccess(['u1'], 's'))]).toEqual([]);
-      expect(await space.getUserSpaceIds('u1')).toEqual([]);
+    });
+
+    it('empty inputs stay a healthy [] with no PDP call (nothing to ask is not an outage)', async () => {
+      expect(await page.filterAccessiblePageIds({ pageIds: [], userId: 'u1' })).toEqual([]);
+      expect(await page.filterAccessiblePageIdsWithPermissions([], 'u1')).toEqual([]);
+      expect(await page.getUserIdsWithPageAccess('p', [])).toEqual([]);
+      expect([...(await space.getUserIdsWithSpaceAccess([], 's'))]).toEqual([]);
+      expect(down.tryFilterResources).not.toHaveBeenCalled();
+      expect(down.tryCheckBulk).not.toHaveBeenCalled();
+      expect(down.tryFilterSubjects).not.toHaveBeenCalled();
+    });
+
+    it('a healthy empty answer is still [] (a real "none"), distinct from an outage', async () => {
+      const none = {
+        tryCheckBulk: jest.fn(async (_s: any, checks: any[]) => checks.map(() => false)),
+        tryFilterResources: jest.fn(async () => []),
+        tryLookupResources: jest.fn(async () => []),
+        tryFilterSubjects: jest.fn(async () => []),
+      };
+      const p = new PdpPagePermissionRepo({} as any, {} as any, {} as any, none as any);
+      const sp = new PdpSpaceMemberRepo({} as any, {} as any, {} as any, {} as any, none as any);
+      expect(await p.filterAccessiblePageIds({ pageIds: ['a'], userId: 'u1' })).toEqual([]);
+      expect(await p.filterAccessiblePageIdsWithPermissions(['a'], 'u1')).toEqual([]);
+      expect(await p.getUserIdsWithPageAccess('p', ['u1'])).toEqual([]);
+      expect([...(await sp.getUserIdsWithSpaceAccess(['u1'], 's'))]).toEqual([]);
+      expect(await sp.getUserSpaceIds('u1')).toEqual([]);
+    });
+
+    it('sidebar: a failure on the SECOND 128-page chunk is a 503, never the first chunk alone', async () => {
+      const ids = Array.from({ length: 129 }, (_, i) => `p${i}`);
+      const flaky = {
+        tryCheckBulk: jest
+          .fn()
+          .mockImplementationOnce(async (_s: any, checks: any[]) => checks.map(() => true))
+          .mockImplementationOnce(async () => null),
+      };
+      const p = new PdpPagePermissionRepo({} as any, {} as any, {} as any, flaky as any);
+      await expect(p.filterAccessiblePageIdsWithPermissions(ids, 'u1')).rejects.toBeInstanceOf(
+        ServiceUnavailableException,
+      );
+      expect(flaky.tryCheckBulk).toHaveBeenCalledTimes(2);
+      expect(flaky.tryCheckBulk.mock.calls[0][1]).toHaveLength(256);
+      expect(flaky.tryCheckBulk.mock.calls[1][1]).toHaveLength(2);
+    });
+
+    it('sidebar: a non-true element never reads as view or edit', async () => {
+      const odd = { tryCheckBulk: jest.fn(async () => [true, false, false, true]) };
+      const p = new PdpPagePermissionRepo({} as any, {} as any, {} as any, odd as any);
+      expect(await p.filterAccessiblePageIdsWithPermissions(['a', 'b'], 'u1')).toEqual([{ id: 'a', canEdit: false }]);
+    });
+
+    describe('over the REAL HttpAuthzClient: a failure on the second 1000-id chunk is a 503, never a subset', () => {
+      // The client chunks filter-resources / filter-subjects at 1000; the repo must see the second chunk's failure.
+      const fetchMock = jest.fn();
+      const realFetch = global.fetch;
+      const ok = (body: unknown) => ({ ok: true, status: 200, json: async () => body });
+      let client: HttpAuthzClient;
+      beforeEach(() => {
+        process.env.PLATFORM_AUTHZ_URL = 'http://platform.test';
+        process.env.PLATFORM_AUTHZ_SERVICE_SECRET = 'sekret';
+        (global as unknown as { fetch: jest.Mock }).fetch = fetchMock;
+        fetchMock.mockReset();
+        client = new HttpAuthzClient();
+      });
+      afterAll(() => {
+        global.fetch = realFetch;
+      });
+      const ids = Array.from({ length: 1001 }, (_, i) => `p${i}`);
+      const secondChunkFails = (first: unknown) =>
+        fetchMock.mockResolvedValueOnce(ok(first)).mockResolvedValueOnce({ ok: false, status: 503, json: async () => ({}) });
+
+      it('filterAccessiblePageIds (move-to-space / duplicate / export / lists)', async () => {
+        secondChunkFails({ ids: ['p0'] });
+        const p = new PdpPagePermissionRepo({} as any, {} as any, {} as any, client);
+        await expect(p.filterAccessiblePageIds({ pageIds: ids, userId: 'u1' })).rejects.toBeInstanceOf(
+          ServiceUnavailableException,
+        );
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+      });
+
+      it('getUserIdsWithPageAccess (notification recipients)', async () => {
+        secondChunkFails({ subjects: [{ provider: 'docmost', externalId: 'p0' }] });
+        const p = new PdpPagePermissionRepo({} as any, {} as any, {} as any, client);
+        await expect(p.getUserIdsWithPageAccess('pg', ids)).rejects.toBeInstanceOf(ServiceUnavailableException);
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+      });
+
+      it('getUserIdsWithSpaceAccess (digest / verification recipients)', async () => {
+        secondChunkFails({ subjects: [{ provider: 'docmost', externalId: 'p0' }] });
+        const sp = new PdpSpaceMemberRepo({} as any, {} as any, {} as any, {} as any, client);
+        await expect(sp.getUserIdsWithSpaceAccess(ids, 's')).rejects.toBeInstanceOf(ServiceUnavailableException);
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+      });
+
+      it('getUserSpaceIds on a failed lookup', async () => {
+        fetchMock.mockRejectedValueOnce(new Error('down'));
+        const sp = new PdpSpaceMemberRepo({} as any, {} as any, {} as any, {} as any, client);
+        await expect(sp.getUserSpaceIds('u1')).rejects.toBeInstanceOf(ServiceUnavailableException);
+      });
+
+      it('control: both chunks healthy is the union in caller order', async () => {
+        fetchMock.mockResolvedValueOnce(ok({ ids: ['p999', 'p0'] })).mockResolvedValueOnce(ok({ ids: ['p1000'] }));
+        const p = new PdpPagePermissionRepo({} as any, {} as any, {} as any, client);
+        expect(await p.filterAccessiblePageIds({ pageIds: ids, userId: 'u1' })).toEqual(['p0', 'p999', 'p1000']);
+      });
     });
   });
   describe('#492 — a failed page check denies even when the space role (a separate call) allows', () => {
@@ -187,6 +311,48 @@ describe('PDP repo primitives — deny propagation (leakage backbone)', () => {
       await expect(access.validateCanViewWithPermissions(page, user)).rejects.toBeInstanceOf(
         ServiceUnavailableException,
       );
+    });
+
+    it('#716 P1: validateCanComment on a FLAPPING PDP — the edit check 503s, the view check answers — is a 503, never a 403', async () => {
+      // The brown-out shape: the edit-side call (canUserEditPage) times out, the next call (canUserAccessPage, inside
+      // validateCanView) answers. Upstream's bare catch read the 503 as "cannot edit" and fell through to the
+      // viewer-comment rule, so an editor in a space with viewer comments off got a deny-shaped 403. A PDP that is
+      // simply down would fail validateCanView as well, so only a flapping one reaches the bug.
+      const flapping = {
+        tryCheckBulk: jest
+          .fn()
+          .mockImplementationOnce(async () => null)
+          .mockImplementation(async (_s: any, checks: any[]) => checks.map(() => true)),
+      };
+      const spaces = { findById: jest.fn(async () => ({ settings: { comments: { allowViewerComments: false } } })) };
+      const flappingAccess = new PageAccessService(
+        new PdpPagePermissionRepo({} as any, {} as any, {} as any, flapping as any),
+        spaceMember as any,
+        spaces as any,
+      );
+      await expect(flappingAccess.validateCanComment(page, user, 'w1')).rejects.toBeInstanceOf(
+        ServiceUnavailableException,
+      );
+      // Not vacuous: the 503 came from the FIRST (edit) call; nothing after it ran.
+      expect(flapping.tryCheckBulk).toHaveBeenCalledTimes(1);
+      expect(flapping.tryCheckBulk.mock.calls[0][1].map((c: any) => c.permission)).toEqual(['view', 'edit', 'locked']);
+      expect(spaces.findById).not.toHaveBeenCalled();
+    });
+
+    it('#716 P1 control: a genuine edit deny still falls through to the viewer-comment rule', async () => {
+      // view only, on a restricted page: canUserEditPage → {locked, canAccess, !canEdit} → validateCanEdit 403s.
+      const viewer = {
+        tryCheckBulk: jest.fn(async (_s: any, checks: any[]) => checks.map((c: any) => c.permission !== 'edit')),
+      };
+      const repo = new PdpPagePermissionRepo({} as any, {} as any, {} as any, viewer as any);
+      const on = { findById: jest.fn(async () => ({ settings: { comments: { allowViewerComments: true } } })) };
+      const off = { findById: jest.fn(async () => ({ settings: { comments: { allowViewerComments: false } } })) };
+      await expect(
+        new PageAccessService(repo, spaceMember as any, on as any).validateCanComment(page, user, 'w1'),
+      ).resolves.toBeUndefined();
+      await expect(
+        new PageAccessService(repo, spaceMember as any, off as any).validateCanComment(page, user, 'w1'),
+      ).rejects.toBeInstanceOf(ForbiddenException);
     });
 
     it('control: the pre-fix all-false reading WOULD have fallen through to the space role (the test is not vacuous)', async () => {

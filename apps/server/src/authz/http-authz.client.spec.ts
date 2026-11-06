@@ -224,6 +224,101 @@ describe('HttpAuthzClient', () => {
     });
   });
 
+  describe('tryLookupResources (#716 — failure is null, never "no resources")', () => {
+    const subject = { provider: 'docmost', externalId: 'u1' };
+
+    it('returns the ids, once each, on a well-formed 200, and posts the lookup', async () => {
+      fetchMock.mockResolvedValueOnce(ok({ ids: ['s2', 's1', 's2'] }));
+      expect(await client.tryLookupResources(subject, 'view', 'space')).toEqual(['s2', 's1']);
+      const [url, init] = fetchMock.mock.calls[0];
+      expect(url).toBe('http://platform.test/authz/lookup-resources');
+      expect(init.headers['x-authz-service-secret']).toBe('sekret');
+      expect(JSON.parse(init.body)).toEqual({ subject, permission: 'view', resourceType: 'space' });
+    });
+
+    it('an empty answer is [] (a real "member of nothing"), distinct from a failure', async () => {
+      fetchMock.mockResolvedValueOnce(ok({ ids: [] }));
+      expect(await client.tryLookupResources(subject, 'view', 'space')).toEqual([]);
+    });
+
+    it.each([
+      ['a network error', () => fetchMock.mockRejectedValueOnce(new Error('down'))],
+      ['a non-200', () => fetchMock.mockResolvedValueOnce({ ok: false, status: 503, json: async () => ({}) })],
+      ['a non-array `ids`', () => fetchMock.mockResolvedValueOnce(ok({ ids: 'abc' }))],
+      ['a missing `ids`', () => fetchMock.mockResolvedValueOnce(ok({}))],
+      ['a non-string element', () => fetchMock.mockResolvedValueOnce(ok({ ids: ['s1', 7] }))],
+      ['a null body', () => fetchMock.mockResolvedValueOnce(ok(null))],
+    ])('returns null on %s', async (_label, arrange) => {
+      arrange();
+      expect(await client.tryLookupResources(subject, 'view', 'space')).toBeNull();
+    });
+  });
+
+  describe('tryFilterSubjects (#716 — failure on any chunk is null, never a partial recipient set)', () => {
+    const subj = (externalId: string) => ({ provider: 'docmost', externalId });
+
+    it('returns the allowed candidates in candidate order, once each, and wraps candidates as docmost refs', async () => {
+      fetchMock.mockResolvedValueOnce(ok({ subjects: [subj('u3'), subj('u1'), subj('u1')] }));
+      expect(await client.tryFilterSubjects('view', 'page', 'pg1', ['u1', 'u2', 'u3'])).toEqual(['u1', 'u3']);
+      const [url, init] = fetchMock.mock.calls[0];
+      expect(url).toBe('http://platform.test/authz/filter-subjects');
+      expect(JSON.parse(init.body)).toEqual({
+        permission: 'view',
+        resourceType: 'page',
+        resourceId: 'pg1',
+        candidates: [subj('u1'), subj('u2'), subj('u3')],
+      });
+    });
+
+    it('an empty allowed set is [] (a real "nobody"), distinct from a failure', async () => {
+      fetchMock.mockResolvedValueOnce(ok({ subjects: [] }));
+      expect(await client.tryFilterSubjects('view', 'space', 's1', ['u1'])).toEqual([]);
+    });
+
+    it('returns [] for no candidates without calling the platform', async () => {
+      expect(await client.tryFilterSubjects('view', 'space', 's1', [])).toEqual([]);
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('never returns a subject the caller did not offer (a Byzantine platform cannot widen the set)', async () => {
+      fetchMock.mockResolvedValueOnce(ok({ subjects: [subj('u1'), subj('intruder')] }));
+      expect(await client.tryFilterSubjects('view', 'space', 's1', ['u1', 'u2'])).toEqual(['u1']);
+    });
+
+    it('chunks over the 1000 cap and unions the chunks', async () => {
+      const users = Array.from({ length: 1001 }, (_, i) => `u${i}`);
+      fetchMock.mockResolvedValueOnce(ok({ subjects: [subj('u999')] })).mockResolvedValueOnce(ok({ subjects: [subj('u1000')] }));
+      expect(await client.tryFilterSubjects('view', 'space', 's1', users)).toEqual(['u999', 'u1000']);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect(JSON.parse(fetchMock.mock.calls[1][1].body).candidates).toEqual([subj('u1000')]);
+    });
+
+    it.each([
+      ['a network error', () => fetchMock.mockRejectedValueOnce(new Error('down'))],
+      ['a non-200', () => fetchMock.mockResolvedValueOnce({ ok: false, status: 503, json: async () => ({}) })],
+      ['a malformed second chunk', () => fetchMock.mockResolvedValueOnce(ok({ subjects: 'u1' }))],
+    ])('a failure on the SECOND chunk (%s) is null — never the first chunk alone', async (_label, arrange) => {
+      const users = Array.from({ length: 1001 }, (_, i) => `u${i}`);
+      fetchMock.mockResolvedValueOnce(ok({ subjects: [subj('u0')] }));
+      arrange();
+      expect(await client.tryFilterSubjects('view', 'space', 's1', users)).toBeNull();
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it.each([
+      ['a network error', () => fetchMock.mockRejectedValueOnce(new Error('down'))],
+      ['a non-200', () => fetchMock.mockResolvedValueOnce({ ok: false, status: 503, json: async () => ({}) })],
+      ['a non-array `subjects`', () => fetchMock.mockResolvedValueOnce(ok({ subjects: 'u1' }))],
+      ['a missing `subjects`', () => fetchMock.mockResolvedValueOnce(ok({}))],
+      ['an element without a string externalId', () => fetchMock.mockResolvedValueOnce(ok({ subjects: [subj('u1'), { externalId: 7 }] }))],
+      ['a null element', () => fetchMock.mockResolvedValueOnce(ok({ subjects: [subj('u1'), null] }))],
+      ['a null body', () => fetchMock.mockResolvedValueOnce(ok(null))],
+    ])('returns null on %s', async (_label, arrange) => {
+      arrange();
+      expect(await client.tryFilterSubjects('view', 'space', 's1', ['u1', 'u2'])).toBeNull();
+    });
+  });
+
   describe('failure logging is throttled per path (#696 — a brown-out must not log at request rate)', () => {
     let errorSpy: jest.SpyInstance;
     beforeEach(() => {

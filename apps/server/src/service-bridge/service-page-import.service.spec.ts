@@ -18,6 +18,7 @@ import {
   ContentParseBusyException,
   ContentTooComplexException,
   ConversionBudgetExhaustedException,
+  requestQueue,
 } from '../editor-compat/content-parse/content-parse.service';
 
 /**
@@ -62,6 +63,12 @@ describe('validate-content through the REAL create parser (#621 network-inert wi
   // #626: the real parser converts in a worker thread; stop it when done.
   afterAll(() => closeContentParser());
   jest.setTimeout(120_000); // the worker compiles its parsers through ts-node on first use
+  // Warm the worker first: under a parallel jest run its one-time ts-node compile (seconds; the shipped worker is
+  // compiled JS) would otherwise land inside the call's 4 s parse budget and answer parse_budget_exceeded — the
+  // budget is a property of load, not of this spec's subject (codes and the network-inert window).
+  beforeAll(async () => {
+    await svc.validateContent({ items: [{ format: 'markdown', content: '# warm' }, { format: 'html', content: '<p>warm</p>' }] });
+  });
 
   it('accepts valid markdown and html; rejects empty; answers ids and codes only (never content or an error)', async () => {
     const res = await svc.validateContent({
@@ -257,6 +264,41 @@ describe('validate-content — budgets and codes', () => {
     expect(three).toEqual({ status: 503, body: { message: expect.any(String), code: 'engine_busy' } });
     release();
     await expect(Promise.all([one, two])).resolves.toHaveLength(2);
+  });
+});
+
+describe('validate-content — whose turn and budget the conversions take (#642, #716 I6)', () => {
+  const U = '11111111-1111-4111-8111-111111111111';
+  const I = '22222222-2222-4222-8222-222222222222';
+  const keyOf = async (dto: { actorUserId?: string; actorIdentityId?: string }) => {
+    const keys: string[] = [];
+    const t = make(async () => void keys.push(requestQueue().principal));
+    await t.svc.validateContent({ items: [{ format: 'html', content: '<p>a</p>' }], ...dto });
+    return keys;
+  };
+
+  it('a human with a Docmost user converts under user:<id>, even when the platform also names their identity', async () => {
+    expect(await keyOf({ actorUserId: U, actorIdentityId: I })).toEqual([`user:${U}`]);
+  });
+
+  it('a human with no Docmost user converts under identity:<id> — never the exempt `background` key', async () => {
+    expect(await keyOf({ actorIdentityId: I })).toEqual([`identity:${I}`]);
+  });
+
+  it('only a call naming neither (an older platform) falls back to `background`', async () => {
+    expect(await keyOf({})).toEqual(['background']);
+  });
+
+  it('actorIdentityId is validated as a UUID and survives the whitelist', async () => {
+    const { plainToInstance } = await import('class-transformer');
+    const { validate } = await import('class-validator');
+    const { ValidateContentDto } = await import('./dto/page-import.dto');
+    const items = [{ format: 'html', content: '<p>a</p>' }];
+    const good = plainToInstance(ValidateContentDto, { items, actorIdentityId: I });
+    expect(await validate(good, { whitelist: true })).toEqual([]);
+    expect(good.actorIdentityId).toBe(I);
+    const bad = plainToInstance(ValidateContentDto, { items, actorIdentityId: 'not-a-uuid' });
+    expect((await validate(bad, { whitelist: true })).map((e) => e.property)).toEqual(['actorIdentityId']);
   });
 });
 

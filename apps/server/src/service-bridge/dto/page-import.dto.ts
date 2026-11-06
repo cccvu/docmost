@@ -56,6 +56,16 @@ export class ValidateContentDto {
   @IsOptional()
   @IsUUID()
   actorUserId?: string;
+
+  /**
+   * #716 I6: the acting human's PLATFORM identity id, which the platform always knows (a human with no Docmost user yet
+   * has no `actorUserId`). Same role: only an admission key. Without it such a human's conversions fell to the exempt
+   * `background` key and escaped their budget; now they take `identity:<id>`, their own bucket. `actorUserId` wins when
+   * both are sent, so a provisioned human keeps their one key. Never an identity for authorization.
+   */
+  @IsOptional()
+  @IsUUID()
+  actorIdentityId?: string;
 }
 
 export class TitleCandidatesDto {

@@ -51,9 +51,16 @@ const tsquery = require('pg-tsquery')();
  *
  * Search can no longer take the engine down (#696): every search has ONE deadline; each statement runs in its own
  * short transaction under `statement_timeout = min(3 s, what is left)` and no transaction is ever held across a PDP
- * call; authenticated searches share a small bulkhead (and one principal holds at most two places in it); the
- * anonymous share search has its own one-slot lane. Overload, a statement timeout or the deadline answer
- * 503 `engine_busy`; a PDP that cannot answer aborts the search with a 503 (never an empty "no results").
+ * call; authenticated searches share a small bulkhead (one principal runs at most `perPrincipal` searches and
+ * `perPrincipal` suggestions in it; more of its own wait their turn); the anonymous share search has its own one-slot
+ * lane. Overload, a statement timeout or the deadline answer 503 `engine_busy`; a PDP that cannot answer aborts the
+ * search with a 503 (never an empty "no results").
+ *
+ * Search sheds only searches (#716): every authorization call search makes (the user leg, the service leg of an
+ * on-behalf-of search, the suggestions' space lookup) goes through ONE process-wide PDP lane, and a slot is held until
+ * that call SETTLES — not until the search gives up on it — so a search burst puts at most about lane × window checks
+ * on the PDP, however many searches it abandons. A full lane sheds the search (503 `engine_busy`), never the point
+ * decisions and lists that share the PDP with it. The first window is sized from what the page needs, doubling after.
  *
  * The single `collectAuthorized` loop is the one filter-then-retrieve primitive — the RAG blueprint:
  * when a vector/`page_embeddings` similarity path lands, its candidate top-k MUST pass through the same
@@ -125,10 +132,36 @@ export interface SearchLimits {
   minStatementMs: number;
   /** Authenticated searches (and suggestions) in flight per process. */
   maxConcurrent: number;
-  /** How long a search may wait for a slot (capped by its deadline). */
+  /** How long a search may wait for admission in all — its principal's turn, then a slot (capped by its deadline). */
   slotWaitMs: number;
-  /** Searches one principal may have in flight (waiting for a slot or running). */
+  /**
+   * Searches one principal may have admitted per kind (search / suggest), waiting for a slot or running
+   * (`SEARCH_MAX_PER_PRINCIPAL`). Its further ones wait their turn in arrival order within `slotWaitMs`, never
+   * refused at once (#716: a debounced keystroke must not 503 behind the user's own previous search).
+   */
   perPrincipal: number;
+  /**
+   * #716 review: how long a SEARCH (not a suggestion) may wait for its own principal's previous search, within its
+   * deadline. Longer than `slotWaitMs` so an agent's parallel searches run one after another instead of the second
+   * being shed 503 after 1.5 s (before #716 both ran at once); a suggestion keeps `slotWaitMs`, because a stale
+   * keystroke's answer is worth less the longer it waits. The bulkhead slot wait after it is still `slotWaitMs`.
+   */
+  searchTurnWaitMs: number;
+  /**
+   * The search PDP lane (#716, `SEARCH_PDP_LANE`): authorization calls search may have in flight per process. A slot
+   * is held until the call settles (≤ the client's `PLATFORM_AUTHZ_TIMEOUT_MS`), so abandoned calls stay counted.
+   * Per process: with N engine tasks the bound is N × this. Default 1 with 32-id windows (#716 A2 load run): at 2 / 64
+   * the search lane's SpiceDB LookupResources load still pushed other routes' PDP calls past their deadline (503).
+   */
+  pdpLaneMax: number;
+  /** How long one authorization call may wait for a lane slot (also capped by the deadline less `pdpMinMs`). */
+  pdpLaneWaitMs: number;
+  /** No authorization call starts with less than this left of the deadline: it would mostly be abandoned. */
+  pdpMinMs: number;
+  /** The smallest first window (ids per PDP call). */
+  pdpWindowMin: number;
+  /** The largest window (`SEARCH_PDP_WINDOW_MAX`); ≤ the platform's 1000-id filter-resources cap. */
+  pdpWindowMax: number;
   /** The anonymous share-search lane: its own slots, never the authenticated ones. */
   shareLaneMax: number;
   shareMaxLimit: number;
@@ -139,11 +172,37 @@ export interface SearchLimits {
 }
 
 export const SEARCH_DEFAULT_MAX_CONCURRENT = 3;
+export const SEARCH_DEFAULT_PDP_LANE = 1;
+export const SEARCH_DEFAULT_PDP_WINDOW_MAX = 32;
+export const SEARCH_DEFAULT_MAX_PER_PRINCIPAL = 1;
 
-/** `SEARCH_MAX_CONCURRENT`, defensively: anything but a positive integer is the default (never 0 = no search). */
-export function searchMaxConcurrent(raw: string | undefined = process.env.SEARCH_MAX_CONCURRENT): number {
+/**
+ * An integer env knob, defensively: anything but an integer ≥ `min` is the default (never 0 = no search, never a
+ * window that cannot move); above `max` is `max`.
+ */
+function intKnob(raw: string | undefined, fallback: number, min: number, max: number): number {
   const n = Number(raw);
-  return Number.isInteger(n) && n >= 1 ? Math.min(n, 64) : SEARCH_DEFAULT_MAX_CONCURRENT;
+  return Number.isInteger(n) && n >= min ? Math.min(n, max) : fallback;
+}
+
+/** `SEARCH_MAX_CONCURRENT`: 1..64, default 3. */
+export function searchMaxConcurrent(raw: string | undefined = process.env.SEARCH_MAX_CONCURRENT): number {
+  return intKnob(raw, SEARCH_DEFAULT_MAX_CONCURRENT, 1, 64);
+}
+
+/** `SEARCH_PDP_LANE`: 1..16, default 1 (#716 load evidence: ADR 0005 amendment). */
+export function searchPdpLane(raw: string | undefined = process.env.SEARCH_PDP_LANE): number {
+  return intKnob(raw, SEARCH_DEFAULT_PDP_LANE, 1, 16);
+}
+
+/** `SEARCH_PDP_WINDOW_MAX`: 16..128, default 32 (#716 load evidence: ADR 0005 amendment). */
+export function searchPdpWindowMax(raw: string | undefined = process.env.SEARCH_PDP_WINDOW_MAX): number {
+  return intKnob(raw, SEARCH_DEFAULT_PDP_WINDOW_MAX, 16, 128);
+}
+
+/** `SEARCH_MAX_PER_PRINCIPAL`: 1..64, default 1. */
+export function searchMaxPerPrincipal(raw: string | undefined = process.env.SEARCH_MAX_PER_PRINCIPAL): number {
+  return intKnob(raw, SEARCH_DEFAULT_MAX_PER_PRINCIPAL, 1, 64);
 }
 
 export function defaultSearchLimits(): SearchLimits {
@@ -153,7 +212,13 @@ export function defaultSearchLimits(): SearchLimits {
     minStatementMs: 50,
     maxConcurrent: searchMaxConcurrent(),
     slotWaitMs: 1500,
-    perPrincipal: 2,
+    perPrincipal: searchMaxPerPrincipal(),
+    searchTurnWaitMs: 4000,
+    pdpLaneMax: searchPdpLane(),
+    pdpLaneWaitMs: 1500,
+    pdpMinMs: 500,
+    pdpWindowMin: 32,
+    pdpWindowMax: searchPdpWindowMax(),
     shareLaneMax: 1,
     shareMaxLimit: 25,
     shareMaxOffset: 100,
@@ -164,7 +229,7 @@ export function defaultSearchLimits(): SearchLimits {
 /** Why a search was shed (internal; answered as 503 `engine_busy`). */
 class SearchShed extends Error {
   constructor(
-    readonly reason: 'deadline' | 'slots' | 'principal' | 'share_lane',
+    readonly reason: 'deadline' | 'slots' | 'principal' | 'share_lane' | 'pdp_lane',
     readonly stage: string,
   ) {
     super(`search shed: ${reason} at ${stage}`);
@@ -179,14 +244,12 @@ type Candidate = { id: string; rank?: number };
 export class PdpSearchService extends SearchService {
   private readonly logger = new Logger(PdpSearchService.name);
 
-  /** Ids per PDP round. ≤ the platform's 1000-item filter-resources cap. */
-  private static readonly CANDIDATE_WINDOW = 128;
   /** Caller `limit` is clamped to this — a huge limit can't force an unbounded candidate scan. */
   private static readonly MAX_LIMIT = 100;
   /**
    * Candidate scan budget per request: it scales with `need` (= offset + limit) so an in-range page
    * always completes, but is floored + capped so the worst-case candidate rows and PDP round-trips stay
-   * bounded (round-trips = ceil(scanned / CANDIDATE_WINDOW)).
+   * bounded (round-trips ≈ scanned / `pdpWindowMax`, plus the smaller first windows).
    */
   private static readonly BASE_SCAN = 1024;
   private static readonly HARD_SCAN_CAP = 2048;
@@ -211,8 +274,14 @@ export class PdpSearchService extends SearchService {
   private readonly slots: OpSemaphore;
   /** The anonymous share search, apart: an outsider can never take a signed-in user's slot. */
   private readonly shareLane: OpSemaphore;
-  /** Searches in flight per principal (waiting or running). */
-  private readonly inFlight = new Map<string, number>();
+  /**
+   * Each principal's places per kind (`<kind>:user:<id>`): a semaphore of `perPrincipal` (its waiters are served in
+   * arrival order) and how many searches hold or await it. A key is dropped when nobody does, so the map stays the
+   * size of the principals searching now.
+   */
+  private readonly inFlight = new Map<string, { places: OpSemaphore; refs: number }>();
+  /** The process-wide search PDP lane (#716): one instance per process (search.provider.ts builds one service). */
+  private readonly pdpLane: OpSemaphore;
 
   constructor(
     @InjectKysely() db: KyselyDB,
@@ -234,6 +303,7 @@ export class PdpSearchService extends SearchService {
     this.limits = { ...defaultSearchLimits(), ...limits };
     this.slots = new OpSemaphore(this.limits.maxConcurrent, this.limits.slotWaitMs);
     this.shareLane = new OpSemaphore(this.limits.shareLaneMax, this.limits.slotWaitMs);
+    this.pdpLane = new OpSemaphore(this.limits.pdpLaneMax, this.limits.pdpLaneWaitMs);
   }
 
   override async searchPage(
@@ -245,10 +315,9 @@ export class PdpSearchService extends SearchService {
       return { items: [] };
     }
 
-    // ReDoS guard (sweep F6): reject an over-long query HERE, ahead of the super() delegation below, so
+    // ReDoS guard (sweep F6): reject an over-long query HERE, ahead of the share branch below, so
     // this ONE fork-owned choke point covers BOTH the authenticated path (tsquery below) AND the @Public
-    // /search/share-search path (which reaches the upstream tsquery via super.searchPage before any DB
-    // lookup). Bounding length keeps pg-tsquery's O(N²) backtracking negligible. Defensive twin to the DTO
+    // /search/share-search path (whose tsquery runs in runShare). Bounding length keeps pg-tsquery's O(N²) backtracking negligible. Defensive twin to the DTO
     // @MaxLength edge validation — same MAX_SEARCH_QUERY_LENGTH so the two bounds can never drift.
     if (query.length > MAX_SEARCH_QUERY_LENGTH) {
       throw new BadRequestException(`search query too long (max ${MAX_SEARCH_QUERY_LENGTH} characters)`);
@@ -270,41 +339,139 @@ export class PdpSearchService extends SearchService {
 
   /**
    * Anonymous / public-share path: there is no principal, and retrieval is already gated by an explicit page-id set
-   * (getPageAndDescendantsExcludingRestricted + the restricted-ancestor check). Nothing for the per-principal PDP
+   * (the share's subtree minus restricted pages, and the restricted-ancestor check). Nothing for the per-principal PDP
    * loop to add. Upstream never asks whether the share is still public (sharing disabled for the workspace or space,
-   * or the space archived), so that is decided here first, in this workspace (#660); then defer to upstream, whose
-   * `findById` re-read is the repo's expiry veto.
+   * or the space archived), so that is decided here first, in this workspace (#660), after `findById` (the repo's
+   * expiry veto).
    *
-   * #696: it keeps upstream's SQL (which headlines every row it pulls, including the OFFSET rows), so it is bounded
-   * here instead — its own one-slot lane (an outsider never takes a signed-in user's search slot), `limit` 1..25,
-   * `offset` 0..100 (past that: nothing), and never a `spaceId` (upstream would search the whole space with it; the
-   * controller strips it too). The upstream statement runs on the parent's own connection, so it has no
-   * `statement_timeout`; the lane holds its slot until that statement ends, so it is never more than one connection.
+   * #696: bounded like the authenticated search — its own one-slot lane (an outsider never takes a signed-in user's
+   * search slot), `limit` 1..25, `offset` 0..100 (past that: nothing), and never a `spaceId` (upstream would search the
+   * whole space with it; the controller strips it too).
+   *
+   * #716: one deadline, and every statement under `SET LOCAL statement_timeout` (see `runShare`). The lane slot is
+   * released only when the work SETTLES, not when the deadline answers: an abandoned statement still holds its
+   * connection until its own timeout ends it, so an outsider can never stack more than `shareLaneMax` of them.
    */
   private async searchShare(searchParams: SearchDTO, workspaceId: string): Promise<{ items: SearchResponseDto[] }> {
     const offset = Math.max(Math.trunc(Number(searchParams.offset) || 0), 0);
     if (offset > this.limits.shareMaxOffset) return { items: [] };
     const limit = Math.min(Math.max(Math.trunc(Number(searchParams.limit) || 25), 1), this.limits.shareMaxLimit);
-    const params = { ...searchParams, spaceId: undefined, limit, offset } as SearchDTO;
+    // Upstream: an anonymous search that names no share finds nothing (the spaceId it would otherwise honor is never
+    // passed on here).
+    if (!searchParams.shareId) return { items: [] };
 
+    const deadline = Date.now() + this.limits.deadlineMs;
     let release: () => void;
     try {
-      release = await this.shareLane.acquire();
+      release = await this.shareLane.acquire(Math.max(0, Math.min(this.limits.slotWaitMs, deadline - Date.now())));
     } catch (err) {
-      if (err instanceof OpSemaphoreTimeout) throw this.shed(new SearchShed('share_lane', 'admit'));
+      if (err instanceof OpSemaphoreTimeout) throw this.shed(new SearchShed('share_lane', 'admit'), 'share', 'anonymous');
       throw err;
     }
+    let work: Promise<{ items: SearchResponseDto[] }>;
     try {
-      if (params.shareId) {
-        const share = await this.shareRepository.findById(params.shareId);
-        if (!share || !this.shareSharing || !(await this.shareSharing.isSharingAllowed(workspaceId, share.spaceId))) {
-          return { items: [] };
-        }
-      }
-      return await super.searchPage(params, { workspaceId });
-    } finally {
+      work = this.runShare(searchParams.query, searchParams.shareId, searchParams.creatorId, workspaceId, {
+        limit,
+        offset,
+        deadline,
+      });
+    } catch (err) {
       release();
+      throw err;
     }
+    work.then(release, release);
+    try {
+      return await this.within(deadline, 'share', work);
+    } catch (err) {
+      if (err instanceof SearchShed) throw this.shed(err, 'share', 'anonymous');
+      const busy = asEngineBusy(err);
+      if (busy) {
+        this.logger.warn(
+          `SEARCH_SHED reason=sqlstate code=${(err as { code?: string }).code} kind=share principal=anonymous: answered 503 engine_busy`,
+        );
+        throw busy;
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * The share search itself, mirroring upstream `SearchService.searchPage`'s share branch (v0.95.0). Its three heavy
+   * statements (the restricted-ancestor read, the descendant walk and the full-text query) each run in their own short
+   * transaction under `statement_timeout` (#716). The share lookup and the sharing check before them are indexed point
+   * reads through the injected repos, outside that bound. The two confidentiality reads are upstream's OWN
+   * methods (`hasRestrictedAncestor`, `getPageAndDescendantsExcludingRestricted`), run on that transaction through
+   * repos built over it — so the restriction semantics are never copied and cannot drift. Both read only `this.db`
+   * (pinned by pdp-search.service.spec.ts); should either start using another dependency, it would throw here
+   * (fail closed — no results), never run unbounded. Only the full-text statement is the fork's: upstream's, with
+   * the headline over at most `headlineInputChars` and no space in the row (upstream selects none for a share).
+   *
+   * Never wrapped in `within()`: the caller races it against the deadline and holds the lane until it settles.
+   */
+  private async runShare(
+    query: string,
+    shareId: string,
+    creatorId: string | undefined,
+    workspaceId: string,
+    o: { limit: number; offset: number; deadline: number },
+  ): Promise<{ items: SearchResponseDto[] }> {
+    const share = await this.shareRepository.findById(shareId);
+    if (!share || share.workspaceId !== workspaceId) return { items: [] };
+    if (!this.shareSharing || !(await this.shareSharing.isSharingAllowed(workspaceId, share.spaceId))) {
+      return { items: [] };
+    }
+
+    const restricted = await this.txStatement(o.deadline, 'share-ancestor', (trx) =>
+      new PagePermissionRepo(trx, null as never, null as never).hasRestrictedAncestor(share.pageId),
+    );
+    if (restricted) return { items: [] };
+
+    const pageIds = share.includeSubPages
+      ? (
+          await this.txStatement(o.deadline, 'share-subtree', (trx) =>
+            new PageRepo(trx, null as never, null as never).getPageAndDescendantsExcludingRestricted(share.pageId, {
+              includeContent: false,
+            }),
+          )
+        ).map((p) => p.id)
+      : [share.pageId];
+    if (pageIds.length === 0) return { items: [] };
+
+    const searchQuery = tsquery(query.trim() + '*');
+    const rows: any[] = await this.txStatement(o.deadline, 'share-search', (trx) =>
+      trx
+        .selectFrom('pages')
+        .select([
+          'id',
+          'slugId',
+          'title',
+          'icon',
+          'parentPageId',
+          'creatorId',
+          'createdAt',
+          'updatedAt',
+          sql<number>`ts_rank(tsv, to_tsquery('english', f_unaccent(${searchQuery})))`.as('rank'),
+          sql<string>`ts_headline('english', left(text_content, ${sql.lit(this.limits.headlineInputChars)}), to_tsquery('english', f_unaccent(${searchQuery})),'MinWords=9, MaxWords=10, MaxFragments=3')`.as(
+            'highlight',
+          ),
+        ])
+        .where('tsv', '@@', sql<string>`to_tsquery('english', f_unaccent(${searchQuery}))`)
+        .$if(Boolean(creatorId), (qb) => qb.where('creatorId', '=', creatorId))
+        .where('deletedAt', 'is', null)
+        .where('id', 'in', pageIds)
+        .where('workspaceId', '=', workspaceId)
+        // Upstream orders by rank alone; the id tiebreak only makes equal-rank paging deterministic.
+        .orderBy('rank', 'desc')
+        .orderBy('id', 'asc')
+        .limit(o.limit)
+        .offset(o.offset)
+        .execute(),
+    );
+    const items = rows.map((r) => ({
+      ...r,
+      highlight: r.highlight ? r.highlight.replace(/\r\n|\r|\n/g, ' ').replace(/\s+/g, ' ') : r.highlight,
+    })) as SearchResponseDto[];
+    return { items };
   }
 
   /**
@@ -539,10 +706,10 @@ export class PdpSearchService extends SearchService {
 
       if (suggestion.includePages) {
         // The array form IS PDP-backed (lookupResources) — a coarse pre-filter; the gate below is
-        // authoritative and truncation-complete, exactly as in searchPage.
-        const userSpaceIds = await this.within(
-          deadline,
-          'suggest-spaces',
+        // authoritative and truncation-complete, exactly as in searchPage. It is an authorization call too, so it
+        // takes the PDP lane (#716); kept over the local mirror, which would drop the spaces a role binding or the
+        // admin cascade grants. A PDP that cannot answer throws its own 503 here — never "no spaces".
+        const userSpaceIds = await this.inPdpLane(deadline, 'suggest-spaces', () =>
           this.spaceMemberRepository.getUserSpaceIds(userId),
         );
 
@@ -625,10 +792,16 @@ export class PdpSearchService extends SearchService {
     const authorized: Candidate[] = [];
     const seen = new Set<string>(); // an id is collected once, whatever the list holds
     let cursor = 0;
+    // #716: the first window is sized from the page (twice what it needs, at least pdpWindowMin), then doubles up to
+    // pdpWindowMax — a 10-result page asks about 32 ids, not 128. At the defaults (min = max = 32) every window is 32
+    // ids. The scan budget is unchanged.
+    const windowMax = Math.max(1, this.limits.pdpWindowMax);
+    let size = Math.min(windowMax, Math.max(this.limits.pdpWindowMin, 2 * opts.need, 1));
 
     while (authorized.length < opts.need && cursor < candidates.length) {
-      const window = candidates.slice(cursor, cursor + PdpSearchService.CANDIDATE_WINDOW);
+      const window = candidates.slice(cursor, cursor + size);
       cursor += window.length;
+      size = Math.min(size * 2, windowMax);
 
       const userOk = await this.gate(
         { provider: 'docmost', externalId: opts.userId },
@@ -666,7 +839,9 @@ export class PdpSearchService extends SearchService {
   /** The ids of `pageIds` `subject` may view. The PDP not answering is a 503, never an empty set. */
   private async gate(subject: AuthzSubject, pageIds: string[], deadline: number): Promise<Set<string>> {
     if (pageIds.length === 0) return new Set();
-    const ids = await this.within(deadline, 'pdp', this.pdp!.tryFilterResources(subject, 'view', 'page', pageIds));
+    const ids = await this.inPdpLane(deadline, 'pdp', () =>
+      this.pdp!.tryFilterResources(subject, 'view', 'page', pageIds),
+    );
     if (ids === null) {
       this.logger.warn('SEARCH_PDP_UNAVAILABLE: the authorization service did not answer; answered 503');
       throw new ServiceUnavailableException('authorization is temporarily unavailable; the search did not run — retry');
@@ -675,46 +850,107 @@ export class PdpSearchService extends SearchService {
   }
 
   /**
-   * Admission for an authenticated search: the per-principal cap (refused at once — a principal never queues behind
-   * itself), then a bulkhead slot (a bounded wait, capped by the deadline). The deadline starts here, so time spent
-   * waiting counts. A shed, an expired deadline or a busy SQLSTATE is a 503 `engine_busy`; anything else passes.
+   * One authorization call in the search PDP lane (#716). No call starts with less than `pdpMinMs` of the deadline
+   * left; the wait for a slot is capped by `pdpLaneWaitMs` and by the deadline less `pdpMinMs`, and running out is a
+   * shed (`pdp_lane`, 503 `engine_busy`) — only this search, never the point decisions sharing the PDP. The slot is
+   * released when the call SETTLES, not when the deadline gives up on it, so abandoned calls stay inside the bound
+   * (the HTTP client times every call out, so a slot is never held for long). No abort is passed down: the platform
+   * would keep running a window's checks anyway, and freeing the slot early is exactly what would let them escape.
    */
-  private async bounded<T>(kind: string, userId: string, fn: (deadline: number) => Promise<T>): Promise<T> {
-    const deadline = Date.now() + this.limits.deadlineMs;
-    const key = `user:${userId}`;
-    const held = this.inFlight.get(key) ?? 0;
-    if (held >= this.limits.perPrincipal) throw this.shed(new SearchShed('principal', kind));
-    this.inFlight.set(key, held + 1);
+  private async inPdpLane<T>(deadline: number, stage: string, call: () => Promise<T>): Promise<T> {
+    const left = deadline - Date.now();
+    if (left < this.limits.pdpMinMs) throw new SearchShed('deadline', stage);
+    let release: () => void;
     try {
-      let release: () => void;
+      release = await this.pdpLane.acquire(
+        Math.max(0, Math.min(this.limits.pdpLaneWaitMs, left - this.limits.pdpMinMs)),
+      );
+    } catch (err) {
+      if (err instanceof OpSemaphoreTimeout) throw new SearchShed('pdp_lane', stage);
+      throw err;
+    }
+    let p: Promise<T>;
+    try {
+      p = call();
+    } catch (err) {
+      release();
+      throw err;
+    }
+    p.then(release, release);
+    return this.within(deadline, stage, p);
+  }
+
+  /**
+   * Admission for an authenticated search: its principal's turn for this kind (`perPrincipal` at a time; the rest
+   * wait in arrival order, a search up to `searchTurnWaitMs`, a suggestion up to `slotWaitMs`), then a bulkhead slot
+   * (up to `slotWaitMs` more). Every wait is capped by the deadline, which starts here, so time spent waiting counts. A shed, an expired deadline or a busy SQLSTATE is a 503
+   * `engine_busy`; anything else passes.
+   */
+  private async bounded<T>(
+    kind: 'search' | 'suggest',
+    userId: string,
+    fn: (deadline: number) => Promise<T>,
+  ): Promise<T> {
+    const deadline = Date.now() + this.limits.deadlineMs;
+    const turnWaitMs = kind === 'search' ? Math.max(this.limits.searchTurnWaitMs, this.limits.slotWaitMs) : this.limits.slotWaitMs;
+    const turnBy = Math.min(Date.now() + turnWaitMs, deadline);
+    const key = `${kind}:user:${userId}`;
+    let entry = this.inFlight.get(key);
+    if (!entry) {
+      entry = { places: new OpSemaphore(Math.max(1, this.limits.perPrincipal), this.limits.slotWaitMs), refs: 0 };
+      this.inFlight.set(key, entry);
+    }
+    entry.refs++;
+    try {
+      let releasePlace: () => void;
       try {
-        release = await this.slots.acquire(Math.max(0, Math.min(this.limits.slotWaitMs, deadline - Date.now())));
+        releasePlace = await entry.places.acquire(Math.max(0, turnBy - Date.now()));
       } catch (err) {
-        if (err instanceof OpSemaphoreTimeout) throw new SearchShed('slots', kind);
+        if (err instanceof OpSemaphoreTimeout) throw new SearchShed('principal', kind);
         throw err;
       }
       try {
-        return await fn(deadline);
+        let release: () => void;
+        try {
+          const slotBy = Math.min(Date.now() + this.limits.slotWaitMs, deadline);
+          release = await this.slots.acquire(Math.max(0, slotBy - Date.now()));
+        } catch (err) {
+          if (err instanceof OpSemaphoreTimeout) throw new SearchShed('slots', kind);
+          throw err;
+        }
+        try {
+          return await fn(deadline);
+        } finally {
+          release();
+        }
       } finally {
-        release();
+        releasePlace();
       }
     } catch (err) {
-      if (err instanceof SearchShed) throw this.shed(err);
+      if (err instanceof SearchShed) throw this.shed(err, kind, userId);
       const busy = asEngineBusy(err);
       if (busy) {
-        this.logger.warn(`SEARCH_SHED reason=sqlstate code=${(err as { code?: string }).code} kind=${kind}: answered 503 engine_busy`);
+        this.logger.warn(
+          `SEARCH_SHED reason=sqlstate code=${(err as { code?: string }).code} kind=${kind} principal=${userId}: answered 503 engine_busy`,
+        );
         throw busy;
       }
       throw err;
     } finally {
-      const n = (this.inFlight.get(key) ?? 1) - 1;
-      if (n > 0) this.inFlight.set(key, n);
-      else this.inFlight.delete(key);
+      if (--entry.refs === 0) this.inFlight.delete(key);
     }
   }
 
-  private shed(err: SearchShed): ServiceUnavailableException {
-    this.logger.warn(`SEARCH_SHED reason=${err.reason} stage=${err.stage}: answered 503 engine_busy`);
+  /** Log a shed with who and how full everything was (#716), and answer it as 503 `engine_busy`. */
+  private shed(err: SearchShed, kind: 'search' | 'suggest' | 'share', principal: string): ServiceUnavailableException {
+    const slots =
+      kind === 'share'
+        ? `${this.shareLane.inUse}/${this.limits.shareLaneMax}`
+        : `${this.slots.inUse}/${this.limits.maxConcurrent}`;
+    this.logger.warn(
+      `SEARCH_SHED reason=${err.reason} stage=${err.stage} kind=${kind} principal=${principal} slots=${slots} ` +
+        `lane=${this.pdpLane.inUse}/${this.limits.pdpLaneMax}: answered 503 engine_busy`,
+    );
     return engineBusy();
   }
 
@@ -724,16 +960,25 @@ export class PdpSearchService extends SearchService {
    * also stops waiting at the deadline: an abandoned statement then finds no time left and rolls back at once.
    */
   private statement<T>(deadline: number, stage: string, run: (trx: KyselyTransaction) => Promise<T>): Promise<T> {
-    return this.within(
-      deadline,
-      stage,
-      executeTx(this.database, async (trx) => {
-        const ms = Math.min(this.limits.statementTimeoutMs, deadline - Date.now());
-        if (ms < this.limits.minStatementMs) throw new SearchShed('deadline', stage);
-        await sql`SET LOCAL statement_timeout = ${sql.lit(Math.floor(ms))}`.execute(trx);
-        return run(trx);
-      }),
-    );
+    return this.within(deadline, stage, this.txStatement(deadline, stage, run));
+  }
+
+  /**
+   * `statement` without the race against the deadline: it settles only when the transaction does (bounded by its own
+   * `statement_timeout`). The share search runs on this so its lane is held until its statements really end.
+   *
+   * Four round trips (BEGIN, SET LOCAL, the statement, COMMIT), knowingly (#716 S4): Postgres reads
+   * `statement_timeout` when a statement STARTS, so it cannot be set inside the statement it bounds, and folding
+   * `BEGIN; SET LOCAL …` into one simple-protocol call would bypass Kysely's transaction handling to save two
+   * sub-millisecond round trips on a path whose cost is its PDP calls.
+   */
+  private txStatement<T>(deadline: number, stage: string, run: (trx: KyselyTransaction) => Promise<T>): Promise<T> {
+    return executeTx(this.database, async (trx) => {
+      const ms = Math.min(this.limits.statementTimeoutMs, deadline - Date.now());
+      if (ms < this.limits.minStatementMs) throw new SearchShed('deadline', stage);
+      await sql`SET LOCAL statement_timeout = ${sql.lit(Math.floor(ms))}`.execute(trx);
+      return run(trx);
+    });
   }
 
   /** `p`, unless the deadline passes first (then a shed; `p` settles unobserved). */

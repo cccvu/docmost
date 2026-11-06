@@ -44,12 +44,27 @@ export interface RemoteAuthzClient {
     permission: string,
     resourceType: string,
   ): Promise<string[]>;
+  /** `lookupResources` with failure reported as `null` (not "no resources") — for the PDP repos' list primitives,
+   *  which answer a 503 instead of an empty list the caller would read as "you have nothing" (#716). */
+  tryLookupResources(
+    subject: AuthzSubject,
+    permission: string,
+    resourceType: string,
+  ): Promise<string[] | null>;
   filterSubjects(
     permission: string,
     resourceType: string,
     resourceId: string,
     candidateUserIds: string[],
   ): Promise<string[]>;
+  /** `filterSubjects` with failure on ANY chunk reported as `null` (never a partial recipient set) (#716). On
+   *  success: the allowed candidates, in candidate order. */
+  tryFilterSubjects(
+    permission: string,
+    resourceType: string,
+    resourceId: string,
+    candidateUserIds: string[],
+  ): Promise<string[] | null>;
 }
 
 export type { AuthzSubject, AuthzCheckItem };

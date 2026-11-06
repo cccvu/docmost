@@ -21,7 +21,8 @@ import {
  *     narrowed to `{ id, rank }` (the statement selects nothing else);
  *   - the HYDRATE statement (`"id" in (…)`) → the full fixture rows for those ids, minus `trashed`, in REVERSE order
  *     (SQL `in` has no order; the service must restore the candidate order itself).
- * Anything else answers no rows. `delayMs` / `fail` model a slow or failing statement.
+ * Anything else answers no rows. `delayMs` / `fail` model a slow or failing statement; `answer` (#716) gives the rows of
+ * any other statement (the share search's restricted-ancestor and subtree reads), ahead of the built-in kinds.
  */
 export type SearchRow = { id: string; rank?: number; title?: string; highlight?: string | null; [k: string]: unknown };
 
@@ -31,6 +32,8 @@ export interface SearchDbOpts {
   trashed?: Set<string>;
   delayMs?: (q: CompiledQuery) => number;
   fail?: (q: CompiledQuery) => Error | undefined;
+  /** Rows for a statement the built-in kinds do not model; `undefined` falls through to them. */
+  answer?: (q: CompiledQuery) => unknown[] | undefined;
 }
 
 export const isSetTimeout = (q: CompiledQuery) => /^set local statement_timeout/i.test(q.sql);
@@ -49,6 +52,8 @@ export function searchDb(opts: SearchDbOpts) {
       const err = opts.fail?.(cq);
       if (err) throw err;
       if (isSetTimeout(cq)) return { rows: [] };
+      const answered = opts.answer?.(cq);
+      if (answered) return { rows: answered as R[] };
       if (isHydrate(cq)) {
         const m = /"id" in \(([^)]*)\)/.exec(cq.sql)!;
         const ids = m[1].split(',').map((p) => String(cq.parameters[Number(p.trim().slice(1)) - 1]));

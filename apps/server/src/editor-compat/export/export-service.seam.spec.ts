@@ -3,7 +3,15 @@ import { Readable } from 'node:stream';
 import { Logger } from '@nestjs/common';
 import { ExportService } from '../../integrations/export/export.service';
 import { ExportStorageException, ExportTooLargeException } from './export-limits';
-import { MISSING_ATTACHMENTS_FILE } from './export-attachment-plan';
+import { ExportAttachmentPlan, MISSING_ATTACHMENTS_FILE } from './export-attachment-plan';
+import { exportBuildMsLeft } from './export-conversion';
+import {
+  ContentParseBusyException,
+  ContentTooComplexException,
+  ConversionBudgetExhaustedException,
+} from '../content-parse/content-parse.service';
+import { jsonToHtml } from '../../collaboration/collaboration.util';
+import { htmlToMarkdown } from '@docmost/editor-ext';
 
 /**
  * #699 — the upstream `ExportService` seam, driven through its real `exportPages` / `exportSpace` / `zipPages` /
@@ -32,6 +40,24 @@ jest.mock('@docmost/editor-ext', () => {
     htmlToMarkdown: (input: unknown) => {
       htmlToMarkdownSpy(typeof input);
       return actual.htmlToMarkdown(input);
+    },
+  };
+});
+// #716: every page is serialized through the worker's API. Here the worker's own pure function runs in-process (the
+// real-worker spec pins it against the real worker), so the seam's calls, queues and refusals are what is pinned.
+const serializeCalls: Array<{ format: string; queue: any }> = [];
+const serializeFail: { nth?: number; error?: Error } = {};
+jest.mock('../content-parse/content-parse.service', () => {
+  const actual = jest.requireActual('../content-parse/content-parse.service');
+  const { serializeForExport } = jest.requireActual('../content-parse/content-parse.worker');
+  return {
+    ...actual,
+    serializePageContent: async (json: unknown, format: string, queue: unknown) => {
+      serializeCalls.push({ format, queue });
+      if (serializeFail.nth === serializeCalls.length) throw serializeFail.error;
+      const out = serializeForExport(json, format, actual.CONTENT_PARSE_LIMITS.maxChars);
+      if (out === null) throw new actual.ContentTooComplexException();
+      return out;
     },
   };
 });
@@ -150,6 +176,9 @@ describe('ExportService #699 seam', () => {
   let warn: jest.SpyInstance;
   beforeEach(() => {
     loadSpy.mockClear();
+    serializeCalls.length = 0;
+    delete serializeFail.nth;
+    delete serializeFail.error;
     for (const k of Object.keys(CONTENT)) delete CONTENT[k];
     warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
@@ -265,5 +294,106 @@ describe('ExportService #699 seam', () => {
     expect(result.type).toBe('file');
     expect(loadSpy).not.toHaveBeenCalled();
     expect(storage.exists).not.toHaveBeenCalled();
+  });
+
+  it('#716: every page is serialized in the worker, a zip under ONE batch turn, a single page interactively', async () => {
+    const f = fixture(1000);
+    const storage = storageStub({ 'ws/a/a.png': 'AAAA' });
+    const { svc } = service({ ...f, storage });
+    await svc.exportPages('root', 'markdown', true, true, 'user-1');
+    expect(serializeCalls.map((c) => c.format)).toEqual(['markdown', 'markdown']); // once per page
+    for (const { queue } of serializeCalls) {
+      expect(queue).toMatchObject({ principal: 'user:user-1', budgetKey: 'user:user-1:export', batch: true });
+    }
+    expect(new Set(serializeCalls.map((c) => c.queue.budgetTurn)).size).toBe(1);
+
+    serializeCalls.length = 0;
+    await svc.exportPages('root', 'html', false, false, 'user-1');
+    expect(serializeCalls).toHaveLength(1);
+    expect(serializeCalls[0].queue).toMatchObject({ principal: 'user:user-1', budgetKey: 'user:user-1:export' });
+    expect(serializeCalls[0].queue.batch).toBeUndefined();
+
+    serializeCalls.length = 0;
+    await svc.exportSpace(SPACE, 'html', false, 'user-1');
+    expect(serializeCalls.length).toBeGreaterThanOrEqual(1);
+    expect(serializeCalls.every((c) => c.queue.batch === true && c.queue.budgetKey === 'user:user-1:export')).toBe(true);
+  });
+
+  it.each([
+    ['422 export_too_large (page)', new ContentTooComplexException(), ExportTooLargeException],
+    ['503 engine_busy', new ContentParseBusyException(), ContentParseBusyException],
+    ['429 conversion_budget_exhausted', new ConversionBudgetExhaustedException(30), ConversionBudgetExhaustedException],
+  ])('#716: %s on page 2 rejects the export before seal() and before any byte', async (_n, error, expected) => {
+    const f = fixture(1000);
+    const storage = storageStub({ 'ws/a/a.png': 'AAAA' });
+    const { svc } = service({ ...f, storage });
+    const seal = jest.spyOn(ExportAttachmentPlan.prototype, 'seal');
+    const stream = jest.spyOn(ExportAttachmentPlan.prototype, 'stream');
+    serializeFail.nth = 2;
+    serializeFail.error = error;
+    const err = await svc.exportPages('root', 'markdown', true, true, 'user-1').catch((e) => e);
+    expect(err).toBeInstanceOf(expected);
+    if (expected === ExportTooLargeException) expect((err as ExportTooLargeException).reason).toBe('page');
+    expect(seal).not.toHaveBeenCalled();
+    expect(stream).not.toHaveBeenCalled();
+    expect(storage.exists).not.toHaveBeenCalled();
+  });
+
+  it('#716: the attachment prechecks (seal) run inside the export’s build deadline', async () => {
+    const f = fixture(1000);
+    const storage = storageStub({ 'ws/a/a.png': 'AAAA' });
+    const left: number[] = [];
+    const exists = storage.exists.getMockImplementation()!;
+    storage.exists.mockImplementation(async (p: string) => {
+      left.push(exportBuildMsLeft());
+      return exists(p);
+    });
+    const { svc } = service({ ...f, storage });
+    await svc.exportPages('root', 'markdown', true, true, 'user-1');
+    expect(left).toHaveLength(1);
+    expect(left[0]).toBeLessThanOrEqual(45_000); // a build was in scope (outside one it is Infinity)
+  });
+
+  it('#716: an export that names no user fails closed (500) before any page is serialized', async () => {
+    const f = fixture(1000);
+    const storage = storageStub({ 'ws/a/a.png': 'AAAA' });
+    const { svc } = service({ ...f, storage });
+    const err = await svc.exportPages('root', 'markdown', false, true, undefined, true).catch((e) => e);
+    expect((err as { getStatus?: () => number }).getStatus?.()).toBe(500);
+    expect(serializeCalls).toHaveLength(0);
+  });
+
+  it('#716: the output is upstream’s exactly — HTML template, and Markdown after the <colgroup> strip', async () => {
+    const table = {
+      type: 'table',
+      content: [1, 2].map(() => ({
+        type: 'tableRow',
+        content: [1, 2].map(() => ({
+          type: 'tableCell',
+          attrs: { colwidth: [120] },
+          content: [{ type: 'paragraph', content: [{ type: 'text', text: 'c' }] }],
+        })),
+      })),
+    };
+    const body = () => ({ type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'body' }] }, table] });
+    CONTENT.root = body();
+    const pages = [pageRow('root', null, 'Root')];
+    const storage = storageStub({});
+    const { svc } = service({ pages, attachments: [], visible: ['root'], storage });
+    // Upstream's composition (export.service.ts at v0.95.0), on the same JSON the page exports (title heading first).
+    const json = { ...body(), content: [{ type: 'heading', attrs: { level: 1 }, content: [{ type: 'text', text: 'Root' }] }, ...body().content] };
+    const upstreamHtml = jsonToHtml(json);
+    expect(upstreamHtml).toMatch(/<colgroup/); // the strip below is exercised
+    const html = (await svc.exportPages('root', 'html', false, false, 'user-1')) as { content: string };
+    expect(html.content).toBe(`<!DOCTYPE html>
+      <html>
+        <head>
+         <title>Root</title>
+        </head>
+        <body>${upstreamHtml}</body>
+      </html>`);
+    CONTENT.root = body(); // the export prepends the title heading to the page's own JSON (upstream), so reload it
+    const md = (await svc.exportPages('root', 'markdown', false, false, 'user-1')) as { content: string };
+    expect(md.content).toBe(htmlToMarkdown(upstreamHtml.replace(/<colgroup[^>]*>[\s\S]*?<\/colgroup>/gim, '')));
   });
 });

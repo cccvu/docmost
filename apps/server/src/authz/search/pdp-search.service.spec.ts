@@ -1,6 +1,15 @@
 import { BadRequestException, ServiceUnavailableException } from '@nestjs/common';
 import { validate } from 'class-validator';
-import { PdpSearchService, SearchLimits, searchMaxConcurrent } from './pdp-search.service';
+import {
+  PdpSearchService,
+  SearchLimits,
+  searchMaxConcurrent,
+  searchMaxPerPrincipal,
+  searchPdpLane,
+  searchPdpWindowMax,
+} from './pdp-search.service';
+import { PageRepo } from '@docmost/db/repos/page/page.repo';
+import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 import { SearchService } from '../../core/search/search.service';
 import {
   MAX_SEARCH_QUERY_LENGTH,
@@ -8,7 +17,7 @@ import {
   SearchShareDTO,
   SearchSuggestionDTO,
 } from '../../core/search/dto/search.dto';
-import { pdpStub, searchDb, SearchRow, userLegCalls } from './search-db.testkit';
+import { isSetTimeout, pdpStub, searchDb, SearchRow, userLegCalls } from './search-db.testkit';
 
 /**
  * CCC authorization integration test (fork compatibility suite) — permission-aware search is
@@ -21,7 +30,9 @@ import { pdpStub, searchDb, SearchRow, userLegCalls } from './search-db.testkit'
  *   - paginates stably over the AUTHORIZED set (no skip/dup across pages);
  *   - never silently truncates — a hit on the candidate scan ceiling is logged;
  *   - #696: one candidate statement, a hydrate of the final slice only, one deadline, statement timeouts in short
- *     transactions never spanning a PDP call, the bulkhead and per-principal cap, the anonymous share lane.
+ *     transactions never spanning a PDP call, the bulkhead and per-principal cap, the anonymous share lane;
+ *   - #716: the process-wide PDP lane (held until a call settles), the adaptive first window, a per-(principal, kind)
+ *     place that waits its turn, the shed log, and the share search under statement timeouts.
  *
  * The DB is a real Kysely over a recording driver (search-db.testkit.ts) that models the candidate statement and the
  * hydrate; the authorization decision is a `tryFilterResources` stub denying a known set. No DB, no containers.
@@ -163,7 +174,12 @@ describe('PdpSearchService — filter-then-retrieve (searchPage)', () => {
   it('never silently truncates — hitting the candidate scan ceiling logs a warning', async () => {
     // 1200 candidates, ALL denied → the statement reads the 1024 budget, the gate walks it, stops empty + warns.
     const all = ids(1200, 'd');
-    const { service, pdp } = build({ pageCandidates: mkRows(all), denied: new Set(all) });
+    // Fixed 128-id windows (#716 sizes the first one from the page; that is pinned in the PDP-lane describe).
+    const { service, pdp } = build({
+      pageCandidates: mkRows(all),
+      denied: new Set(all),
+      limits: { pdpWindowMin: 128, pdpWindowMax: 128 },
+    });
     const warn = jest.spyOn((service as any).logger, 'warn').mockImplementation();
 
     const { items } = await service.searchPage({ query: 'foo', limit: 25 } as any, { userId: USER, workspaceId: WS });
@@ -225,7 +241,11 @@ describe('PdpSearchService — #696 one candidate statement, then hydrate only t
   it('reads the candidates in ONE statement (id + rank only, LIMIT budget) however many PDP windows it takes', async () => {
     // The sole authorized hit is candidate #300: three PDP windows, still ONE candidate statement.
     const all = [...ids(299, 'd'), 'a0'];
-    const { service, pdp, candidateQueries } = build({ pageCandidates: mkRows(all), denied: new Set(ids(299, 'd')) });
+    const { service, pdp, candidateQueries } = build({
+      pageCandidates: mkRows(all),
+      denied: new Set(ids(299, 'd')),
+      limits: { pdpWindowMin: 128, pdpWindowMax: 128 },
+    });
 
     const { items } = await service.searchPage({ query: 'foo', limit: 25 } as any, { userId: USER, workspaceId: WS });
 
@@ -382,7 +402,7 @@ describe('PdpSearchService — #696 statements: short transactions, statement_ti
     const { service, pdp, hydrateQueries } = build({
       pageCandidates: mkRows(ids(3)),
       denied: new Set(),
-      limits: { deadlineMs: 150 },
+      limits: { deadlineMs: 150, pdpMinMs: 0 }, // pdpMinMs 0: the PDP call must really start, then outlive the deadline
     });
     pdp.tryFilterResources.mockImplementation(
       (_s: unknown, _p: string, _t: string, list: string[]) =>
@@ -392,20 +412,23 @@ describe('PdpSearchService — #696 statements: short transactions, statement_ti
     const t0 = Date.now();
     await expectEngineBusy(service.searchPage({ query: 'foo' } as any, { userId: USER, workspaceId: WS }));
     expect(Date.now() - t0).toBeLessThan(1000);
+    expect(pdp.tryFilterResources).toHaveBeenCalledTimes(1);
     expect(hydrateQueries()).toHaveLength(0);
   });
 
   it('a slow statement past the deadline answers 503 engine_busy at the deadline', async () => {
-    const { service } = build({
+    const { service, pdp, hydrateQueries } = build({
       pageCandidates: mkRows(ids(3)),
       denied: new Set(),
-      limits: { deadlineMs: 150 },
+      limits: { deadlineMs: 150, pdpMinMs: 0 }, // the gate must pass so the slow statement is the HYDRATE
       delayMs: (q) => (/"id" in \(/.test(q.sql) ? 1500 : 0),
     });
     jest.spyOn((service as any).logger, 'warn').mockImplementation();
     const t0 = Date.now();
     await expectEngineBusy(service.searchPage({ query: 'foo' } as any, { userId: USER, workspaceId: WS }));
     expect(Date.now() - t0).toBeLessThan(1000);
+    expect(pdp.tryFilterResources).toHaveBeenCalledTimes(1);
+    expect(hydrateQueries()).toHaveLength(1);
   });
 
   it('never starts a statement with (almost) no time left — it would need statement_timeout 0, which is NO timeout', async () => {
@@ -413,13 +436,14 @@ describe('PdpSearchService — #696 statements: short transactions, statement_ti
     const { service, pdp, timeouts, hydrateQueries } = build({
       pageCandidates: mkRows(ids(3)),
       denied: new Set(),
-      limits: { deadlineMs: 300, minStatementMs: 200 },
+      limits: { deadlineMs: 300, minStatementMs: 200, pdpMinMs: 0 },
     });
     pdp.tryFilterResources.mockImplementation(
       (_s: unknown, _p: string, _t: string, list: string[]) => new Promise((r) => setTimeout(() => r(list), 150)),
     );
     jest.spyOn((service as any).logger, 'warn').mockImplementation();
     await expectEngineBusy(service.searchPage({ query: 'foo' } as any, { userId: USER, workspaceId: WS }));
+    expect(pdp.tryFilterResources).toHaveBeenCalledTimes(1); // the gate ran and ate the time
     expect(timeouts()).toHaveLength(1); // the candidate statement only
     expect(hydrateQueries()).toHaveLength(0);
   });
@@ -445,7 +469,13 @@ describe('PdpSearchService — #696 statements: short transactions, statement_ti
   });
 });
 
-describe('PdpSearchService — #696 bulkheads', () => {
+const until = async (cond: () => boolean) => {
+  for (let i = 0; i < 200 && !cond(); i++) await tick();
+  expect(cond()).toBe(true);
+};
+const warnLines = (warn: jest.SpyInstance) => warn.mock.calls.map((c) => String(c[0])).join('\n');
+
+describe('PdpSearchService — #696/#716 bulkheads', () => {
   const mk = (limits: Partial<SearchLimits>, pdp = heldPdp()) => {
     const sdb = searchDb({ candidates: mkRows(ids(3)) });
     const service = new PdpSearchService(
@@ -456,21 +486,28 @@ describe('PdpSearchService — #696 bulkheads', () => {
       {} as any,
       pdp,
       undefined,
-      limits,
+      // A wide PDP lane unless a case is about it: these cases are about admission.
+      { pdpLaneMax: 10, ...limits },
     );
-    jest.spyOn((service as any).logger, 'warn').mockImplementation();
-    return { service, pdp };
+    const warn = jest.spyOn((service as any).logger, 'warn').mockImplementation();
+    return { service, pdp, warn };
   };
   const search = (s: PdpSearchService, userId: string) =>
     s.searchPage({ query: 'foo' } as any, { userId, workspaceId: WS });
-  const until = async (cond: () => boolean) => {
-    for (let i = 0; i < 200 && !cond(); i++) await tick();
-    expect(cond()).toBe(true);
-  };
 
-  it('SEARCH_MAX_CONCURRENT: a positive integer, anything else the default 3', () => {
+  it('the env knobs parse defensively: an integer in range, clamped above, anything else the default', () => {
     expect(searchMaxConcurrent('5')).toBe(5);
+    expect(searchMaxConcurrent('500')).toBe(64);
     for (const bad of [undefined, '', '0', '-2', '2.5', 'abc']) expect(searchMaxConcurrent(bad)).toBe(3);
+    expect(searchPdpLane('3')).toBe(3);
+    expect(searchPdpLane('99')).toBe(16);
+    for (const bad of [undefined, '', '0', '-1', '1.5', 'x']) expect(searchPdpLane(bad)).toBe(1); // #716 default
+    expect(searchPdpWindowMax('32')).toBe(32);
+    expect(searchPdpWindowMax('1000')).toBe(128);
+    for (const bad of [undefined, '', '0', '8', '15', '40.5', 'x']) expect(searchPdpWindowMax(bad)).toBe(32); // #716 default
+    expect(searchMaxPerPrincipal('2')).toBe(2);
+    expect(searchMaxPerPrincipal('1000')).toBe(64);
+    for (const bad of [undefined, '', '0', '-3', '0.5', 'x']) expect(searchMaxPerPrincipal(bad)).toBe(1);
   });
 
   it('the slots are full → a search waits at most slotWaitMs, then 503 engine_busy; a freed slot admits the next', async () => {
@@ -486,123 +523,484 @@ describe('PdpSearchService — #696 bulkheads', () => {
     await expect(search(service, 'u-c')).resolves.toBeDefined();
   });
 
-  it('one principal holds at most perPrincipal (2) places — its third search is refused at once, others are not', async () => {
-    const { service, pdp } = mk({ maxConcurrent: 10, perPrincipal: 2 });
-    const a = search(service, USER);
-    const b = search(service, USER);
-    await until(() => pdp.pending === 2);
-    const t0 = Date.now();
-    await expectEngineBusy(search(service, USER));
-    expect(Date.now() - t0).toBeLessThan(100); // never queued behind itself
+  it('#716: one principal runs perPrincipal (1) search at a time — its next ones WAIT their turn in order, and nobody else waits behind them', async () => {
+    const { service, pdp } = mk({ maxConcurrent: 10, perPrincipal: 1, slotWaitMs: 5000 });
+    const order: string[] = [];
+    const a = search(service, USER).then(() => order.push('a'));
+    await until(() => pdp.pending === 1);
+    const b = search(service, USER).then(() => order.push('b'));
+    const c = search(service, USER).then(() => order.push('c'));
     const other = search(service, 'someone-else');
+    await until(() => pdp.pending === 2); // a and someone-else run; b and c wait for USER's place
+    for (let i = 0; i < 10; i++) await tick();
+    expect(pdp.pending).toBe(2);
+    expect((service as any).inFlight.get(`search:user:${USER}`).refs).toBe(3);
+    pdp.open();
+    await until(() => order.includes('a') && pdp.pending === 1); // b, and only b, admitted
+    pdp.open();
+    await until(() => order.includes('b') && pdp.pending === 1); // then c
+    pdp.open();
+    await Promise.all([a, b, c, other]);
+    expect(order).toEqual(['a', 'b', 'c']);
+    expect((service as any).inFlight.size).toBe(0); // idle keys are pruned
+  });
+
+  it('#716: with the default limits two principals cannot hold every slot — a third is admitted at once', async () => {
+    const { service, pdp } = mk({}); // maxConcurrent 3, perPrincipal 1
+    expect((service as any).limits.perPrincipal).toBe(1);
+    const a1 = search(service, 'u-a');
+    const a2 = search(service, 'u-a'); // waits for u-a's place, holds no slot
+    const b = search(service, 'u-b');
+    await until(() => pdp.pending === 2);
+    const c = search(service, 'u-c');
     await until(() => pdp.pending === 3);
     pdp.open();
-    await Promise.all([a, b, other]);
+    await until(() => pdp.pending === 1); // a2's turn
+    pdp.open();
+    await Promise.all([a1, a2, b, c]);
   });
 
-  it('a principal waiting for a slot counts toward its cap', async () => {
-    const { service, pdp } = mk({ maxConcurrent: 1, perPrincipal: 2, slotWaitMs: 2000 });
-    const a = search(service, USER); // running
+  it('#716 review: a search waits for its own previous search up to searchTurnWaitMs (not slotWaitMs): parallel agent calls run in turn', async () => {
+    const { service, pdp } = mk({ maxConcurrent: 10, perPrincipal: 1, slotWaitMs: 30, searchTurnWaitMs: 5000 });
+    const a = search(service, USER);
     await until(() => pdp.pending === 1);
-    const b = search(service, USER); // waiting for the slot
-    await tick();
+    const b = search(service, USER);
+    await new Promise((r) => setTimeout(r, 80)); // well past slotWaitMs: b is still waiting, not shed
+    expect(pdp.pending).toBe(1);
+    pdp.open();
+    await until(() => pdp.pending === 1); // b admitted once a finished
+    pdp.open();
+    await expect(a).resolves.toBeDefined();
+    await expect(b).resolves.toBeDefined();
+  });
+
+  it('#716: a principal whose turn does not come within slotWaitMs is shed 503 — logged with kind, principal, slots and lane', async () => {
+    const { service, pdp, warn } = mk({ maxConcurrent: 10, perPrincipal: 1, slotWaitMs: 50, searchTurnWaitMs: 50 });
+    const a = search(service, USER);
+    await until(() => pdp.pending === 1);
+    const t0 = Date.now();
     await expectEngineBusy(search(service, USER));
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(40); // it waited its turn; it was not refused at once
+    expect(warnLines(warn)).toMatch(
+      /^SEARCH_SHED reason=principal stage=search kind=search principal=u1 slots=1\/10 lane=1\/10: answered 503 engine_busy$/m,
+    );
     pdp.open();
     await a;
-    await until(() => pdp.pending === 1);
-    pdp.open();
-    await b;
   });
 
-  it('a principal\'s places are given back however a search ends (503s included)', async () => {
+  it('a principal waiting for a slot holds its place: its next search waits for that place, never for a slot', async () => {
+    const { service, pdp } = mk({ maxConcurrent: 1, perPrincipal: 1, slotWaitMs: 5000 });
+    const a = search(service, 'u-other'); // holds the only slot
+    await until(() => pdp.pending === 1);
+    const b = search(service, USER); // has USER's place, waits for the slot
+    const c = search(service, USER); // waits for USER's place
+    for (let i = 0; i < 10; i++) await tick();
+    expect((service as any).slots.waiters).toHaveLength(1); // b alone
+    expect((service as any).inFlight.get(`search:user:${USER}`).places.waiters).toHaveLength(1); // c
+    for (let round = 0; round < 3; round++) {
+      await until(() => pdp.pending === 1);
+      pdp.open();
+    }
+    await Promise.all([a, b, c]);
+  });
+
+  it("a principal's places, the slots and the PDP lane are given back however a search ends (503s included)", async () => {
     const pdp = { tryFilterResources: jest.fn(async () => null as string[] | null) };
     const { service } = mk({ maxConcurrent: 1, perPrincipal: 1 }, pdp as any);
     for (let i = 0; i < 3; i++) {
       await expect(search(service, USER)).rejects.toBeInstanceOf(ServiceUnavailableException);
     }
+    await tick();
     expect((service as any).inFlight.size).toBe(0);
     expect((service as any).slots.inUse).toBe(0);
+    expect((service as any).pdpLane.inUse).toBe(0);
   });
 
-  it('suggestions share the bulkhead and the per-principal cap', async () => {
+  it("#716: suggestions share the bulkhead but take their own place — a mention suggestion never waits behind the user's own search", async () => {
     const { service, pdp } = mk({ maxConcurrent: 10, perPrincipal: 1 });
     (service as any).spaceMemberRepository.getUserSpaceIds = async () => ['s1'];
     const a = search(service, USER);
     await until(() => pdp.pending === 1);
+    const sug = service.searchSuggestions({ query: 'p', includePages: true } as any, USER, WS);
+    await until(() => pdp.pending === 2);
+    pdp.open();
+    await Promise.all([a, sug]);
+  });
+
+  it('#716 review: a suggestion waits for its own previous suggestion only slotWaitMs (a stale keystroke is shed, not queued long)', async () => {
+    const { service, pdp, warn } = mk({ maxConcurrent: 10, perPrincipal: 1, slotWaitMs: 50, searchTurnWaitMs: 5000 });
+    (service as any).spaceMemberRepository.getUserSpaceIds = async () => ['s1'];
+    const first = service.searchSuggestions({ query: 'p', includePages: true } as any, USER, WS);
+    await until(() => pdp.pending === 1);
+    const t0 = Date.now();
+    await expectEngineBusy(service.searchSuggestions({ query: 'pa', includePages: true } as any, USER, WS));
+    expect(Date.now() - t0).toBeLessThan(2000);
+    expect(warnLines(warn)).toMatch(/SEARCH_SHED reason=principal stage=suggest kind=suggest principal=u1 /);
+    pdp.open();
+    await first;
+  });
+
+  it('suggestions share the bulkhead: full slots shed a suggestion too (kind=suggest)', async () => {
+    const { service, pdp, warn } = mk({ maxConcurrent: 1, slotWaitMs: 50 });
+    (service as any).spaceMemberRepository.getUserSpaceIds = async () => ['s1'];
+    const a = search(service, 'u-other');
+    await until(() => pdp.pending === 1);
     await expectEngineBusy(service.searchSuggestions({ query: 'p', includePages: true } as any, USER, WS));
+    expect(warnLines(warn)).toMatch(/SEARCH_SHED reason=slots stage=suggest kind=suggest principal=u1 slots=1\/1 /);
     pdp.open();
     await a;
   });
 });
 
-describe('PdpSearchService — #696 the anonymous share-search lane', () => {
+describe('PdpSearchService — #716 the search PDP lane and the adaptive window', () => {
+  const mk = (limits: Partial<SearchLimits>, pdp: any = heldPdp(), candidates = mkRows(ids(3))) => {
+    const sdb = searchDb({ candidates });
+    const spaceMemberRepo = {
+      getUserSpaceIdsQuery: () => sdb.db.selectFrom('space_members').select('spaceId'),
+      getUserSpaceIds: jest.fn(async () => ['s1']),
+    };
+    const service = new PdpSearchService(
+      sdb.db as any,
+      { withSpace: (eb: any) => eb.lit(null).as('space') } as any,
+      {} as any,
+      spaceMemberRepo as any,
+      {} as any,
+      pdp,
+      undefined,
+      { maxConcurrent: 10, perPrincipal: 10, ...limits },
+    );
+    const warn = jest.spyOn((service as any).logger, 'warn').mockImplementation();
+    return { service, pdp, warn, spaceMemberRepo, ...sdb };
+  };
+  const search = (s: PdpSearchService, userId: string, params: object = {}) =>
+    s.searchPage({ query: 'foo', ...params } as any, { userId, workspaceId: WS });
+
+  it('#716 load-run defaults: a lane of 1 and windows of at most 32 ids (ADR 0005 amendment)', () => {
+    const { service } = mk({});
+    expect((service as any).limits).toMatchObject({ pdpLaneMax: 1, pdpWindowMin: 32, pdpWindowMax: 32 });
+    expect((service as any).pdpLane.max).toBe(1);
+  });
+
+  it('the first window is sized from the page (2 × need, at least 32), then doubles up to pdpWindowMax', async () => {
+    const all = ids(300, 'd');
+    const sizes = async (limit: number, limits: Partial<SearchLimits> = {}) => {
+      const { service, pdp } = mk(limits, pdpStub({ userDenied: new Set(all) }), mkRows(all));
+      await search(service, USER, { limit });
+      return userLegCalls(pdp).map((c) => c[3].length);
+    };
+    const w64 = { pdpWindowMax: 64 };
+    expect(await sizes(10, w64)).toEqual([32, 64, 64, 64, 64, 12]); // need 11
+    expect(await sizes(25, w64)).toEqual([52, 64, 64, 64, 56]); // need 26
+    expect(await sizes(100, w64)).toEqual([64, 64, 64, 64, 44]); // need 101
+    expect(await sizes(25, { pdpWindowMax: 128 })).toEqual([52, 104, 128, 16]);
+    // The #716 defaults (pdpWindowMin = pdpWindowMax = 32): every window is 32 ids, whatever the page.
+    expect(await sizes(10)).toEqual([...Array(9).fill(32), 12]);
+    expect(await sizes(100)).toEqual([...Array(9).fill(32), 12]);
+    // The scan budget is unchanged: 1024 candidates are still walked for a page that cannot fill.
+    const { service, pdp } = mk({}, pdpStub({ userDenied: new Set(ids(1200, 'd')) }), mkRows(ids(1200, 'd')));
+    await search(service, USER, { limit: 25 });
+    expect(userLegCalls(pdp).reduce((n, c) => n + c[3].length, 0)).toBe(1024);
+  });
+
+  it('the default window fills the same page as fixed 128-id windows (completeness unchanged)', async () => {
+    const stream: string[] = [];
+    for (let i = 0; i < 600; i++) stream.push(i % 7 === 0 ? `a${i}` : `d${i}`);
+    const denied = new Set(stream.filter((id) => id.startsWith('d')));
+    const page = async (offset: number, limits: Partial<SearchLimits>) => {
+      const { service } = mk({ ...limits }, pdpStub({ userDenied: denied }), mkRows(stream));
+      const out = await service.searchAuthorized({ query: 'foo', limit: 20, offset } as any, {}, { userId: USER, workspaceId: WS });
+      return { ids: out.items.map((r: any) => r.id), hasMore: out.hasMore };
+    };
+    for (const offset of [0, 20, 60, 80]) {
+      expect(await page(offset, {})).toEqual(await page(offset, { pdpWindowMin: 128, pdpWindowMax: 128 }));
+    }
+  });
+
+  it('a full lane sheds the next search (503 pdp_lane) within pdpLaneWaitMs, and the PDP never sees its ids', async () => {
+    // (The shed is logged after u-b gave its own slot back: slots=1/10 is u-a's.)
+    const { service, pdp, warn } = mk({ pdpLaneMax: 1, pdpLaneWaitMs: 50 });
+    const a = search(service, 'u-a');
+    await until(() => pdp.pending === 1);
+    await expectEngineBusy(search(service, 'u-b'));
+    expect(pdp.tryFilterResources).toHaveBeenCalledTimes(1);
+    expect(warnLines(warn)).toMatch(
+      /SEARCH_SHED reason=pdp_lane stage=pdp kind=search principal=u-b slots=1\/10 lane=1\/1: answered 503 engine_busy/,
+    );
+    pdp.open();
+    await a;
+    pdp.tryFilterResources.mockImplementation(async (_s: unknown, _p: string, _t: string, l: string[]) => l);
+    await expect(search(service, 'u-b')).resolves.toBeDefined(); // the freed slot admits the next
+  });
+
+  it('a call the deadline abandoned keeps its lane slot until it SETTLES — then the next search is admitted', async () => {
+    const { service, pdp } = mk({ pdpLaneMax: 1, pdpLaneWaitMs: 30, deadlineMs: 100, pdpMinMs: 0 });
+    await expectEngineBusy(search(service, 'u-a')); // its PDP call is still pending
+    expect(pdp.pending).toBe(1);
+    expect((service as any).pdpLane.inUse).toBe(1);
+    await expectEngineBusy(search(service, 'u-b')); // shed: the abandoned call still holds the lane
+    expect(pdp.tryFilterResources).toHaveBeenCalledTimes(1);
+    pdp.open(); // the abandoned call settles
+    await until(() => (service as any).pdpLane.inUse === 0);
+    pdp.tryFilterResources.mockImplementation(async (_s: unknown, _p: string, _t: string, l: string[]) => l);
+    await expect(search(service, 'u-b', {})).resolves.toBeDefined();
+  });
+
+  it('no PDP call starts with less than pdpMinMs of the deadline left: shed at stage pdp, the PDP never called', async () => {
+    const { service, pdp, warn, hydrateQueries } = mk({ deadlineMs: 1000, pdpMinMs: 5000 }, pdpStub());
+    await expectEngineBusy(search(service, USER));
+    expect(pdp.tryFilterResources).not.toHaveBeenCalled();
+    expect(hydrateQueries()).toHaveLength(0);
+    expect(warnLines(warn)).toMatch(/SEARCH_SHED reason=deadline stage=pdp kind=search principal=u1 /);
+  });
+
+  it('the lane bounds every authorization call search makes: plain, both on-behalf-of legs, and the suggestions\' space lookup', async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const waiting: Array<() => void> = [];
+    const held = <T>(v: T) =>
+      new Promise<T>((resolve) => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        waiting.push(() => {
+          inFlight--;
+          resolve(v);
+        });
+      });
+    const pdp = {
+      tryFilterResources: jest.fn((_s: unknown, _p: string, _t: string, list: string[]) => held(list)),
+    };
+    const { service, spaceMemberRepo } = mk({ pdpLaneMax: 2, pdpLaneWaitMs: 5000 }, pdp);
+    spaceMemberRepo.getUserSpaceIds.mockImplementation(() => held(['s1']));
+    const runs = [
+      search(service, 'u-1'),
+      search(service, 'u-2'),
+      service.searchAuthorized({ query: 'foo', limit: 2 } as any, {}, { userId: 'u-3', workspaceId: WS, serviceSubjectId: 'sa-1' }),
+      service.searchAuthorized({ query: 'foo', limit: 2 } as any, {}, { userId: 'u-4', workspaceId: WS, serviceSubjectId: 'sa-1' }),
+      service.searchSuggestions({ query: 'p', includePages: true } as any, 'u-5', WS),
+      service.searchSuggestions({ query: 'p', includePages: true } as any, 'u-6', WS),
+    ];
+    let done = false;
+    const all = Promise.all(runs).then(() => (done = true));
+    for (let i = 0; i < 2000 && !done; i++) {
+      await tick();
+      waiting.shift()?.();
+    }
+    await all;
+    expect(peak).toBe(2); // reached, never exceeded
+    expect(pdp.tryFilterResources.mock.calls.filter((c: any[]) => c[0]?.subjectType === 'service')).toHaveLength(2);
+    expect(spaceMemberRepo.getUserSpaceIds).toHaveBeenCalledTimes(2);
+    expect((service as any).pdpLane.inUse).toBe(0);
+  });
+
+  it('page suggestions: the space lookup takes the lane (a full lane sheds it before the lookup runs)', async () => {
+    const { service, pdp, spaceMemberRepo, warn } = mk({ pdpLaneMax: 1, pdpLaneWaitMs: 30 });
+    const a = search(service, 'u-a');
+    await until(() => pdp.pending === 1);
+    await expectEngineBusy(service.searchSuggestions({ query: 'p', includePages: true } as any, USER, WS));
+    expect(spaceMemberRepo.getUserSpaceIds).not.toHaveBeenCalled();
+    expect(warnLines(warn)).toMatch(/SEARCH_SHED reason=pdp_lane stage=suggest-spaces kind=suggest principal=u1 /);
+    pdp.open();
+    await a;
+  });
+
+  it('page suggestions: a space lookup the PDP could not answer is ITS 503 (never "no spaces", never a shed), and the lane is given back', async () => {
+    const { service, spaceMemberRepo, candidateQueries, warn } = mk({}, pdpStub());
+    const outage = new ServiceUnavailableException('authorization is temporarily unavailable');
+    spaceMemberRepo.getUserSpaceIds.mockRejectedValue(outage);
+    await expect(service.searchSuggestions({ query: 'p', includePages: true } as any, USER, WS)).rejects.toBe(outage);
+    expect(candidateQueries()).toHaveLength(0);
+    expect(warnLines(warn)).not.toMatch(/SEARCH_SHED/);
+    await tick();
+    expect((service as any).pdpLane.inUse).toBe(0);
+  });
+});
+
+describe('PdpSearchService — #696/#716 the anonymous share search', () => {
   afterEach(() => jest.restoreAllMocks());
-  const mk = (limits: Partial<SearchLimits> = {}) => {
-    const shareRepo = { findById: jest.fn().mockResolvedValue({ id: 'sh', spaceId: 'sp' }) };
-    const gate = { isSharingAllowed: jest.fn().mockResolvedValue(true) };
+  const ROOT = 'p-root';
+  const SHARE = { id: 'sh', pageId: ROOT, spaceId: 'sp', workspaceId: WS, includeSubPages: true };
+  const isAncestor = (q: { sql: string }) => /with recursive "ancestors"/.test(q.sql);
+  const isSubtree = (q: { sql: string }) => /with recursive "page_hierarchy"/.test(q.sql);
+  const isShareSearch = (q: { sql: string }) => /^select .* from "pages" where "tsv" @@ .* offset \$\d+$/.test(q.sql);
+  const mk = (
+    o: {
+      limits?: Partial<SearchLimits>;
+      share?: object | null;
+      findById?: jest.Mock;
+      sharingAllowed?: boolean;
+      restricted?: boolean;
+      subtree?: string[];
+      fail?: Parameters<typeof searchDb>[0]['fail'];
+    } = {},
+  ) => {
+    const shareRepo = { findById: o.findById ?? jest.fn().mockResolvedValue(o.share === undefined ? SHARE : o.share) };
+    const gate = { isSharingAllowed: jest.fn().mockResolvedValue(o.sharingAllowed ?? true) };
     const pdp = heldPdp();
-    const sdb = searchDb({ candidates: mkRows(ids(3)) });
+    const sdb = searchDb({
+      candidates: mkRows([ROOT, 'p-child', 'p-other']),
+      fail: o.fail,
+      answer: (q) =>
+        isAncestor(q)
+          ? o.restricted
+            ? [{ id: 'access-row' }]
+            : []
+          : isSubtree(q)
+            ? (o.subtree ?? [ROOT, 'p-child']).map((id) => ({ id }))
+            : undefined,
+    });
     const service = new PdpSearchService(
       sdb.db as any,
       { withSpace: (eb: any) => eb.lit(null).as('space') } as any,
       shareRepo as any,
       { getUserSpaceIdsQuery: () => sdb.db.selectFrom('space_members').select('spaceId') } as any,
-      {} as any,
+      {} as any, // the injected PagePermissionRepo is never used by the share search
       pdp,
       gate as any,
-      limits,
+      o.limits,
     );
-    jest.spyOn((service as any).logger, 'warn').mockImplementation();
-    return { service, pdp };
+    const warn = jest.spyOn((service as any).logger, 'warn').mockImplementation();
+    const shareSearches = () => sdb.queries.filter(isShareSearch);
+    return { service, pdp, shareRepo, gate, warn, shareSearches, ...sdb };
   };
   const share = (s: PdpSearchService, extra: object = {}) =>
     s.searchPage({ query: 'roadmap', shareId: 'sh', ...extra } as any, { workspaceId: WS } as any);
+  const inList = (q: { sql: string; parameters: readonly unknown[] }) =>
+    /"id" in \(([^)]*)\)/
+      .exec(q.sql)![1]
+      .split(',')
+      .map((p) => q.parameters[Number(p.trim().slice(1)) - 1]);
 
-  it('clamps limit to 1..25 and offset to ≥ 0, and never passes a spaceId upstream', async () => {
-    const upstream = jest.spyOn(SearchService.prototype, 'searchPage').mockResolvedValue({ items: [] } as any);
-    const { service } = mk();
-    for (const [limit, offset, want] of [
-      [1e6, -5, { limit: 25, offset: 0 }],
-      [-3, 7, { limit: 1, offset: 7 }],
-      [undefined, undefined, { limit: 25, offset: 0 }],
-      [10, 100, { limit: 10, offset: 100 }],
-    ] as const) {
-      upstream.mockClear();
-      await share(service, { limit, offset, spaceId: 'some-space' });
-      expect(upstream).toHaveBeenCalledTimes(1);
-      const [params] = upstream.mock.calls[0];
-      expect({ limit: params.limit, offset: params.offset }).toEqual(want);
-      expect(params.spaceId).toBeUndefined();
+  it('the two confidentiality reads are upstream\'s own methods and read only this.db (so a repo built on the transaction runs them whole)', () => {
+    // If upstream ever reads another dependency in either, the share search would call it on `null` and fail
+    // closed; this pin reds first so the bump re-checks the share-search note in UPSTREAM_MODIFICATIONS.md §5.
+    for (const fn of [
+      PagePermissionRepo.prototype.hasRestrictedAncestor,
+      PageRepo.prototype.getPageAndDescendantsExcludingRestricted,
+    ]) {
+      const used = new Set(fn.toString().match(/this\.\w+/g));
+      expect([...used]).toEqual(['this.db']);
     }
   });
 
-  it('an offset past shareMaxOffset (100) answers empty without running upstream SQL', async () => {
-    const upstream = jest.spyOn(SearchService.prototype, 'searchPage').mockResolvedValue({ items: ['x'] } as any);
-    const { service } = mk();
-    expect(await share(service, { offset: 101 })).toEqual({ items: [] });
-    expect(upstream).not.toHaveBeenCalled();
+  it('runs EVERY statement in its own transaction under SET LOCAL statement_timeout: the restricted-ancestor read, the subtree read, the full-text search', async () => {
+    const { service, queries, tx, timeouts } = mk();
+    const { items } = await share(service);
+    const kinds = queries.map((q) =>
+      isSetTimeout(q) ? 'set' : isAncestor(q) ? 'ancestor' : isSubtree(q) ? 'subtree' : isShareSearch(q) ? 'search' : q.sql,
+    );
+    expect(kinds).toEqual(['set', 'ancestor', 'set', 'subtree', 'set', 'search']);
+    expect(tx).toEqual(['begin', 'commit', 'begin', 'commit', 'begin', 'commit']);
+    for (const t of timeouts()) {
+      const ms = Number(/= (\d+)$/.exec(t.sql)![1]);
+      expect(ms).toBeGreaterThan(0);
+      expect(ms).toBeLessThanOrEqual(3000);
+    }
+    expect(items.map((i: any) => i.id).sort()).toEqual([ROOT, 'p-child'].sort());
+  });
+
+  it('the full-text statement: only the share\'s pages, this workspace, live, a headline over left(text_content, 64 KiB), no space', async () => {
+    const { service, shareSearches } = mk();
+    const { items } = await share(service);
+    const [q, ...rest] = shareSearches();
+    expect(rest).toHaveLength(0);
+    expect(inList(q)).toEqual([ROOT, 'p-child']);
+    expect(q.sql).toContain(
+      "ts_headline('english', left(text_content, 65536), to_tsquery('english', f_unaccent($2)),'MinWords=9, MaxWords=10, MaxFragments=3') as \"highlight\"",
+    );
+    expect(q.sql).toMatch(/"deleted_at" is null and "id" in \([^)]*\) and "workspace_id" = \$\d+ order by "rank" desc, "id" asc limit \$\d+ offset \$\d+$/);
+    expect(q.sql).not.toMatch(/"spaces"|"space_id"/);
+    expect(q.parameters).toContain(WS);
+    for (const item of items) {
+      expect(item).not.toHaveProperty('space');
+      expect(item.highlight).not.toMatch(/\n/); // normalized as upstream does
+    }
+  });
+
+  it('clamps limit to 1..25 and offset to ≥ 0, and never searches by a spaceId', async () => {
+    for (const [limit, offset, want] of [
+      [1e6, -5, [25, 0]],
+      [-3, 7, [1, 7]],
+      [undefined, undefined, [25, 0]],
+      [10, 100, [10, 100]],
+    ] as const) {
+      const { service, shareSearches } = mk();
+      await share(service, { limit, offset, spaceId: 'some-space' });
+      const [q] = shareSearches();
+      expect(q.parameters.slice(-2)).toEqual(want);
+      expect(q.parameters).not.toContain('some-space');
+    }
+  });
+
+  it('includeSubPages=false searches the shared page alone (no subtree read)', async () => {
+    const { service, queries, shareSearches } = mk({ share: { ...SHARE, includeSubPages: false } });
+    await share(service);
+    expect(queries.some(isSubtree)).toBe(false);
+    expect(inList(shareSearches()[0])).toEqual([ROOT]);
+  });
+
+  it('a restricted ancestor answers empty before any search (and an empty subtree too)', async () => {
+    const restricted = mk({ restricted: true });
+    expect(await share(restricted.service)).toEqual({ items: [] });
+    expect(restricted.queries.some(isSubtree)).toBe(false);
+    expect(restricted.shareSearches()).toHaveLength(0);
+    const empty = mk({ subtree: [] });
+    expect(await share(empty.service)).toEqual({ items: [] });
+    expect(empty.shareSearches()).toHaveLength(0);
+  });
+
+  it.each([
+    ['no shareId (upstream finds nothing without one)', { shareId: undefined }, {}],
+    ['an offset past shareMaxOffset (100)', { offset: 101 }, {}],
+    ['an unknown or vetoed share', {}, { share: null }],
+    ['a share of another workspace', {}, { share: { ...SHARE, workspaceId: 'ws-other' } }],
+    ['sharing not allowed (disabled, or the space archived)', {}, { sharingAllowed: false }],
+  ])('%s → empty, with no statement run', async (_n, params, o) => {
+    const m = mk(o as any);
+    expect(await share(m.service, params)).toEqual({ items: [] });
+    expect(m.queries).toHaveLength(0);
   });
 
   it('has its OWN one-slot lane: a busy lane is 503 engine_busy, and full authenticated slots never block it', async () => {
-    let finish!: () => void;
-    const upstream = jest
-      .spyOn(SearchService.prototype, 'searchPage')
-      .mockImplementation(() => new Promise((r) => (finish = () => r({ items: [] } as any))));
-    const { service, pdp } = mk({ maxConcurrent: 1, slotWaitMs: 50 });
+    let finish!: (v: unknown) => void;
+    const findById = jest.fn(() => new Promise((r) => (finish = r)));
+    const { service, pdp, warn } = mk({ findById, limits: { maxConcurrent: 1, slotWaitMs: 50 } });
 
     // The authenticated slot is held...
     const authed = service.searchPage({ query: 'foo' } as any, { userId: USER, workspaceId: WS });
-    for (let i = 0; i < 50 && pdp.pending === 0; i++) await tick();
+    await until(() => pdp.pending === 1);
     // ...and the share lane still admits one,
     const first = share(service);
-    for (let i = 0; i < 50 && upstream.mock.calls.length === 0; i++) await tick();
-    expect(upstream).toHaveBeenCalledTimes(1);
+    await until(() => findById.mock.calls.length === 1);
     // but only one.
     await expectEngineBusy(share(service));
-    finish();
+    expect(warnLines(warn)).toMatch(/SEARCH_SHED reason=share_lane stage=admit kind=share principal=anonymous slots=1\/1 /);
+    finish(SHARE);
     await first;
     pdp.open();
     await authed;
+  });
+
+  it('the deadline answers 503 engine_busy, but the lane is held until the work SETTLES — no statement starts after it', async () => {
+    let finish!: (v: unknown) => void;
+    const findById = jest.fn(() => new Promise((r) => (finish = r)));
+    const { service, queries } = mk({ findById, limits: { deadlineMs: 100 } });
+    await expectEngineBusy(share(service));
+    expect((service as any).shareLane.inUse).toBe(1); // the abandoned work still runs
+    finish(SHARE); // it resumes past the deadline: no time left, so no statement starts, and the lane is freed
+    await until(() => (service as any).shareLane.inUse === 0);
+    expect(queries).toHaveLength(0);
+  });
+
+  it('SQLSTATE 57014 on a share statement is 503 engine_busy (logged, anonymous); any other DB error passes through', async () => {
+    const timedOut = mk({
+      fail: (q) => (isSubtree(q) ? Object.assign(new Error('canceling statement'), { code: '57014' }) : undefined),
+    });
+    await expectEngineBusy(share(timedOut.service));
+    expect(warnLines(timedOut.warn)).toMatch(/SEARCH_SHED reason=sqlstate code=57014 kind=share principal=anonymous/);
+    await tick();
+    expect((timedOut.service as any).shareLane.inUse).toBe(0);
+    const broken = mk({ fail: (q) => (isShareSearch(q) ? Object.assign(new Error('boom'), { code: '42P01' }) : undefined) });
+    await expect(share(broken.service)).rejects.toThrow('boom');
   });
 });
 

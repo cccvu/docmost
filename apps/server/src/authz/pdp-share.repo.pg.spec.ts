@@ -1,4 +1,5 @@
 import * as postgres from 'postgres';
+import { ServiceUnavailableException } from '@nestjs/common';
 import { Kysely, sql } from 'kysely';
 import { ShareRepo } from '@docmost/db/repos/share/share.repo';
 import { emptyCursorPaginationResult } from '@docmost/db/pagination/cursor-pagination';
@@ -18,7 +19,7 @@ import { PG_URL, uuid, mkReadModelPg, bootstrapSchema, mkReadModelDb } from '../
  * table from `ShareExpiryInstaller`:
  *  - the shares list is filter-then-retrieve: PDP-hidden pages never appear and never shape the meta or a cursor,
  *    the cursor is stable across many windows (same-millisecond rows included), the workspace is pinned, trashed
- *    pages and expired shares are excluded, and a PDP outage is an empty list;
+ *    pages and expired shares are excluded, and a PDP outage is a 503 (#716; a healthy empty answer stays empty);
  *  - expiry is enforced at READ time with no sweeper running: findById / findByPageId / getShares refuse an
  *    expired share (default, explicit, the exact boundary instant), "Never" and renewals stay live, and an error
  *    evaluating expiry throws instead of returning the share;
@@ -83,7 +84,8 @@ d('PdpShareRepo on real Postgres (#660, #335)', () => {
   let db: Kysely<any>;
   let repo: PdpShareRepo;
   let viewable: Set<string>;
-  let userSpaces: string[];
+  /** The caller's PDP spaces, or `null`: the PDP could not answer (what `tryLookupResources` reports). */
+  let userSpaces: string[] | null;
   let filterCalls: string[][];
   let pageOutage: boolean;
 
@@ -118,13 +120,13 @@ d('PdpShareRepo on real Postgres (#660, #335)', () => {
     expect((await new ShareExpiryInstaller(db as any, 'remote').install()).created).toBe(true);
 
     // The platform, stubbed at the HTTP-client seam: lookup-resources (the caller's spaces) and filter-resources
-    // (page view). An outage is what HttpAuthzClient returns on any failure: an empty set.
+    // (page view). An outage is what HttpAuthzClient's try* methods return on any failure: null (#716).
     const authz = {
-      lookupResources: async () => userSpaces,
-      filterResources: async (_s: unknown, permission: string, type: string, ids: string[]) => {
+      tryLookupResources: async () => userSpaces,
+      tryFilterResources: async (_s: unknown, permission: string, type: string, ids: string[]) => {
         expect([permission, type]).toEqual(['view', 'page']);
         filterCalls.push(ids);
-        return pageOutage ? [] : ids.filter((id) => viewable.has(id));
+        return pageOutage ? null : ids.filter((id) => viewable.has(id));
       },
     } as any;
     repo = new PdpShareRepo(
@@ -243,7 +245,7 @@ d('PdpShareRepo on real Postgres (#660, #335)', () => {
       expect(seen).toEqual(expected);
     });
 
-    it('PDP outage (empty space set or empty page allow-set) ⇒ the canonical empty result, never the mirror', async () => {
+    it('healthy empty answers (no PDP space, or no viewable page) ⇒ the canonical empty result, never the mirror', async () => {
       await page(uuid(10), SPACE_A);
       await share(uuid(210), uuid(10));
       viewable = new Set([uuid(10)]);
@@ -253,8 +255,24 @@ d('PdpShareRepo on real Postgres (#660, #335)', () => {
       userSpaces = [];
       expect(await list({ cursor: 'eA' })).toEqual(emptyCursorPaginationResult(20));
       userSpaces = [SPACE_A];
-      pageOutage = true;
+      viewable = new Set();
       expect(await list()).toEqual(emptyCursorPaginationResult(20));
+    });
+
+    it('#716 PDP outage (spaces or page filter could not answer) ⇒ a 503, never an empty list and never the mirror', async () => {
+      await page(uuid(10), SPACE_A);
+      await share(uuid(210), uuid(10));
+      viewable = new Set([uuid(10)]);
+      await pg`insert into space_members (user_id, space_id, role) values (${USER}, ${SPACE_A}, 'admin')`;
+      expect((await list()).items).toHaveLength(1);
+
+      userSpaces = null;
+      await expect(list({ cursor: 'eA' })).rejects.toBeInstanceOf(ServiceUnavailableException);
+      userSpaces = [SPACE_A];
+      pageOutage = true;
+      filterCalls = [];
+      await expect(list()).rejects.toBeInstanceOf(ServiceUnavailableException);
+      expect(filterCalls.length).toBeGreaterThan(0); // the page filter ran and was the one that failed
     });
 
     it('keeps upstream\'s item shape byte for byte (parity with the stock repo when everything is viewable)', async () => {
@@ -265,7 +283,7 @@ d('PdpShareRepo on real Postgres (#660, #335)', () => {
       await pg`insert into space_members (user_id, space_id, role) values (${USER}, ${SPACE_A}, 'writer')`;
       viewable = new Set([uuid(10), uuid(11)]);
       const stock = new ShareRepo(db as any, {
-        getUserSpaceIdsQuery: () => db.selectFrom('spaces').select('spaces.id').where('spaces.id', 'in', userSpaces),
+        getUserSpaceIdsQuery: () => db.selectFrom('spaces').select('spaces.id').where('spaces.id', 'in', userSpaces as string[]),
       } as any);
       const ours = await list();
       expect(ours).toEqual(await stock.getShares(USER, { limit: 20 } as any));

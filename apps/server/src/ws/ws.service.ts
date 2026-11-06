@@ -10,6 +10,8 @@ import {
   getSpaceRoomName,
   getUserRoomName,
 } from './ws.utils';
+// CCC integration seam (UPSTREAM_MODIFICATIONS.md #197, authz/route-guard/import-boundary.spec.ts).
+import { pageEventRecipients } from '../authz/ws-connection/ws-event-recipients';
 
 @Injectable()
 export class WsService {
@@ -144,11 +146,12 @@ export class WsService {
     const candidateUserIds = Array.from(userSocketMap.keys());
     if (candidateUserIds.length === 0) return;
 
-    const authorizedUserIds =
-      await this.pagePermissionRepo.getUserIdsWithPageAccess(
-        pageId,
-        candidateUserIds,
-      );
+    // CCC seam #197 (#716): a PDP outage sends the event to no one (logged), instead of an unhandled rejection.
+    const authorizedUserIds = await pageEventRecipients(
+      this.pagePermissionRepo,
+      pageId,
+      candidateUserIds,
+    );
 
     const authorizedSet = new Set(authorizedUserIds);
     for (const [userId, userSockets] of userSocketMap) {

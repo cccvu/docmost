@@ -4,7 +4,7 @@ import {
   Logger,
   NotFoundException,
 } from '@nestjs/common';
-import { jsonToHtml, jsonToNode } from '../../collaboration/collaboration.util';
+import { jsonToNode } from '../../collaboration/collaboration.util'; // CCC seam #196 (#716): jsonToHtml runs in the worker
 import { ExportFormat } from './dto/export-dto';
 import { Page } from '@docmost/db/types/entity.types';
 import { InjectKysely } from 'nestjs-kysely';
@@ -38,15 +38,20 @@ import {
   getAttachmentIds,
   getProsemirrorContent,
 } from '../../common/helpers/prosemirror/utils';
-// CCC seam #183 (#699): bounded export — content and attachments decided before the first byte, attachments streamed;
-// Markdown through htmlToMarkdown with its jsdom window closed (it was kept until the whole export had converted)
-import { ExportAttachmentPlan, htmlToMarkdownReleasingDom, loadExportContent } from '../../editor-compat/export';
+// CCC seam #196 (#699, #716): bounded export — content and attachments decided before the first byte, attachments
+// streamed; every page serialized in the conversion worker, inside one build deadline per export
+import {
+  ExportAttachmentPlan,
+  loadExportContent,
+  renderExportPage,
+  withExportConversion,
+} from '../../editor-compat/export';
 
 type AllowedAttachment = {
   id: string;
   fileName: string;
   filePath: string;
-  fileSize: string | number | bigint | null; // CCC seam #183 (#699)
+  fileSize: string | number | bigint | null; // CCC seam #196 (#699)
 };
 
 @Injectable()
@@ -87,27 +92,8 @@ export class ExportService {
       prosemirrorJson.content.unshift(titleNode);
     }
 
-    const pageHtml = jsonToHtml(prosemirrorJson);
-
-    if (format === ExportFormat.HTML) {
-      return `<!DOCTYPE html>
-      <html>
-        <head>
-         <title>${getPageTitle(page.title)}</title>
-        </head>
-        <body>${pageHtml}</body>
-      </html>`;
-    }
-
-    if (format === ExportFormat.Markdown) {
-      const newPageHtml = pageHtml.replace(
-        /<colgroup[^>]*>[\s\S]*?<\/colgroup>/gim,
-        '',
-      );
-      return htmlToMarkdownReleasingDom(newPageHtml); // CCC seam #183 (#699)
-    }
-
-    return;
+    // CCC seam #196 (#716): the HTML template and the Markdown composition, serialized in the conversion worker
+    return renderExportPage(prosemirrorJson, format, page.title);
   }
 
   async exportPages(
@@ -118,12 +104,13 @@ export class ExportService {
     userId?: string,
     ignorePermissions = false,
   ) {
+    const startedAt = Date.now(); // CCC seam #196 (#716): the export's build deadline runs from here
     let pages: Page[];
 
     if (includeChildren) {
       //@ts-ignore
       pages = await this.pageRepo.getPageAndDescendants(pageId, {
-        includeContent: false, // CCC seam #183 (#699): content is loaded below, once it fits
+        includeContent: false, // CCC seam #196 (#699): content is loaded below, once it fits
       });
     } else {
       // Only fetch the single page when includeChildren is false
@@ -151,7 +138,7 @@ export class ExportService {
       }
     }
 
-    if (includeChildren) await loadExportContent(this.db, pages); // CCC seam #183 (#699)
+    if (includeChildren) await loadExportContent(this.db, pages); // CCC seam #196 (#699)
 
     const parentPageIndex = pages.findIndex((obj) => obj.id === pageId);
 
@@ -165,7 +152,7 @@ export class ExportService {
     const isSinglePage = pages.length === 1 && !includeAttachments;
 
     if (isSinglePage) {
-      const pageContent = await this.exportPage(format, pages[0], true);
+      const pageContent = await withExportConversion({ label: `page:${pageId}`, userId, zip: false, startedAt }, () => this.exportPage(format, pages[0], true)); // CCC seam #196 (#716)
       return { type: 'file' as const, content: pageContent, page: pages[0] };
     }
 
@@ -173,8 +160,8 @@ export class ExportService {
 
     const baseUrl = await this.getWorkspaceBaseUrl(pages[0].workspaceId);
     const zip = new JSZip();
-    const attachments = new ExportAttachmentPlan(this.storageService, `page:${pageId}`); // CCC seam #183 (#699)
-    await this.zipPages(
+    const attachments = new ExportAttachmentPlan(this.storageService, `page:${pageId}`); // CCC seam #196 (#699)
+    await withExportConversion({ label: `page:${pageId}`, userId, zip: true, startedAt }, () => this.zipPages( // CCC seam #196 (#716): one build deadline over the pages and seal
       tree,
       format,
       zip,
@@ -183,10 +170,9 @@ export class ExportService {
       userId,
       ignorePermissions,
       attachments,
-    );
-    await attachments.seal(zip); // CCC seam #183 (#699): budget, entry cap, missing objects — before any byte
+    ).then(() => attachments.seal(zip))); // CCC seam #196 (#699): budget, entry cap, missing objects — before any byte
 
-    const zipFile = attachments.stream( // CCC seam #183 (#699): wall cap, fail-closed stream, cleanup
+    const zipFile = attachments.stream( // CCC seam #196 (#699): wall cap, fail-closed stream, cleanup
       zip.generateNodeStream({
         type: 'nodebuffer',
         streamFiles: true,
@@ -204,6 +190,7 @@ export class ExportService {
     userId?: string,
     ignorePermissions = false,
   ) {
+    const startedAt = Date.now(); // CCC seam #196 (#716): the export's build deadline runs from here
     const space = await this.db
       .selectFrom('spaces')
       .select(['id', 'name'])
@@ -222,7 +209,7 @@ export class ExportService {
         'pages.title',
         'pages.icon',
         'pages.position',
-        'pages.parentPageId', // CCC seam #183 (#699): content is loaded below, once it fits
+        'pages.parentPageId', // CCC seam #196 (#699): content is loaded below, once it fits
         'pages.spaceId',
         'pages.workspaceId',
         'pages.createdAt',
@@ -244,15 +231,15 @@ export class ExportService {
       }
     }
 
-    await loadExportContent(this.db, pages); // CCC seam #183 (#699)
+    await loadExportContent(this.db, pages); // CCC seam #196 (#699)
 
     const tree = buildTree(pages as Page[]);
 
     const baseUrl = await this.getWorkspaceBaseUrl(pages[0].workspaceId);
     const zip = new JSZip();
-    const attachments = new ExportAttachmentPlan(this.storageService, `space:${spaceId}`); // CCC seam #183 (#699)
+    const attachments = new ExportAttachmentPlan(this.storageService, `space:${spaceId}`); // CCC seam #196 (#699)
 
-    await this.zipPages(
+    await withExportConversion({ label: `space:${spaceId}`, userId, zip: true, startedAt }, () => this.zipPages( // CCC seam #196 (#716): one build deadline over the pages and seal
       tree,
       format,
       zip,
@@ -261,10 +248,9 @@ export class ExportService {
       userId,
       ignorePermissions,
       attachments,
-    );
-    await attachments.seal(zip); // CCC seam #183 (#699): budget, entry cap, missing objects — before any byte
+    ).then(() => attachments.seal(zip))); // CCC seam #196 (#699): budget, entry cap, missing objects — before any byte
 
-    const zipFile = attachments.stream( // CCC seam #183 (#699): wall cap, fail-closed stream, cleanup
+    const zipFile = attachments.stream( // CCC seam #196 (#699): wall cap, fail-closed stream, cleanup
       zip.generateNodeStream({
         type: 'nodebuffer',
         streamFiles: true,
@@ -286,9 +272,9 @@ export class ExportService {
     zip: JSZip,
     includeAttachments: boolean,
     baseUrl: string,
-    userId?: string,
+    userId: string | undefined, // CCC seam #196 (#716 M6): not `?`, so the plan below can be required
     ignorePermissions = false,
-    attachments?: ExportAttachmentPlan, // CCC seam #183 (#699)
+    attachments: ExportAttachmentPlan, // CCC seam #196 (#699, #716 M6: required)
   ): Promise<void> {
     const slugIdToPath: Record<string, string> = {};
     const pageIdToFilePath: Record<string, string> = {};
@@ -331,7 +317,7 @@ export class ExportService {
         );
 
         if (includeAttachments) {
-          await this.zipAttachments(updatedJsonContent, folder, allowedAttachments, attachments, page); // CCC seam #183 (#699)
+          await this.zipAttachments(updatedJsonContent, folder, allowedAttachments, attachments, page); // CCC seam #196 (#699)
           updatedJsonContent =
             updateAttachmentUrlsToLocalPaths(updatedJsonContent);
         }
@@ -377,12 +363,12 @@ export class ExportService {
     zip.file('docmost-metadata.json', JSON.stringify(metadata, null, 2));
   }
 
-  // CCC seam #183 (#699): plans the entry (no read here); ExportAttachmentPlan.seal decides and streams it
+  // CCC seam #196 (#699): plans the entry (no read here); ExportAttachmentPlan.seal decides and streams it
   async zipAttachments(
     prosemirrorJson: any,
     zip: JSZip,
     allowed: Map<string, AllowedAttachment>,
-    attachments: ExportAttachmentPlan | undefined,
+    attachments: ExportAttachmentPlan,
     page: { id: string; title: string | null },
   ) {
     const attachmentIds = getAttachmentIds(prosemirrorJson);
@@ -390,7 +376,6 @@ export class ExportService {
     for (const id of attachmentIds) {
       const attachment = allowed.get(id);
       if (!attachment) continue;
-      if (!attachments) throw new Error('zipAttachments needs an ExportAttachmentPlan (#699)');
       const filePath = `/files/${attachment.id}/${attachment.fileName}`;
       attachments.add(zip, filePath, attachment, page);
     }
@@ -418,7 +403,7 @@ export class ExportService {
 
     const attachments = await this.db
       .selectFrom('attachments')
-      .select(['id', 'fileName', 'filePath', 'fileSize', 'pageId']) // CCC seam #183 (#699): fileSize
+      .select(['id', 'fileName', 'filePath', 'fileSize', 'pageId']) // CCC seam #196 (#699): fileSize
       .where('id', 'in', [...allAttachmentIds])
       .where('spaceId', '=', spaceId)
       .execute();

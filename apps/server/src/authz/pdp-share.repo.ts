@@ -27,8 +27,9 @@ import { boundWaits } from '../service-bridge/resource-version';
  *    lookup-resources), `shares.workspace_id` is pinned to the caller's workspace, trashed pages and expired shares
  *    are excluded in SQL, and every candidate window is gated through the PDP page view
  *    (`filterAccessiblePageIds`) BEFORE pagination (`authorizedKeysetPage`, the label lists' walk — same limits,
- *    same canonical empty result, cursors only from authorized rows). A PDP outage yields an empty space set or an
- *    empty allowed set: an empty list, never the mirror's. The `{ items, meta }` shape is upstream's; the mirror
+ *    same canonical empty result, cursors only from authorized rows). A PDP outage is a 503 from either primitive
+ *    (#716: `authzUnavailable`), never an empty list and never the mirror's; a healthy empty answer (no space, nothing
+ *    viewable) is the canonical empty result. The `{ items, meta }` shape is upstream's; the mirror
  *    `space.userRole` stays because it is UX only (it disables "Delete share"; the server re-validates).
  *
  * 2. Public share EXPIRY (#335, ADR 0032) is enforced at READ time, here, through the existing DI seam #1 — so the

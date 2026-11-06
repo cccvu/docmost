@@ -25,10 +25,16 @@ Configuration:
 
 Behavior you must design around:
 
-- **Fail-closed.** A non-2xx, a timeout, a dropped connection, or a malformed body is treated as deny/empty.
-  Returning `5xx` on your own errors is safe: it degrades to deny, never to allow. This includes the page
-  `locked` check, where `false` means *unrestricted*: a failed or malformed `check-bulk` carrying `locked` is
-  treated as **restricted with no access**. It never falls back to the space role.
+- **Fail-closed.** A non-2xx, a timeout, a dropped connection, or a malformed body never grants anything.
+  Returning `5xx` on your own errors is safe: it degrades to a refusal, never to allow. The fork answers its
+  own caller a retryable **503** (with `Retry-After`) when you could not answer: for a point decision (#696), and
+  for a list — `filter-resources`, `lookup-resources`, `filter-subjects` and the sidebar's `check-bulk` (#716).
+  A list is never answered empty or partial (one failed chunk fails the whole call), because an empty list reads
+  as "you have nothing" and a partial one would make a move-to-space or duplicate act on part of a page tree.
+  This includes the page `locked` check, where `false` means *unrestricted*: a failed or malformed `check-bulk`
+  carrying `locked` is a 503, never "unrestricted", and never falls back to the space role. The one degrade is
+  the realtime socket connect, which joins no space rooms rather than dropping the socket. A well-formed empty
+  answer from you (`{ "ids": [] }`) is a real "none" and is passed on as such.
 - **"No view, not locked" is checked against the fork's own rows.** When you answer `view=false` AND
   `locked=false` for a page (as a PDP does for a page it has no placement for: trashed, or not yet synced), the
   fork walks that page's restriction lineage in its own database: the page itself and every ancestor, trashed

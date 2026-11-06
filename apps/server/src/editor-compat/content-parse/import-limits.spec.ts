@@ -9,6 +9,7 @@ import * as bytes from 'bytes';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join, resolve } from 'path';
+import { importFileSizeLimit, IMPORT_PAGE_FILE_BYTES, isImportPageFileName } from '@docmost/editor-ext';
 import { CONTENT_PARSE_LIMITS, ContentTooComplexException, ConversionBudgetExhaustedException } from './content-parse.service';
 import {
   assertImportHtmlWithinBounds,
@@ -52,6 +53,15 @@ describe('#643 IMPORT_LIMITS', () => {
   it('page files are .md and .html, by extension or name', () => {
     expect(['.md', '.HTML', 'a/b.md', 'x.html'].map(isImportPageFile)).toEqual([true, true, true, true]);
     expect(['.docx', '.pdf', 'a.zip', 'md'].map(isImportPageFile)).toEqual([false, false, false, false]);
+  });
+
+  it('#716 I7: the page-file cap IS the shared number the SPA import modal checks, and both agree on page files', () => {
+    expect(IMPORT_LIMITS.maxPageFileBytes).toBe(IMPORT_PAGE_FILE_BYTES);
+    for (const name of ['a.md', 'b.HTML', 'c.Md', 'd.docx', 'e.pdf', 'f.zip', 'md']) {
+      expect(isImportPageFileName(name)).toBe(isImportPageFile(name));
+    }
+    expect(importFileSizeLimit('page.md', IMPORT_LIMITS.singleFileBytes)).toBe(IMPORT_LIMITS.maxPageFileBytes);
+    expect(importFileSizeLimit('scan.pdf', IMPORT_LIMITS.singleFileBytes)).toBe(IMPORT_LIMITS.singleFileBytes);
   });
 });
 

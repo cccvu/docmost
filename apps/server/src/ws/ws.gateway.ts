@@ -25,6 +25,9 @@ import { readDocmostAuthCookie } from '../authz/session-cookie/docmost-auth-cook
 // CCC seam (UPSTREAM_MODIFICATIONS.md, #455): re-check user-disabled + session liveness at connect, so a
 // revoked/disabled identity cannot keep opening notifications sockets on the lingering authToken cookie.
 import { isWsConnectionLive } from '../authz/ws-connection/ws-connection-live';
+// CCC seam (UPSTREAM_MODIFICATIONS.md #161, #716): a PDP that cannot list the user's spaces degrades to no space
+// rooms instead of killing the socket (the client never reconnects on its own).
+import { spaceIdsForConnect } from '../authz/ws-connection/ws-space-rooms';
 
 @WebSocketGateway({
   cors: { origin: '*' },
@@ -79,7 +82,7 @@ export class WsGateway
       client.data.userId = userId;
       client.data.workspaceId = workspaceId;
 
-      const userSpaceIds = await this.spaceMemberRepo.getUserSpaceIds(userId);
+      const userSpaceIds = await spaceIdsForConnect(this.spaceMemberRepo, userId);
 
       const userRoom = getUserRoomName(userId);
       const workspaceRoom = `workspace-${workspaceId}`;

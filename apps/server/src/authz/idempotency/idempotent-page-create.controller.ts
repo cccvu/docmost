@@ -26,7 +26,6 @@ import { CreatePageDto } from '../../core/page/dto/create-page.dto';
 import { AuditEvent, AuditResource } from '../../common/events/audit-events';
 import { AUDIT_SERVICE, IAuditService } from '../../integrations/audit/audit.service';
 import { getPageTitle } from '../../common/helpers';
-import { jsonToHtml, jsonToMarkdown } from '../../collaboration/collaboration.util';
 import { RemoteOnlyGuard } from '../mode/remote-only.guard';
 import { OpSemaphore } from '../page-write/op-semaphore';
 import { toEngineBusy } from '../page-write/conditional-page-ops.controller';
@@ -170,12 +169,9 @@ export class IdempotentPageCreateController {
       });
     }
 
-    if (createPageDto.format && createPageDto.format !== 'json' && page.content) {
-      const contentOutput =
-        createPageDto.format === 'markdown' ? jsonToMarkdown(page.content) : jsonToHtml(page.content);
-      return { ...page, content: contentOutput, permissions, replayed };
-    }
-
+    // #716: no echo. The native create converts the new page back to the request's `format` on the event loop (~1 s
+    // a MiB, a DOM per call), and the only caller (the platform) reads the page back instead. The content answered is
+    // the canonical JSON that was stored, whatever `format` the request was written in.
     return { ...page, permissions, replayed };
   }
 

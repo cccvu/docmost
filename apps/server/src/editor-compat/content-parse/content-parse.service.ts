@@ -27,7 +27,15 @@
  *     is admitted ONCE, on its first conversion, where it waits for the refill within its batch wait instead; its
  *     later conversions are charged but never gated, because the zip import converts inside its open transaction and
  *     a budget wait there would hold the connection and the inserted rows (one turn at a time still applies).
- *     Actorless keys (`background`, `batch:<id>`) are exempt.
+ *     Actorless keys (`background`, `batch:<id>`) are exempt. The bucket itself is `ConversionBudget`
+ *     (conversion-budget.ts, #716 M7); an admitted batch is refused 429 once it overdraws past `batchOverdraftMs`
+ *     (#716 I3). A human with no Docmost user converts under `identity:<platform id>` (#716 I6), never `background`.
+ *   - small interactive inputs (#716): a non-batch conversion of at most `smallInputBytes` takes the worker ahead of
+ *     larger waiters (an urgent turn, aged after `smallAgingMs` so a large waiter is never starved). That priority is
+ *     all it gets: the same `deadlineMs` and `waitMs` as every other conversion (#716 load run: a 3 s deadline of its
+ *     own killed a 17 KB page that took 3.3 s on a contended CPU, a non-retryable 422 for an ordinary edit). A killed
+ *     conversion holds the worker until its replacement is ready, and the
+ *     waiters' clocks stop for that reload (credited up to `reloadCreditMs` each), so it is bounded and counted once.
  */
 import { AsyncLocalStorage } from 'node:async_hooks';
 import * as fs from 'node:fs';
@@ -35,8 +43,7 @@ import * as path from 'node:path';
 import { Worker } from 'node:worker_threads';
 import {
   BadRequestException,
-  HttpException,
-  HttpStatus,
+  InternalServerErrorException,
   Logger,
   ServiceUnavailableException,
   UnprocessableEntityException,
@@ -45,10 +52,20 @@ import { ClsServiceManager } from 'nestjs-cls';
 import { OpSemaphore, OpSemaphoreTimeout } from '../../authz/page-write/op-semaphore';
 import { AUDIT_CONTEXT_KEY, type AuditContext } from '../../common/middlewares/audit-context.middleware';
 import type { ParseFormat, ParseReply, ParseRequest, WorkerMessage } from './content-parse.worker';
+import {
+  type BatchBudgetTurn,
+  ConversionBudget,
+  ConversionBudgetExhaustedException,
+  type ConversionBudgetLimits,
+  isBudgetExempt,
+} from './conversion-budget';
 
 export type { ParseFormat } from './content-parse.worker';
+// #716 M7: the budget moved to conversion-budget.ts; re-exported so every existing import keeps working.
+export { ConversionBudget, ConversionBudgetExhaustedException, isBudgetExempt };
+export type { BatchBudgetTurn, ConversionBudgetLimits };
 
-export interface ContentParseLimits {
+export interface ContentParseLimits extends ConversionBudgetLimits {
   /** Wall-clock limit for one conversion, from the moment it is handed to a ready worker. */
   deadlineMs: number;
   /** How long a request may wait for its turn (its own earlier conversion, then the worker), in total. */
@@ -63,10 +80,18 @@ export interface ContentParseLimits {
   batchWaitMs: number;
   /** How long a fresh worker may take to load the parsers. */
   startupMs: number;
-  /** #642: a human key's bucket of worker time, in ms: how much it may use in a burst. */
-  budgetCapacityMs: number;
-  /** #642: worker ms a key's bucket regains per minute: its sustained share of the one worker. */
-  budgetRefillMsPerMinute: number;
+  /** #716: a non-batch input of at most this many UTF-8 bytes is a small interactive conversion. */
+  smallInputBytes: number;
+  /**
+   * #716: the queue-aging bound, NOT a deadline: a large waiter that has waited this long is served before any small
+   * one. A small conversion keeps the normal `deadlineMs` and `waitMs`; only its place in the queue differs.
+   */
+  smallAgingMs: number;
+  /**
+   * #716: the most wait a worker reload (after a kill) gives back to one waiter: the reload holds the worker without
+   * converting anything, so a waiter's clock stops for it, up to this much in total.
+   */
+  reloadCreditMs: number;
 }
 
 /**
@@ -74,10 +99,26 @@ export interface ContentParseLimits {
  *   - deadline 7 s: ~1 MiB of real Markdown (1.28 Mi characters of HTML, 42k nodes) converts in ~0.56 s here with
  *     happy-dom 21 (it was ~2.0 s on 20.8.9, which re-parsed every CSS selector on every match), so ≤~1.4 s in
  *     production at idle. Past it is 422 `content_too_complex`.
- *   - wait 8 s, longer than the deadline (#642): a principal is admitted behind at most one conversion of each
- *     principal ahead of it, and a killed conversion's principal waits out the worker's reload (`convert`), so one
- *     principal looping deadline-length conversions can never make another wait past this. Wait + a worker load
- *     (~0.5–3.5 s) + deadline ≤ 18.5 s stays under the platform's 20 s content-write relay timeout.
+ *   - wait 8 s, longer than the deadline plus lag (#642): a principal is admitted behind at most one conversion of each
+ *     principal ahead of it, a killed conversion's principal waits out the worker's reload (`convert`), and (#716) the
+ *     worker is not handed on until that reload is done — but the reload is nobody's conversion, so it stops the
+ *     waiters' clocks (`reloadCreditMs`, 3.5 s at most per waiter): one principal looping deadline-length conversions
+ *     can never make another wait past 7 s + its lag of its own wait time. Worst case, with a reload: 8 + 3.5 + 7 =
+ *     18.5 s; without one: 8 + 7 = 15 s (#716 review: folding the reload into an 11.5 s wait had raised the no-reload
+ *     worst case to 18.5 s too). That is only the CONVERSION's share of the platform's 20 s content-write relay
+ *     timeout: the same relay call also reads the page, runs the edit check and applies + stores the result (the
+ *     settle and pageInfo are separate calls, before it). Under load those took the rest and more (#716: 1 write in
+ *     12 crossed 20 s), so the margin comes from cutting their main-thread work, not from this budget.
+ *   - small inputs (#716), ≤ 32 KiB, non-batch: served ahead of larger waiters, and otherwise like any conversion:
+ *     deadline 7 s, wait 8 s (a 32 KiB page converts in ~0.25 s here, ≤~1.2 s at Graviton × CFS contention; the #716
+ *     load run saw a 17 KB page take 3.3 s on a contended CPU, which a 3 s small deadline answered 422). Worst case,
+ *     the same as a large write's: wait 8 + reload ≤ 3.5 + deadline 7 = 18.5 s < the 20 s relay. A small write waits
+ *     behind the running conversion (≤ 7 s + lag ≤ 8 s) and any small principals queued ahead of it; past the wait
+ *     is 503 as before. Aging 3 s (`smallAgingMs`, a queue bound, not a deadline): a large waiter that has waited
+ *     that long goes before any small one, so it waits at most 3 + one small conversion + lag (≤ 1 s) past the
+ *     running one: within its own 8 s for every small conversion up to 4 s (~3× the contended measurement), reloads
+ *     credited. A pathological small input that runs longer can push that one large waiter to a retryable 503; the
+ *     budget bounds how often one principal can do that.
  *   - heap 1 GiB: that page needs ~384 MB; dense 1 MiB markup (99k nodes) 768 MB. The task has 4 GB (ADR 0031), and
  *     this must equal docmost's process-wide `--max-old-space-size` (check-infra-config §27 reads it from here).
  *   - nodes 100k: dense 1 MiB markup is 99k nodes, the real 1.25 MiB page 61k. It bounds what the main thread does
@@ -95,7 +136,17 @@ export interface ContentParseLimits {
  *     burst is four deadline-length conversions with their reloads. A legitimate heavy writer — a ~1 MiB page every
  *     20 s at ~1.4–4 s a conversion — uses 4–12 s a minute and is never refused. An abuser, once spent, gets ~one
  *     deadline-length conversion every 40 s, so the worker is free for everyone else most of the time.
+ *   - batch overdraft 120 s (#716 I3, `CONTENT_PARSE_BATCH_OVERDRAFT_MS`, clamped 30 s–10 min): an admitted zip import
+ *     is refused 429 (and rolls back) once it has been charged this much past the -capacity floor, so one import gets
+ *     at most ~2 × 30 s + 120 s + the refill of worker time (~3 min, ~180 s of legit conversions), not unbounded.
  */
+/** #716 I3: `CONTENT_PARSE_BATCH_OVERDRAFT_MS`, whole ms, clamped to [30 s, 10 min]; unset or junk is 120 s. */
+export function batchOverdraftFromEnv(raw: string | undefined): number {
+  const n = raw === undefined || raw.trim() === '' ? NaN : Number(raw);
+  if (!Number.isFinite(n)) return 120_000;
+  return Math.min(600_000, Math.max(30_000, Math.floor(n)));
+}
+
 export const CONTENT_PARSE_LIMITS: Readonly<ContentParseLimits> = Object.freeze({
   deadlineMs: 7_000,
   waitMs: 8_000,
@@ -106,6 +157,10 @@ export const CONTENT_PARSE_LIMITS: Readonly<ContentParseLimits> = Object.freeze(
   startupMs: 30_000,
   budgetCapacityMs: 30_000,
   budgetRefillMsPerMinute: 15_000,
+  batchOverdraftMs: batchOverdraftFromEnv(process.env.CONTENT_PARSE_BATCH_OVERDRAFT_MS),
+  smallInputBytes: 32 * 1024,
+  smallAgingMs: 3_000,
+  reloadCreditMs: 3_500,
 });
 
 /** 422: the content is beyond what one write may convert. Deterministic for the same content: split it, never retry. */
@@ -127,22 +182,6 @@ export class ContentParseBusyException extends ServiceUnavailableException {
   }
 }
 
-/**
- * 429 (#642): this key has used its share of the converter's time. Refused at admission (nothing queued, nothing
- * applied); `retryAfterSeconds` is when its bucket is positive again. RetryAfterFilter turns it into `Retry-After`.
- */
-export class ConversionBudgetExhaustedException extends HttpException {
-  constructor(readonly retryAfterSeconds: number) {
-    super(
-      {
-        message: `this account is using the content converter heavily; retry in ${retryAfterSeconds} s`,
-        code: 'conversion_budget_exhausted',
-      },
-      HttpStatus.TOO_MANY_REQUESTS,
-    );
-  }
-}
-
 /** A conversion refused on its bounds (422), its capacity (503) or its budget (429) — passed on as is, never relabeled. */
 export function isContentParseRefusal(
   err: unknown,
@@ -153,14 +192,6 @@ export function isContentParseRefusal(
     err instanceof ConversionBudgetExhaustedException
   );
 }
-
-/** #642: keys with no human behind them share no budget — actorless requests and imports nobody started. */
-export function isBudgetExempt(principal: string): boolean {
-  return principal === 'background' || principal.startsWith('batch:');
-}
-
-/** How often idle (full) buckets are swept, at most. Buckets are also dropped whenever they are read full. */
-const BUDGET_PRUNE_EVERY_MS = 60_000;
 
 export type SpawnWorker = (memoryMb: number) => Worker;
 
@@ -188,7 +219,11 @@ export const spawnContentParseWorker: SpawnWorker = (memoryMb) => {
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 
 /** What happened to one conversion: the worker's reply, or what the parent saw instead. */
-type Outcome = ParseReply | { ok: false; reason: 'deadline' | 'heap' | 'crashed' | 'unavailable' };
+type Outcome =
+  | ParseReply
+  | { ok: false; reason: 'heap' | 'crashed' | 'unavailable' }
+  /** #716: `lateMs` is how far past the deadline the kill fired: the main thread's lag at that moment. */
+  | { ok: false; reason: 'deadline'; lateMs: number };
 
 /** One conversion's outcome, its own time, and — when it cost the worker — the replacement's load. */
 interface Run {
@@ -200,13 +235,15 @@ interface Run {
 
 export class ContentParsePool {
   private readonly logger = new Logger('ContentParse');
-  /** The one worker: one conversion at a time. */
+  /** The one worker: one conversion at a time. Small interactive conversions take an urgent turn (#716). */
   private readonly slot: OpSemaphore;
+  /**
+   * #716: export serializations wait for the worker through this lane of ONE, so at most one of them is ever queued on
+   * (or holding) the worker: a write waits behind at most one export page, however many exports are running.
+   */
+  private readonly serializeLane: OpSemaphore;
   /** One conversion queued or running per principal. Entries are dropped when idle. */
   private readonly principals = new Map<string, OpSemaphore>();
-  /** #642: worker-time buckets of the keys that are below capacity. A missing key is full. */
-  private readonly buckets = new Map<string, { tokens: number; at: number }>();
-  private lastPrune = 0;
   private current: Worker | null = null;
   private starting: Promise<Worker> | null = null;
   private nextId = 1;
@@ -214,128 +251,87 @@ export class ContentParsePool {
   constructor(
     private readonly limits: Readonly<ContentParseLimits> = CONTENT_PARSE_LIMITS,
     private readonly spawn: SpawnWorker = spawnContentParseWorker,
+    /** #642/#716 M7: the per-key worker-time budget (injectable with its own clock, for tests). */
+    private readonly budget: ConversionBudget = new ConversionBudget(limits),
   ) {
-    this.slot = new OpSemaphore(1, limits.waitMs);
+    // `smallAgingMs`: a large waiter that has waited that long is served before any small one (see CONTENT_PARSE_LIMITS).
+    // #716: a reload after a kill pauses the waiters' clocks (credited up to `reloadCreditMs` each), see `convert`.
+    const pauseCreditMs = limits.reloadCreditMs;
+    this.slot = new OpSemaphore(1, limits.waitMs, { agingMs: limits.smallAgingMs, pauseCreditMs });
+    this.serializeLane = new OpSemaphore(1, limits.waitMs, { pauseCreditMs });
   }
 
-  /**
-   * HTML or Markdown → ProseMirror JSON. `waitMs`: how long it may wait for its turn (default `limits.waitMs`).
-   * `batch`: an empty budget is waited out within `waitMs` rather than refused (#642); with `turn`, only until the
-   * batch's first admission (`BatchBudgetTurn`).
-   */
-  async parse(
-    content: string,
-    format: ParseFormat,
-    principal: string,
-    waitMs?: number,
-    batch = false,
-    turn?: BatchBudgetTurn,
-  ): Promise<Record<string, unknown>> {
+  /** HTML or Markdown → ProseMirror JSON, under `queue`'s turn, wait and budget. */
+  async parse(content: string, format: ParseFormat, queue: ConversionQueue): Promise<Record<string, unknown>> {
     const { maxNodes, maxChars } = this.limits;
     const req = { op: 'to-json', format, content, maxNodes, maxChars } as const;
-    return (await this.convert(req, principal, `format=${format}`, waitMs, batch, turn)) as Record<string, unknown>;
+    return (await this.convert(req, queue, `format=${format}`)) as Record<string, unknown>;
   }
 
   /**
    * Markdown → HTML only (the importers rewrite the HTML before it is parsed). `maxChars` lowers the cap on the
    * HTML's length for this call (an importer bounds it by its own input cap); it never raises it past the limit.
    */
-  async toHtml(
-    markdown: string,
-    principal: string,
-    waitMs?: number,
-    maxChars?: number,
-    batch = false,
-    turn?: BatchBudgetTurn,
-  ): Promise<string> {
+  async toHtml(markdown: string, queue: ConversionQueue, maxChars?: number): Promise<string> {
     const cap = Math.min(maxChars ?? this.limits.maxChars, this.limits.maxChars);
     const req = { op: 'markdown-to-html', content: markdown, maxChars: cap } as const;
-    return (await this.convert(req, principal, 'op=markdown-to-html', waitMs, batch, turn)) as string;
+    return (await this.convert(req, queue, 'op=markdown-to-html')) as string;
+  }
+
+  /**
+   * #716: a stored page (ProseMirror JSON) → the native export's HTML or Markdown, in the worker. Never a small/urgent
+   * turn, and through the serialize lane (above). Output past `maxChars` is 422 like any other bound. Stored content
+   * that does not serialize is the server's fault, not the caller's: 500, never the 400 "Invalid content format".
+   */
+  async serialize(json: unknown, format: ParseFormat, queue: ConversionQueue): Promise<string> {
+    const req = { op: 'serialize', format, json, maxChars: this.limits.maxChars } as const;
+    try {
+      return (await this.convert(req, queue, `op=serialize format=${format}`)) as string;
+    } catch (err) {
+      if (err instanceof BadRequestException) {
+        this.logger.error(`CONTENT_SERIALIZE_FAILED principal=${queue.principal} format=${format}: answered 500`);
+        throw new InternalServerErrorException('The page could not be converted for export.');
+      }
+      throw err;
+    }
   }
 
   /** #642: the key's worker-time left, in ms, refilled to now (may be negative). Drops a bucket that is full again. */
-  budgetLeft(principal: string, now = Date.now()): number {
-    const { budgetCapacityMs: cap, budgetRefillMsPerMinute: perMin } = this.limits;
-    const b = this.buckets.get(principal);
-    if (!b) return cap;
-    const tokens = Math.min(cap, b.tokens + ((now - b.at) * perMin) / 60_000);
-    if (tokens >= cap) {
-      this.buckets.delete(principal);
-      return cap;
-    }
-    b.tokens = tokens;
-    b.at = now;
-    return tokens;
+  budgetLeft(key: string, now?: number): number {
+    return this.budget.left(key, now);
   }
 
   /** How many keys hold a bucket below capacity (tests, diagnostics). */
   get budgetKeys(): number {
-    return this.buckets.size;
-  }
-
-  /** #642: charge `ms` of worker time to the key (on settle). Exempt keys are never charged. */
-  private charge(principal: string, ms: number): void {
-    if (isBudgetExempt(principal) || !(ms > 0)) return;
-    const now = Date.now();
-    // Floor at -capacity: an ungated charge (a zip import admitted once, then charged per page) can never lock its
-    // human out for longer than one full refill (~2 min at the defaults), however large the archive was.
-    const tokens = Math.max(-this.limits.budgetCapacityMs, this.budgetLeft(principal, now) - ms);
-    this.buckets.set(principal, { tokens, at: now });
-  }
-
-  /** Sweep the buckets that have refilled, at most once a `BUDGET_PRUNE_EVERY_MS`, so idle keys do not accumulate. */
-  private pruneBuckets(now: number): void {
-    if (now - this.lastPrune < BUDGET_PRUNE_EVERY_MS) return;
-    this.lastPrune = now;
-    for (const key of [...this.buckets.keys()]) this.budgetLeft(key, now);
+    return this.budget.size;
   }
 
   /**
-   * #642: admit the key only while its bucket is positive. Empty: an interactive caller is refused at once (429 with
-   * the seconds until it is positive again); a batch caller waits for the refill if that fits in what is left of its
-   * wait, else is refused the same way. A batch whose `turn` was already admitted is not gated at all (charged only).
+   * One conversion under `queue`: admission against the budget (keyed `queue.budgetKey ?? queue.principal`), the
+   * principal's own turn, then the worker. `what` is for logs only. A new worker op calls this with its request.
    */
-  private async admitBudget(
-    principal: string,
-    batch: boolean,
-    left: () => number,
-    context: string,
-    turn?: BatchBudgetTurn,
-  ): Promise<void> {
-    if (isBudgetExempt(principal) || (batch && turn?.admitted)) return;
-    const perMin = this.limits.budgetRefillMsPerMinute;
-    for (;;) {
-      const tokens = this.budgetLeft(principal);
-      if (tokens > 0) return;
-      // ms until the bucket is strictly positive again.
-      const needMs = perMin > 0 ? Math.floor((-tokens * 60_000) / perMin) + 1 : Number.POSITIVE_INFINITY;
-      if (batch && needMs <= left()) {
-        await new Promise<void>((resolve) => setTimeout(resolve, needMs));
-        continue;
-      }
-      const retryAfter = Number.isFinite(needMs) ? Math.max(1, Math.ceil(needMs / 1000)) : 60;
-      this.logger.warn(
-        `CONTENT_PARSE_BUDGET principal=${principal} ${context} budgetMs=${Math.round(tokens)}: worker-time budget spent; answered 429 conversion_budget_exhausted retryAfter=${retryAfter}`,
-      );
-      throw new ConversionBudgetExhaustedException(retryAfter);
-    }
-  }
-
-  private async convert(
-    req: DistributiveOmit<ParseRequest, 'id'>,
-    principal: string,
-    what: string,
-    waitMs = this.limits.waitMs,
-    batch = false,
-    turn?: BatchBudgetTurn,
-  ): Promise<unknown> {
-    const bytes = Buffer.byteLength(String(req.content ?? ''), 'utf8');
+  protected async convert(req: DistributiveOmit<ParseRequest, 'id'>, queue: ConversionQueue, what: string): Promise<unknown> {
+    const { principal } = queue;
+    const budgetKey = queue.budgetKey ?? principal;
+    const batch = queue.batch === true;
+    // Not narrowed on `batch`: this project's non-strict compiler settings collapse that union to `never`.
+    const turn = batch ? (queue as BatchConversionQueue).budgetTurn : undefined;
+    // #716: a serialization carries JSON, not `content`: it counts 0 bytes here and is never small (below).
+    const serializing = req.op === 'serialize';
+    const bytes = Buffer.byteLength(String(('content' in req ? req.content : '') ?? ''), 'utf8');
+    // #716: a small interactive input waits ahead of larger ones, and that is all: the same wait and deadline as every
+    // conversion (a shorter deadline of its own turned a contended-CPU edit into a non-retryable 422). An export
+    // serialization is never small: its cost is the stored page's, which no input size here measures.
+    const small = !batch && !serializing && bytes <= this.limits.smallInputBytes;
+    const waitMs = queue.waitMs ?? this.limits.waitMs;
+    const deadlineMs = this.limits.deadlineMs;
     const admitBy = Date.now() + waitMs;
     const left = () => Math.max(0, admitBy - Date.now());
-    const context = `${what} bytes=${bytes}`;
-    this.pruneBuckets(Date.now());
+    const context = `${what} bytes=${bytes}${small ? ' class=small' : ''}`;
+    const admit = () => this.budget.admit(budgetKey, { batch, turn, left, context });
+    this.budget.prune();
     // #642: refused before it queues — an over-budget key never waits in line, nor holds its own turn.
-    await this.admitBudget(principal, batch, left, context, turn);
+    await admit();
 
     let own = this.principals.get(principal);
     if (!own) {
@@ -351,28 +347,53 @@ export class ContentParsePool {
       let reload: Promise<unknown> | null = null;
       try {
         // Again once it is this key's turn: its own previous conversion (just settled) may have spent the budget.
-        await this.admitBudget(principal, batch, left, context, turn);
-        if (batch && turn) turn.admitted = true; // later conversions of this batch are charged, never gated
-        const releaseSlot = await this.slot.acquire(left());
+        await admit();
+        if (turn) turn.admitted = true; // later conversions of this batch are charged, never gated (bar #716 I3)
+        // #716: an export serialization queues for the worker only through its lane of one (never urgent).
+        const releaseLane = serializing ? await this.serializeLane.acquire(left()) : null;
+        let releaseSlot: () => void;
         try {
-          const run = await this.run({ ...req, id: this.nextId++ } as ParseRequest);
+          releaseSlot = await this.slot.acquire(left(), { urgent: small });
+        } catch (err) {
+          releaseLane?.();
+          throw err;
+        }
+        const releaseWorker = () => {
+          releaseSlot(); // the worker first: a write already waiting for it goes ahead of the next serialization
+          releaseLane?.();
+        };
+        try {
+          const run = await this.run({ ...req, id: this.nextId++ } as ParseRequest, deadlineMs);
           reload = run.reload;
           // #642: charged on settle — the conversion's own wall time (a killed one up to its kill)…
-          this.charge(principal, run.ms);
+          this.budget.charge(budgetKey, run.ms, turn);
           if (reload) {
             // …and the reload it caused, once the replacement worker is ready.
             const reloadFrom = Date.now();
-            void reload.then(() => this.charge(principal, Date.now() - reloadFrom));
+            void reload.then(() => this.budget.charge(budgetKey, Date.now() - reloadFrom, turn));
           }
-          return this.settle(run.outcome, run.ms, `principal=${principal} ${what} bytes=${bytes} ms=${run.ms}`);
+          return this.settle(run.outcome, run.ms, deadlineMs, `principal=${principal} ${context} ms=${run.ms}`);
         } finally {
-          releaseSlot();
+          // #716: a conversion that cost the worker hands the slot on only once the replacement is ready, so the
+          // next caller spends the reload inside its wait (bounded, and counted), never after it. Registered before
+          // the turn's release below, so a waiting newcomer still goes ahead of this principal's next conversion.
+          // The reload is nobody's conversion, so it does not count against the waiters' waits (each is credited up to
+          // `reloadCreditMs`): a wait counts the conversions ahead of it, never a recovery folded into every wait.
+          if (reload) {
+            this.slot.pause();
+            this.serializeLane.pause();
+            void reload.then(() => {
+              this.slot.resume();
+              this.serializeLane.resume();
+              releaseWorker();
+            });
+          } else releaseWorker();
         }
       } finally {
         if (reload) {
           // #642: this conversion cost the worker. Its principal keeps its own turn until the replacement is ready,
-          // so the reload is spent by whoever took the slot meanwhile (outside their wait), never by this principal's
-          // next conversion ahead of them. The answer itself is not held back.
+          // so the reload is spent by whoever waits for the slot meanwhile, never by this principal's next
+          // conversion ahead of them. The answer itself is not held back.
           const sem = own;
           void reload.then(() => {
             releaseOwn();
@@ -385,7 +406,7 @@ export class ContentParsePool {
     } catch (err) {
       if (err instanceof OpSemaphoreTimeout) {
         this.logger.warn(
-          `CONTENT_PARSE_BUSY principal=${principal} ${what} bytes=${bytes}: no conversion slot within ${waitMs} ms; answered 503 engine_busy`,
+          `CONTENT_PARSE_BUSY principal=${principal} ${context}: no conversion slot within ${waitMs} ms; answered 503 engine_busy`,
         );
         throw new ContentParseBusyException();
       }
@@ -404,10 +425,10 @@ export class ContentParsePool {
   }
 
   /** The caller's answer for one outcome. `context` is for logs only: sizes and ids, never content. */
-  private settle(outcome: Outcome, ms: number, context: string): unknown {
+  private settle(outcome: Outcome, ms: number, deadlineMs: number, context: string): unknown {
     if (outcome.ok) {
-      if (ms > this.limits.deadlineMs / 2) {
-        this.logger.warn(`CONTENT_PARSE_SLOW ${context} nodes=${outcome.nodes ?? '-'}: over half the ${this.limits.deadlineMs} ms deadline`);
+      if (ms > deadlineMs / 2) {
+        this.logger.warn(`CONTENT_PARSE_SLOW ${context} nodes=${outcome.nodes ?? '-'}: over half the ${deadlineMs} ms deadline`);
       }
       return outcome.result;
     }
@@ -419,7 +440,12 @@ export class ContentParsePool {
       case 'too_complex':
       case 'deadline':
       case 'heap': {
-        const why = failure.reason === 'too_complex' ? failure.detail : failure.reason;
+        const why =
+          failure.reason === 'too_complex'
+            ? failure.detail
+            : failure.reason === 'deadline'
+              ? `deadline lateMs=${(failure as { lateMs: number }).lateMs}`
+              : failure.reason;
         this.logger.warn(`CONTENT_PARSE_TOO_COMPLEX reason=${why} ${context}: answered 422 content_too_complex`);
         throw new ContentTooComplexException();
       }
@@ -435,7 +461,7 @@ export class ContentParsePool {
    * Hand one request to the (started) worker and wait for its reply, the deadline, or the worker's death. `ms` is
    * the conversion's own time, from dispatch: loading a new worker counts toward neither it nor the deadline.
    */
-  private async run(req: ParseRequest): Promise<Run> {
+  private async run(req: ParseRequest, deadlineMs: number): Promise<Run> {
     let worker: Worker;
     try {
       worker = await this.ready();
@@ -460,7 +486,11 @@ export class ContentParsePool {
       const onError = (err: Error & { code?: string }) =>
         finish({ ok: false, reason: err.code === 'ERR_WORKER_OUT_OF_MEMORY' ? 'heap' : 'crashed' }, true);
       const onExit = () => finish({ ok: false, reason: 'crashed' }, true);
-      const timer = setTimeout(() => finish({ ok: false, reason: 'deadline' }, true), this.limits.deadlineMs);
+      // The timer runs on this (main) thread, so it fires late by the event loop's lag; `lateMs` logs by how much.
+      const timer = setTimeout(
+        () => finish({ ok: false, reason: 'deadline', lateMs: Date.now() - dispatched - deadlineMs }, true),
+        deadlineMs,
+      );
       worker.on('message', onMessage);
       worker.on('error', onError);
       worker.on('exit', onExit);
@@ -540,25 +570,34 @@ export class ContentParsePool {
 
 const pool = new ContentParsePool();
 
-/** Whose turn a conversion takes (one queued or running per principal), and how long it may wait for it. */
-export interface ConversionQueue {
+interface ConversionQueueBase {
+  /** Whose turn it takes: one conversion queued or running per principal. */
   principal: string;
-  waitMs: number;
-  /** #642: work nobody waits on a response for: an empty budget is waited out within `waitMs`, not refused. */
-  batch?: boolean;
-  /** #642: a batch's budget admission, shared by all its conversions (`batchConversion` sets it). */
-  budgetTurn?: BatchBudgetTurn;
+  /** How long it may wait for its turn, in total. Absent: the pool's `waitMs`. */
+  waitMs?: number;
+  /**
+   * #716: the budget key to admit and charge under, when it differs from the turn (`principal`): e.g. an export's
+   * `user:<id>:export`, so a human's exports spend their own bucket but still take that human's one turn.
+   */
+  budgetKey?: string;
+}
+
+/** An interactive conversion: an empty budget is refused at once (429). */
+export interface InteractiveConversionQueue extends ConversionQueueBase {
+  batch?: false;
 }
 
 /**
- * #642: a batch is admitted against its human's budget once, on its first conversion; after that its conversions are
- * charged but never gated. The zip import converts every page inside one open transaction, so a budget wait on each
- * conversion would hold that connection and the inserted rows' locks for minutes. It still takes one turn at a time,
- * so it can never hold more than one conversion's share of the worker.
+ * #642: work nobody waits on a response for: an empty budget is waited out within `waitMs`, not refused. Always carries
+ * its `budgetTurn` (#716 M9: a batch without one would be gated on every conversion, inside the import's transaction).
  */
-export interface BatchBudgetTurn {
-  admitted: boolean;
+export interface BatchConversionQueue extends ConversionQueueBase {
+  batch: true;
+  budgetTurn: BatchBudgetTurn;
 }
+
+/** Whose turn a conversion takes, how long it may wait for it, and how its budget is gated. */
+export type ConversionQueue = InteractiveConversionQueue | BatchConversionQueue;
 
 /** A human's admission key: the one key their requests, imports and validations all take their turn under (#642). */
 export function userConversionKey(userId: string): string {
@@ -566,27 +605,42 @@ export function userConversionKey(userId: string): string {
 }
 
 /**
+ * #716 I6: the key of a human the platform names by their PLATFORM identity because they have no Docmost user yet. Not
+ * exempt: their own bucket, never the shared `background` key.
+ */
+export function identityConversionKey(identityId: string): string {
+  return `identity:${identityId}`;
+}
+
+/** #716 I6: the key an east-west caller's human converts under: their Docmost user, else their platform identity. */
+export function humanConversionKey(userId?: string | null, identityId?: string | null): string | undefined {
+  if (userId) return userConversionKey(userId);
+  if (identityId) return identityConversionKey(identityId);
+  return undefined;
+}
+
+/**
  * The queue for work nobody waits on a response for (the zip import's queue job), with the batch wait. It takes the
  * turn of the human who started it (`userId`), so their import and their requests are one principal, not two; work
  * no human started names its own unit (`id`, e.g. `file-task:<id>`).
  */
-export function batchConversion(id: string, userId?: string | null): ConversionQueue {
+export function batchConversion(id: string, userId?: string | null): BatchConversionQueue {
   return {
     principal: userId ? userConversionKey(userId) : `batch:${id}`,
     waitMs: CONTENT_PARSE_LIMITS.batchWaitMs,
     batch: true,
-    budgetTurn: { admitted: false },
+    budgetTurn: { admitted: false, overdraftMs: 0 },
   };
 }
 
 /**
- * An east-west call made FOR a human (validate-content: the platform names the acting user): conversions run inside
- * `fn` take that human's turn, with the interactive wait. Without a user, `fn` runs with no override (the request
- * queue below).
+ * An east-west call made FOR a human (validate-content: the platform names the acting human): conversions run inside
+ * `fn` take that human's turn, with the interactive wait. `key` is ready-made (`humanConversionKey`). Without one, `fn`
+ * runs with no override (the request queue below).
  */
 const onBehalfOf = new AsyncLocalStorage<string>();
-export function convertOnBehalfOf<T>(userId: string | null | undefined, fn: () => Promise<T>): Promise<T> {
-  return userId ? onBehalfOf.run(userConversionKey(userId), fn) : fn();
+export function convertOnBehalfOf<T>(key: string | null | undefined, fn: () => Promise<T>): Promise<T> {
+  return key ? onBehalfOf.run(key, fn) : fn();
 }
 
 /**
@@ -597,7 +651,9 @@ export function requestQueue(): ConversionQueue {
   const named = onBehalfOf.getStore();
   if (named) return { principal: named, waitMs: CONTENT_PARSE_LIMITS.waitMs };
   const ctx = ClsServiceManager.getClsService()?.get<AuditContext>(AUDIT_CONTEXT_KEY);
-  const principal = ctx?.actorId ? `${ctx.actorType}:${ctx.actorId}` : 'background';
+  // #716 M8: the ONE key helper, whatever `actorType` says, so a human's requests can never split from their imports
+  // and validations into two turns and two buckets.
+  const principal = ctx?.actorId ? userConversionKey(ctx.actorId) : 'background';
   return { principal, waitMs: CONTENT_PARSE_LIMITS.waitMs };
 }
 
@@ -612,7 +668,7 @@ export function parseUntrustedContent(
   format: ParseFormat,
   queue: ConversionQueue = requestQueue(),
 ): Promise<Record<string, unknown>> {
-  return pool.parse(content, format, queue.principal, queue.waitMs, queue.batch === true, queue.budgetTurn);
+  return pool.parse(content, format, queue);
 }
 
 /**
@@ -624,7 +680,15 @@ export function untrustedMarkdownToHtml(
   queue: ConversionQueue = requestQueue(),
   options: { maxChars?: number } = {},
 ): Promise<string> {
-  return pool.toHtml(markdown, queue.principal, queue.waitMs, options.maxChars, queue.batch === true, queue.budgetTurn);
+  return pool.toHtml(markdown, queue, options.maxChars);
+}
+
+/**
+ * #716: serialize a stored page for the native export, off the event loop (`ContentParsePool.serialize`). The export
+ * names its queue (`editor-compat/export/export-conversion.ts`): the human's turn, their own `:export` budget key.
+ */
+export function serializePageContent(json: unknown, format: ParseFormat, queue: ConversionQueue): Promise<string> {
+  return pool.serialize(json, format, queue);
 }
 
 /** Stop the shared worker (tests). */

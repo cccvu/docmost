@@ -52,8 +52,10 @@ PLATFORM_AUTHZ_SERVICE_SECRET=<a shared secret, >= 16 chars>
 - **Respond within the timeout** (`PLATFORM_AUTHZ_TIMEOUT_MS`, default 1500 ms). The fork uses an
   `AbortController`; a slow response is treated as a denial.
 - **The fork fails closed.** If your service is unreachable, times out, returns a non-2xx, or returns a
-  malformed body, the fork denies (`check` -> false, the list endpoints -> empty). It NEVER falls back to
-  native decisions. So returning `5xx` on your own errors is safe: it degrades to deny, never to allow.
+  malformed body, the fork grants nothing: a point decision or a list it could not get answered is a retryable
+  `503` to the fork's own caller (wiki-v2 #696, #716), never an empty or partial list (one failed chunk fails
+  the whole list). It NEVER falls back to native decisions. So returning `5xx` on your own errors is safe: it
+  degrades to a retryable refusal, never to allow. A well-formed empty answer is a real "none".
 - **Subjects arrive as** `{ "provider": "docmost", "externalId": "<docmost user id>" }` for every user
   decision. One exception (1.2.0, wiki-v2 #615): when a caller of the service-bridge `content/search` passes a
   `serviceSubjectId` (the CCC platform does for an on-behalf-of search), the fork also sends
@@ -141,6 +143,13 @@ the 6 s search deadline passes). Both are retryable; nothing was changed. `POST 
 takes an optional `actorUserId` (the Docmost user the integrator validates for): its conversions take that user's
 turn at the content converter, the same as the user's own writes. It is an admission key only, never used for
 authorization. An engine before 1.11.0 drops the unknown field and validates on the shared actorless turn.
+
+**1.14.0 (wiki-v2 #716).** `POST /api/service/pages/validate-content` also takes an optional `actorIdentityId` (the
+platform identity of the acting human, always sent by the platform). It is the converter's admission key when
+`actorUserId` is absent (`identity:<id>`, a per-human bucket, never the shared actorless one), and, like `actorUserId`,
+never used for authorization. Its `429 conversion_budget_exhausted` is now in the document
+(`RateLimitedOrConversionBudget`). In remote mode the native page routes answer `400 { code: use_v1 }` to a non-json
+`format` echo (`/api/pages/info`, `/api/pages/update`, and `/api/pages/create` with content).
 
 **Native routes refused in remote mode (1.10.0; wiki-v2 #502, #598, #636).** In `AUTHZ_MODE=remote` the engine
 answers `404` to every authenticated caller of the native routes below, before any permission check, and forwards one

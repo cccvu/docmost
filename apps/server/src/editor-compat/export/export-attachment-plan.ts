@@ -10,17 +10,22 @@
  *      anything about content it cannot see. NULL sizes count 0 here; the streamed-bytes backstop catches them.
  *   2. entries: every name the archive will hold (pages, folders JSZip creates for each path, attachments, the
  *      missing-attachments note) against the zip32 limit, computed exactly the way JSZip names them.
- *   3. missing objects: `exists()` for each distinct storage object, 8 at a time. An object storage does not have is
+ *   3. missing objects: `exists()` for each distinct storage object, 8 at a time per export and (#716) 16 at a time
+ *      across every export in the process, each slot taken before its storage timeout starts (so time queued here is
+ *      never a spurious storage 503), and inside the export's build deadline (export-conversion.ts), checked before
+ *      every HEAD: a client that has gone, or a build past its 45 s, stops here. An object storage does not have is
  *      left out of the archive (never an empty entry), logged `EXPORT_ATTACHMENT_MISSING` at WARN, and listed in
  *      `missing-attachments.txt` at the archive root (owner decision, #699). Any OTHER storage error stops the export
  *      with a 503: the archive is never silently incomplete.
  *   4. the remaining attachments are added as lazily opened, STORE'd streams (export-stream.ts). Already-compressed
  *      media gain nothing from DEFLATE, which JSZip runs in pure JS on the main thread.
  */
-import { Logger } from '@nestjs/common';
+import { Logger, ServiceUnavailableException } from '@nestjs/common';
 import type * as JSZip from 'jszip';
 import type { Readable } from 'node:stream';
 import {
+  EXPORT_EXISTS_GLOBAL,
+  ExportBuildTimeoutException,
   exportLimits,
   ExportLimits,
   ExportStorageException,
@@ -28,6 +33,31 @@ import {
   withStorageTimeout,
 } from './export-limits';
 import { ExportStreamRegistry } from './export-stream';
+import { OpSemaphore, OpSemaphoreTimeout } from '../../authz/page-write/op-semaphore';
+import { ExportCancelledException, exportBuildMsLeft, throwIfExportBuildStopped } from './export-conversion';
+
+/** The longest a HEAD waits for a process-wide slot outside an export build (inside one: the build's time left). */
+const EXISTS_SLOT_MAX_WAIT_MS = 60_000;
+
+/** #716 M4: storage HEADs in flight across every export in this process. */
+const existsSlots = new OpSemaphore(EXPORT_EXISTS_GLOBAL, EXISTS_SLOT_MAX_WAIT_MS);
+
+/** #716: a HEAD that never settles frees its slot this many storage timeouts after it started (see `existing`). */
+const EXISTS_SLOT_HUNG_FACTOR = 6;
+
+/** `release`, callable once, and called by itself after `backstopMs` if nobody has by then. */
+function leaseOnce(release: () => void, backstopMs: number): () => void {
+  let done = false;
+  const free = () => {
+    if (done) return;
+    done = true;
+    clearTimeout(timer);
+    release();
+  };
+  const timer = setTimeout(free, backstopMs);
+  (timer as { unref?: () => void }).unref?.();
+  return free;
+}
 
 export const MISSING_ATTACHMENTS_FILE = 'missing-attachments.txt';
 
@@ -76,6 +106,11 @@ export function isMissingObjectError(err: unknown): boolean {
     e.code === 'ENOENT' ||
     e.$metadata?.httpStatusCode === 404
   );
+}
+
+/** The two ways an export build stops (export-conversion.ts): never relabeled as a storage failure. */
+function isBuildStop(err: unknown): boolean {
+  return err instanceof ExportBuildTimeoutException || err instanceof ExportCancelledException;
 }
 
 function declaredSize(a: PlannedAttachment): number {
@@ -197,18 +232,62 @@ export class ExportAttachmentPlan {
     const present = new Set<string>();
     let next = 0;
     let failed: unknown = null;
+    let stopped: unknown = null; // #716: the build's deadline or a closed client — passed on as is, never a storage 503
+    let busy = false; // #716: no process-wide HEAD slot in time (other exports' HEADs): a busy engine, not a storage error
     const worker = async () => {
-      while (failed === null && next < paths.length) {
+      while (failed === null && stopped === null && !busy && next < paths.length) {
         const p = paths[next++];
+        let release: (() => void) | null = null;
         try {
-          if (await withStorageTimeout(this.storage.exists(p), this.limits.storageTimeoutMs, 'exists()')) present.add(p);
+          throwIfExportBuildStopped();
+          try {
+            // The process-wide slot first, then the storage timeout: queueing here never counts against storage.
+            release = await existsSlots.acquire(Math.max(1, Math.min(exportBuildMsLeft(), EXISTS_SLOT_MAX_WAIT_MS)));
+          } catch (err) {
+            if (err instanceof OpSemaphoreTimeout) {
+              throwIfExportBuildStopped(); // the wait was the build's time left
+              busy = true;
+              continue;
+            }
+            throw err;
+          }
+          // #716: the slot is held until the HEAD itself SETTLES, not until our timeout gives up on it: a timed-out HEAD
+          // still holds its S3 socket, so releasing at the timeout would let more than EXPORT_EXISTS_GLOBAL HEADs run
+          // during a storage brownout. Backstop: a HEAD that never settles (the S3 client sets no request timeout)
+          // frees its slot EXISTS_SLOT_HUNG_FACTOR × the storage timeout after it started, so hung calls cannot take
+          // every slot for the life of the process.
+          const lease = leaseOnce(release, EXISTS_SLOT_HUNG_FACTOR * this.limits.storageTimeoutMs);
+          release = null;
+          let head: Promise<boolean>;
+          try {
+            head = Promise.resolve(this.storage.exists(p));
+          } catch (err) {
+            lease();
+            throw err;
+          }
+          head.then(lease, lease);
+          if (await withStorageTimeout(head, this.limits.storageTimeoutMs, 'exists()')) present.add(p);
         } catch (err) {
+          if (isBuildStop(err)) {
+            if (stopped === null) stopped = err;
+            continue;
+          }
           if (isMissingObjectError(err)) continue;
           if (failed === null) failed = err;
+        } finally {
+          release?.();
         }
       }
     };
     await Promise.all(Array.from({ length: Math.min(this.limits.existsConcurrency, paths.length) }, worker));
+    if (stopped !== null) throw stopped;
+    if (failed === null && busy) {
+      this.logger.warn(`EXPORT_BUSY scope=storage_heads export=${this.label} phase=precheck: answered 503 engine_busy`);
+      throw new ServiceUnavailableException({
+        message: 'Too many exports are checking their attachments right now; retry shortly.',
+        code: 'engine_busy',
+      });
+    }
     if (failed !== null) {
       this.logger.error(
         `EXPORT_ABORTED reason=storage_error export=${this.label} phase=precheck: ${

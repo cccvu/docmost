@@ -18,6 +18,7 @@ import { exportSpace } from "@/features/space/services/space-service";
 import { useTranslation } from "react-i18next";
 import { Feature } from "@/ee/features";
 import { useHasFeature } from "@/ee/hooks/use-feature";
+import { exportErrorMessage } from "@/features/editor-ux/export-error-message";
 
 interface ExportModalProps {
   id: string;
@@ -64,7 +65,7 @@ export default function ExportModal({
       onClose();
     } catch (err) {
       notifications.show({
-        message: "Export failed:" + err.response?.data.message,
+        message: "Export failed: " + (await exportErrorMessage(err)),
         color: "red",
       });
       console.error("export error", err);

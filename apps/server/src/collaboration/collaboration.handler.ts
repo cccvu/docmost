@@ -1,4 +1,8 @@
-import { Injectable, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  InternalServerErrorException,
+  Logger,
+} from '@nestjs/common';
 import { Hocuspocus, Document } from '@hocuspocus/server';
 import { TiptapTransformer } from '@hocuspocus/transformer';
 import {
@@ -8,10 +12,6 @@ import {
 import { setYjsMark, updateYjsMarkAttribute, YjsSelection } from './yjs.util';
 import * as Y from 'yjs';
 import { User } from '@docmost/db/types/entity.types';
-// CCC integration seam (UPSTREAM_MODIFICATIONS.md + authz/route-guard/import-boundary.spec.ts):
-// the conditional page write compares the LIVE document against a caller-supplied digest, and the digest
-// function is cross-service contract code that must live beside its shared vectors in authz/.
-import { stableHash } from '../authz/page-write/stable-hash';
 import {
   ConditionalUpdateOutcome,
   FlushPageContentOutcome,
@@ -25,6 +25,16 @@ import {
   recordWriteKey,
   scopedWriteKey,
 } from '../authz/page-write/write-idem';
+// CCC integration seam (UPSTREAM_MODIFICATIONS.md §2 + authz/route-guard/import-boundary.spec.ts): the conditional
+// write compares the LIVE document's digest (cross-service contract code, `stable-hash` beside its shared vectors),
+// memoized per document mutation (#716: one walk per state, not one per compare); a replace's Yjs update is built
+// before the connection opens (#716). Pure helpers in authz/; this file only calls them.
+import { liveContentDigest } from '../authz/page-write/doc-version';
+import {
+  PreparedContent,
+  prepareContentOperation,
+  yieldToEventLoop,
+} from '../authz/page-write/replace-update';
 
 export type CollabEventHandlers = ReturnType<
   CollaborationHandler['getHandlers']
@@ -85,11 +95,10 @@ export class CollaborationHandler {
           // default attributes (e.g. `attrs: {indent: 0}`), so the two never hash alike until a store has
           // rewritten the row — and a caller comparing row-derived digests against a resident document
           // would 412 on every attempt, forever, with a re-read that never changes anything.
+          // #716: memoized per document state, so a conditional write that follows with no edit in between reuses it.
           return {
             flushed: true,
-            contentDigest: stableHash(
-              TiptapTransformer.fromYdoc(doc, 'default'),
-            ),
+            contentDigest: liveContentDigest(doc),
           };
         } catch (err) {
           this.logger.warn(
@@ -166,12 +175,31 @@ export class CollaborationHandler {
       ) => {
         const { prosemirrorJson, operation, user } = payload;
         this.logger.debug('Updating page content via yjs', documentName);
+        // #716: build the operation before opening (a failure opens nothing), then let the loop breathe.
+        const prepared = prepareContentOperation(prosemirrorJson, operation);
+        await yieldToEventLoop();
+        let liveDoc: Document | undefined;
         await this.withYdocConnection(
           hocuspocus,
           documentName,
           { user },
-          (doc) => this.applyContentOperation(doc, prosemirrorJson, operation),
+          (doc) => {
+            liveDoc = doc;
+            this.applyContentOperation(doc, prepared);
+          },
         );
+        // #716 R4: the stores that followed the apply (transact's, then disconnect's retry) failed to persist it, and
+        // `disconnect()` unloads a document nobody else holds — the write may be lost. Not a 200: the outcome is
+        // unknown (500 `write_outcome_unknown`, which the platform answers 504 "may have been applied").
+        if (liveDoc && hasStoreFailure(liveDoc)) {
+          this.logger.warn(
+            `updatePageContent applied to ${documentName} but its store failed; answered write_outcome_unknown`,
+          );
+          throw new InternalServerErrorException({
+            message: 'the content was applied to the live page but could not be confirmed as saved',
+            code: 'write_outcome_unknown',
+          });
+        }
       },
       // CCC integration seam (UPSTREAM_MODIFICATIONS.md): a COMPARE-AND-SWAP content write (#282).
       //
@@ -201,6 +229,10 @@ export class CollaborationHandler {
           // #429: optional caller idempotency key. When present, a repeat within the retention window is a
           // no-op (`reason:'duplicate'`); recorded on the live doc atomically with the content it applies.
           idempotencyKey?: string;
+          // #716: the page is at the API size cap (the caller measured it): refuse the append/prepend with
+          // `too_large`, but only AFTER the dedup and the CAS, so a retry of an append that already applied still
+          // answers `duplicate` (a 200), never a false "not applied".
+          refuseOverCap?: boolean;
         },
       ): Promise<ConditionalUpdateOutcome> => {
         const {
@@ -209,12 +241,52 @@ export class CollaborationHandler {
           user,
           expectedContentHash,
           idempotencyKey,
+          refuseOverCap,
         } = payload;
         let outcome: ConditionalUpdateOutcome = {
           applied: false,
           reason: 'unknown',
         };
+        // #716 O2/R4: set right before the first mutation. A throw after it, or a failed store after the apply,
+        // is `applied_unconfirmed` (the live document holds the write, the row may not), never a retryable error.
+        let mutationStarted = false;
+        let liveDoc: Document | undefined;
         try {
+          // #716: a replace's Yjs update is built FIRST — a pure function of the request, so building it here
+          // changes no concurrency semantics — and the loop gets a tick before the pre-check. A build failure opens
+          // no connection and runs no store (#342 BUILD-BEFORE-DELETE, strengthened). Nothing yields between the
+          // pre-check and the transaction: that would widen the #282 window described below.
+          // #716 page cap on a RESIDENT document: decided on it directly, in the same order as inside the transaction
+          // below (dedup, then CAS, then the cap), without opening a connection — whose two stores would walk the
+          // whole (over-cap) page and could persist a human's unsaved edit under this caller. A refusal touches
+          // nothing. Not resident: the connection below loads it (no unsaved edit exists to reattribute).
+          const resident0 = refuseOverCap
+            ? hocuspocus.documents.get(documentName)
+            : undefined;
+          if (resident0) {
+            if (
+              idempotencyKey &&
+              isDuplicateWriteKey(
+                resident0,
+                scopedWriteKey(user.id, idempotencyKey),
+              )
+            ) {
+              return { applied: false, reason: 'duplicate' };
+            }
+            if (
+              expectedContentHash &&
+              liveContentDigest(resident0) !== expectedContentHash
+            ) {
+              return { applied: false, reason: 'precondition' };
+            }
+            return { applied: false, reason: 'too_large' };
+          }
+          // A refused-over-cap write builds nothing (its content is never applied, and may not have been parsed).
+          let prepared: PreparedContent | undefined;
+          if (!refuseOverCap) {
+            prepared = prepareContentOperation(prosemirrorJson, operation);
+            await yieldToEventLoop();
+          }
           // Refuse the COMMON case before opening a direct connection. `DirectConnection.transact()` and
           // `.disconnect()` each run an immediate store, and on a refusal that store is not a no-op: the
           // live document has moved past the settled row by construction, so it would persist a human's
@@ -231,11 +303,9 @@ export class CollaborationHandler {
           const resident = expectedContentHash
             ? hocuspocus.documents.get(documentName)
             : undefined;
-          if (
-            resident &&
-            stableHash(TiptapTransformer.fromYdoc(resident, 'default')) !==
-              expectedContentHash
-          ) {
+          // #716: memoized per document state, so the compare inside the transaction below reuses this digest
+          // unless a transaction (any edit, delete-only or remote included) ran in between.
+          if (resident && liveContentDigest(resident) !== expectedContentHash) {
             return { applied: false, reason: 'precondition' };
           }
           await this.withYdocConnection(
@@ -266,13 +336,19 @@ export class CollaborationHandler {
               // edit that arrives while the connection is opening.
               if (
                 expectedContentHash &&
-                stableHash(TiptapTransformer.fromYdoc(doc, 'default')) !==
-                  expectedContentHash
+                liveContentDigest(doc) !== expectedContentHash
               ) {
                 outcome = { applied: false, reason: 'precondition' };
                 return;
               }
-              this.applyContentOperation(doc, prosemirrorJson, operation);
+              // #716: the page cap, after the dedup and the CAS (see `refuseOverCap`), before any mutation.
+              if (refuseOverCap) {
+                outcome = { applied: false, reason: 'too_large' };
+                return;
+              }
+              liveDoc = doc;
+              mutationStarted = true;
+              this.applyContentOperation(doc, prepared);
               // #429: record the key in the SAME transaction as the content it applies — one atomic CRDT
               // mutation, so the key rides the persisted ydoc with the append (both commit or neither).
               // ONLY on an actual apply, and AFTER the CAS above: a write that FAILED the precondition must
@@ -285,9 +361,22 @@ export class CollaborationHandler {
           );
         } catch (err) {
           this.logger.warn(
-            `conditionalUpdatePageContent failed for ${documentName}: ${err?.['message']}`,
+            `conditionalUpdatePageContent failed for ${documentName}${mutationStarted ? ' after it began applying' : ''}: ${err?.['message']}`,
           );
-          return { applied: false, reason: 'error' };
+          // #716 O2: once the mutation began, the live document holds (some of) this write and a later store may
+          // persist it: answering a retryable error would invite a second append. Unknown outcome, said so.
+          return mutationStarted
+            ? { applied: false, reason: 'applied_unconfirmed' }
+            : { applied: false, reason: 'error' };
+        }
+        // #716 R4: applied, but the stores that followed (transact's and disconnect's, the in-request retry) failed
+        // to persist it. The append lives only in the resident document, and `disconnect()` unloads a document
+        // nobody else holds — so this is not a 200.
+        if (outcome.applied && liveDoc && hasStoreFailure(liveDoc)) {
+          this.logger.warn(
+            `conditionalUpdatePageContent applied to ${documentName} but its store failed; answered applied_unconfirmed`,
+          );
+          return { applied: false, reason: 'applied_unconfirmed' };
         }
         return outcome;
       },
@@ -297,38 +386,30 @@ export class CollaborationHandler {
   /**
    * Apply a content operation to a live document. Extracted verbatim from `updatePageContent` so the
    * conditional write (#282) applies byte-identical semantics — there must be exactly one definition of
-   * what `replace`/`append`/`prepend` mean.
+   * what `replace`/`append`/`prepend` mean. #716: the operation is built beforehand by `prepareContentOperation`
+   * (authz/page-write/replace-update.ts), so only the mutation itself runs here, inside the transaction.
    */
   private applyContentOperation(
     doc: Document,
-    prosemirrorJson: any,
-    operation: string,
+    prepared: PreparedContent,
   ): void {
     const fragment = doc.getXmlFragment('default');
 
-    if (operation === 'replace') {
+    if (prepared.kind === 'replace') {
       // BUILD BEFORE DELETE (#342). `TiptapTransformer.toYdoc` throws on content it cannot convert
       // (a body that passed `jsonToNode` but that the Yjs transformer rejects). If the fragment were
       // emptied first, that throw would leave an empty document behind, and the connection's closing
       // `disconnect()` store would persist it — silently WIPING the page while the request also fails.
       // Encoding the new state first means a conversion failure aborts before any mutation, so the
       // original content survives and the closing store re-persists it unchanged.
-      const newDoc = TiptapTransformer.toYdoc(
-        prosemirrorJson,
-        'default',
-        tiptapExtensions,
-      );
-      const update = Y.encodeStateAsUpdate(newDoc);
-
+      // (#716: `prepared.update` was built before the connection opened — the build-before-delete order holds.)
       if (fragment.length > 0) {
         fragment.delete(0, fragment.length);
       }
-      Y.applyUpdate(doc, update);
+      Y.applyUpdate(doc, prepared.update);
     } else {
-      const newContent = prosemirrorJson.content || [];
-      const yElements = newContent.map(prosemirrorNodeToYElement);
-      const position = operation === 'prepend' ? 0 : fragment.length;
-      fragment.insert(position, yElements);
+      const position = prepared.atStart ? 0 : fragment.length;
+      fragment.insert(position, prepared.elements as never);
     }
   }
 
@@ -343,7 +424,10 @@ export class CollaborationHandler {
       context,
     );
     try {
-      await connection.transact(fn);
+      // #716: ONE Yjs transaction around the whole callback (Hocuspocus's DirectConnection.transact does not open
+      // one). A nested `applyUpdate` joins it, so a replace's delete + apply — and #429's key record — are one
+      // atomic CRDT mutation: one update event, one broadcast, and peers never see the empty fragment between them.
+      await connection.transact((doc) => doc.transact(() => fn(doc)));
     } finally {
       await connection.disconnect();
     }

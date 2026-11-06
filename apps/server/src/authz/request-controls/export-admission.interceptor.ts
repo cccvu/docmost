@@ -14,11 +14,15 @@ import { Observable, defer, finalize, throwError } from 'rxjs';
  *
  * Admission for the heavy native exports: `ExportController.exportSpace`, and `ExportController.exportPage` when it
  * builds a zip (`includeChildren` or `includeAttachments`). At most ONE such export per principal and EIGHT per process
- * run at once; any more answer 503 `engine_busy` with `Retry-After` before the handler runs. Each export converts
- * every page on the main thread and, while it streams, holds one storage socket (the S3 pool has 50, shared with every
- * download and upload), so eight leaves the pool to everyone else and keeps the heap the exports can hold together
- * bounded (export-limits.ts). The single-page export without attachments, which the platform's `/v1` export job uses
- * (`includeChildren:false, includeAttachments:false`), is cheap and stays unthrottled.
+ * run at once; any more answer 503 `engine_busy` with `Retry-After` before the handler runs. Each export holds its
+ * pages' content and their serialized output on the main heap until the archive has streamed, and while it streams
+ * holds one storage socket (the S3 pool has 50, shared with every download and upload), so eight leaves the pool to
+ * everyone else and keeps the heap the exports can hold together bounded (export-limits.ts). Since #716 the pages are
+ * serialized in the conversion worker, not on the main thread: one export page at a time across ALL exports (the
+ * worker's serialize lane), under the human's own `:export` budget, inside a 45 s build deadline
+ * (editor-compat/export/export-conversion.ts). That also bounds the single-page export without attachments, which the
+ * platform's `/v1` export job uses (`includeChildren:false, includeAttachments:false`): it stays unadmitted here, but
+ * its one serialization takes the human's turn and the lane like any other.
  *
  * A slot is released only when BOTH the handler has finished AND the response has closed. The handler uses `@Res()`
  * and returns as soon as it has handed the archive stream to fastify, so releasing on the handler alone would free the

@@ -96,9 +96,19 @@ describe('htmlToMarkdownReleasingDom (#699)', () => {
     const fromEditorExt = createRequire(require.resolve('@docmost/editor-ext'));
     const Turndown = fromEditorExt('@joplin/turndown') as { prototype: { turndown: (input: unknown) => string } };
     const seen: unknown[] = [];
+    // #716 M10: how Turndown calls the root's clone, counted on the very node it is handed (before it can clone it).
+    const clones: Array<boolean | undefined> = [];
     const real = Turndown.prototype.turndown;
     const spy = jest.spyOn(Turndown.prototype, 'turndown').mockImplementation(function (this: unknown, input: unknown) {
       seen.push(input);
+      if (input && typeof input === 'object') {
+        const node = input as { cloneNode: (deep?: boolean) => unknown };
+        const override = node.cloneNode;
+        node.cloneNode = (deep?: boolean) => {
+          clones.push(deep);
+          return override.call(node, deep);
+        };
+      }
       return real.call(this, input);
     });
     try {
@@ -109,7 +119,23 @@ describe('htmlToMarkdownReleasingDom (#699)', () => {
     const root = seen[0] as { cloneNode(deep: boolean): unknown; nodeType: number };
     expect(typeof root).toBe('object'); // a node, not a string (RootNode clones a node it is given)
     expect(root.nodeType).toBe(1);
-    expect(root.cloneNode(true)).toBe(root); // control: a plain jsdom element's clone is a new node
+    // Turndown 4.0.82's RootNode clones its input exactly once, deep: the override is what it reaches. A bump that
+    // stops cloning (the override dead) or clones another way turns this red.
+    expect(clones).toEqual([true]);
+    expect(root.cloneNode(true)).toBe(root); // the override: the clone IS the root
+    // Control (#716 M10): a plain element from the same jsdom (resolved through the same chain as the helper) clones
+    // to a NEW node, so the line above tests the override, not jsdom.
+    const fromTurndown = createRequire(fromEditorExt.resolve('@joplin/turndown/package.json'));
+    const { JSDOM } = fromTurndown('jsdom') as {
+      JSDOM: new (html: string) => { window: { document: { getElementById(id: string): { cloneNode(deep: boolean): unknown } }; close(): void } };
+    };
+    const dom = new JSDOM('<div id="plain"><p>x</p></div>');
+    try {
+      const plain = dom.window.document.getElementById('plain');
+      expect(plain.cloneNode(true)).not.toBe(plain);
+    } finally {
+      dom.window.close();
+    }
   });
 
   it('keeps no DOM after it returns, where htmlToMarkdown keeps one per call until the event loop turns (control)', () => {

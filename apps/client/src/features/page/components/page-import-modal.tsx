@@ -36,6 +36,7 @@ import { getFileTaskById } from "@/features/file-task/services/file-task-service
 import { queryClient } from "@/main.tsx";
 import { useQueryEmit } from "@/features/websocket/use-query-emit.ts";
 import bytes from "bytes";
+import { importFileSizeLimit } from "@docmost/editor-ext"; // CCC #716 I7
 
 interface PageImportModalProps {
   spaceId: string;
@@ -251,14 +252,15 @@ function ImportFormatSelection({ spaceId, onClose }: ImportFormatSelection) {
       return;
     }
 
+    // CCC #716 I7: a .md/.html page file has the engine's 4 MiB page-file limit, not the 30 MB upload limit
     const oversizedFiles = selectedFiles.filter(
-      (f) => f.size > maxSingleFileSize,
+      (f) => f.size > importFileSizeLimit(f.name, maxSingleFileSize),
     );
     if (oversizedFiles.length > 0) {
       notifications.show({
         color: "red",
         message: t("File exceeds the {{limit}} import limit", {
-          limit: formatBytes(maxSingleFileSize),
+          limit: formatBytes(importFileSizeLimit(oversizedFiles[0].name, maxSingleFileSize)),
         }),
       });
       return;

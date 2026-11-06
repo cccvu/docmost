@@ -1,6 +1,6 @@
 import * as postgres from 'postgres';
 import { Kysely } from 'kysely';
-import { HttpException } from '@nestjs/common';
+import { HttpException, ServiceUnavailableException } from '@nestjs/common';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { PageService } from '../../core/page/services/page.service';
 import { AuthzOutboxInstaller } from '../../service-bridge/authz-outbox.installer';
@@ -17,6 +17,8 @@ import { PG_URL, uuid, mkReadModelPg, bootstrapSchema, mkReadModelDb } from '../
 jest.mock('../../collaboration/collaboration.gateway', () => ({ CollaborationGateway: class {} }));
 
 import { ConditionalPageOpsController } from './conditional-page-ops.controller';
+import { PdpPagePermissionRepo } from '../pdp-page-permission.repo';
+import { HttpAuthzClient } from '../http-authz.client';
 import { pageEtagOpaque } from './page-etag';
 
 /**
@@ -61,6 +63,13 @@ d('ConditionalPageOpsController on real Postgres (#616)', () => {
   const serviceJobs: string[] = [];
   const controllerJobs: string[] = [];
   const audits: string[] = [];
+  let pageService: PageService;
+  /** #716: the page repo the service's tree filter goes through. By default the real `PdpPagePermissionRepo` over a
+   *  healthy stubbed `tryFilterResources` that allows every id; the outage cases swap in a failing one. */
+  let filterRepo: PdpPagePermissionRepo;
+  let healthyFilterRepo: PdpPagePermissionRepo;
+  let filterCalls = 0;
+  const realFetch = global.fetch;
 
   const page = (id: string, parent: string | null, opts: { position?: string; trashed?: boolean; title?: string } = {}) => pg`
     insert into pages (id, slug_id, title, workspace_id, space_id, parent_page_id, position, last_updated_by_id,
@@ -148,9 +157,13 @@ d('ConditionalPageOpsController on real Postgres (#616)', () => {
         serviceJobs.push(`${name}:${job}:${data?.pageId ?? ''}`);
       },
     });
+    healthyFilterRepo = new PdpPagePermissionRepo(db as never, {} as never, {} as never, {
+      tryFilterResources: async (_s: unknown, _p: string, _t: string, ids: string[]) => (filterCalls++, ids),
+    } as never);
+    filterRepo = healthyFilterRepo;
     const pages = new PageService(
       pageRepo,
-      { filterAccessiblePageIds: async ({ pageIds }: { pageIds: string[] }) => pageIds } as never,
+      { filterAccessiblePageIds: (opts: { pageIds: string[]; userId: string }) => filterRepo.filterAccessiblePageIds(opts) } as never,
       { updateAttachmentsByPageId: async () => undefined } as never,
       db as never,
       {} as never,
@@ -162,6 +175,7 @@ d('ConditionalPageOpsController on real Postgres (#616)', () => {
       { movePageWatchersToSpace: async () => undefined } as never,
       {} as never,
     );
+    pageService = pages;
     const allow = { can: () => true, cannot: () => false };
     controller = new ConditionalPageOpsController(
       db as never,
@@ -188,6 +202,9 @@ d('ConditionalPageOpsController on real Postgres (#616)', () => {
 
   afterEach(async () => {
     afterLock = null;
+    filterRepo = healthyFilterRepo;
+    filterCalls = 0;
+    global.fetch = realFetch;
     serviceJobs.length = 0;
     controllerJobs.length = 0;
     audits.length = 0;
@@ -466,6 +483,88 @@ d('ConditionalPageOpsController on real Postgres (#616)', () => {
       ).toBe(`error:${RESTRICTED_SPACE_MOVE}`);
       expect(await row(uuid(3))).toMatchObject({ spaceId: S1 });
       expect(await outboxCount()).toBe(outboxBefore);
+    });
+
+    describe('#716 move-to-space when the PDP tree filter cannot answer (point decisions healthy)', () => {
+      /** Every page row's tree fields, in id order, as text: compared byte for byte before and after. */
+      const snapshot = async () =>
+        JSON.stringify(
+          await pg`select id, space_id, parent_page_id, position, updated_at, deleted_at from pages order by id`,
+        );
+      const seedTree = async () => {
+        await page(uuid(1), null);
+        await page(uuid(2), uuid(1), { position: 'a0001' });
+        await page(uuid(3), uuid(1), { position: 'a0002' });
+        await page(uuid(4), uuid(3), { position: 'a0003' });
+      };
+      const failingFilter = () =>
+        new PdpPagePermissionRepo(db as never, {} as never, {} as never, {
+          tryFilterResources: async () => (filterCalls++, null),
+        } as never);
+
+      it('through conditionalMoveToSpace (the caller transaction): 503, every row byte-identical, nothing projected', async () => {
+        await seedTree();
+        filterRepo = failingFilter();
+        const before = await snapshot();
+        const outboxBefore = await outboxCount();
+        expect(
+          await outcome(controller.conditionalMoveToSpace({ pageId: uuid(1), spaceId: S2, expectedEtags: ['*'] } as never, ACTOR, WORKSPACE)),
+        ).toBe('503:');
+        expect(filterCalls).toBe(1); // the healthy point decisions passed; the tree filter ran and was what failed
+        expect(await snapshot()).toBe(before);
+        expect(await outboxCount()).toBe(outboxBefore);
+        expect(audits).toEqual([]);
+        expect(serviceJobs).toEqual([]);
+      });
+
+      it('direct PageService.movePageToSpace (no caller transaction): 503 before any write', async () => {
+        await seedTree();
+        filterRepo = failingFilter();
+        const before = await snapshot();
+        const root = await pageRepo.findById(uuid(1));
+        await expect(pageService.movePageToSpace(root as never, S2, USER)).rejects.toBeInstanceOf(ServiceUnavailableException);
+        expect(filterCalls).toBe(1);
+        expect(await snapshot()).toBe(before);
+      });
+
+      it('over the real client, the SECOND 1000-id chunk fails: 503, never a move of the first chunk alone', async () => {
+        await seedTree();
+        await pg`
+          insert into pages (id, slug_id, title, workspace_id, space_id, parent_page_id, position)
+          select gen_random_uuid(), 'bulk-' || g, 'bulk', ${WS}, ${S1}, ${uuid(1)}, 'b' || lpad(g::text, 4, '0')
+          from generate_series(1, 997) g`;
+        process.env.PLATFORM_AUTHZ_URL = 'http://platform.test';
+        process.env.PLATFORM_AUTHZ_SERVICE_SECRET = 'sekret';
+        const fetchMock = jest
+          .fn()
+          .mockImplementationOnce(async (_url: string, init: { body: string }) => ({
+            ok: true,
+            status: 200,
+            json: async () => ({ ids: JSON.parse(init.body).candidateIds }),
+          }))
+          .mockResolvedValueOnce({ ok: false, status: 503, json: async () => ({}) });
+        (global as unknown as { fetch: jest.Mock }).fetch = fetchMock;
+        filterRepo = new PdpPagePermissionRepo(db as never, {} as never, {} as never, new HttpAuthzClient());
+        const before = await snapshot();
+        const outboxBefore = await outboxCount();
+        expect(
+          await outcome(controller.conditionalMoveToSpace({ pageId: uuid(1), spaceId: S2, expectedEtags: ['*'] } as never, ACTOR, WORKSPACE)),
+        ).toBe('503:');
+        expect(fetchMock).toHaveBeenCalledTimes(2);
+        expect(JSON.parse(fetchMock.mock.calls[0][1].body).candidateIds).toHaveLength(1000);
+        expect(await snapshot()).toBe(before);
+        expect(await outboxCount()).toBe(outboxBefore);
+      });
+
+      it('control: the same tree with a healthy filter moves whole', async () => {
+        await seedTree();
+        expect(
+          await outcome(controller.conditionalMoveToSpace({ pageId: uuid(1), spaceId: S2, expectedEtags: ['*'] } as never, ACTOR, WORKSPACE)),
+        ).toBe('applied');
+        expect(filterCalls).toBe(1);
+        for (const id of [uuid(1), uuid(2), uuid(3), uuid(4)]) expect((await row(id)).spaceId).toBe(S2);
+        expect((await row(uuid(4))).parentPageId).toBe(uuid(3));
+      });
     });
 
     it('move-to-space OUT of an archived space (#589): the g1 guard refuses, the whole write rolls back', async () => {
