@@ -451,6 +451,7 @@ export class FileImportTaskService {
     let currentFile: string | null = null; // CCC #643: the page a failure names
     const attempted = new Set<string>(); // CCC #716 I2: pages whose attachments were uploaded (committed outside trx)
     let committed = false; // CCC #716 I2
+    let txBodyFinished = false; // CCC #716 I2: set as the callback's last statement; a failure after it may have committed
 
     try {
       await executeTx(this.db, async (trx) => {
@@ -574,6 +575,7 @@ export class FileImportTaskService {
         this.logger.log(
           `Successfully imported ${totalPagesProcessed} pages with ${filteredBacklinks.length} backlinks`,
         );
+        txBodyFinished = true; // CCC #716 I2: COMMIT is next
       });
       committed = true; // CCC #716 I2
 
@@ -598,9 +600,11 @@ export class FileImportTaskService {
       }
     } catch (error) {
       this.logger.error('Failed to import files:', error);
-      // CCC #716 I2: the rolled-back pages' attachment rows and objects were written outside the transaction (only pages
-      // that do not exist: an ambiguous COMMIT failure may have committed them)
-      if (!committed) await queueRolledBackImportAttachmentDeletion(this.db, this.attachmentQueue, [...attempted], this.logger);
+      // CCC #716 I2: the attachment rows and objects were written outside the transaction. Deleted only when the rollback
+      // is certain (the callback threw, COMMIT was never sent); a failure at or after COMMIT may have committed: kept.
+      if (!committed) {
+        await queueRolledBackImportAttachmentDeletion(this.attachmentQueue, [...attempted], { bodyFinished: txBodyFinished }, this.logger);
+      }
       throw importTaskError(error, { file: currentFile, logger: this.logger }); // CCC #643
     }
   }

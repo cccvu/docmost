@@ -1,45 +1,38 @@
 /**
  * CCC integration — NOT upstream Docmost code (#716 I2, seam #176).
  *
- * After a zip import failed before its transaction was KNOWN to commit, queue the attachment deletion (objects and
- * rows, which `processAttachments` wrote outside the transaction) of every attempted page that does not exist. Only
- * the absent ones: a COMMIT can fail ambiguously (the connection reset after the server committed), and then pages that
- * did commit must keep their attachments. Page ids are fresh v7s minted by this import, so "the row exists" means "it
- * committed".
+ * `ImportAttachmentService` writes attachment rows and objects OUTSIDE the zip import's transaction, so a rolled-back
+ * import leaves both behind. This queues their deletion (the same job, id and retry as `forceDelete`) ONLY when the
+ * rollback is certain, and otherwise deletes nothing. Deleting a committed page's attachments cannot be undone; leaking
+ * a rolled-back page's files only costs storage (what upstream always did).
  *
- * If the existence check itself fails, nothing is deleted (logged): leaking a rolled-back page's files is recoverable,
- * deleting a committed page's attachments is not.
+ * The caller says how far the transaction got (`bodyFinished`):
+ * - `false`: the transaction callback threw, so Kysely rolled it back and COMMIT was never sent. No attempted page
+ *   can exist (their ids are fresh v7s minted by this import), so every attempted page's attachments are queued.
+ * - `true`: the callback finished, so the failure came from COMMIT or after it was sent. The server may have
+ *   committed (a reset or timeout after COMMIT), so the outcome is unknown: nothing is queued, and one
+ *   `IMPORT_ROLLBACK_CLEANUP outcome=unknown cleanup=skipped` line is logged. A "do the pages exist?" read cannot
+ *   settle it: it can run before the commit becomes visible.
  */
 import type { Logger } from '@nestjs/common';
 import type { Queue } from 'bullmq';
-import type { KyselyDB } from '@docmost/db/types/kysely.types';
 import { queuePageAttachmentDeletion } from '../../authz/page-delete/page-attachment-jobs';
 
-const CHUNK = 1000;
-
 export async function queueRolledBackImportAttachmentDeletion(
-  db: KyselyDB,
   queue: Queue,
   attemptedPageIds: readonly string[],
-  logger: Pick<Logger, 'error'>,
+  tx: { bodyFinished: boolean },
+  logger: Pick<Logger, 'error' | 'warn' | 'log'>,
 ): Promise<void> {
   if (attemptedPageIds.length === 0) return;
-  const existing = new Set<string>();
-  try {
-    for (let i = 0; i < attemptedPageIds.length; i += CHUNK) {
-      const rows = await db
-        .selectFrom('pages')
-        .select('id')
-        .where('id', 'in', attemptedPageIds.slice(i, i + CHUNK) as string[])
-        .execute();
-      for (const r of rows) existing.add(r.id);
-    }
-  } catch (err) {
-    logger.error(
-      `PAGE_ATTACHMENT_CLEANUP_ENQUEUE_FAILED import: could not tell which of ${attemptedPageIds.length} attempted pages committed, so none of their attachments were queued for deletion: ${(err as Error).message}`,
+  if (tx.bodyFinished) {
+    logger.warn(
+      `IMPORT_ROLLBACK_CLEANUP outcome=unknown cleanup=skipped pages=${attemptedPageIds.length}: the import failed at or after COMMIT, so it may have committed; none of the attachments it uploaded were queued for deletion (a rolled-back page's files are left in storage)`,
     );
     return;
   }
-  const absent = attemptedPageIds.filter((id) => !existing.has(id));
-  await queuePageAttachmentDeletion(queue, absent, logger as Logger);
+  logger.log(
+    `IMPORT_ROLLBACK_CLEANUP outcome=rolled_back cleanup=queued pages=${attemptedPageIds.length}: the import's transaction rolled back before COMMIT; the attachments it uploaded are queued for deletion`,
+  );
+  await queuePageAttachmentDeletion(queue, attemptedPageIds, logger as Logger);
 }

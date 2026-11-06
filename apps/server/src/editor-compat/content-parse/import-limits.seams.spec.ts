@@ -177,21 +177,29 @@ describe('#643 zip import (seam #176)', () => {
         },
       }),
     };
+    // #716 I2: `commitError` stands for a failure raised BY the COMMIT (a reset or timeout after it was sent): the
+    // callback ran to its end, then the transaction rejected. The server may have committed.
+    let commitError: Error | null = null;
+    const failCommit = (e: Error) => (commitError = e);
     const db = {
       selectFrom: jest.fn(() => {
-        // #716 I2: `execute` is the rollback's "which attempted pages exist?" check (none, by default: rolled back).
+        // `execute` would answer "these pages do not exist" — the rollback must never rely on such a read.
         const q: any = {
           select: () => q,
           where: () => q,
           executeTakeFirst: async () => ({ slug: 's' }),
-          execute: async () => existingPages(),
+          execute: async () => [],
         };
         return q;
       }),
-      transaction: jest.fn(() => ({ execute: (fn: (t: unknown) => unknown) => fn(trx) })),
+      transaction: jest.fn(() => ({
+        execute: async (fn: (t: unknown) => unknown) => {
+          const out = await fn(trx);
+          if (commitError) throw commitError;
+          return out;
+        },
+      })),
     };
-    let existingPages: () => Array<{ id: string }> = () => [];
-    const setExisting = (f: () => Array<{ id: string }>) => (existingPages = f);
     const importAttachmentService = { processAttachments: jest.fn(async ({ html }: { html: string }) => html) };
     const importService = {
       processHTML: jest.fn(async () => DOC),
@@ -216,7 +224,7 @@ describe('#643 zip import (seam #176)', () => {
     const fileTask = { id: 'task-1', source: 'generic', spaceId: 'space-1', workspaceId: 'ws-1', creatorId: 'user-1' };
     const run = () => service.processGenericImport({ extractDir, fileTask: fileTask as any });
     const setAudit = (audit: unknown) => ((service as any).auditService = audit);
-    return { db, importAttachmentService, importService, logger, run, attachmentQueue, inserted, setAudit, setExisting };
+    return { db, importAttachmentService, importService, logger, run, attachmentQueue, inserted, setAudit, failCommit };
   };
 
   it('refuses an oversize page file by its path in the archive, before the transaction and any upload', async () => {
@@ -359,31 +367,30 @@ describe('#643 zip import (seam #176)', () => {
     expect(t.attachmentQueue.add).not.toHaveBeenCalled();
   });
 
-  it('#716 I2: an ambiguous COMMIT failure (the pages exist) deletes only the attachments of pages that do not', async () => {
+  it('#716 I2: a failure raised by COMMIT deletes NOTHING, even though the pages look absent (the outcome is unknown)', async () => {
     write('docs/a.html', '<p>a</p>');
     write('docs/b.html', '<p>b</p>');
     const t = setup();
-    // The transaction "fails" after the server committed page a only (stands for a reset on COMMIT).
-    t.importService.processHTML.mockResolvedValueOnce(DOC).mockRejectedValueOnce(new Error('connection reset'));
-    t.setExisting(() => [{ id: (t.importAttachmentService.processAttachments.mock.calls[0][0] as unknown as { pageId: string }).pageId }]);
-    await t.run().catch(() => undefined);
-    const [committedId, rolledBackId] = t.importAttachmentService.processAttachments.mock.calls.map(
-      (c) => (c[0] as unknown as { pageId: string }).pageId,
+    t.failCommit(new Error('Connection terminated unexpectedly')); // the reset arrived after COMMIT was sent
+    const err = await t.run().catch((e) => e);
+    expect(err).toBeInstanceOf(ImportTaskFailure);
+    expect(t.importAttachmentService.processAttachments).toHaveBeenCalledTimes(2); // both pages uploaded files
+    expect(t.attachmentQueue.add).not.toHaveBeenCalled();
+    expect(t.logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('IMPORT_ROLLBACK_CLEANUP outcome=unknown cleanup=skipped pages=2'),
     );
-    expect((t.attachmentQueue.add.mock.calls as unknown[][]).map((c) => (c[1] as { pageId: string }).pageId)).toEqual([rolledBackId]);
-    expect(committedId).not.toBe(rolledBackId);
   });
 
-  it('#716 I2: when the existence check fails, nothing is deleted (logged): leaking beats deleting real attachments', async () => {
+  it('#716 I2: a certain rollback decides from the transaction alone, never from a "which pages exist?" read', async () => {
     write('docs/a.html', '<p>a</p>');
     const t = setup();
     t.importService.processHTML.mockRejectedValueOnce(new Error('boom'));
-    t.setExisting(() => {
-      throw new Error('db down');
-    });
     await expect(t.run()).rejects.toBeInstanceOf(ImportTaskFailure);
-    expect(t.attachmentQueue.add).not.toHaveBeenCalled();
-    expect(t.logger.error).toHaveBeenCalledWith(expect.stringContaining('PAGE_ATTACHMENT_CLEANUP_ENQUEUE_FAILED import:'));
+    expect(t.attachmentQueue.add).toHaveBeenCalledTimes(1);
+    expect(t.db.selectFrom.mock.calls.map((c: unknown[]) => c[0])).not.toContain('pages');
+    expect(t.logger.log).toHaveBeenCalledWith(
+      expect.stringContaining('IMPORT_ROLLBACK_CLEANUP outcome=rolled_back cleanup=queued pages=1'),
+    );
   });
 
   it('#716 I2: a failing queue never masks the import error (logged, best effort)', async () => {
