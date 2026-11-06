@@ -7,15 +7,15 @@ const { parentPort, workerData } = require('node:worker_threads');
 if (workerData && workerData.mode === 'throw-on-load') throw new Error('fixture: failed to load');
 
 /**
- * #734: call `done` once at least `ms` have passed on `Date.now()`, the clock the pool charges with. A bare
- * setTimeout(ms) can fire about 1 ms early by that clock (libuv starts the timer from its cached, ms-truncated loop
- * time), so a 60 ms sleep was sometimes charged 59 and the "charged at least <ms>" specs flaked. The pool's own clock
- * starts before it posts the request, so ending at or after `until` makes the conversion it measures ≥ `ms`.
+ * #734: call `done` once at least `ms` have passed on the monotonic clock (`performance.now()`), the clock the pool
+ * charges with. A bare setTimeout(ms) can fire about 1 ms early (libuv starts the timer from its cached, ms-truncated
+ * loop time), so a 60 ms sleep was sometimes charged 59 and the "charged at least <ms>" specs flaked. The pool's own
+ * clock starts before it posts the request, so ending at or after `until` makes the conversion it measures ≥ `ms`.
  */
 function sleepAtLeast(ms, done) {
-  const until = Date.now() + ms;
+  const until = performance.now() + ms;
   const check = () => {
-    const left = until - Date.now();
+    const left = Math.ceil(until - performance.now());
     if (left > 0) setTimeout(check, left);
     else done();
   };

@@ -5,6 +5,7 @@
  * Run in CI via the `docmost-authz` job's jest glob (`… src/editor-compat …`).
  */
 import * as path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { Worker } from 'node:worker_threads';
 import { BadRequestException } from '@nestjs/common';
 import {
@@ -432,24 +433,58 @@ describe('#642 the per-principal worker-time budget', () => {
     );
   });
 
-  it('#734 a deadline timer that fires early re-arms: a conversion is never killed before its full deadline', async () => {
-    // A main-thread setTimeout can fire ~1 ms early by Date.now(); here every one fires 50 ms early, so the kill
-    // timer is only honored if it re-checks the elapsed time (without the re-arm: killed and charged at ~150 ms).
-    const deadlineMs = 200;
-    const { pool } = track(makePool({ deadlineMs, budgetCapacityMs: 10_000, budgetRefillMsPerMinute: 0 }));
-    await pool.parse('warm', 'html', q('background'));
+  /** Every main-thread setTimeout fires 50 ms early while `work` runs (a real one can fire ~1 ms early). */
+  const withEarlyTimers = async <T>(work: () => Promise<T>): Promise<T> => {
     const real = global.setTimeout;
     const early = jest
       .spyOn(global, 'setTimeout')
-      .mockImplementation(((fn: () => void, ms?: number) => real(fn, Math.max(0, (ms ?? 0) - 50))) as typeof setTimeout);
-    let err: unknown;
+      .mockImplementation(((fn: (...a: unknown[]) => void, ms?: number, ...args: unknown[]) =>
+        real(fn, Math.max(0, (ms ?? 0) - 50), ...args)) as typeof setTimeout);
     try {
-      err = await pool.parse('hang', 'html', q('user:A')).catch((e) => e);
+      return await work();
     } finally {
       early.mockRestore();
     }
+  };
+
+  it('#734 a deadline timer that fires early re-arms: a conversion is never killed before its full deadline', async () => {
+    // The kill timer is only honored if it re-checks the elapsed time (without the re-arm: killed and charged at
+    // ~150 ms).
+    const deadlineMs = 200;
+    const { pool } = track(makePool({ deadlineMs, budgetCapacityMs: 10_000, budgetRefillMsPerMinute: 0 }));
+    await pool.parse('warm', 'html', q('background'));
+    const err = await withEarlyTimers(() => pool.parse('hang', 'html', q('user:A')).catch((e) => e));
     expect(err).toBeInstanceOf(ContentTooComplexException);
     expect(pool.budgetLeft('user:A')).toBeLessThanOrEqual(10_000 - deadlineMs);
+  });
+
+  it('#734 a conversion that replies after the kill timer re-armed keeps its worker: the re-armed timer is cleared', async () => {
+    // 170 ms: past the first (early) timer at ~150 ms, so the reply lands while a re-armed one is pending.
+    const deadlineMs = 200;
+    const { pool, spawned } = track(makePool({ deadlineMs, budgetCapacityMs: 10_000, budgetRefillMsPerMinute: 0 }));
+    await pool.parse('warm', 'html', q('background'));
+    await expect(withEarlyTimers(() => pool.parse('sleep:170', 'html', q('user:A')))).resolves.toBeDefined();
+    await new Promise((r) => setTimeout(r, deadlineMs)); // a leftover timer would have fired by now
+    expect(spawned.length).toBe(1); // never discarded and replaced
+    await expect(pool.parse('after', 'html', q('background'))).resolves.toEqual({ type: 'doc', label: 'after' });
+  });
+
+  it('#734 a wall clock that steps backward neither postpones the kill nor undercharges it: the deadline is monotonic', async () => {
+    // ADR 0031: the deadline is the one bound on the single worker. Date.now() steps back 3 s just after dispatch
+    // (an NTP/chrony step); a kill decided on it would land at ~3.2 s and hold the worker for everyone that long.
+    const deadlineMs = 200;
+    const { pool } = track(makePool({ deadlineMs, budgetCapacityMs: 10_000, budgetRefillMsPerMinute: 0 }));
+    await pool.parse('warm', 'html', q('background'));
+    const step = setTimeout(() => (offset -= 3_000), 20); // `offset` steers this describe's Date.now spy
+    const started = performance.now();
+    const err = await pool.parse('hang', 'html', q('user:A')).catch((e) => e);
+    const took = performance.now() - started;
+    clearTimeout(step);
+    expect(offset).toBe(-3_000); // the step happened, mid-conversion
+    expect(err).toBeInstanceOf(ContentTooComplexException);
+    expect(took).toBeGreaterThanOrEqual(deadlineMs);
+    expect(took).toBeLessThan(deadlineMs + 1_500); // a postponed kill takes ≥ 3.2 s
+    expect(pool.budgetLeft('user:A')).toBeLessThanOrEqual(10_000 - deadlineMs); // charged its full deadline
   });
 
   it('an ordinary conversion is charged its wall time; exempt keys are never charged', async () => {
