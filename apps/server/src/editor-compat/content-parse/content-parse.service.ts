@@ -40,6 +40,7 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { Worker } from 'node:worker_threads';
 import {
   BadRequestException,
@@ -64,6 +65,11 @@ export type { ParseFormat } from './content-parse.worker';
 // #716 M7: the budget moved to conversion-budget.ts; re-exported so every existing import keeps working.
 export { ConversionBudget, ConversionBudgetExhaustedException, isBudgetExempt };
 export type { BatchBudgetTurn, ConversionBudgetLimits };
+
+/** #734: milliseconds since `from` on the monotonic clock (`performance.now()`), which a wall-clock step cannot move. */
+function elapsedSince(from: number): number {
+  return performance.now() - from;
+}
 
 export interface ContentParseLimits extends ConversionBudgetLimits {
   /** Wall-clock limit for one conversion, from the moment it is handed to a ready worker. */
@@ -369,8 +375,8 @@ export class ContentParsePool {
           this.budget.charge(budgetKey, run.ms, turn);
           if (reload) {
             // …and the reload it caused, once the replacement worker is ready.
-            const reloadFrom = Date.now();
-            void reload.then(() => this.budget.charge(budgetKey, Date.now() - reloadFrom, turn));
+            const reloadFrom = performance.now();
+            void reload.then(() => this.budget.charge(budgetKey, Math.ceil(elapsedSince(reloadFrom)), turn));
           }
           return this.settle(run.outcome, run.ms, deadlineMs, `principal=${principal} ${context} ms=${run.ms}`);
         } finally {
@@ -469,7 +475,10 @@ export class ContentParsePool {
       this.logger.error(`CONTENT_PARSE_WORKER_START_FAILED: ${(err as Error).message}; answered 503 engine_busy`);
       return { outcome: { ok: false, reason: 'unavailable' }, ms: 0, reload: null };
     }
-    const dispatched = Date.now();
+    // #734: one MONOTONIC clock for the deadline and the charge. The wall clock can step backward (NTP/chrony
+    // makestep, a host correction), which would postpone the kill by the step and hold the one worker past ADR 0031's
+    // bound, and would undercharge the conversion.
+    const dispatched = performance.now();
     return new Promise((resolve) => {
       const finish = (outcome: Outcome, discard: boolean) => {
         clearTimeout(timer);
@@ -478,7 +487,7 @@ export class ContentParsePool {
         worker.off('exit', onExit);
         worker.unref();
         const reload = discard ? this.replace(worker) : null;
-        resolve({ outcome, ms: Date.now() - dispatched, reload });
+        resolve({ outcome, ms: Math.ceil(elapsedSince(dispatched)), reload });
       };
       const onMessage = (m: WorkerMessage) => {
         if ('id' in m && m.id === req.id) finish(m, false);
@@ -487,10 +496,18 @@ export class ContentParsePool {
         finish({ ok: false, reason: err.code === 'ERR_WORKER_OUT_OF_MEMORY' ? 'heap' : 'crashed' }, true);
       const onExit = () => finish({ ok: false, reason: 'crashed' }, true);
       // The timer runs on this (main) thread, so it fires late by the event loop's lag; `lateMs` logs by how much.
-      const timer = setTimeout(
-        () => finish({ ok: false, reason: 'deadline', lateMs: Date.now() - dispatched - deadlineMs }, true),
-        deadlineMs,
-      );
+      // #734: it can also fire about 1 ms EARLY (libuv starts it from its cached, ms-truncated loop time), so it
+      // re-arms for the remainder: a conversion is never killed, or charged, before its full deadline, and, the clock
+      // being monotonic, never killed later than the deadline plus that lag.
+      let timer: NodeJS.Timeout;
+      const arm = (ms: number) => {
+        timer = setTimeout(() => {
+          const elapsed = elapsedSince(dispatched);
+          if (elapsed < deadlineMs) return arm(Math.ceil(deadlineMs - elapsed));
+          finish({ ok: false, reason: 'deadline', lateMs: Math.round(elapsed - deadlineMs) }, true);
+        }, ms);
+      };
+      arm(deadlineMs);
       worker.on('message', onMessage);
       worker.on('error', onError);
       worker.on('exit', onExit);
