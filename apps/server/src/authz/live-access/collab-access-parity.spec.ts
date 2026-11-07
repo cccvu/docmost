@@ -264,7 +264,7 @@ describe('collab access parity: decideCollabAccess ⇔ AuthenticationExtension.o
   it('#537 accepted asymmetry: a revoked session is DENY at connect, but the revalidator still ALLOWS the open socket', async () => {
     // The connect re-checks the collab token's session row; decideCollabAccess has no session fact, so an
     // already-open collab socket outlives a sign-out until it reconnects (account disable still force-closes it).
-    // This pins the residual so closing it (follow-up issue) is a deliberate change to both sides.
+    // This pins the residual so closing it (wiki-v2 issue 751) is a deliberate change to both sides.
     const c: Case = {
       name: 'revoked session',
       grants: { edit: true, view: true, pageView: true, pageEdit: true },
