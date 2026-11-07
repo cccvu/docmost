@@ -1,4 +1,5 @@
 import type { Editor } from "@tiptap/react";
+import type { MarkType, Node as PMNode } from "@tiptap/pm/model";
 
 /** The literal text inserted when a Link is requested with no word under the caret. */
 export const LINK_PLACEHOLDER = "link";
@@ -27,7 +28,10 @@ export interface LinkableSelectionResult {
  * button is usually clicked with a collapsed caret:
  *   - inside an existing link → select the whole link (edit / remove);
  *   - a real selection already exists → keep it;
- *   - caret inside a word → select that word;
+ *   - caret inside a word → select that word (never part of a link: a word
+ *     stops at a link's edge, at whitespace, and at any inline node);
+ *   - no word, but the caret touches a link's edge → select that whole link
+ *     (links are `inclusive: false`, so `isActive("link")` is false there);
  *   - caret in empty space → insert a "link" placeholder and select it.
  *
  * Returns the placeholder range (when one was inserted) so the caller can undo
@@ -47,7 +51,7 @@ export function ensureLinkableSelection(
   if (!selection.empty) return { placeholder: null };
 
   const $from = selection.$from;
-  const parentText = $from.parent.textContent;
+  const parentText = wordScanText($from.parent, editor.schema.marks.link);
   const offset = $from.parentOffset;
   const base = $from.start();
   const isWordChar = (ch: string | undefined) => !!ch && !/\s/.test(ch);
@@ -65,6 +69,19 @@ export function ensureLinkableSelection(
     return { placeholder: null };
   }
 
+  // No word, but the caret sits at a link's edge: edit that link
+  // (`extendMarkRange` looks at the node after the caret, then before it).
+  const linkType = editor.schema.marks.link;
+  if (
+    linkType &&
+    [$from.nodeBefore, $from.nodeAfter].some(
+      (node) => node?.isText && linkType.isInSet(node.marks),
+    )
+  ) {
+    editor.chain().extendMarkRange("link").run();
+    return { placeholder: null };
+  }
+
   // No word under the caret: insert a placeholder anchor and select it.
   const at = selection.from;
   editor
@@ -73,6 +90,24 @@ export function ensureLinkableSelection(
     .setTextSelection({ from: at, to: at + LINK_PLACEHOLDER.length })
     .run();
   return { placeholder: { from: at, to: at + LINK_PLACEHOLDER.length } };
+}
+
+/**
+ * The parent textblock's content as a string indexed 1:1 by `parentOffset`
+ * (#145), for the word scan above. `Node.textContent` cannot be used: an inline
+ * leaf (hard break, mention, status, inline math) takes one doc position but
+ * contributes no text, so every leaf before the caret would shift the range.
+ * Here each position that is not plain, unlinked text becomes "\n", which the
+ * scan treats as a boundary: an inline node, and linked text (so a word never
+ * partially overlaps an existing link).
+ */
+function wordScanText(parent: PMNode, linkType: MarkType | undefined): string {
+  let text = "";
+  parent.forEach((child) => {
+    const plain = child.isText && !(linkType && linkType.isInSet(child.marks));
+    text += plain ? child.text! : "\n".repeat(child.nodeSize);
+  });
+  return text;
 }
 
 /**

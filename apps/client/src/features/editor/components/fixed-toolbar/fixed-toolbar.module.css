@@ -100,6 +100,26 @@
       black calc(100% - 12px),
       transparent 100%
     );
+    /* CCC (#145): keep a focused or snapped control (and its 2px+2px focus
+       ring) clear of the 12px fade — arrow-key focus scrolls it 16px in. */
+    scroll-padding-inline: 16px;
+  }
+
+  .inner {
+    padding-inline: 16px;
+  }
+
+  /* CCC (#145): no fade over a keyboard-focused control at all. */
+  .fixedToolbar:has(:focus-visible) {
+    -webkit-mask-image: none;
+    mask-image: none;
+  }
+}
+
+/* CCC (#145): no animated scrolling for users who ask for reduced motion. */
+@media (prefers-reduced-motion: reduce) {
+  .fixedToolbar {
+    scroll-behavior: auto;
   }
 }
 

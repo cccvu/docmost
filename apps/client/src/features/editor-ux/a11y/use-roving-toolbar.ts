@@ -1,4 +1,4 @@
-import { RefObject, useEffect, useRef } from "react";
+import { RefObject, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 /**
  * CCC editor-UX (issue #135): ARIA roving-tabindex for the `role="toolbar"`.
@@ -16,9 +16,17 @@ import { RefObject, useEffect, useRef } from "react";
  * focusable controls and never fires while focus is inside a portaled menu
  * dropdown (that focus is outside the toolbar root), so Mantine's own menu
  * keyboard handling is untouched.
+ *
+ * #145: the effect keys on the toolbar ELEMENT, not the (stable) ref object,
+ * because the caller may render null until its editor exists (FixedToolbar on
+ * an Edit-default page load); and a MutationObserver re-assigns the tab stop
+ * when controls are disabled/enabled or added/removed, so the toolbar always
+ * has exactly one tab stop (a re-enabled Undo never becomes a second one, and a
+ * disabled active control never leaves it with none).
  */
 
 const FOCUSABLE = "button:not([disabled]), a[href], input:not([disabled])";
+const DISABLED = "button[disabled], input[disabled]";
 
 export function useRovingToolbar(
   ref: RefObject<HTMLElement | null>,
@@ -29,11 +37,20 @@ export function useRovingToolbar(
   // every render; if that were a dep, the effect would tear down + re-register
   // all listeners and reset the roving tab stop to the first control on every
   // toolbar re-render (frequent during editing) — losing the user's position.
+  // (Latest-ref pattern: written in an effect, never during render.)
   const onExitRef = useRef(onExit);
-  onExitRef.current = onExit;
+  useEffect(() => {
+    onExitRef.current = onExit;
+  });
+
+  // The element the ref currently points at, synced after every commit so the
+  // effect below runs when the toolbar mounts (or is replaced), not only once.
+  const [root, setRoot] = useState<HTMLElement | null>(null);
+  useLayoutEffect(() => {
+    if (ref.current !== root) setRoot(ref.current);
+  });
 
   useEffect(() => {
-    const root = ref.current;
     if (!root) return;
 
     const items = (): HTMLElement[] =>
@@ -48,9 +65,27 @@ export function useRovingToolbar(
       list.forEach((el) => {
         el.tabIndex = el === chosen ? 0 : -1;
       });
+      // A disabled control keeps -1 so it is not a second stop once re-enabled.
+      root.querySelectorAll<HTMLElement>(DISABLED).forEach((el) => {
+        el.tabIndex = -1;
+      });
     };
 
     setTabStops();
+
+    // Writes only tabIndex, which is not observed, so it cannot loop.
+    const observer = new MutationObserver(() =>
+      setTabStops(
+        root.querySelector<HTMLElement>('[tabindex="0"]:not([disabled])') ??
+          undefined,
+      ),
+    );
+    observer.observe(root, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ["disabled"],
+    });
 
     const onFocusIn = (e: FocusEvent) => {
       const target = e.target as HTMLElement;
@@ -100,9 +135,10 @@ export function useRovingToolbar(
     root.addEventListener("keydown", onKeyDown);
     document.addEventListener("keydown", onGlobalKeyDown);
     return () => {
+      observer.disconnect();
       root.removeEventListener("focusin", onFocusIn);
       root.removeEventListener("keydown", onKeyDown);
       document.removeEventListener("keydown", onGlobalKeyDown);
     };
-  }, [ref]);
+  }, [root]);
 }

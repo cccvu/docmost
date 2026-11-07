@@ -21,6 +21,7 @@ import { useEditorState } from "@tiptap/react";
 import { useTranslation } from "react-i18next";
 import { isEditorReady } from "@docmost/editor-ext";
 import classes from "./bubble-menu.module.css";
+import { getActiveHeadingLevel } from "@/features/editor-ux/toolbar/active-heading";
 
 interface NodeSelectorProps {
   editor: Editor | null;
@@ -56,6 +57,7 @@ export const NodeSelector: FC<NodeSelectorProps> = ({
         isHeading1: ctx.editor.isActive("heading", { level: 1 }),
         isHeading2: ctx.editor.isActive("heading", { level: 2 }),
         isHeading3: ctx.editor.isActive("heading", { level: 3 }),
+        headingLevel: getActiveHeadingLevel(ctx.editor), // CCC (#145): H4–H6
         isTaskItem: ctx.editor.isActive("taskItem"),
         isBlockquote: ctx.editor.isActive("blockquote"),
         isCodeBlock: ctx.editor.isActive("codeBlock"),
@@ -175,7 +177,9 @@ export const NodeSelector: FC<NodeSelectorProps> = ({
             aria-haspopup="menu"
             aria-expanded={isOpen}
           >
-            {t(activeItem?.name)}
+            {activeItem.name === "Multiple" && editorState?.headingLevel
+              ? t("Heading {{level}}", { level: editorState.headingLevel })
+              : t(activeItem?.name)}
           </Button>
         </Tooltip>
       </Popover.Target>

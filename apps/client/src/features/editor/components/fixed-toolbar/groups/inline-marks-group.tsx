@@ -18,30 +18,30 @@ import { useTranslation } from "react-i18next";
 import clsx from "clsx";
 import type { ToolbarState } from "../use-toolbar-state";
 import classes from "../fixed-toolbar.module.css";
-import { platformModifierLabel } from "@/lib/utils";
+import { shortcutHint } from "@/features/editor-ux/a11y/shortcut-hint";
 
 interface Props {
   editor: Editor;
   state: ToolbarState;
 }
 
-// CCC (issue #135): show the modifier in tooltips so users can learn the
-// shortcuts, and expose them to assistive tech via aria-keyshortcuts.
-const mod = platformModifierLabel; // "⌘" on Apple, "Ctrl" elsewhere
-const ariaMod = mod === "⌘" ? "Meta" : "Control";
-
 export const InlineMarksGroup: FC<Props> = ({ editor, state }) => {
   const { t } = useTranslation();
+  // CCC (issue #135): shortcut hints in tooltips + aria-keyshortcuts.
+  const bold = shortcutHint(t("Bold"), "B");
+  const italic = shortcutHint(t("Italic"), "I");
+  const underline = shortcutHint(t("Underline"), "U");
+  const strike = shortcutHint(t("Strikethrough"), "S", { shift: true });
 
   return (
     <ActionIcon.Group>
-      <Tooltip label={`${t("Bold")} · ${mod}B`} withArrow>
+      <Tooltip label={bold.tooltip} withArrow>
         <ActionIcon
           variant="subtle"
           color="dark"
           size="md"
           aria-label={t("Bold")}
-          aria-keyshortcuts={`${ariaMod}+B`}
+          aria-keyshortcuts={bold.ariaKeyshortcuts}
           aria-pressed={state.isBold}
           className={clsx({ [classes.active]: state.isBold })}
           onClick={() => editor.chain().focus().toggleBold().run()}
@@ -49,13 +49,13 @@ export const InlineMarksGroup: FC<Props> = ({ editor, state }) => {
           <IconBold size={16} />
         </ActionIcon>
       </Tooltip>
-      <Tooltip label={`${t("Italic")} · ${mod}I`} withArrow>
+      <Tooltip label={italic.tooltip} withArrow>
         <ActionIcon
           variant="subtle"
           color="dark"
           size="md"
           aria-label={t("Italic")}
-          aria-keyshortcuts={`${ariaMod}+I`}
+          aria-keyshortcuts={italic.ariaKeyshortcuts}
           aria-pressed={state.isItalic}
           className={clsx({ [classes.active]: state.isItalic })}
           onClick={() => editor.chain().focus().toggleItalic().run()}
@@ -63,13 +63,13 @@ export const InlineMarksGroup: FC<Props> = ({ editor, state }) => {
           <IconItalic size={16} />
         </ActionIcon>
       </Tooltip>
-      <Tooltip label={`${t("Underline")} · ${mod}U`} withArrow>
+      <Tooltip label={underline.tooltip} withArrow>
         <ActionIcon
           variant="subtle"
           color="dark"
           size="md"
           aria-label={t("Underline")}
-          aria-keyshortcuts={`${ariaMod}+U`}
+          aria-keyshortcuts={underline.ariaKeyshortcuts}
           aria-pressed={state.isUnderline}
           className={clsx({ [classes.active]: state.isUnderline })}
           onClick={() => editor.chain().focus().toggleUnderline().run()}
@@ -79,13 +79,13 @@ export const InlineMarksGroup: FC<Props> = ({ editor, state }) => {
       </Tooltip>
       {/* CCC (issue #135): strikethrough was hidden behind the chevron despite
           being a common, expected control — surfaced as a visible button. */}
-      <Tooltip label={`${t("Strikethrough")} · ${mod}⇧S`} withArrow>
+      <Tooltip label={strike.tooltip} withArrow>
         <ActionIcon
           variant="subtle"
           color="dark"
           size="md"
           aria-label={t("Strikethrough")}
-          aria-keyshortcuts={`${ariaMod}+Shift+S`}
+          aria-keyshortcuts={strike.ariaKeyshortcuts}
           aria-pressed={state.isStrike}
           className={clsx({ [classes.active]: state.isStrike })}
           onClick={() => editor.chain().focus().toggleStrike().run()}

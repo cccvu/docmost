@@ -139,6 +139,8 @@ const variantColorResolver: VariantColorsResolver = (input) => {
 export const theme = createTheme({
   primaryColor: "brandBlack",
   autoContrast: true,
+  // #145: honour the OS "reduce motion" setting in every Mantine transition.
+  respectReducedMotion: true,
   variantColorResolver,
   colors: {
     brandBlack,
