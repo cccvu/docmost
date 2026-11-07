@@ -43,4 +43,5 @@ export * from "./lib/base-embed";
 // and server schemas.
 export * from "./lib/ccc/typography";
 export * from "./lib/ccc/color"; // CCC #145: render-gated CccColor/CccHighlight (both schemas)
+export * from "./lib/ccc/align"; // CCC #145: render-gated CccTextAlign (both schemas)
 export * from "./lib/ccc/import"; // CCC #716 I7: the shared import page-file limit

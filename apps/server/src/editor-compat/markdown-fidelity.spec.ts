@@ -109,6 +109,9 @@ describe('==highlight== re-import (#145)', () => {
     ['**==b==**', '<strong><mark>b</mark></strong>'],
     ['==a `b==` c==', '<mark>a <code>b==</code> c</mark>'],
     ['==x== and ==y==', '<mark>x</mark> and <mark>y</mark>'],
+    ['==a \\== b==', '<mark>a == b</mark>'], // an escaped `==` does not close
+    ['==a`==`` b', '<mark>a`</mark>`` b'], // a longer backtick run does not close a shorter one
+    ['==a ==b==', '==a <mark>b</mark>'], // the closer search stops at the next opener
   ])('%s highlights', (input, html) => {
     expect(md(input)).toBe(`<p>${html}</p>\n`);
   });
@@ -137,6 +140,23 @@ describe('==highlight== re-import (#145)', () => {
     'para\n\n    ==x== indented code',
   ])('%j does not highlight', (input) => {
     expect(md(input)).not.toContain('<mark');
+  });
+
+  // Review of PR 754: every unclosed opener used to rescan to the end of the paragraph (quadratic), so ~120 KB of
+  // Markdown held the one shared conversion worker past its 7 s deadline. Linear, each takes tens of milliseconds;
+  // quadratic, each took 5–20 s. The budget is loose so a loaded runner cannot flake it.
+  it.each([
+    ['==a ', 30_000],
+    ['(==a ', 24_000],
+    ['a==b `c` ', 20_000],
+    ['a == b `c` ', 12_000],
+    ['==a `', 20_000],
+    ['=', 120_000],
+  ])('%j × %i stays linear', (unit, times) => {
+    const input = unit.repeat(times);
+    const started = performance.now();
+    md(input);
+    expect(performance.now() - started).toBeLessThan(1_500);
   });
 
   it('round-trips through the real paths; the colour is lossy (ADR 0012 §4)', () => {

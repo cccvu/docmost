@@ -11,8 +11,14 @@
  *  - the text may not start or end with a space or `=` (`a == b`, `===`), and the closing `==` may not be followed by
  *    `=` or a word character;
  *  - a closing `==` inside a code span or after a backslash does not count, and code spans / fenced code never reach
- *    this at all (marked consumes them first).
+ *    this at all (marked consumes them first);
+ *  - the search for a closer stops at the next `==` that could open a highlight itself, so `==a ==b==` highlights `b`.
  * The text inside is parsed as inline Markdown, so `==**bold** [link](…)==` keeps its marks.
+ *
+ * Linear time (review of PR 754): this runs on every Markdown write, import and paste, inside the one shared conversion
+ * worker. `start()` returns the next `==` and lets the tokenizer decide, so it never rescans the rest of the text, and
+ * the closer search ends at the next possible opener, so no two failed searches cover the same text. Before, every
+ * unclosed opener rescanned to the end of the paragraph: 120 KB of `==a ` took 8 s.
  */
 import type { Token, Tokens } from "marked";
 
@@ -37,7 +43,10 @@ function opensHere(src: string): boolean {
   return src.startsWith("==") && src.length > 2 && !SPACE_RE.test(src[2]) && src[2] !== "=";
 }
 
-/** Index of the closing `==` for `src` (which opens at 0), or -1. Skips escapes and code spans. */
+/**
+ * Index of the closing `==` for `src` (which opens at 0), or -1. Skips escapes and code spans, and gives up at the next
+ * `==` that could open a highlight (which the tokenizer then tries on its own), so each character is scanned once.
+ */
 function closingIndex(src: string): number {
   let i = 2;
   while (i < src.length) {
@@ -68,6 +77,8 @@ function closingIndex(src: string): number {
       if (end - i === 2 && i > 2 && !SPACE_RE.test(before) && before !== "=" && (after === undefined || !WORD_RE.test(after))) {
         return i;
       }
+      // A run of exactly two that opens here is the tokenizer's next attempt: stop, so no text is scanned twice.
+      if (end - i === 2 && opensAfter(before) && opensHere(src.slice(i, i + 3))) return -1;
       i = end;
       continue;
     }
@@ -79,16 +90,11 @@ function closingIndex(src: string): number {
 export const highlightExtension = {
   name: "highlight",
   level: "inline" as const,
+  // The next `==`, whether or not it opens: the tokenizer decides. Skipping non-openers here would rescan the rest of
+  // the text on every call (marked calls this again after each code span, link, …), which is quadratic.
   start(src: string): number | undefined {
-    let from = 0;
-    for (;;) {
-      const index = src.indexOf("==", from);
-      if (index === -1) return undefined;
-      // Index 0 has a previous character this function cannot see (marked passes the text after it): the tokenizer
-      // decides there.
-      if (opensHere(src.slice(index)) && (index === 0 || opensAfter(src[index - 1]))) return index;
-      from = index + 1;
-    }
+    const index = src.indexOf("==");
+    return index === -1 ? undefined : index;
   },
   tokenizer(this: { lexer: { inlineTokens(src: string): Token[] } }, src: string, tokens: Token[]): HighlightToken | undefined {
     if (!opensHere(src)) return undefined;

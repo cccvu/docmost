@@ -1,5 +1,6 @@
 import { TableCell as TiptapTableCell } from "@tiptap/extension-table";
 import { safeCssColor } from "../ccc/color/safe-css-color"; // CCC #145
+import { withSafeCellAlign } from "../ccc/align/cell-align"; // CCC #145
 
 export const TableCell = TiptapTableCell.extend({
   name: "tableCell",
@@ -8,7 +9,7 @@ export const TableCell = TiptapTableCell.extend({
 
   addAttributes() {
     return {
-      ...this.parent?.(),
+      ...withSafeCellAlign(this.parent?.()), // CCC #145: render-gated `align`
       backgroundColor: {
         default: null,
         parseHTML: (element) =>

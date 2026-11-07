@@ -1,5 +1,4 @@
 import { StarterKit } from '@tiptap/starter-kit';
-import { TextAlign } from '@tiptap/extension-text-align';
 import { Superscript } from '@tiptap/extension-superscript';
 import SubScript from '@tiptap/extension-subscript';
 import { Typography } from '@tiptap/extension-typography';
@@ -45,6 +44,7 @@ import {
   CccFontSize,
   CccFontFamily,
   CccColor, // CCC #145: render-gated (was @tiptap/extension-color)
+  CccTextAlign, // CCC #145: render-gated (was @tiptap/extension-text-align)
 } from '@docmost/editor-ext';
 import { generateText, getSchema, JSONContent } from '@tiptap/core';
 import { generateHTML, generateJSON } from '../common/helpers/prosemirror/html';
@@ -73,7 +73,7 @@ export const tiptapExtensions = [
     types: ['heading', 'paragraph', 'transclusionSource'],
   }),
   Comment,
-  TextAlign.configure({ types: ['heading', 'paragraph'] }),
+  CccTextAlign.configure({ types: ['heading', 'paragraph'] }), // CCC #145: render-gated
   Indent,
   TaskList,
   TaskItem.configure({

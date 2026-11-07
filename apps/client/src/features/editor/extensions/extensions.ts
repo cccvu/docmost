@@ -1,7 +1,6 @@
 import { markInputRule } from "@tiptap/core";
 import { StarterKit } from "@tiptap/starter-kit";
 import { Code } from "@tiptap/extension-code";
-import { TextAlign } from "@tiptap/extension-text-align";
 import { TaskList, TaskItem } from "@tiptap/extension-list";
 import { Placeholder, CharacterCount, UndoRedo } from "@tiptap/extensions";
 import { Superscript } from "@tiptap/extension-superscript";
@@ -64,6 +63,7 @@ import {
   CccFontSize,
   CccFontFamily,
   CccColor, // CCC #145: render-gated (was @tiptap/extension-color)
+  CccTextAlign, // CCC #145: render-gated (was @tiptap/extension-text-align)
 } from "@docmost/editor-ext";
 import {
   randomElement,
@@ -196,7 +196,7 @@ export const mainExtensions = [
     includeChildren: true,
     showOnlyWhenEditable: true,
   }),
-  TextAlign.configure({ types: ["heading", "paragraph"] }),
+  CccTextAlign.configure({ types: ["heading", "paragraph"] }), // CCC #145: render-gated
   // #345: skip normalizing indent on collaboration change-origin transactions (mirrors UniqueID) so an open
   // browser doesn't rewrite the indent of nodes authored elsewhere (API/MCP/another client).
   Indent.configure({
