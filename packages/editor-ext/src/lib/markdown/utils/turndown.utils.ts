@@ -1,6 +1,10 @@
 import * as _TurndownService from '@joplin/turndown';
 import * as TurndownPluginGfm from '@joplin/turndown-plugin-gfm';
 import { getBasename } from './basename';
+import { stripTableColgroups } from '../../ccc/markdown/strip-colgroup'; // CCC #145
+import { collapseTableCellBreaks } from '../../ccc/markdown/table-row-breaks'; // CCC #145
+import { taskItemMarkdown } from '../../ccc/markdown/task-item'; // CCC #145
+import { summaryOf, turndownElement } from '../../ccc/markdown/turndown-node'; // CCC #145
 
 // CJS/ESM interop: .default exists in Vite, not in NestJS
 const TurndownService = (_TurndownService as any).default || _TurndownService;
@@ -35,7 +39,8 @@ export function htmlToMarkdown(html: string): string {
     image,
     video,
   ]);
-  return turndownService.turndown(html).replaceAll('<br>', ' ');
+  // CCC #145: no <colgroup> (phantom header row); cell <br> → space in table rows only (literal <br> in code survives)
+  return collapseTableCellBreaks(turndownService.turndown(stripTableColgroups(html)));
 }
 
 function listParagraph(turndownService: _TurndownService) {
@@ -106,10 +111,9 @@ function taskList(turndownService: _TurndownService) {
         node.parentNode.nodeName === 'UL'
       );
     },
-    replacement: function (_content: string, node: HTMLInputElement) {
+    replacement: function (content: string, node: HTMLInputElement) {
       const isChecked = node.getAttribute('data-checked') === 'true';
-      const div = node.querySelector('div');
-      const text = div ? div.textContent.trim() : node.textContent.trim();
+      const text = taskItemMarkdown(content); // CCC #145: keep links, code, marks, nested tasks
 
       const prefix = `- ${isChecked ? '[x]' : '[ ]'} `;
 
@@ -128,18 +132,18 @@ function preserveDetail(turndownService: _TurndownService) {
       return node.nodeName === 'DETAILS';
     },
     replacement: function (_content: string, node: HTMLInputElement) {
-      const summary = node.querySelector(':scope > summary');
+      const summary = summaryOf(node); // CCC #145: no selector query (keeps the jsdom alive)
       let detailSummary = '';
 
       if (summary) {
-        detailSummary = `<summary>${turndownService.turndown(summary.innerHTML)}</summary>`;
+        detailSummary = `<summary>${turndownService.turndown(summary as HTMLElement)}</summary>`; // CCC #145: a node, no new JSDOM
       }
 
       const detailsContent = Array.from(node.childNodes)
         .filter((child) => child.nodeName !== 'SUMMARY')
         .map((child) =>
           child.nodeType === 1
-            ? turndownService.turndown((child as HTMLElement).outerHTML)
+            ? turndownElement(turndownService, child as HTMLElement) // CCC #145: a node, no new JSDOM
             : child.textContent,
         )
         .join('');

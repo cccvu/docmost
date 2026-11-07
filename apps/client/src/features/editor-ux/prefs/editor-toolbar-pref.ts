@@ -10,6 +10,14 @@
  *
  * Read from all three upstream sites (the editor mount, the bubble menu, and
  * the settings toggle) so the default can never drift between them.
+ *
+ * Deliberate exception (#145): the EE template editor
+ * (`ee/template/pages/template-editor.tsx`) keeps upstream's
+ * `editorToolbar ?? false`. Templates cannot be used in this deployment: the
+ * feature is never entitled, its nav entries are hidden, and no server code
+ * serves it (the server `src/ee` stays empty and there is no templates
+ * controller). Migrating it would add an upstream seam to dead EE code. If
+ * templates are ever enabled, switch that read to resolveEditorToolbarPref.
  */
 
 export const DEFAULT_EDITOR_TOOLBAR_ENABLED = true;

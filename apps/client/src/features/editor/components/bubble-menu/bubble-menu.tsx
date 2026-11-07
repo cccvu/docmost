@@ -225,6 +225,7 @@ export const EditorBubbleMenu: FC<EditorBubbleMenuProps> = (props) => {
                     size="lg"
                     radius="0"
                     aria-label={t(item.name)}
+                    aria-pressed={!!item.isActive()}
                     className={clsx({ [classes.active]: item.isActive() })}
                     style={{ border: "none" }}
                     onClick={() => isEditorReady(props.editor) && item.command()}

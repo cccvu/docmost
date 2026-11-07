@@ -13,6 +13,7 @@ import {
   shouldRemovePlaceholder,
   type PlaceholderRange,
 } from "./link-selection";
+import { shortcutHint } from "../a11y/shortcut-hint";
 import classes from "@/features/editor/components/fixed-toolbar/fixed-toolbar.module.css";
 
 /**
@@ -76,13 +77,17 @@ export const LinkGroup: FC<Props> = ({ editor }) => {
     }
   }, [showLinkMenu, editor]);
 
+  // #145: advertise Mod-K, which opens this panel on a text selection.
+  const hint = shortcutHint(t("Add link"), "K");
+
   return (
-    <Tooltip label={t("Add link")} withArrow>
+    <Tooltip label={hint.tooltip} withArrow>
       <ActionIcon
         variant="subtle"
         color="dark"
         size="md"
         aria-label={t("Add link")}
+        aria-keyshortcuts={hint.ariaKeyshortcuts}
         aria-pressed={isActive}
         className={clsx({ [classes.active]: isActive })}
         onClick={() => {

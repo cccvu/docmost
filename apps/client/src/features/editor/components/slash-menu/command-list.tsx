@@ -144,9 +144,9 @@ const CommandList = ({
         {(() => {
           let flatIndex = -1;
           return Object.entries(visibleItems).map(([category, categoryItems]) => (
-          <div key={category} role="group" aria-label={category}>
-            <Text c="dimmed" mb={4} fw={500} tt="capitalize">
-              {category}
+          <div key={category} role="group" aria-label={t(category)}>
+            <Text c="dimmed" mb={4} fw={500}>
+              {t(category)}
             </Text>
             {categoryItems.map((item: SlashMenuItemType) => {
               flatIndex += 1;

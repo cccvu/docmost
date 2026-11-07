@@ -40,7 +40,11 @@ export type ParseReply =
 
 export type WorkerMessage = { ready: true } | ParseReply;
 
-/** Upstream's export strip (export.service.ts, before #716): tables' `<colgroup>` has no Markdown form. */
+/**
+ * Upstream's export strip (export.service.ts, before #716): tables' `<colgroup>` has no Markdown form. Since #145
+ * editor-ext `htmlToMarkdown` strips it itself for every caller (`lib/ccc/markdown/strip-colgroup.ts`), so this is
+ * redundant but harmless (the strip is idempotent); kept so the export composition stays upstream's.
+ */
 const COLGROUP_RE = /<colgroup[^>]*>[\s\S]*?<\/colgroup>/gim;
 
 /** #716: the export's serialization of one page, on this thread. Pure: the real-worker spec compares it in-process. */

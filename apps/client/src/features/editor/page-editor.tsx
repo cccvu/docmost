@@ -27,12 +27,13 @@ import {
   collabExtensions,
   mainExtensions,
 } from "@/features/editor/extensions/extensions";
-import { useAtom, useAtomValue } from "jotai";
+import { useAtom, useAtomValue, useSetAtom } from "jotai";
 import useCollaborationUrl from "@/features/editor/hooks/use-collaboration-url";
 import { currentUserAtom } from "@/features/user/atoms/current-user-atom";
 import {
   currentPageEditModeAtom,
   pageEditorAtom,
+  showLinkMenuAtom,
   yjsConnectionStatusAtom,
   yjsSyncedAtom,
 } from "@/features/editor/atoms/editor-atoms";
@@ -78,6 +79,7 @@ import { extractPageSlugId, platformModifierKey } from "@/lib";
 import { FIVE_MINUTES } from "@/lib/constants.ts";
 import { PageEditMode } from "@/features/user/types/user.types.ts";
 import { searchSpotlight } from "@/features/search/constants.ts";
+import { modKOpensLinkPanel } from "@/features/editor-ux/toolbar/link-shortcut";
 import { useEditorScroll } from "./hooks/use-editor-scroll";
 import { EditorAiMenu } from "@/ee/ai/components/editor/ai-menu/ai-menu";
 import { EditorLinkMenu } from "@/features/editor/components/link/link-menu";
@@ -119,6 +121,7 @@ export default function PageEditor({
     yjsConnectionStatusAtom,
   );
   const [, setYjsSynced] = useAtom(yjsSyncedAtom);
+  const setShowLinkMenu = useSetAtom(showLinkMenuAtom); // CCC (#145): Mod-K on a selection
   const menuContainerRef = useRef(null);
   const { data: collabQuery, refetch: refetchCollabToken } = useCollabToken();
   const { isIdle, resetIdle } = useIdle(FIVE_MINUTES, { initialState: false });
@@ -305,13 +308,16 @@ export default function PageEditor({
           "aria-label": t("Page content"),
         },
         handleDOMEvents: {
-          keydown: (_view, event) => {
+          keydown: (view, event) => {
             if (platformModifierKey(event) && event.code === "KeyS") {
               event.preventDefault();
               return true;
             }
             if (platformModifierKey(event) && event.code === "KeyK") {
-              searchSpotlight.open();
+              // CCC (#145): a linkable text selection opens the link panel, else search (editor-ux/toolbar/link-shortcut).
+              event.preventDefault();
+              if (modKOpensLinkPanel(view.state, view.editable)) setShowLinkMenu(true);
+              else searchSpotlight.open();
               return true;
             }
             if (["ArrowUp", "ArrowDown", "Enter"].includes(event.key)) {
