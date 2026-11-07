@@ -101,7 +101,8 @@
       transparent 100%
     );
     /* CCC (#145): keep a focused or snapped control (and its 2px+2px focus
-       ring) clear of the 12px fade — arrow-key focus scrolls it 16px in. */
+       ring) clear of the 12px fade. focus() ignores this; the roving hook's
+       scrollIntoView after an arrow key honours it and scrolls 16px in. */
     scroll-padding-inline: 16px;
   }
 

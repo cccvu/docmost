@@ -1,7 +1,9 @@
 // #145: the roving-tabindex hook must (1) initialise when the toolbar element mounts AFTER the hook's first
 // render (FixedToolbar returns null until the page editor is in its atom, i.e. every Edit-default page load),
 // and (2) keep exactly one tab stop as controls are disabled / re-enabled (Undo/Redo start disabled; the font
-// menus disable inside a code block).
+// menus disable inside a code block), (3) scroll an arrow-key target fully into view (focus() alone ignores the
+// scroll container's scroll-padding, so at 375px a control just inside the edge kept a clipped focus ring), and
+// (4) make Alt+F10 return to the current roving stop (APG toolbar pattern), not always the first control.
 import {
   describe,
   it,
@@ -20,7 +22,17 @@ const offsetParentDescriptor = Object.getOwnPropertyDescriptor(
   HTMLElement.prototype,
   "offsetParent",
 );
+const scrollIntoViewDescriptor = Object.getOwnPropertyDescriptor(
+  HTMLElement.prototype,
+  "scrollIntoView",
+);
+const scrollIntoView = vi.fn();
 beforeAll(() => {
+  Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
+    configurable: true,
+    writable: true,
+    value: scrollIntoView,
+  });
   Object.defineProperty(HTMLElement.prototype, "offsetParent", {
     configurable: true,
     get() {
@@ -29,6 +41,13 @@ beforeAll(() => {
   });
 });
 afterAll(() => {
+  if (scrollIntoViewDescriptor)
+    Object.defineProperty(
+      HTMLElement.prototype,
+      "scrollIntoView",
+      scrollIntoViewDescriptor,
+    );
+  else delete (HTMLElement.prototype as Partial<HTMLElement>).scrollIntoView;
   if (offsetParentDescriptor)
     Object.defineProperty(
       HTMLElement.prototype,
@@ -36,7 +55,10 @@ afterAll(() => {
       offsetParentDescriptor,
     );
 });
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  scrollIntoView.mockClear();
+});
 
 interface HarnessProps {
   show?: boolean;
@@ -142,5 +164,84 @@ describe("useRovingToolbar", () => {
     rerender(<Harness />);
     await flushObservers();
     expect(tabStops()).toEqual(["B"]);
+  });
+
+  it("scrolls the newly focused control fully into view on ArrowRight / Home / End / ArrowLeft", () => {
+    render(<Harness />);
+    const nearest = { block: "nearest", inline: "nearest" };
+    const lastScrolled = () =>
+      scrollIntoView.mock.contexts[scrollIntoView.mock.contexts.length - 1];
+
+    button("A").focus();
+    scrollIntoView.mockClear();
+    fireEvent.keyDown(button("A"), { key: "ArrowRight" });
+    expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    expect(scrollIntoView).toHaveBeenLastCalledWith(nearest);
+    expect(lastScrolled()).toBe(button("B"));
+
+    fireEvent.keyDown(button("B"), { key: "End" });
+    expect(scrollIntoView).toHaveBeenLastCalledWith(nearest);
+    expect(lastScrolled()).toBe(button("C"));
+
+    fireEvent.keyDown(button("C"), { key: "Home" });
+    expect(scrollIntoView).toHaveBeenLastCalledWith(nearest);
+    expect(lastScrolled()).toBe(button("A"));
+
+    fireEvent.keyDown(button("A"), { key: "ArrowLeft" });
+    expect(scrollIntoView).toHaveBeenLastCalledWith(nearest);
+    expect(lastScrolled()).toBe(button("C"));
+    expect(scrollIntoView).toHaveBeenCalledTimes(4);
+  });
+
+  it("still moves focus where scrollIntoView is unavailable", () => {
+    const saved = HTMLElement.prototype.scrollIntoView;
+    delete (HTMLElement.prototype as Partial<HTMLElement>).scrollIntoView;
+    // jsdom does not rethrow a listener's exception; it reports it as a window "error" event (after focus moved).
+    const errors: unknown[] = [];
+    const onError = (e: ErrorEvent) => {
+      errors.push(e.error);
+      e.preventDefault();
+    };
+    window.addEventListener("error", onError);
+    try {
+      expect(HTMLElement.prototype.scrollIntoView).toBeUndefined();
+      render(<Harness />);
+      button("A").focus();
+      fireEvent.keyDown(button("A"), { key: "ArrowRight" });
+      expect(document.activeElement).toBe(button("B"));
+      expect(errors).toEqual([]);
+    } finally {
+      window.removeEventListener("error", onError);
+      HTMLElement.prototype.scrollIntoView = saved;
+    }
+  });
+
+  it("Alt+F10 returns to the current roving stop, not the first control", () => {
+    render(<Harness />);
+    button("A").focus();
+    fireEvent.keyDown(button("A"), { key: "ArrowRight" });
+    fireEvent.keyDown(button("B"), { key: "ArrowRight" });
+    expect(tabStops()).toEqual(["C"]);
+
+    button("C").blur();
+    expect(document.activeElement).toBe(document.body);
+    fireEvent.keyDown(document.body, { key: "F10", altKey: true });
+    expect(document.activeElement).toBe(button("C"));
+  });
+
+  it("Alt+F10 falls back to the first enabled control when the stop is disabled", async () => {
+    const { rerender } = render(<Harness />);
+    expect(tabStops()).toEqual(["A"]);
+
+    // Disable A and B in one commit; the observer reassigns the stop to C.
+    rerender(<Harness disabled={{ a: true, b: true }} />);
+    await flushObservers();
+    expect(tabStops()).toEqual(["C"]);
+
+    // Strip every stop (e.g. a stale DOM before the observer runs): fall back to the first enabled control.
+    button("C").tabIndex = -1;
+    rerender(<Harness disabled={{ a: true }} />);
+    fireEvent.keyDown(document.body, { key: "F10", altKey: true });
+    expect(document.activeElement).toBe(button("B"));
   });
 });

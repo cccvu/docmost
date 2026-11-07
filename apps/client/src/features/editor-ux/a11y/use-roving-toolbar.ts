@@ -10,7 +10,7 @@ import { RefObject, useEffect, useLayoutEffect, useRef, useState } from "react";
  *   - ← / →            → previous / next control;
  *   - Home / End       → first / last control;
  *   - Escape           → leave the toolbar (back to the editor via `onExit`);
- *   - Alt+F10 (global) → jump INTO the toolbar from the editor.
+ *   - Alt+F10 (global) → jump INTO the toolbar (to its current stop).
  *
  * Deliberately small and self-contained: it only manages the toolbar's own
  * focusable controls and never fires while focus is inside a portaled menu
@@ -118,15 +118,25 @@ export function useRovingToolbar(
           return;
       }
       e.preventDefault();
-      list[next]?.focus();
+      const target = list[next];
+      if (!target) return;
+      target.focus();
+      // focus() scrolls only as far as the control's border box and ignores the
+      // scroll container's `scroll-padding-inline`, so a control landing just
+      // inside the edge (e.g. at 375px) kept its 2px+2px focus ring clipped.
+      // scrollIntoView honours scroll-padding. Guarded: jsdom lacks it.
+      target.scrollIntoView?.({ block: "nearest", inline: "nearest" });
     };
 
     const onGlobalKeyDown = (e: KeyboardEvent) => {
       if (e.altKey && e.key === "F10") {
-        const first = items()[0];
-        if (first) {
+        // APG toolbar pattern: return to the current roving stop (the control
+        // with tabIndex 0), falling back to the first enabled control.
+        const list = items();
+        const target = list.find((el) => el.tabIndex === 0) ?? list[0];
+        if (target) {
           e.preventDefault();
-          first.focus();
+          target.focus();
         }
       }
     };
