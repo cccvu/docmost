@@ -7,7 +7,7 @@
  *
  * Kept narrow so ordinary text keeps its meaning:
  *  - the opening `==` must start the text or follow a space or punctuation, never a letter, digit, `_` or `=`
- *    (`a==b`, `if a==b and c==d`), checked in `start()` AND in the tokenizer, which sees the previous token;
+ *    (`a==b`, `if a==b and c==d`), checked by the tokenizer (see `charBefore`);
  *  - the text may not start or end with a space or `=` (`a == b`, `===`), and the closing `==` may not be followed by
  *    `=` or a word character;
  *  - a closing `==` inside a code span or after a backslash does not count, and code spans / fenced code never reach
@@ -16,8 +16,9 @@
  * The text inside is parsed as inline Markdown, so `==**bold** [link](…)==` keeps its marks.
  *
  * Linear time (review of PR 754): this runs on every Markdown write, import and paste, inside the one shared conversion
- * worker. `start()` returns the next `==` and lets the tokenizer decide, so it never rescans the rest of the text, and
- * the closer search ends at the next possible opener, so no two failed searches cover the same text. Before, every
+ * worker. `start()` returns the next `==` and lets the tokenizer decide, so it never rescans the rest of the text; the
+ * closer search ends at the next possible opener, so no two failed searches cover the same text; and the character
+ * before an opener is read without copying the text so far (`charBefore`). Before, every
  * unclosed opener rescanned to the end of the paragraph: 120 KB of `==a ` took 8 s.
  */
 import type { Token, Tokens } from "marked";
@@ -87,6 +88,22 @@ function closingIndex(src: string): number {
   return -1;
 }
 
+/**
+ * The source this tokenizer last saw, per inline run (marked's token array for it). marked calls the inline
+ * extensions at each position of a run, always with a suffix of the same string, so the character before `src` is
+ * the last one consumed since that call, read from the earlier suffix in O(1). Never read it from the previous
+ * token's `raw`: marked grows a text token with `+=`, and indexing that string copies all of it on every call, which
+ * made a long run quadratic.
+ */
+const lastSrc = new WeakMap<Token[], string>();
+
+function charBefore(src: string, earlier: string | undefined, tokens: Token[]): string | undefined {
+  if (earlier !== undefined && earlier.length > src.length) return earlier[earlier.length - src.length - 1];
+  if (tokens.length === 0) return undefined; // the start of the run
+  const raw = tokens[tokens.length - 1].raw; // first call on a run that already holds tokens: once per run
+  return raw ? raw[raw.length - 1] : undefined;
+}
+
 export const highlightExtension = {
   name: "highlight",
   level: "inline" as const,
@@ -97,9 +114,10 @@ export const highlightExtension = {
     return index === -1 ? undefined : index;
   },
   tokenizer(this: { lexer: { inlineTokens(src: string): Token[] } }, src: string, tokens: Token[]): HighlightToken | undefined {
+    const earlier = lastSrc.get(tokens);
+    lastSrc.set(tokens, src);
     if (!opensHere(src)) return undefined;
-    const prevRaw = tokens.length > 0 ? tokens[tokens.length - 1].raw : "";
-    if (!opensAfter(prevRaw ? prevRaw[prevRaw.length - 1] : undefined)) return undefined;
+    if (!opensAfter(charBefore(src, earlier, tokens))) return undefined;
     const close = closingIndex(src);
     if (close === -1) return undefined;
     const text = src.slice(2, close);

@@ -142,22 +142,35 @@ describe('==highlight== re-import (#145)', () => {
     expect(md(input)).not.toContain('<mark');
   });
 
-  // Review of PR 754: every unclosed opener used to rescan to the end of the paragraph (quadratic), so ~120 KB of
-  // Markdown held the one shared conversion worker past its 7 s deadline. Linear, each takes tens of milliseconds;
-  // quadratic, each took 5–20 s. The budget is loose so a loaded runner cannot flake it.
+  // Review of PR 754: the reader was quadratic (every unclosed opener rescanned to the end of the paragraph), so
+  // ~120 KB of Markdown held the one shared conversion worker past its 7 s deadline. A wall-clock budget flakes on a
+  // loaded runner, so each input is measured against work done in the same moment: stock marked on the same input
+  // (marked has its own cost on code-span-heavy text) plus our reader on a benign input of the same length and
+  // shape (every highlight closes). Linear, the input stays within a small multiple of that; quadratic, it was 30–1000x.
+  const stockMarked = new (createRequire(require.resolve('@docmost/editor-ext'))('marked').Marked)();
+  const fastest = (convert: (s: string) => unknown, input: string): number =>
+    Math.min(
+      ...[0, 1].map(() => {
+        const started = performance.now();
+        convert(input);
+        return performance.now() - started;
+      }),
+    );
   it.each([
     ['==a ', 30_000],
     ['(==a ', 24_000],
     ['a==b `c` ', 20_000],
     ['a == b `c` ', 12_000],
     ['==a `', 20_000],
-    ['=', 120_000],
+    // Larger: reading the previous token's growing `raw` copied the whole run per `==`, quadratic past ~300 KB.
+    ['==a ', 120_000],
+    ['a==b ', 100_000],
   ])('%j × %i stays linear', (unit, times) => {
     const input = unit.repeat(times);
-    const started = performance.now();
-    md(input);
-    expect(performance.now() - started).toBeLessThan(1_500);
-  });
+    const benign = '==x== '.repeat(Math.ceil(input.length / 6));
+    const reference = fastest((s) => stockMarked.parse(s), input) + fastest(md, benign);
+    expect(fastest(md, input)).toBeLessThan(4 * reference + 20);
+  }, 60_000);
 
   it('round-trips through the real paths; the colour is lossy (ADR 0012 §4)', () => {
     const colored = doc(para(text('a '), text('hi', [{ type: 'highlight', attrs: { color: '#ffd43b' } }]), text(' b')));
