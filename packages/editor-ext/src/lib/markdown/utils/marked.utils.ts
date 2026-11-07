@@ -2,6 +2,7 @@ import { marked } from "marked";
 import { calloutExtension } from "./callout.marked";
 import { mathBlockExtension } from "./math-block.marked";
 import { mathInlineExtension } from "./math-inline.marked";
+import { highlightExtension } from "../../ccc/markdown/highlight.marked"; // CCC #145
 
 marked.use({
   renderer: {
@@ -34,7 +35,7 @@ marked.use({
 });
 
 marked.use({
-  extensions: [calloutExtension, mathBlockExtension, mathInlineExtension],
+  extensions: [calloutExtension, mathBlockExtension, mathInlineExtension, highlightExtension], // CCC #145: ==highlight==
 });
 
 marked.setOptions({ breaks: true });
