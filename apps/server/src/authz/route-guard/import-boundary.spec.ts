@@ -67,6 +67,7 @@ const SEAM_ALLOWLIST = new Set<string>([
   'integrations/import/services/import.service.ts', // seam #147 — imported Markdown/HTML converted via editor-compat/content-parse (#626)
   'integrations/import/services/file-import-task.service.ts', // seam #176 — zip-import Markdown converted via editor-compat/content-parse (#626); linear page levels via editor-compat/import (#716 I1); a rolled-back import queues its attachments' deletion via editor-compat/import/import-rollback (#716 I2)
   'integrations/export/export.service.ts', // seam #196 (#699, #716) — bounded export: content + attachments decided before the first byte, attachments streamed, pages serialized in the conversion worker inside one build deadline, via editor-compat/export
+  'collaboration/extensions/authentication.extension.ts', // seam #202 (#537) — the collab connect re-checks the collab token's session via authz/ws-connection/ws-connection-live (the same rule as /api and the notifications socket)
   'collaboration/extensions/persistence.extension.ts', // seam #390 — reconcile-before-store + store-failure signal via authz/page-write/{reconcile-store,store-failure-registry}
   'collaboration/server/collaboration.controller.ts', // seam #163 — CollabServiceSecretGuard on GET /collab/stats in the separate CollabAppModule process (#80)
   'core/casl/casl.module.ts', // seam #177 — mode-selected WorkspaceAbilityFactory via authz/mode/workspace-ability (remote: users.role confers no workspace authority, #636)

@@ -42,15 +42,25 @@ export class TokenService {
     return this.jwtService.sign(payload);
   }
 
-  async generateCollabToken(user: User, workspaceId: string): Promise<string> {
+  async generateCollabToken(
+    user: User,
+    workspaceId: string,
+    sessionId: string,
+  ): Promise<string> {
     if (isUserDisabled(user)) {
       throw new ForbiddenException();
+    }
+    // CCC (wiki-v2 #537, UPSTREAM_MODIFICATIONS #200): bind the collab token to the access token's session, so
+    // the collab connect re-checks that session row. Never mint an unbound one.
+    if (!sessionId) {
+      throw new UnauthorizedException();
     }
 
     const payload: JwtCollabPayload = {
       sub: user.id,
       workspaceId,
       type: JwtType.COLLAB,
+      sessionId,
     };
     const expiresIn = '24h';
     return this.jwtService.sign(payload, { expiresIn });

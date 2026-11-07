@@ -196,6 +196,7 @@ export default function PageEditor({
           socket.on("disconnect", reopen);
           socket.disconnect();
         }
+        return step;
       };
       const onAuthenticationFailedHandler = () => {
         // CCC (#501): judge the token the provider actually sent — a refresh updates remote.configuration.token,
@@ -204,17 +205,25 @@ export default function PageEditor({
           currentCollabToken(remote.configuration.token, collabQuery?.token),
           Date.now(),
         );
-        onCollabAccess({ kind: "auth-failed", tokenExpired: isTokenExpired });
-        if (isTokenExpired) {
+        // CCC (#537): an expiry, or the first other refusal, refetches the token once; a failed refetch is final.
+        const step = onCollabAccess({
+          kind: "auth-failed",
+          tokenExpired: isTokenExpired,
+        });
+        if (step.refreshToken) {
+          const refreshFailed = () =>
+            onCollabAccess({ kind: "refresh-failed" });
           refetchCollabToken().then((result) => {
-            if (result.data?.token) {
+            if (result.isSuccess && result.data?.token) {
               socket.disconnect();
               setTimeout(() => {
                 remote.configuration.token = result.data.token;
                 socket.connect();
               }, 100);
+            } else {
+              refreshFailed();
             }
-          });
+          }, refreshFailed);
         }
       };
       const remote = new HocuspocusProvider({

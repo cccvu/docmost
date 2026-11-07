@@ -34,6 +34,7 @@ const USER = '11111111-1111-4111-8111-111111111111';
 const WS = '22222222-2222-4222-8222-222222222222';
 const PAGE = '33333333-3333-4333-8333-333333333333';
 const SPACE = '44444444-4444-4444-8444-444444444444';
+const SID = '55555555-5555-4555-8555-555555555555';
 
 type Grants = Partial<
   Record<
@@ -49,6 +50,16 @@ interface Case {
   grants: Grants;
   pdpFails?: boolean;
   lineage?: 'open' | 'restricted' | 'error';
+  /** #537: the token's session row is gone (signed out / revoked); absent = live. */
+  sessionRevoked?: boolean;
+}
+
+/** #537: the connect re-reads the collab token's session row. Live unless the case revokes it. */
+function sessionsFor(c: Case) {
+  return {
+    findActiveById: async (id: string) =>
+      c.sessionRevoked ? undefined : { id, userId: USER, workspaceId: WS },
+  } as any;
 }
 
 /** The fork DB for the repo's #524 lineage walk: a one-row walk that ends at a root. */
@@ -100,11 +111,12 @@ const livePage = { id: PAGE, spaceId: SPACE, deletedAt: null };
 async function connectDecision(c: Case): Promise<CollabAccess> {
   const authz = authzFor(c) as any;
   const ext = new AuthenticationExtension(
-    { verifyJwt: async () => ({ sub: USER, workspaceId: WS }) } as any,
+    { verifyJwt: async () => ({ sub: USER, workspaceId: WS, sessionId: SID }) } as any,
     { findById: async () => (c.user === undefined ? liveUser : c.user) } as any,
     { findById: async () => (c.page === undefined ? livePage : c.page) } as any,
     new PdpSpaceMemberRepo({} as any, {} as any, {} as any, {} as any, authz),
     new PdpPagePermissionRepo(dbFor(c), {} as any, {} as any, authz),
+    sessionsFor(c),
   );
   const data = {
     documentName: `page.${PAGE}`,
@@ -249,6 +261,20 @@ describe('collab access parity: decideCollabAccess ⇔ AuthenticationExtension.o
     },
   );
 
+  it('#537 accepted asymmetry: a revoked session is DENY at connect, but the revalidator still ALLOWS the open socket', async () => {
+    // The connect re-checks the collab token's session row; decideCollabAccess has no session fact, so an
+    // already-open collab socket outlives a sign-out until it reconnects (account disable still force-closes it).
+    // This pins the residual so closing it (wiki-v2 issue 751) is a deliberate change to both sides.
+    const c: Case = {
+      name: 'revoked session',
+      grants: { edit: true, view: true, pageView: true, pageEdit: true },
+      sessionRevoked: true,
+    };
+    expect(await connectDecision(c)).toBe('deny');
+    expect(revalidateDecision(c)).toBe('write');
+    expect(await connectDecision({ ...c, sessionRevoked: false })).toBe('write');
+  });
+
   it('a PDP failure is DENY at connect (fail closed) but UNKNOWN on revalidation (no mass eviction)', async () => {
     const c: Case = {
       name: 'pdp down',
@@ -267,11 +293,12 @@ describe('collab access parity: decideCollabAccess ⇔ AuthenticationExtension.o
     };
     const authz = authzFor(c) as any;
     const ext = new AuthenticationExtension(
-      { verifyJwt: async () => ({ sub: USER, workspaceId: WS }) } as any,
+      { verifyJwt: async () => ({ sub: USER, workspaceId: WS, sessionId: SID }) } as any,
       { findById: async () => liveUser } as any,
       { findById: async () => livePage } as any,
       new PdpSpaceMemberRepo({} as any, {} as any, {} as any, {} as any, authz),
       new PdpPagePermissionRepo(dbFor(c), {} as any, {} as any, authz),
+      sessionsFor(c),
     );
     const data = { documentName: `page.${PAGE}`, token: 't', connectionConfig: { readOnly: false } } as any;
     await expect(ext.onAuthenticate(data)).rejects.toBeInstanceOf(ServiceUnavailableException);
