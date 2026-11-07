@@ -14,7 +14,8 @@ import { jwtDecode } from "jwt-decode";
  *     the token is bound to the session that minted it, so a refusal can mean that session ended while a newer
  *     one is live, e.g. the user signed in again); a second refusal with no successful authentication in
  *     between, or a refetch that fails, means access is lost: stop editing and show the connection-lost
- *     status. An expired token keeps upstream's refresh-and-retry;
+ *     status. An expired token refetches every time, as upstream did; a refetch that fails is lost there too
+ *     (upstream left that editor editable with nothing syncing);
  *   - a successful authentication → the server's scope decides whether the editor may edit.
  *
  * Pure and dependency-free so it is unit-tested without a provider; page-editor.tsx wires it (seam 169).

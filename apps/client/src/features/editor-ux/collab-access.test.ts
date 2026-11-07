@@ -96,7 +96,7 @@ describe("nextCollabAccess", () => {
     expect(collabAllowsEditing(failed.state)).toBe(false);
   });
 
-  it("an expired token keeps the upstream refresh path, every time, and is never lost", () => {
+  it("an expired token refetches every time and is not lost by the refusal itself", () => {
     const step = nextCollabAccess(initialCollabAccess, {
       kind: "auth-failed",
       tokenExpired: true,
@@ -111,6 +111,23 @@ describe("nextCollabAccess", () => {
     );
     expect(afterRefetch.refreshToken).toBe(true);
     expect(afterRefetch.state.lost).toBe(false);
+  });
+
+  it("a failed refetch after an expiry is lost too (upstream left the editor editable, syncing nothing)", () => {
+    const expired = nextCollabAccess(initialCollabAccess, {
+      kind: "auth-failed",
+      tokenExpired: true,
+    });
+    const failed = nextCollabAccess(expired.state, { kind: "refresh-failed" });
+    expect(failed.state.lost).toBe(true);
+    expect(failed.markDisconnected).toBe(true);
+    expect(collabAllowsEditing(failed.state)).toBe(false);
+    // and a successful authentication (e.g. the provider's own reconnect) clears it
+    const ok = nextCollabAccess(failed.state, {
+      kind: "authenticated",
+      scope: "read-write",
+    });
+    expect(collabAllowsEditing(ok.state)).toBe(true);
   });
 
   it("a demoted user re-authenticates read-only and can no longer edit", () => {
