@@ -203,8 +203,14 @@ export class AuthController {
   async collabToken(
     @AuthUser() user: User,
     @AuthWorkspace() workspace: Workspace,
+    @Req() req: FastifyRequest,
   ) {
-    return this.authService.getCollabToken(user, workspace.id);
+    // CCC (seam #87, wiki-v2 #537): the collab token names the session the access token carries.
+    return this.authService.getCollabToken(
+      user,
+      workspace.id,
+      (req.raw as any).sessionId,
+    );
   }
 
   @SessionScopedRoute() // native-auth allowlist (seam #87): stays reachable in remote — no native credential

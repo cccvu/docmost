@@ -31,23 +31,86 @@ describe("nextCollabAccess", () => {
     expect(step.reconnect).toBe(false);
   });
 
-  it("a refusal that is not a token expiry means access is lost: stop editing, show the lost status", () => {
+  // #537: the collab token is bound to the session that minted it, so the FIRST refusal refetches it once.
+  it("the first refusal that is not a token expiry refetches the token once and is NOT lost", () => {
     const step = nextCollabAccess(initialCollabAccess, {
       kind: "auth-failed",
       tokenExpired: false,
     });
-    expect(step.state.lost).toBe(true);
-    expect(step.markDisconnected).toBe(true);
-    expect(collabAllowsEditing(step.state)).toBe(false);
+    expect(step.refreshToken).toBe(true);
+    expect(step.state.lost).toBe(false);
+    expect(step.state.refreshed).toBe(true);
+    expect(step.markDisconnected).toBe(false);
+    expect(collabAllowsEditing(step.state)).toBe(true); // not decided yet
   });
 
-  it("an expired token keeps the upstream refresh path and changes nothing here", () => {
+  it("a refusal after that refetch (no authentication in between) means access is lost: stop editing, show the lost status", () => {
+    const first = nextCollabAccess(initialCollabAccess, {
+      kind: "auth-failed",
+      tokenExpired: false,
+    });
+    const second = nextCollabAccess(first.state, {
+      kind: "auth-failed",
+      tokenExpired: false,
+    });
+    expect(second.refreshToken).toBe(false); // no loop
+    expect(second.state.lost).toBe(true);
+    expect(second.markDisconnected).toBe(true);
+    expect(collabAllowsEditing(second.state)).toBe(false);
+    // and it stays final: a further refusal never refetches again
+    const third = nextCollabAccess(second.state, {
+      kind: "auth-failed",
+      tokenExpired: false,
+    });
+    expect(third.refreshToken).toBe(false);
+    expect(third.state.lost).toBe(true);
+  });
+
+  it("a successful authentication resets the refetch, so a later refusal refetches once again", () => {
+    const first = nextCollabAccess(initialCollabAccess, {
+      kind: "auth-failed",
+      tokenExpired: false,
+    });
+    const ok = nextCollabAccess(first.state, {
+      kind: "authenticated",
+      scope: "read-write",
+    });
+    expect(ok.state).toEqual(initialCollabAccess);
+    const later = nextCollabAccess(ok.state, {
+      kind: "auth-failed",
+      tokenExpired: false,
+    });
+    expect(later.refreshToken).toBe(true);
+    expect(later.state.lost).toBe(false);
+  });
+
+  it("a failed refetch means access is lost", () => {
+    const first = nextCollabAccess(initialCollabAccess, {
+      kind: "auth-failed",
+      tokenExpired: false,
+    });
+    const failed = nextCollabAccess(first.state, { kind: "refresh-failed" });
+    expect(failed.refreshToken).toBe(false);
+    expect(failed.state.lost).toBe(true);
+    expect(failed.markDisconnected).toBe(true);
+    expect(collabAllowsEditing(failed.state)).toBe(false);
+  });
+
+  it("an expired token keeps the upstream refresh path, every time, and is never lost", () => {
     const step = nextCollabAccess(initialCollabAccess, {
       kind: "auth-failed",
       tokenExpired: true,
     });
+    expect(step.refreshToken).toBe(true);
     expect(step.state).toEqual(initialCollabAccess);
     expect(step.markDisconnected).toBe(false);
+    // an expiry after a non-expiry refetch still refreshes and does not use up or end the state
+    const afterRefetch = nextCollabAccess(
+      { ...initialCollabAccess, refreshed: true },
+      { kind: "auth-failed", tokenExpired: true },
+    );
+    expect(afterRefetch.refreshToken).toBe(true);
+    expect(afterRefetch.state.lost).toBe(false);
   });
 
   it("a demoted user re-authenticates read-only and can no longer edit", () => {
@@ -55,16 +118,24 @@ describe("nextCollabAccess", () => {
       kind: "authenticated",
       scope: "readonly",
     });
-    expect(step.state).toEqual({ lost: false, readOnly: true });
+    expect(step.state).toEqual({
+      lost: false,
+      readOnly: true,
+      refreshed: false,
+    });
     expect(collabAllowsEditing(step.state)).toBe(false);
   });
 
   it("a read-write authentication (e.g. access restored) clears lost and read-only", () => {
     const step = nextCollabAccess(
-      { lost: true, readOnly: true },
+      { lost: true, readOnly: true, refreshed: true },
       { kind: "authenticated", scope: "read-write" },
     );
-    expect(step.state).toEqual({ lost: false, readOnly: false });
+    expect(step.state).toEqual({
+      lost: false,
+      readOnly: false,
+      refreshed: false,
+    });
     expect(collabAllowsEditing(step.state)).toBe(true);
   });
 });
@@ -83,11 +154,14 @@ describe("collab token expiry (the refreshed token, not the one captured at moun
   it("a refusal with a fresh refreshed token is NOT an expiry — so it reaches the lost state instead of looping", () => {
     const token = currentCollabToken(fresh, stale);
     expect(isCollabTokenExpired(token, now)).toBe(false);
-    const step = nextCollabAccess(initialCollabAccess, {
-      kind: "auth-failed",
+    const event = {
+      kind: "auth-failed" as const,
       tokenExpired: isCollabTokenExpired(token, now),
-    });
-    expect(step.state.lost).toBe(true);
+    };
+    // #537: one refetch, then lost — bounded, never a refetch loop.
+    const first = nextCollabAccess(initialCollabAccess, event);
+    expect(first.state.lost).toBe(false);
+    expect(nextCollabAccess(first.state, event).state.lost).toBe(true);
   });
 
   it("an expired, missing or unreadable token is an expiry (refresh it)", () => {

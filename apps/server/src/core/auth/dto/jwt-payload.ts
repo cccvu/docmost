@@ -20,6 +20,9 @@ export type JwtCollabPayload = {
   sub: string;
   workspaceId: string;
   type: 'collab';
+  // CCC (wiki-v2 #537, UPSTREAM_MODIFICATIONS #199): the access token's session. Optional in the type only:
+  // a token minted before #537 lacks it and is refused at connect.
+  sessionId?: string;
 };
 
 export type JwtExchangePayload = {
