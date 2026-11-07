@@ -9,6 +9,7 @@ import PasswordlessVerify from "@/pages/public/passwordless-verify.tsx";
 // The server is the source of truth (NATIVE_AUTH_ENABLED capability); the client only reflects it.
 import NativeLogin from "@/features/auth-native/pages/native-login.tsx";
 import { isNativeAuthEnabled } from "@/features/auth-native/lib/auth-mode.ts";
+import { isEnterpriseLoginEnabled } from "@/features/auth-native/lib/enterprise-login.ts";
 import Home from "@/pages/dashboard/home";
 import Page from "@/pages/page/page";
 import { Error404 } from "@/components/ui/error-404.tsx";
@@ -77,8 +78,16 @@ export default function App() {
         <Route path={"/login/verify"} element={<PasswordlessVerify />} />
         <Route path={"/request-access"} element={<RequestAccess />} />
         <Route path={"/invites/:invitationId"} element={<InviteSignup />} />
-        <Route path={"/login/mfa"} element={<MfaChallengePage />} />
-        <Route path={"/login/mfa/setup"} element={<MfaSetupRequiredPage />} />
+        {/* CCC seam (#133): EE MFA login is unsupported (ADR 0035). */}
+        {isEnterpriseLoginEnabled() && (
+          <>
+            <Route path={"/login/mfa"} element={<MfaChallengePage />} />
+            <Route
+              path={"/login/mfa/setup"}
+              element={<MfaSetupRequiredPage />}
+            />
+          </>
+        )}
 
         {!isCloud() && (
           <Route path={"/setup/register"} element={<SetupWorkspace />} />

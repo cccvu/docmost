@@ -18,9 +18,10 @@ import { JwtPayload } from '../../core/auth/dto/jwt-payload';
  * Account disable now sets `deactivatedAt` + revokes `user_sessions` on the shadow user, and this gate
  * makes the notifications plane honor it, closing the residual to the next (re)connection.
  *
- * Returns `true` iff the connection may proceed. The `sessionId` check is conditional exactly as in
- * `jwt.strategy`: platform-minted sessions always carry one; a token without a `sessionId` is gated on
- * `isUserDisabled` alone (never fail-open — a missing/expired/revoked session row is rejected).
+ * Returns `true` iff the connection may proceed. As in `jwt.strategy` (#133), every access token must carry a
+ * `sessionId` (the only mint, `SessionService.createSessionAndToken`, always sets one): a token without one is
+ * rejected, and a missing/expired/revoked or mismatched session row is rejected. `liveness-parity.spec.ts`
+ * pins the two planes in lockstep.
  */
 export async function isWsConnectionLive(
   userRepo: UserRepo,
@@ -31,15 +32,16 @@ export async function isWsConnectionLive(
   if (!user || isUserDisabled(user)) {
     return false;
   }
-  if (payload.sessionId) {
-    const session = await userSessionRepo.findActiveById(payload.sessionId);
-    if (
-      !session ||
-      session.userId !== payload.sub ||
-      session.workspaceId !== payload.workspaceId
-    ) {
-      return false;
-    }
+  if (!payload.sessionId) {
+    return false;
+  }
+  const session = await userSessionRepo.findActiveById(payload.sessionId);
+  if (
+    !session ||
+    session.userId !== payload.sub ||
+    session.workspaceId !== payload.workspaceId
+  ) {
+    return false;
   }
   return true;
 }

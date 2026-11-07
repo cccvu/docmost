@@ -77,12 +77,12 @@ describe('isWsConnectionLive (#455 notifications-socket liveness gate)', () => {
     await expect(isWsConnectionLive(wrongWs.userRepo, wrongWs.userSessionRepo, payload())).resolves.toBe(false);
   });
 
-  it('gates on isUserDisabled ONLY when the token carries no sessionId (mirrors jwt.strategy)', async () => {
-    const { userRepo, userSessionRepo } = repos({ user: liveUser, session: undefined });
+  it('rejects a token with no sessionId, even for a live user with a live session row (#133, mirrors jwt.strategy)', async () => {
+    const { userRepo, userSessionRepo } = repos({ user: liveUser, session: liveSession });
     await expect(
       isWsConnectionLive(userRepo, userSessionRepo, payload({ sessionId: undefined })),
-    ).resolves.toBe(true);
-    // No sessionId → the session row is never consulted (a legacy ACCESS token rides isUserDisabled alone).
+    ).resolves.toBe(false);
+    // Rejected on the token's shape alone: there is no session to look up.
     expect(userSessionRepo.findActiveById).not.toHaveBeenCalled();
   });
 });

@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { render, screen } from "@testing-library/react";
 import * as lazyPages from "./lazy-pages";
+import { isEnterpriseLoginEnabled } from "@/features/auth-native/lib/enterprise-login";
 
 const readSource = (relativeToThisFile: string): string =>
   readFileSync(fileURLToPath(new URL(relativeToThisFile, import.meta.url)), "utf8");
@@ -162,5 +163,38 @@ describe("lazy-pages (issue #309)", () => {
     const eager = new Set(staticImports.map(normalize));
     const collisions = lazied.map(normalize).filter((spec) => eager.has(spec));
     expect(collisions).toEqual([]);
+  });
+
+  // CCC #133 (ADR 0035): EE MFA login is unsupported, so the /login/mfa routes are registered only
+  // inside the isEnterpriseLoginEnabled() gate (false in every mode). The lazy exports stay pinned above.
+  it("App.tsx registers the /login/mfa routes only inside the isEnterpriseLoginEnabled() gate", () => {
+    const app = readSource("../../App.tsx");
+    expect(app).toMatch(
+      /^import\s*\{\s*isEnterpriseLoginEnabled\s*\}\s*from\s*["']@\/features\/auth-native\/lib\/enterprise-login(\.ts)?["'];/m,
+    );
+
+    const MFA_ROUTE = /path=\{\s*["']\/login\/mfa[^"']*["']\s*\}/g;
+    const gateStart = app.indexOf("{isEnterpriseLoginEnabled() && (");
+    expect(gateStart, "isEnterpriseLoginEnabled() route gate").not.toBe(-1);
+
+    // The gate's extent: from its "(" to the matching ")".
+    const open = app.indexOf("(", app.indexOf("&&", gateStart));
+    let depth = 0;
+    let close = -1;
+    for (let i = open; i < app.length; i++) {
+      if (app[i] === "(") depth++;
+      else if (app[i] === ")" && --depth === 0) {
+        close = i;
+        break;
+      }
+    }
+    expect(close).toBeGreaterThan(open);
+
+    const gated = app.slice(open, close);
+    const outside = app.slice(0, gateStart) + app.slice(close);
+    expect(gated.match(MFA_ROUTE)?.length ?? 0).toBe(2);
+    expect(outside.match(MFA_ROUTE) ?? []).toEqual([]);
+    // …and the gate is closed.
+    expect(isEnterpriseLoginEnabled()).toBe(false);
   });
 });
