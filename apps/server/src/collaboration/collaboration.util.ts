@@ -4,7 +4,6 @@ import { Superscript } from '@tiptap/extension-superscript';
 import SubScript from '@tiptap/extension-subscript';
 import { Typography } from '@tiptap/extension-typography';
 import { TextStyle } from '@tiptap/extension-text-style';
-import { Color } from '@tiptap/extension-color';
 import { Youtube } from '@tiptap/extension-youtube';
 import { TaskList, TaskItem } from '@tiptap/extension-list';
 import {
@@ -34,7 +33,7 @@ import {
   Embed,
   Mention,
   Subpages,
-  Highlight,
+  CccHighlight, // CCC #145: render-gated (was the stock-CSS Highlight)
   Indent,
   UniqueID,
   Columns,
@@ -45,6 +44,7 @@ import {
   BaseEmbed,
   CccFontSize,
   CccFontFamily,
+  CccColor, // CCC #145: render-gated (was @tiptap/extension-color)
 } from '@docmost/editor-ext';
 import { generateText, getSchema, JSONContent } from '@tiptap/core';
 import { generateHTML, generateJSON } from '../common/helpers/prosemirror/html';
@@ -82,11 +82,13 @@ export const tiptapExtensions = [
   LinkExtension,
   Superscript,
   SubScript,
-  Highlight,
+  CccHighlight,
   Typography,
   TrailingNode,
   TextStyle,
-  Color,
+  // CCC #145: Color/Highlight render their CSS only for a safe colour token;
+  // MUST stay in lockstep with the client schema (extensions.ts).
+  CccColor,
   // CCC controlled typography (issue #135) — attrs on the `textStyle` mark.
   // MUST stay registered in lockstep with the client schema (extensions.ts),
   // else these schema-bound paths (jsonToNode / rehydration / duplicate /

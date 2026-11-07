@@ -8,7 +8,6 @@ import { Superscript } from "@tiptap/extension-superscript";
 import SubScript from "@tiptap/extension-subscript";
 import { Typography } from "@tiptap/extension-typography";
 import { TextStyle } from "@tiptap/extension-text-style";
-import { Color } from "@tiptap/extension-color";
 import { Youtube } from "@tiptap/extension-youtube";
 import SlashCommand, {
   SlashCommandExtension as Command,
@@ -51,7 +50,7 @@ import {
   TableReadonlySort,
   Subpages,
   Heading,
-  Highlight,
+  CccHighlight, // CCC #145: render-gated (was the stock-CSS Highlight)
   Indent,
   UniqueID,
   SharedStorage,
@@ -64,6 +63,7 @@ import {
   BaseEmbed as BaseEmbedNode,
   CccFontSize,
   CccFontFamily,
+  CccColor, // CCC #145: render-gated (was @tiptap/extension-color)
 } from "@docmost/editor-ext";
 import {
   randomElement,
@@ -215,7 +215,7 @@ export const mainExtensions = [
   }),
   Superscript,
   SubScript,
-  Highlight.configure({
+  CccHighlight.configure({
     multicolor: true,
   }),
   Typography,
@@ -229,7 +229,9 @@ export const mainExtensions = [
     atomNodes: ["base"],
   }),
   TextStyle,
-  Color,
+  // CCC #145: Color/Highlight render their CSS only for a safe colour token;
+  // MUST stay in lockstep with the server schema (collaboration.util.ts).
+  CccColor,
   // CCC controlled typography (issue #135) — attrs on the `textStyle` mark.
   // MUST stay registered in lockstep with the server schema
   // (collaboration.util.ts), else the schema-bound server paths silently strip
