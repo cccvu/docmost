@@ -19,6 +19,7 @@ import "./i18n";
 import { PostHogAnalytics } from "@/features/analytics/posthog-analytics.tsx";
 import { loadBrandConfig } from "@/features/brand/brand-config.ts";
 import { prefetchCodeGrammarsWhenIdle } from "@/features/editor-ux/code-highlight/lowlight.ts";
+import { startNewVersionWatcher } from "@/features/layout/new-version-watcher.tsx";
 
 // #384: same defaults as before, plus one retry for the fork's short rate limit and a deduped 429 toast.
 export const queryClient = createAppQueryClient();
@@ -48,4 +49,6 @@ void loadBrandConfig().finally(() => {
   );
   // #407: fetch the lazy code grammars at the browser's first idle period, not only at editor mount.
   prefetchCodeGrammarsWhenIdle();
+  // #145: offer a reload once a newer build is confirmed live (no-op under the Vite dev server).
+  startNewVersionWatcher();
 });
