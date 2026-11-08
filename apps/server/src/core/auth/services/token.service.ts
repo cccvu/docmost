@@ -50,7 +50,7 @@ export class TokenService {
     if (isUserDisabled(user)) {
       throw new ForbiddenException();
     }
-    // CCC (wiki-v2 #537, UPSTREAM_MODIFICATIONS #200): bind the collab token to the access token's session, so
+    // CCC (wiki-v2 #537, UPSTREAM_MODIFICATIONS #211): bind the collab token to the access token's session, so
     // the collab connect re-checks that session row. Never mint an unbound one.
     if (!sessionId) {
       throw new UnauthorizedException();

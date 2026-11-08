@@ -56,7 +56,7 @@ export class AuthenticationExtension implements Extension {
       throw new UnauthorizedException();
     }
 
-    // CCC (wiki-v2 #537, UPSTREAM_MODIFICATIONS #202): the token's session must still be live, the same rule as
+    // CCC (wiki-v2 #537, UPSTREAM_MODIFICATIONS #213): the token's session must still be live, the same rule as
     // /api and the notifications socket. A failed read throws, which refuses the connection.
     if (
       !(await isWsConnectionLive(
