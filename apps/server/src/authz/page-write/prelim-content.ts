@@ -22,6 +22,12 @@
  *     null-prototype attrs object across marks and nodes, and `stableHash` collapses a repeated object.
  *   - a mark type that does not exclude itself (y-prosemirror names those `<mark>--<hash>`) is refused: the server
  *     schema has none, pinned by the parity spec, so this throw is unreachable until the schema changes.
+ *   - every string (text, attribute and format values, object keys) is made well-formed: a lone UTF-16 surrogate (half
+ *     an emoji) becomes U+FFFD. Yjs's encoder (`TextEncoder`) does that to text and attribute values, so a decoded
+ *     document never holds one; a raw insert would, and Postgres jsonb refuses its `fromYdoc` JSON on every store from
+ *     then on (#731 review). A FORMAT value is written as escaped JSON, so `toYdoc`'s round trip KEEPS a lone surrogate
+ *     there and poisons the page the same way; this build normalizes it too, the one place it differs from `toYdoc` in
+ *     content. Pinned by the parity spec's lone-surrogate case.
  */
 import * as Y from 'yjs';
 import { getSchema } from '@tiptap/core';
@@ -36,19 +42,26 @@ export function serverSchema(): Schema {
   return schema;
 }
 
-/** A value as Yjs's own decoder returns an attribute (`readAny`): arrays and objects copied, plain-prototype. */
+/** A string as Yjs's decoder returns it: a lone surrogate is U+FFFD (Node ≥ 20; the target lib predates the type). */
+const wellFormed = (s: string): string => (s as string & { toWellFormed(): string }).toWellFormed();
+
+/**
+ * A value as Yjs's own decoder returns an attribute (`readAny`): arrays and objects copied, plain-prototype, every
+ * string and key well-formed.
+ */
 function asDecodedAny(value: unknown): unknown {
+  if (typeof value === 'string') return wellFormed(value);
   if (Array.isArray(value)) return value.map(asDecodedAny);
   if (value !== null && typeof value === 'object' && !(value instanceof Uint8Array)) {
     const out: Record<string, unknown> = {};
-    for (const key of Object.keys(value)) out[key] = asDecodedAny((value as Record<string, unknown>)[key]);
+    for (const key of Object.keys(value)) out[wellFormed(key)] = asDecodedAny((value as Record<string, unknown>)[key]);
     return out;
   }
   return value;
 }
 
-/** A format value as Yjs's decoder returns it: `ContentFormat` is written as JSON. */
-const asDecodedFormat = (value: unknown): unknown => JSON.parse(JSON.stringify(value));
+/** A format value as Yjs's decoder returns it (`ContentFormat` is written as JSON), with its strings well-formed. */
+const asDecodedFormat = (value: unknown): unknown => asDecodedAny(JSON.parse(JSON.stringify(value)));
 
 function marksToAttributes(marks: readonly Mark[]): Record<string, unknown> {
   const attrs: Record<string, unknown> = {};
@@ -80,7 +93,7 @@ function normalizedContent(node: PMNode): Array<PMNode | PMNode[]> {
 
 function textType(nodes: PMNode[]): Y.XmlText {
   const type = new Y.XmlText();
-  type.applyDelta(nodes.map((n) => ({ insert: n.text, attributes: marksToAttributes(n.marks) })));
+  type.applyDelta(nodes.map((n) => ({ insert: wellFormed(n.text), attributes: marksToAttributes(n.marks) })));
   return type;
 }
 

@@ -349,6 +349,51 @@ describe('#731 a content write built as preliminary Yjs types equals the toYdoc 
     expect(parityFailures(json)).toEqual([]);
   });
 
+  it('a lone surrogate (half an emoji) is stored as U+FFFD, as a decoded document holds it — never raw', () => {
+    // A raw lone surrogate in the LIVE document puts one in its `fromYdoc` JSON, which Postgres jsonb refuses on every
+    // store until the page unloads (#731 review). Yjs's encoder writes U+FFFD for text and attribute values, so the
+    // reference build never held one there; compare against it exactly. Byte-level parity alone cannot see this: the
+    // encoder repairs the string on the way out. `parityFailures`' live comparison (in-memory vs decoded) does.
+    const lone = ['\ud83d', 'a\ude00b', 'x\ud83d', '\ude00\ud83d'];
+    const allWellFormed = (v: unknown): boolean =>
+      typeof v === 'string'
+        ? (v as string & { isWellFormed(): boolean }).isWellFormed()
+        : Array.isArray(v)
+          ? v.every(allWellFormed)
+          : v !== null && typeof v === 'object'
+            ? Object.entries(v).every(([k, x]) => allWellFormed(k) && allWellFormed(x))
+            : true;
+    const liveJson = (json: unknown) => {
+      const d = new Y.Doc();
+      insertInto(d, buildPrelimContent(json));
+      return fromYdoc(d);
+    };
+    for (const t of lone) {
+      // Text (one Y.XmlText run, with and without formatting) and element attribute values.
+      const json = {
+        type: 'doc',
+        content: [
+          { type: 'paragraph', content: [{ type: 'text', text: `p ${t}` }, { type: 'text', text: t, marks: [{ type: 'bold' }] }] },
+          { type: 'codeBlock', attrs: { language: t }, content: [{ type: 'text', text: t }] },
+          { type: 'heading', attrs: { level: 2, id: `h${t}` }, content: [{ type: 'text', text: 'h' }] },
+        ],
+      };
+      expect([t, parityFailures(json)]).toEqual([t, []]);
+      expect(allWellFormed(liveJson(json))).toBe(true);
+    }
+    // A FORMAT value (a mark's attributes) is written as escaped JSON, so the reference round trip KEEPS a lone
+    // surrogate there — the same poison. The build normalizes it: what it holds is the reference build of the
+    // well-formed input.
+    const linked = (href: string) => ({
+      type: 'doc',
+      content: [{ type: 'paragraph', content: [{ type: 'text', text: 'l', marks: [{ type: 'link', attrs: { href } }] }] }],
+    });
+    expect(allWellFormed(fromYdoc(decoded(referenceUpdate(linked('https://e.com/\ud83d')).update)))).toBe(false); // the old poison
+    expect(allWellFormed(liveJson(linked('https://e.com/\ud83d')))).toBe(true);
+    expect(liveJson(linked('https://e.com/\ud83d'))).toEqual(fromYdoc(decoded(referenceUpdate(linked('https://e.com/�')).update)));
+    expect(parityFailures(linked('https://e.com/�'))).toEqual([]);
+  });
+
   it('replace, append and prepend all build through it (one definition of the content a write inserts)', () => {
     const json = htmlToJson('<p>a <strong>b</strong> <a href="https://e.com">c</a></p><ul><li><p>d</p></li></ul>') as Json;
     const ref = decoded(referenceUpdate(json).update);
