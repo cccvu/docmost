@@ -31,7 +31,8 @@
  *     (conversion-budget.ts, #716 M7); an admitted batch is refused 429 once it overdraws past `batchOverdraftMs`
  *     (#716 I3). A human with no Docmost user converts under `identity:<platform id>` (#716 I6), never `background`.
  *   - small interactive inputs (#716): a non-batch conversion of at most `smallInputBytes` takes the worker ahead of
- *     larger waiters (an urgent turn, aged after `smallAgingMs` so a large waiter is never starved). That priority is
+ *     larger waiters (an urgent turn, aged after `smallAgingMs` so a large waiter is never starved, but never ahead of
+ *     a small one that has already waited out a large conversion, #731). That priority is
  *     all it gets: the same `deadlineMs` and `waitMs` as every other conversion (#716 load run: a 3 s deadline of its
  *     own killed a 17 KB page that took 3.3 s on a contended CPU, a non-retryable 422 for an ordinary edit). A killed
  *     conversion holds the worker until its replacement is ready, and the
@@ -119,12 +120,18 @@ export interface ContentParseLimits extends ConversionBudgetLimits {
  *     deadline 7 s, wait 8 s (a 32 KiB page converts in ~0.25 s here, ≤~1.2 s at Graviton × CFS contention; the #716
  *     load run saw a 17 KB page take 3.3 s on a contended CPU, which a 3 s small deadline answered 422). Worst case,
  *     the same as a large write's: wait 8 + reload ≤ 3.5 + deadline 7 = 18.5 s < the 20 s relay. A small write waits
- *     behind the running conversion (≤ 7 s + lag ≤ 8 s) and any small principals queued ahead of it; past the wait
- *     is 503 as before. Aging 3 s (`smallAgingMs`, a queue bound, not a deadline): a large waiter that has waited
- *     that long goes before any small one, so it waits at most 3 + one small conversion + lag (≤ 1 s) past the
- *     running one: within its own 8 s for every small conversion up to 4 s (~3× the contended measurement), reloads
- *     credited. A pathological small input that runs longer can push that one large waiter to a retryable 503; the
- *     budget bounds how often one principal can do that.
+ *     out at most ONE large conversion (≤ 7 s + lag ≤ 8 s, its reload credited), plus the small conversions of the
+ *     small principals queued ahead of it; past the wait is 503 as before. Aging 3 s (`smallAgingMs`, a queue bound,
+ *     not a deadline): a large waiter that has waited that long goes before a small one, so it waits at most 3 + one
+ *     small conversion + lag (≤ 1 s) past the running one: within its own 8 s for every small conversion up to 4 s
+ *     (~3× the contended measurement), reloads credited. A pathological small input that runs longer can push that
+ *     one large waiter to a retryable 503; the budget bounds how often one principal can do that.
+ *     #731: except a small write that has already waited out a large conversion, which goes first. Before, aging
+ *     granted the next aged large conversion ahead of it too, so whenever large conversions ran past 3 s (always, at
+ *     the A1 load) a small write waited the running one AND an aged one, past its 8 s (2.7% of A1's small writes were
+ *     503). Now a large waiter behind a large conversion also waits out the small writes queued behind that one (at
+ *     most one per small principal, each a small conversion), then goes; the small stream's rate never delays it
+ *     more, so it still never starves (op-semaphore.ts `agingMs`).
  *   - heap 1 GiB: that page needs ~384 MB; dense 1 MiB markup (99k nodes) 768 MB. The task has 4 GB (ADR 0031), and
  *     this must equal docmost's process-wide `--max-old-space-size` (check-infra-config §27 reads it from here).
  *   - nodes 100k: dense 1 MiB markup is 99k nodes, the real 1.25 MiB page 61k. It bounds what the main thread does
@@ -260,7 +267,8 @@ export class ContentParsePool {
     /** #642/#716 M7: the per-key worker-time budget (injectable with its own clock, for tests). */
     private readonly budget: ConversionBudget = new ConversionBudget(limits),
   ) {
-    // `smallAgingMs`: a large waiter that has waited that long is served before any small one (see CONTENT_PARSE_LIMITS).
+    // `smallAgingMs`: a large waiter that has waited that long is served before a small one, unless that small one has
+    // already waited out a large conversion (#731, see CONTENT_PARSE_LIMITS).
     // #716: a reload after a kill pauses the waiters' clocks (credited up to `reloadCreditMs` each), see `convert`.
     const pauseCreditMs = limits.reloadCreditMs;
     this.slot = new OpSemaphore(1, limits.waitMs, { agingMs: limits.smallAgingMs, pauseCreditMs });
