@@ -29,7 +29,10 @@ import {
 // write compares the LIVE document's digest (cross-service contract code, `stable-hash` beside its shared vectors),
 // memoized per document mutation (#716: one walk per state, not one per compare); a content operation's Yjs types are
 // built before the connection opens (#716, #731). Pure helpers in authz/; this file only calls them.
-import { liveContentDigest } from '../authz/page-write/doc-version';
+import {
+  liveContentDigest,
+  warmLiveContentDigest,
+} from '../authz/page-write/doc-version';
 import {
   insertAsOwnClient,
   PreparedContent,
@@ -301,6 +304,13 @@ export class CollaborationHandler {
           // — still pays `disconnect()`'s store, and so still reattributes that edit to the API caller.
           // No content is lost either way; the pre-check shrinks this from "every 412" to "a 412 that
           // races connection setup".
+          // #731 F4: a digest the memo does not hold (an edit since the settle) is computed first and the loop gets a
+          // turn, so that walk and the transaction are two blocks. The pre-check below then reads the memo, or
+          // recomputes if an edit landed in the yield. Nothing yields between the pre-check and the transaction.
+          const warm = expectedContentHash
+            ? hocuspocus.documents.get(documentName)
+            : undefined;
+          if (warm && warmLiveContentDigest(warm)) await yieldToEventLoop();
           const resident = expectedContentHash
             ? hocuspocus.documents.get(documentName)
             : undefined;

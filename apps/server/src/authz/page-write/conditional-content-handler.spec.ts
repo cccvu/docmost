@@ -727,21 +727,61 @@ describe('CollaborationHandler.conditionalUpdatePageContent — #716', () => {
     });
 
     it('no macrotask runs between the resident pre-check and the transaction callback', async () => {
+      // #731 F4: the first walk (the warm-up) is followed by a yield; an edit landing in it makes the pre-check walk
+      // again, and the tick that walk queues must come after the mutation.
       const order: string[] = [];
+      const { handler, doc } = build();
+      let first = true;
       fromYdoc.mockImplementation(() => {
         order.push('compare');
-        setImmediate(() => order.push('tick'));
+        if (first) {
+          first = false;
+          setImmediate(() => (order.push('edit'), doc.remoteEdit()));
+        } else setImmediate(() => order.push('tick'));
         return LIVE;
       });
-      const { handler, doc } = build();
       (doc.getXmlFragment as jest.Mock).mockImplementation(() => ({
         length: 0,
         delete: jest.fn(),
         insert: jest.fn(() => order.push('mutate')),
       }));
-      await handler(DOC, req({ expectedContentHash: stableHash(LIVE) }));
+      await expect(handler(DOC, req({ expectedContentHash: stableHash(LIVE) }))).resolves.toEqual({ applied: true });
       await new Promise((r) => setImmediate(r));
-      expect(order).toEqual(['compare', 'mutate', 'tick']);
+      expect(order).toEqual(['compare', 'edit', 'compare', 'mutate', 'tick']);
+    });
+
+    it('#731 F4: a cold digest is warmed, then a loop turn, then the pre-check (a memo hit) and the transaction', async () => {
+      const order: string[] = [];
+      const { handler, doc, hocuspocus } = build();
+      const get = hocuspocus.documents.get.bind(hocuspocus.documents);
+      hocuspocus.documents.get = ((name: string) => (order.push('get'), get(name))) as never;
+      fromYdoc.mockImplementation(() => {
+        order.push('walk');
+        setImmediate(() => order.push('tick'));
+        return LIVE;
+      });
+      const open = hocuspocus.openDirectConnection;
+      hocuspocus.openDirectConnection = jest.fn(async () => (order.push('open'), open()));
+      (doc.transact as jest.Mock).mockImplementation((f: () => void) => {
+        order.push('transaction');
+        try {
+          f();
+        } finally {
+          doc.remoteEdit();
+        }
+      });
+      await expect(handler(DOC, req({ expectedContentHash: stableHash(LIVE) }))).resolves.toEqual({ applied: true });
+      // warm (walk) → yield (tick) → pre-check (memo hit: no walk) → open → transaction (CAS: memo hit).
+      expect(order).toEqual(['get', 'walk', 'tick', 'get', 'open', 'transaction']);
+    });
+
+    it('#731 F4: a digest the memo already holds (the settle\'s) is not walked again by the warm-up', async () => {
+      const { handler, doc } = build();
+      const { liveContentDigest } = await import('./doc-version');
+      expect(liveContentDigest(doc as never)).toBe(stableHash(LIVE)); // the settle's digest
+      fromYdoc.mockClear();
+      await expect(handler(DOC, req({ expectedContentHash: stableHash(LIVE) }))).resolves.toEqual({ applied: true });
+      expect(fromYdoc).not.toHaveBeenCalled(); // warm-up, pre-check and CAS all hit (warmLiveContentDigest → false: no yield)
     });
 
     it('applies the pre-built content (nothing is built again inside the transaction): delete, then ONE insert', async () => {
