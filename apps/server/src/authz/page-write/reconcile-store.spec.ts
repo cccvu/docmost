@@ -2,7 +2,7 @@
 // CRDT merge semantics the fix depends on are actually exercised rather than mocked. Docs are modelled as a
 // root XmlFragment 'default' of paragraph elements, matching the shape TiptapTransformer produces.
 import * as Y from 'yjs';
-import { reconcileRowIntoDoc } from './reconcile-store';
+import { markRowCovered, reconcileRowIntoDoc } from './reconcile-store';
 
 function paragraph(text: string): Y.XmlElement {
   const el = new Y.XmlElement('paragraph');
@@ -104,5 +104,73 @@ describe('reconcileRowIntoDoc (#390 stale-doc clobber guard)', () => {
     expect(reconcileRowIntoDoc(resident, undefined as unknown as Buffer).merged).toBe(false);
     expect(reconcileRowIntoDoc(resident, Buffer.alloc(0)).merged).toBe(false);
     expect(Buffer.from(Y.encodeStateVector(resident))).toEqual(before);
+  });
+});
+
+// #731 — the reconcile memo: bytes a document is known to cover are not diffed again; anything else is.
+describe('reconcileRowIntoDoc memo (#731)', () => {
+  const spyDiff = () => jest.spyOn(Y, 'diffUpdate');
+  afterEach(() => jest.restoreAllMocks());
+
+  it('a hit: the second reconcile of the SAME bytes runs no diff (and still merges nothing)', () => {
+    const resident = docWith(['a', 'b']);
+    const row = rowBytesOf(resident);
+    const diff = spyDiff();
+    expect(reconcileRowIntoDoc(resident, row).merged).toBe(false);
+    expect(diff).toHaveBeenCalledTimes(1);
+    expect(reconcileRowIntoDoc(resident, Buffer.from(row)).merged).toBe(false); // equal bytes, another buffer
+    expect(diff).toHaveBeenCalledTimes(1);
+  });
+
+  it('a miss: different bytes (an out-of-band write) are diffed and folded in, then memoized', () => {
+    const resident = docWith(['a']);
+    reconcileRowIntoDoc(resident, rowBytesOf(resident)); // memo = the resident's own bytes
+    const row = new Y.Doc();
+    Y.applyUpdate(row, Y.encodeStateAsUpdate(resident));
+    row.getXmlFragment('default').insert(1, [paragraph('out-of-band')]);
+    const diff = spyDiff();
+    expect(reconcileRowIntoDoc(resident, rowBytesOf(row)).merged).toBe(true);
+    expect(resident.getXmlFragment('default').toString()).toContain('out-of-band');
+    expect(reconcileRowIntoDoc(resident, rowBytesOf(row)).merged).toBe(false);
+    expect(diff).toHaveBeenCalledTimes(1); // the merged result covers the row: the repeat is a hit
+  });
+
+  it('markRowCovered seeds it (the load, a store\'s own write); a memo is per document', () => {
+    const resident = docWith(['a']);
+    const own = rowBytesOf(resident);
+    markRowCovered(resident, own);
+    const diff = spyDiff();
+    expect(reconcileRowIntoDoc(resident, own).merged).toBe(false);
+    expect(diff).not.toHaveBeenCalled();
+    const other = docWith(['a']); // another document, the same bytes: no memo of its own
+    expect(reconcileRowIntoDoc(other, own).merged).toBe(true); // divergent lineage, folded in (see #390 edge)
+    expect(diff).toHaveBeenCalledTimes(1);
+  });
+
+  it('only the LAST covered bytes are memoized: earlier bytes diff again (one digest per document)', () => {
+    const resident = docWith(['a']);
+    const first = rowBytesOf(resident);
+    reconcileRowIntoDoc(resident, first);
+    resident.getXmlFragment('default').insert(1, [paragraph('b')]);
+    markRowCovered(resident, rowBytesOf(resident));
+    const diff = spyDiff();
+    expect(reconcileRowIntoDoc(resident, first).merged).toBe(false); // still covered, just not memoized
+    expect(diff).toHaveBeenCalledTimes(1);
+  });
+
+  it('never memoizes while the document holds pending structs (their bytes are encoded but not integrated)', () => {
+    const source = docWith(['a']);
+    source.getXmlFragment('default').insert(1, [paragraph('b')]);
+    const sv1 = Y.encodeStateVector(source);
+    source.getXmlFragment('default').insert(2, [paragraph('c')]);
+    const resident = new Y.Doc();
+    // Only the LAST change: it depends on structs the resident lacks, so it stays pending.
+    Y.applyUpdate(resident, Y.encodeStateAsUpdate(source, sv1));
+    expect((resident as any).store.pendingStructs).not.toBeNull();
+    const own = Buffer.from(Y.encodeStateAsUpdate(resident)); // includes the pending structs
+    markRowCovered(resident, own);
+    const diff = spyDiff();
+    reconcileRowIntoDoc(resident, own);
+    expect(diff).toHaveBeenCalledTimes(1);
   });
 });

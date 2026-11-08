@@ -47,15 +47,25 @@ jest.mock('@docmost/db/utils', () => ({
 }));
 
 const reconcileRowIntoDoc = jest.fn(() => ({ merged: false }));
+const markRowCovered = jest.fn();
 jest.mock('./reconcile-store', () => ({
   reconcileRowIntoDoc: (...a: unknown[]) => reconcileRowIntoDoc(...(a as [])),
+  markRowCovered: (...a: unknown[]) => markRowCovered(...(a as [])),
 }));
 const recordStoreFailure = jest.fn();
 const clearStoreFailure = jest.fn();
+// #731: the one-store-per-write skip (its logic is unit-tested in store-failure-registry.spec.ts and end to end,
+// with real Hocuspocus, in content-write-passes.spec.ts); here only the seam's call sites and their order.
+const isStoreCurrent = jest.fn((..._a: unknown[]) => false);
+const markStoredAt = jest.fn();
+const storeGenerationOf = jest.fn((..._a: unknown[]) => 7 as number | undefined);
 jest.mock('./store-failure-registry', () => ({
   recordStoreFailure: (...a: unknown[]) => recordStoreFailure(...(a as [])),
   clearStoreFailure: (...a: unknown[]) => clearStoreFailure(...(a as [])),
   hasStoreFailure: jest.fn(() => false),
+  isStoreCurrent: (...a: unknown[]) => isStoreCurrent(...(a as [])),
+  markStoredAt: (...a: unknown[]) => markStoredAt(...(a as [])),
+  storeGenerationOf: (...a: unknown[]) => storeGenerationOf(...(a as [])),
 }));
 const logStaleReconcile = jest.fn();
 const logStoreFailure = jest.fn();
@@ -100,6 +110,8 @@ describe('PersistenceExtension.onStoreDocument reconcile seam (#390)', () => {
     });
     jsonToText.mockReturnValue('text');
     reconcileRowIntoDoc.mockReturnValue({ merged: false });
+    isStoreCurrent.mockReturnValue(false);
+    storeGenerationOf.mockReturnValue(7);
     mockTx.inside = false;
     mockTx.serializeSawInside = undefined;
   });
@@ -185,6 +197,106 @@ describe('PersistenceExtension.onStoreDocument reconcile seam (#390)', () => {
   });
 });
 
+// #731 — one store per write. The skip and the generation mark are the only additions to the #390 seam; these pin
+// WHERE they sit (the conditions the ADR 0031 amendment rests on). The logic itself: store-failure-registry.spec.ts;
+// end to end with real Hocuspocus: content-write-passes.spec.ts.
+describe('PersistenceExtension.onStoreDocument one-store-per-write seam (#731)', () => {
+  const document = { broadcastStateless: jest.fn() };
+  const context = { user: { id: 'u1' } };
+  const ROW = { id: 'page-1', slugId: 's', content: { type: 'doc', content: [] }, ydoc: Buffer.from([9]), creatorId: 'c1' };
+
+  const build = (page: unknown, updateImpl?: () => Promise<unknown>) => {
+    const findById = jest.fn(async () => page);
+    const updatePage = jest.fn(updateImpl ?? (async () => undefined));
+    const collabHistory = { addContributors: jest.fn(async () => undefined) } as any;
+    const queue = { add: jest.fn(async () => undefined) } as any;
+    const transclusion = { syncPageTransclusions: jest.fn(async () => undefined), syncPageReferences: jest.fn(async () => undefined) } as any;
+    const ext = new PersistenceExtension({ findById, updatePage } as any, {} as any, queue, queue, queue, collabHistory, transclusion);
+    return { ext, findById, updatePage, collabHistory };
+  };
+  const run = (ext: PersistenceExtension) => ext.onStoreDocument({ documentName: 'page.1', document, context } as any);
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    fromYdoc.mockReturnValue({ type: 'doc', content: [{ type: 'paragraph' }] }); // ≠ ROW.content: a write
+    reconcileRowIntoDoc.mockReturnValue({ merged: false });
+    isStoreCurrent.mockReturnValue(false);
+    storeGenerationOf.mockReturnValue(7);
+  });
+
+  it('a current document skips the whole store: no row read, no write, contributors kept for the next store', async () => {
+    const { ext, findById, updatePage, collabHistory } = build(ROW);
+    await ext.onChange({ documentName: 'page.1', context: { user: { id: 'human' } } } as any);
+    isStoreCurrent.mockReturnValueOnce(true);
+    await expect(run(ext)).resolves.toBeUndefined();
+    expect(isStoreCurrent).toHaveBeenCalledWith(document);
+    expect(findById).not.toHaveBeenCalled();
+    expect(updatePage).not.toHaveBeenCalled();
+    expect(markStoredAt).not.toHaveBeenCalled();
+    expect(clearStoreFailure).not.toHaveBeenCalled();
+    // The next (real) store still credits the contributor the skip did not consume.
+    await run(ext);
+    expect(updatePage).toHaveBeenCalledTimes(1);
+    expect((updatePage.mock.calls[0] as any)[0].contributorIds).toContain('human');
+    expect(collabHistory.addContributors).toHaveBeenCalledWith('page-1', ['human']);
+  });
+
+  it('reads the generation after the reconcile and before serializing, inside the locked transaction', async () => {
+    const order: string[] = [];
+    reconcileRowIntoDoc.mockImplementation(() => (order.push('reconcile'), { merged: false }));
+    storeGenerationOf.mockImplementation(() => (order.push(mockTx.inside ? 'generation:in-tx' : 'generation:outside'), 7));
+    fromYdoc.mockImplementation(() => (order.push('serialize'), { type: 'doc', content: [{ type: 'paragraph' }] }));
+    const { ext } = build(ROW);
+    await run(ext);
+    expect(order).toEqual(['reconcile', 'generation:in-tx', 'serialize']);
+  });
+
+  it('a committed WRITE marks the generation and seeds the reconcile memo with the bytes it wrote', async () => {
+    const { ext, updatePage } = build(ROW);
+    await run(ext);
+    expect(markStoredAt).toHaveBeenCalledTimes(1);
+    expect(markStoredAt).toHaveBeenCalledWith(document, 7);
+    expect(markRowCovered).toHaveBeenCalledTimes(1);
+    expect(markRowCovered).toHaveBeenCalledWith(document, (updatePage.mock.calls[0] as any)[0].ydoc);
+    // …after the commit: the clear and the mark follow the transaction, never inside it.
+    expect(clearStoreFailure.mock.invocationCallOrder[0]).toBeLessThan(markStoredAt.mock.invocationCallOrder[0]);
+  });
+
+  it('a deep-equal no-op marks the generation (the row already holds it) but seeds nothing', async () => {
+    fromYdoc.mockReturnValue(ROW.content);
+    const { ext, updatePage } = build(ROW);
+    await run(ext);
+    expect(updatePage).not.toHaveBeenCalled();
+    expect(markStoredAt).toHaveBeenCalledWith(document, 7);
+    expect(markRowCovered).not.toHaveBeenCalled();
+  });
+
+  it('page not found: forgets (never marks)', async () => {
+    const { ext } = build(undefined);
+    await run(ext);
+    expect(markStoredAt).toHaveBeenCalledWith(document, undefined);
+    expect(markRowCovered).not.toHaveBeenCalled();
+  });
+
+  it('a refused blank clobber: forgets (never marks)', async () => {
+    fromYdoc.mockReturnValue({ type: 'doc', content: [{ type: 'paragraph' }] });
+    const { ext, updatePage } = build({ ...ROW, ydoc: null, content: { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'real' }] }] } });
+    await run(ext);
+    expect(updatePage).not.toHaveBeenCalled();
+    expect(markStoredAt).toHaveBeenCalledWith(document, undefined);
+  });
+
+  it('a FAILED store records the failure and marks nothing (the next store — disconnect()\'s — runs in full)', async () => {
+    const { ext } = build(ROW, async () => {
+      throw new Error('db down');
+    });
+    await expect(run(ext)).resolves.toBeUndefined();
+    expect(recordStoreFailure).toHaveBeenCalledWith(document);
+    expect(markStoredAt).not.toHaveBeenCalled();
+    expect(markRowCovered).not.toHaveBeenCalled();
+  });
+});
+
 // #345 defect 2 — the post-commit side effects run AFTER the row commits and are best-effort. A throw there
 // must NEVER reject onStoreDocument: Hocuspocus's debouncer leaves a rejected store resident and wedges ALL
 // future persistence for the document (silent data loss), and returns a false 503 on the settle/flush path.
@@ -249,6 +361,7 @@ describe('PersistenceExtension.onStoreDocument post-store side-effect isolation 
     });
     jsonToText.mockReturnValue('text');
     reconcileRowIntoDoc.mockReturnValue({ merged: false });
+    isStoreCurrent.mockReturnValue(false);
     extractMentions.mockReturnValue([]);
     extractUserMentions.mockReturnValue([]);
   });

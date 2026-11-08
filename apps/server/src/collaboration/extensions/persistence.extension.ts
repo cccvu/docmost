@@ -35,12 +35,19 @@ import {
 import { TransclusionService } from '../../core/page/transclusion/transclusion.service';
 // CCC integration seam (UPSTREAM_MODIFICATIONS.md + authz/route-guard/import-boundary.spec.ts): #390 folds
 // the fork-owned symmetric stale-doc guard (reconcile-before-store) and the store-failure signal into the
-// upstream persistence hook. The policy/CRDT logic lives in authz/page-write/; this file only calls it.
-import { reconcileRowIntoDoc } from '../../authz/page-write/reconcile-store';
+// upstream persistence hook; #731 adds the one-store-per-write skip and the reconcile memo. The policy/CRDT
+// logic lives in authz/page-write/; this file only calls it.
+import {
+  markRowCovered,
+  reconcileRowIntoDoc,
+} from '../../authz/page-write/reconcile-store';
 import { shouldRefuseBlankClobber } from '../../authz/page-write/blank-clobber-guard';
 import {
   recordStoreFailure,
   clearStoreFailure,
+  isStoreCurrent,
+  markStoredAt,
+  storeGenerationOf,
 } from '../../authz/page-write/store-failure-registry';
 // The alarm tokens (COLLAB_STALE_RECONCILE / COLLAB_STORE_FAILED / COLLAB_POST_STORE_FAILED) are emitted from
 // authz/ — the CCC-owned fork subtree scripts/check-infra-config.mjs §14 scans for a monitoring.tf filter's
@@ -69,6 +76,10 @@ export class PersistenceExtension implements Extension {
   async onLoadDocument(data: onLoadDocumentPayload) {
     const { documentName, document } = data;
     const pageId = getPageId(documentName);
+    // CCC #731 (UPSTREAM_MODIFICATIONS.md #122): type the root fragment now, while nothing observes the document. A
+    // fragment first typed by a later read (the store's or the digest's `fromYdoc`) is typed inside a transaction,
+    // which looks like an edit to the generation those memos are keyed on (authz/page-write/doc-version.ts).
+    document.getXmlFragment('default');
 
     if (!document.isEmpty('default')) {
       return;
@@ -84,14 +95,17 @@ export class PersistenceExtension implements Extension {
       return;
     }
 
+    // CCC #731 (UPSTREAM_MODIFICATIONS.md #122): fill Hocuspocus's own `document` and return nothing. A returned
+    // doc is re-encoded and re-applied by Hocuspocus 3.4.4 (one more page-sized encode + apply per load); a hook
+    // that returns nothing skips that step, and nothing is listening to the document yet.
     if (page.ydoc) {
       this.logger.debug(`ydoc loaded from db: ${pageId}`);
 
-      const doc = new Y.Doc();
       const dbState = new Uint8Array(page.ydoc);
 
-      Y.applyUpdate(doc, dbState);
-      return doc;
+      Y.applyUpdate(document, dbState);
+      markRowCovered(document, dbState); // #731: the next store's reconcile of these bytes is a no-op
+      return;
     }
 
     // if no ydoc state in db convert json in page.content to Ydoc.
@@ -104,16 +118,20 @@ export class PersistenceExtension implements Extension {
         tiptapExtensions,
       );
 
-      Y.encodeStateAsUpdate(ydoc);
-      return ydoc;
+      Y.applyUpdate(document, Y.encodeStateAsUpdate(ydoc));
+      return;
     }
 
     this.logger.debug(`creating fresh ydoc: ${pageId}`);
-    return new Y.Doc();
   }
 
   async onStoreDocument(data: onStoreDocumentPayload) {
     const { documentName, document, context } = data;
+
+    // CCC #731: nothing ran on the document since its last successful store (a content write's `disconnect()`
+    // store after its `transact()` store) — nothing to persist. Before consuming the contributors, which stay for
+    // the next real store. Never throws.
+    if (isStoreCurrent(document)) return;
 
     const pageId = getPageId(documentName);
 
@@ -124,6 +142,9 @@ export class PersistenceExtension implements Extension {
     let tiptapJson: any = null;
     let ydocState: Buffer = null;
     let textContent: string = null;
+    // #731: the document generation this store's serialization covers, and what the store did with it.
+    let coveredGeneration: number | undefined;
+    let stored: 'written' | 'unchanged' | undefined;
 
     let page: Page = null;
     const editingUserIds = this.consumeContributors(documentName);
@@ -157,6 +178,7 @@ export class PersistenceExtension implements Extension {
         }
 
         // Serialize AFTER the reconcile, under the lock (see #390 TOCTOU note above).
+        coveredGeneration = storeGenerationOf(document); // #731: same synchronous block as the serialization
         tiptapJson = TiptapTransformer.fromYdoc(document, 'default');
         ydocState = Buffer.from(Y.encodeStateAsUpdate(document));
         try {
@@ -181,6 +203,7 @@ export class PersistenceExtension implements Extension {
 
         if (isDeepStrictEqual(tiptapJson, page.content)) {
           page = null;
+          stored = 'unchanged';
           return;
         }
 
@@ -210,10 +233,15 @@ export class PersistenceExtension implements Extension {
           trx,
         );
 
+        stored = 'written';
         this.logger.debug(`Page updated: ${pageId} - SlugId: ${page.slugId}`);
       });
       // #390: a completed store (write or no-op) clears any prior failure so the settle stops failing closed.
       clearStoreFailure(document);
+      // #731: committed — the next store may skip while the generation is unchanged (not after a not-found or a
+      // refused blank clobber); a written row is bytes this document covers.
+      markStoredAt(document, stored ? coveredGeneration : undefined);
+      if (stored === 'written') markRowCovered(document, ydocState);
     } catch (err) {
       // #390: do NOT re-throw (an unhandled rejection on the setTimeout debounce path could crash the
       // process). Record the failure so the settle (flushPageContent) reports {reason:'error'} → the platform
