@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { useDisclosure } from "@mantine/hooks";
 import { isNativeAuthEnabled } from "@/features/auth-native/lib/auth-mode";
@@ -15,8 +15,11 @@ export interface FeedbackEntry {
   /** Pass to the account `<Menu onChange>`: the status probe runs on the first open, not on page load. */
   onMenuChange: (opened: boolean) => void;
   opened: boolean;
-  open: () => void;
+  /** Open the dialog; `returnFocusTo` is the element that gets focus back once it has closed. */
+  open: (returnFocusTo?: HTMLElement | null) => void;
   close: () => void;
+  /** Pass to the dialog's `onExitTransitionEnd`: moves focus back to the `returnFocusTo` given to `open`. */
+  restoreFocus: () => void;
 }
 
 /**
@@ -29,6 +32,9 @@ export function useFeedbackEntry(): FeedbackEntry {
   const native = isNativeAuthEnabled();
   const [menuSeen, setMenuSeen] = useState(false);
   const [opened, { open, close }] = useDisclosure(false);
+  // The dialog opens from a menu item that unmounts with the menu, so Mantine's own focus return would land
+  // on <body>; the caller names the element to return to instead (the account menu trigger).
+  const returnFocusTo = useRef<HTMLElement | null>(null);
 
   const status = useQuery({
     queryKey: FEEDBACK_STATUS_QUERY_KEY,
@@ -50,7 +56,14 @@ export function useFeedbackEntry(): FeedbackEntry {
     needsSignIn: errorStatus(status.error) === 401,
     onMenuChange,
     opened,
-    open,
+    open: (target) => {
+      returnFocusTo.current = target ?? null;
+      open();
+    },
     close,
+    restoreFocus: () => {
+      const target = returnFocusTo.current;
+      if (target?.isConnected) target.focus({ preventScroll: true });
+    },
   };
 }

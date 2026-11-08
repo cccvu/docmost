@@ -341,6 +341,21 @@ describe("feedback dialog", () => {
     expect(keyOf(postMock.mock.calls[1])).toBe(keyOf(postMock.mock.calls[0]));
   });
 
+  it.each([
+    ["Escape", (dialog: HTMLElement) => fireEvent.keyDown(dialog, { key: "Escape" })],
+    [
+      "the Close button",
+      (dialog: HTMLElement) =>
+        fireEvent.click(within(dialog).getAllByRole("button", { name: "Close" })[0]),
+    ],
+  ])("closing with %s returns focus to the account menu trigger", async (_, close) => {
+    const dialog = await openFeedback();
+    const trigger = screen.getByRole("button", { name: "Account menu" });
+    close(dialog);
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(trigger));
+  });
+
   it("401: offers sign-in in a NEW tab and keeps the draft", async () => {
     postMock.mockRejectedValueOnce(problem(401, "unauthenticated"));
     const dialog = await openFeedback();

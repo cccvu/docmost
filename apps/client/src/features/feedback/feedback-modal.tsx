@@ -161,6 +161,9 @@ export function FeedbackModal({ entry }: { entry: FeedbackEntry }) {
     <Modal
       opened={entry.opened}
       onClose={onClose}
+      // The opener (a menu item) has unmounted; focus goes back to the account menu trigger instead.
+      returnFocus={false}
+      onExitTransitionEnd={entry.restoreFocus}
       title={t("Send feedback")}
       fullScreen={fullScreen}
       centered
