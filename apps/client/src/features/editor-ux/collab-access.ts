@@ -10,8 +10,12 @@ import { jwtDecode } from "jwt-decode";
  *
  *   - a server-side close while the socket is still connected → reconnect now, so the server re-decides
  *     (a demoted user comes back read-only; a user who lost access is refused);
- *   - an authentication refusal that is NOT an expired token → access is lost: stop editing and show the
- *     connection-lost status (an expired token keeps upstream's refresh-and-retry);
+ *   - an authentication refusal that is NOT an expired token → refetch the collab token ONCE and retry (#537:
+ *     the token is bound to the session that minted it, so a refusal can mean that session ended while a newer
+ *     one is live, e.g. the user signed in again); a second refusal with no successful authentication in
+ *     between, or a refetch that fails, means access is lost: stop editing and show the connection-lost
+ *     status. An expired token refetches every time, as upstream did; a refetch that fails is lost there too
+ *     (upstream left that editor editable with nothing syncing);
  *   - a successful authentication → the server's scope decides whether the editor may edit.
  *
  * Pure and dependency-free so it is unit-tested without a provider; page-editor.tsx wires it (seam 169).
@@ -22,22 +26,28 @@ export interface CollabAccessState {
   lost: boolean;
   /** The server authenticated the connection read-only. */
   readOnly: boolean;
+  /** A non-expiry refusal already refetched the token; the next one is final (reset by `authenticated`). */
+  refreshed: boolean;
 }
 
 export const initialCollabAccess: CollabAccessState = {
   lost: false,
   readOnly: false,
+  refreshed: false,
 };
 
 export type CollabAccessEvent =
   | { kind: "server-close"; socketConnected: boolean }
   | { kind: "auth-failed"; tokenExpired: boolean }
+  | { kind: "refresh-failed" }
   | { kind: "authenticated"; scope: string | undefined };
 
 export interface CollabAccessStep {
   state: CollabAccessState;
   /** Re-open the socket so every attached document re-authenticates. */
   reconnect: boolean;
+  /** Refetch the collab token, then reconnect with it (report a failure as `refresh-failed`). */
+  refreshToken: boolean;
   /** Show the connection-lost status (the editor can no longer sync this document). */
   markDisconnected: boolean;
 }
@@ -53,24 +63,50 @@ export function nextCollabAccess(
       return {
         state: prev,
         reconnect: event.socketConnected,
+        refreshToken: false,
         markDisconnected: false,
       };
     case "auth-failed":
       if (event.tokenExpired) {
-        return { state: prev, reconnect: false, markDisconnected: false };
+        return {
+          state: prev,
+          reconnect: false,
+          refreshToken: true,
+          markDisconnected: false,
+        };
       }
-      return {
-        state: { lost: true, readOnly: prev.readOnly },
-        reconnect: false,
-        markDisconnected: true,
-      };
+      if (!prev.refreshed) {
+        return {
+          state: { ...prev, refreshed: true },
+          reconnect: false,
+          refreshToken: true,
+          markDisconnected: false,
+        };
+      }
+      return lostStep(prev);
+    case "refresh-failed":
+      return lostStep(prev);
     case "authenticated":
       return {
-        state: { lost: false, readOnly: event.scope === "readonly" },
+        state: {
+          lost: false,
+          readOnly: event.scope === "readonly",
+          refreshed: false,
+        },
         reconnect: false,
+        refreshToken: false,
         markDisconnected: false,
       };
   }
+}
+
+function lostStep(prev: CollabAccessState): CollabAccessStep {
+  return {
+    state: { ...prev, lost: true },
+    reconnect: false,
+    refreshToken: false,
+    markDisconnected: true,
+  };
 }
 
 /** The editor may edit only if the page allows it AND the server still lets this connection write. */

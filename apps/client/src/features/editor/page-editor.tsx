@@ -67,6 +67,10 @@ import {
   isCollabTokenExpired,
   nextCollabAccess,
 } from "@/features/editor-ux/collab-access";
+import {
+  refetchCollabTokenAndReopen,
+  reopenCollabSocket,
+} from "@/features/editor-ux/collab-reconnect";
 import DrawioMenu from "./components/drawio/drawio-menu";
 import { useCollabToken } from "@/features/auth/queries/auth-query.tsx";
 import SearchAndReplaceDialog from "@/features/editor/components/search-and-replace/search-and-replace-dialog.tsx";
@@ -181,6 +185,8 @@ export default function PageEditor({
           // ignore unrelated stateless messages
         }
       };
+      // False once this editor unmounted or moved to another page: a late callback then changes nothing.
+      const isCurrent = () => providersRef.current?.socket === socket;
       const onCollabAccess = (event: CollabAccessEvent) => {
         const step = nextCollabAccess(collabAccessRef.current, event);
         collabAccessRef.current = step.state;
@@ -188,16 +194,18 @@ export default function PageEditor({
         if (step.markDisconnected) {
           setYjsConnectionStatus(WebSocketStatus.Disconnected);
         }
-        if (step.reconnect) {
-          // Reopen on the socket's own `disconnect` (status is back to Disconnected), not on a timer:
-          // `disconnect()` keeps the status Connected until the browser's close event, and `connect()`
-          // is a no-op while it reads Connected — a slow close would strand the editor.
-          const reopen = () => {
-            socket.off("disconnect", reopen);
-            if (providersRef.current?.socket === socket) socket.connect(); // not after unmount
-          };
-          socket.on("disconnect", reopen);
-          socket.disconnect();
+        // CCC (#501, #537): reopen on the socket's own `disconnect`, never on a timer (collab-reconnect.ts).
+        if (step.reconnect) reopenCollabSocket(socket, isCurrent);
+        if (step.refreshToken) {
+          void refetchCollabTokenAndReopen({
+            refetch: refetchCollabToken,
+            setToken: (token) => {
+              remote.configuration.token = token;
+            },
+            reopen: () => reopenCollabSocket(socket, isCurrent),
+            onFailed: () => onCollabAccess({ kind: "refresh-failed" }),
+            isCurrent,
+          });
         }
       };
       const onAuthenticationFailedHandler = () => {
@@ -207,18 +215,8 @@ export default function PageEditor({
           currentCollabToken(remote.configuration.token, collabQuery?.token),
           Date.now(),
         );
+        // CCC (#537): an expiry, or the first other refusal, refetches the token once; a failed refetch is final.
         onCollabAccess({ kind: "auth-failed", tokenExpired: isTokenExpired });
-        if (isTokenExpired) {
-          refetchCollabToken().then((result) => {
-            if (result.data?.token) {
-              socket.disconnect();
-              setTimeout(() => {
-                remote.configuration.token = result.data.token;
-                socket.connect();
-              }, 100);
-            }
-          });
-        }
       };
       const remote = new HocuspocusProvider({
         websocketProvider: socket,

@@ -11,6 +11,11 @@ import { PdpPagePermissionRepo } from '../pdp-page-permission.repo';
 import { PdpSpaceMemberRepo } from '../pdp-space-member.repo';
 import { spyKysely } from '../../service-bridge/kysely-spy.testkit';
 
+/** #537: the connect re-checks the token's session; these suites hold it live. */
+const liveSessions = {
+  findActiveById: async (id: string) => ({ id, userId: 'u1', workspaceId: 'w1' }),
+} as any;
+
 /**
  * CCC authorization integration test — NOT upstream Docmost code.
  *
@@ -39,7 +44,7 @@ describe('#524 — the collab connect refuses a page the PDP has not placed in a
   };
   const extension = (lineage: unknown[]) =>
     new AuthenticationExtension(
-      { verifyJwt: async () => ({ sub: 'u1', workspaceId: 'w1' }) } as any,
+      { verifyJwt: async () => ({ sub: 'u1', workspaceId: 'w1', sessionId: 'sid1' }) } as any,
       {
         findById: async () => ({
           id: 'u1',
@@ -63,6 +68,7 @@ describe('#524 — the collab connect refuses a page the PDP has not placed in a
         {} as any,
         unplaced as any,
       ),
+      liveSessions,
     );
   const payload = () =>
     ({
@@ -106,11 +112,12 @@ describe('#542 — the collab connect takes the strict PDP space role', () => {
   const extension = (grants: Record<string, boolean>) => {
     const authz = pdp(grants) as any;
     return new AuthenticationExtension(
-      { verifyJwt: async () => ({ sub: 'u1', workspaceId: 'w1' }) } as any,
+      { verifyJwt: async () => ({ sub: 'u1', workspaceId: 'w1', sessionId: 'sid1' }) } as any,
       { findById: async () => ({ id: 'u1', deactivatedAt: null, deletedAt: null }) } as any,
       { findById: async () => ({ id: PAGE, spaceId: SPACE, deletedAt: null }) } as any,
       new PdpSpaceMemberRepo({} as any, {} as any, {} as any, {} as any, authz),
       new PdpPagePermissionRepo(openLineage(), {} as any, {} as any, authz),
+      liveSessions,
     );
   };
   const payload = () => ({ documentName: `page.${PAGE}`, token: 't', connectionConfig: { readOnly: false } }) as any;
@@ -143,5 +150,82 @@ describe('#542 — the collab connect takes the strict PDP space role', () => {
       'page:edit': true,
     }).onAuthenticate(data);
     expect(data.connectionConfig.readOnly).toBe(false);
+  });
+});
+
+/**
+ * #537 — the collab token names the access token's session, and the connect re-checks that session row with the
+ * SAME rule as /api and the notifications socket (`isWsConnectionLive`). Before this, a signed-out or revoked
+ * session kept opening collab documents for the collab token's 24h life.
+ */
+describe('#537 — the collab connect refuses a token whose session is not live', () => {
+  const SID = 'sid-537';
+  const liveRow = { id: SID, userId: 'u1', workspaceId: 'w1' };
+  const build = (opts: {
+    claims?: Record<string, unknown>;
+    session?: (id: string) => Promise<unknown>;
+    page?: unknown;
+  }) => {
+    const findActiveById = jest.fn(opts.session ?? (async () => liveRow));
+    const pageFindById = jest.fn(async () =>
+      'page' in opts ? opts.page : { id: 'p1', spaceId: 's1', deletedAt: null },
+    );
+    const ext = new AuthenticationExtension(
+      {
+        verifyJwt: async () => ({ sub: 'u1', workspaceId: 'w1', type: 'collab', sessionId: SID, ...opts.claims }),
+      } as any,
+      { findById: async () => ({ id: 'u1', deactivatedAt: null, deletedAt: null }) } as any,
+      { findById: pageFindById } as any,
+      { getUserSpaceRoles: async () => [{ userId: 'u1', role: 'writer' }] } as any,
+      { canUserEditPage: async () => ({ hasAnyRestriction: false, canAccess: true, canEdit: true }) } as any,
+      { findActiveById } as any,
+    );
+    return { ext, findActiveById, pageFindById };
+  };
+  const payload = () => ({ documentName: 'page.p1', token: 't', connectionConfig: { readOnly: false } }) as any;
+
+  it("control: a live session connects read-write, and the row read is the token's sessionId", async () => {
+    const { ext, findActiveById } = build({});
+    const data = payload();
+    await expect(ext.onAuthenticate(data)).resolves.toEqual({ user: expect.objectContaining({ id: 'u1' }) });
+    expect(data.connectionConfig.readOnly).toBe(false);
+    expect(findActiveById).toHaveBeenCalledWith(SID);
+  });
+
+  it('refuses a token with no sessionId (a pre-#537 token)', async () => {
+    const { ext, findActiveById } = build({ claims: { sessionId: undefined } });
+    await expect(ext.onAuthenticate(payload())).rejects.toBeInstanceOf(UnauthorizedException);
+    expect(findActiveById).not.toHaveBeenCalled();
+  });
+
+  it('refuses a revoked or expired session (no active row)', async () => {
+    const { ext } = build({ session: async () => undefined });
+    await expect(ext.onAuthenticate(payload())).rejects.toBeInstanceOf(UnauthorizedException);
+  });
+
+  it("refuses another user's session", async () => {
+    const { ext } = build({ session: async () => ({ ...liveRow, userId: 'u2' }) });
+    await expect(ext.onAuthenticate(payload())).rejects.toBeInstanceOf(UnauthorizedException);
+  });
+
+  it("refuses another workspace's session", async () => {
+    const { ext } = build({ session: async () => ({ ...liveRow, workspaceId: 'w2' }) });
+    await expect(ext.onAuthenticate(payload())).rejects.toBeInstanceOf(UnauthorizedException);
+  });
+
+  it('a failed session read refuses the connection (throws), never allows', async () => {
+    const boom = new Error('db down');
+    const { ext } = build({
+      session: async () => {
+        throw boom;
+      },
+    });
+    await expect(ext.onAuthenticate(payload())).rejects.toBe(boom);
+  });
+
+  it('a dead session on a missing page is Unauthorized, not NotFound, and the page is never read', async () => {
+    const { ext, pageFindById } = build({ session: async () => undefined, page: undefined });
+    await expect(ext.onAuthenticate(payload())).rejects.toBeInstanceOf(UnauthorizedException);
+    expect(pageFindById).not.toHaveBeenCalled();
   });
 });

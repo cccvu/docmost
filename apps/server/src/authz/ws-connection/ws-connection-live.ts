@@ -18,15 +18,21 @@ import { JwtPayload } from '../../core/auth/dto/jwt-payload';
  * Account disable now sets `deactivatedAt` + revokes `user_sessions` on the shadow user, and this gate
  * makes the notifications plane honor it, closing the residual to the next (re)connection.
  *
- * Returns `true` iff the connection may proceed. As in `jwt.strategy` (#133), every access token must carry a
- * `sessionId` (the only mint, `SessionService.createSessionAndToken`, always sets one): a token without one is
- * rejected, and a missing/expired/revoked or mismatched session row is rejected. `liveness-parity.spec.ts`
- * pins the two planes in lockstep.
+ * The collab (Hocuspocus) connect gate uses it too (#537): `AuthenticationExtension.onAuthenticate` passes the
+ * COLLAB token's payload, whose `sessionId` is the session of the access token it was minted from
+ * (`TokenService.generateCollabToken`). So a signed-out, revoked or expired session stops opening collab
+ * documents at the next connect, instead of riding the collab token's 24h life.
+ *
+ * Returns `true` iff the connection may proceed. As in `jwt.strategy` (#133), every token must carry a
+ * `sessionId` (the only access mint, `SessionService.createSessionAndToken`, always sets one, and since #537 the
+ * collab mint refuses without one): a token without one is rejected, and a missing/expired/revoked or mismatched
+ * session row is rejected. A failed read throws (the caller refuses), never allows. `liveness-parity.spec.ts`
+ * pins the three planes in lockstep.
  */
 export async function isWsConnectionLive(
   userRepo: UserRepo,
   userSessionRepo: UserSessionRepo,
-  payload: JwtPayload,
+  payload: Pick<JwtPayload, 'sub' | 'workspaceId' | 'sessionId'>,
 ): Promise<boolean> {
   const user = await userRepo.findById(payload.sub, payload.workspaceId);
   if (!user || isUserDisabled(user)) {

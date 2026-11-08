@@ -15,6 +15,8 @@ import { SpaceRole } from '../../common/helpers/types/permission';
 import { isUserDisabled } from '../../common/helpers';
 import { getPageId } from '../collaboration.util';
 import { JwtCollabPayload, JwtType } from '../../core/auth/dto/jwt-payload';
+import { UserSessionRepo } from '@docmost/db/repos/session/user-session.repo';
+import { isWsConnectionLive } from '../../authz/ws-connection/ws-connection-live';
 
 @Injectable()
 export class AuthenticationExtension implements Extension {
@@ -26,6 +28,7 @@ export class AuthenticationExtension implements Extension {
     private pageRepo: PageRepo,
     private readonly spaceMemberRepo: SpaceMemberRepo,
     private readonly pagePermissionRepo: PagePermissionRepo,
+    private readonly userSessionRepo: UserSessionRepo,
   ) {}
 
   async onAuthenticate(data: onAuthenticatePayload) {
@@ -50,6 +53,18 @@ export class AuthenticationExtension implements Extension {
     }
 
     if (isUserDisabled(user)) {
+      throw new UnauthorizedException();
+    }
+
+    // CCC (wiki-v2 #537, UPSTREAM_MODIFICATIONS #202): the token's session must still be live, the same rule as
+    // /api and the notifications socket. A failed read throws, which refuses the connection.
+    if (
+      !(await isWsConnectionLive(
+        this.userRepo,
+        this.userSessionRepo,
+        jwtPayload,
+      ))
+    ) {
       throw new UnauthorizedException();
     }
 
