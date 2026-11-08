@@ -4,7 +4,7 @@ import { formatCentralDateTime } from "./format-central-datetime";
 // Newer ICU (CLDR 42+) emits a narrow no-break space (U+202F) before AM/PM;
 // older ICU emits an ASCII space. Normalize both so assertions are stable
 // across Node/ICU versions rather than pinning one whitespace codepoint.
-const norm = (s: string) => s.replace(/[  ]/g, " ");
+const norm = (s: string) => s.replace(/[\u202f\u00a0]/g, " ");
 
 describe("formatCentralDateTime", () => {
   it("renders a summer instant in CDT (UTC-5)", () => {

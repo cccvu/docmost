@@ -1,11 +1,11 @@
 import { FC } from "react";
 import type { Editor } from "@tiptap/react";
 import { useEditorState } from "@tiptap/react";
-import { ActionIcon, Menu, Tooltip } from "@mantine/core";
-import { IconCheck, IconTextSize } from "@tabler/icons-react";
+import { IconTextSize } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
 import { FONT_SIZE_OPTIONS } from "@docmost/editor-ext";
 import { collectTextStyleAttr } from "./selection-attr";
+import { TextStyleMenu } from "./text-style-menu";
 
 interface Props {
   editor: Editor;
@@ -14,10 +14,9 @@ interface Props {
 /**
  * CCC editor-UX (issue #135): controlled font-size menu. Applies allowlisted
  * `fontSize` values via the fork `CccFontSize` command (attr on the `textStyle`
- * mark). Disabled inside code blocks; shows a check on the active value. A
- * selection spanning several sizes reads as "mixed" (no item checked); a
- * visible mixed-state label + `menuitemradio` semantics are tracked as a
- * follow-up.
+ * mark). Disabled inside code blocks. The active value is a checked
+ * `menuitemradio` and part of the trigger's name; a selection spanning several
+ * sizes reads "Mixed" (#145, see `TextStyleMenu`).
  */
 export const FontSizeGroup: FC<Props> = ({ editor }) => {
   const { t } = useTranslation();
@@ -25,9 +24,7 @@ export const FontSizeGroup: FC<Props> = ({ editor }) => {
   const state = useEditorState({
     editor,
     selector: (ctx) => ({
-      current: ctx.editor
-        ? collectTextStyleAttr(ctx.editor, "fontSize")
-        : null,
+      current: ctx.editor ? collectTextStyleAttr(ctx.editor, "fontSize") : null,
       disabled: !!ctx.editor?.isActive("codeBlock"),
     }),
   });
@@ -39,35 +36,13 @@ export const FontSizeGroup: FC<Props> = ({ editor }) => {
   };
 
   return (
-    <Menu shadow="md" position="bottom-start" withArrow={false}>
-      <Menu.Target>
-        <Tooltip label={t("Font size")} withArrow>
-          <ActionIcon
-            variant="subtle"
-            color="dark"
-            size="md"
-            aria-label={t("Font size")}
-            disabled={state.disabled}
-          >
-            <IconTextSize size={16} />
-          </ActionIcon>
-        </Tooltip>
-      </Menu.Target>
-      <Menu.Dropdown>
-        <Menu.Label>{t("Font size")}</Menu.Label>
-        {FONT_SIZE_OPTIONS.map((option) => {
-          const active = state.current === option.value;
-          return (
-            <Menu.Item
-              key={option.label}
-              rightSection={active ? <IconCheck size={14} /> : null}
-              onClick={() => apply(option.value)}
-            >
-              {t(option.label)}
-            </Menu.Item>
-          );
-        })}
-      </Menu.Dropdown>
-    </Menu>
+    <TextStyleMenu
+      label={t("Font size")}
+      icon={<IconTextSize size={16} />}
+      options={FONT_SIZE_OPTIONS}
+      current={state.current}
+      disabled={state.disabled}
+      onSelect={apply}
+    />
   );
 };

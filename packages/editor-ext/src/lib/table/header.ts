@@ -1,4 +1,6 @@
 import { TableHeader as TiptapTableHeader } from "@tiptap/extension-table";
+import { safeCssColor } from "../ccc/color/safe-css-color"; // CCC #145
+import { withSafeCellAlign } from "../ccc/align/cell-align"; // CCC #145
 
 export const TableHeader = TiptapTableHeader.extend({
   name: "tableHeader",
@@ -7,7 +9,7 @@ export const TableHeader = TiptapTableHeader.extend({
 
   addAttributes() {
     return {
-      ...this.parent?.(),
+      ...withSafeCellAlign(this.parent?.()), // CCC #145: render-gated `align`
       backgroundColor: {
         default: null,
         parseHTML: (element) =>
@@ -15,12 +17,13 @@ export const TableHeader = TiptapTableHeader.extend({
           element.getAttribute("data-background-color") ||
           null,
         renderHTML: (attributes) => {
-          if (!attributes.backgroundColor) {
+          const backgroundColor = safeCssColor(attributes.backgroundColor); // CCC #145: render gate
+          if (!backgroundColor) {
             return {};
           }
           return {
-            style: `background-color: ${attributes.backgroundColor}`,
-            "data-background-color": attributes.backgroundColor,
+            style: `background-color: ${backgroundColor}`,
+            "data-background-color": backgroundColor,
           };
         },
       },

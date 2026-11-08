@@ -46,6 +46,14 @@ export const CccFontFamily = FontFamily.extend({
         (fontFamily: string) =>
         ({ chain }) => {
           const keyword = normalizeFontFamily(fontFamily);
+          // #145: mirror setFontSize — a value outside the allowlist clears the
+          // family and drops a now-empty textStyle mark instead of leaving one.
+          if (!keyword) {
+            return chain()
+              .setMark("textStyle", { fontFamily: null })
+              .removeEmptyTextStyle()
+              .run();
+          }
           return chain().setMark("textStyle", { fontFamily: keyword }).run();
         },
       unsetFontFamily:

@@ -4,6 +4,7 @@
 // that block changed. Rendered for real: a minimal Tiptap editor (the mainExtensions barrel throws under
 // jsdom) with CustomCodeBlock({ view: CodeBlockView }) inside EditorContent.
 import { describe, it, expect, beforeAll, afterEach, vi } from "vitest";
+import { useEffect } from "react";
 import { act, cleanup, render, renderHook } from "@testing-library/react";
 import { MantineProvider } from "@mantine/core";
 import {
@@ -77,7 +78,10 @@ async function mount(language: string, editable: boolean) {
       editable,
       immediatelyRender: true,
     });
-    editor = e;
+    // Captured in an effect, not during render (react-hooks/globals); render() runs effects inside act().
+    useEffect(() => {
+      editor = e;
+    }, [e]);
     return (
       <MantineProvider>
         <EditorContent editor={e} />

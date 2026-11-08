@@ -3,6 +3,7 @@ import { Editor } from "@tiptap/core";
 import { DOMOutputSpec } from "@tiptap/pm/model";
 import { TextSelection } from "@tiptap/pm/state";
 import { cellAround } from "@tiptap/pm/tables";
+import { withSafeColwidths } from "../ccc/table/safe-colwidths"; // CCC #145
 
 const LIST_TYPES = ["bulletList", "orderedList", "taskList"];
 
@@ -99,7 +100,7 @@ export const CustomTable = Table.extend({
 
   renderHTML({ node, HTMLAttributes }) {
     // https://github.com/ueberdosis/tiptap/issues/4872#issuecomment-2717554498
-    const originalRender = this.parent?.({ node, HTMLAttributes });
+    const originalRender = this.parent?.({ node: withSafeColwidths(node), HTMLAttributes }); // CCC #145: numeric colwidths
     const wrapper: DOMOutputSpec = [
       "div",
       { class: "tableWrapper" },

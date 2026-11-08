@@ -1,5 +1,6 @@
 import { Node, mergeAttributes, findParentNode } from "@tiptap/core";
 import { TextSelection } from "@tiptap/pm/state";
+import { safeColumnWidth } from "../ccc/columns/safe-column-width"; // CCC #145
 
 export interface ColumnOptions {
   HTMLAttributes: Record<string, any>;
@@ -40,10 +41,11 @@ export const Column = Node.create<ColumnOptions>({
           return value ? parseFloat(value) : null;
         },
         renderHTML: (attributes: ColumnAttributes) => {
-          if (!attributes.width) return {};
+          const width = safeColumnWidth(attributes.width); // CCC #145: render gate (finite positive number)
+          if (!width) return {};
           return {
-            "data-width": attributes.width,
-            style: `flex: ${attributes.width}`,
+            "data-width": width,
+            style: `flex: ${width}`,
           };
         },
       },

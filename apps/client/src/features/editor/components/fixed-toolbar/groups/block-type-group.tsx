@@ -14,6 +14,7 @@ import {
   IconTypography,
 } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
+import { getActiveHeadingLevel } from "@/features/editor-ux/toolbar/active-heading";
 
 interface Props {
   editor: Editor;
@@ -28,6 +29,7 @@ export const BlockTypeGroup: FC<Props> = ({ editor }) => {
       isHeading1: !!ctx.editor?.isActive("heading", { level: 1 }),
       isHeading2: !!ctx.editor?.isActive("heading", { level: 2 }),
       isHeading3: !!ctx.editor?.isActive("heading", { level: 3 }),
+      headingLevel: getActiveHeadingLevel(ctx.editor), // CCC (#145): H4–H6
       isBlockquote: !!ctx.editor?.isActive("blockquote"),
       isCodeBlock: !!ctx.editor?.isActive("codeBlock"),
     }),
@@ -37,6 +39,8 @@ export const BlockTypeGroup: FC<Props> = ({ editor }) => {
   if (state.isHeading1) label = t("Heading 1");
   else if (state.isHeading2) label = t("Heading 2");
   else if (state.isHeading3) label = t("Heading 3");
+  else if (state.headingLevel)
+    label = t("Heading {{level}}", { level: state.headingLevel });
   else if (state.isBlockquote) label = t("Quote");
   else if (state.isCodeBlock) label = t("Code block");
 

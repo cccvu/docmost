@@ -51,6 +51,7 @@ export default function PasswordlessVerify() {
   // that write and the request would break the very sign-in it is redeeming.
   useEffect(() => {
     const next = readLinkToken(hash);
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- syncs from the URL fragment (an external system the router owns); guarded, so it settles in one extra render
     if (next && next !== token) setToken(next);
   }, [hash, token]);
   const { completeSignIn, isVerifying } = usePasswordless();

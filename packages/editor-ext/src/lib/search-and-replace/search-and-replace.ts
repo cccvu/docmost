@@ -28,7 +28,8 @@ import {
   type EditorState,
   type Transaction,
 } from "@tiptap/pm/state";
-import { Node as PMNode, Mark } from "@tiptap/pm/model";
+import { Node as PMNode } from "@tiptap/pm/model";
+import { unionMarksBetween } from "../ccc/marks/union-marks"; // CCC #145
 
 declare module "@tiptap/core" {
   interface Storage {
@@ -189,14 +190,7 @@ const replace = (
     const tr = state.tr;
 
     // Get all marks that span the text being replaced
-    const marksSet = new Set<Mark>();
-    state.doc.nodesBetween(from, to, (node) => {
-      if (node.isText && node.marks) {
-        node.marks.forEach((mark) => marksSet.add(mark));
-      }
-    });
-
-    const marks = Array.from(marksSet);
+    const marks = unionMarksBetween(state.doc, from, to); // CCC #145: a valid set (no duplicate textStyle)
     
     // Delete the old text
     tr.delete(from, to);
@@ -224,14 +218,7 @@ const replaceAll = (
     const { from, to } = resultsCopy[i];
 
     // Get all marks that span the text being replaced
-    const marksSet = new Set<Mark>();
-    tr.doc.nodesBetween(from, to, (node) => {
-      if (node.isText && node.marks) {
-        node.marks.forEach((mark) => marksSet.add(mark));
-      }
-    });
-
-    const marks = Array.from(marksSet);
+    const marks = unionMarksBetween(tr.doc, from, to); // CCC #145: a valid set (no duplicate textStyle)
     
     // Delete the old text
     tr.delete(from, to);
