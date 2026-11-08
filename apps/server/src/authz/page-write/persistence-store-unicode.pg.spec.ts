@@ -227,7 +227,7 @@ d('the collab store on real Postgres (#773)', () => {
     const s = stack();
     const doc = await s.open();
     remoteUpdate(doc, poison);
-    await s.handlers.flushPageContent(DOC);
+    const first = await s.handlers.flushPageContent(DOC, { withDigest: true });
     const before = await row();
     expect(s.updatePage).toHaveBeenCalledTimes(1);
 
@@ -235,7 +235,9 @@ d('the collab store on real Postgres (#773)', () => {
     remoteUpdate(doc, (f) => ((f.get(1) as Y.XmlElement).get(0) as Y.XmlText).format(0, 4, { link: { href: `x\ud83e` } }));
     expect(textNode(TiptapTransformer.fromYdoc(doc, 'default') as Json, 'link')?.marks?.[0].attrs?.href).toBe('x\ud83e');
     const readsBefore = s.lockedReads();
-    await expect(s.handlers.flushPageContent(DOC)).resolves.toEqual({ flushed: true });
+    // The ADR 0019 digest hashes the same projection the store writes, so the version does not move either: a version
+    // handed out now still matches after the store reports `unchanged` and the document reloads from the old bytes.
+    await expect(s.handlers.flushPageContent(DOC, { withDigest: true })).resolves.toEqual(first);
 
     expect(storeFailures).toEqual([]);
     expect(s.lockedReads()).toBe(readsBefore + 1); // the store RAN (not the one-store-per-write skip)…
@@ -264,7 +266,7 @@ d('the collab store on real Postgres (#773)', () => {
     const first = stack();
     const doc = await first.open();
     remoteUpdate(doc, poison);
-    await first.handlers.flushPageContent(DOC);
+    const settledBefore = await first.handlers.flushPageContent(DOC, { withDigest: true });
     for (const conn of live.splice(0)) await conn.disconnect();
     for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
     expect(first.hocuspocus.documents.has(DOC)).toBe(false);
@@ -282,5 +284,58 @@ d('the collab store on real Postgres (#773)', () => {
     const after = await row();
     expect(after.updatedAt).toEqual(stored.updatedAt);
     expect(after.content).toEqual(stored.content);
+    // The version survives the unload: the reloaded document's digest is the one handed out before.
+    await expect(second.handlers.flushPageContent(DOC, { withDigest: true })).resolves.toEqual(settledBefore);
+  });
+
+  // The shape is attacker-controlled too (#773 security review): each of these reached Postgres raw, or made
+  // JSON.stringify throw, on every store and every settle, before the store followed what JSON.stringify writes.
+  it.each<[string, (p: Y.XmlElement) => void, unknown]>([
+    [
+      'an element attribute named __proto__ (Yjs builds attrs by assignment, so it re-prototypes them) beside a NUL',
+      (p) => {
+        p.setAttribute('__proto__', {} as never);
+        p.setAttribute('textAlign', 'center\0');
+      },
+      `center${R}`,
+    ],
+    [
+      'an object attribute value with an own __proto__ key (lib0 readAny re-prototypes it) holding a NUL',
+      (p) => p.setAttribute('textAlign', JSON.parse('{"__proto__":{},"a":"x\\u0000"}')),
+      { a: `x${R}` },
+    ],
+    [
+      'a Y.Map attribute value (serialized through its toJSON) holding a NUL',
+      (p) => {
+        const m = new Y.Map();
+        p.setAttribute('textAlign', m as never);
+        m.set('a', 'x\0');
+      },
+      { a: `x${R}` },
+    ],
+    ['a BigInt attribute value (JSON.stringify throws on one)', (p) => p.setAttribute('textAlign', BigInt(10) as never), '10'],
+  ])('%s: the store and the settle succeed, and the next store is `unchanged`', async (_name, setAttrs, stored) => {
+    const s = stack();
+    const doc = await s.open();
+    remoteUpdate(doc, (f) => {
+      const p = new Y.XmlElement('paragraph');
+      f.insert(f.length, [p]);
+      setAttrs(p);
+    });
+
+    const settled = await s.handlers.flushPageContent(DOC, { withDigest: true });
+    expect(storeFailures).toEqual([]);
+    expect(hasStoreFailure(doc)).toBe(false);
+    expect(settled).toMatchObject({ flushed: true, contentDigest: expect.any(String) });
+    expect(s.updatePage).toHaveBeenCalledTimes(1);
+    const r = await row();
+    expect(storable(r.content)).toBe(true);
+    expect(r.content.content![1].attrs?.textAlign).toEqual(stored);
+
+    // It converges: the same live state stores as `unchanged` and keeps its version.
+    await s.persistence.onStoreDocument({ documentName: DOC, document: doc, context: { user: USER } } as never);
+    expect(storeFailures).toEqual([]);
+    expect(s.updatePage).toHaveBeenCalledTimes(1);
+    await expect(s.handlers.flushPageContent(DOC, { withDigest: true })).resolves.toEqual(settled);
   });
 });

@@ -117,11 +117,90 @@ describe('storeSafeJson (#773)', () => {
     expect(Object.getPrototypeOf(storeSafeJson(bare))).toBeNull();
   });
 
-  it('leaves non-string primitives, null and non-JSON objects untouched', () => {
-    for (const v of [0, 1.5, -0, true, false, null, undefined]) expect(storeSafeJson(v)).toBe(v);
+  it('leaves JSON primitives, null and byte arrays untouched', () => {
+    for (const v of [0, 1.5, -1, true, false, null]) expect(storeSafeJson(v)).toBe(v);
     const bytes = new Uint8Array([0, 0xd8]);
     expect(storeSafeJson(bytes)).toBe(bytes);
-    const mixed = { n: 1, b: false, z: null, s: `\0` };
-    expect(storeSafeJson(mixed)).toEqual({ n: 1, b: false, z: null, s: R });
+    const mixed = { n: 1, b: false, z: null, s: `\0`, bytes };
+    const out = storeSafeJson(mixed);
+    expect(out).toEqual({ n: 1, b: false, z: null, s: R, bytes });
+    expect(out.bytes).toBe(bytes);
+  });
+
+  // The shape is attacker-controlled too (#773 security review): the walk writes what JSON.stringify writes.
+  describe('follows what JSON.stringify writes, whatever the shape', () => {
+    it('calls toJSON once and walks its result (a Y type attribute value, a Date)', () => {
+      const yMapLike = { toJSON: () => ({ a: `x\0`, nested: { toJSON: () => 'kept as an object' } }) };
+      class YMapLike {
+        toJSON() {
+          return { a: `x${HIGH}` };
+        }
+      }
+      const date = new Date(0);
+      const out = storeSafeJson({ m: yMapLike, c: new YMapLike(), d: date, t: { toJSON: () => `t\0` } });
+      // toJSON is called once per value, as JSON.stringify does: a `toJSON` inside its result is a nested value's own.
+      expect(out).toEqual({ m: { a: `x${R}`, nested: 'kept as an object' }, c: { a: `x${R}` }, d: date.toJSON(), t: `t${R}` });
+      expect(storable(out)).toBe(true);
+    });
+
+    it('walks an object re-prototyped by a `__proto__` assignment, and copies it into a plain object', () => {
+      const attrs: Record<string, unknown> = {};
+      attrs['__proto__'] = { inherited: `\0` }; // what Yjs getAttributes / lib0 readAny do with a `__proto__` key
+      attrs.textAlign = `center\0`;
+      expect(Object.getPrototypeOf(attrs)).not.toBe(Object.prototype);
+      const out = storeSafeJson({ attrs }).attrs;
+      expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+      expect(Object.keys(out)).toEqual(['textAlign']); // an inherited key is not written, as in JSON.stringify
+      expect(out).toEqual({ textAlign: `center${R}` });
+    });
+
+    it('copies any non-plain object (even a clean one) into a plain object of its own keys', () => {
+      class Attr {
+        a = 'clean';
+        [HIGH] = `v${LOW}`;
+      }
+      const clean = new (class {
+        a = 'clean';
+      })();
+      expect(storeSafeJson(clean)).not.toBe(clean);
+      expect(Object.getPrototypeOf(storeSafeJson(clean))).toBe(Object.prototype);
+      expect(storeSafeJson({ x: new Attr() })).toEqual({ x: { a: 'clean', [R]: `v${R}` } });
+      expect(storeSafeJson(new Map([['k', `\0`]]))).toEqual({}); // a Map has no own keys: JSON writes {}
+    });
+
+    it('turns a BigInt into its decimal string (JSON.stringify throws on one)', () => {
+      expect(() => JSON.stringify({ n: BigInt(10) })).toThrow(/BigInt/);
+      expect(storeSafeJson({ n: BigInt(10), m: [BigInt(-2)] })).toEqual({ n: '10', m: ['-2'] });
+      expect(storeSafeJson(BigInt(7))).toBe('7');
+    });
+
+    it('drops undefined, functions and symbols from objects, and writes null for them and for non-finite numbers in arrays', () => {
+      const fn = () => 1;
+      const out = storeSafeJson({ u: undefined, f: fn, s: Symbol('s'), keep: 1, a: [undefined, fn, NaN, Infinity, -0, 2] });
+      expect(Object.keys(out)).toEqual(['keep', 'a']);
+      expect(out).toEqual({ keep: 1, a: [null, null, null, null, 0, 2] });
+      expect(Object.is(out.a[4], 0)).toBe(true);
+      expect(storeSafeJson({ n: NaN, i: -Infinity })).toEqual({ n: null, i: null });
+      // eslint-disable-next-line no-sparse-arrays
+      expect(storeSafeJson([1, , 3])).toEqual([1, null, 3]);
+    });
+
+    it('its result is a plain JSON value: it survives a JSON round trip unchanged, and stringifies as the input does', () => {
+      const date = new Date(0);
+      const reproto: Record<string, unknown> = {};
+      reproto['__proto__'] = { hidden: 1 };
+      reproto.v = 'ok';
+      const corpus: unknown[] = [
+        { type: 'doc', content: [{ type: 'text', text: EMOJI, marks: [{ type: 'bold' }] }] },
+        { a: undefined, b: [undefined, NaN], c: date, d: { toJSON: () => ({ e: 1 }) }, f: reproto, g: -0 },
+        [Infinity, null, 'x', { y: [true, false] }],
+        new Map([['k', 'v']]),
+      ];
+      for (const input of corpus) {
+        const out = storeSafeJson(input);
+        expect(JSON.parse(JSON.stringify(out))).toStrictEqual(out); // nothing JSON would drop or rewrite is left
+        expect(JSON.stringify(out)).toBe(JSON.stringify(input)); // and it writes what the input writes
+      }
+    });
   });
 });
