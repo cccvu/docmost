@@ -11,6 +11,7 @@ import { ServicePageController } from './service-page.controller';
 import { ServiceContentController } from './service-content.controller';
 import { ServiceAttachmentController } from './service-attachment.controller';
 import { AuthzChangeController } from './authz-change.controller';
+import { RATE_PRINCIPAL_HEADER, RATE_PRINCIPAL_PATTERN } from './service-auth.guard';
 import {
   CONTENT_DESCENDANT_MAX_DEPTH,
   CONTENT_LIST_MAX_IDS,
@@ -756,5 +757,57 @@ describe('service-bridge.openapi.json content request schemas match the fork DTO
     // The service principal id grammar is the DTO's (an any-version hex uuid, the platform's id column shape).
     expect(props.serviceSubjectId.pattern).toBe(PRINCIPAL_ID_PATTERN.source);
     for (const k of ['updatedSince', 'updatedUntil'] as const) expect(props[k].format).toBe('date-time');
+  });
+});
+
+/**
+ * #780 — the per-principal rate key and the 429 are part of the wire contract: every ServiceAuthGuard operation (every
+ * `/api/service/*` one; `/api/collab/*` has its own guard) declares the optional `x-ccc-rate-principal` header with the
+ * guard's own pattern, and every 429 is a coded `rate_limited` (or anon `service_auth_throttled`) body with `Retry-After`.
+ */
+describe('service-bridge.openapi.json rate principal and 429 (#780)', () => {
+  const S = SPEC as any;
+  const refName = (r: any): string => String(r?.$ref ?? '').split('/').pop()!;
+
+  it('RatePrincipal is the guard header, optional, with the guard pattern', () => {
+    const p = S.components.parameters.RatePrincipal;
+    expect(p).toMatchObject({ name: RATE_PRINCIPAL_HEADER, in: 'header', required: false });
+    expect(p.schema.pattern).toBe(RATE_PRINCIPAL_PATTERN.source);
+  });
+
+  it('every /api/service operation references RatePrincipal and declares 400 and 429; no /api/collab one does', () => {
+    const missing: string[] = [];
+    for (const [path, ops] of Object.entries(S.paths as Record<string, Record<string, any>>)) {
+      for (const [method, op] of Object.entries(ops)) {
+        if (method === 'parameters') continue;
+        const refs = (op.parameters ?? []).map(refName);
+        const has = refs.includes('RatePrincipal');
+        if (path.startsWith('/api/service/')) {
+          if (!has || !op.responses['400'] || !op.responses['429']) missing.push(`${method} ${path}`);
+        } else expect(has).toBe(false);
+      }
+    }
+    expect(missing).toEqual([]);
+  });
+
+  it('every 429 is RateLimited or RateLimitedOrConversionBudget: a rate_limited body and Retry-After', () => {
+    const used = new Set<string>();
+    for (const [path, ops] of Object.entries(S.paths as Record<string, Record<string, any>>)) {
+      if (!path.startsWith('/api/service/')) continue;
+      for (const [method, op] of Object.entries(ops)) if (method !== 'parameters') used.add(refName(op.responses['429']));
+    }
+    expect([...used].sort()).toEqual(['RateLimited', 'RateLimitedOrConversionBudget']);
+    const r = S.components.responses;
+    expect(refName(r.RateLimited.content['application/json'].schema)).toBe('RateLimitedError');
+    expect(r.RateLimitedOrConversionBudget.content['application/json'].schema.anyOf.map(refName).sort()).toEqual([
+      'ConversionBudgetExhaustedError',
+      'RateLimitedError',
+    ]);
+    for (const name of ['RateLimited', 'RateLimitedOrConversionBudget']) {
+      expect(r[name].headers['Retry-After'].schema).toEqual({ type: 'integer', minimum: 1 });
+    }
+    // The anon bucket's refusal has its own code: a credential fault the integrator must not read as its caller's load.
+    expect(S.components.schemas.RateLimitedError.properties.code.enum).toEqual(['rate_limited', 'service_auth_throttled']);
+    expect(S.components.schemas.RateLimitedError.required).toEqual(['code', 'message']);
   });
 });
