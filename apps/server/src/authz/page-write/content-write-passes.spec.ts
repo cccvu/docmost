@@ -316,6 +316,63 @@ describe('#731 whole-page passes per content write (real Hocuspocus 3.4.4)', () 
     expect(s.db.updatePage).toHaveBeenCalledTimes(0); // the row already held it
   });
 
+  // #731: a write that LOADS the page yields one macrotask between the load and the transaction (two event-loop blocks,
+  // not one); a write to a RESIDENT page never yields there (#282: nothing between the pre-check and the transaction).
+  const orderAroundOpen = (s: ReturnType<typeof stack>) => {
+    const order: string[] = [];
+    const open = s.hocuspocus.openDirectConnection.bind(s.hocuspocus);
+    jest.spyOn(s.hocuspocus, 'openDirectConnection').mockImplementation(async (name: string, ctx?: unknown) => {
+      const conn = await open(name, ctx);
+      order.push('opened');
+      setImmediate(() => order.push('macrotask'));
+      let first = true;
+      conn.document!.on('beforeTransaction', () => first && (first = false, order.push('transaction')));
+      return conn;
+    });
+    return order;
+  };
+
+  it('NON-RESIDENT: one macrotask between the load and the transaction; the CAS still decides inside it', async () => {
+    const s = stack(page('A', 50));
+    const order = orderAroundOpen(s);
+    await expect(
+      s.handlers.conditionalUpdatePageContent(DOC, { prosemirrorJson: page('B', 5), operation: 'replace', user: USER }),
+    ).resolves.toEqual({ applied: true });
+    expect(order).toEqual(['opened', 'macrotask', 'transaction']);
+    // A stale digest on a page that had to load is still refused by the in-transaction compare, nothing applied.
+    await settleTimers();
+    const t = stack(page('A', 50));
+    const order2 = orderAroundOpen(t);
+    await expect(
+      t.handlers.conditionalUpdatePageContent(DOC, {
+        prosemirrorJson: page('B', 5),
+        operation: 'replace',
+        user: USER,
+        expectedContentHash: 'stale',
+      }),
+    ).resolves.toEqual({ applied: false, reason: 'precondition' });
+    expect(order2).toEqual(['opened', 'macrotask', 'transaction']);
+    expect(rowHas(t.db, 'B paragraph')).toBe(false);
+  });
+
+  it('RESIDENT: no macrotask between opening and the transaction (the #282 window is unchanged)', async () => {
+    const s = stack(page('A', 50));
+    const keeper = await s.hocuspocus.openDirectConnection(DOC, { user: USER });
+    const order = orderAroundOpen(s);
+    const settled = (await s.handlers.flushPageContent(DOC, { withDigest: true })) as { contentDigest: string };
+    await expect(
+      s.handlers.conditionalUpdatePageContent(DOC, {
+        prosemirrorJson: page('B', 5),
+        operation: 'replace',
+        user: USER,
+        expectedContentHash: settled.contentDigest,
+      }),
+    ).resolves.toEqual({ applied: true });
+    await new Promise((r) => setImmediate(r));
+    expect(order).toEqual(['opened', 'transaction', 'macrotask']);
+    await keeper.disconnect();
+  });
+
   it('load in place equals the pre-#731 load (return a doc, Hocuspocus re-encodes and applies it), and the legacy content-only row still converts', async () => {
     const s = stack(page('A', 200));
     const conn = await s.hocuspocus.openDirectConnection(DOC, { user: USER });

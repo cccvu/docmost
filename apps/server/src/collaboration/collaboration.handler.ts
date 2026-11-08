@@ -420,11 +420,17 @@ export class CollaborationHandler {
     context: any = {},
     fn: (doc: Document) => void,
   ): Promise<void> {
+    // #731: a document this open has to LOAD gets one macrotask between the load (a page-sized apply) and the
+    // transaction, so the two are not one event-loop block. Never for a resident document: on that path nothing may
+    // yield between the resident pre-check and the transaction (#282). The CAS, dedup and cap inside the transaction
+    // decide atomically either way.
+    const loads = hocuspocus.documents?.has(documentName) === false;
     const connection = await hocuspocus.openDirectConnection(
       documentName,
       context,
     );
     try {
+      if (loads) await yieldToEventLoop();
       // #716: ONE Yjs transaction around the whole callback (Hocuspocus's DirectConnection.transact does not open
       // one). A nested `applyUpdate` joins it, so a replace's delete + apply — and #429's key record — are one
       // atomic CRDT mutation: one update event, one broadcast, and peers never see the empty fragment between them.
