@@ -57,6 +57,8 @@ import {
   logStoreFailure,
   logPostStoreFailure,
 } from '../../authz/page-write/collab-drift-log';
+// CCC #773: the stored projection is made storable (no lone surrogate or NUL) before anything reads or writes it.
+import { storeSafeJson } from '../../authz/page-write/store-safe-json';
 
 @Injectable()
 export class PersistenceExtension implements Extension {
@@ -179,7 +181,7 @@ export class PersistenceExtension implements Extension {
 
         // Serialize AFTER the reconcile, under the lock (see #390 TOCTOU note above).
         coveredGeneration = storeGenerationOf(document); // #731: same synchronous block as the serialization
-        tiptapJson = TiptapTransformer.fromYdoc(document, 'default');
+        tiptapJson = storeSafeJson(TiptapTransformer.fromYdoc(document, 'default')); // CCC #773
         ydocState = Buffer.from(Y.encodeStateAsUpdate(document));
         try {
           textContent = jsonToText(tiptapJson);
