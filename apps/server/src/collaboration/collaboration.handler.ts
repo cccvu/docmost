@@ -27,10 +27,11 @@ import {
 } from '../authz/page-write/write-idem';
 // CCC integration seam (UPSTREAM_MODIFICATIONS.md §2 + authz/route-guard/import-boundary.spec.ts): the conditional
 // write compares the LIVE document's digest (cross-service contract code, `stable-hash` beside its shared vectors),
-// memoized per document mutation (#716: one walk per state, not one per compare); a replace's Yjs update is built
-// before the connection opens (#716). Pure helpers in authz/; this file only calls them.
+// memoized per document mutation (#716: one walk per state, not one per compare); a content operation's Yjs types are
+// built before the connection opens (#716, #731). Pure helpers in authz/; this file only calls them.
 import { liveContentDigest } from '../authz/page-write/doc-version';
 import {
+  insertAsOwnClient,
   PreparedContent,
   prepareContentOperation,
   yieldToEventLoop,
@@ -252,7 +253,7 @@ export class CollaborationHandler {
         let mutationStarted = false;
         let liveDoc: Document | undefined;
         try {
-          // #716: a replace's Yjs update is built FIRST — a pure function of the request, so building it here
+          // #716: a content operation is built FIRST — a pure function of the request, so building it here
           // changes no concurrency semantics — and the loop gets a tick before the pre-check. A build failure opens
           // no connection and runs no store (#342 BUILD-BEFORE-DELETE, strengthened). Nothing yields between the
           // pre-check and the transaction: that would widen the #282 window described below.
@@ -402,14 +403,14 @@ export class CollaborationHandler {
       // `disconnect()` store would persist it — silently WIPING the page while the request also fails.
       // Encoding the new state first means a conversion failure aborts before any mutation, so the
       // original content survives and the closing store re-persists it unchanged.
-      // (#716: `prepared.update` was built before the connection opened — the build-before-delete order holds.)
+      // (#716/#731: `prepared.elements` were built before the connection opened — the build-before-delete order holds.)
       if (fragment.length > 0) {
         fragment.delete(0, fragment.length);
       }
-      Y.applyUpdate(doc, prepared.update);
+      insertAsOwnClient(doc, fragment, prepared.elements); // #731: as the toYdoc build did, a client id per replace
     } else {
       const position = prepared.atStart ? 0 : fragment.length;
-      fragment.insert(position, prepared.elements as never);
+      fragment.insert(position, prepared.elements);
     }
   }
 
@@ -419,11 +420,17 @@ export class CollaborationHandler {
     context: any = {},
     fn: (doc: Document) => void,
   ): Promise<void> {
+    // #731: a document this open has to LOAD gets one macrotask between the load (a page-sized apply) and the
+    // transaction, so the two are not one event-loop block. Never for a resident document: on that path nothing may
+    // yield between the resident pre-check and the transaction (#282). The CAS, dedup and cap inside the transaction
+    // decide atomically either way.
+    const loads = hocuspocus.documents?.has(documentName) === false;
     const connection = await hocuspocus.openDirectConnection(
       documentName,
       context,
     );
     try {
+      if (loads) await yieldToEventLoop();
       // #716: ONE Yjs transaction around the whole callback (Hocuspocus's DirectConnection.transact does not open
       // one). A nested `applyUpdate` joins it, so a replace's delete + apply — and #429's key record — are one
       // atomic CRDT mutation: one update event, one broadcast, and peers never see the empty fragment between them.

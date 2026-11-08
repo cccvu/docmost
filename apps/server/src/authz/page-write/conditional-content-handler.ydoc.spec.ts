@@ -39,6 +39,16 @@ jest.mock('../../collaboration/collaboration.util', () => ({
   tiptapExtensions: [],
 }));
 jest.mock('../../collaboration/yjs.util', () => ({ setYjsMark: jest.fn(), updateYjsMarkAttribute: jest.fn() }));
+// #731: the content builder, paragraph-only like the transformer above (the real one is pinned against toYdoc by
+// prelim-content.parity.spec.ts and runs unmocked in content-write-passes.spec.ts).
+jest.mock('./prelim-content', () => ({
+  buildPrelimContent: (json: { content: Para[] }) =>
+    json.content.map((p) => {
+      const el = new Y.XmlElement('paragraph');
+      el.insert(0, [new Y.XmlText(p.text)]);
+      return el;
+    }),
+}));
 
 import { CollaborationHandler } from '../../collaboration/collaboration.handler';
 import { stableHash } from './stable-hash';

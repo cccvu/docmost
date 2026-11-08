@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import * as Y from 'yjs';
 
 /**
@@ -17,7 +18,7 @@ import * as Y from 'yjs';
  * calling this, inside the row's `SELECT … FOR UPDATE` transaction, so the persisted content is always a
  * superset of the locked row and can never be a stale subset (the TOCTOU proof in ADR 0019 / #390).
  *
- * Imports ONLY `yjs` (not the tiptap/lib0 graph) so it stays unit-testable against real CRDT semantics.
+ * Imports ONLY `yjs` and `node:crypto` (not the tiptap/lib0 graph) so it stays unit-testable against real CRDT semantics.
  *
  * The trigger is deliberately `structs > 0` — the row carries content OPS the resident lacks — which is
  * exactly the #390 shape (accepted content about to be lost) and yields ZERO false positives in normal
@@ -42,14 +43,52 @@ export function reconcileRowIntoDoc(
     return { merged: false };
   }
 
+  // #731: bytes this document is already known to cover need no diff (see `markRowCovered`).
+  const rowDigest = bytesDigest(rowYdocBytes);
+  if (coveredRows.get(document) === rowDigest) {
+    return { merged: false };
+  }
+
   // The ops present in the row's state that the resident document does not already have.
   const missing = Y.diffUpdate(rowYdocBytes, Y.encodeStateVector(document));
 
   // `structs.length === 0` ⇒ the resident is a superset of the row (normal operation) ⇒ nothing to fold in.
   if (Y.decodeUpdate(missing).structs.length === 0) {
+    coveredRows.set(document, rowDigest);
     return { merged: false };
   }
 
   Y.applyUpdate(document, missing);
+  rememberIfIntegrated(document, rowDigest);
   return { merged: true };
+}
+
+/**
+ * #731 — the reconcile memo. Every store reads the row's ydoc under the lock and diffs it against the resident
+ * document (a page-sized `diffUpdate` + decode), and in normal operation that row is bytes this very document wrote
+ * or loaded. Covering is monotonic: a document's state vector only grows (garbage-collected structs keep their
+ * clocks) and the reconcile ignores the delete set, so once a document is known to hold every struct in some bytes,
+ * the same bytes always diff to nothing against it. So one digest per document is kept: the sha256 of the full row
+ * bytes last known to be covered. A hit skips the diff; any other bytes (an out-of-band write) diff in full.
+ *
+ * Seeded from facts about bytes, not about the row: the load (the row it just applied) and a store's write (its own
+ * `encodeStateAsUpdate`), so it stays sound even when that write's commit then fails. Never seeded while the document
+ * holds pending structs: those are in its encoding but not in its state vector.
+ */
+const coveredRows = new WeakMap<object, string>();
+
+const bytesDigest = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('base64');
+
+const hasPendingStructs = (document: Y.Doc): boolean =>
+  (document as unknown as { store?: { pendingStructs?: unknown } }).store?.pendingStructs != null;
+
+function rememberIfIntegrated(document: Y.Doc, digest: string): void {
+  if (hasPendingStructs(document)) coveredRows.delete(document);
+  else coveredRows.set(document, digest);
+}
+
+/** Record that `document` holds every struct in `bytes` (it just applied them, or they are its own encoding). */
+export function markRowCovered(document: Y.Doc, bytes: Uint8Array | Buffer | null | undefined): void {
+  if (!bytes || bytes.length === 0) return;
+  rememberIfIntegrated(document, bytesDigest(bytes));
 }

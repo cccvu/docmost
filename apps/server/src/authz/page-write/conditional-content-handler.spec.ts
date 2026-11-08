@@ -21,6 +21,12 @@ jest.mock('../../collaboration/yjs.util', () => ({
   setYjsMark: jest.fn(),
   updateYjsMarkAttribute: jest.fn(),
 }));
+// #731: a content operation's new nodes are built as Yjs preliminary types (prelim-content.ts, parity-pinned against
+// toYdoc in prelim-content.parity.spec.ts). Stubbed: the stand-in "types" are the top-level JSON nodes themselves.
+const buildPrelimContent = jest.fn((json: unknown) => ((json as { content?: unknown[] } | null)?.content ?? []) as unknown[]);
+jest.mock('./prelim-content', () => ({
+  buildPrelimContent: (...a: unknown[]) => buildPrelimContent(...(a as [unknown])),
+}));
 
 import { CollaborationHandler } from '../../collaboration/collaboration.handler';
 import { stableHash } from './stable-hash';
@@ -36,6 +42,8 @@ function ydocLike<T extends object>(d: T) {
   const listeners: Array<() => void> = [];
   const fire = () => listeners.forEach((l) => l());
   return Object.assign(d, {
+    clientID: 1, // #731: a replace inserts under an id of its own (insertAsOwnClient), then restores this one
+    store: { clients: new Map() },
     on: jest.fn((evt: string, fn: () => void) => {
       if (evt === 'afterTransaction') listeners.push(fn);
     }),
@@ -332,12 +340,11 @@ describe('CollaborationHandler.updatePageContent — build-before-delete (#342)'
   });
 
   beforeEach(() => {
-    toYdoc.mockReset();
-    toYdoc.mockReturnValue({});
+    buildPrelimContent.mockClear();
   });
 
   it('does NOT delete the fragment when building the new document throws (page not wiped)', async () => {
-    toYdoc.mockImplementationOnce(() => {
+    buildPrelimContent.mockImplementationOnce(() => {
       throw new Error('unconvertible content');
     });
     const { handler, fragment, connection, hocuspocus } = build();
@@ -648,8 +655,7 @@ describe('CollaborationHandler.conditionalUpdatePageContent — #716', () => {
   beforeEach(() => {
     fromYdoc.mockReset();
     fromYdoc.mockReturnValue(LIVE);
-    toYdoc.mockReset();
-    toYdoc.mockReturnValue({});
+    buildPrelimContent.mockClear();
   });
 
   describe('the digest memo (doc-version.ts)', () => {
@@ -695,10 +701,10 @@ describe('CollaborationHandler.conditionalUpdatePageContent — #716', () => {
   describe('replace: built before the pre-check, one tick, nothing between the pre-check and the transaction', () => {
     it('builds, yields one macrotask, then pre-checks and opens', async () => {
       const order: string[] = [];
-      toYdoc.mockImplementation(() => {
+      buildPrelimContent.mockImplementationOnce(() => {
         order.push('build');
         setImmediate(() => order.push('tick')); // queued during the build: runs in the yield after it
-        return {};
+        return [];
       });
       fromYdoc.mockImplementation(() => (order.push('compare'), LIVE));
       const { handler, hocuspocus } = build();
@@ -711,7 +717,7 @@ describe('CollaborationHandler.conditionalUpdatePageContent — #716', () => {
     });
 
     it('a build failure opens no connection, runs no store, mutates nothing → error (retryable, nothing applied)', async () => {
-      toYdoc.mockImplementation(() => {
+      buildPrelimContent.mockImplementationOnce(() => {
         throw new Error('unconvertible content');
       });
       const { handler, hocuspocus, ops } = build();
@@ -738,11 +744,13 @@ describe('CollaborationHandler.conditionalUpdatePageContent — #716', () => {
       expect(order).toEqual(['compare', 'mutate', 'tick']);
     });
 
-    it('applies the pre-built update (the transformer is not run again inside the transaction)', async () => {
-      const { handler, ops } = build();
+    it('applies the pre-built content (nothing is built again inside the transaction): delete, then ONE insert', async () => {
+      const { handler, ops, doc } = build();
       await handler(DOC, req({ operation: 'replace' }));
-      expect(toYdoc).toHaveBeenCalledTimes(1);
-      expect(ops).toEqual(['open', 'delete']); // Y.applyUpdate is mocked
+      expect(buildPrelimContent).toHaveBeenCalledTimes(1);
+      expect(toYdoc).not.toHaveBeenCalled(); // #731: no second Y.Doc is built, encoded or applied
+      expect(ops).toEqual(['open', 'delete', 'insert']);
+      expect(((doc.getXmlFragment as jest.Mock)() as { insert: jest.Mock }).insert).toHaveBeenCalledWith(0, [{ type: 'paragraph' }]);
     });
 
     it('the whole callback runs inside ONE doc.transact', async () => {
@@ -803,8 +811,7 @@ describe('CollaborationHandler.conditionalUpdatePageContent — #716', () => {
     });
 
     it('an append whose nodes cannot be built fails BEFORE opening: a plain error, never applied_unconfirmed', async () => {
-      const prep = await import('../../collaboration/collaboration.util');
-      (prep.prosemirrorNodeToYElement as jest.Mock).mockImplementationOnce(() => {
+      buildPrelimContent.mockImplementationOnce(() => {
         throw new Error('unknown node type');
       });
       const { handler, ops, hocuspocus } = build();
@@ -843,8 +850,7 @@ describe('CollaborationHandler.conditionalUpdatePageContent — #716', () => {
     });
 
     it('resident: decided on the live document WITHOUT opening a connection (no stores, nothing reattributed)', async () => {
-      const prep = await import('../../collaboration/collaboration.util');
-      (prep.prosemirrorNodeToYElement as jest.Mock).mockClear();
+      buildPrelimContent.mockClear();
       const { handler, ops, hocuspocus } = build();
       await expect(handler(DOC, req({ refuseOverCap: true, idempotencyKey: 'K', prosemirrorJson: undefined }))).resolves.toEqual({
         applied: false,
@@ -852,7 +858,7 @@ describe('CollaborationHandler.conditionalUpdatePageContent — #716', () => {
       });
       expect(hocuspocus.openDirectConnection).not.toHaveBeenCalled();
       expect(ops).toEqual([]);
-      expect(prep.prosemirrorNodeToYElement).not.toHaveBeenCalled(); // nothing built for content never applied
+      expect(buildPrelimContent).not.toHaveBeenCalled(); // nothing built for content never applied
     });
 
     it('resident: an applied retry is duplicate, a stale digest is precondition — both without opening', async () => {
