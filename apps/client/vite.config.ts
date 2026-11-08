@@ -201,6 +201,12 @@ export default defineConfig(({ mode }) => {
           target: PLATFORM_URL || "http://localhost:4000",
           changeOrigin: true,
         },
+        // The platform's versioned API (#764: the wiki's "Send feedback" calls /v1/feedback with the session
+        // cookie). In prod the ALB routes /v1 to the platform; without this it hits the Vite SPA fallback in dev.
+        "/v1": {
+          target: PLATFORM_URL || "http://localhost:4000",
+          changeOrigin: true,
+        },
         "/socket.io": {
           target: APP_URL,
           ws: true,

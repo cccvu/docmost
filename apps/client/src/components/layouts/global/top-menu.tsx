@@ -34,6 +34,9 @@ import { CustomAvatar } from "@/components/ui/custom-avatar.tsx";
 import { useTranslation } from "react-i18next";
 import { AvatarIconType } from "@/features/attachments/types/attachment.types.ts";
 import { PublicAuthButtons } from "@/features/public/components/public-auth-buttons.tsx";
+import { useFeedbackEntry } from "@/features/feedback/use-feedback-entry";
+import { FeedbackMenuItem } from "@/features/feedback/feedback-menu-item";
+import { FeedbackModal } from "@/features/feedback/feedback-modal";
 
 export default function TopMenu() {
   const { t } = useTranslation();
@@ -51,6 +54,8 @@ export default function TopMenu() {
     createOpened,
     { open: openCreate, close: closeCreate },
   ] = useDisclosure(false);
+  // CCC #764: "Send feedback" — visibility + dialog state (fork-owned, features/feedback/).
+  const feedback = useFeedbackEntry();
 
   if (!user || !workspace) {
     // Signed-out (e.g. an anonymous visitor who reached an app route): offer Log in / Sign up
@@ -60,9 +65,15 @@ export default function TopMenu() {
 
   return (
     <>
-    <Menu width={250} position="bottom-end" withArrow shadow={"lg"}>
+    <Menu
+      width={250}
+      position="bottom-end"
+      withArrow
+      shadow={"lg"}
+      onChange={feedback.onMenuChange}
+    >
       <Menu.Target>
-        <UnstyledButton>
+        <UnstyledButton aria-label={t("Account menu")}>
           {/* CCC: avatar-only trigger (workspace-name label removed) so the wiki
               and the admin console read identically — the console header already
               carries the CCC brand, and the workspace/account details are in the
@@ -193,6 +204,8 @@ export default function TopMenu() {
           </Menu.Sub.Dropdown>
         </Menu.Sub>
 
+        <FeedbackMenuItem entry={feedback} />
+
         <Menu.Divider />
 
         <Menu.Item onClick={logout} leftSection={<IconLogout size={16} />}>
@@ -202,6 +215,8 @@ export default function TopMenu() {
     </Menu>
 
       <CreatePersonalSpaceModal opened={createOpened} onClose={closeCreate} />
+      {/* CCC #764: a sibling of the Menu (not inside it), so the draft survives the menu closing. */}
+      <FeedbackModal entry={feedback} />
     </>
   );
 }
