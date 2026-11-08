@@ -14,6 +14,7 @@ import { Error404 } from "@/components/ui/error-404.tsx";
 import { useEntitlements } from "@/ee/entitlement/use-entitlements";
 import { entitlementAtom } from "@/ee/entitlement/entitlement-atom";
 import { changeAppLanguage } from "@/lib/date-locale.ts";
+import { useIdentityReconcile } from "@/features/identity-reconcile/use-identity-reconcile";
 
 export function UserProvider({ children }: React.PropsWithChildren) {
   const [, setCurrentUser] = useAtom(currentUserAtom);
@@ -51,6 +52,7 @@ export function UserProvider({ children }: React.PropsWithChildren) {
   useQuerySubscription();
   useTreeSocket();
   useNotificationSocket();
+  useIdentityReconcile(data?.user?.id); // wiki-v2 #761
 
   useEffect(() => {
     if (data && data.user && data.workspace) {
