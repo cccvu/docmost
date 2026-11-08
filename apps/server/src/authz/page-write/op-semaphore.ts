@@ -24,6 +24,11 @@ interface Waiter {
   credited: number;
   timer?: ReturnType<typeof setTimeout>;
   expire: () => void;
+  /**
+   * #731: an urgent waiter that has already waited through a NORMAL holder's turn. Aging never passes it over again,
+   * so an urgent waiter waits out at most one normal holder (see `next()`).
+   */
+  behindNormal: boolean;
 }
 
 export interface OpSemaphoreOptions {
@@ -31,6 +36,13 @@ export interface OpSemaphoreOptions {
    * #716: with urgent waiters present, a NORMAL waiter that has waited at least this long is granted first, so a
    * steady stream of urgent work can delay normal work by about this much, never starve it. Absent: urgent waiters are
    * always served first (still FIFO among themselves).
+   *
+   * #731: except ahead of an urgent waiter that has already waited through a normal holder's turn: that one is served
+   * first. So an urgent waiter waits out at most ONE normal holder (the one running when it joined, or one aged
+   * waiter granted while it waited), never a chain of aged ones. Normal work still never starves: once the oldest
+   * normal waiter has aged, no other normal holder runs before it, so the urgent waiters that waited through the last
+   * normal holder are a fixed set (with max 1 and one waiter per caller, at most one per caller) that only shrinks;
+   * urgent waiters that join after it have waited behind urgent holders only, and aging passes them.
    */
   agingMs?: number;
   /** The clock aging reads (tests). */
@@ -71,23 +83,25 @@ export class OpSemaphore {
    * ahead of every normal waiter (subject to `agingMs`); without it the queue is plain FIFO, as before.
    */
   acquire(waitMs: number = this.waitMs, opts: { urgent?: boolean } = {}): Promise<() => void> {
+    const urgent = opts.urgent === true;
     if (this.active < this.max) {
       this.active++;
-      return Promise.resolve(this.releaser());
+      return Promise.resolve(this.releaser(urgent));
     }
-    const queue = opts.urgent ? this.urgent : this.waiters;
+    const queue = urgent ? this.urgent : this.waiters;
     return new Promise((resolve, reject) => {
       const joined = Date.now();
       const waiter: Waiter = {
         grant: () => {
           clearTimeout(waiter.timer);
           this.active++;
-          resolve(this.releaser());
+          resolve(this.releaser(urgent));
         },
         at: this.now(),
         deadline: joined + waitMs,
         joined,
         credited: 0,
+        behindNormal: false,
         expire: () => {
           clearTimeout(waiter.timer);
           const i = queue.indexOf(waiter);
@@ -150,21 +164,29 @@ export class OpSemaphore {
     }
   }
 
-  /** Who a freed slot goes to: an urgent waiter first, unless the oldest normal waiter has aged past `agingMs`. */
+  /**
+   * Who a freed slot goes to: an urgent waiter first, unless the oldest normal waiter has aged past `agingMs` AND the
+   * oldest urgent waiter has not yet waited through a normal holder's turn (#731). Urgent waiters are FIFO, so the
+   * oldest one has waited through everything a newer one has.
+   */
   private next(): Waiter | undefined {
     if (this.urgent.length === 0) return this.waiters.shift();
     if (this.waiters.length === 0) return this.urgent.shift();
     const { agingMs } = this.options;
-    if (agingMs !== undefined && this.now() - this.waiters[0].at >= agingMs) return this.waiters.shift();
+    const aged = agingMs !== undefined && this.now() - this.waiters[0].at >= agingMs;
+    if (aged && !this.urgent[0].behindNormal) return this.waiters.shift();
     return this.urgent.shift();
   }
 
-  private releaser(): () => void {
+  /** `urgent`: whether the holder came through the urgent queue (#731: a normal holder's release marks the waiters). */
+  private releaser(urgent: boolean): () => void {
     let released = false;
     return () => {
       if (released) return; // idempotent: a double release must never free a slot someone else holds
       released = true;
       this.active--;
+      // #731: every urgent waiter still queued has now waited through this normal holder's turn.
+      if (!urgent) for (const w of this.urgent) w.behindNormal = true;
       this.next()?.grant();
     };
   }

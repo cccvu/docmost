@@ -47,7 +47,6 @@ import {
   clearStoreFailure,
   isStoreCurrent,
   markStoredAt,
-  storeGenerationOf,
 } from '../../authz/page-write/store-failure-registry';
 // The alarm tokens (COLLAB_STALE_RECONCILE / COLLAB_STORE_FAILED / COLLAB_POST_STORE_FAILED) are emitted from
 // authz/ — the CCC-owned fork subtree scripts/check-infra-config.mjs §14 scans for a monitoring.tf filter's
@@ -57,8 +56,13 @@ import {
   logStoreFailure,
   logPostStoreFailure,
 } from '../../authz/page-write/collab-drift-log';
-// CCC #773: the stored projection is made storable (no lone surrogate or NUL) before anything reads or writes it.
-import { storeSafeJson } from '../../authz/page-write/store-safe-json';
+// #731: the load reads `content` only for a legacy row; the store yields a loop turn between its page-sized steps.
+// CCC #773: the store's snapshot (persistence-steps) makes the stored projection storable (no lone surrogate or NUL).
+import {
+  findPageRowForLoad,
+  snapshotForStore,
+} from '../../authz/page-write/persistence-steps';
+import { yieldToEventLoop } from '../../authz/page-write/yield-to-event-loop';
 
 @Injectable()
 export class PersistenceExtension implements Extension {
@@ -87,10 +91,12 @@ export class PersistenceExtension implements Extension {
       return;
     }
 
-    const page = await this.pageRepo.findById(pageId, {
-      includeContent: true,
-      includeYdoc: true,
-    });
+    // CCC #731 (UPSTREAM_MODIFICATIONS.md #122): `content` is read only for a row with no ydoc, the one branch that
+    // uses it (a page-sized jsonb parse and key walk otherwise thrown away).
+    const page = await findPageRowForLoad(
+      (id, opts) => this.pageRepo.findById(id, opts),
+      pageId,
+    );
 
     if (!page) {
       this.logger.warn('page not found');
@@ -165,6 +171,10 @@ export class PersistenceExtension implements Extension {
           return;
         }
 
+        // CCC #731: a loop turn between the locked read and the reconcile, between the snapshot and `jsonToText`, and
+        // after `jsonToText` (three page-sized blocks, not one). Never inside the snapshot (`snapshotForStore`).
+        await yieldToEventLoop();
+
         // #390 — SYMMETRIC guard. Fold any row content this resident doc is MISSING back in (lossless Yjs
         // union) BEFORE serializing, so a stale resident copy cannot revert an out-of-band write. No-op in
         // normal operation (the resident is a superset of the row). Runs inside the lock; the merge also
@@ -179,15 +189,19 @@ export class PersistenceExtension implements Extension {
           }
         }
 
-        // Serialize AFTER the reconcile, under the lock (see #390 TOCTOU note above).
-        coveredGeneration = storeGenerationOf(document); // #731: same synchronous block as the serialization
-        tiptapJson = storeSafeJson(TiptapTransformer.fromYdoc(document, 'default')); // CCC #773
-        ydocState = Buffer.from(Y.encodeStateAsUpdate(document));
+        // Serialize AFTER the reconcile, under the lock (see #390 TOCTOU note above). #731: the generation, `fromYdoc`
+        // and the encode are ONE synchronous run (an edit in a later yield bumps the generation: the next store runs).
+        const snapshot = snapshotForStore(document);
+        coveredGeneration = snapshot.generation;
+        tiptapJson = snapshot.json;
+        ydocState = snapshot.state;
+        await yieldToEventLoop();
         try {
           textContent = jsonToText(tiptapJson);
         } catch (err) {
           this.logger.warn('jsonToText' + err?.['message']);
         }
+        await yieldToEventLoop();
 
         // #390 null-ydoc defensive fallback (dormant: verified no LIVE write path omits ydoc). Without a
         // shared ydoc lineage the CRDT reconcile cannot run, so refuse the clobber shape — a blank resident

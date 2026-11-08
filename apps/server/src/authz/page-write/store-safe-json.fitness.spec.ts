@@ -18,7 +18,7 @@ const SRC_ROOT = resolve(__dirname, '..', '..');
 
 /** Every file that may turn the live document into JSON, and how many times (paths relative to apps/server/src). */
 const ALLOWED: Record<string, number> = {
-  'collaboration/extensions/persistence.extension.ts': 1, // the store (UPSTREAM_MODIFICATIONS.md §122)
+  'authz/page-write/persistence-steps.ts': 1, // the store's snapshot, called from UPSTREAM_MODIFICATIONS.md §122 (#731)
   'authz/page-write/doc-version.ts': 1, // the ADR 0019 content digest
 };
 

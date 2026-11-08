@@ -789,6 +789,8 @@ describe('#716 small interactive conversions', () => {
     expect(waitMs + reloadCreditMs + deadlineMs).toBeLessThan(20_000);
     // An aged large waiter + one small conversion of up to 4 s + lag still fits its own wait (reloads credited).
     expect(smallAgingMs + 4_000 + 1_000).toBeLessThanOrEqual(waitMs);
+    // #731: a small write waits out at most one large conversion (≤ the deadline + lag), its reload credited.
+    expect(deadlineMs + 1_000).toBeLessThanOrEqual(waitMs);
   });
 
   it('a small write is served ahead of a large one that queued before it', async () => {
@@ -802,7 +804,18 @@ describe('#716 small interactive conversions', () => {
     expect(order).toEqual(['l1', 's', 'l2']);
   });
 
-  it('aging: a large waiter that has waited smallAgingMs goes before a small one', async () => {
+  it('aging: a large waiter that has waited smallAgingMs goes before a small one queued behind a SMALL conversion', async () => {
+    const { pool } = track(makePool({ smallInputBytes: 12, smallAgingMs: 50, deadlineMs: 5_000, waitMs: 5_000 }));
+    const order: string[] = [];
+    const running = pool.parse(SMALL(400, 's0'), 'html', q('user:S0')).then(() => order.push('s0'));
+    await new Promise((r) => setTimeout(r, 20));
+    const l2 = pool.parse(LARGE(20, 'l2'), 'html', q('user:L2')).then(() => order.push('l2'));
+    const s = pool.parse(SMALL(20, 's'), 'html', q('user:S')).then(() => order.push('s'));
+    await Promise.all([running, l2, s]);
+    expect(order).toEqual(['s0', 'l2', 's']); // l2 waited ~380 ms ≥ 50 ms when s0 finished
+  });
+
+  it('#731: a small write that waited out a LARGE conversion goes before an aged large waiter', async () => {
     const { pool } = track(makePool({ smallInputBytes: 12, smallAgingMs: 50, deadlineMs: 5_000, waitMs: 5_000 }));
     const order: string[] = [];
     const running = pool.parse(LARGE(400, 'l1'), 'html', q('user:L1')).then(() => order.push('l1'));
@@ -810,7 +823,28 @@ describe('#716 small interactive conversions', () => {
     const l2 = pool.parse(LARGE(20, 'l2'), 'html', q('user:L2')).then(() => order.push('l2'));
     const s = pool.parse(SMALL(20, 's'), 'html', q('user:S')).then(() => order.push('s'));
     await Promise.all([running, l2, s]);
-    expect(order).toEqual(['l1', 'l2', 's']); // l2 waited ~380 ms ≥ 50 ms when l1 finished
+    expect(order).toEqual(['l1', 's', 'l2']); // l2 had aged (~380 ms ≥ 50 ms), but s had waited out l1's whole turn
+  });
+
+  it('#731 the A1 trace: behind a killed conversion and an aged large one, a small write is served after the reload', async () => {
+    // i2-M-r1 18:14:43–51: the abuser killed at the deadline, the reload, then an aged large conversion (the next
+    // abuser's, killed at the deadline too) granted ahead of the small write, which gave up after its 8 s wait. Scaled:
+    // deadline 400, wait 600, reload ~200 (credited up to 300). Before the fix the small write here was a 503.
+    const { pool, spawned } = track(
+      makePool(
+        { smallInputBytes: 12, smallAgingMs: 50, deadlineMs: 400, waitMs: 600, reloadCreditMs: 300 },
+        ['normal', 'slow-ready:200'],
+      ),
+    );
+    await pool.parse('warm', 'html', q('user:A1'));
+    const abuser1 = pool.parse(`hang:${'x'.repeat(16)}`, 'html', q('user:A1')).catch((e) => e);
+    await new Promise((r) => setTimeout(r, 20));
+    const abuser2 = pool.parse(`hang:${'y'.repeat(16)}`, 'html', q('user:A2')).catch((e) => e); // aged by the kill
+    await new Promise((r) => setTimeout(r, 10));
+    await expect(pool.parse(SMALL(20, 's'), 'html', q('user:S'))).resolves.toMatchObject({ type: 'doc', label: 's' });
+    expect(spawned.length).toBe(2); // served after the first reload, before abuser2's conversion killed a second worker
+    await expect(abuser1).resolves.toBeInstanceOf(ContentTooComplexException);
+    await expect(abuser2).resolves.toBeInstanceOf(ContentTooComplexException);
   });
 
   it('a batch conversion is never small, however short its input', async () => {

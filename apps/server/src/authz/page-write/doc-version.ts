@@ -87,3 +87,21 @@ const contentDigest = (d: Y.Doc): string => stableHash(storeSafeJson(TiptapTrans
 export function liveContentDigest(doc: Y.Doc): string {
   return memoizedDigest(doc, contentDigest);
 }
+
+/**
+ * #731 F4: compute the live digest now if the memo does not hold it for the document's current generation. True when
+ * it had to (a page-sized walk ran), false on a hit or for a document whose transactions cannot be observed (that one
+ * is never memoized, so warming it would only walk the page twice).
+ *
+ * The conditional write warms the memo, yields a loop turn, and only then runs its pre-check and transaction, so the
+ * digest walk and the transaction are separate event-loop blocks. Sound because the memo is keyed on the generation:
+ * an edit that lands during the yield bumps it, and the pre-check (and the authoritative compare inside the
+ * transaction) recompute; nothing yields between the pre-check and the transaction (#282).
+ */
+export function warmLiveContentDigest(doc: Y.Doc): boolean {
+  if (typeof (doc as { on?: unknown })?.on !== 'function') return false;
+  const v = track(doc);
+  if (v.digest !== undefined && v.digestGen === v.gen && v.digestOf === contentDigest) return false;
+  memoizedDigest(doc, contentDigest);
+  return true;
+}

@@ -6,7 +6,7 @@ jest.mock('@hocuspocus/transformer', () => ({
   TiptapTransformer: { fromYdoc: (doc: Y.Doc) => doc.getXmlFragment('default').toJSON() },
 }));
 
-import { docGeneration, liveContentDigest, memoizedDigest } from './doc-version';
+import { docGeneration, liveContentDigest, memoizedDigest, warmLiveContentDigest } from './doc-version';
 import { stableHash } from './stable-hash';
 
 const docWith = (...texts: string[]) => {
@@ -117,5 +117,24 @@ describe('#716 doc-version: the live digest, memoized per document state', () =>
   it('liveContentDigest is stableHash(fromYdoc(doc)) — the same value the settle hands out', () => {
     const doc = docWith('a', 'b');
     expect(liveContentDigest(doc)).toBe(read(doc));
+  });
+});
+
+describe('#731 F4 warmLiveContentDigest', () => {
+  it('walks only when the memo does not hold the current generation, and then the pre-check is a hit', () => {
+    const doc = docWith('a');
+    expect(warmLiveContentDigest(doc)).toBe(true); // cold: computed
+    expect(warmLiveContentDigest(doc)).toBe(false); // hit
+    expect(liveContentDigest(doc)).toBe(read(doc));
+    doc.transact(() => doc.getXmlFragment('default').delete(0, 1)); // an edit (delete-only) during the yield
+    expect(warmLiveContentDigest(doc)).toBe(true); // the memo is generation-keyed: stale is never a hit
+    expect(liveContentDigest(doc)).toBe(read(doc));
+  });
+
+  it('another function in the memo slot is not a hit; an unobservable document is never warmed', () => {
+    const doc = docWith('a');
+    memoizedDigest(doc, () => 'other');
+    expect(warmLiveContentDigest(doc)).toBe(true);
+    expect(warmLiveContentDigest({} as never)).toBe(false);
   });
 });

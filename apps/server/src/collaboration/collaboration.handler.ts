@@ -29,7 +29,10 @@ import {
 // write compares the LIVE document's digest (cross-service contract code, `stable-hash` beside its shared vectors),
 // memoized per document mutation (#716: one walk per state, not one per compare); a content operation's Yjs types are
 // built before the connection opens (#716, #731). Pure helpers in authz/; this file only calls them.
-import { liveContentDigest } from '../authz/page-write/doc-version';
+import {
+  liveContentDigest,
+  warmLiveContentDigest,
+} from '../authz/page-write/doc-version';
 import {
   insertAsOwnClient,
   PreparedContent,
@@ -254,7 +257,7 @@ export class CollaborationHandler {
         let liveDoc: Document | undefined;
         try {
           // #716: a content operation is built FIRST — a pure function of the request, so building it here
-          // changes no concurrency semantics — and the loop gets a tick before the pre-check. A build failure opens
+          // changes no concurrency semantics — and the loop gets a turn before the pre-check. A build failure opens
           // no connection and runs no store (#342 BUILD-BEFORE-DELETE, strengthened). Nothing yields between the
           // pre-check and the transaction: that would widen the #282 window described below.
           // #716 page cap on a RESIDENT document: decided on it directly, in the same order as inside the transaction
@@ -301,6 +304,13 @@ export class CollaborationHandler {
           // — still pays `disconnect()`'s store, and so still reattributes that edit to the API caller.
           // No content is lost either way; the pre-check shrinks this from "every 412" to "a 412 that
           // races connection setup".
+          // #731 F4: a digest the memo does not hold (an edit since the settle) is computed first and the loop gets a
+          // turn, so that walk and the transaction are two blocks. The pre-check below then reads the memo, or
+          // recomputes if an edit landed in the yield. Nothing yields between the pre-check and the transaction.
+          const warm = expectedContentHash
+            ? hocuspocus.documents.get(documentName)
+            : undefined;
+          if (warm && warmLiveContentDigest(warm)) await yieldToEventLoop();
           const resident = expectedContentHash
             ? hocuspocus.documents.get(documentName)
             : undefined;
@@ -420,7 +430,7 @@ export class CollaborationHandler {
     context: any = {},
     fn: (doc: Document) => void,
   ): Promise<void> {
-    // #731: a document this open has to LOAD gets one macrotask between the load (a page-sized apply) and the
+    // #731: a document this open has to LOAD gets a loop turn between the load (a page-sized apply) and the
     // transaction, so the two are not one event-loop block. Never for a resident document: on that path nothing may
     // yield between the resident pre-check and the transaction (#282). The CAS, dedup and cap inside the transaction
     // decide atomically either way.
