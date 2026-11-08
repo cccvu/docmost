@@ -92,6 +92,8 @@ export function FeedbackModal({ entry }: { entry: FeedbackEntry }) {
   const [sent, setSent] = useState<{ reference: string | null } | null>(null);
   const alertRef = useRef<HTMLDivElement>(null);
   const statusRef = useRef<HTMLDivElement>(null);
+  // "Send more feedback" unmounts the focused button; focus moves into the fresh form instead of <body>.
+  const focusFormRef = useRef(false);
 
   // The status probe already saw a 401: lead with "Sign in again" instead of letting a send fail first.
   const shown: FeedbackFailure | null =
@@ -102,8 +104,16 @@ export function FeedbackModal({ entry }: { entry: FeedbackEntry }) {
   }, [failure]);
 
   useEffect(() => {
-    if (sent) statusRef.current?.focus();
+    if (sent) {
+      statusRef.current?.focus();
+    } else if (focusFormRef.current) {
+      focusFormRef.current = false;
+      document.getElementById(FIELD_IDS.type)?.focus();
+    }
   }, [sent]);
+
+  // A platform-coded 504: every same-key retry only answers 409/504 again, so no retry is offered.
+  const sendClosed = shown?.kind === "outcome_unknown" && shown.final;
 
   function keyFor(payload: FeedbackPayload): string {
     const body = JSON.stringify(payload);
@@ -185,7 +195,13 @@ export function FeedbackModal({ entry }: { entry: FeedbackEntry }) {
               : t("Thanks — sent.")}
           </Alert>
           <Group justify="flex-end">
-            <Button variant="default" onClick={() => setSent(null)}>
+            <Button
+              variant="default"
+              onClick={() => {
+                focusFormRef.current = true;
+                setSent(null);
+              }}
+            >
               {t("Send more feedback")}
             </Button>
             <Button onClick={onClose}>{t("Close")}</Button>
@@ -263,9 +279,11 @@ export function FeedbackModal({ entry }: { entry: FeedbackEntry }) {
               <Button variant="default" onClick={onClose}>
                 {t("Close")}
               </Button>
-              <Button type="submit" loading={submitting}>
-                {shown ? t("Try again") : t("Send feedback")}
-              </Button>
+              {!sendClosed && (
+                <Button type="submit" loading={submitting}>
+                  {shown ? t("Try again") : t("Send feedback")}
+                </Button>
+              )}
             </Group>
           </Stack>
         </form>
@@ -330,9 +348,31 @@ function FailureAlert({
         </Alert>
       );
     case "outcome_unknown":
+      if (failure.final) {
+        return (
+          <Alert {...common} color="yellow" title={t("It may have arrived")}>
+            <Text size="sm">
+              {failure.reference
+                ? t(
+                    "We couldn't confirm your feedback arrived, and it may have. Please don't send it again. Reference {{reference}}",
+                    { reference: failure.reference },
+                  )
+                : t(
+                    "We couldn't confirm your feedback arrived, and it may have. Please don't send it again.",
+                  )}
+            </Text>
+          </Alert>
+        );
+      }
       return (
         <Alert {...common} color="yellow">
           {t("We couldn't confirm it arrived. Trying again won't send it twice.")}
+        </Alert>
+      );
+    case "in_flight":
+      return (
+        <Alert {...common} color="yellow">
+          {t("It's still being sent. Wait a few seconds, then select Try again.")}
         </Alert>
       );
     case "unavailable":

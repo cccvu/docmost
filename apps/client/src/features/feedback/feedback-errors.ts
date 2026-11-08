@@ -10,17 +10,30 @@ import {
  * What a failed `POST /v1/feedback` means for the reporter. Each kind maps to one inline message in the
  * modal (never a toast). House rule: a 503 means nothing was sent; a 504 means it may have been sent, and
  * a same-key retry never sends it twice.
+ *
+ * `outcome_unknown` is `final` when the PLATFORM said so (a coded `504 upstream_timeout`): GitHub never
+ * confirmed, the platform keeps that key's record unresolved, and every same-key retry only answers 409/504
+ * again — so the dialog stops offering a retry. It is not final when a bare gateway 500/502/504 answered
+ * instead of the platform: a same-key retry then replays the 201 if the send went through, and still never
+ * sends twice. (No response at all keeps the shared "can't reach the wiki" message, which claims nothing.)
  */
 export type FeedbackFailure =
   | { kind: "unauthenticated" }
   | { kind: "rate_limited"; waitSeconds: number | null; detail: string | null }
-  | { kind: "outcome_unknown" }
+  | { kind: "outcome_unknown"; final: boolean; reference: string | null }
+  | { kind: "in_flight" }
   | { kind: "unavailable" }
   | { kind: "blocked" }
   | { kind: "other"; message: string };
 
 // The server's `detail` is untrusted text shown verbatim (as React text), so bound it.
 const MAX_DETAIL_CHARS = 200;
+
+// The platform's `FB-` reference: Crockford base32, 10 characters (feedback-issue.renderer.ts).
+const REFERENCE_RE = /\bFB-[0-9A-HJKMNP-TV-Z]{10}\b/;
+
+// Gateway answers that never came from the platform: the request may have reached it.
+const UNCONFIRMED_GATEWAY_STATUSES = new Set([500, 502, 504]);
 
 /**
  * The `code` of an RFC 7807 body from the platform, or null when the response is not problem+json — e.g.
@@ -73,9 +86,14 @@ export function classifyFeedbackError(
       detail: code ? problemDetail(error) : null,
     };
   }
-  if (status === 504 || code === "upstream_timeout") {
-    return { kind: "outcome_unknown" };
+  if (code === "upstream_timeout") {
+    const reference = problemDetail(error)?.match(REFERENCE_RE)?.[0] ?? null;
+    return { kind: "outcome_unknown", final: true, reference };
   }
+  if (code === null && status !== null && UNCONFIRMED_GATEWAY_STATUSES.has(status)) {
+    return { kind: "outcome_unknown", final: false, reference: null };
+  }
+  if (code === "idempotency_key_in_use") return { kind: "in_flight" };
   if (code === "feedback_unavailable") return { kind: "unavailable" };
   // The platform's own 403s are problem+json (`forbidden`, `insufficient_scope`); a 403 without one is the
   // edge WAF refusing the body (typically markup or a path-like snippet).

@@ -125,13 +125,33 @@ describe("classifyFeedbackError", () => {
     });
   });
 
-  it("504 (problem or a bare gateway page) is an unknown outcome", () => {
-    expect(classifyFeedbackError(problem(504, "upstream_timeout"), t).kind).toBe(
-      "outcome_unknown",
-    );
-    expect(classifyFeedbackError(httpError(504, "<html/>"), t).kind).toBe(
-      "outcome_unknown",
-    );
+  it("the platform's coded 504 is a FINAL unknown outcome, with its reference", () => {
+    const detail =
+      "GitHub did not confirm the feedback (reference FB-0123456789), and it may have been sent.";
+    expect(
+      classifyFeedbackError(problem(504, "upstream_timeout", detail), t),
+    ).toEqual({ kind: "outcome_unknown", final: true, reference: "FB-0123456789" });
+    expect(classifyFeedbackError(problem(504, "upstream_timeout"), t)).toEqual({
+      kind: "outcome_unknown",
+      final: true,
+      reference: null,
+    });
+  });
+
+  it("an answer that never came from the platform is a retryable unknown outcome", () => {
+    const retryable = { kind: "outcome_unknown", final: false, reference: null };
+    for (const status of [500, 502, 504]) {
+      expect(classifyFeedbackError(httpError(status, "<html/>"), t)).toEqual(retryable);
+    }
+    // A platform-coded 502 is "GitHub refused it, nothing sent", and a bare 503 never reached the platform.
+    expect(classifyFeedbackError(problem(502, "upstream_error"), t).kind).toBe("other");
+    expect(classifyFeedbackError(httpError(503, "<html/>"), t).kind).toBe("other");
+  });
+
+  it("409 idempotency_key_in_use: the first attempt is still being sent", () => {
+    expect(classifyFeedbackError(problem(409, "idempotency_key_in_use"), t)).toEqual({
+      kind: "in_flight",
+    });
   });
 
   it("feedback_unavailable is 'off right now'; a transient 503 is not", () => {

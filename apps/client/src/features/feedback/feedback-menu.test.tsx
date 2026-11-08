@@ -291,7 +291,8 @@ describe("feedback dialog", () => {
 
   it("reuses the key on retry, moves focus to the success status, and uses a new key for the next draft", async () => {
     postMock
-      .mockRejectedValueOnce(problem(504, "upstream_timeout"))
+      // A gateway 504 that never came from the platform: a same-key retry may replay the send.
+      .mockRejectedValueOnce(httpError(504, "<html>Gateway Timeout</html>", { "content-type": "text/html" }))
       .mockResolvedValueOnce({ data: { reference: "FB-ABCDEFGHJK", issueNumber: 9 } })
       .mockResolvedValueOnce({ data: { reference: "FB-ZZZZZZZZZZ", issueNumber: 10 } });
     const dialog = await openFeedback();
@@ -311,13 +312,51 @@ describe("feedback dialog", () => {
     expect(keyOf(postMock.mock.calls[1])).toBe(keyOf(postMock.mock.calls[0]));
     expect(postMock.mock.calls[1][1]).toEqual(postMock.mock.calls[0][1]);
 
-    // The draft is cleared only now, after the success.
+    // The draft is cleared only now, after the success; focus lands in the fresh form, not on <body>.
     fireEvent.click(within(dialog).getByRole("button", { name: "Send more feedback" }));
     expect((within(dialog).getByLabelText("Summary") as HTMLInputElement).value).toBe("");
+    await waitFor(() =>
+      expect(document.activeElement).toBe(within(dialog).getByLabelText("Bug")),
+    );
     fill(dialog);
     send(dialog);
     await waitFor(() => expect(postMock).toHaveBeenCalledTimes(3));
     expect(keyOf(postMock.mock.calls[2])).not.toBe(keyOf(postMock.mock.calls[0]));
+  });
+
+  it("the platform's 504: says it may have arrived, shows the reference, and offers no retry", async () => {
+    postMock.mockRejectedValueOnce(
+      problem(
+        504,
+        "upstream_timeout",
+        "GitHub did not confirm the feedback (reference FB-ABCDEFGHJK), and it may have been sent.",
+      ),
+    );
+    const dialog = await openFeedback();
+    fill(dialog);
+    send(dialog);
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert.textContent).toContain("Please don't send it again. Reference FB-ABCDEFGHJK");
+    await waitFor(() => expect(document.activeElement).toBe(alert));
+    expect(within(dialog).queryByRole("button", { name: "Try again" })).toBeNull();
+    expect(within(dialog).queryByRole("button", { name: "Send feedback" })).toBeNull();
+    expect(postMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("409 idempotency_key_in_use: asks to wait, then a same-key retry gets the result", async () => {
+    postMock
+      .mockRejectedValueOnce(problem(409, "idempotency_key_in_use"))
+      .mockResolvedValueOnce({ data: { reference: "FB-0123456789", issueNumber: 3 } });
+    const dialog = await openFeedback();
+    fill(dialog);
+    send(dialog);
+    const alert = await within(dialog).findByRole("alert");
+    expect(alert.textContent).toBe(
+      "It's still being sent. Wait a few seconds, then select Try again.",
+    );
+    send(dialog, "Try again");
+    await within(dialog).findByRole("status");
+    expect(keyOf(postMock.mock.calls[1])).toBe(keyOf(postMock.mock.calls[0]));
   });
 
   it("keeps the draft and the key when the dialog is closed and reopened", async () => {
