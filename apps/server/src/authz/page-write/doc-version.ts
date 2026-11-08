@@ -1,7 +1,7 @@
 /**
  * CCC integration — NOT upstream Docmost code (#716, UPSTREAM_MODIFICATIONS.md §2, ADR 0019 note).
  *
- * The live document's content digest (`stableHash(fromYdoc(doc))`), computed at most once per state of the document.
+ * The live document's content digest (`stableHash(storeSafeJson(fromYdoc(doc)))`), computed at most once per state of the document.
  * A conditional write compares it twice — the pre-check before the direct connection opens, and the authoritative
  * compare inside the transaction — and the settle (`flushPageContent`) hands the same digest out first. Each is three
  * full-page passes (serialize, sorted stringify, sha256), so a page that nobody changed in between was walked up to
@@ -23,6 +23,7 @@
 import type * as Y from 'yjs';
 import { TiptapTransformer } from '@hocuspocus/transformer';
 import { stableHash } from './stable-hash';
+import { storeSafeJson } from './store-safe-json';
 
 interface Version {
   /** Bumped at the end of every transaction on the document. */
@@ -73,8 +74,14 @@ export function memoizedDigest(doc: Y.Doc, compute: (doc: Y.Doc) => string): str
   return digest;
 }
 
-/** The ADR 0019 content digest. A module constant, so the memo above (keyed on the function) hits across calls. */
-const contentDigest = (d: Y.Doc): string => stableHash(TiptapTransformer.fromYdoc(d, 'default'));
+/**
+ * The ADR 0019 content digest. A module constant, so the memo above (keyed on the function) hits across calls.
+ * It hashes the STORED projection (`storeSafeJson`, #773), the same JSON the collab store writes: a clean page comes
+ * back as the same reference, so its digest is what it always was. For a page holding a lone surrogate, NUL or a
+ * non-JSON value (a BigInt makes `JSON.stringify` throw, which failed every settle), the digest is defined and stays
+ * the same across an unload and reload, and an edit that changes nothing the store keeps changes no version.
+ */
+const contentDigest = (d: Y.Doc): string => stableHash(storeSafeJson(TiptapTransformer.fromYdoc(d, 'default')));
 
 /** The live document's content digest — the version a conditional write names (ADR 0019) — memoized per generation. */
 export function liveContentDigest(doc: Y.Doc): string {

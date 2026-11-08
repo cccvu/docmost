@@ -46,22 +46,35 @@ export function defaultChunkReloadEnv(): ChunkReloadEnv {
 export function recoverFromChunkLoadError(
   env: ChunkReloadEnv = defaultChunkReloadEnv(),
 ): boolean {
+  return reloadOncePerWindow(CHUNK_RELOAD_KEY, env);
+}
+
+/**
+ * The guard behind {@link recoverFromChunkLoadError}, keyed so another reload reason (wiki-v2 #761: the
+ * identity reconcile) keeps its OWN once-per-window stamp. Same contract: true iff it reloaded, and every
+ * "cannot guard" branch returns false without reloading.
+ */
+export function reloadOncePerWindow(
+  key: string,
+  env: ChunkReloadEnv = defaultChunkReloadEnv(),
+  windowMs: number = CHUNK_RELOAD_WINDOW_MS,
+): boolean {
   const { storage } = env;
   if (!storage) return false;
 
   let last: number;
   try {
-    last = Number(storage.getItem(CHUNK_RELOAD_KEY));
+    last = Number(storage.getItem(key));
   } catch {
     return false;
   }
   const now = env.now();
-  if (Number.isFinite(last) && last > 0 && now - last < CHUNK_RELOAD_WINDOW_MS) {
+  if (Number.isFinite(last) && last > 0 && now - last < windowMs) {
     return false;
   }
 
   try {
-    storage.setItem(CHUNK_RELOAD_KEY, String(now));
+    storage.setItem(key, String(now));
   } catch {
     return false;
   }

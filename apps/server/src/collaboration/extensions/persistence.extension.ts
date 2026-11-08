@@ -57,6 +57,7 @@ import {
   logPostStoreFailure,
 } from '../../authz/page-write/collab-drift-log';
 // #731: the load reads `content` only for a legacy row; the store yields a loop turn between its page-sized steps.
+// CCC #773: the store's snapshot (persistence-steps) makes the stored projection storable (no lone surrogate or NUL).
 import {
   findPageRowForLoad,
   snapshotForStore,

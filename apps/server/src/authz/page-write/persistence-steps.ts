@@ -7,6 +7,8 @@
 import * as Y from 'yjs';
 import { TiptapTransformer } from '@hocuspocus/transformer';
 import { storeGenerationOf } from './store-failure-registry';
+// CCC #773: the stored projection is made storable (no lone surrogate or NUL) before anything reads or writes it.
+import { storeSafeJson } from './store-safe-json';
 
 /** The subset of `PageRepo.findById` the load uses. */
 type FindPageById<P> = (
@@ -53,7 +55,7 @@ export interface StoreSnapshot {
  */
 export function snapshotForStore(document: Y.Doc): StoreSnapshot {
   const generation = storeGenerationOf(document);
-  const json = TiptapTransformer.fromYdoc(document, 'default');
+  const json = storeSafeJson(TiptapTransformer.fromYdoc(document, 'default'));
   const state = Buffer.from(Y.encodeStateAsUpdate(document));
   return { generation, json, state };
 }
