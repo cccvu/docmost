@@ -315,7 +315,7 @@ export class AuthService {
     }
   }
 
-  // CCC (wiki-v2 #537, UPSTREAM_MODIFICATIONS #201): pass the presented access token's session through.
+  // CCC (wiki-v2 #537, UPSTREAM_MODIFICATIONS #212): pass the presented access token's session through.
   async getCollabToken(user: User, workspaceId: string, sessionId: string) {
     const token = await this.tokenService.generateCollabToken(
       user,
