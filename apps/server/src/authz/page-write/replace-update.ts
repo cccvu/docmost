@@ -4,8 +4,8 @@
  * Build a content operation BEFORE the live document is touched. It is a pure function of the request, so building it
  * outside the direct connection's transaction changes no concurrency semantics, and:
  *   - it keeps the conversion out of the one synchronous chunk that holds the CAS and the mutation (the longest
- *     event-loop block a content write had, #716 M1); the caller yields one tick after it, so the build and that chunk
- *     are separate macrotasks;
+ *     event-loop block a content write had, #716 M1); the caller yields a loop turn after it (`yieldToEventLoop`), so
+ *     the build and that chunk are separate blocks, with an I/O poll between them;
  *   - BUILD-BEFORE-DELETE (#342) gets stronger: content the schema rejects fails before any direct connection is
  *     opened, so no store runs and nothing is reattributed, rather than after the open.
  *
@@ -67,7 +67,6 @@ export function insertAsOwnClient(doc: Y.Doc, fragment: Y.XmlFragment, elements:
   }
 }
 
-/** Let other macrotasks (websocket frames, health checks, timers) run between two heavy synchronous steps. */
-export function yieldToEventLoop(): Promise<void> {
-  return new Promise<void>((resolve) => setImmediate(resolve));
-}
+// #731: the loop yield lives in its own dependency-free module (the persistence seam uses it too); re-exported for the
+// handler's existing import.
+export { yieldToEventLoop } from './yield-to-event-loop';
