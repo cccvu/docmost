@@ -9,6 +9,7 @@ import { ShareLifecycleModule } from './share-lifecycle/share-lifecycle.module';
 import { ExportAdmissionModule } from './request-controls/export-admission.module';
 import { RetryAfterModule } from './request-controls/retry-after.module';
 import { NativeFormatModule } from './native-format/native-format.module';
+import { StorableTextModule } from './request-controls/storable-text.module';
 
 /**
  * CCC authorization integration — NOT upstream Docmost code.
@@ -23,7 +24,8 @@ import { NativeFormatModule } from './native-format/native-format.module';
  * (NativeRouteAuthzModule, #574), and the public-share expiry feature (ShareLifecycleModule, #335), and the native
  * export admission (ExportAdmissionModule, #699: a resource bound, in both modes), and the engine-wide `Retry-After` on
  * every 503 (RetryAfterModule, #696), and the remote-mode refusal of a non-json `format` on the native page routes
- * (NativeFormatModule, #716: their echo converts a whole page on the event loop).
+ * (NativeFormatModule, #716: their echo converts a whole page on the event loop), and the refusal of a NUL or lone
+ * surrogate in any request before its handler, with its Postgres backstop (StorableTextModule, #781).
  */
 @Module({
   imports: [
@@ -36,6 +38,7 @@ import { NativeFormatModule } from './native-format/native-format.module';
     ExportAdmissionModule, // #699: at most 1 heavy export per principal, 8 per process — both modes
     RetryAfterModule, // #696: every 503 carries Retry-After (kept when already set) — both modes
     NativeFormatModule, // #716: remote mode refuses a non-json `format` on native /api/pages/info|create|update
+    StorableTextModule, // #781: NUL / lone surrogate in a request → 400 invalid_characters before the handler — both modes
   ],
   providers: [HttpAuthzClient],
   exports: [AuthzModeModule, HttpAuthzClient],

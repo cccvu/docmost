@@ -28,6 +28,7 @@ import {
 // CCC seam (UPSTREAM_MODIFICATIONS.md #3f): the account-disable force-disconnect predicate lives in authz/
 // (importless, so it is unit-testable outside the lib0 ESM graph); this method is a thin delegate.
 import { disconnectUserConnections } from '../authz/collab/disconnect-user-connections';
+import { CollabUpdateGuardExtension } from '../authz/collab-ingress/collab-update-guard.extension'; // CCC seam #3 (#781)
 
 @Injectable()
 export class CollaborationGateway {
@@ -61,6 +62,7 @@ export class CollaborationGateway {
       // designed. See UPSTREAM_MODIFICATIONS.md. (Upstream default is true; Docmost had set it to false.)
       unloadImmediately: true,
       extensions: [
+        new CollabUpdateGuardExtension(), // CCC #781: refuses a malformed frame before it applies; first, synchronous
         this.authenticationExtension,
         this.persistenceExtension,
         this.loggerExtension,

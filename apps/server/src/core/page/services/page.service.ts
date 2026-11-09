@@ -56,6 +56,8 @@ import { parseUntrustedContent } from '../../../editor-compat/content-parse/cont
 import { hasCopyRestrictionGuard } from '../../../authz/page-copy/copy-restriction.guard';
 // CCC #716 (UPSTREAM_MODIFICATIONS #121): an append/prepend to a page already at the API size cap is refused 422.
 import { applyWithinPageCap, assertPageCanGrow } from '../../../authz/page-write/page-size';
+// CCC #781 (UPSTREAM_MODIFICATIONS #121): content the collab editor would delete or crash on is refused, 400/422.
+import { assertCollabSafeContent } from '../../../authz/collab-ingress/content-rules';
 import { WatcherService } from '../../watcher/watcher.service';
 import { sql } from 'kysely';
 import { TransclusionService } from '../transclusion/transclusion.service';
@@ -1128,6 +1130,7 @@ export class PageService {
     } catch (err) {
       throw new BadRequestException('Invalid content format');
     }
+    assertCollabSafeContent(prosemirrorJson); // CCC #781: after the parse, so its 400 content_not_allowed / 422 keep their codes
 
     return prosemirrorJson;
   }
