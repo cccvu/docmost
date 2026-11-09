@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  COLLAB_UPDATE_REFUSED_PREFIX,
+  COLLAB_UPDATE_UNRESOLVED,
+  CollabAccessState,
+  classifyCollabCloseReason,
   collabAllowsEditing,
   currentCollabToken,
   initialCollabAccess,
@@ -136,24 +140,230 @@ describe("nextCollabAccess", () => {
       scope: "readonly",
     });
     expect(step.state).toEqual({
-      lost: false,
+      ...initialCollabAccess,
       readOnly: true,
-      refreshed: false,
     });
     expect(collabAllowsEditing(step.state)).toBe(false);
   });
 
   it("a read-write authentication (e.g. access restored) clears lost and read-only", () => {
     const step = nextCollabAccess(
-      { lost: true, readOnly: true, refreshed: true },
+      { ...initialCollabAccess, lost: true, readOnly: true, refreshed: true },
       { kind: "authenticated", scope: "read-write" },
     );
-    expect(step.state).toEqual({
-      lost: false,
-      readOnly: false,
-      refreshed: false,
-    });
+    expect(step.state).toEqual(initialCollabAccess);
     expect(collabAllowsEditing(step.state)).toBe(true);
+  });
+});
+
+// cccvu/wiki-v2#781 — the server refuses a collab frame it will not apply with a document-level CLOSE (the socket
+// stays open, and the provider reports code 1000 for it), so the reason string is the only signal.
+describe("collab update refusal (#781)", () => {
+  const refused = (rule: string) => `${COLLAB_UPDATE_REFUSED_PREFIX}${rule}`;
+  const close = (reason: string | undefined, socketConnected = true) =>
+    ({ kind: "server-close", socketConnected, reason }) as const;
+  const allEvents = [
+    close(undefined),
+    close(undefined, false),
+    close(refused("mark")),
+    close(COLLAB_UPDATE_UNRESOLVED),
+    { kind: "auth-failed", tokenExpired: false },
+    { kind: "auth-failed", tokenExpired: true },
+    { kind: "refresh-failed" },
+    { kind: "authenticated", scope: "read-write" },
+    { kind: "authenticated", scope: "readonly" },
+    { kind: "sync-acked" },
+  ] as const;
+
+  it("classifies only the two contract reasons; anything else is an ordinary close", () => {
+    expect(classifyCollabCloseReason(refused("root"))).toBe("refused");
+    expect(classifyCollabCloseReason(refused("shadow-unavailable"))).toBe(
+      "refused",
+    );
+    expect(classifyCollabCloseReason(COLLAB_UPDATE_UNRESOLVED)).toBe(
+      "unresolved",
+    );
+    for (const other of [
+      undefined,
+      "",
+      "Forbidden",
+      "ccc:collab-update-refused", // no rule separator: not the contract
+      "ccc:collab-update-unresolved:x",
+      "xccc:collab-update-refused:mark",
+      ` ${COLLAB_UPDATE_UNRESOLVED}`,
+    ]) {
+      expect(classifyCollabCloseReason(other)).toBe("other");
+    }
+  });
+
+  it.each([
+    "root",
+    "mark",
+    "schema",
+    "foreign-client",
+    "value-depth",
+    "shadow-unavailable",
+  ])(
+    "refused:%s ⇒ detach the provider, stop editing, never reconnect or refetch",
+    (rule) => {
+      const step = nextCollabAccess(initialCollabAccess, close(refused(rule)));
+      expect(step.detach).toBe(true);
+      expect(step.reconnect).toBe(false);
+      expect(step.refreshToken).toBe(false);
+      expect(step.state.refused).toBe(true);
+      expect(collabAllowsEditing(step.state)).toBe(false);
+      // The notice is the UX: the header's "connection lost. Retrying..." indicator would be untrue (nothing retries).
+      expect(step.markDisconnected).toBe(false);
+    },
+  );
+
+  it("refused on a socket that is already closing still detaches (the socket's own reconnect would re-sync it)", () => {
+    const step = nextCollabAccess(
+      initialCollabAccess,
+      close(refused("mark"), false),
+    );
+    expect(step.detach).toBe(true);
+    expect(step.reconnect).toBe(false);
+    expect(step.state.refused).toBe(true);
+  });
+
+  it("refused is final: no later event reconnects, refetches, re-allows editing or changes the state", () => {
+    const refusedState = nextCollabAccess(
+      initialCollabAccess,
+      close(refused("mark")),
+    ).state;
+    for (const event of allEvents) {
+      const step = nextCollabAccess(refusedState, event);
+      expect(step.state).toBe(refusedState);
+      expect(step.reconnect).toBe(false);
+      expect(step.refreshToken).toBe(false);
+      expect(step.detach).toBe(false); // already detached
+      expect(step.markDisconnected).toBe(false);
+      expect(collabAllowsEditing(step.state)).toBe(false);
+    }
+  });
+
+  it("the first unresolved reconnects once, keeps editing, and does not detach", () => {
+    const step = nextCollabAccess(
+      initialCollabAccess,
+      close(COLLAB_UPDATE_UNRESOLVED),
+    );
+    expect(step.reconnect).toBe(true);
+    expect(step.detach).toBe(false);
+    expect(step.refreshToken).toBe(false);
+    expect(step.markDisconnected).toBe(false);
+    expect(step.state.unresolvedRetried).toBe(true);
+    expect(step.state.refused).toBe(false);
+    expect(collabAllowsEditing(step.state)).toBe(true);
+  });
+
+  it("the first unresolved on a closing socket leaves the reconnect to the provider but still spends the retry", () => {
+    const step = nextCollabAccess(
+      initialCollabAccess,
+      close(COLLAB_UPDATE_UNRESOLVED, false),
+    );
+    expect(step.reconnect).toBe(false);
+    expect(step.state.unresolvedRetried).toBe(true);
+    const second = nextCollabAccess(
+      step.state,
+      close(COLLAB_UPDATE_UNRESOLVED),
+    );
+    expect(second.state.refused).toBe(true);
+    expect(second.detach).toBe(true);
+  });
+
+  it("a second unresolved with no sync-acked in between is refused, even across a re-authentication", () => {
+    let state: CollabAccessState = nextCollabAccess(
+      initialCollabAccess,
+      close(COLLAB_UPDATE_UNRESOLVED),
+    ).state;
+    // the reconnect re-authenticates (and may even refetch the token first): neither is proof the replay landed
+    for (const event of [
+      { kind: "auth-failed", tokenExpired: true },
+      { kind: "authenticated", scope: "read-write" },
+      { kind: "authenticated", scope: "readonly" },
+      { kind: "authenticated", scope: "read-write" },
+      close(undefined),
+    ] as const) {
+      state = nextCollabAccess(state, event).state;
+      expect(state.unresolvedRetried).toBe(true);
+    }
+    const second = nextCollabAccess(state, close(COLLAB_UPDATE_UNRESOLVED));
+    expect(second.reconnect).toBe(false);
+    expect(second.detach).toBe(true);
+    expect(second.state.refused).toBe(true);
+    expect(collabAllowsEditing(second.state)).toBe(false);
+  });
+
+  it("sync-acked (every sent frame applied) clears the retry, so a later unresolved reconnects once again", () => {
+    const first = nextCollabAccess(
+      initialCollabAccess,
+      close(COLLAB_UPDATE_UNRESOLVED),
+    );
+    const authed = nextCollabAccess(first.state, {
+      kind: "authenticated",
+      scope: "read-write",
+    });
+    const acked = nextCollabAccess(authed.state, { kind: "sync-acked" });
+    expect(acked.state.unresolvedRetried).toBe(false);
+    expect(acked.reconnect || acked.refreshToken || acked.detach).toBe(false);
+    const later = nextCollabAccess(
+      acked.state,
+      close(COLLAB_UPDATE_UNRESOLVED),
+    );
+    expect(later.reconnect).toBe(true);
+    expect(later.state.refused).toBe(false);
+    expect(later.state.unresolvedRetried).toBe(true);
+  });
+
+  it("sync-acked with no retry pending is a no-op that keeps the same state object (no re-render per ack)", () => {
+    const state = { ...initialCollabAccess, readOnly: true, refreshed: true };
+    const step = nextCollabAccess(state, { kind: "sync-acked" });
+    expect(step.state).toBe(state);
+    expect(
+      step.reconnect ||
+        step.refreshToken ||
+        step.detach ||
+        step.markDisconnected,
+    ).toBe(false);
+  });
+
+  it("sync-acked does not reset the #537 token refetch or clear lost/read-only", () => {
+    const state = {
+      ...initialCollabAccess,
+      lost: true,
+      readOnly: true,
+      refreshed: true,
+      unresolvedRetried: true,
+    };
+    const step = nextCollabAccess(state, { kind: "sync-acked" });
+    expect(step.state).toEqual({ ...state, unresolvedRetried: false });
+  });
+
+  it.each([undefined, "", "Forbidden", "ccc:collab-update-refused"])(
+    "an unrelated reason (%s) keeps the #501 behaviour and the same state",
+    (reason) => {
+      const live = nextCollabAccess(initialCollabAccess, close(reason));
+      expect(live).toEqual({
+        state: initialCollabAccess,
+        reconnect: true,
+        refreshToken: false,
+        markDisconnected: false,
+        detach: false,
+      });
+      expect(live.state).toBe(initialCollabAccess);
+      const dead = nextCollabAccess(initialCollabAccess, close(reason, false));
+      expect(dead.reconnect).toBe(false);
+      expect(dead.detach).toBe(false);
+    },
+  );
+
+  it("no #501/#537 path detaches", () => {
+    for (const event of allEvents.filter(
+      (e) => e.kind !== "server-close" || e.reason === undefined,
+    )) {
+      expect(nextCollabAccess(initialCollabAccess, event).detach).toBe(false);
+    }
   });
 });
 

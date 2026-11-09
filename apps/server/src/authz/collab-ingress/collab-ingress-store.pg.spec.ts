@@ -1,0 +1,234 @@
+import * as postgres from 'postgres';
+import { Kysely } from 'kysely';
+import * as Y from 'yjs';
+import { Hocuspocus } from '@hocuspocus/server';
+import { TiptapTransformer } from '@hocuspocus/transformer';
+import { PageRepo } from '@docmost/db/repos/page/page.repo';
+import { tiptapExtensions } from '../../collaboration/collaboration.util';
+import { CollaborationHandler } from '../../collaboration/collaboration.handler';
+import { PersistenceExtension } from '../../collaboration/extensions/persistence.extension';
+import { PG_URL, uuid, mkReadModelPg, bootstrapSchema, mkReadModelDb } from '../../service-bridge/read-model-pg.testkit';
+import * as driftLog from '../page-write/collab-drift-log';
+import { hasStoreFailure } from '../page-write/store-failure-registry';
+import { isDuplicateWriteKey, recordWriteKey, WRITE_IDEM_MAP } from '../page-write/write-idem';
+import { authFrame, FakeSocket, MSG, readServerFrame, RemoteClient, SYNC, syncFrame } from './collab-ingress.testkit';
+import { CollabUpdateGuardExtension } from './collab-update-guard.extension';
+import { CollabUpdateGuard } from './update-guard';
+
+/**
+ * #781 on real Postgres (ADR 0036): the REAL store path (Hocuspocus 3.4.4, the real PersistenceExtension and
+ * CollaborationHandler settle, PageRepo, postgres.js, Postgres) with the collab update guard in front of it, fed by fake
+ * WebSocket clients. Control arms apply the same bytes with no guard and show the damage: a store that fails on every
+ * attempt (the #773-style wedge) and a forged or deleted `/v1` idempotency-ledger entry. Treatment arms show the CLOSE,
+ * a store that succeeds, the row intact, and a client that replays its refused state (y-indexeddb) refused again.
+ * Self-skips without AUTHZ_TEST_PG_URL; the `docmost-authz-pg` CI job provides Postgres.
+ */
+const d = PG_URL ? describe : describe.skip;
+
+describe('real-PG collab ingress guard (#781)', () => {
+  it('is not vacuous: runs against a real Postgres when the CI lane requires it', () => {
+    if (process.env.AUTHZ_REQUIRE_PG === '1') expect(PG_URL).toBeTruthy();
+  });
+});
+
+const SCHEMA = 'collab_ingress_store_pg_spec';
+const PAGE_ID = uuid(781);
+const DOC = `page.${PAGE_ID}`;
+const USERS: Record<string, { id: string; name: string }> = {
+  attacker: { id: uuid(901), name: 'Attacker' },
+  editor: { id: uuid(902), name: 'Editor' },
+  peer: { id: uuid(903), name: 'Peer' },
+};
+const REFUSED = (rule: string) => `ccc:collab-update-refused:${rule}`;
+const settle = async () => {
+  for (let i = 0; i < 8; i++) await new Promise((r) => setImmediate(r));
+};
+const textOf = (el: Y.XmlElement): Y.XmlText => el.toArray().find((c) => c instanceof Y.XmlText) as Y.XmlText;
+/** A server-side `/v1` write: any truthy, non-Redis origin makes Hocuspocus debounce a store with this context. */
+const V1_WRITE = { context: { user: USERS.editor }, socketId: 'v1-write' };
+
+d('the collab store behind the ingress guard (#781)', () => {
+  let pg: postgres.Sql;
+  let appPg: postgres.Sql;
+  let db: Kysely<any>;
+  const sockets: FakeSocket[] = [];
+  const nodes: Hocuspocus[] = [];
+
+  const row = async () =>
+    (await pg<{ content: any; ydoc: Buffer }[]>`select content, ydoc from pages where id = ${PAGE_ID}`)[0];
+
+  /** One collab node: Hocuspocus with (or without) the guard first, a token-auth stand-in, and the real persistence. */
+  function node(withGuard: boolean) {
+    const pageRepo = new PageRepo(db as never, {} as never, { emit: () => true } as never);
+    const queue = { add: jest.fn(async () => undefined) } as never;
+    const persistence = new PersistenceExtension(
+      pageRepo,
+      db as never,
+      queue,
+      queue,
+      queue,
+      { addContributors: jest.fn(async () => undefined) } as never,
+      { syncPageTransclusions: jest.fn(async () => undefined), syncPageReferences: jest.fn(async () => undefined) } as never,
+    );
+    const auth = {
+      async onAuthenticate(data: any) {
+        const user = USERS[data.token];
+        if (!user) throw new Error('denied');
+        return { user };
+      },
+    };
+    const guard = new CollabUpdateGuard({ logger: { warn: () => undefined } });
+    const extensions: any[] = withGuard ? [new CollabUpdateGuardExtension(guard), auth, persistence] : [auth, persistence];
+    const hocuspocus = new Hocuspocus({ quiet: true, extensions, debounce: 60_000, maxDebounce: 60_000 } as never);
+    nodes.push(hocuspocus);
+    const handlers = new CollaborationHandler().getHandlers(hocuspocus);
+    const connect = async (token: string, sock = new FakeSocket()) => {
+      if (!sockets.includes(sock)) sockets.push(sock);
+      if (!sock.listenerCount('message')) hocuspocus.handleConnection(sock as never, { headers: {}, url: '/' } as never);
+      sock.deliver(authFrame(token, DOC));
+      // The document loads from Postgres: wait for real I/O, not only for the event loop to turn.
+      const deadline = Date.now() + 5_000;
+      while (!(hocuspocus.documents.get(DOC) as any)?.connections?.has(sock)) {
+        if (Date.now() > deadline) throw new Error(`connection ${token} was not established`);
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      await settle();
+      return sock;
+    };
+    const live = () => hocuspocus.documents.get(DOC)!;
+    return { hocuspocus, handlers, connect, live, persistence };
+  }
+
+  let storeFailures: string[];
+
+  beforeAll(async () => {
+    await bootstrapSchema(SCHEMA);
+    pg = mkReadModelPg(SCHEMA, 1);
+    appPg = mkReadModelPg(SCHEMA, 4);
+    db = mkReadModelDb(appPg);
+    await pg`
+      create table pages (
+        id uuid primary key, slug_id varchar, title varchar, icon varchar, cover_photo varchar, position varchar,
+        content jsonb, ydoc bytea, text_content text, tsv tsvector,
+        parent_page_id uuid, creator_id uuid, last_updated_by_id uuid, space_id uuid not null, workspace_id uuid not null,
+        is_locked boolean not null default false, is_base boolean not null default false, contributor_ids uuid[],
+        created_at timestamptz not null default now(), updated_at timestamptz not null default now(), deleted_at timestamptz
+      )`;
+  });
+
+  beforeEach(async () => {
+    storeFailures = [];
+    jest.spyOn(console, 'error').mockImplementation(() => undefined); // Hocuspocus logs every CLOSE
+    jest.spyOn(driftLog, 'logStoreFailure').mockImplementation((_logger, _pageId, err) => {
+      storeFailures.push(String((err as Error)?.message ?? err));
+    });
+    const seed = TiptapTransformer.toYdoc(
+      { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'seed text' }] }] } as never,
+      'default',
+      tiptapExtensions,
+    );
+    await pg`delete from pages`;
+    await pg`
+      insert into pages (id, slug_id, title, space_id, workspace_id, creator_id, last_updated_by_id, contributor_ids,
+                         content, ydoc, text_content, created_at)
+      values (${PAGE_ID}, 'slug', 'Title', ${uuid(50)}, ${uuid(100)}, ${uuid(902)}, ${uuid(902)}, array[${uuid(902)}::uuid],
+              ${pg.json(TiptapTransformer.fromYdoc(seed, 'default'))}, ${Buffer.from(Y.encodeStateAsUpdate(seed))},
+              'seed text', '2020-01-01')`;
+  });
+
+  afterEach(async () => {
+    for (const s of sockets.splice(0)) s.close(1000, 'test over');
+    await settle();
+    for (const h of nodes.splice(0)) h.closeConnections();
+    for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 5));
+    jest.restoreAllMocks();
+  });
+
+  afterAll(async () => {
+    await db?.destroy();
+    await pg?.end({ timeout: 5 });
+  });
+
+  /** A value that is not an XmlElement/XmlText inside `default`: the server's fromYdoc throws on it at every store. */
+  const wedge = (live: Y.Doc) => new RemoteClient(live).edit(live, (f) => f.insert(1, [{ evil: 1 } as never]));
+
+  it('case 2 control: with no guard, a non-element child in default fails every store and the settle answers error', async () => {
+    const n = node(false);
+    const sock = await n.connect('attacker');
+    sock.deliver(syncFrame(wedge(n.live()), SYNC.Update, MSG.Sync, DOC));
+    await settle();
+    await expect(n.handlers.flushPageContent(DOC, { withDigest: true })).resolves.toMatchObject({ flushed: false, reason: 'error' });
+    expect(hasStoreFailure(n.live())).toBe(true);
+    expect(storeFailures.length).toBeGreaterThan(0);
+  });
+
+  it('case 2 treatment: refused before it applies; the store, the settle and the row are intact; a replay is refused again', async () => {
+    const n = node(true);
+    const attacker = await n.connect('attacker');
+    const peer = await n.connect('peer');
+    const live = n.live();
+    const bad = wedge(live);
+    const peerFramesBefore = peer.sent.length;
+    attacker.deliver(syncFrame(bad, SYNC.Update, MSG.Sync, DOC));
+    await settle();
+    expect(attacker.closeReasons()).toEqual([REFUSED('child-kind')]);
+    // y-indexeddb replay: the client re-authenticates on the same socket and sends its (refused) state as Step2.
+    await n.connect('attacker', attacker);
+    attacker.deliver(syncFrame(bad, SYNC.Step2, MSG.Sync, DOC));
+    await settle();
+    expect(attacker.closeReasons()).toEqual([REFUSED('child-kind'), REFUSED('child-kind')]);
+    expect(peer.sent.slice(peerFramesBefore).filter((m) => readServerFrame(m).type === MSG.Sync)).toEqual([]);
+
+    // An honest edit still stores.
+    const editor = await n.connect('editor');
+    editor.deliver(syncFrame(new RemoteClient(live).edit(live, (f) => textOf(f.get(0) as Y.XmlElement).insert(9, ' and more')), SYNC.Update, MSG.Sync, DOC));
+    await settle();
+    await expect(n.handlers.flushPageContent(DOC, { withDigest: true })).resolves.toMatchObject({ flushed: true });
+    expect(storeFailures).toEqual([]);
+    const stored = JSON.stringify((await row()).content);
+    expect(stored).toContain('"text":"seed text and more"');
+    expect(stored).not.toContain('evil');
+  });
+
+  it('the /v1 idempotency ledger: control erases another writer\'s key; treatment refuses and the key stays', async () => {
+    for (const withGuard of [false, true]) {
+      const n = node(withGuard);
+      const sock = await n.connect('attacker');
+      const live = n.live();
+      live.transact(() => recordWriteKey(live, 'victim-key', Date.now()), V1_WRITE);
+      const del = new RemoteClient(live).edit(live, (_f, doc) => doc.getMap(WRITE_IDEM_MAP).delete('victim-key'));
+      sock.deliver(syncFrame(del, SYNC.Update, MSG.Sync, DOC));
+      await settle();
+      await expect(n.handlers.flushPageContent(DOC)).resolves.toMatchObject({ flushed: true });
+      if (!withGuard) {
+        expect(isDuplicateWriteKey(live, 'victim-key')).toBe(false); // control: a client erased another's write key
+        for (const s of sockets.splice(0)) s.close(1000, 'next arm');
+        await settle();
+        continue;
+      }
+      expect(sock.closeReasons()).toEqual([REFUSED('root')]);
+      expect(isDuplicateWriteKey(live, 'victim-key')).toBe(true);
+    }
+  });
+
+  it('residual (ADR 0036): a browser holding a ledger entry the crashed node never stored is refused on reconnect', async () => {
+    const first = node(true);
+    const browserSock = await first.connect('editor');
+    const live = first.live();
+    live.transact(() => recordWriteKey(live, 'api-key', Date.now()), V1_WRITE); // broadcast before the debounced store
+    const browser = new RemoteClient(live);
+    expect(isDuplicateWriteKey(browser.doc, 'api-key')).toBe(true);
+    expect(browserSock.closeReasons()).toEqual([]);
+    // The node crashes inside the store debounce: no store ran, the row lacks the entry. A fresh node loads the row.
+    const stored = new Y.Doc();
+    Y.applyUpdate(stored, new Uint8Array((await row()).ydoc));
+    expect(isDuplicateWriteKey(stored, 'api-key')).toBe(false);
+    const second = node(true);
+    const sock = await second.connect('editor');
+    const live2 = second.live();
+    sock.deliver(syncFrame(Y.encodeStateAsUpdate(browser.doc, Y.encodeStateVector(second.live())), SYNC.Step2, MSG.Sync, DOC));
+    await settle();
+    expect(sock.closeReasons()).toEqual([REFUSED('root')]);
+    expect(isDuplicateWriteKey(live2, 'api-key')).toBe(false);
+  });
+});
