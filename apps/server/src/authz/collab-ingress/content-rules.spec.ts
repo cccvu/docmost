@@ -83,7 +83,7 @@ describe('#781 STRING_ATTRS over HTTP JSON: a non-string URL/label is refused be
 describe('#781 review: table spans and __proto__ over HTTP JSON', () => {
   it('a colspan past the HTML limit (or not an integer) is refused number-attr; an honest span and null are accepted', async () => {
     for (const type of ['tableCell', 'tableHeader']) {
-      for (const bad of [1e9, 1001, -1, 1.5, '5']) {
+      for (const bad of [1e9, 1001, 0, -1, 1.5, '5']) {
         const json = withNode(type, { colspan: bad });
         expect(accepted(json)).not.toThrow(); // control: stored, and every viewer builds one column per unit
         const r = await refusal(() => parse(json));
@@ -100,6 +100,41 @@ describe('#781 review: table spans and __proto__ over HTTP JSON', () => {
       expect((await refusal(() => buildPrelimContent(json))).body).toMatchObject({ code: 'content_not_allowed', rule: 'schema' });
     }
     await expect(parse(doc(p(t('x'))))).resolves.toBeDefined();
+  });
+
+  const cell = (colspan: unknown, rowspan: unknown = 1) => ({ type: 'tableCell', attrs: { colspan, rowspan }, content: [p(t('x'))] });
+  const table = (...rows: unknown[][]) => doc({ type: 'table', content: rows.map((cells) => ({ type: 'tableRow', content: cells })) });
+
+  it('a table wider than 1000 columns or past 1M columns × rows is refused table-size, though each cell span is in range', async () => {
+    const cases: Array<[string, unknown]> = [
+      ['two cells of colspan 600 in one row', table([cell(600), cell(600)])],
+      ['a rowspan carrying 600 columns into a row with another 600', table([cell(600, 2)], [cell(600)])],
+      ['1001 rows of a 1000-column cell', table(...Array.from({ length: 1001 }, () => [cell(1000)]))],
+    ];
+    for (const [name, json] of cases) {
+      expect(accepted(json)).not.toThrow(); // control: stored, and prosemirror-tables builds a width × rows map
+      const r = await refusal(() => parse(json));
+      expect({ name, ...r }).toMatchObject({ name, status: 400, body: { code: 'content_not_allowed', rule: 'table-size', node: 'table' } });
+      expect((await refusal(() => buildPrelimContent(json))).body).toMatchObject({ rule: 'table-size' });
+    }
+    await expect(parse(table([cell(500), cell(500)], [cell(1, 3), cell(999)]))).resolves.toBeDefined();
+    await expect(parse(table(...Array.from({ length: 1000 }, () => [cell(1000)])))).resolves.toBeDefined(); // exactly 1M
+  });
+
+  it('HTML spans parse as a browser reads them (clamped integers), so an honest paste stays accepted; a too-wide table does not', async () => {
+    const spans = (html: string) => {
+      const out: unknown[] = [];
+      JSON.stringify(htmlToJson(html), (k, v) => (k === 'attrs' && v && 'colspan' in v ? (out.push([v.colspan, v.rowspan]), v) : v));
+      return out;
+    };
+    const html = '<table><tr><td colspan="100%">a</td><td colspan="">b</td><td colspan=" 2">c</td><td colspan="2.5" rowspan="0">d</td><td colspan="5000">e</td></tr></table>';
+    expect(spans(html)).toEqual([[100, 1], [1, 1], [2, 1], [2, 1], [1000, 1]]); // parseInt, as a browser reads it
+    // 100 + 1 + 2 + 2 + 1000 is 1105 columns: refused as a table, not as a span.
+    expect((await refusal(() => parse(htmlToJson(html)))).body).toMatchObject({ rule: 'table-size' });
+    const honest = '<table><tr><td colspan="100%">a</td><td colspan=" 2">b</td><td rowspan="x">c</td></tr><tr><td>d</td></tr></table>';
+    await expect(parse(htmlToJson(honest))).resolves.toBeDefined();
+    const wide = '<table><tr>' + '<td colspan="1000">x</td>'.repeat(3) + '</tr></table>';
+    expect((await refusal(() => parse(htmlToJson(wide)))).body).toMatchObject({ rule: 'table-size' });
   });
 
   it('a JSON attrs key "__proto__" (an own property after JSON.parse) is refused attr-kind', async () => {

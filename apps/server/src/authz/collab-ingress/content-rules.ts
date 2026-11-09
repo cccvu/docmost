@@ -28,9 +28,11 @@ import { serverSchema } from '../page-write/prelim-content';
 
 /**
  * Value depth 16 and 10k entries (the editor's deepest honest value is depth 2, a mark's attrs holding an array), and
- * element depth 128 (lists nest a few levels; the recursive walkers break between ~1k and ~7k levels).
+ * element depth 128 (lists nest a few levels; the recursive walkers break between ~1k and ~7k levels). A table at most
+ * 1000 columns wide (HTML's own colspan limit) and 1M columns × rows: prosemirror-tables builds a width × rows map and
+ * the table view one `<col>` per column, so 1000 cells of colspan 1000 would hang every viewer.
  */
-export const COLLAB_LIMITS = Object.freeze({ valueDepth: 16, valueEntries: 10_000, elementDepth: 128 });
+export const COLLAB_LIMITS = Object.freeze({ valueDepth: 16, valueEntries: 10_000, elementDepth: 128, tableWidth: 1000, tableCells: 1_000_000 });
 
 /**
  * Attributes a renderer reads as a string (`.startsWith`, `.trim`, `.toLowerCase`, a URL sanitizer, a React child):
@@ -68,10 +70,10 @@ export const STRING_ATTRS: ReadonlySet<string> = new Set([
  * a browser clamps `colspan` to 1000 and `rowspan` to 65534), null or undefined.
  */
 export const INT_ATTRS: ReadonlyMap<string, readonly [min: number, max: number]> = new Map([
-  ['node tableCell.colspan', [0, 1000]],
-  ['node tableHeader.colspan', [0, 1000]],
-  ['node tableCell.rowspan', [0, 65534]],
-  ['node tableHeader.rowspan', [0, 65534]],
+  ['node tableCell.colspan', [1, 1000]],
+  ['node tableHeader.colspan', [1, 1000]],
+  ['node tableCell.rowspan', [1, 65534]],
+  ['node tableHeader.rowspan', [1, 65534]],
 ]);
 
 export type CollabRule =
@@ -86,6 +88,7 @@ export type CollabRule =
   | 'element-depth'
   | 'string-attr'
   | 'number-attr'
+  | 'table-size'
   | 'unknown-mark'
   | 'hashed-mark'
   | 'zero-length'
@@ -395,12 +398,65 @@ export function assertCollabSafeContent(json: unknown, opts: { strict?: boolean 
   return node;
 }
 
+/** A span value as prosemirror-tables reads it (`j < colspan`): a number-like value, else the default 1. */
+const spanOf = (v: unknown): number => {
+  const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : v === null ? 0 : NaN;
+  return Number.isFinite(n) && n >= 0 ? n : 1;
+};
+
+/**
+ * A table's width as prosemirror-tables' `findWidth` computes it (the widest row, counting cells carried down by an
+ * earlier row's rowspan) and its height, in one pass; refused past COLLAB_LIMITS. `rows` holds each row's cells' spans.
+ */
+export function checkTableExtent(rows: ReadonlyArray<ReadonlyArray<{ colspan: unknown; rowspan: unknown }>>): Violation | null {
+  let width = 0;
+  let carried = 0;
+  const expires = new Map<number, number>();
+  for (let r = 0; r < rows.length; r++) {
+    carried -= expires.get(r) ?? 0;
+    let rowWidth = carried;
+    for (const cell of rows[r]) {
+      const colspan = spanOf(cell.colspan);
+      const rowspan = spanOf(cell.rowspan);
+      rowWidth += colspan;
+      if (rowspan > 1) {
+        carried += colspan;
+        expires.set(r + rowspan, (expires.get(r + rowspan) ?? 0) + colspan);
+      }
+    }
+    if (rowWidth > width) width = rowWidth;
+    if (width > COLLAB_LIMITS.tableWidth) return { rule: 'table-size', node: 'table' };
+  }
+  return width * rows.length > COLLAB_LIMITS.tableCells ? { rule: 'table-size', node: 'table' } : null;
+}
+
+/** The extent of a Yjs `table` element (its visible rows and their cells' current span attributes). */
+export function checkYTable(table: Y.XmlElement): Violation | null {
+  const rows = (table.toArray().filter((r) => r instanceof Y.XmlElement) as Y.XmlElement[]).map((row) =>
+    (row.toArray().filter((c) => c instanceof Y.XmlElement) as Y.XmlElement[]).map((cell) => ({
+      colspan: cell.getAttribute('colspan'),
+      rowspan: cell.getAttribute('rowspan'),
+    })),
+  );
+  return checkTableExtent(rows);
+}
+
 /** `checkElement`'s structure rule over a built ProseMirror tree, iteratively (see `assertCollabSafeContent`). */
 function checkTree(root: PMNode): Violation | null {
   const stack: PMNode[] = [root];
   while (stack.length) {
     const node = stack.pop()!;
     if (node.isText) continue;
+    if (node.type.name === 'table') {
+      const rows: Array<Array<{ colspan: unknown; rowspan: unknown }>> = [];
+      node.forEach((row) => {
+        const cells: Array<{ colspan: unknown; rowspan: unknown }> = [];
+        row.forEach((cell) => cells.push({ colspan: cell.attrs.colspan, rowspan: cell.attrs.rowspan }));
+        rows.push(cells);
+      });
+      const v = checkTableExtent(rows);
+      if (v) return v;
+    }
     const match = node.type.contentMatch.matchFragment(node.content);
     if ((!match || !match.validEnd) && node.childCount > 0) return { rule: 'schema', node: nodeId(node.type.name) };
     for (let i = 0; i < node.childCount; i++) {

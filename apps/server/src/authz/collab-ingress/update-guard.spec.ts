@@ -1,8 +1,9 @@
 import * as Y from 'yjs';
 import { initProseMirrorDoc, prosemirrorJSONToYDoc, updateYFragment } from '@tiptap/y-tiptap';
 import { Node as PMNode } from '@tiptap/pm/model';
+import { TableMap } from '@tiptap/pm/tables';
 import { TiptapTransformer } from '@hocuspocus/transformer';
-import { jsonToHtml } from '../../collaboration/collaboration.util';
+import { htmlToJson, jsonToHtml } from '../../collaboration/collaboration.util';
 import { serverSchema } from '../page-write/prelim-content';
 import { isDuplicateWriteKey, recordWriteKey, WRITE_IDEM_MAP } from '../page-write/write-idem';
 import {
@@ -192,9 +193,61 @@ describe('#781 review: null where the default is a string, table spans, and a __
       };
       const huge = edit(1e9);
       expect((contentOf(unguarded(s.live, huge)) as any).content.find((n: any) => n.type === 'table')).toBeDefined(); // control stores it
-      for (const bad of [1e9, max + 1, -1, 1.5, '5', null, { n: 1 }]) expectRefused(s, s.conn('attacker'), edit(bad), REFUSED('number-attr'));
+      for (const bad of [1e9, max + 1, 0, -1, 1.5, '5', null, { n: 1 }]) expectRefused(s, s.conn('attacker'), edit(bad), REFUSED('number-attr'));
       expect(s.send(s.conn('honest'), edit(2))).toBe('applied');
     }
+  });
+
+  it('widening a table past 1000 columns through one cell span: control maps 1001 columns; treatment refuses table-size', () => {
+    const s = setup({ seed: ALL_NODES_DOC });
+    const c = new RemoteClient(s.live);
+    const u = c.edit(s.live, () => find(c.doc, 'tableCell').setAttribute('colspan', 1000 as never)); // in range on its own
+    let width = 0;
+    initProseMirrorDoc(unguarded(s.live, u).getXmlFragment('default'), schema).doc.descendants((n) => {
+      if (n.type.name === 'table') width = TableMap.get(n).width;
+    });
+    expect(width).toBe(1001); // control
+    expectRefused(s, s.conn('attacker'), u, REFUSED('table-size'));
+    const honest = new RemoteClient(s.live);
+    expect(s.send(s.conn('honest'), honest.edit(s.live, () => find(honest.doc, 'tableCell').setAttribute('colspan', 2 as never)))).toBe('applied');
+  });
+
+  it('a new table of in-range cells adding up past the bound is refused; an honest paste of odd HTML spans is accepted', () => {
+    const s = setup({ seed: SEED });
+    const tableOf = (json: unknown) => prosemirrorJSONToYDoc(schema, json, 'default').getXmlFragment('default').get(0) as Y.XmlElement;
+    const insert = (json: unknown) => {
+      const c = new RemoteClient(s.live);
+      return c.edit(s.live, (f) => f.insert(1, [tableOf(json).clone()]));
+    };
+    const cellJ = (colspan: number) => ({ type: 'tableCell', attrs: { colspan }, content: [{ type: 'paragraph' }] });
+    const wide = { type: 'doc', content: [{ type: 'table', content: [{ type: 'tableRow', content: [cellJ(600), cellJ(600)] }] }] };
+    expectRefused(s, s.conn('attacker'), insert(wide), REFUSED('table-size'));
+    // What a browser's paste parser makes of colspan="100%", "", " 2", rowspan="0" (the editor-ext span clamp).
+    const pasted = htmlToJson('<table><tr><td colspan="100%">a</td><td colspan="">b</td><td colspan=" 2" rowspan="0">c</td></tr></table>');
+    expect(s.send(s.conn('honest'), insert(pasted))).toBe('applied');
+  });
+
+  it('a legacy table already past the bound is reported, and editing its cells is not refused for it', () => {
+    const legacy = new Y.Doc();
+    legacy.transact(() => {
+      const row = new Y.XmlElement('tableRow');
+      for (const span of [800, 800]) {
+        const cellEl = new Y.XmlElement('tableCell');
+        cellEl.setAttribute('colspan', span as never);
+        const para = new Y.XmlElement('paragraph');
+        para.insert(0, [new Y.XmlText('x')]);
+        cellEl.insert(0, [para]);
+        row.insert(row.length, [cellEl]);
+      }
+      const tableEl = new Y.XmlElement('table');
+      tableEl.insert(0, [row]);
+      legacy.getXmlFragment('default').insert(0, [tableEl]);
+    });
+    const s = setup({ legacy: Y.encodeStateAsUpdate(legacy) });
+    const c = new RemoteClient(s.live);
+    const u = c.edit(s.live, () => find(c.doc, 'tableCell').setAttribute('backgroundColor', '#fff' as never));
+    expect(s.send(s.conn('editor'), u)).toBe('applied');
+    expect(s.logs.some((l) => l.startsWith('COLLAB_STORED_CONTENT_INVALID') && l.includes('table-size'))).toBe(true);
   });
 
   it('an element attribute named __proto__ is refused by the stateless pre-pass, before any shadow exists', () => {

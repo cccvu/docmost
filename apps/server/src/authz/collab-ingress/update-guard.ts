@@ -33,6 +33,7 @@ import {
   checkElement,
   checkFormat,
   checkValue,
+  checkYTable,
   COLLAB_LIMITS,
   isElementName,
   type CollabRule,
@@ -234,6 +235,16 @@ export class CollabUpdateGuard {
       if (doc.legacyInvalid.has(idOf(type))) continue; // invalid before this frame, already deleted on every open
       return result(check.violation);
     }
+    // A table's extent is a property of the whole table: a changed cell span, row or cell can widen it.
+    const tables = new Set<Y.XmlElement>();
+    for (const type of touched) {
+      const table = enclosingTable(type);
+      if (table && isVisible(table) && !doc.legacyInvalid.has(idOf(table))) tables.add(table);
+    }
+    for (const table of tables) {
+      const v = checkYTable(table);
+      if (v) return result(v);
+    }
     // Structs that wait for a missing dependency would integrate later, unchecked and blamed on whoever sends it.
     if (!covers(pendingBefore, pendingRanges(store))) return result({ rule: 'unresolved' });
     for (const v of reportOnly) this.log('COLLAB_LEGACY_PENDING_INVALID', doc.live, { rule: v.rule });
@@ -308,6 +319,11 @@ export class CollabUpdateGuard {
       const [type, depth] = stack.pop()!;
       const check: ElementCheck = depth > COLLAB_LIMITS.elementDepth ? { ok: false, violation: { rule: 'element-depth' }, empty: false } : checkElement(type as Y.XmlElement);
       if (!check.ok && type !== root) gone.add(type);
+      const tableSize = type !== root && (type as Y.XmlElement).nodeName === 'table' ? checkYTable(type as Y.XmlElement) : null;
+      if (tableSize && check.ok) {
+        doc.legacyInvalid.add(idOf(type)); // a legacy table past the extent bound: reported, its edits not refused for it
+        rules['table-size'] = (rules['table-size'] ?? 0) + 1;
+      }
       if (!check.ok && !check.empty) {
         doc.legacyInvalid.add(idOf(type));
         rules[check.violation.rule] = (rules[check.violation.rule] ?? 0) + 1;
@@ -525,6 +541,18 @@ function checkStruct(item: Y.Item, root: Y.AbstractType<any> | undefined, touche
   else if (parent === root) return { rule: 'child-kind' }; // any root XmlText stops the page opening (even if the root is legacy)
   newTypes.push(type);
   touched.add(parent);
+  return null;
+}
+
+/** The table a touched table, row or cell belongs to (the structure its extent is computed from). */
+function enclosingTable(type: Y.AbstractType<any>): Y.XmlElement | null {
+  let t: Y.AbstractType<any> | null = type;
+  for (let up = 0; up < 3 && t && kindOf(t) === 'element'; up++) {
+    const name = (t as Y.XmlElement).nodeName;
+    if (name === 'table') return t as Y.XmlElement;
+    if (name !== 'tableRow' && name !== 'tableCell' && name !== 'tableHeader') return null;
+    t = t._item ? (t._item.parent as Y.AbstractType<any>) : null;
+  }
   return null;
 }
 
