@@ -234,8 +234,11 @@ export class PageService {
     trx?: KyselyTransaction,
   ): Promise<Page> {
     // CCC #716: refuse an append/prepend to a page at the cap BEFORE the row write, so a refused write renames nothing.
+    // CCC #781: likewise parse (and refuse) the content before the row write; updatePageContent applies this parse.
+    let parsedContent: unknown;
     if (updatePageDto.content && updatePageDto.operation && updatePageDto.format) {
       await assertPageCanGrow(this.db, page.id, updatePageDto.operation);
+      parsedContent = await this.parseProsemirrorContent(updatePageDto.content, updatePageDto.format);
     }
     const contributors = new Set<string>(page.contributorIds);
     contributors.add(user.id);
@@ -275,6 +278,7 @@ export class PageService {
         updatePageDto.operation,
         updatePageDto.format,
         user,
+        parsedContent,
       );
     }
 
@@ -294,8 +298,9 @@ export class PageService {
     operation: ContentOperation,
     format: ContentFormat,
     user: User,
+    parsed?: unknown, // CCC #781 (seam #121): update()'s own parse, made before its row write
   ): Promise<void> {
-    const prosemirrorJson = await this.parseProsemirrorContent(content, format);
+    const prosemirrorJson = parsed ?? (await this.parseProsemirrorContent(content, format));
 
     const documentName = `page.${pageId}`;
     // CCC #716: an append/prepend re-checks the page cap and applies under the page's growth lock. A replace just applies.

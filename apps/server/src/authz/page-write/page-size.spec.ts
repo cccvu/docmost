@@ -169,7 +169,8 @@ describe('#716 page growth lock', () => {
 /**
  * Seam #121: native `/api/pages/update` (SPA sessions, the attachment auto-embed, `/v1` JSON writes that skip the
  * conditional route). `PageService.update` refuses an append/prepend to a page at the cap BEFORE its row write (a
- * refused write renames nothing) and before the parse; `updatePageContent` re-checks under the page's growth lock
+ * refused write renames nothing) and before the parse, which also precedes the row write (#781); `updatePageContent`
+ * re-checks under the page's growth lock
  * right before the collab event.
  */
 describe('#716 seam #121: PageService.update / updatePageContent', () => {
@@ -227,10 +228,10 @@ describe('#716 seam #121: PageService.update / updatePageContent', () => {
     expect(calls).toEqual(['size']);
   });
 
-  it('an append under the cap: entry check, row write, parse, re-check under the lock, collab event', async () => {
+  it('an append under the cap: entry check, parse, row write, re-check under the lock, collab event', async () => {
     const a = update(1, 'append');
     await a.run;
-    expect(a.calls).toEqual(['size', 'updatePage', 'parse', 'size', 'yjs']);
+    expect(a.calls).toEqual(['size', 'parse', 'updatePage', 'size', 'yjs']); // #781: parsed before the row write
   });
 
   it('the re-check under the lock refuses an append another write pushed over the cap after the entry check', async () => {
@@ -249,6 +250,6 @@ describe('#716 seam #121: PageService.update / updatePageContent', () => {
   it('a replace is never checked', async () => {
     const r = update(50 * MiB, 'replace');
     await r.run;
-    expect(r.calls).toEqual(['updatePage', 'parse', 'yjs']);
+    expect(r.calls).toEqual(['parse', 'updatePage', 'yjs']);
   });
 });
