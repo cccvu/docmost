@@ -151,6 +151,26 @@ never used for authorization. Its `429 conversion_budget_exhausted` is now in th
 (`RateLimitedOrConversionBudget`). In remote mode the native page routes answer `400 { code: use_v1 }` to a non-json
 `format` echo (`/api/pages/info`, `/api/pages/update`, and `/api/pages/create` with content).
 
+**1.15.0 (wiki-v2 #780).** Every `/api/service/*` route takes an optional `x-ccc-rate-principal` header, `user:<id>`
+(the acting human) or `service:<id>` (a service account acting for nobody), the id a uuid. It is a rate-limit key only,
+never identity or authority, and is read only after the secret and scope checks; a malformed value is
+`400 { code: rate_principal_invalid }`, which never echoes it. Each scope has three token buckets that refill
+continuously (no fixed window, so no 60 s cliff): one per principal, one global bucket for all calls that send the
+header, and one unattributed bucket for calls that do not. A call with the header is charged to its principal's bucket
+and the global one, all or nothing; a call without it, to the unattributed one only, so background callers are never
+starved by user traffic. Sizes per minute (principal / global / unattributed, env `SERVICE_BRIDGE_<SCOPE>_RATE_LIMIT` /
+`_GLOBAL_RATE_LIMIT` / `_UNATTRIBUTED_RATE_LIMIT` with `<SCOPE>` = `PAGES_READ`, `PAGES_AUTHZ`, `PAGES_IMPORT`, or none
+for the default): `pages:read` and `pages:authz:read` 6000 / 60000 / 6000, `pages:import:read` 120 / 1200 / 120, every
+other scope 1200 / 6000 / 600; missing or wrong-secret requests share one bucket of 600
+(`SERVICE_BRIDGE_ANON_RATE_LIMIT`). One principal is isolated from another while all attributed calls together stay
+under the global size; past it, every attributed caller of that scope is refused alike until the bucket refills. Every
+refusal of an authenticated call is `429 { code: rate_limited }` with `Retry-After` (`RateLimitedError`); the anon
+bucket's is `429 { code: service_auth_throttled }`, a credential fault an integrator must never read as its caller's own
+throttle. The engine logs
+`SERVICE_BRIDGE_RATE_LIMITED scope=<scope> bucket=principal|global|unattributed|anon` at most once a minute per bucket
+kind, never the principal. An engine before 1.15.0 ignores the header and throttles every caller of a scope in one
+fixed 60 s window, with an uncoded 429 and no `Retry-After`.
+
 **Native routes refused in remote mode (1.10.0; wiki-v2 #502, #598, #636).** In `AUTHZ_MODE=remote` the engine
 answers `404` to every authenticated caller of the native routes below, before any permission check, and forwards one
 audit row per refusal (its event in brackets) to `/audit/ingest`. A session minted before the switch to remote (an
@@ -235,7 +255,7 @@ must read that as "upgrade pending", never as page-not-found, and must never fal
 **Keyed page create (1.9.0, wiki-v2 #616).** `POST /api/pages/idempotent-create` (relayed as the acting user; `404` unless `AUTHZ_MODE=remote`) takes the native `POST /api/pages/create` body plus `idempotencyKey` (1–255), `idempotencyNamespace` (1–128, the integrator's key namespace) and `fingerprint` (64 lowercase hex, sha256 of the integrator's stable request body). The fork binds the key to the workspace, the authenticated user and the namespace, and records it in the page's own transaction for at least 24h. First use → `200` native body + `replayed: false`; same key + fingerprint → `200` with that page's current state, re-authorized, `replayed: true`, nothing re-run; different fingerprint → `409 { code: idempotency_key_reused }`; page since deleted → `404 { code: idempotency_resource_gone }`; busy → `503 { code: engine_busy }`. The native authorization runs on every call. A fork without the route answers the framework's plain 404 — read it as "upgrade pending", never as not-found. `POST /api/service/spaces` takes the same three fields, optionally (all or none; a partial key is a `400`): the key is recorded in the space insert's transaction, bound to the workspace, the service credential that authenticated the call and the creator (`creatorExternalId`, as its shadow user), so a key sent for another human — or through another credential — is a separate entry and can never answer this space. A repeat answers `{ id, slug, name, replayed: true }` and re-runs nothing (no space, member or outbox row; the creator's shadow-user upsert runs as on every call and is idempotent); a keyed create skips the friendly slug pre-check, so a slug held by another space is still the unique index's `409`; mismatch, gone and busy answer as for pages. Unkeyed, the space create is unchanged and its body carries no `replayed`.
 
 **Import helpers (1.9.0, wiki-v2 #616).** Two read-only routes a platform plans a page import with, under their own
-scope `pages:import:read` (a smaller rate bucket, `SERVICE_BRIDGE_PAGES_IMPORT_RATE_LIMIT`, default 120/min). `POST
+scope `pages:import:read` (smaller rate buckets, `SERVICE_BRIDGE_PAGES_IMPORT_*`: see 1.15.0). `POST
 /api/service/pages/validate-content` `{ items: [{ format: markdown | html, content }] }` (1–50 items) parses each item
 exactly as a page create would (including the network-inert HTML parse), writes nothing, and answers `{ results: [{ idx,
 ok: true } | { idx, ok: false, code }] }` in item order — `too_large` (over 512 KiB, or once the call's budget of 1 MiB
