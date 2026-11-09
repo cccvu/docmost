@@ -71,6 +71,8 @@ import {
   refetchCollabTokenAndReopen,
   reopenCollabSocket,
 } from "@/features/editor-ux/collab-reconnect";
+import { CollabRefusalNotice } from "@/features/editor-ux/collab-refusal-notice";
+import { clearLocalCollabCopy } from "@/features/editor-ux/collab-local-copy";
 import DrawioMenu from "./components/drawio/drawio-menu";
 import { useCollabToken } from "@/features/auth/queries/auth-query.tsx";
 import SearchAndReplaceDialog from "@/features/editor/components/search-and-replace/search-and-replace-dialog.tsx";
@@ -196,6 +198,7 @@ export default function PageEditor({
         }
         // CCC (#501, #537): reopen on the socket's own `disconnect`, never on a timer (collab-reconnect.ts).
         if (step.reconnect) reopenCollabSocket(socket, isCurrent);
+        if (step.detach) remote.detach(); // CCC (#781): a refused provider stops sending (see attach() below)
         if (step.refreshToken) {
           void refetchCollabTokenAndReopen({
             refetch: refetchCollabToken,
@@ -228,11 +231,15 @@ export default function PageEditor({
           onCollabAccess({ kind: "authenticated", scope }),
         // A server CLOSE for this document arrives while the socket stays open; a raw socket close has
         // already set the status to disconnected (and the provider reconnects on its own).
-        onClose: () =>
+        onClose: ({ event }) =>
           onCollabAccess({
             kind: "server-close",
             socketConnected: socket.status === WebSocketStatus.Connected,
+            reason: event?.reason, // CCC (#781): a document CLOSE always says code 1000; the reason is the signal
           }),
+        onUnsyncedChanges: ({ number }) => {
+          if (number === 0) onCollabAccess({ kind: "sync-acked" }); // CCC (#781)
+        },
         onStatus: onStatusHandler,
         onSynced: onSyncedHandler,
         onStateless: onStatelessHandler,
@@ -278,7 +285,7 @@ export default function PageEditor({
   }, [isIdle, documentState, providersReady, resetIdle]);
 
   // Attach here, to make sure the connection gets properly established
-  providersRef.current?.remote.attach();
+  if (!collabAccessRef.current.refused) providersRef.current?.remote.attach(); // CCC (#781): never re-attach
 
   const extensions = useMemo(() => {
     if (!providersReady || !providersRef.current || !currentUser?.user) {
@@ -472,6 +479,13 @@ export default function PageEditor({
 
   return (
     <TransclusionLookupProvider>
+      {collabAccess.refused && (
+        <CollabRefusalNotice
+          clearLocalCopy={() =>
+            clearLocalCollabCopy(providersRef.current?.local)
+          }
+        />
+      )}
       {showStatic ? (
         <EditorProvider
           editable={false}

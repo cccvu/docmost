@@ -1,7 +1,9 @@
 // #773: the collab store's JSON normalizer. Every string and key Postgres cannot store (a lone surrogate in jsonb,
 // U+0000 in jsonb and text) becomes U+FFFD; everything else, and every clean input, comes back untouched — the SAME
 // reference, so a clean page allocates nothing — and the input is never written to (it can be Yjs's own objects).
-import { storeSafeJson, storeSafeString } from './store-safe-json';
+import { isDeepStrictEqual } from 'node:util';
+import { STORE_SAFE_MAX_DEPTH, storeSafeJson, storeSafeString } from './store-safe-json';
+import { stableHash } from './stable-hash';
 
 const R = '\uFFFD';
 const HIGH = '\ud83d';
@@ -202,5 +204,82 @@ describe('storeSafeJson (#773)', () => {
         expect(JSON.stringify(out)).toBe(JSON.stringify(input)); // and it writes what the input writes
       }
     });
+  });
+});
+
+// #781 (ADR 0036): a crafted collab client can nest a value (a format value, an attribute) far deeper than any page
+// needs. The recursive walks after the store's `fromYdoc` (this one, `isDeepStrictEqual` in the no-op check, the
+// digest's `stableStringify`) threw RangeError at about 10k levels, and the page could never be stored again. A value
+// nested deeper than STORE_SAFE_MAX_DEPTH now projects as null, so everything downstream walks at most that deep.
+describe('storeSafeJson depth bound (#781)', () => {
+  /** `leaf` inside `n` arrays: the leaf sits at depth `n` (the root value is depth 0). Built without recursion. */
+  const nestArrays = (n: number, leaf: unknown): unknown => {
+    let v = leaf;
+    for (let i = 0; i < n; i++) v = [v];
+    return v;
+  };
+  /** A ProseMirror-shaped chain `levels` nodes deep (each node adds 2 levels: the node and its `content` array). */
+  const nestNodes = (levels: number): Record<string, unknown> => {
+    let v: Record<string, unknown> = { type: 'text', text: 'bottom' };
+    for (let i = 0; i < levels; i++) v = { type: 'paragraph', content: [v] };
+    return v;
+  };
+  /** The value `n` arrays down. */
+  const descend = (v: unknown, n: number): unknown => {
+    for (let i = 0; i < n; i++) v = (v as unknown[])[0];
+    return v;
+  };
+
+  it('is 512', () => {
+    expect(STORE_SAFE_MAX_DEPTH).toBe(512);
+  });
+
+  it('a 100k-deep input: no RangeError in storeSafeJson, nor in isDeepStrictEqual or stableHash on its output', () => {
+    const deep = nestNodes(100_000);
+    let out: unknown;
+    expect(() => (out = storeSafeJson(deep))).not.toThrow();
+    expect(() => isDeepStrictEqual(out, storeSafeJson(nestNodes(100_000)))).not.toThrow();
+    expect(isDeepStrictEqual(out, storeSafeJson(nestNodes(100_000)))).toBe(true);
+    expect(() => stableHash(out)).not.toThrow();
+    expect(() => JSON.stringify(out)).not.toThrow();
+    // The no-op check compares the projection with the stored row: a legacy row holding the deep value compares
+    // unequal (the walk stops where the projection holds null), never a RangeError.
+    expect(() => isDeepStrictEqual(out, deep)).not.toThrow();
+    expect(isDeepStrictEqual(out, deep)).toBe(false);
+  });
+
+  it('keeps every value at depth ≤ 512 and the same reference for a clean input exactly that deep', () => {
+    const atMax = nestArrays(STORE_SAFE_MAX_DEPTH, 'leaf');
+    expect(storeSafeJson(atMax)).toBe(atMax);
+  });
+
+  it('writes null for a value nested deeper than 512, copying only the path to it', () => {
+    const over = nestArrays(STORE_SAFE_MAX_DEPTH + 1, 'leaf') as unknown[];
+    const out = storeSafeJson(over) as unknown[];
+    expect(out).not.toBe(over);
+    expect(descend(out, STORE_SAFE_MAX_DEPTH)).toEqual([null]);
+    expect(descend(over, STORE_SAFE_MAX_DEPTH + 1)).toBe('leaf'); // the input is untouched
+    // An object member deeper than the bound is null too (not dropped), and a shallow sibling keeps its reference.
+    const sibling = { ok: true };
+    // `tooDeep` sits at depth 1, so its object at depth 512 and that object's `k` value at 513.
+    const tooDeep = nestArrays(STORE_SAFE_MAX_DEPTH - 1, { k: { x: 1 } });
+    const obj = { sibling, tooDeep };
+    const outObj = storeSafeJson(obj) as typeof obj;
+    expect(outObj.sibling).toBe(sibling);
+    expect(descend(outObj.tooDeep, STORE_SAFE_MAX_DEPTH - 2)).toEqual([{ k: null }]);
+  });
+
+  it('honest page depth is far inside the bound: a 200-node-deep page comes back as the same reference', () => {
+    const page = { type: 'doc', content: [nestNodes(200)] }; // 402 levels: deeper than the collab guard allows
+    expect(storeSafeJson(page)).toBe(page);
+  });
+
+  it('a toJSON that overflows the stack (RangeError) projects as null; any other throw still propagates', () => {
+    const overflow = (n: number): number => overflow(n + 1) + 1;
+    const input = { a: { toJSON: () => overflow(0) }, b: 'kept' };
+    expect(storeSafeJson(input)).toEqual({ a: null, b: 'kept' });
+    expect(storeSafeJson([{ toJSON: () => { throw new RangeError('Maximum call stack size exceeded'); } }])).toEqual([null]);
+    const boom = new TypeError('boom');
+    expect(() => storeSafeJson({ a: { toJSON: () => { throw boom; } } })).toThrow(boom);
   });
 });

@@ -541,6 +541,16 @@ describe('ConditionalPageController.conditionalUpdate', () => {
       expect(t.pageHistoryRepo.insertPageHistory).not.toHaveBeenCalled();
     });
 
+    it('#781: a legacy row and version nested 100k deep snapshot without a RangeError (the hash is depth-bounded)', async () => {
+      const deep = () => ({ type: 'doc', content: [{ type: 'paragraph', attrs: { textAlign: JSON.parse('{"a":'.repeat(100_000) + '1' + '}'.repeat(100_000)) } }] });
+      const t = build({ current: deep(), lastHistory: { id: 'hist-7', title: PAGE.title, content: deep() } });
+      const out = (await t.controller.conditionalUpdate(
+        dto({ content: NEW as never, format: 'json', snapshotBefore: true }),
+        USER,
+      )) as { snapshot?: unknown };
+      expect(out.snapshot).toEqual({ status: 'unchanged', historyId: 'hist-7' });
+    });
+
     it('saves a version when the newest one has the same content but a different title', async () => {
       const t = build({ current: OLD, lastHistory: { id: 'hist-7', title: 'an older title', content: OLD } });
       const out = (await t.controller.conditionalUpdate(

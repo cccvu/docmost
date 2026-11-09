@@ -1,6 +1,7 @@
 import { TableHeader as TiptapTableHeader } from "@tiptap/extension-table";
 import { safeCssColor } from "../ccc/color/safe-css-color"; // CCC #145
 import { withSafeCellAlign } from "../ccc/align/cell-align"; // CCC #145
+import { withSafeCellSpans } from "../ccc/table/safe-spans"; // CCC #781
 
 export const TableHeader = TiptapTableHeader.extend({
   name: "tableHeader",
@@ -9,7 +10,7 @@ export const TableHeader = TiptapTableHeader.extend({
 
   addAttributes() {
     return {
-      ...withSafeCellAlign(this.parent?.()), // CCC #145: render-gated `align`
+      ...withSafeCellSpans(withSafeCellAlign(this.parent?.())), // CCC #145: render-gated `align`; #781: clamped spans
       backgroundColor: {
         default: null,
         parseHTML: (element) =>

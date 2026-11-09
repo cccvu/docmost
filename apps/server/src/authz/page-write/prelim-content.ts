@@ -33,6 +33,7 @@ import * as Y from 'yjs';
 import { getSchema } from '@tiptap/core';
 import { Node as PMNode, type Mark, type Schema } from '@tiptap/pm/model';
 import { tiptapExtensions } from '../../collaboration/collaboration.util';
+import { assertCollabSafeContent } from '../collab-ingress/content-rules';
 
 let schema: Schema | undefined;
 
@@ -118,6 +119,8 @@ export function buildPrelimContent(prosemirrorJson: unknown): Array<Y.XmlElement
     // `toYdoc`'s own refusal of an empty document.
     throw new Error('empty or invalid document');
   }
-  const root = PMNode.fromJSON(serverSchema(), prosemirrorJson as never);
+  // #781: the content rules every collab frame is held to (ADR 0036) run first, then `Node.fromJSON` exactly as before
+  // (strict: an unknown node or mark type throws its RangeError, as `toYdoc` does), then `.check()`.
+  const root = assertCollabSafeContent(prosemirrorJson, { strict: true });
   return normalizedContent(root).map(toYType);
 }

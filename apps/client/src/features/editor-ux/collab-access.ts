@@ -16,7 +16,15 @@ import { jwtDecode } from "jwt-decode";
  *     between, or a refetch that fails, means access is lost: stop editing and show the connection-lost
  *     status. An expired token refetches every time, as upstream did; a refetch that fails is lost there too
  *     (upstream left that editor editable with nothing syncing);
- *   - a successful authentication → the server's scope decides whether the editor may edit.
+ *   - a successful authentication → the server's scope decides whether the editor may edit;
+ *   - #781: the server's collab ingress guard refuses a frame it will not apply with that same per-document CLOSE,
+ *     and the provider reports it as code 1000, so the REASON is the only signal:
+ *       - `ccc:collab-update-refused:<rule>` → detach the provider (a refused provider stays attached and keeps
+ *         sending), stop editing, show the refusal notice, and never reconnect: this browser's copy would be
+ *         replayed and refused again. Final until the page reloads;
+ *       - `ccc:collab-update-unresolved` → the server could not decide; reconnect ONCE. The retry is spent until
+ *         `sync-acked` (every frame this provider sent was applied), NOT until the next authentication, which
+ *         happens before the replay is judged; a second one before that is treated as refused.
  *
  * Pure and dependency-free so it is unit-tested without a provider; page-editor.tsx wires it (seam 169).
  */
@@ -28,19 +36,40 @@ export interface CollabAccessState {
   readOnly: boolean;
   /** A non-expiry refusal already refetched the token; the next one is final (reset by `authenticated`). */
   refreshed: boolean;
+  /** #781: the server refused a frame from this editor; the provider is detached. Final until a reload. */
+  refused: boolean;
+  /** #781: an `unresolved` close already reconnected; the next one is refused (reset only by `sync-acked`). */
+  unresolvedRetried: boolean;
 }
 
 export const initialCollabAccess: CollabAccessState = {
   lost: false,
   readOnly: false,
   refreshed: false,
+  refused: false,
+  unresolvedRetried: false,
 };
 
+/** #781: the server's close reasons (`apps/server/src/authz/collab-ingress`). */
+export const COLLAB_UPDATE_REFUSED_PREFIX = "ccc:collab-update-refused:";
+export const COLLAB_UPDATE_UNRESOLVED = "ccc:collab-update-unresolved";
+
+export function classifyCollabCloseReason(
+  reason: string | undefined,
+): "refused" | "unresolved" | "other" {
+  if (typeof reason !== "string") return "other";
+  if (reason.startsWith(COLLAB_UPDATE_REFUSED_PREFIX)) return "refused";
+  if (reason === COLLAB_UPDATE_UNRESOLVED) return "unresolved";
+  return "other";
+}
+
 export type CollabAccessEvent =
-  | { kind: "server-close"; socketConnected: boolean }
+  | { kind: "server-close"; socketConnected: boolean; reason?: string }
   | { kind: "auth-failed"; tokenExpired: boolean }
   | { kind: "refresh-failed" }
-  | { kind: "authenticated"; scope: string | undefined };
+  | { kind: "authenticated"; scope: string | undefined }
+  /** #781: the provider's unsynced-changes count reached 0 — the server applied every frame it was sent. */
+  | { kind: "sync-acked" };
 
 export interface CollabAccessStep {
   state: CollabAccessState;
@@ -50,37 +79,52 @@ export interface CollabAccessStep {
   refreshToken: boolean;
   /** Show the connection-lost status (the editor can no longer sync this document). */
   markDisconnected: boolean;
+  /** #781: detach the provider so it stops sending (and keep it detached). */
+  detach: boolean;
 }
+
+const NO_ACTION = {
+  reconnect: false,
+  refreshToken: false,
+  markDisconnected: false,
+  detach: false,
+} as const;
 
 export function nextCollabAccess(
   prev: CollabAccessState,
   event: CollabAccessEvent,
 ): CollabAccessStep {
+  // #781: refused is final. The provider is detached, so nothing should arrive; if something does, ignore it.
+  if (prev.refused) return { state: prev, ...NO_ACTION };
   switch (event.kind) {
-    case "server-close":
+    case "server-close": {
+      const reason = classifyCollabCloseReason(event.reason);
+      if (reason === "refused") return refusedStep(prev);
+      if (reason === "unresolved") {
+        if (prev.unresolvedRetried) return refusedStep(prev);
+        // Reconnect once (a closing socket is reconnected by the provider itself).
+        return {
+          ...NO_ACTION,
+          state: { ...prev, unresolvedRetried: true },
+          reconnect: event.socketConnected,
+        };
+      }
       // A raw socket close is already handled by the provider (it reconnects and re-authenticates). Only a
       // per-document CLOSE on a live socket leaves the document unauthenticated with nothing to recover it.
-      return {
-        state: prev,
-        reconnect: event.socketConnected,
-        refreshToken: false,
-        markDisconnected: false,
-      };
+      return { ...NO_ACTION, state: prev, reconnect: event.socketConnected };
+    }
+    case "sync-acked":
+      if (!prev.unresolvedRetried) return { state: prev, ...NO_ACTION };
+      return { state: { ...prev, unresolvedRetried: false }, ...NO_ACTION };
     case "auth-failed":
       if (event.tokenExpired) {
-        return {
-          state: prev,
-          reconnect: false,
-          refreshToken: true,
-          markDisconnected: false,
-        };
+        return { ...NO_ACTION, state: prev, refreshToken: true };
       }
       if (!prev.refreshed) {
         return {
+          ...NO_ACTION,
           state: { ...prev, refreshed: true },
-          reconnect: false,
           refreshToken: true,
-          markDisconnected: false,
         };
       }
       return lostStep(prev);
@@ -88,30 +132,36 @@ export function nextCollabAccess(
       return lostStep(prev);
     case "authenticated":
       return {
+        ...NO_ACTION,
         state: {
+          ...prev, // #781: `unresolvedRetried` survives: authenticating says nothing about the replay
           lost: false,
           readOnly: event.scope === "readonly",
           refreshed: false,
         },
-        reconnect: false,
-        refreshToken: false,
-        markDisconnected: false,
       };
   }
 }
 
 function lostStep(prev: CollabAccessState): CollabAccessStep {
   return {
+    ...NO_ACTION,
     state: { ...prev, lost: true },
-    reconnect: false,
-    refreshToken: false,
     markDisconnected: true,
   };
 }
 
+/**
+ * #781: stop sending and stop editing. No `markDisconnected`: the header's "connection lost. Retrying..." would be
+ * untrue (nothing retries); the refusal notice says what happened and offers the recovery.
+ */
+function refusedStep(prev: CollabAccessState): CollabAccessStep {
+  return { ...NO_ACTION, state: { ...prev, refused: true }, detach: true };
+}
+
 /** The editor may edit only if the page allows it AND the server still lets this connection write. */
 export function collabAllowsEditing(state: CollabAccessState): boolean {
-  return !state.lost && !state.readOnly;
+  return !state.lost && !state.readOnly && !state.refused;
 }
 
 /**
