@@ -49,6 +49,7 @@ export const STRING_ATTRS: ReadonlySet<string> = new Set([
   'node pdf.src',
   'node pdf.name',
   'node embed.src',
+  'node embed.provider',
   'node youtube.src',
   'node drawio.src',
   'node excalidraw.src',
@@ -59,6 +60,18 @@ export const STRING_ATTRS: ReadonlySet<string> = new Set([
   'node mathBlock.text',
   'node mention.label',
   'node status.text',
+]);
+
+/**
+ * Integer attributes a renderer loops over: prosemirror-tables' `computeMap` and the table node view build one column per
+ * unit of `colspan`, so `colspan: 1e9` hangs every viewer's tab. Each must be an integer in its range (HTML's own limits:
+ * a browser clamps `colspan` to 1000 and `rowspan` to 65534), null or undefined.
+ */
+export const INT_ATTRS: ReadonlyMap<string, readonly [min: number, max: number]> = new Map([
+  ['node tableCell.colspan', [0, 1000]],
+  ['node tableHeader.colspan', [0, 1000]],
+  ['node tableCell.rowspan', [0, 65534]],
+  ['node tableHeader.rowspan', [0, 65534]],
 ]);
 
 export type CollabRule =
@@ -72,6 +85,7 @@ export type CollabRule =
   | 'value-kind'
   | 'element-depth'
   | 'string-attr'
+  | 'number-attr'
   | 'unknown-mark'
   | 'hashed-mark'
   | 'zero-length'
@@ -175,8 +189,20 @@ export function checkFormat(key: string, value: unknown): Violation | null {
   return null;
 }
 
-/** An element attribute: every value of its ContentAny (a map entry may hold several), and its string-ness. */
-export function checkAttribute(nodeName: string, key: string, values: readonly unknown[]): Violation | null {
+/**
+ * A null attribute value in the Yjs document: y-tiptap never writes one (it removes the attribute instead), and the
+ * renderer then sees `null` where the schema default is a string or a number (`node.attrs.text.trim()` on a math node
+ * crashes). So in a Yjs element null is accepted only where the attribute's schema default is itself null or absent.
+ * ProseMirror JSON may carry null anywhere: `toYdoc` drops it, and the default applies.
+ */
+function nullAllowed(nodeName: string, key: string, yjs: boolean): boolean {
+  if (!yjs) return true;
+  const spec = knownNode(nodeName)?.spec.attrs?.[key] as { default?: unknown } | undefined;
+  return spec?.default === null || spec?.default === undefined;
+}
+
+/** An element attribute: every value of its ContentAny (a map entry may hold several), its string-ness and its range. */
+export function checkAttribute(nodeName: string, key: string, values: readonly unknown[], opts: { yjs?: boolean } = {}): Violation | null {
   const node = nodeId(nodeName);
   const attrKey = node && attrNames(knownNode(node)!).includes(key) ? key : undefined;
   if (key === '__proto__') return { rule: 'attr-kind', node }; // Yjs builds attrs by assignment: it would re-prototype them
@@ -184,8 +210,13 @@ export function checkAttribute(nodeName: string, key: string, values: readonly u
     const v = checkValue(value);
     if (v) return { rule: v, node, key: attrKey };
   }
-  if (STRING_ATTRS.has(`node ${nodeName}.${key}`) && !isStringish(values[values.length - 1])) {
-    return { rule: 'string-attr', node, key: attrKey };
+  const last = values[values.length - 1];
+  const entry = `node ${nodeName}.${key}`;
+  if (last === undefined || (last === null && nullAllowed(nodeName, key, !!opts.yjs))) return null;
+  if (STRING_ATTRS.has(entry) && typeof last !== 'string') return { rule: 'string-attr', node, key: attrKey };
+  const range = INT_ATTRS.get(entry);
+  if (range && !(Number.isInteger(last) && (last as number) >= range[0] && (last as number) <= range[1])) {
+    return { rule: 'number-attr', node, key: attrKey };
   }
   return null;
 }
@@ -195,8 +226,9 @@ export function checkAttribute(nodeName: string, key: string, values: readonly u
  * Shallow, like y-tiptap's own check: child ELEMENTS count by their type only (each is checked when it is touched).
  * `empty` marks a failure that is only "required content is missing and there is none": y-tiptap then deletes an
  * element that holds nothing, which loses nothing (the guard allows it; schema-names.spec.ts proves no cascade).
+ * `gone`: children to treat as already deleted (the build audit's model of y-tiptap's cascade over legacy content).
  */
-export function checkElement(type: Y.XmlElement | Y.XmlFragment): ElementCheck {
+export function checkElement(type: Y.XmlElement | Y.XmlFragment, gone?: ReadonlySet<Y.AbstractType<any>>): ElementCheck {
   const schema = serverSchema();
   const isRoot = type._item === null;
   let nodeType: NodeType;
@@ -215,7 +247,7 @@ export function checkElement(type: Y.XmlElement | Y.XmlFragment): ElementCheck {
     if (item.deleted) continue;
     if (isRoot || !(item.content instanceof Y.ContentAny)) return fail({ rule: 'attr-kind', node: name });
     const values = item.content.arr;
-    const v = checkAttribute(name!, key, values);
+    const v = checkAttribute(name!, key, values, { yjs: true });
     if (v) return fail(v);
     attrs[key] = values[values.length - 1];
   }
@@ -232,6 +264,7 @@ export function checkElement(type: Y.XmlElement | Y.XmlFragment): ElementCheck {
   let lastText: readonly Mark[] | null = null;
   for (let item = type._start; item !== null; item = item.right) {
     if (item.deleted) continue;
+    if (gone && item.content instanceof Y.ContentType && gone.has(item.content.type)) continue; // y-tiptap deletes it
     if (!(item.content instanceof Y.ContentType)) return fail({ rule: 'child-kind', node: name });
     const child = item.content.type;
     if (child.constructor === Y.XmlElement) {
@@ -338,6 +371,11 @@ function walkJson(json: unknown): Violation | null {
  * unknown node type keeps upstream's behaviour, stripped by `jsonToNode` rather than refused.
  */
 export function assertCollabSafeContent(json: unknown, opts: { strict?: boolean } = {}): PMNode {
+  // A page's content is a document. Any other root stores its children at the Yjs root (a paragraph's text becomes a
+  // root XmlText), which no browser can open; a collab frame doing the same is refused `child-kind`.
+  if (!json || typeof json !== 'object' || (json as { type?: unknown }).type !== serverSchema().topNodeType.name) {
+    throw new ContentNotAllowedException({ rule: 'schema' });
+  }
   const v = walkJson(json);
   if (v?.rule === 'element-depth') throw new ContentTooComplexException();
   if (v) throw new ContentNotAllowedException(v);

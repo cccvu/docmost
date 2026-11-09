@@ -19,7 +19,7 @@ import {
   SYNC,
   syncFrame,
 } from './collab-ingress.testkit';
-import { STRING_ATTRS } from './content-rules';
+import { INT_ATTRS, STRING_ATTRS } from './content-rules';
 import { COLLAB_REFUSAL_CODE, CollabUpdateGuard, SOCKET_REFUSAL_BUDGET, UNRESOLVED_REASON, type CollabGuardMode } from './update-guard';
 
 /**
@@ -148,6 +148,65 @@ describe('#781 case 1: a non-string URL or label is refused (every viewer crashe
   });
 });
 
+describe('#781 review: null where the default is a string, table spans, and a __proto__ attribute', () => {
+  it('a null STRING_ATTRS value is refused only where the schema default is not null (y-tiptap never writes null)', () => {
+    let refused = 0;
+    for (const entry of [...STRING_ATTRS].filter((e) => e.startsWith('node '))) {
+      const [type, attr] = entry.slice('node '.length).split('.');
+      const def = (schema.nodes[type].spec.attrs as Record<string, { default?: unknown }>)[attr]?.default;
+      const s = setup({ seed: ALL_NODES_DOC });
+      const c = new RemoteClient(s.live);
+      const u = c.edit(s.live, () => find(c.doc, type).setAttribute(attr, null as never));
+      if (def === null || def === undefined) {
+        expect(s.send(s.conn('editor'), u)).toBe('applied');
+      } else {
+        expectRefused(s, s.conn('attacker'), u, REFUSED('string-attr'));
+        refused++;
+      }
+    }
+    expect(refused).toBeGreaterThanOrEqual(10); // math text, media src, embed provider, …
+  });
+
+  it('a math node whose text is null: control crashes every viewer (text.trim()); treatment refuses', () => {
+    const s = setup({ seed: ALL_NODES_DOC });
+    const c = new RemoteClient(s.live);
+    const u = c.edit(s.live, () => find(c.doc, 'mathBlock').setAttribute('text', null as never));
+    const control = unguarded(s.live, u);
+    expect(initProseMirrorDoc(control.getXmlFragment('default'), schema).doc.firstChild).toBeDefined();
+    let mathText: unknown = 'unset';
+    initProseMirrorDoc(control.getXmlFragment('default'), schema).doc.descendants((n) => {
+      if (n.type.name === 'mathBlock') mathText = n.attrs.text;
+    });
+    expect(mathText).toBeNull(); // the client view then calls node.attrs.text.trim()
+    expectRefused(s, s.conn('attacker'), u, REFUSED('string-attr'));
+  });
+
+  it('a table colspan of 1e9: control renders one column per unit for every viewer; treatment refuses number-attr', () => {
+    expect([...INT_ATTRS.keys()].sort()).toEqual(['node tableCell.colspan', 'node tableCell.rowspan', 'node tableHeader.colspan', 'node tableHeader.rowspan']);
+    for (const [entry, [, max]] of INT_ATTRS) {
+      const [type, attr] = entry.slice('node '.length).split('.');
+      const s = setup({ seed: ALL_NODES_DOC });
+      const edit = (value: unknown) => {
+        const c = new RemoteClient(s.live);
+        return c.edit(s.live, () => find(c.doc, type).setAttribute(attr, value as never));
+      };
+      const huge = edit(1e9);
+      expect((contentOf(unguarded(s.live, huge)) as any).content.find((n: any) => n.type === 'table')).toBeDefined(); // control stores it
+      for (const bad of [1e9, max + 1, -1, 1.5, '5', null, { n: 1 }]) expectRefused(s, s.conn('attacker'), edit(bad), REFUSED('number-attr'));
+      expect(s.send(s.conn('honest'), edit(2))).toBe('applied');
+    }
+  });
+
+  it('an element attribute named __proto__ is refused by the stateless pre-pass, before any shadow exists', () => {
+    const s = setup({ seed: ALL_NODES_DOC });
+    const c = new RemoteClient(s.live);
+    // Yjs builds getAttributes() by assignment, so this would re-prototype the image's attrs with a non-string src.
+    const u = c.edit(s.live, () => find(c.doc, 'image').setAttribute('__proto__', { src: { evil: 1 } } as never));
+    expectRefused(s, s.conn('attacker'), u, REFUSED('attr-kind'));
+    expect(s.guard.shadowOf(s.live)).toBeNull(); // refused in the pre-pass: the shadow step never ran
+  });
+});
+
 describe('#781 case 2: only XmlElement/XmlText content, so the store never wedges and no render throws', () => {
   const cases: Array<[string, (f: Y.XmlFragment) => void, string]> = [
     ['a plain value (ContentAny) in default', (f) => f.insert(0, [{ evil: 1 } as never]), 'child-kind'],
@@ -235,7 +294,7 @@ describe('#781 transition semantics', () => {
     const editor = new RemoteClient(s.live);
     const typing = editor.edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(5, ' typed'));
     expect(s.send(s.conn('editor'), typing)).toBe('applied');
-    expect(s.logs.some((l) => l.startsWith('collab_stored_content_invalid'))).toBe(true);
+    expect(s.logs.some((l) => l.startsWith('COLLAB_STORED_CONTENT_INVALID'))).toBe(true);
     expect(s.logs.join('\n')).not.toContain('inner'); // no content in the audit log
     const fresh = new RemoteClient(s.live).edit(s.live, (f) => (f.get(1) as Y.XmlElement).insert(0, [new Y.XmlElement('paragraph')]));
     expect(s.send(s.conn('editor'), fresh)).toBe(REFUSED('schema'));
@@ -251,6 +310,39 @@ describe('#781 transition semantics', () => {
       { type: 'paragraph', content: [{ type: 'text', text: 'after' }] },
     ],
   };
+  it.each([
+    ['a listItem whose first paragraph is invalid, followed by a nested list (y-tiptap then deletes the listItem too)', 'listItem'],
+    ['a details whose summary is invalid (y-tiptap then deletes the details too)', 'details'],
+  ])('legacy: %s — every browser\'s cascade of deletes is accepted on open', (_name, shape) => {
+    const legacyDoc = new Y.Doc();
+    legacyDoc.transact(() => {
+      const el = (name: string, ...children: Array<Y.XmlElement | Y.XmlText>) => {
+        const e = new Y.XmlElement(name);
+        e.insert(0, children);
+        return e;
+      };
+      const para = (text: string) => el('paragraph', new Y.XmlText(text));
+      // Invalid before the guard existed: a paragraph holding a block (y-tiptap deletes it), and a summary holding one.
+      const bad = shape === 'listItem' ? el('paragraph', para('inner')) : el('detailsSummary', para('inner'));
+      const block =
+        shape === 'listItem'
+          ? el('bulletList', el('listItem', bad, el('bulletList', el('listItem', para('nested')))), el('listItem', para('sibling')))
+          : el('details', bad, el('detailsContent', para('hidden')));
+      legacyDoc.getXmlFragment('default').insert(0, [block, para('victim text')]);
+    });
+    const s = setup({ legacy: Y.encodeStateAsUpdate(legacyDoc) });
+    // A browser opens the page: y-tiptap deletes what it cannot build, one transaction per element, each sent as a frame.
+    const browser = new Y.Doc();
+    Y.applyUpdate(browser, Y.encodeStateAsUpdate(s.live));
+    const sent: Uint8Array[] = [];
+    browser.on('update', (u: Uint8Array) => sent.push(u));
+    initProseMirrorDoc(browser.getXmlFragment('default'), schema);
+    expect(sent.length).toBeGreaterThanOrEqual(2); // the invalid element, then its parent: a cascade
+    const editor = s.conn('opener');
+    for (const u of sent) expect(s.send(editor, u)).toBe('applied');
+    expect(renderLikeABrowser(s.live).text).toContain('victim text');
+  });
+
   it('two concurrent deletes that empty a list are both accepted (an empty container loses nothing)', () => {
     const s = setup({ seed: LIST2 });
     const one = new RemoteClient(s.live);
@@ -331,6 +423,31 @@ describe('#781 B4: a client id is bound to its user (forged clocks)', () => {
     Y.applyUpdate(remount, Y.encodeStateAsUpdate(s.live));
     expect(s.send(s.conn('peer'), Y.encodeStateAsUpdate(remount), SYNC.Step2)).toBe('applied');
     expect(s.send(vc, victim.edit(s.live, () => textOf(find(victim.doc, 'paragraph')).insert(0, 'v2 ')))).toBe('applied');
+  });
+
+  it('a writer echoing a reader\'s awareness does not bind the reader\'s id: the reader, once promoted, edits under it', () => {
+    const s = setup({ seed: SEED });
+    // Hocuspocus's Document applies every awareness frame (a reader's too) to its awareness; stand in for its meta.
+    const meta = new Map<number, { clock: number }>();
+    (s.live as unknown as { awareness: unknown }).awareness = { meta };
+    const reader = new RemoteClient(s.live, 3003);
+    expect(s.deliver(s.conn('reader', true), awarenessFrame([{ clientID: 3003, clock: 4, state: { user: { name: 'R' } } }]))).toBe('applied');
+    meta.set(3003, { clock: 4 }); // what Hocuspocus then applies and relays
+    // Every writer's provider sends the relayed state back: the same clock, so not an announcement of its own.
+    expect(s.deliver(s.conn('writer'), awarenessFrame([{ clientID: 3003, clock: 4, state: { user: { name: 'R' } } }]))).toBe('applied');
+    expect(s.deliver(s.conn('writer'), awarenessFrame([{ clientID: 3003, clock: 3, state: { user: { name: 'R' } } }]))).toBe('applied');
+    // The reader is granted edit and re-authenticates with the same Y.Doc: its first edit is accepted and binds the id.
+    const promoted = s.conn('reader');
+    expect(s.send(promoted, reader.edit(s.live, () => textOf(find(reader.doc, 'paragraph')).insert(0, 'now a writer ')))).toBe('applied');
+    expectRefused(s, s.conn('writer'), forge(s, 3003, 'FORGED '), REFUSED('foreign-client'));
+  });
+
+  it('a writer announcing a state at a NEWER clock than the server holds still binds (its own id, or an unbound one)', () => {
+    const s = setup({ seed: SEED });
+    const meta = new Map<number, { clock: number }>([[1001, { clock: 1 }]]);
+    (s.live as unknown as { awareness: unknown }).awareness = { meta };
+    expect(s.deliver(s.conn('victim'), awarenessFrame([{ clientID: 1001, clock: 2, state: { user: { name: 'V' } } }]))).toBe('applied');
+    expectRefused(s, s.conn('attacker'), forge(s, 1001, 'FORGED '), REFUSED('foreign-client'));
   });
 
   it('the server\'s own client id is protected', () => {
@@ -459,7 +576,7 @@ describe('#781 deep values and deep trees (stack safety)', () => {
     const edit = () => new RemoteClient(new Y.Doc()).edit(new Y.Doc(), (f) => f.insert(0, [new Y.XmlElement('paragraph')]));
     expect(s.send(s.conn('a'), edit())).toBe(REFUSED('shadow-unavailable'));
     expect(s.send(s.conn('b'), edit())).toBe(REFUSED('shadow-unavailable'));
-    expect(s.logs.filter((l) => l.startsWith('collab_shadow_unavailable'))).toHaveLength(1);
+    expect(s.logs.filter((l) => l.startsWith('COLLAB_SHADOW_UNAVAILABLE'))).toHaveLength(1);
   });
 });
 
@@ -526,15 +643,29 @@ describe('#781 refusal mechanics', () => {
     expect(ws.close).toHaveBeenCalledWith(COLLAB_REFUSAL_CODE, REFUSED('unknown-mark'));
   });
 
+  it('a frame accepted but never applied leaves the shadow ahead of live: it is rebuilt before a later frame reuses those clocks', async () => {
+    const s = setup({ seed: SEED });
+    const c = s.conn('editor');
+    // Accepted by the guard, then never applied (e.g. #501's revalidator made the connection read-only in flight).
+    const first = new RemoteClient(s.live, 4242).edit(s.live, (f) => f.insert(0, [new Y.XmlElement('paragraph')]));
+    expect(s.deliver(c, syncFrame(first))).toBe('applied');
+    expect(Y.getState(s.live.store, 4242)).toBe(0);
+    await new Promise((r) => setImmediate(r));
+    // The same client id and clocks, now carrying a listItem at the root (y-tiptap deletes it on every peer).
+    const reuse = new RemoteClient(s.live, 4242).edit(s.live, (f) => f.insert(0, [new Y.XmlElement('listItem')]));
+    expect(renderLikeABrowser(unguarded(s.live, reuse)).deleted).toBe(true); // control
+    expectRefused(s, c, reuse, REFUSED('schema'));
+  });
+
   it('logs are rate-limited, structured, and never carry a value', () => {
     const s = setup({ seed: SEED });
     for (let i = 0; i < 100; i++) {
       s.send(s.conn('attacker'), new RemoteClient(s.live).edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).format(0, 2, { link: { href: { token: 'SECRET-TOKEN-781' } } })));
     }
-    const refused = s.logs.filter((l) => l.startsWith('collab_update_refused '));
+    const refused = s.logs.filter((l) => l.startsWith('COLLAB_UPDATE_REFUSED '));
     expect(refused.length).toBeGreaterThan(0);
     expect(refused.length).toBeLessThan(100);
-    expect(JSON.parse(refused[0].slice('collab_update_refused '.length))).toMatchObject({ rule: 'string-attr', userId: 'attacker', mark: 'link' });
+    expect(JSON.parse(refused[0].slice('COLLAB_UPDATE_REFUSED '.length))).toMatchObject({ rule: 'string-attr', userId: 'attacker', mark: 'link' });
     expect(s.logs.join('\n')).not.toContain('SECRET-TOKEN-781');
   });
 
@@ -553,7 +684,7 @@ describe('#781 refusal mechanics', () => {
     expect(s.deliver(conn, syncFrame(new Uint8Array([0xff, 0xff, 0xff, 0x01])))).toBe('applied'); // not applied to live here
     expect(s.send(conn, new RemoteClient(s.live).edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'ok ')))).toBe('applied');
     expect(s.guard.shadowOf(s.live)).not.toBeNull();
-    expect(s.logs.some((l) => l.startsWith('collab_shadow_unavailable'))).toBe(false);
+    expect(s.logs.some((l) => l.startsWith('COLLAB_SHADOW_UNAVAILABLE'))).toBe(false);
   });
 
   it('a mirror failure never stops the live document\'s update events, and the shadow rebuilds', () => {

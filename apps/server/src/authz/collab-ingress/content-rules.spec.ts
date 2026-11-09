@@ -10,6 +10,7 @@ import { ALL_NODES_DOC } from './collab-ingress.testkit';
 import {
   assertCollabSafeContent,
   checkFormat,
+  checkAttribute,
   checkValue,
   COLLAB_LIMITS,
   STRING_ATTRS,
@@ -76,6 +77,36 @@ describe('#781 STRING_ATTRS over HTTP JSON: a non-string URL/label is refused be
       const json = kind === 'mark' ? withMark(type, { [attr]: ok }) : withNode(type, { [attr]: ok });
       await expect(parse(json)).resolves.toBeDefined();
     }
+  });
+});
+
+describe('#781 review: table spans and __proto__ over HTTP JSON', () => {
+  it('a colspan past the HTML limit (or not an integer) is refused number-attr; an honest span and null are accepted', async () => {
+    for (const type of ['tableCell', 'tableHeader']) {
+      for (const bad of [1e9, 1001, -1, 1.5, '5']) {
+        const json = withNode(type, { colspan: bad });
+        expect(accepted(json)).not.toThrow(); // control: stored, and every viewer builds one column per unit
+        const r = await refusal(() => parse(json));
+        expect(r).toMatchObject({ status: 400, body: { code: 'content_not_allowed', rule: 'number-attr', node: type, attribute: 'colspan' } });
+      }
+      expect((await refusal(() => parse(withNode(type, { rowspan: 70_000 })))).body).toMatchObject({ rule: 'number-attr', attribute: 'rowspan' });
+      for (const ok of [1, 3, 1000, null]) await expect(parse(withNode(type, { colspan: ok, rowspan: ok }))).resolves.toBeDefined();
+    }
+  });
+
+  it('a root that is not a doc (a bare paragraph stores a root XmlText no browser opens) is refused on both paths', async () => {
+    for (const json of [p(t('x')), { type: 'blockquote', content: [p(t('x'))] }]) {
+      expect((await refusal(() => parse(json))).body).toMatchObject({ code: 'content_not_allowed', rule: 'schema' });
+      expect((await refusal(() => buildPrelimContent(json))).body).toMatchObject({ code: 'content_not_allowed', rule: 'schema' });
+    }
+    await expect(parse(doc(p(t('x'))))).resolves.toBeDefined();
+  });
+
+  it('a JSON attrs key "__proto__" (an own property after JSON.parse) is refused attr-kind', async () => {
+    const json = JSON.parse('{"type":"doc","content":[{"type":"image","attrs":{"src":"/x.png","__proto__":{"src":{"evil":1}}}}]}');
+    const r = await refusal(() => parse(json));
+    expect(r).toMatchObject({ status: 400, body: { code: 'content_not_allowed', rule: 'attr-kind' } });
+    expect(checkAttribute('image', '__proto__', ['x'])).toMatchObject({ rule: 'attr-kind', node: 'image' });
   });
 });
 

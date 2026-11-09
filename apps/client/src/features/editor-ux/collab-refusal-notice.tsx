@@ -7,8 +7,8 @@ import { useTranslation } from "react-i18next";
  * CCC fork addition (cccvu/wiki-v2#781) — shown once the server refused a collab frame from this editor
  * (`collab-access.ts`, `refused`). The provider is already detached and the editor read-only, so nothing more is sent.
  *
- *   - Reload (primary): a fresh Yjs clientID, keeping this browser's copy. Recovers a rolling-deploy skew or a
- *     clientID the server bound to someone else.
+ *   - Reload (primary): a fresh Yjs clientID, keeping this browser's copy. Recovers a rolling-deploy skew. Not a
+ *     clientID the server bound to someone else: the copy holds the refused edit under that ID and replays it.
  *   - Discard this browser's copy: after a confirm, clear the page's IndexedDB copy, then reload. For a copy the
  *     server refuses every time it is replayed. A failed clear does not reload (it would replay the same copy).
  *

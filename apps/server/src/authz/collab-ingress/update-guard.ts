@@ -72,7 +72,8 @@ export interface GuardConnection {
 /** The subset of Hocuspocus's `beforeHandleMessagePayload` the guard reads. */
 export interface GuardFrame {
   connection: GuardConnection;
-  document: Y.Doc & { name?: string };
+  /** Hocuspocus's Document: a Y.Doc with its page name and the awareness it has applied (`meta`: clientID → clock). */
+  document: Y.Doc & { name?: string; awareness?: { meta: Map<number, { clock: number }> } };
   update: Uint8Array;
   context?: { user?: { id?: string } };
 }
@@ -199,7 +200,9 @@ export class CollabUpdateGuard {
           // Client-id binding, on NEW clocks only: a remount honestly resends a peer's structs live already has.
           const owner = doc.bindings.get(client) ?? binds.get(client);
           if (owner === undefined) {
-            if (!tr.beforeState.has(client)) binds.set(client, userId); // the first struct of an id live never saw
+            // Only an id live never saw binds here. An id the stored document already holds (an earlier lifetime) binds
+            // by awareness only: bindings are not persisted, so a claim on it after a reload is undetectable (ADR 0036).
+            if (!tr.beforeState.has(client)) binds.set(client, userId);
           } else if (owner !== userId) {
             return result({ rule: 'foreign-client' });
           }
@@ -233,7 +236,7 @@ export class CollabUpdateGuard {
     }
     // Structs that wait for a missing dependency would integrate later, unchecked and blamed on whoever sends it.
     if (!covers(pendingBefore, pendingRanges(store))) return result({ rule: 'unresolved' });
-    for (const v of reportOnly) this.log('collab_legacy_pending_invalid', doc.live, { rule: v.rule });
+    for (const v of reportOnly) this.log('COLLAB_LEGACY_PENDING_INVALID', doc.live, { rule: v.rule });
     return result(null);
   }
 
@@ -287,7 +290,7 @@ export class CollabUpdateGuard {
       // A live document Yjs cannot encode (a legacy value too deep for lib0's encoder): fail closed, logged once.
       doc.unavailable = true;
       doc.shadow = null;
-      this.logger.warn(`collab_shadow_unavailable ${JSON.stringify({ pageId: pageIdOf(live) })}`);
+      this.logger.warn(`COLLAB_SHADOW_UNAVAILABLE ${JSON.stringify({ pageId: pageIdOf(live) })}`);
       return false;
     }
   }
@@ -297,10 +300,14 @@ export class CollabUpdateGuard {
     doc.audited = true;
     doc.legacyPending = pendingRanges(shadow.store);
     const rules: Record<string, number> = {};
-    const stack: Array<[Y.AbstractType<any>, number]> = [[shadow.getXmlFragment('default'), 0]];
+    const root = shadow.getXmlFragment('default');
+    /** Elements every browser's y-tiptap deletes on open (invalid, or emptied and then invalid). */
+    const gone = new Set<Y.AbstractType<any>>();
+    const stack: Array<[Y.AbstractType<any>, number]> = [[root, 0]];
     while (stack.length) {
       const [type, depth] = stack.pop()!;
       const check: ElementCheck = depth > COLLAB_LIMITS.elementDepth ? { ok: false, violation: { rule: 'element-depth' }, empty: false } : checkElement(type as Y.XmlElement);
+      if (!check.ok && type !== root) gone.add(type);
       if (!check.ok && !check.empty) {
         doc.legacyInvalid.add(idOf(type));
         rules[check.violation.rule] = (rules[check.violation.rule] ?? 0) + 1;
@@ -311,8 +318,26 @@ export class CollabUpdateGuard {
         }
       }
     }
+    // y-tiptap's cascade: deleting an invalid element can leave its parent invalid, and every browser then deletes the
+    // parent too, one transaction (one frame) per element. Each parent left invalid and non-empty is legacy as well, so
+    // the deletes of every browser that opens the page are accepted, never refused on every open.
+    const queue = [...gone];
+    while (queue.length) {
+      const parent = queue.pop()!._item?.parent as Y.AbstractType<any> | undefined;
+      if (!parent || gone.has(parent) || !isVisible(parent)) continue;
+      const check = checkElement(parent as Y.XmlElement, gone);
+      if (check.ok) continue;
+      if (!check.empty) {
+        doc.legacyInvalid.add(idOf(parent));
+        rules[`cascade:${check.violation!.rule}`] = (rules[`cascade:${check.violation!.rule}`] ?? 0) + 1;
+      }
+      if (parent !== root) {
+        gone.add(parent);
+        queue.push(parent);
+      }
+    }
     if (doc.legacyInvalid.size) {
-      this.logger.warn(`collab_stored_content_invalid ${JSON.stringify({ pageId: pageIdOf(doc.live), elements: doc.legacyInvalid.size, rules })}`);
+      this.logger.warn(`COLLAB_STORED_CONTENT_INVALID ${JSON.stringify({ pageId: pageIdOf(doc.live), elements: doc.legacyInvalid.size, rules })}`);
     }
   }
 
@@ -335,9 +360,14 @@ export class CollabUpdateGuard {
       const n = decoding.readVarUint(d);
       for (let i = 0; i < n; i++) {
         const clientID = decoding.readVarUint(d);
-        decoding.readVarUint(d); // clock
+        const clock = decoding.readVarUint(d);
         const state = JSON.parse(decoding.readVarString(d));
         if (state === null || doc.bindings.has(clientID)) continue;
+        // An echo: every provider sends the peer states it receives back to the server. The server already holds this
+        // client's state at this clock (it relayed it), so the echo says nothing about who owns the id: a writer's echo
+        // of a READER's state would otherwise bind the reader's id to the writer, refusing the reader once promoted.
+        const held = frame.document.awareness?.meta.get(clientID)?.clock;
+        if (held !== undefined && held >= clock) continue;
         const used = doc.awarenessBinds.get(frame.connection) ?? 0;
         if (used >= AWARENESS_BINDS_PER_CONNECTION) return;
         doc.bindings.set(clientID, userId);
@@ -351,7 +381,7 @@ export class CollabUpdateGuard {
   /** Logs the refusal; in enforce mode also closes the session (throws) and counts against the socket's budget. */
   private refuse(frame: GuardFrame, header: Header, violation: Violation): void {
     const reason = reasonFor(violation.rule);
-    this.log('collab_update_refused', frame.document, {
+    this.log('COLLAB_UPDATE_REFUSED', frame.document, {
       rule: violation.rule,
       ...(violation.node ? { node: violation.node } : {}),
       ...(violation.mark ? { mark: violation.mark } : {}),
@@ -384,7 +414,7 @@ export class CollabUpdateGuard {
     const now = Date.now();
     const w = this.logWindow;
     if (now - w.start >= 60_000) {
-      if (w.suppressed) this.logger.warn(`collab_update_refused_suppressed ${JSON.stringify({ count: w.suppressed })}`);
+      if (w.suppressed) this.logger.warn(`COLLAB_GUARD_LOG_SUPPRESSED ${JSON.stringify({ count: w.suppressed })}`);
       this.logWindow = { start: now, count: 0, suppressed: 0 };
     }
     if (this.logWindow.count++ < LOGS_PER_MINUTE) this.logger.warn(`${token} ${JSON.stringify({ ...fields, pageId: pageIdOf(live) })}`);
@@ -471,7 +501,7 @@ function checkStruct(item: Y.Item, root: Y.AbstractType<any> | undefined, touche
   const content = item.content;
   if (item.parentSub !== null) {
     if (parentKind !== 'element' || !(content instanceof Y.ContentAny)) return { rule: content instanceof Y.ContentType ? 'content-kind' : 'attr-kind' };
-    const v = checkAttribute((parent as Y.XmlElement).nodeName, item.parentSub, content.arr);
+    const v = checkAttribute((parent as Y.XmlElement).nodeName, item.parentSub, content.arr, { yjs: true });
     if (v) return v;
     touched.add(parent);
     return null;

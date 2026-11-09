@@ -262,13 +262,16 @@ describe('#781 races through a real Hocuspocus 3.4.4', () => {
 });
 
 describe('#781 B4 through Hocuspocus: client ids bind to users', () => {
-  it('a victim bound by awareness: a forged struct at its next clock is foreign-client; a reader cannot pre-claim it', async () => {
+  it('a victim bound by awareness: a forged struct at its next clock is foreign-client; a reader or an echo cannot pre-claim it', async () => {
     const s = await server();
     const reader = await s.connect('reader');
     const victim = await s.connect('victim');
     const attacker = await s.connect('attacker');
-    reader.deliver(awarenessFrame([{ clientID: 1001, state: { user: {} } }])); // a reader never binds
-    victim.deliver(awarenessFrame([{ clientID: 1001, state: { user: { name: 'V' } } }]));
+    reader.deliver(awarenessFrame([{ clientID: 1001, clock: 1, state: { user: {} } }])); // a reader never binds
+    await settle();
+    // A writer's provider echoes the state Hocuspocus relayed (the clock its Document's awareness already holds): no bind.
+    attacker.deliver(awarenessFrame([{ clientID: 1001, clock: 1, state: { user: {} } }]));
+    victim.deliver(awarenessFrame([{ clientID: 1001, clock: 2, state: { user: { name: 'V' } } }]));
     await settle();
     const live = s.live();
     const mine = new RemoteClient(live, 1001);
