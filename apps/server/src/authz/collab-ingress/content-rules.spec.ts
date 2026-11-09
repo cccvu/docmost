@@ -2,6 +2,10 @@
 jest.mock('../../collaboration/collaboration.gateway', () => ({ CollaborationGateway: class {} }));
 
 import { HttpException } from '@nestjs/common';
+import * as Y from 'yjs';
+import { prosemirrorJSONToYDoc } from '@tiptap/y-tiptap';
+import { EditorState } from '@tiptap/pm/state';
+import { fixTables, TableMap } from '@tiptap/pm/tables';
 import { htmlToJson, jsonToNode } from '../../collaboration/collaboration.util';
 import { PageService } from '../../core/page/services/page.service';
 import { Node as PMNode } from '@tiptap/pm/model';
@@ -12,6 +16,7 @@ import {
   checkFormat,
   checkAttribute,
   checkValue,
+  checkYTable,
   COLLAB_LIMITS,
   STRING_ATTRS,
 } from './content-rules';
@@ -105,11 +110,12 @@ describe('#781 review: table spans and __proto__ over HTTP JSON', () => {
   const cell = (colspan: unknown, rowspan: unknown = 1) => ({ type: 'tableCell', attrs: { colspan, rowspan }, content: [p(t('x'))] });
   const table = (...rows: unknown[][]) => doc({ type: 'table', content: rows.map((cells) => ({ type: 'tableRow', content: cells })) });
 
-  it('a table wider than 1000 columns or past 1M columns × rows is refused table-size, though each cell span is in range', async () => {
+  it('a table wider than 1000 columns, over 2500 rows or past 50,000 columns × rows is refused table-size, though each cell span is in range', async () => {
     const cases: Array<[string, unknown]> = [
       ['two cells of colspan 600 in one row', table([cell(600), cell(600)])],
       ['a rowspan carrying 600 columns into a row with another 600', table([cell(600, 2)], [cell(600)])],
-      ['1001 rows of a 1000-column cell', table(...Array.from({ length: 1001 }, () => [cell(1000)]))],
+      ['51 rows under a 1000-column cell (fixTables would pad them to 51,000 cells)', table([cell(1000)], ...Array.from({ length: 50 }, () => [cell(1)]))],
+      ['2501 one-cell rows (findWidth is quadratic in rows once a cell spans rows)', table([cell(1, 2)], ...Array.from({ length: 2500 }, () => [cell(1)]))],
     ];
     for (const [name, json] of cases) {
       expect(accepted(json)).not.toThrow(); // control: stored, and prosemirror-tables builds a width × rows map
@@ -118,7 +124,52 @@ describe('#781 review: table spans and __proto__ over HTTP JSON', () => {
       expect((await refusal(() => buildPrelimContent(json))).body).toMatchObject({ rule: 'table-size' });
     }
     await expect(parse(table([cell(500), cell(500)], [cell(1, 3), cell(999)]))).resolves.toBeDefined();
-    await expect(parse(table(...Array.from({ length: 1000 }, () => [cell(1000)])))).resolves.toBeDefined(); // exactly 1M
+    // A rowspan stops counting once its rows end: 1000 columns wide, not 1600.
+    await expect(parse(table([cell(600, 2)], [cell(400)], [cell(1000)]))).resolves.toBeDefined();
+    // A long honest table with many vertical merges.
+    const merged = Array.from({ length: 400 }, (_, i) => (i % 2 === 0 ? [cell(1, 2), cell(10)] : [cell(10)]));
+    await expect(parse(table(...merged))).resolves.toBeDefined();
+    await expect(parse(table([cell(1000)], ...Array.from({ length: 49 }, () => [cell(1)])))).resolves.toBeDefined(); // exactly 50,000
+    await expect(parse(table(...Array.from({ length: 2500 }, () => [cell(1), cell(1)])))).resolves.toBeDefined(); // 2500 rows
+  });
+
+  it('oracle: on the largest accepted shapes, every editor\'s fixTables pads at most 50,000 cells, in milliseconds', async () => {
+    const shapes = [table([cell(1000)], ...Array.from({ length: 49 }, () => [cell(1)])), table([cell(1, 2)], ...Array.from({ length: 2499 }, () => [cell(19)]))];
+    for (const json of shapes) {
+      const node = await parse(json).then(() => jsonToNode(json as never));
+      const state = EditorState.create({ doc: node });
+      const started = Date.now();
+      const tr = fixTables(state);
+      const after = tr ? tr.doc : node;
+      let cells = 0;
+      after.descendants((n) => {
+        if (n.type.name === 'tableCell' || n.type.name === 'tableHeader') cells++;
+        return true;
+      });
+      after.descendants((n) => {
+        if (n.type.name === 'table') expect(TableMap.get(n).width * TableMap.get(n).height).toBeLessThanOrEqual(COLLAB_LIMITS.tableCells);
+        return n.type.name !== 'table';
+      });
+      expect(cells).toBeLessThanOrEqual(COLLAB_LIMITS.tableCells);
+      expect(Date.now() - started).toBeLessThan(2000);
+    }
+  });
+
+  it('the HTTP extent equals the extent of what is stored: a null span is the default 1, never 0', async () => {
+    const stored = (json: unknown) => checkYTable(prosemirrorJSONToYDoc(serverSchema(), json, 'default').getXmlFragment('default').get(0) as Y.XmlElement);
+    const nullRow = (n: number) => table(Array.from({ length: n }, () => cell(null, null)));
+    const cases: unknown[] = [nullRow(1500), nullRow(1000), table([cell(null), cell(600)], [cell(500, null)]), table([cell(999), cell(null)])];
+    for (const json of cases) {
+      let httpRefused = false;
+      try {
+        await parse(json);
+      } catch (err) {
+        httpRefused = ((err as HttpException).getResponse() as Record<string, unknown>).rule === 'table-size';
+      }
+      const storedVerdict = stored(json)?.rule === 'table-size';
+      expect({ json: JSON.stringify(json).slice(0, 80), httpRefused }).toEqual({ json: JSON.stringify(json).slice(0, 80), httpRefused: storedVerdict });
+    }
+    expect((await refusal(() => parse(nullRow(1500)))).body).toMatchObject({ rule: 'table-size' }); // 1500 columns once stored
   });
 
   it('HTML spans parse as a browser reads them (clamped integers), so an honest paste stays accepted; a too-wide table does not', async () => {

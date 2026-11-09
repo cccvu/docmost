@@ -29,10 +29,19 @@ import { serverSchema } from '../page-write/prelim-content';
 /**
  * Value depth 16 and 10k entries (the editor's deepest honest value is depth 2, a mark's attrs holding an array), and
  * element depth 128 (lists nest a few levels; the recursive walkers break between ~1k and ~7k levels). A table at most
- * 1000 columns wide (HTML's own colspan limit) and 1M columns × rows: prosemirror-tables builds a width × rows map and
- * the table view one `<col>` per column, so 1000 cells of colspan 1000 would hang every viewer.
+ * 1000 columns wide (HTML's own colspan limit), 2500 rows, and 50,000 columns × rows: prosemirror-tables builds a
+ * width × rows map, its `fixTables` (every editor's table plugin) pads every short row to the full width, its
+ * `findWidth` is quadratic in rows once a cell spans rows, and the table view builds one `<col>` per column. Each
+ * bound is well above an honest wiki table and keeps those costs to milliseconds per change.
  */
-export const COLLAB_LIMITS = Object.freeze({ valueDepth: 16, valueEntries: 10_000, elementDepth: 128, tableWidth: 1000, tableCells: 1_000_000 });
+export const COLLAB_LIMITS = Object.freeze({
+  valueDepth: 16,
+  valueEntries: 10_000,
+  elementDepth: 128,
+  tableWidth: 1000,
+  tableRows: 2500,
+  tableCells: 50_000,
+});
 
 /**
  * Attributes a renderer reads as a string (`.startsWith`, `.trim`, `.toLowerCase`, a URL sanitizer, a React child):
@@ -398,10 +407,14 @@ export function assertCollabSafeContent(json: unknown, opts: { strict?: boolean 
   return node;
 }
 
-/** A span value as prosemirror-tables reads it (`j < colspan`): a number-like value, else the default 1. */
+/**
+ * A span as the stored table will hold it, for the extent bound: a number-like value of at least 1, else 1. A null or
+ * absent span is the default 1 (`toYdoc` and y-tiptap drop a null attribute, so it renders as 1); a span below 1 (a
+ * legacy 0) is counted as 1 too, which can only over-count, never let a wider table through.
+ */
 const spanOf = (v: unknown): number => {
-  const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : v === null ? 0 : NaN;
-  return Number.isFinite(n) && n >= 0 ? n : 1;
+  const n = typeof v === 'number' ? v : typeof v === 'string' ? Number(v) : NaN;
+  return Number.isFinite(n) && n >= 1 ? n : 1;
 };
 
 /**
@@ -409,6 +422,7 @@ const spanOf = (v: unknown): number => {
  * earlier row's rowspan) and its height, in one pass; refused past COLLAB_LIMITS. `rows` holds each row's cells' spans.
  */
 export function checkTableExtent(rows: ReadonlyArray<ReadonlyArray<{ colspan: unknown; rowspan: unknown }>>): Violation | null {
+  if (rows.length > COLLAB_LIMITS.tableRows) return { rule: 'table-size', node: 'table' };
   let width = 0;
   let carried = 0;
   const expires = new Map<number, number>();
