@@ -39,6 +39,8 @@ import {
   SYNC_REFILL_MS,
   TRY_LATER_REASON,
   USER_DOC_BUDGETS_MAX,
+  USER_SYNC_BURST,
+  USER_SYNC_REFILL_MS,
   UNRESOLVED_REASON,
   type CollabGuardMode,
 } from './update-guard';
@@ -943,14 +945,38 @@ describe('#790 frame bounds: the sync budget, per (user, document), across conne
     }
   });
 
-  it('the budget is per document too', () => {
-    const { s } = clocked();
-    for (let i = 0; i < SYNC_BURST; i++) s.deliver(s.conn('writer'), step1Frame(s.live));
-    expect(s.deliver(s.conn('writer'), step1Frame(s.live))).toBe(TRY_LATER);
-    const other = new Y.Doc() as Y.Doc & { name: string };
-    other.name = 'page.00000000-0000-4000-8000-000000000002';
-    const c = s.conn('writer');
-    expect(() => s.guard.check({ connection: c, document: other, update: step1Frame(other), context: c.context })).not.toThrow();
+  /** A Step1 for another page, through the same guard: 'applied' or TRY_LATER. */
+  const onPage = (s: ReturnType<typeof setup>, user: string, n: number) => {
+    const doc = new Y.Doc() as Y.Doc & { name: string };
+    doc.name = `page.00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+    const c = s.conn(user);
+    try {
+      s.guard.check({ connection: c, document: doc, update: step1Frame(doc), context: c.context });
+      return 'applied';
+    } catch (err: any) {
+      expect(err).toEqual({ code: COLLAB_TRY_LATER_CODE, reason: TRY_LATER_REASON });
+      return TRY_LATER;
+    }
+  };
+
+  it(`a new page buys no new burst: ${USER_SYNC_BURST} Step1s per user across all pages, then one per ${USER_SYNC_REFILL_MS} ms`, () => {
+    const { s, advance } = clocked();
+    for (let n = 1; n <= USER_SYNC_BURST; n++) expect(onPage(s, 'reader', n)).toBe('applied'); // one Step1 on each of 64 pages
+    expect(onPage(s, 'reader', 1000)).toBe(TRY_LATER); // a fresh page, but the user's budget is spent
+    expect(onPage(s, 'someone-else', 1000)).toBe('applied');
+    advance(USER_SYNC_REFILL_MS);
+    expect(onPage(s, 'reader', 1001)).toBe('applied');
+    expect(onPage(s, 'reader', 1002)).toBe(TRY_LATER);
+  });
+
+  it('the per-page budget still binds within the user budget: one page cannot spend more than its own burst', () => {
+    const { s, advance } = clocked();
+    for (let i = 0; i < SYNC_BURST; i++) expect(s.deliver(s.conn('writer'), step1Frame(s.live))).toBe('applied');
+    advance(10 * USER_SYNC_REFILL_MS); // the user budget refills 10, the page budget 2
+    expect(s.deliver(s.conn('writer'), step1Frame(s.live))).toBe('applied');
+    expect(s.deliver(s.conn('writer'), step1Frame(s.live))).toBe('applied');
+    expect(s.deliver(s.conn('writer'), step1Frame(s.live))).toBe(TRY_LATER); // the page is spent, the user is not
+    expect(onPage(s, 'writer', 7)).toBe('applied'); // so another page still opens
   });
 
   it(`refills one per ${SYNC_REFILL_MS} ms, never above the burst`, () => {

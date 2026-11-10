@@ -153,6 +153,7 @@ export default function PageEditor({
   const collabAccessRef = useRef<CollabAccessState>(initialCollabAccess);
 
   useEffect(() => {
+    let lostRetry: ReturnType<typeof setTimeout> | undefined; // CCC (#790): a lost editor's next try
     if (!providersRef.current) {
       const documentName = `page.${pageId}`;
       const ydoc = new Y.Doc();
@@ -202,7 +203,14 @@ export default function PageEditor({
         // CCC (#501, #537): reopen on the socket's own `disconnect`, never on a timer (collab-reconnect.ts).
         if (step.reconnect) reopenCollabSocket(socket, isCurrent);
         if (step.detach) remote.detach(); // CCC (#781): a refused provider stops sending (see attach() below)
-        if (step.disconnectSocket) socket.disconnect(); // CCC (#790): and its now-empty socket closes, for good
+        if (step.disconnectSocket) socket.disconnect(); // CCC (#790): a refused or lost editor's socket closes
+        if (step.retryAfterMs) {
+          // CCC (#790): a lost editor tries again later, not at the provider's pace (collab-access.ts)
+          clearTimeout(lostRetry);
+          lostRetry = setTimeout(() => {
+            if (isCurrent() && collabAccessRef.current.lost) socket.connect();
+          }, step.retryAfterMs);
+        }
         if (step.refreshToken) {
           void refetchCollabTokenAndReopen({
             refetch: refetchCollabToken,
@@ -260,6 +268,7 @@ export default function PageEditor({
     }
     // Only destroy on final unmount
     return () => {
+      clearTimeout(lostRetry); // CCC (#790)
       providersRef.current?.socket.destroy();
       providersRef.current?.remote.destroy();
       providersRef.current?.local.destroy();

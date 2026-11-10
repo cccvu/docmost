@@ -6,7 +6,8 @@ import * as Y from 'yjs';
 import { Hocuspocus } from '@hocuspocus/server';
 import { CollabWsAdapter } from '../../collaboration/adapter/collab-ws.adapter';
 import { PAGE_MAX_YDOC_BYTES, PAGE_MAX_YDOC_BYTES_CEILING } from '../page-write/page-size';
-import { COLLAB_HOCUSPOCUS_OPTIONS, COLLAB_MAX_PAYLOAD_BYTES, COLLAB_WS_SERVER_OPTIONS } from './limits';
+import { COLLAB_HOCUSPOCUS_OPTIONS, COLLAB_MAX_PAYLOAD_BYTES, COLLAB_PREAUTH_BYTES, COLLAB_WS_SERVER_OPTIONS } from './limits';
+import { collabPreAuthSlots } from './preauth-slots';
 
 /**
  * #790: the inbound bounds are effective where they are wired. The ws limits through the REAL collab ws adapter
@@ -40,6 +41,9 @@ describe('#790 ws limits through the collab ws adapter', () => {
     adapter = new CollabWsAdapter();
     wss = adapter.handleUpgrade('/collab', http);
     wss.on('connection', (ws) => {
+      // As if it had authenticated: maxPayload is the bound on an authenticated socket (before that, the pre-auth byte
+      // count terminates it far sooner: preauth-slots.spec.ts).
+      collabPreAuthSlots.release(ws);
       ws.on('message', (data: Buffer) => received.push(data.byteLength));
       ws.on('error', () => undefined); // collaboration.module.ts logs a client error; ws closes the socket itself
     });
@@ -139,13 +143,14 @@ describe('#790 Hocuspocus options (a real Hocuspocus 4.7.1 with the gateway cons
   }
 
   it('pins the values', () => {
-    expect(COLLAB_HOCUSPOCUS_OPTIONS).toEqual({ maxPendingDocuments: 4, maxUnauthenticatedQueueSize: 8 * MiB });
+    expect(COLLAB_HOCUSPOCUS_OPTIONS).toEqual({ maxPendingDocuments: 1, maxUnauthenticatedQueueSize: COLLAB_PREAUTH_BYTES });
+    expect(COLLAB_PREAUTH_BYTES).toBe(256 * 1024);
   });
 
-  it('one maximum honest frame fits in the pre-auth queue; a byte more terminates the socket', () => {
+  it('an honest pre-auth send (a SyncStep1 and an awareness state) fits in the pre-auth queue; past the bound terminates', () => {
     const hp = new Hocuspocus({ ...COLLAB_HOCUSPOCUS_OPTIONS });
     const c = connect(hp);
-    c.deliver(frameOf(COLLAB_MAX_PAYLOAD_BYTES - 64));
+    c.deliver(frameOf(COLLAB_PREAUTH_BYTES - 64));
     c.deliver(frameOf(64));
     expect(c.socket.closed).toBeNull();
     c.deliver(frameOf(64));
@@ -153,21 +158,22 @@ describe('#790 Hocuspocus options (a real Hocuspocus 4.7.1 with the gateway cons
     c.close();
   });
 
-  it('anti-vacuity: under the upstream default (5 MiB) that honest frame would terminate', () => {
+  it('anti-vacuity: under the upstream default (5 MiB) a 1 MiB pre-auth backlog would be held', () => {
     const hp = new Hocuspocus({});
     const c = connect(hp);
-    c.deliver(frameOf(COLLAB_MAX_PAYLOAD_BYTES - 64));
-    expect(c.socket.closed).toBe(RESET_CONNECTION);
+    c.deliver(frameOf(MiB));
+    expect(c.socket.closed).toBeNull();
     c.close();
   });
 
-  it('four pending documents are held; a fifth terminates the socket', () => {
+  it('one pending document is held; a second terminates the socket (Docmost opens one document per socket)', () => {
     const hp = new Hocuspocus({ ...COLLAB_HOCUSPOCUS_OPTIONS });
     const c = connect(hp);
     const page = (n: number) => `page.0f8fad5b-d9cb-469f-a165-7086772895${String(n).padStart(2, '0')}`;
-    for (let n = 0; n < 4; n++) c.deliver(frameOf(64, page(n)));
+    c.deliver(frameOf(64, page(0)));
+    c.deliver(frameOf(64, page(0)));
     expect(c.socket.closed).toBeNull();
-    c.deliver(frameOf(64, page(4)));
+    c.deliver(frameOf(64, page(1)));
     expect(c.socket.closed).toBe(RESET_CONNECTION);
     c.close();
   });

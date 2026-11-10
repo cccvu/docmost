@@ -25,28 +25,45 @@ export const COLLAB_WS_SERVER_OPTIONS: ServerOptions & { maxFragments: number; m
 };
 
 /**
- * Unauthenticated collab sockets per process (preauth-slots.ts): past it the upgrade is refused 503. Each holds at most
- * the pre-auth queue (8 MiB) plus one partial frame (8 MiB, `maxPayload`), so all of them together hold at most
- * 16 x 16 MiB = 256 MiB of native memory. The task is 4096 MiB and its V8 and Go heap caps sum to 3072 MiB (docmost
- * 1024, its conversion worker 1024, platform 512, SpiceDB 512; ecs.tf, check-infra-config §27), so everything outside
- * a heap (Buffers, ws, stacks, code) shares the remaining 1024 MiB; this bound takes at most a quarter of it. An honest
- * socket is unauthenticated for one token verify and its reads (well under a second), so 16 serve tens of opens a second;
- * a burst past that (every tab reconnecting after a deploy) is refused and retried by the provider's backoff.
+ * Bytes one socket may send before it is authenticated (preauth-slots.ts, counted on its TCP socket, so a partial frame
+ * ws is still assembling counts too); past it the socket is terminated. An honest provider sends only its Auth frame,
+ * its SyncStep1 (a state vector: a few bytes per client id the document has seen), its awareness state (at most 8 KiB)
+ * and any keystrokes made while the token verifies before it is authenticated; offline content is exchanged after (its
+ * Step2 answers the server's Step1). A socket cut off here reconnects, and the content syncs then.
  */
-export const COLLAB_PREAUTH_SOCKETS = 16;
+export const COLLAB_PREAUTH_BYTES = 256 * 1024;
+/**
+ * Unauthenticated collab sockets per process (preauth-slots.ts): past it the upgrade is refused 503. Each holds at most
+ * COLLAB_PREAUTH_BYTES of received bytes (its pre-auth queue and any partial frame are both made of them) plus its
+ * objects (ws, Hocuspocus, timers: budgeted at 64 KiB), so all of them together hold at most 512 x 320 KiB = 160 MiB of
+ * native memory. The task is 4096 MiB and its V8 and Go heap caps sum to 3072 MiB (docmost 1024, its conversion worker
+ * 1024, platform 512, SpiceDB 512; ecs.tf, check-infra-config §27), so everything outside a heap (Buffers, ws, stacks,
+ * code) shares the remaining 1024 MiB; this bound takes under a sixth of it.
+ *
+ * The pool is sized so that no one source can hold it: the edge allows each client address 2000 requests per 5 minutes
+ * (the WAF's rate rules, on both the proxied and the direct path), so with COLLAB_PREAUTH_DEADLINE_MS one source holds
+ * at most about 2000 / 300 s x 10 s = 67 unauthenticated sockets at a time, under a seventh of the pool. A socket whose
+ * authentication is refused is closed at once (bounded-socket.ts), so it holds its slot for one round trip, and an
+ * honest socket for one token verify and its reads.
+ */
+export const COLLAB_PREAUTH_SOCKETS = 512;
 /** A socket not authenticated this long after it opened is terminated (preauth-slots.ts). 4.7.1's own is 60–120 s. */
-export const COLLAB_PREAUTH_DEADLINE_MS = 15_000;
+export const COLLAB_PREAUTH_DEADLINE_MS = 10_000;
+/** After an authentication is refused the socket is closed; one that has not finished closing by then is terminated. */
+export const COLLAB_PREAUTH_CLOSE_GRACE_MS = 2_000;
 
 /** Hocuspocus 4.7.1 options; the rest stay at upstream defaults (1000 queued messages, 60 s `timeout`). */
 export const COLLAB_HOCUSPOCUS_OPTIONS = {
-  maxPendingDocuments: 4, // Docmost opens one document per socket; the default is 100 concurrent onAuthenticate runs
-  maxUnauthenticatedQueueSize: COLLAB_MAX_PAYLOAD_BYTES, // one maximum honest offline frame fits before auth
+  maxPendingDocuments: 1, // Docmost opens one document per socket (page-editor.tsx); the default is 100
+  maxUnauthenticatedQueueSize: COLLAB_PREAUTH_BYTES, // never more than the socket may send before it is authenticated
 } as const;
 
 /**
  * Distinct document names one socket may ever address (frame-address.ts), checked before RedisSync keys a name in Redis
  * and before Hocuspocus's own `maxPendingDocuments`. Docmost opens one document per socket (page-editor.tsx makes a
- * websocket per page editor); this is that limit's value, so an honest socket never meets either.
+ * websocket per page editor); this is that limit's value, so an honest socket never meets either. One, not more: once a
+ * socket has authenticated, Hocuspocus 4.7.1 applies no deadline to a second document it never authenticates, so its
+ * pre-auth queue (and the socket) would stay for good.
  */
 export const COLLAB_DOCUMENTS_PER_SOCKET = COLLAB_HOCUSPOCUS_OPTIONS.maxPendingDocuments;
 

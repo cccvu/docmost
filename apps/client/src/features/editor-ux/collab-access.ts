@@ -15,7 +15,8 @@ import { jwtDecode } from "jwt-decode";
  *     one is live, e.g. the user signed in again); a second refusal with no successful authentication in
  *     between, or a refetch that fails, means access is lost: stop editing and show the connection-lost
  *     status. An expired token refetches every time, as upstream did; a refetch that fails is lost there too
- *     (upstream left that editor editable with nothing syncing);
+ *     (upstream left that editor editable with nothing syncing). #790: a lost editor also closes its socket and
+ *     opens it again after COLLAB_LOST_RETRY_MS, or when the tab becomes visible again, never at the provider's pace;
  *   - a successful authentication → the server's scope decides whether the editor may edit;
  *   - #781: the server's collab ingress guard refuses a frame it will not apply with that same per-document CLOSE,
  *     and the provider reports it as code 1000, so the REASON is the only signal:
@@ -98,9 +99,19 @@ export interface CollabAccessStep {
   markDisconnected: boolean;
   /** #781: detach the provider so it stops sending (and keep it detached). */
   detach: boolean;
-  /** #790: close the editor's socket after the detach, and never reopen it (nothing is attached to it any more). */
+  /** #790: close the editor's socket (after a refusal, for good; after a loss, until `retryAfterMs`). */
   disconnectSocket: boolean;
+  /** #790: lost: try the socket again after this many ms (0: no timer). */
+  retryAfterMs: number;
 }
+
+/**
+ * #790: how long a lost editor waits before it opens its socket again (the tab becoming visible again also reopens it,
+ * page-editor.tsx). The server closes a socket right after refusing its authentication and counts every unauthenticated
+ * socket against a process-wide pool, so a lost editor that kept reconnecting at the provider's pace (about once a
+ * second) would hold a slot of that pool for as long as the tab stayed open.
+ */
+export const COLLAB_LOST_RETRY_MS = 60_000;
 
 const NO_ACTION = {
   reconnect: false,
@@ -108,6 +119,7 @@ const NO_ACTION = {
   markDisconnected: false,
   detach: false,
   disconnectSocket: false,
+  retryAfterMs: 0,
 } as const;
 
 export function nextCollabAccess(
@@ -163,11 +175,14 @@ export function nextCollabAccess(
   }
 }
 
+/** Access lost: show the connection-lost status, close the socket, and try again in COLLAB_LOST_RETRY_MS (#790). */
 function lostStep(prev: CollabAccessState): CollabAccessStep {
   return {
     ...NO_ACTION,
     state: { ...prev, lost: true },
     markDisconnected: true,
+    disconnectSocket: true,
+    retryAfterMs: COLLAB_LOST_RETRY_MS,
   };
 }
 

@@ -16,9 +16,12 @@
  * `readyState` is the raw socket's once it is closing, so Hocuspocus stops sending to a socket the client closed
  * (the backported WsSocketWrapper keeps its own, which only its own `close()` moves).
  *
- * It also holds the socket's pre-auth slot (preauth-slots.ts) from construction (the connection, on both gateway paths)
- * until the first `Authenticated` reply it sends: the one place that sees the replies of documents this node owns and
- * of documents RedisSync proxies to another node.
+ * It also ends the socket's pre-auth slot (preauth-slots.ts, taken at the upgrade): the first `Authenticated` reply it
+ * sends frees the slot, and a `PermissionDenied` reply sent while the socket holds one closes the socket (4401,
+ * `permission-denied`, after the reply, so the editor still reads it and runs its token refetch), which then keeps the
+ * slot only until it has closed. This is the one place that sees the replies of documents this node owns and of
+ * documents RedisSync proxies to another node. Without the close, Hocuspocus 4.7.1 leaves a refused socket open and
+ * the provider reconnecting it keeps a slot for as long as the editor stays open.
  */
 import * as decoding from 'lib0/decoding';
 import type { WebSocketLike } from '@hocuspocus/server';
@@ -27,16 +30,21 @@ import { collabPreAuthSlots, type CollabPreAuthSlots, type PreAuthSocket } from 
 import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
 
 const AUTH = 2; // Hocuspocus MessageType.Auth
+const PERMISSION_DENIED = 1; // @hocuspocus/common AuthMessageType.PermissionDenied
 const AUTHENTICATED = 2; // @hocuspocus/common AuthMessageType.Authenticated
+/** The socket close after a refused authentication (the 4401 Hocuspocus's own Unauthorized close uses). */
+export const COLLAB_DENIED_CLOSE_CODE = 4401;
 
-/** True when `frame` is a Hocuspocus `Authenticated` reply: [documentName][Auth][Authenticated][scope]. Never throws. */
-export function isAuthenticatedReply(frame: Uint8Array): boolean {
+/** A Hocuspocus Auth reply, [documentName][Auth][Authenticated | PermissionDenied]…: which one, or null. Never throws. */
+export function authReplyOf(frame: Uint8Array): 'authenticated' | 'denied' | null {
   try {
     const d = decoding.createDecoder(frame);
     decoding.readVarString(d);
-    return decoding.readVarUint(d) === AUTH && decoding.readVarUint(d) === AUTHENTICATED;
+    if (decoding.readVarUint(d) !== AUTH) return null;
+    const subtype = decoding.readVarUint(d);
+    return subtype === AUTHENTICATED ? 'authenticated' : subtype === PERMISSION_DENIED ? 'denied' : null;
   } catch {
-    return false;
+    return null;
   }
 }
 
@@ -57,9 +65,7 @@ export class BoundedCollabSocket implements WebSocketLike {
     private readonly inner: WebSocketLike,
     private readonly limitLog: SocketLimitLog = collabSocketLimitLog,
     private readonly preAuth: CollabPreAuthSlots = collabPreAuthSlots,
-  ) {
-    preAuth.hold(raw);
-  }
+  ) {}
 
   /** The ws socket underneath (socket-documents.ts keys a socket's document connections by it). */
   get rawSocket(): RawCollabSocket {
@@ -81,8 +87,13 @@ export class BoundedCollabSocket implements WebSocketLike {
       return;
     }
     this.largestSent = largest;
-    if (this.preAuth.holds(this.raw) && isAuthenticatedReply(message)) this.preAuth.release(this.raw);
+    const reply = this.preAuth.holds(this.raw) ? authReplyOf(message) : null;
+    if (reply === 'authenticated') this.preAuth.release(this.raw);
     this.inner.send(message);
+    if (reply === 'denied') {
+      this.preAuth.closing(this.raw);
+      this.inner.close(COLLAB_DENIED_CLOSE_CODE, 'permission-denied');
+    }
   }
 
   close(code?: number, reason?: string): void {

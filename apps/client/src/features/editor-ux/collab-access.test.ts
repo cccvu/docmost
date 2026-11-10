@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  COLLAB_LOST_RETRY_MS,
   COLLAB_UPDATE_REFUSED_PREFIX,
   COLLAB_UPDATE_UNRESOLVED,
   CollabAccessEvent,
@@ -358,6 +359,7 @@ describe("collab update refusal (#781)", () => {
         markDisconnected: false,
         detach: false,
         disconnectSocket: false,
+        retryAfterMs: 0,
       });
       expect(live.state).toBe(initialCollabAccess);
       const dead = nextCollabAccess(initialCollabAccess, close(reason, false));
@@ -440,6 +442,7 @@ describe("a socket close with 1009 (a frame over the server's maxPayload) (#790)
         markDisconnected: false,
         detach: false,
         disconnectSocket: false,
+        retryAfterMs: 0,
       });
     },
   );
@@ -480,19 +483,54 @@ describe("a socket close with 1009 (a frame over the server's maxPayload) (#790)
 
 // cccvu/wiki-v2#790 — only a refusal closes the socket: every other step keeps it (reconnect and token refresh need it).
 describe("disconnectSocket", () => {
-  it("is false for every event that is not a refusal", () => {
+  it("is false for every event that is neither a refusal nor a loss", () => {
     const events: CollabAccessEvent[] = [
       { kind: "server-close", socketConnected: true },
       { kind: "server-close", socketConnected: false, code: 1006 },
       { kind: "server-close", socketConnected: true, reason: COLLAB_UPDATE_UNRESOLVED },
       { kind: "auth-failed", tokenExpired: true },
       { kind: "auth-failed", tokenExpired: false },
-      { kind: "refresh-failed" },
       { kind: "authenticated", scope: "read-write" },
       { kind: "sync-acked" },
     ];
     for (const event of events) {
       expect([event, nextCollabAccess(initialCollabAccess, event).disconnectSocket]).toEqual([event, false]);
+    }
+  });
+
+  // #790: the server closes a socket right after refusing its authentication and counts every unauthenticated socket
+  // in a process-wide pool. A lost editor that kept reconnecting at the provider's pace (about once a second) would
+  // hold a slot of that pool for as long as the tab stayed open, so a loss closes the socket and retries slowly.
+  it("a loss (a second refusal, or a refetch that fails) closes the socket and retries after COLLAB_LOST_RETRY_MS, never refused", () => {
+    const refetched = nextCollabAccess(initialCollabAccess, { kind: "auth-failed", tokenExpired: false });
+    expect(refetched.disconnectSocket).toBe(false); // the first refusal refetches the token once (#537)
+    for (const step of [
+      nextCollabAccess(refetched.state, { kind: "auth-failed", tokenExpired: false }),
+      nextCollabAccess(initialCollabAccess, { kind: "refresh-failed" }),
+    ]) {
+      expect(step.state.lost).toBe(true);
+      expect(step.state.refused).toBe(false);
+      expect(step.markDisconnected).toBe(true);
+      expect(step.disconnectSocket).toBe(true);
+      expect(step.detach).toBe(false); // the provider stays attached, so a later authentication recovers it
+      expect(step.retryAfterMs).toBe(COLLAB_LOST_RETRY_MS);
+      expect(COLLAB_LOST_RETRY_MS).toBeGreaterThanOrEqual(30_000);
+      // the retry is judged like any other open: a later authentication clears the loss
+      const back = nextCollabAccess(step.state, { kind: "authenticated", scope: "read-write" });
+      expect(collabAllowsEditing(back.state)).toBe(true);
+    }
+    // a refusal on the retry, after the one refetch was spent, is a loss again (no refetch loop)
+    const lost = nextCollabAccess(refetched.state, { kind: "auth-failed", tokenExpired: false });
+    const again = nextCollabAccess(lost.state, { kind: "auth-failed", tokenExpired: false });
+    expect(again.retryAfterMs).toBe(COLLAB_LOST_RETRY_MS);
+    expect(again.refreshToken).toBe(false);
+    // no other step schedules a retry
+    for (const event of [
+      { kind: "server-close", socketConnected: true },
+      { kind: "authenticated", scope: "read-write" },
+      { kind: "sync-acked" },
+    ] as CollabAccessEvent[]) {
+      expect(nextCollabAccess(initialCollabAccess, event).retryAfterMs).toBe(0);
     }
   });
 
@@ -512,6 +550,11 @@ describe("page-editor wiring", () => {
     join(__dirname, "..", "editor", "page-editor.tsx"),
     "utf8",
   );
+  it("a lost editor's retry timer reconnects only while it is still current and still lost, and is cleared on unmount", () => {
+    expect(source).toMatch(/if \(step\.retryAfterMs\) \{[\s\S]*?clearTimeout\(lostRetry\);[\s\S]*?lostRetry = setTimeout\(\(\) => \{\s*if \(isCurrent\(\) && collabAccessRef\.current\.lost\) socket\.connect\(\);\s*\}, step\.retryAfterMs\);/);
+    expect(source).toMatch(/return \(\) => \{\s*clearTimeout\(lostRetry\);/);
+  });
+
   it("a disconnectSocket step disconnects the editor's socket, after the detach", () => {
     const detach = source.indexOf("if (step.detach) remote.detach();");
     const disconnect = source.indexOf(

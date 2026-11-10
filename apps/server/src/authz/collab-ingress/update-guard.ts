@@ -26,8 +26,8 @@
  * the guard still remembers the refusal and refuses any that do, as defense.
  *
  * Frame bounds (#790), in the same synchronous check, where Hocuspocus 4.7.1 leaves a gap: a SYNC BUDGET per (user,
- * document) (a SyncStep1, and a reader's Step2, each make 4.7.1 encode or snapshot the whole document); AWARENESS bounds
- * for every connection, readers too (each state's size before anything parses it; a budget per (user, document) of
+ * document) and per user (a SyncStep1, and a reader's Step2, each make 4.7.1 encode or snapshot the whole document);
+ * AWARENESS bounds for every connection, readers too (each state's size before anything parses it; a budget per (user, document) of
  * client ids new to the document; and no newer state for a client id bound to another user, so nobody can move
  * another user's cursor or selection; the name and colour in a state are the client's own say, never checked); and Auth
  * on an established
@@ -89,6 +89,13 @@ export const AWARENESS_BINDS_PER_USER = 256;
  */
 export const SYNC_BURST = 2 * COLLAB_CONNECTIONS_PER_USER;
 export const SYNC_REFILL_MS = 4_000;
+/**
+ * #790: the same sync frames per USER across all documents, charged together with the per-(user, document) budget, so
+ * that opening a new page (a fresh per-document budget) does not buy another burst: the same burst (all 32 tabs
+ * reconnecting after a deploy, each on its own page, pass), then one per USER_SYNC_REFILL_MS.
+ */
+export const USER_SYNC_BURST = 2 * COLLAB_CONNECTIONS_PER_USER;
+export const USER_SYNC_REFILL_MS = 1_000;
 /** #790: one awareness state's JSON, in UTF-8 bytes (an honest state is a user name, a colour and a cursor). */
 export const AWARENESS_STATE_MAX_BYTES = 8 * 1024;
 /**
@@ -222,7 +229,11 @@ export class CollabUpdateGuard {
     if (header.type !== MESSAGE.Sync && header.type !== MESSAGE.SyncReply) return;
     // A Step1 makes Hocuspocus encode the whole document (its Step2 answer); a reader's Step2 makes it snapshot it.
     if (header.subtype === STEP1 || (header.subtype === STEP2 && frame.connection.readOnly)) {
-      if (!this.take(this.budgetFor(frame).sync, SYNC_BURST, SYNC_REFILL_MS, 1)) this.tryLater(frame, 'user_sync_budget');
+      const ok = this.takeBoth(
+        [this.budgetFor(frame, true).sync, USER_SYNC_BURST, USER_SYNC_REFILL_MS],
+        [this.budgetFor(frame).sync, SYNC_BURST, SYNC_REFILL_MS],
+      );
+      if (!ok) this.tryLater(frame, 'user_sync_budget');
       return;
     }
     if (header.subtype !== STEP2 && header.subtype !== UPDATE) return; // Hocuspocus refuses an unknown subtype itself
@@ -247,15 +258,28 @@ export class CollabUpdateGuard {
   }
 
   /** The (user, document) budget of this frame's connection, made most recently used; the least recent past the cap goes. */
-  private budgetFor(frame: GuardFrame): UserDocBudget {
-    const key = `${String(frame.context?.user?.id ?? '')}\u0000${frame.document.name ?? ''}`;
+  private budgetFor(frame: GuardFrame, wholeUser = false): UserDocBudget {
+    const user = String(frame.context?.user?.id ?? '');
+    const key = wholeUser ? `${user}\u0001` : `${user}\u0000${frame.document.name ?? ''}`;
     const at = this.now();
     let budget = this.userDocBudgets.get(key);
     if (budget) this.userDocBudgets.delete(key);
-    else budget = { sync: { tokens: SYNC_BURST, at }, ids: { tokens: AWARENESS_NEW_IDS_BURST, at } };
+    else budget = { sync: { tokens: wholeUser ? USER_SYNC_BURST : SYNC_BURST, at }, ids: { tokens: AWARENESS_NEW_IDS_BURST, at } };
     this.userDocBudgets.set(key, budget);
     if (this.userDocBudgets.size > USER_DOC_BUDGETS_MAX) this.userDocBudgets.delete(this.userDocBudgets.keys().next().value!);
     return budget;
+  }
+
+  /** One token from each bucket, or none from either. */
+  private takeBoth(...buckets: Array<[Bucket, number, number]>): boolean {
+    const now = this.now();
+    for (const [bucket, burst, refillMs] of buckets) {
+      bucket.tokens = Math.min(burst, bucket.tokens + Math.max(0, now - bucket.at) / refillMs);
+      bucket.at = now;
+    }
+    if (buckets.some(([bucket]) => bucket.tokens < 1)) return false;
+    for (const [bucket] of buckets) bucket.tokens -= 1;
+    return true;
   }
 
   /** Take `n` tokens from `bucket` (`burst`, refilled one per `refillMs`); false, taking none, when it holds fewer. */

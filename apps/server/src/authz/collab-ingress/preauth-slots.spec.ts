@@ -4,10 +4,17 @@ import { WebSocket } from 'ws';
 import { Hocuspocus, OutgoingMessage } from '@hocuspocus/server';
 import { CollabWsAdapter } from '../../collaboration/adapter/collab-ws.adapter';
 import { WsSocketWrapper } from '../../collaboration/extensions/redis-sync/ws-socket-wrapper';
-import { BoundedCollabSocket, isAuthenticatedReply } from './bounded-socket';
+import { authReplyOf, BoundedCollabSocket, COLLAB_DENIED_CLOSE_CODE } from './bounded-socket';
 import { authFrame, FakeSocket } from './collab-ingress.testkit';
-import { COLLAB_MAX_PAYLOAD_BYTES, COLLAB_PREAUTH_DEADLINE_MS, COLLAB_PREAUTH_SOCKETS, COLLAB_HOCUSPOCUS_OPTIONS } from './limits';
+import {
+  COLLAB_HOCUSPOCUS_OPTIONS,
+  COLLAB_PREAUTH_BYTES,
+  COLLAB_PREAUTH_CLOSE_GRACE_MS,
+  COLLAB_PREAUTH_DEADLINE_MS,
+  COLLAB_PREAUTH_SOCKETS,
+} from './limits';
 import { answerCollabUpgrade, collabPreAuthSlots, CollabPreAuthSlots } from './preauth-slots';
+import { EventEmitter } from 'node:events';
 import { SocketLimitLog } from './socket-limit-log';
 
 /**
@@ -88,28 +95,75 @@ describe('#790 CollabPreAuthSlots', () => {
     expect(done).toHaveBeenLastCalledWith(false, 503, 'Service Unavailable', { 'Retry-After': '5' });
   });
 
-  it('the cap times the per-socket pre-auth bound (queue + one partial frame) stays within 256 MiB', () => {
-    const perSocket = COLLAB_HOCUSPOCUS_OPTIONS.maxUnauthenticatedQueueSize + COLLAB_MAX_PAYLOAD_BYTES;
-    expect(perSocket).toBe(16 * MiB);
-    expect(COLLAB_PREAUTH_SOCKETS * perSocket).toBeLessThanOrEqual(256 * MiB);
-    expect(COLLAB_HOCUSPOCUS_OPTIONS.maxUnauthenticatedQueueSize).toBeGreaterThanOrEqual(COLLAB_MAX_PAYLOAD_BYTES); // one honest frame
+  it('the cap times the per-socket pre-auth bound (its bytes plus 64 KiB of objects) stays within 256 MiB', () => {
+    expect(COLLAB_PREAUTH_SOCKETS * (COLLAB_PREAUTH_BYTES + 64 * 1024)).toBeLessThanOrEqual(256 * MiB);
+    // the Hocuspocus pre-auth queue is made of bytes the socket sent before it authenticated
+    expect(COLLAB_HOCUSPOCUS_OPTIONS.maxUnauthenticatedQueueSize).toBeLessThanOrEqual(COLLAB_PREAUTH_BYTES);
+    // an honest pre-auth send (an Auth frame, a SyncStep1, an 8 KiB awareness state, keystrokes) fits many times over
+    expect(COLLAB_PREAUTH_BYTES).toBeGreaterThanOrEqual(128 * 1024);
+  });
+
+  it('no one source can hold the pool: the edge lets one address hold at most ~67 unauthenticated sockets at a time', () => {
+    const edgeRequestsPerSecond = 2000 / 300; // the WAF rate rules, proxied and direct: 2000 requests per 5 minutes per address
+    const perSource = Math.ceil(edgeRequestsPerSecond * (COLLAB_PREAUTH_DEADLINE_MS / 1000));
+    expect(perSource).toBeLessThanOrEqual(67);
+    expect(COLLAB_PREAUTH_SOCKETS).toBeGreaterThanOrEqual(7 * perSource);
+  });
+
+  it('counts what the TCP socket delivers while unauthenticated: past the byte cap it terminates (logged); after release it stops counting', () => {
+    const warn = jest.fn();
+    const slots = new CollabPreAuthSlots(4, 60_000, new SocketLimitLog({ warn }), 1000);
+    const [greedy, honest] = [new Sock(), new Sock()];
+    const [tg, th] = [new EventEmitter(), new EventEmitter()];
+    slots.hold(greedy, tg as never);
+    slots.hold(honest, th as never);
+    tg.emit('data', Buffer.alloc(600));
+    tg.emit('data', Buffer.alloc(400));
+    expect(greedy.terminated).toBe(0); // exactly at the cap
+    tg.emit('data', Buffer.alloc(1));
+    expect(greedy.terminated).toBe(1);
+    expect(warn.mock.calls).toEqual([['COLLAB_SOCKET_LIMIT {"limit":"preauth_bytes","bytes":1001}']]);
+    expect(tg.listenerCount('data')).toBe(0);
+    th.emit('data', Buffer.alloc(900));
+    slots.release(honest); // authenticated
+    expect(th.listenerCount('data')).toBe(0);
+    th.emit('data', Buffer.alloc(10_000)); // an authenticated socket is not counted here
+    expect(honest.terminated).toBe(0);
+  });
+
+  it(`a refused socket keeps its slot while it closes, for at most ${COLLAB_PREAUTH_CLOSE_GRACE_MS} ms`, () => {
+    jest.useFakeTimers();
+    const warn = jest.fn();
+    const slots = new CollabPreAuthSlots(4, 60_000, new SocketLimitLog({ warn }));
+    const [slow, prompt] = [new Sock(), new Sock()];
+    slots.hold(slow);
+    slots.hold(prompt);
+    slots.closing(slow);
+    slots.closing(prompt);
+    prompt.closeNow(); // an honest client closes at once
+    expect(slots.holds(prompt)).toBe(false);
+    expect(slots.holds(slow)).toBe(true);
+    jest.advanceTimersByTime(COLLAB_PREAUTH_CLOSE_GRACE_MS);
+    expect(slow.terminated).toBe(1);
+    expect(slots.size).toBe(0);
+    expect(warn.mock.calls).toEqual([[`COLLAB_SOCKET_LIMIT {"limit":"preauth_close_grace","deadlineMs":${COLLAB_PREAUTH_CLOSE_GRACE_MS}}`]]);
   });
 });
 
-describe('#790 isAuthenticatedReply', () => {
-  it("recognises Hocuspocus 4.7.1's own Authenticated reply (both scopes), and nothing else", () => {
+describe('#790 authReplyOf', () => {
+  it("recognises Hocuspocus 4.7.1's own Authenticated (both scopes) and PermissionDenied replies, and nothing else", () => {
     const name = 'page.00000000-0000-4000-8000-000000000790';
-    expect(isAuthenticatedReply(new OutgoingMessage(name).writeAuthenticated(false).toUint8Array())).toBe(true);
-    expect(isAuthenticatedReply(new OutgoingMessage(name).writeAuthenticated(true).toUint8Array())).toBe(true);
-    expect(isAuthenticatedReply(new OutgoingMessage(name).writePermissionDenied('permission-denied').toUint8Array())).toBe(false);
-    expect(isAuthenticatedReply(new OutgoingMessage(name).writeTokenSyncRequest().toUint8Array())).toBe(false);
-    expect(isAuthenticatedReply(authFrame('token'))).toBe(false); // a client Auth (Token subtype)
-    expect(isAuthenticatedReply(new Uint8Array([]))).toBe(false);
-    expect(isAuthenticatedReply(new Uint8Array([200]))).toBe(false);
+    expect(authReplyOf(new OutgoingMessage(name).writeAuthenticated(false).toUint8Array())).toBe('authenticated');
+    expect(authReplyOf(new OutgoingMessage(name).writeAuthenticated(true).toUint8Array())).toBe('authenticated');
+    expect(authReplyOf(new OutgoingMessage(name).writePermissionDenied('permission-denied').toUint8Array())).toBe('denied');
+    expect(authReplyOf(new OutgoingMessage(name).writeTokenSyncRequest().toUint8Array())).toBeNull();
+    expect(authReplyOf(authFrame('token'))).toBeNull(); // a client Auth (Token subtype)
+    expect(authReplyOf(new Uint8Array([]))).toBeNull();
+    expect(authReplyOf(new Uint8Array([200]))).toBeNull();
   });
 });
 
-describe('#790 through a real Hocuspocus 4.7.1: the slot is freed by the Authenticated reply, not by a denied one', () => {
+describe('#790 through a real Hocuspocus 4.7.1: Authenticated frees the slot, PermissionDenied closes the socket', () => {
   const open: Hocuspocus[] = [];
   const sockets: FakeSocket[] = [];
   afterEach(async () => {
@@ -117,46 +171,72 @@ describe('#790 through a real Hocuspocus 4.7.1: the slot is freed by the Authent
     for (const hp of open.splice(0)) hp.closeConnections();
     await settle();
   });
-
-  it('a socket whose token verifies frees its slot; one that is denied keeps it (until the deadline or its close)', async () => {
-    const slots = new CollabPreAuthSlots(8, 60_000, quietLog());
+  const server = () => {
     const hp = new Hocuspocus({
       quiet: true,
       extensions: [{ async onAuthenticate(d: { token: string }) { if (d.token !== 'ok') throw new Error('denied'); return { user: { id: 'u' } }; } }],
     } as never);
     open.push(hp);
-    const connect = (token: string) => {
-      const sock = new FakeSocket();
-      sockets.push(sock);
-      const bounded = new BoundedCollabSocket(sock, new WsSocketWrapper(sock as never), quietLog(), slots);
-      const cc = hp.handleConnection(bounded, new Request('http://localhost/'));
-      sock.on('message', (data: Buffer) => cc.handleMessage(new Uint8Array(data)));
-      sock.on('close', (code: number, reason: Buffer) => cc.handleClose({ code, reason: reason.toString() }));
-      sock.deliver(authFrame(token));
-      return sock;
-    };
-    const ok = connect('ok');
-    const denied = connect('nope');
-    expect(slots.size).toBe(2); // both held from the connection
+    return hp;
+  };
+  const connect = (hp: Hocuspocus, slots: CollabPreAuthSlots, token: string) => {
+    const sock = new FakeSocket();
+    sockets.push(sock);
+    slots.hold(sock); // as the ws adapter does at the upgrade
+    const bounded = new BoundedCollabSocket(sock, new WsSocketWrapper(sock as never), quietLog(), slots);
+    const cc = hp.handleConnection(bounded, new Request('http://localhost/'));
+    sock.on('message', (data: Buffer) => cc.handleMessage(new Uint8Array(data)));
+    sock.on('close', (code: number, reason: Buffer) => cc.handleClose({ code, reason: reason.toString() }));
+    sock.deliver(authFrame(token));
+    return sock;
+  };
+
+  it('a verified token frees its slot and keeps its socket; a refused one is closed 4401 after its PermissionDenied reply', async () => {
+    const slots = new CollabPreAuthSlots(8, 60_000, quietLog());
+    const closing = jest.spyOn(slots, 'closing');
+    const hp = server();
+    const ok = connect(hp, slots, 'ok');
+    const denied = connect(hp, slots, 'nope');
+    expect(slots.size).toBe(2);
     await settle(20);
     expect(slots.holds(ok)).toBe(false);
-    expect(slots.holds(denied)).toBe(true);
-    denied.close(1000, 'gone');
+    expect(ok.closed).toBeNull();
+    expect(denied.closed).toEqual({ code: COLLAB_DENIED_CLOSE_CODE, reason: 'permission-denied' });
+    const replies = denied.sent.map((f) => authReplyOf(f)).filter(Boolean);
+    expect(replies).toEqual(['denied']); // the editor reads the refusal (and runs its token refetch) before the close
+    expect(closing.mock.calls).toEqual([[denied]]); // a client that does not finish closing is cut off after the grace
     expect(slots.size).toBe(0);
+  });
+
+  it('refused editors reconnecting over and over never fill the pool: an honest socket still gets a slot', async () => {
+    const slots = new CollabPreAuthSlots(4, 60_000, quietLog());
+    const hp = server();
+    for (let i = 0; i < 40; i++) {
+      connect(hp, slots, 'nope');
+      if (i % 4 === 3) await settle(5);
+    }
+    await settle(20);
+    expect(slots.size).toBe(0);
+    expect(slots.admit()).toBe(true);
+    const ok = connect(hp, slots, 'ok');
+    await settle(20);
+    expect(ok.closed).toBeNull();
+    expect(slots.holds(ok)).toBe(false);
   });
 });
 
-describe('#790 through the real ws adapter: the upgrade is refused 503 past the cap', () => {
+describe('#790 through the real ws adapter: the upgrade check, the slot and the byte count', () => {
   let server: Server;
   let adapter: CollabWsAdapter;
   let port: number;
   const clients: WebSocket[] = [];
+  const fillers: Sock[] = [];
 
   beforeEach(async () => {
     server = createServer();
     adapter = new CollabWsAdapter();
     const wss = adapter.handleUpgrade('/collab', server);
-    // As the gateway does on both paths: the bounded socket holds the slot from the connection.
+    // As the gateway does on both paths: the bounded socket frees the slot on its first Authenticated reply.
     wss.on('connection', (ws: WebSocket) => {
       const bounded = new BoundedCollabSocket(ws, new WsSocketWrapper(ws as never));
       ws.on('message', (data: Buffer) => {
@@ -167,10 +247,12 @@ describe('#790 through the real ws adapter: the upgrade is refused 503 past the 
     port = (server.address() as AddressInfo).port;
   });
   afterEach(async () => {
+    for (const f of fillers.splice(0)) collabPreAuthSlots.release(f);
     for (const c of clients.splice(0)) c.terminate();
     adapter.destroy();
     await new Promise<void>((r) => server.close(() => r()));
-    await settle(20);
+    await settle(30);
+    expect(collabPreAuthSlots.size).toBe(0); // nothing leaks
   });
 
   /** Open a client; resolves 'open' or the HTTP status the upgrade was refused with. */
@@ -182,11 +264,21 @@ describe('#790 through the real ws adapter: the upgrade is refused 503 past the 
       ws.once('unexpected-response', (_req, res) => resolve({ ws, outcome: res.statusCode ?? 0 }));
       ws.once('error', () => undefined);
     });
+  const closed = (ws: WebSocket) => new Promise<number>((r) => ws.once('close', (code) => r(code)));
+  /** Take all but `free` slots with stand-ins (512 real sockets would only slow the spec down). */
+  const fill = (free: number) => {
+    while (collabPreAuthSlots.size < COLLAB_PREAUTH_SOCKETS - free) {
+      const f = new Sock();
+      fillers.push(f);
+      collabPreAuthSlots.hold(f);
+    }
+  };
 
-  it(`${COLLAB_PREAUTH_SOCKETS + 6} concurrent upgrades: exactly ${COLLAB_PREAUTH_SOCKETS} open, the rest get 503; an authentication or a close frees a slot`, async () => {
-    const results = await Promise.all(Array.from({ length: COLLAB_PREAUTH_SOCKETS + 6 }, dial));
+  it('12 concurrent upgrades with 6 slots free: exactly 6 open, 6 get 503; an authentication or a close frees a slot', async () => {
+    fill(6);
+    const results = await Promise.all(Array.from({ length: 12 }, dial));
     const opened = results.filter((r) => r.outcome === 'open');
-    expect(opened).toHaveLength(COLLAB_PREAUTH_SOCKETS);
+    expect(opened).toHaveLength(6);
     expect(results.filter((r) => r.outcome === 503)).toHaveLength(6);
     expect(collabPreAuthSlots.size).toBe(COLLAB_PREAUTH_SOCKETS);
     expect((await dial()).outcome).toBe(503);
@@ -200,5 +292,30 @@ describe('#790 through the real ws adapter: the upgrade is refused 503 past the 
     await settle(30);
     expect(collabPreAuthSlots.size).toBe(COLLAB_PREAUTH_SOCKETS - 1);
     expect((await dial()).outcome).toBe('open');
+  });
+
+  it('one source holding as many idle unauthenticated sockets as the edge lets it (67) leaves room: a second one connects and authenticates', async () => {
+    const held = await Promise.all(Array.from({ length: 67 }, dial));
+    expect(held.every((r) => r.outcome === 'open')).toBe(true);
+    const other = await dial();
+    expect(other.outcome).toBe('open');
+    other.ws.send('authenticate-me');
+    await settle(30);
+    expect(collabPreAuthSlots.size).toBe(67);
+  });
+
+  it(`terminates an unauthenticated socket past ${COLLAB_PREAUTH_BYTES} bytes, a partial frame included; an honest one is kept`, async () => {
+    const greedy = await dial();
+    const honest = await dial();
+    honest.ws.send(Buffer.alloc(64 * 1024)); // well inside
+    const code = closed(greedy.ws);
+    // one frame announcing 8 MiB, of which only COLLAB_PREAUTH_BYTES + 1 bytes arrive: ws would hold it as a partial frame
+    const raw = (greedy.ws as unknown as { _socket: import('node:net').Socket })._socket;
+    const header = Buffer.from([0x82, 0xff, 0, 0, 0, 0, 0, 0x80, 0, 0, 1, 2, 3, 4]); // FIN+binary, masked, 64-bit length 8 MiB, mask
+    raw.write(Buffer.concat([header, Buffer.alloc(COLLAB_PREAUTH_BYTES)]));
+    expect(await code).toBe(1006);
+    await settle(30);
+    expect(honest.ws.readyState).toBe(WebSocket.OPEN);
+    expect(collabPreAuthSlots.size).toBe(1);
   });
 });
