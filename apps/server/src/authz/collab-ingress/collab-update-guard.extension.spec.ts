@@ -19,10 +19,12 @@ import { CollabUpdateGuardExtension } from './collab-update-guard.extension';
 import { COLLAB_REFUSAL_CODE, CollabUpdateGuard, SOCKET_REFUSAL_BUDGET, UNRESOLVED_REASON, type CollabGuardMode } from './update-guard';
 
 /**
- * #781 (ADR 0036) through a REAL Hocuspocus 3.4.4: its ClientConnection queueing, its hook chain (the guard is a hook in
- * a promise chain, so every frame's chain must stay the same length for frames to apply in FIFO order), its
- * `Connection.close` on a hook rejection (a document-level CLOSE carrying our reason; the websocket stays up), and its
- * apply path. Frames are delivered the way `ws` does for one TCP chunk: synchronously, back to back.
+ * #781 (ADR 0036) through a REAL Hocuspocus 4.7.1: its ClientConnection queueing, its per-connection message queue
+ * (one frame at a time per connection; frames of different connections interleave), its hook chain (the guard is a hook
+ * in a promise chain, so every frame's check-to-apply path must stay the same length for frames to apply in the order
+ * they were checked), its `Connection.close` on a hook rejection (a document-level CLOSE carrying our reason; the
+ * websocket stays up), and its apply path. Frames are delivered the way `ws` does for one TCP chunk: synchronously,
+ * back to back, each handed to the `ClientConnection` as the gateway does.
  */
 const REFUSED = (rule: string) => `ccc:collab-update-refused:${rule}`;
 const SEED = {
@@ -47,7 +49,7 @@ const settle = async () => {
 const open: Hocuspocus[] = [];
 const sockets: FakeSocket[] = [];
 
-/** `guard: false` is the control arm: the same server with no guard. `refuseOnly` is a naive guard with no state. */
+/** `guard: 'none'` is the control arm: the same server with no guard. `refuse-unknown-mark` is a naive guard with no state. */
 async function server(opts: { guard?: 'real' | 'none' | 'refuse-unknown-mark'; mode?: CollabGuardMode } = {}) {
   const logs: string[] = [];
   const guard = new CollabUpdateGuard({ mode: opts.mode ?? 'enforce', logger: { warn: (m: string) => logs.push(m) } });
@@ -55,7 +57,7 @@ async function server(opts: { guard?: 'real' | 'none' | 'refuse-unknown-mark'; m
   const extensions: any[] = [];
   if ((opts.guard ?? 'real') === 'real') extensions.push(new CollabUpdateGuardExtension(guard));
   if (opts.guard === 'refuse-unknown-mark') {
-    // What Hocuspocus does with a stateless guard: it refuses the one frame and keeps applying the rest of the burst.
+    // A stateless guard: it refuses the one frame and remembers nothing (3.4.4 then applied the rest of the burst).
     extensions.push({
       beforeHandleMessage({ update }: { update: Uint8Array }) {
         if (Buffer.from(update).includes(Buffer.from('evilMark'))) throw { code: 4422, reason: REFUSED('unknown-mark') };
@@ -82,7 +84,7 @@ async function server(opts: { guard?: 'real' | 'none' | 'refuse-unknown-mark'; m
   const connect = async (token: string) => {
     const sock = new FakeSocket();
     sockets.push(sock);
-    hp.handleConnection(sock as never, { headers: {}, url: '/' } as never);
+    sock.connect(hp);
     sock.deliver(authFrame(token));
     await settle();
     return sock;
@@ -112,8 +114,11 @@ const badMark = (live: Y.Doc) => new RemoteClient(live).edit(live, (f) => textOf
 /** Refused in the SHADOW step (not by the stateless pre-pass), so the refusal rebuilds the shadow. */
 const badSchema = (live: Y.Doc) => new RemoteClient(live).edit(live, (f) => (f.get(0) as Y.XmlElement).insert(0, [new Y.XmlElement('paragraph')]));
 
-describe('#781 races through a real Hocuspocus 3.4.4', () => {
-  it('frames sent after a refused one are not applied (Hocuspocus 3.4.4 would apply them after the CLOSE)', async () => {
+describe('#781 races through a real Hocuspocus 4.7.1', () => {
+  // Hocuspocus 3.4.4 applied the frames already queued behind a refused one after its CLOSE, so only a guard that
+  // remembered the refusal (`refusedConnections`) stopped them. 4.x (#1123) empties the connection's queue when a hook
+  // throws, so even a stateless guard drops them now: both arms assert that, and the guard keeps its memory as defense.
+  it('frames sent after a refused one are not applied (by Hocuspocus 4.x itself, and by the guard)', async () => {
     for (const arm of ['refuse-unknown-mark', 'real'] as const) {
       const s = await server({ guard: arm });
       const sock = await s.connect('attacker');
@@ -125,8 +130,7 @@ describe('#781 races through a real Hocuspocus 3.4.4', () => {
       expect(sock.closeReasons()).toEqual([REFUSED('unknown-mark')]);
       const text = renderLikeABrowser(live).text;
       expect(text).toContain('A ');
-      if (arm === 'refuse-unknown-mark') expect(text).toContain('C '); // control: applied after the CLOSE
-      else expect(text).not.toContain('C ');
+      expect(text).not.toContain('C '); // control too: 4.x drops the refused connection's queued frames
     }
   });
 
@@ -237,6 +241,7 @@ describe('#781 races through a real Hocuspocus 3.4.4', () => {
     Object.defineProperty(shadow, 'store', { get: () => { throw new Error('mirror boom'); } });
     const received = updatesReceived(peer);
     live.transact(() => textOf(live.getXmlFragment('default').get(0) as Y.XmlElement).insert(0, 'server1 '));
+    await settle(); // 4.x merges one event-loop turn's updates into one broadcast (flushDelay 0): one per turn here
     live.transact(() => textOf(live.getXmlFragment('default').get(0) as Y.XmlElement).insert(0, 'server2 '));
     await settle();
     expect(updatesReceived(peer)).toBe(received + 2);

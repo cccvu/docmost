@@ -13,12 +13,17 @@
  * and pending structs. A refused frame leaves the shadow ahead of live, so the shadow is rebuilt from live plus the
  * frames accepted but not yet applied (`inflight`), keeping it an exact image of live's future.
  *
- * Ordering (Hocuspocus 3.4.4): `beforeHandleMessage` hooks run as one promise chain per frame; the frame applies when
- * its chain resolves. Frames apply in arrival order only while every chain has the same length, so this guard is
- * synchronous (returns undefined or throws, never a promise), runs first, and is the only such hook
- * (collab-update-guard.wiring.spec.ts). Accepted frames have applied by the next macrotask: `setImmediate` clears the
- * in-flight list. Hocuspocus 3.4.4 also applies frames that were already in its chain when it CLOSEs a refused
- * connection, so a refused connection's later frames are refused here too.
+ * Ordering (Hocuspocus 4.7.1, `Connection.processMessages` and `MessageReceiver.apply`): each document connection
+ * queues its frames and handles one at a time: it awaits the `beforeHandleMessage` hooks (one promise chain), then the
+ * apply, which first awaits the `beforeSync` hooks (Sync frames) or the `beforeHandleAwareness` hooks (awareness
+ * frames). So one connection's frames are strictly sequential, but frames of DIFFERENT connections interleave, and they
+ * apply in the order this guard checked them only while every frame's path from check to apply has the same length and
+ * waits on nothing but microtasks. Hence this guard is synchronous (returns undefined or throws, never a promise), runs
+ * first, and is the only `beforeHandleMessage`, and the server defines no `beforeSync` or `beforeHandleAwareness` hook
+ * (collab-update-guard.wiring.spec.ts). The in-flight list is still needed for that cross-connection interleaving.
+ * Accepted frames have applied by the next macrotask: `setImmediate` clears the in-flight list. When a hook throws,
+ * 4.x drops the frames that connection had queued (#1123), so a refused connection's later frames never reach here;
+ * the guard still remembers the refusal and refuses any that do, as defense.
  *
  * Refusal = a throw of `{ code: 4422, reason }`: Hocuspocus closes that ONE document session and sends the reason (the
  * websocket stays up). Reasons the client acts on (apps/client features/editor-ux): `ccc:collab-update-refused:<rule>`
@@ -54,7 +59,7 @@ const LOGS_PER_MINUTE = 30;
 
 export const reasonFor = (rule: CollabRule): string => (rule === 'unresolved' ? UNRESOLVED_REASON : REFUSED_REASON_PREFIX + rule);
 
-/** Hocuspocus 3.4.4 MessageType values and y-protocols sync subtypes. */
+/** Hocuspocus 4.7.1 MessageType values and y-protocols sync subtypes. */
 const MESSAGE = { Sync: 0, Awareness: 1, SyncReply: 4, Stateless: 5, BroadcastStateless: 6 } as const;
 const STEP2 = 1;
 const UPDATE = 2;
