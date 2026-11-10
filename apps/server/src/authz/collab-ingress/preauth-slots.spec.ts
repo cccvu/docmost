@@ -8,7 +8,9 @@ import { authReplyOf, BoundedCollabSocket, COLLAB_DENIED_CLOSE_CODE } from './bo
 import { authFrame, FakeSocket } from './collab-ingress.testkit';
 import {
   COLLAB_HOCUSPOCUS_OPTIONS,
-  COLLAB_PREAUTH_BYTES,
+  COLLAB_MAX_PAYLOAD_BYTES,
+  COLLAB_PREAUTH_SOCKET_BYTES,
+  COLLAB_PREAUTH_TOTAL_BYTES,
   COLLAB_PREAUTH_CLOSE_GRACE_MS,
   COLLAB_PREAUTH_DEADLINE_MS,
   COLLAB_PREAUTH_SOCKETS,
@@ -95,12 +97,12 @@ describe('#790 CollabPreAuthSlots', () => {
     expect(done).toHaveBeenLastCalledWith(false, 503, 'Service Unavailable', { 'Retry-After': '5' });
   });
 
-  it('the cap times the per-socket pre-auth bound (its bytes plus 64 KiB of objects) stays within 256 MiB', () => {
-    expect(COLLAB_PREAUTH_SOCKETS * (COLLAB_PREAUTH_BYTES + 64 * 1024)).toBeLessThanOrEqual(256 * MiB);
+  it('the total pre-auth bytes plus 64 KiB of objects per slot stays within 256 MiB; one socket may send a maximal frame', () => {
+    expect(COLLAB_PREAUTH_TOTAL_BYTES + COLLAB_PREAUTH_SOCKETS * 64 * 1024).toBeLessThanOrEqual(256 * MiB);
+    // a SyncStep1 of a page many sessions wrote to (about 7 bytes per client id) is never cut off below a maximal frame
+    expect(COLLAB_PREAUTH_SOCKET_BYTES).toBe(COLLAB_MAX_PAYLOAD_BYTES);
     // the Hocuspocus pre-auth queue is made of bytes the socket sent before it authenticated
-    expect(COLLAB_HOCUSPOCUS_OPTIONS.maxUnauthenticatedQueueSize).toBeLessThanOrEqual(COLLAB_PREAUTH_BYTES);
-    // an honest pre-auth send (an Auth frame, a SyncStep1, an 8 KiB awareness state, keystrokes) fits many times over
-    expect(COLLAB_PREAUTH_BYTES).toBeGreaterThanOrEqual(128 * 1024);
+    expect(COLLAB_HOCUSPOCUS_OPTIONS.maxUnauthenticatedQueueSize).toBeLessThanOrEqual(COLLAB_PREAUTH_SOCKET_BYTES);
   });
 
   it('no one source can hold the pool: the edge lets one address hold at most ~67 unauthenticated sockets at a time', () => {
@@ -112,7 +114,7 @@ describe('#790 CollabPreAuthSlots', () => {
 
   it('counts what the TCP socket delivers while unauthenticated: past the byte cap it terminates (logged); after release it stops counting', () => {
     const warn = jest.fn();
-    const slots = new CollabPreAuthSlots(4, 60_000, new SocketLimitLog({ warn }), 1000);
+    const slots = new CollabPreAuthSlots(4, 60_000, new SocketLimitLog({ warn }), 1000, 2000, 1_000_000);
     const [greedy, honest] = [new Sock(), new Sock()];
     const [tg, th] = [new EventEmitter(), new EventEmitter()];
     slots.hold(greedy, tg as never);
@@ -129,6 +131,46 @@ describe('#790 CollabPreAuthSlots', () => {
     expect(th.listenerCount('data')).toBe(0);
     th.emit('data', Buffer.alloc(10_000)); // an authenticated socket is not counted here
     expect(honest.terminated).toBe(0);
+    expect(slots.bytes).toBe(0);
+  });
+
+  it('past the total budget the socket holding the most is cut, not the small honest ones, until the total is under', () => {
+    const warn = jest.fn();
+    // per socket 10,000 bytes, all of them together 10,000
+    const slots = new CollabPreAuthSlots(8, 60_000, new SocketLimitLog({ warn }), 10_000, 2000, 10_000);
+    const honest = [new Sock(), new Sock(), new Sock()];
+    const [big1, big2] = [new Sock(), new Sock()];
+    const t = new Map<Sock, EventEmitter>();
+    for (const s of [...honest, big1, big2]) {
+      t.set(s, new EventEmitter());
+      slots.hold(s, t.get(s) as never);
+    }
+    for (const s of honest) t.get(s)!.emit('data', Buffer.alloc(300)); // an Auth, a SyncStep1, an awareness state
+    t.get(big1)!.emit('data', Buffer.alloc(5000));
+    t.get(big2)!.emit('data', Buffer.alloc(4000));
+    expect(slots.bytes).toBe(9900);
+    t.get(big2)!.emit('data', Buffer.alloc(500)); // 10,400: over; big1 (5000) holds the most
+    expect(big1.terminated).toBe(1);
+    expect(big2.terminated).toBe(0);
+    expect(slots.bytes).toBe(5400);
+    t.get(big2)!.emit('data', Buffer.alloc(4700)); // 10,100: over; now big2 (9200) holds the most
+    expect(big2.terminated).toBe(1);
+    expect(honest.map((s) => s.terminated)).toEqual([0, 0, 0]);
+    expect(slots.bytes).toBe(900);
+    expect(warn.mock.calls.map((c) => JSON.parse(c[0].replace('COLLAB_SOCKET_LIMIT ', '')))).toEqual([
+      { limit: 'preauth_total_bytes', bytes: 5000, totalBytes: 10_400 },
+      { limit: 'preauth_total_bytes', bytes: 9200, totalBytes: 10_100 },
+    ]);
+  });
+
+  it('a page whose SyncStep1 is 1 MiB (about 150,000 client ids) still opens before auth', () => {
+    const slots = new CollabPreAuthSlots(8, 60_000, quietLog());
+    const sock = new Sock();
+    const tr = new EventEmitter();
+    slots.hold(sock, tr as never);
+    tr.emit('data', Buffer.alloc(MiB));
+    expect(sock.terminated).toBe(0);
+    slots.release(sock);
   });
 
   it(`a refused socket keeps its slot while it closes, for at most ${COLLAB_PREAUTH_CLOSE_GRACE_MS} ms`, () => {
@@ -304,15 +346,15 @@ describe('#790 through the real ws adapter: the upgrade check, the slot and the 
     expect(collabPreAuthSlots.size).toBe(67);
   });
 
-  it(`terminates an unauthenticated socket past ${COLLAB_PREAUTH_BYTES} bytes, a partial frame included; an honest one is kept`, async () => {
+  it(`terminates an unauthenticated socket past ${COLLAB_PREAUTH_SOCKET_BYTES} bytes, a partial frame included; an honest one is kept`, async () => {
     const greedy = await dial();
     const honest = await dial();
-    honest.ws.send(Buffer.alloc(64 * 1024)); // well inside
+    honest.ws.send(Buffer.alloc(MiB)); // a SyncStep1 of a page about 150,000 sessions wrote to
     const code = closed(greedy.ws);
-    // one frame announcing 8 MiB, of which only COLLAB_PREAUTH_BYTES + 1 bytes arrive: ws would hold it as a partial frame
+    // one frame announcing 8 MiB, of which COLLAB_PREAUTH_SOCKET_BYTES + 1 bytes (frame header included) arrive
     const raw = (greedy.ws as unknown as { _socket: import('node:net').Socket })._socket;
     const header = Buffer.from([0x82, 0xff, 0, 0, 0, 0, 0, 0x80, 0, 0, 1, 2, 3, 4]); // FIN+binary, masked, 64-bit length 8 MiB, mask
-    raw.write(Buffer.concat([header, Buffer.alloc(COLLAB_PREAUTH_BYTES)]));
+    raw.write(Buffer.concat([header, Buffer.alloc(COLLAB_PREAUTH_SOCKET_BYTES)]));
     expect(await code).toBe(1006);
     await settle(30);
     expect(honest.ws.readyState).toBe(WebSocket.OPEN);

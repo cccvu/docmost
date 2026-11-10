@@ -12,9 +12,10 @@
  *   seam §226) until the socket's first `Authenticated` reply is SENT (`BoundedCollabSocket.send`, which sees the
  *   replies of documents this node owns and of documents RedisSync proxies to another node alike), or the socket closes.
  * - **Bytes**: while it holds a slot, every byte the socket's TCP socket delivers is counted (Node's public `data`
- *   event, so a partial frame ws is still assembling counts too); past COLLAB_PREAUTH_BYTES it is terminated
- *   (`preauth_bytes`). Its pre-auth queue and any partial frame are made of those bytes, so one unauthenticated socket
- *   holds at most COLLAB_PREAUTH_BYTES of them.
+ *   event, so a partial frame ws is still assembling counts too). Its pre-auth queue and any partial frame are made of
+ *   those bytes. One socket past COLLAB_PREAUTH_SOCKET_BYTES is terminated (`preauth_bytes`); and when all of them
+ *   together pass COLLAB_PREAUTH_TOTAL_BYTES, the one holding the most is terminated (`preauth_total_bytes`) until the
+ *   total is back under, so a client that fills the budget loses its own largest sockets, not the honest small ones.
  * - **A deadline**: a socket still unauthenticated COLLAB_PREAUTH_DEADLINE_MS after it opened is terminated
  *   (`preauth_deadline`). Hocuspocus 4.7.1's own deadline is its `timeout` (60 s, checked every 60 s, so up to 120 s),
  *   which is also its idle timeout, so it cannot be shortened alone.
@@ -27,10 +28,11 @@
  */
 import type { IncomingMessage } from 'http';
 import {
-  COLLAB_PREAUTH_BYTES,
   COLLAB_PREAUTH_CLOSE_GRACE_MS,
   COLLAB_PREAUTH_DEADLINE_MS,
+  COLLAB_PREAUTH_SOCKET_BYTES,
   COLLAB_PREAUTH_SOCKETS,
+  COLLAB_PREAUTH_TOTAL_BYTES,
 } from './limits';
 import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
 
@@ -46,17 +48,19 @@ export interface PreAuthTransport {
   off(event: 'data', listener: (chunk: Buffer) => void): unknown;
 }
 
-type Held = { timer: ReturnType<typeof setTimeout>; detach: () => void };
+type Held = { socket: PreAuthSocket; timer: ReturnType<typeof setTimeout>; detach: () => void; bytes: number };
 
 export class CollabPreAuthSlots {
   private readonly held = new Map<object, Held>();
+  private totalBytes = 0;
 
   constructor(
     private readonly cap: number = COLLAB_PREAUTH_SOCKETS,
     private readonly deadlineMs: number = COLLAB_PREAUTH_DEADLINE_MS,
     private readonly limitLog: SocketLimitLog = collabSocketLimitLog,
-    private readonly bytesCap: number = COLLAB_PREAUTH_BYTES,
+    private readonly socketBytesCap: number = COLLAB_PREAUTH_SOCKET_BYTES,
     private readonly closeGraceMs: number = COLLAB_PREAUTH_CLOSE_GRACE_MS,
+    private readonly totalBytesCap: number = COLLAB_PREAUTH_TOTAL_BYTES,
   ) {}
 
   /** At the upgrade: false (logged) when the process already holds the cap. Takes nothing. */
@@ -72,18 +76,28 @@ export class CollabPreAuthSlots {
    */
   hold(socket: PreAuthSocket, transport?: PreAuthTransport): void {
     if (this.held.has(socket)) return;
-    let bytes = 0;
     const onData = (chunk: Buffer) => {
-      bytes += chunk.length;
-      if (bytes <= this.bytesCap || !this.held.has(socket)) return;
-      this.limitLog.log('preauth_bytes', { bytes });
-      this.release(socket);
-      socket.terminate();
+      const entry = this.held.get(socket);
+      if (!entry) return;
+      entry.bytes += chunk.length;
+      this.totalBytes += chunk.length;
+      if (entry.bytes > this.socketBytesCap) {
+        this.limitLog.log('preauth_bytes', { bytes: entry.bytes });
+        this.cut(entry);
+      }
+      while (this.totalBytes > this.totalBytesCap) {
+        const largest = this.largest();
+        if (!largest) break;
+        this.limitLog.log('preauth_total_bytes', { bytes: largest.bytes, totalBytes: this.totalBytes });
+        this.cut(largest);
+      }
     };
     transport?.on('data', onData);
     const entry: Held = {
+      socket,
       timer: this.deadline(socket, this.deadlineMs, 'preauth_deadline'),
       detach: () => transport?.off('data', onData),
+      bytes: 0,
     };
     this.held.set(socket, entry);
     socket.once?.('close', () => this.release(socket));
@@ -95,7 +109,25 @@ export class CollabPreAuthSlots {
     if (!entry) return;
     clearTimeout(entry.timer);
     entry.detach();
+    this.totalBytes -= entry.bytes;
     this.held.delete(socket);
+  }
+
+  /** Bytes all unauthenticated sockets hold (specs and diagnostics). */
+  get bytes(): number {
+    return this.totalBytes;
+  }
+
+  private cut(entry: Held): void {
+    this.release(entry.socket);
+    entry.socket.terminate();
+  }
+
+  /** The unauthenticated socket holding the most bytes (O(slots), only once the total is over its budget). */
+  private largest(): Held | null {
+    let top: Held | null = null;
+    for (const entry of this.held.values()) if (!top || entry.bytes > top.bytes) top = entry;
+    return top;
   }
 
   /** Its authentication was refused and it is being closed: it keeps its slot, now for COLLAB_PREAUTH_CLOSE_GRACE_MS. */

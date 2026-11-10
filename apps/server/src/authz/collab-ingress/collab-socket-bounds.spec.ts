@@ -6,7 +6,7 @@ import * as Y from 'yjs';
 import { Hocuspocus } from '@hocuspocus/server';
 import { CollabWsAdapter } from '../../collaboration/adapter/collab-ws.adapter';
 import { PAGE_MAX_YDOC_BYTES, PAGE_MAX_YDOC_BYTES_CEILING } from '../page-write/page-size';
-import { COLLAB_HOCUSPOCUS_OPTIONS, COLLAB_MAX_PAYLOAD_BYTES, COLLAB_PREAUTH_BYTES, COLLAB_WS_SERVER_OPTIONS } from './limits';
+import { COLLAB_HOCUSPOCUS_OPTIONS, COLLAB_MAX_PAYLOAD_BYTES, COLLAB_PREAUTH_SOCKET_BYTES, COLLAB_WS_SERVER_OPTIONS } from './limits';
 import { collabPreAuthSlots } from './preauth-slots';
 
 /**
@@ -143,14 +143,14 @@ describe('#790 Hocuspocus options (a real Hocuspocus 4.7.1 with the gateway cons
   }
 
   it('pins the values', () => {
-    expect(COLLAB_HOCUSPOCUS_OPTIONS).toEqual({ maxPendingDocuments: 1, maxUnauthenticatedQueueSize: COLLAB_PREAUTH_BYTES });
-    expect(COLLAB_PREAUTH_BYTES).toBe(256 * 1024);
+    expect(COLLAB_HOCUSPOCUS_OPTIONS).toEqual({ maxPendingDocuments: 1, maxUnauthenticatedQueueSize: COLLAB_PREAUTH_SOCKET_BYTES });
+    expect(COLLAB_PREAUTH_SOCKET_BYTES).toBe(COLLAB_MAX_PAYLOAD_BYTES);
   });
 
-  it('an honest pre-auth send (a SyncStep1 and an awareness state) fits in the pre-auth queue; past the bound terminates', () => {
+  it('one maximum honest frame (a busy page\'s SyncStep1, a cached page) fits in the pre-auth queue; a byte more terminates', () => {
     const hp = new Hocuspocus({ ...COLLAB_HOCUSPOCUS_OPTIONS });
     const c = connect(hp);
-    c.deliver(frameOf(COLLAB_PREAUTH_BYTES - 64));
+    c.deliver(frameOf(COLLAB_MAX_PAYLOAD_BYTES - 64));
     c.deliver(frameOf(64));
     expect(c.socket.closed).toBeNull();
     c.deliver(frameOf(64));
@@ -158,11 +158,11 @@ describe('#790 Hocuspocus options (a real Hocuspocus 4.7.1 with the gateway cons
     c.close();
   });
 
-  it('anti-vacuity: under the upstream default (5 MiB) a 1 MiB pre-auth backlog would be held', () => {
+  it('anti-vacuity: under the upstream default (5 MiB) that maximal frame would terminate', () => {
     const hp = new Hocuspocus({});
     const c = connect(hp);
-    c.deliver(frameOf(MiB));
-    expect(c.socket.closed).toBeNull();
+    c.deliver(frameOf(COLLAB_MAX_PAYLOAD_BYTES - 64));
+    expect(c.socket.closed).toBe(RESET_CONNECTION);
     c.close();
   });
 

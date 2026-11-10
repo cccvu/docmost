@@ -25,26 +25,37 @@ export const COLLAB_WS_SERVER_OPTIONS: ServerOptions & { maxFragments: number; m
 };
 
 /**
- * Bytes one socket may send before it is authenticated (preauth-slots.ts, counted on its TCP socket, so a partial frame
- * ws is still assembling counts too); past it the socket is terminated. An honest provider sends only its Auth frame,
- * its SyncStep1 (a state vector: a few bytes per client id the document has seen), its awareness state (at most 8 KiB)
- * and any keystrokes made while the token verifies before it is authenticated; offline content is exchanged after (its
- * Step2 answers the server's Step1). A socket cut off here reconnects, and the content syncs then.
+ * Bytes ONE socket may send before it is authenticated (preauth-slots.ts, counted on its TCP socket, so a partial frame
+ * ws is still assembling counts too): the largest frame the server accepts at all (`maxPayload`). Before it is
+ * authenticated an honest provider sends its Auth frame, its SyncStep1 and its awareness state, and what it holds that
+ * the socket has not sent: keystrokes made while the token verifies, edits queued while it was offline, and a page's
+ * cached copy that its local store (y-indexeddb) loaded after the socket opened. A SyncStep1 is the page's whole state
+ * vector, about 7 bytes for every client id that ever wrote to the page, which is never pruned, so on a page written to
+ * by many sessions (every API write and every editing session adds one) it can be hundreds of KiB. A per-socket cap
+ * below a maximal frame would cut such a page off for every editor, so the bound on the total is the next constant.
  */
-export const COLLAB_PREAUTH_BYTES = 256 * 1024;
+export const COLLAB_PREAUTH_SOCKET_BYTES = COLLAB_MAX_PAYLOAD_BYTES;
 /**
- * Unauthenticated collab sockets per process (preauth-slots.ts): past it the upgrade is refused 503. Each holds at most
- * COLLAB_PREAUTH_BYTES of received bytes (its pre-auth queue and any partial frame are both made of them) plus its
- * objects (ws, Hocuspocus, timers: budgeted at 64 KiB), so all of them together hold at most 512 x 320 KiB = 160 MiB of
+ * Bytes ALL unauthenticated sockets together may hold (preauth-slots.ts). Past it, the socket holding the most is
+ * terminated, until the total is back under: an honest unauthenticated socket holds a few KiB to a few hundred, so a
+ * client that fills the budget loses its own largest sockets first.
+ */
+export const COLLAB_PREAUTH_TOTAL_BYTES = 128 * 1024 * 1024;
+/**
+ * Unauthenticated collab sockets per process (preauth-slots.ts): past it the upgrade is refused 503. Together they hold
+ * at most COLLAB_PREAUTH_TOTAL_BYTES of received bytes (their pre-auth queues and partial frames are both made of them)
+ * plus their objects (ws, Hocuspocus, timers: budgeted at 64 KiB each), so at most 128 MiB + 512 x 64 KiB = 160 MiB of
  * native memory. The task is 4096 MiB and its V8 and Go heap caps sum to 3072 MiB (docmost 1024, its conversion worker
  * 1024, platform 512, SpiceDB 512; ecs.tf, check-infra-config §27), so everything outside a heap (Buffers, ws, stacks,
  * code) shares the remaining 1024 MiB; this bound takes under a sixth of it.
  *
- * The pool is sized so that no one source can hold it: the edge allows each client address 2000 requests per 5 minutes
- * (the WAF's rate rules, on both the proxied and the direct path), so with COLLAB_PREAUTH_DEADLINE_MS one source holds
- * at most about 2000 / 300 s x 10 s = 67 unauthenticated sockets at a time, under a seventh of the pool. A socket whose
- * authentication is refused is closed at once (bounded-socket.ts), so it holds its slot for one round trip, and an
- * honest socket for one token verify and its reads.
+ * Holding the pool: the edge allows each client address 2000 requests per 5 minutes (the WAF's rate rules, on both the
+ * proxied and the direct path). The count is per 5-minute window, so one address CAN burst 512 upgrades at once and hold
+ * the whole pool for COLLAB_PREAUTH_DEADLINE_MS, about three more times before its window blocks it (roughly 40 s of
+ * refused collab opens per 5 minutes). Held continuously, at its average rate, one address holds about
+ * 2000 / 300 s x 10 s = 67 sockets, under a seventh of the pool, so a sustained hold takes about eight addresses. A
+ * socket whose authentication is refused is closed at once (bounded-socket.ts), so it holds its slot for one round
+ * trip, and an honest socket for one token verify and its reads.
  */
 export const COLLAB_PREAUTH_SOCKETS = 512;
 /** A socket not authenticated this long after it opened is terminated (preauth-slots.ts). 4.7.1's own is 60–120 s. */
@@ -55,7 +66,7 @@ export const COLLAB_PREAUTH_CLOSE_GRACE_MS = 2_000;
 /** Hocuspocus 4.7.1 options; the rest stay at upstream defaults (1000 queued messages, 60 s `timeout`). */
 export const COLLAB_HOCUSPOCUS_OPTIONS = {
   maxPendingDocuments: 1, // Docmost opens one document per socket (page-editor.tsx); the default is 100
-  maxUnauthenticatedQueueSize: COLLAB_PREAUTH_BYTES, // never more than the socket may send before it is authenticated
+  maxUnauthenticatedQueueSize: COLLAB_PREAUTH_SOCKET_BYTES, // never more than the socket may send before it is authenticated
 } as const;
 
 /**
