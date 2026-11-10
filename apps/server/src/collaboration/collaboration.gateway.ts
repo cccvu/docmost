@@ -21,6 +21,7 @@ import RedisClient from 'ioredis';
 import { pack, unpack } from 'msgpackr';
 import { nanoid } from 'nanoid';
 import * as os from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { CollabWsAdapter } from './adapter/collab-ws.adapter';
 import {
   CollaborationHandler,
@@ -31,6 +32,9 @@ import {
 import { disconnectUserConnections } from '../authz/collab/disconnect-user-connections';
 import { CollabUpdateGuardExtension } from '../authz/collab-ingress/collab-update-guard.extension'; // CCC seam #3 (#781)
 import { keepCollabSocketAlive } from '../authz/collab-ingress/socket-keepalive'; // CCC seam #3 (#790)
+import { COLLAB_HOCUSPOCUS_OPTIONS } from '../authz/collab-ingress/limits'; // CCC seam #3 (#790)
+import { BoundedCollabSocket } from '../authz/collab-ingress/bounded-socket'; // CCC seam #3 (#790)
+import { admitCollabFrame } from '../authz/collab-ingress/frame-address'; // CCC seam #3 (#790)
 
 @Injectable()
 export class CollaborationGateway {
@@ -63,6 +67,7 @@ export class CollaborationGateway {
       // "not resident ⇒ row authoritative" invariant holds, and RedisSync releases the doc lock on unload as
       // designed. See UPSTREAM_MODIFICATIONS.md. (Upstream default is true; Docmost had set it to false.)
       unloadImmediately: true,
+      ...COLLAB_HOCUSPOCUS_OPTIONS, // CCC #790: pending documents and the pre-auth queue (authz/collab-ingress/limits)
       extensions: [
         new CollabUpdateGuardExtension(), // CCC #781: refuses a malformed frame before it applies; first, synchronous
         this.authenticationExtension,
@@ -101,7 +106,9 @@ export class CollaborationGateway {
       method: request.method ?? 'GET',
       url: request.url ?? '/',
       headers: {
-        'sec-websocket-key': request.headers['sec-websocket-key'] ?? '',
+        // CCC #790: RedisSync's socket id rides in this header slot (every RedisSync peer reads it there), and is a
+        // server-made UUID: the client's own header would let one socket name another's connection.
+        'sec-websocket-key': randomUUID(),
         'sec-websocket-protocol':
           request.headers['sec-websocket-protocol'] ?? '',
       },
@@ -114,7 +121,11 @@ export class CollaborationGateway {
       const serializedHTTPRequest = this.serializeRequest(request);
       const socketId = serializedHTTPRequest.headers['sec-websocket-key'];
 
-      const wrappedSocket = new WsSocketWrapper(client);
+      // CCC #790: the outbound bound (authz/collab-ingress/bounded-socket)
+      const wrappedSocket = new BoundedCollabSocket(
+        client,
+        new WsSocketWrapper(client),
+      );
 
       // Route through RedisSync extension (this calls handleConnection internally)
       const clientConnection = this.redisSync.onSocketOpen(
@@ -125,6 +136,7 @@ export class CollaborationGateway {
       keepCollabSocketAlive(client, () => clientConnection.touch());
 
       client.on('message', (data: ArrayBuffer) => {
+        if (!admitCollabFrame(client, data)) return; // CCC #790: `page.<uuid>` only, before RedisSync keys it
         this.redisSync!.onSocketMessage(serializedHTTPRequest, data);
       });
 
@@ -138,11 +150,12 @@ export class CollaborationGateway {
     } else {
       // Fallback to direct Hocuspocus connection
       const clientConnection = this.hocuspocus.handleConnection(
-        client,
+        new BoundedCollabSocket(client, new WsSocketWrapper(client)), // CCC #790: the outbound bound
         toWebRequest(this.serializeRequest(request)),
       );
 
       client.on('message', (data: Buffer) => {
+        if (!admitCollabFrame(client, data)) return; // CCC #790: `page.<uuid>` only
         clientConnection.handleMessage(new Uint8Array(data));
       });
 

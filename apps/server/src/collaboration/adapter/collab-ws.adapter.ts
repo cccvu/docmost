@@ -1,10 +1,12 @@
 import { WebSocketServer } from 'ws';
+import { COLLAB_WS_SERVER_OPTIONS } from '../../authz/collab-ingress/limits'; // CCC (wiki-v2 #790)
 
 export class CollabWsAdapter {
   private readonly wss: WebSocketServer;
 
   constructor() {
-    this.wss = new WebSocketServer({ noServer: true });
+    // CCC (wiki-v2 #790, UPSTREAM_MODIFICATIONS): inbound frame bounds; Hocuspocus never configures ws.
+    this.wss = new WebSocketServer({ noServer: true, ...COLLAB_WS_SERVER_OPTIONS });
   }
 
   handleUpgrade(path: string, httpServer: any) {

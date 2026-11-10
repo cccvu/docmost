@@ -17,6 +17,7 @@ import { getPageId } from '../collaboration.util';
 import { JwtCollabPayload, JwtType } from '../../core/auth/dto/jwt-payload';
 import { UserSessionRepo } from '@docmost/db/repos/session/user-session.repo';
 import { isWsConnectionLive } from '../../authz/ws-connection/ws-connection-live';
+import { chargeCollabAuth } from '../../authz/collab-ingress/auth-rate';
 
 @Injectable()
 export class AuthenticationExtension implements Extension {
@@ -45,6 +46,9 @@ export class AuthenticationExtension implements Extension {
 
     const userId = jwtPayload.sub;
     const workspaceId = jwtPayload.workspaceId;
+
+    // CCC (wiki-v2 #790, UPSTREAM_MODIFICATIONS #213): a per-user rate on authentication, before any read.
+    chargeCollabAuth(userId);
 
     const user = await this.userRepo.findById(userId, workspaceId);
 
