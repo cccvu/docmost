@@ -34,7 +34,9 @@ const WS_ID = '33333333-3333-4333-8333-333333333333';
 const ADMIN_ID = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const TARGET = 'dddddddd-dddd-4ddd-8ddd-dddddddddddd';
 const ACCESS_ID = 'ffffffff-ffff-4fff-8fff-ffffffffffff';
-const admin = { id: ADMIN_ID } as unknown as User;
+// #797: a native workspace owner, so INV-4's ceiling passes (its admin disjunct) without adding the actor's own grant
+// to every ACL this spec versions; the ceiling itself is page-grant-ceiling.spec.ts's subject.
+const admin = { id: ADMIN_ID, role: 'owner' } as unknown as User;
 
 type Grant = { userId: string | null; groupId: string | null; role: string };
 

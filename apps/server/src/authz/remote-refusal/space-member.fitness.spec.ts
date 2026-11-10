@@ -16,7 +16,8 @@ import { routesOf } from './remote-refusal.table';
  *  - the routes whose handler checks `SpaceCaslAction.Manage, SpaceCaslSubject.Member` are EXACTLY the refused keys;
  *  - every `space_members` row write (Kysely or raw SQL): the three upstream repo sink methods, the workspace member
  *    delete (`WorkspaceService.deleteUser`, reached only from the refused `WorkspaceController.deleteWorkspaceMember`)
- *    and the service bridge's member writes (`ServiceSpaceService`, behind RemoteOnlyGuard + ServiceAuthGuard);
+ *    and the service bridge's member writes (`ServiceSpaceService`, behind RemoteOnlyGuard + ServiceAuthGuard; since #797
+ *    the add's upsert is its own `upsertMember`);
  *  - every hop from the three repo sinks up to a route:
  *      insertSpaceMember ← SpaceMemberService.{addUserToSpace, addGroupToSpace, addMembersToSpaceBatch}
  *        addUserToSpace  ← SpaceService.createSpace (refused, #598) and the first-run WorkspaceService.create
@@ -124,11 +125,12 @@ describe('native space-member writes are refused on every route that reaches the
       'database/repos/space/space-member.repo.ts:SpaceMemberRepo.insertSpaceMember',
       'database/repos/space/space-member.repo.ts:SpaceMemberRepo.removeSpaceMemberById',
       'database/repos/space/space-member.repo.ts:SpaceMemberRepo.updateSpaceMember',
-      'service-bridge/service-space.service.ts:ServiceSpaceService.addMember',
       'service-bridge/service-space.service.ts:ServiceSpaceService.changeMemberRole',
       'service-bridge/service-space.service.ts:ServiceSpaceService.create',
       'service-bridge/service-space.service.ts:ServiceSpaceService.createKeyed',
       'service-bridge/service-space.service.ts:ServiceSpaceService.removeMember',
+      // #797: the add's user/group upsert, called only from ServiceSpaceService.addMember (behind the bridge guards).
+      'service-bridge/service-space.service.ts:ServiceSpaceService.upsertMember',
     ]);
   });
 

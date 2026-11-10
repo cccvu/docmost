@@ -12,7 +12,13 @@
  *  - `identity_platform_owned`: in remote mode a user's email is identity, and the platform owns identity. A session
  *    holder that moves its own email into the reserved shadow namespace could be adopted by a later provisioning
  *    upsert (#636).
- * Reads stay reachable (members, invites list, group reads, `invites/info`): the remote SPA uses them as a member.
+ *  - `directory_platform_owned` (#797): the workspace directory — who is in the workspace, who is invited, which groups
+ *    exist and who is in them, who is in a space — is not shown to wiki users in remote mode. Upstream lets any
+ *    member read it (workspace CASL `Read` on Member/Group, space CASL `Read` on Member for any space reader); the
+ *    console, through the platform, is the governed view. The SPA's Settings > Members / Groups pages and the space
+ *    settings Members tab stop loading; nothing else in the SPA reads these routes (@mentions use `search/suggest`,
+ *    whose group results `PdpSearchService` gives only to a caller who administers the workspace or a space).
+ * `invites/info` (public, the invitation-acceptance page) stays reachable.
  *
  * Every key is pinned to a real route whose path equals `route`, families are disjoint, and each family's key set is
  * pinned both ways against the code that reaches its sink (`remote-refusal.fitness.spec.ts` and the family specs
@@ -25,7 +31,8 @@ export type RefusalFamilyId =
   | 'workspaceAdmin'
   | 'groupAdmin'
   | 'spaceMember'
-  | 'userEmail';
+  | 'userEmail'
+  | 'directoryRead';
 
 export interface RefusedRoute {
   /** The audit row's `metadata.route`: `POST <path>`, equal to the scanned route's path (the fitness spec pins it). */
@@ -49,7 +56,7 @@ export interface RefusalFamily {
   readonly id: RefusalFamilyId;
   readonly event: string;
   readonly resourceType: 'space' | 'workspace' | 'group' | 'user';
-  readonly reason: 'archive_only' | 'platform_only' | 'identity_platform_owned';
+  readonly reason: 'archive_only' | 'platform_only' | 'identity_platform_owned' | 'directory_platform_owned';
   /** Keyed `<ControllerClass>.<handler>`. */
   readonly routes: ReadonlyMap<string, RefusedRoute>;
 }
@@ -137,6 +144,22 @@ export const REMOTE_REFUSAL_FAMILIES: readonly RefusalFamily[] = [
     resourceType: 'user',
     reason: 'identity_platform_owned',
     routes: new Map([['UserController.updateUser', { route: 'POST /api/users/update', when: changesEmail }]]),
+  },
+  {
+    // #797: no `resourceIdField`: the rows' resource is the workspace directory, and a space or group id the caller
+    // named is not recorded against a `workspace` resource type.
+    id: 'directoryRead',
+    event: 'directory.native_read_refused',
+    resourceType: 'workspace',
+    reason: 'directory_platform_owned',
+    routes: new Map<string, RefusedRoute>([
+      ['WorkspaceController.getWorkspaceMembers', { route: 'POST /api/workspace/members' }],
+      ['WorkspaceController.getInvitations', { route: 'POST /api/workspace/invites' }],
+      ['GroupController.getWorkspaceGroups', { route: 'POST /api/groups' }],
+      ['GroupController.getGroup', { route: 'POST /api/groups/info' }],
+      ['GroupController.getGroupMembers', { route: 'POST /api/groups/members' }],
+      ['SpaceController.getSpaceMembers', { route: 'POST /api/spaces/members' }],
+    ]),
   },
 ];
 

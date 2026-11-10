@@ -154,7 +154,12 @@ export function PagePermissionTab({
           {canManage && (
             <Group gap="xs" align="flex-end">
               <Box style={{ flex: 1 }}>
-                <MultiMemberSelect value={memberIds} onChange={setMemberIds} />
+                {/* CCC (wiki-v2 #797, INV-6): restricted pages take per-person grants only. */}
+                <MultiMemberSelect
+                  value={memberIds}
+                  onChange={setMemberIds}
+                  includeGroups={false}
+                />
               </Box>
               <Select
                 data={pagePermissionRoleData.map((r) => ({

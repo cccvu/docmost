@@ -64,8 +64,17 @@ describe('narrowing route table', () => {
       'GroupController.removeGroupMember',
       'ServiceSpaceController.archive',
       'ServiceSpaceController.removeMember',
+      'ServiceGroupController.removeMember', // #797
     ]) {
       expect(NARROWING_ROUTES.has(key)).toBe(true);
     }
+  });
+
+  // #797: of the governed group routes, only the member removal narrows (an add, a rename, the ensure only widen or
+  // change nothing; a delete is refused while the group grants anything). A new group route must be decided here.
+  it('settles exactly the governed group member removal among the group control plane routes', () => {
+    const groupRoutes = [...routes].filter((k) => k.startsWith('ServiceGroupController.')).sort();
+    expect(groupRoutes.length).toBeGreaterThanOrEqual(11);
+    expect(groupRoutes.filter((k) => NARROWING_ROUTES.has(k))).toEqual(['ServiceGroupController.removeMember']);
   });
 });

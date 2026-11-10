@@ -94,6 +94,8 @@ d('PageRestrictionService self-dealing SQL on real Postgres (#486)', () => {
     await pg`alter table page_permissions add column added_by_id uuid,
              add column updated_at timestamptz not null default now()`;
     await pg`create table group_users (user_id uuid not null, group_id uuid not null, primary key (user_id, group_id))`;
+    // #797: INV-4's settle fence reads the max committed outbox position (empty here: nothing is projected).
+    await pg`create table authz_outbox (xact_id xid8 not null default pg_current_xact_id(), id bigserial not null)`;
     // The rest of upstream `PageRepo.findById`'s base fields, so the real repo can run here.
     await pg`alter table pages add column cover_photo varchar, add column is_locked boolean not null default false,
              add column is_base boolean not null default false, add column contributor_ids uuid[]`;
@@ -122,9 +124,16 @@ d('PageRestrictionService self-dealing SQL on real Postgres (#486)', () => {
         // here (the unit spec pins it), so it always allows and is kept out of `pdpCalls`/`pdpAnswer`.
         const [c] = checks as Array<{ permission: string; resourceType: string }>;
         if (checks.length === 1 && c.permission === 'administer' && c.resourceType === 'space') return [true];
+        // #797 INV-4's ceiling (space view + workspace admin_cascade, then the settled page check) is not under test
+        // here either (page-grant-ceiling.pg.spec.ts is): it allows, outside `pdpCalls`/`pdpAnswer`.
+        const ceiling = checks.some((x) => (x as { permission: string }).permission === 'admin_cascade');
+        if (ceiling || (checks.length === 1 && c.resourceType === 'page' && c.permission === 'view')) {
+          return checks.map(() => true);
+        }
         pdpCalls.push({ subject, checks });
         return pdpAnswer;
       },
+      settleProjection: async () => ({ status: 'confirmed' as const }),
     };
     svc = new PageRestrictionService(
       db as any,
@@ -288,16 +297,16 @@ d('PageRestrictionService self-dealing SQL on real Postgres (#486)', () => {
       expect(await grants(P)).toEqual([]);
     });
 
-    it('grants a group the actor is not in', async () => {
+    it('a group the actor is not in passes A1, then INV-6 refuses it (#797: per-user grants only), writing nothing', async () => {
       await page(P, null);
       await restrictRow(P);
-      await svc.addPermission(
-        { pageId: P, groupIds: [THEIR_GROUP], role: 'reader' } as any,
-        actor,
-      );
-      expect(await grants(P)).toEqual([
-        { userId: null, groupId: THEIR_GROUP, role: 'reader' },
-      ]);
+      await expect(
+        svc.addPermission(
+          { pageId: P, groupIds: [THEIR_GROUP], role: 'reader' } as any,
+          actor,
+        ),
+      ).rejects.toMatchObject({ response: { code: 'group_grant_not_allowed_on_restricted_page' } });
+      expect(await grants(P)).toEqual([]);
     });
 
     it('refuses re-roling a group grant the actor belongs to', async () => {

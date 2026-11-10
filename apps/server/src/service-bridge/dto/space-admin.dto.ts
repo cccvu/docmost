@@ -6,7 +6,11 @@ import {
   Matches,
   MaxLength,
   MinLength,
+  Validate,
   ValidateIf,
+  ValidationArguments,
+  ValidatorConstraint,
+  ValidatorConstraintInterface,
 } from 'class-validator';
 import { IsExpectedVersion } from '../resource-version';
 import {
@@ -23,7 +27,29 @@ import {
 export const SPACE_ROLES = ['admin', 'writer', 'reader'] as const;
 export type SpaceMemberRole = (typeof SPACE_ROLES)[number];
 
-const EXTERNAL_ID = /^[A-Za-z0-9._+-]{1,128}$/;
+/** An integrator identity's opaque externalId (never a Docmost id). Shared by every service-bridge DTO that names one. */
+export const EXTERNAL_ID = /^[A-Za-z0-9._+-]{1,128}$/;
+
+/**
+ * #797: how an add treats an existing live membership. `set` (the default, the pre-#797 behaviour) writes exactly
+ * `role` — it can demote. `atLeast` never lowers: a live membership already at or above `role` is left as it is (the
+ * add answers `applied: false`), which is what a bulk "give these people/groups access" fan-out wants.
+ */
+export const ADD_MEMBER_MODES = ['set', 'atLeast'] as const;
+export type AddMemberMode = (typeof ADD_MEMBER_MODES)[number];
+
+/** #797: a member write names exactly one subject — a user (`externalId`) or a group (`groupId`). */
+@ValidatorConstraint({ name: 'exactlyOneMemberSubject' })
+export class ExactlyOneMemberSubject implements ValidatorConstraintInterface {
+  validate(_value: unknown, args: ValidationArguments): boolean {
+    const o = args.object as { externalId?: unknown; groupId?: unknown };
+    return (o.externalId === undefined) !== (o.groupId === undefined);
+  }
+
+  defaultMessage(): string {
+    return 'exactly one of externalId or groupId is required';
+  }
+}
 
 export class CreateSpaceDto {
   @IsString()
@@ -101,13 +127,28 @@ export class ExpectedVersionDto {
 }
 
 export class AddSpaceMemberDto {
-  /** The platform identity to add, as its opaque externalId — resolved to a shadow user server-side. */
+  /**
+   * The platform identity to add, as its opaque externalId — resolved to a shadow user server-side. #797: exactly one
+   * of `externalId` and `groupId`.
+   */
+  @ValidateIf((o: AddSpaceMemberDto) => o.groupId === undefined)
   @IsString()
   @Matches(EXTERNAL_ID, { message: 'externalId must be 1-128 chars of [A-Za-z0-9._+-]' })
-  externalId!: string;
+  externalId?: string;
+
+  /** #797: the Docmost group to add (a group of this workspace, never the default group). */
+  @ValidateIf((o: AddSpaceMemberDto) => o.externalId === undefined)
+  @IsUUID()
+  groupId?: string;
 
   @IsIn(SPACE_ROLES)
+  @Validate(ExactlyOneMemberSubject)
   role!: SpaceMemberRole;
+
+  /** #797: `set` (default) or `atLeast` (never lowers an existing live membership). */
+  @IsOptional()
+  @IsIn(ADD_MEMBER_MODES)
+  mode?: AddMemberMode;
 
   /** The acting admin's externalId (the `added_by` FK). */
   @IsString()
@@ -137,7 +178,7 @@ export type SpaceMemberPreviewAction = (typeof SPACE_MEMBER_PREVIEW_ACTIONS)[num
 
 /**
  * #616: `POST service/spaces/:spaceId/members/preview` — `action` plus the body of the real write it previews:
- *   add    → `externalId`, `role`, `addedByExternalId`            (as `POST …/members`)
+ *   add    → `externalId` | `groupId`, `role`, `addedByExternalId`, `mode?` (as `POST …/members`)
  *   update → `memberId`, `role`, `actorExternalId`, `expectedVersion?` (as `PATCH …/members/:memberId`)
  *   remove → `memberId`, `expectedVersion?`                        (as `DELETE …/members/:memberId`)
  * Each field is validated as the real route validates it; a field the action does not take is ignored, and one it
@@ -151,6 +192,16 @@ export class SpaceMemberPreviewDto {
   @IsString()
   @Matches(EXTERNAL_ID, { message: 'externalId must be 1-128 chars of [A-Za-z0-9._+-]' })
   externalId?: string;
+
+  /** #797: an add of a GROUP (instead of `externalId`; exactly one of the two for `add`). */
+  @IsOptional()
+  @IsUUID()
+  groupId?: string;
+
+  /** #797: as on the real add. */
+  @IsOptional()
+  @IsIn(ADD_MEMBER_MODES)
+  mode?: AddMemberMode;
 
   @IsOptional()
   @IsString()

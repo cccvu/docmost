@@ -85,7 +85,7 @@ function renderModal() {
 }
 
 describe("SpaceSettingsModal — members management gating", () => {
-  it("remote mode: shows the Admin Console note, no Add button, read-only list", () => {
+  it("remote mode: shows the Admin Console note, no Add button and no member list (#797)", () => {
     nativeState.value = false; // remote
     renderModal();
 
@@ -94,9 +94,9 @@ describe("SpaceSettingsModal — members management gating", () => {
     expect(link.getAttribute("href")).toBe("/console");
 
     expect(screen.queryByTestId("add-members")).toBeNull();
-    expect(screen.getByTestId("members-list").getAttribute("data-readonly")).toBe(
-      "true",
-    );
+    // The server refuses the native member read in remote mode (directoryRead, 404), so the
+    // list is not rendered at all: an empty table would read as "no members".
+    expect(screen.queryByTestId("members-list")).toBeNull();
   });
 
   it("native/standalone mode: keeps the Add button and editable list, no note", () => {

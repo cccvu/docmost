@@ -43,6 +43,7 @@ import {
 import { mobileSidebarAtom } from "@/components/layouts/global/hooks/atoms/sidebar-atom.ts";
 import { useToggleSidebar } from "@/components/layouts/global/hooks/hooks/use-toggle-sidebar.ts";
 import { useSettingsNavigation } from "@/hooks/use-settings-navigation";
+import { isNativeAuthEnabled } from "@/features/auth-native/lib/auth-mode.ts";
 
 type DataItem = {
   label: string;
@@ -51,6 +52,8 @@ type DataItem = {
   feature?: string;
   role?: "admin" | "owner";
   env?: "cloud" | "selfhosted";
+  /** CCC (wiki-v2 #797): a native directory screen the server does not serve in remote mode. */
+  nativeOnly?: true;
 };
 
 type DataGroup = {
@@ -88,7 +91,12 @@ const groupedData: DataGroup[] = [
         path: "/settings/workspace",
         role: "admin",
       },
-      { label: "Members", icon: IconUsers, path: "/settings/members" },
+      {
+        label: "Members",
+        icon: IconUsers,
+        path: "/settings/members",
+        nativeOnly: true,
+      },
       {
         label: "Billing",
         icon: IconCoin,
@@ -103,7 +111,12 @@ const groupedData: DataGroup[] = [
         feature: Feature.SECURITY_SETTINGS,
         role: "admin",
       },
-      { label: "Groups", icon: IconUsersGroup, path: "/settings/groups" },
+      {
+        label: "Groups",
+        icon: IconUsersGroup,
+        path: "/settings/groups",
+        nativeOnly: true,
+      },
       { label: "Spaces", icon: IconSpaces, path: "/settings/spaces" },
       { label: "Public sharing", icon: IconWorld, path: "/settings/sharing" },
       {
@@ -185,6 +198,10 @@ export default function SettingsSidebar({
     // disabled with an "Available with a paid license" tooltip). This is an
     // internal tool — advertising unbuyable paid features is pure noise.
     if (item.feature && !hasFeature(item.feature)) return false;
+    // CCC (wiki-v2 #797): in remote mode members and groups are managed in the Admin
+    // Console and the server refuses the native directory reads (404), so these screens
+    // would show empty tables. Hidden (which also drops their hover prefetch).
+    if (item.nativeOnly && !isNativeAuthEnabled()) return false;
     return true;
   };
 

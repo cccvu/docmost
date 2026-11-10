@@ -35,6 +35,7 @@ import {
   asEngineBusy,
   assertExpectedVersion,
   boundWaits,
+  engineBusy,
   PreviewOutcome,
   PreviewRollback,
   refusal,
@@ -43,7 +44,27 @@ import {
 import { AclEffect, AclState, aclVersionOf, diffAcl, isNoop, noEffect, readAclState } from './acl-state';
 import { AUDIT_SERVICE, IAuditService } from '../../integrations/audit/audit.service';
 import { AuditLogPayload } from '../../common/events/audit-events';
-import { AclAuditAction, aclAuditPayload, aclRefusalAuditPayload } from './acl-audit';
+import {
+  ACL_ADMIN_OVERRIDE_LOG_TOKEN,
+  AclAuditAction,
+  aclAdminOverridePayload,
+  aclAuditPayload,
+  aclRefusalAuditPayload,
+} from './acl-audit';
+import {
+  ceilingPermission,
+  ceilingUnconfirmed,
+  CeilingDecision,
+  grantExceedsActor,
+  groupGrantNotAllowed,
+  listRestrictedPagesWithGroupGrants,
+  localRoleOf,
+  RestrictedGroupGrantPage,
+  roleCovers,
+  roleRank,
+} from './grant-ceiling';
+import { purgeSettleWaitMs, settle } from '../page-delete/page-delete-decision';
+import { UserRole } from '../../common/helpers/types/permission';
 
 /** A1 (#486): the 403 body carries a machine-readable `code`, the same one rule M uses on the bridge. */
 const selfGrant = () =>
@@ -90,6 +111,16 @@ interface RunOptions {
   page?: Page;
 }
 
+/**
+ * #797 INV-4: what the ceiling learns BEFORE the ACL lock — never page-level facts (those are decided under the lock).
+ * Remote: the human's `space#view` (page access needs it) and `workspace#admin_cascade`; native: the actor passed
+ * `authorize` (space admin ⊇ view), and the admin disjunct is upstream's workspace owner/admin role.
+ */
+interface CeilingInputs {
+  spaceView: boolean;
+  admin: boolean;
+}
+
 interface AclRun {
   outcome: 'applied' | 'noop';
   version: string;
@@ -98,6 +129,8 @@ interface AclRun {
   page: Page;
   /** Set by a restrict that wrote: the space whose socket.io restriction cache is dropped after the commit. */
   invalidateSpace?: string;
+  /** #797: set by a grant (add, or an update that raises) once INV-4 passed — `settle` audits an admin override. */
+  ceiling?: CeilingDecision;
 }
 
 /**
@@ -123,25 +156,42 @@ interface AclRun {
  * Recovering a page nobody can manage is a two-identity re-grant, never a one-admin lift: a space or workspace
  * admin grants writer to a DIFFERENT admin (A1 refuses a self-grant), who lifts or edits it under A3; the binding is
  * removed afterwards, and every step is audited (ADR 0025, #673/#504 amendment).
- * The PDP is only ever asked space administer/view/edit and page edit here — never `locked` (issue 499).
+ * The PDP is only ever asked space administer/view/edit, workspace admin_cascade and page view/edit here — never
+ * `locked` (issue 499).
  *
  * Versioned writes (#616): each of the five writes is ONE transaction under a per-page ACL lock (`aclTx`), with every
  * repo write passed that transaction, so a write lands whole or not at all — outbox rows included, since the capture
  * trigger writes them in the same transaction. Inside it the ACL is re-read, its version compared with the caller's
  * optional `expectedVersion` (412 `precondition_failed`, nothing changed), and the write re-validated against what
- * the lock now protects (still restricted, grant still there, A3's children). The PDP reads (A2, A3) and the A1
- * group probe stay BEFORE the lock: no HTTP call is ever made while holding it. Each write answers the ACL's new
+ * the lock now protects (still restricted, grant still there, A3's children). The PDP reads (A2, A3, INV-4's inputs)
+ * and the A1 group probe stay BEFORE the lock. The one exception is INV-4's page-level read (#797), which must follow
+ * a settle fence read under the lock; it runs only when the actor's own rows do not decide, while the transaction holds
+ * no xid (see `decideCeiling`). Each write answers the ACL's new
  * `version` and its `effect`; `preview` runs the same code and rolls it back.
  *
  * Audit (#503): each APPLIED write emits exactly one domain-audit row (`acl-audit.ts`: upstream event names, ids and
  * roles only, `metadata.surface: 'engine'`) after its transaction commits. A write REFUSED as self-dealing
- * (`self_grant`, `actor_cannot_edit`; #673) emits exactly one `page.acl_write_refused` row instead (ids only), and
+ * (`self_grant`, `actor_cannot_edit`; #673; `grant_exceeds_actor`, #797) emits exactly one `page.acl_write_refused` row instead (ids only), and
  * still answers its 403. A no-op, any other refusal, a busy or failed transaction and a preview emit nothing; a
  * broken audit sink never fails a committed write and never changes a refusal.
+ *
+ * Grant ceilings (#797), on every path that lands here (the native route and the platform relay, which calls the same
+ * route as the relayed human — the fork cannot tell them apart, so nothing here depends on which it is), real or preview:
+ *   - INV-4 (A4): a grant never exceeds the acting human. Granting reader needs their own page `view`, granting writer
+ *     (add, or an update that RAISES reader → writer) needs page `edit` — or the workspace-admin disjunct
+ *     (`workspace#admin_cascade`; native: upstream's owner/admin role). Refused: 403 `grant_exceeds_actor`, audited
+ *     `page.acl_write_refused`. A grant that passes ONLY through the admin disjunct is applied and audited a second
+ *     time as `page.acl_admin_override_grant` (log token `PAGE_ACL_ADMIN_OVERRIDE`). Lowering and removal stay open.
+ *     See `decideCeiling` for how it is decided (local rows under the lock first; the PDP after a settle fence).
+ *   - INV-6: a restricted page takes per-user grants only: a group on an add, or a group raise, is 400
+ *     `group_grant_not_allowed_on_restricted_page` (the default group included — INV-5). Existing group grants are
+ *     grandfathered: they keep resolving (and count as the actor's own access above), and can be lowered or removed.
  */
 @Injectable()
 export class PageRestrictionService {
   private readonly logger = new Logger(PageRestrictionService.name);
+  /** #797: the settle wait for INV-4's page-level PDP read — the same knob and cap as the remote purge's fence. */
+  private readonly settleMs = purgeSettleWaitMs();
 
   constructor(
     @InjectKysely() private readonly db: KyselyDB,
@@ -219,6 +269,103 @@ export class PageRestrictionService {
       throw new ServiceUnavailableException('authorization is unavailable; the restriction was not removed — retry');
     }
     return res[0];
+  }
+
+  /**
+   * #797 INV-4, step 1 (BEFORE the ACL lock, so the common path makes no HTTP call while holding it): the facts that do
+   * not depend on this page's restriction — they cannot be made stale by a restrict racing the grant.
+   *
+   * Remote: ONE strict bulk read for the HUMAN, `space#view` + `workspace#admin_cascade` (no answer, or a malformed one
+   * → 503 before anything is locked). The admin disjunct is decided on the human ONLY and never intersected with a
+   * service-account leg: a recorded exception to the #617 intersection rule (plan §2a; pinned by
+   * `page-grant-ceiling.spec.ts`). A delegated caller's service account never holds `admin_cascade` (#506, ADR 0025),
+   * so intersecting it would make the disjunct unreachable through the relay, where workspace admins legitimately
+   * grant; the override audit row is what makes each such reach visible instead.
+   * Native (no PDP): `authorize` already required space admin (⊇ view); the admin disjunct is the workspace
+   * owner/admin role, which native mode treats as authority (remote mode never reads `users.role`, #636).
+   */
+  private async ceilingInputs(page: Page, user: User): Promise<CeilingInputs> {
+    if (this.mode !== 'remote') {
+      const role = (user as { role?: string | null }).role;
+      return { spaceView: true, admin: role === UserRole.OWNER || role === UserRole.ADMIN };
+    }
+    const res = await this.authz.tryCheckBulk(this.subject(user), [
+      { permission: 'view', resourceType: 'space', resourceId: page.spaceId },
+      { permission: 'admin_cascade', resourceType: 'workspace', resourceId: page.workspaceId },
+    ]);
+    if (!res || res.length !== 2) {
+      throw new ServiceUnavailableException('authorization is unavailable; the page access was not changed — retry');
+    }
+    return { spaceView: res[0] === true, admin: res[1] === true };
+  }
+
+  /**
+   * #797 INV-4, step 2 — INSIDE the ACL transaction, under the page's ACL lock, after the ACL was re-read and BEFORE
+   * anything is written. `need` is the role being granted (reader → page `view`, writer → page `edit`).
+   *
+   *   1. Local rows: the actor's own live grant on this page (direct, or through a group they are in — a grandfathered
+   *      group grant counts), read on the locked state. On a restricted page that grant plus `space#view` IS page
+   *      access in the schema (`page_grant_* & space->view`; nothing writes `banned`), and it cannot be stale: every
+   *      ACL writer of this page waits for the lock. Covers → allowed, with no fence and no further PDP call.
+   *   2. No `space#view` and no admin → refused: every page-level path in the schema needs `space->view`.
+   *   3. Otherwise the remainder (a page-scoped role binding; or classifying a workspace admin) needs the PDP's
+   *      page-level answer, and only AFTER the settle fence: the platform's watermark lags, so a grant racing a
+   *      just-committed restriction would otherwise pass on a stale `space->view - locked`. The fence position is the
+   *      max COMMITTED outbox position read on this transaction now — after the ACL (so this page's restriction) was
+   *      read under the lock: the remote-purge precedent. The transaction holds NO xid here (an advisory lock and reads
+   *      only; every write, and update's row lock, comes after this call), so it does not hold the relay back
+   *      (AGENTS.md; the pg spec asserts no backend holds an xid while the fence is awaited).
+   *      Confirmed → a strict PDP page check: allowed → `page_access`; denied → admin ? `admin_override` : 403.
+   *      Not confirmed, or the PDP failed → admin ? `admin_override` marked unconfirmed (audited as an override, never
+   *      less) : 503 (`grant_ceiling_unconfirmed`, or the PDP's own 503). A disabled fence (`0`) proves nothing → 403.
+   * Native: step 1, else the owner/admin disjunct, else 403 — no PDP, no fence.
+   */
+  private async decideCeiling(
+    trx: KyselyTransaction,
+    page: Page,
+    user: User,
+    state: AclState,
+    need: PageGrantRole,
+    pre: CeilingInputs,
+  ): Promise<CeilingDecision> {
+    const local = await localRoleOf(trx, user.id, state.grants);
+    if (roleCovers(local, need) && pre.spaceView) return { basis: 'grant', role: need };
+    if (this.mode !== 'remote') {
+      if (pre.admin) return { basis: 'admin_override', role: need };
+      throw grantExceedsActor(need);
+    }
+    if (!pre.spaceView && !pre.admin) throw grantExceedsActor(need);
+
+    const settled = await settle(this.authz, trx, this.settleMs);
+    if (!settled.ok) {
+      if (pre.admin) return { basis: 'admin_override', role: need, pageAccessUnconfirmed: true };
+      if (settled.reason === 'settle-disabled') throw grantExceedsActor(need);
+      this.logger.warn(
+        `PAGE_ACL_CEILING_UNCONFIRMED reason=${settled.reason}${settled.position ? ` position=${settled.position}` : ''}: answered 503`,
+      );
+      throw ceilingUnconfirmed();
+    }
+    const res = await this.authz.tryCheckBulk(this.subject(user), [
+      { permission: ceilingPermission(need), resourceType: 'page', resourceId: page.id },
+    ]);
+    if (!res || res.length !== 1) {
+      if (pre.admin) return { basis: 'admin_override', role: need, pageAccessUnconfirmed: true };
+      throw new ServiceUnavailableException('authorization is unavailable; the page access was not changed — retry');
+    }
+    if (res[0] === true) return { basis: 'page_access', role: need };
+    if (pre.admin) return { basis: 'admin_override', role: need };
+    throw grantExceedsActor(need);
+  }
+
+  /**
+   * #797 INV-6 report: the grandfathered group grants on restricted pages in `workspaceId` (read-only, keyset-paged),
+   * for the console report through a later service-bridge read. No write path calls it.
+   */
+  async listRestrictedPagesWithGroupGrants(
+    workspaceId: string,
+    opts: { limit?: number; after?: { pageId: string; groupId: string } } = {},
+  ): Promise<RestrictedGroupGrantPage> {
+    return listRestrictedPagesWithGroupGrants(this.db, workspaceId, opts);
   }
 
   /**
@@ -418,12 +565,18 @@ export class PageRestrictionService {
       throw new BadRequestException('userIds or groupIds required');
     }
     await this.refuseSelfGrant(user, userIds, groupIds);
+    // #797 INV-6: per-user grants only (after A1, so a self-group attempt keeps its audited `self_grant`). Every add
+    // naming a group is refused, whatever the group holds: lowering a grandfathered group grant is update-permission.
+    if (groupIds.length > 0) throw groupGrantNotAllowed();
+    const pre = await this.ceilingInputs(page, user);
     return this.aclTx(page.id, !!run.preview, async (trx) => {
       const before = await readAclState(trx, page.id, page.workspaceId);
       const versionBefore = aclVersionOf(page.id, before);
       assertExpectedVersion(run.expectedVersion, versionBefore);
       if (!before.accessId) throw notRestricted(); // lifted since the pre-check
       const accessId = before.accessId;
+      // #797 INV-4: decided on the locked state, before the first write (no xid yet — see decideCeiling).
+      const ceiling = await this.decideCeiling(trx, page, user, before, dto.role, pre);
       // Replace any existing grant for these subjects so add is idempotent / doubles as a role change.
       await this.pagePermissionRepo.deletePagePermissionsByUserIds(accessId, userIds, trx);
       await this.pagePermissionRepo.deletePagePermissionsByGroupIds(accessId, groupIds, trx);
@@ -433,7 +586,7 @@ export class PageRestrictionService {
       ];
       await this.pagePermissionRepo.insertPagePermissions(perms, trx);
       const after = await readAclState(trx, page.id, page.workspaceId);
-      return this.ran(page, before, after, versionBefore);
+      return { ...this.ran(page, before, after, versionBefore), ceiling };
     });
   }
 
@@ -477,11 +630,30 @@ export class PageRestrictionService {
     const page = await this.authorize(dto.pageId, user, run);
     await this.refuseSelfGrant(user, dto.userId ? [dto.userId] : [], dto.groupId ? [dto.groupId] : []);
     await this.requireAccessId(dto.pageId);
+    // #797: only a writer update can raise (reader is the lowest role), so only it needs the ceiling's inputs — a
+    // lowering never waits on, or fails with, the PDP.
+    const pre = dto.role === 'writer' ? await this.ceilingInputs(page, user) : undefined;
     return this.aclTx(page.id, !!run.preview, async (trx) => {
       const before = await readAclState(trx, page.id, page.workspaceId);
       const versionBefore = aclVersionOf(page.id, before);
       assertExpectedVersion(run.expectedVersion, versionBefore);
       if (!before.accessId) throw notRestricted();
+      // #797: the grant's current role from the ACL read under the lock — BEFORE the row lock below, which gives this
+      // transaction an xid and must therefore come after INV-4's settle fence.
+      const current = before.grants.find((g) =>
+        dto.userId
+          ? g.userId?.toLowerCase() === dto.userId.toLowerCase()
+          : g.groupId?.toLowerCase() === dto.groupId!.toLowerCase(),
+      );
+      if (!current) {
+        throw refusal(new NotFoundException('no permission for this user or group on the page'), 'grant_not_found');
+      }
+      const raises = roleRank(dto.role) > roleRank(current.role);
+      // INV-6: a grandfathered group grant may be lowered (or left as it is), never raised.
+      if (raises && dto.groupId) throw groupGrantNotAllowed();
+      // INV-4: a raise grants writer, so it needs the actor's own page edit (or the admin disjunct). `pre` is set: a
+      // raise is always to writer.
+      const ceiling = raises ? await this.decideCeiling(trx, page, user, before, dto.role, pre!) : undefined;
       const grant = await trx
         .selectFrom('pagePermissions')
         .select(['id', 'role'])
@@ -493,13 +665,16 @@ export class PageRestrictionService {
       if (!grant) {
         throw refusal(new NotFoundException('no permission for this user or group on the page'), 'grant_not_found');
       }
+      // Every ACL writer of this page holds its ACL lock, so the row cannot have changed since `before`. If something
+      // outside that discipline changed it, the ceiling above was decided on the wrong role: retry, never apply.
+      if (grant.role !== current.role) throw engineBusy();
       await trx
         .updateTable('pagePermissions')
         .set({ role: dto.role, updatedAt: new Date() })
         .where('id', '=', grant.id)
         .execute();
       const after = await readAclState(trx, page.id, page.workspaceId);
-      return this.ran(page, before, after, versionBefore);
+      return { ...this.ran(page, before, after, versionBefore), ceiling };
     });
   }
 
@@ -600,6 +775,15 @@ export class PageRestrictionService {
       await this.wsService?.invalidateSpaceRestrictionCache(run.invalidateSpace).catch(() => undefined);
     }
     if (run.outcome === 'applied') this.emitAudit(action, aclAuditPayload(action, run.page, run.effect));
+    if (run.outcome === 'applied' && run.ceiling?.basis === 'admin_override' && (action === 'add' || action === 'update')) {
+      // #797: a workspace admin reached into a restricted page they could not view/edit themselves — always visible.
+      const unconfirmed = run.ceiling.pageAccessUnconfirmed === true;
+      this.logger.warn(
+        `${ACL_ADMIN_OVERRIDE_LOG_TOKEN} action=${action} page=${run.page.id} space=${run.page.spaceId} role=${run.ceiling.role}` +
+          ` grantees=${run.effect.added.length + run.effect.changed.length}${unconfirmed ? ' pageAccess=unconfirmed' : ''}`,
+      );
+      this.emitAudit(action, aclAdminOverridePayload(action, run.page, run.effect, run.ceiling.role, unconfirmed));
+    }
     return { version: run.version, effect: run.effect };
   }
 

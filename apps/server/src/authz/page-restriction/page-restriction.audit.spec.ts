@@ -51,12 +51,20 @@ function make(opts: {
   audit?: Sink | null;
 }) {
   let reads = 0;
-  const aclRows = (restricted: boolean, grants: Grant[]) =>
-    restricted
-      ? grants.length
-        ? grants.map((g) => ({ accessId: ACCESS_ID, ...g }))
-        : [{ accessId: ACCESS_ID, userId: null, groupId: null, role: null }]
-      : [];
+  // #797 INV-4: on a page that stays restricted, the admin actor holds a writer grant of its own (unless the world
+  // names the actor's grant itself), so its grants are within the ceiling — page-grant-ceiling.spec.ts covers it.
+  const withActor = !opts.after || opts.after.restricted;
+  const withActorGrant = (grants: Grant[]): Grant[] =>
+    withActor && !grants.some((g) => g.userId === ADMIN_ID)
+      ? [...grants, { userId: ADMIN_ID, groupId: null, role: 'writer' }]
+      : grants;
+  const aclRows = (restricted: boolean, grants: Grant[]) => {
+    if (!restricted) return [];
+    const all = withActorGrant(grants);
+    return all.length
+      ? all.map((g) => ({ accessId: ACCESS_ID, ...g }))
+      : [{ accessId: ACCESS_ID, userId: null, groupId: null, role: null }];
+  };
   const spy = spyKysely((q) => {
     const fail = opts.failOn?.(q);
     if (fail) throw fail;
@@ -66,7 +74,11 @@ function make(opts: {
       return aclRows(opts.restricted ?? true, opts.grants ?? []);
     }
     if (q.sql.includes('from "group_users"')) return opts.inGroup ? [{ groupId: GROUP }] : [];
-    if (q.sql.includes('from "page_permissions"')) return opts.grantRow === false ? [] : [{ id: 'perm-1', role: 'reader' }];
+    if (q.sql.includes('from "page_permissions"')) {
+      // The locked grant row carries the role the ACL read shows for it (#797 re-checks that they agree).
+      const role = (opts.grants ?? []).find((g) => g.userId === TARGET)?.role ?? 'reader';
+      return opts.grantRow === false ? [] : [{ id: 'perm-1', role }];
+    }
     if (q.sql.includes('from "pages" as "c"')) return opts.darkChild ? [{ id: 'child' }] : [];
     return [];
   });
@@ -119,6 +131,11 @@ function make(opts: {
 }
 
 const reader = (userId: string): Grant => ({ userId, groupId: null, role: 'reader' });
+/** The ACL `make` serves for a page that stays restricted: the world's grants plus the actor's own writer grant. */
+const withAdmin = (s: { restricted: boolean; grants: Grant[] }) => ({
+  ...s,
+  grants: [...s.grants, { userId: ADMIN_ID, groupId: null, role: 'writer' }],
+});
 const addDto = (b: Partial<AddPagePermissionDto> = {}) =>
   ({ pageId: PAGE_ID, role: 'reader', userIds: [TARGET], ...b }) as AddPagePermissionDto;
 const removeDto = (b: Partial<RemovePagePermissionDto> = {}) =>
@@ -401,7 +418,7 @@ describe('page-ACL domain audit (#503)', () => {
       },
     });
     await expect(service.addPermission(addDto(), admin)).resolves.toMatchObject({
-      version: aclVersionOf(PAGE_ID, after),
+      version: aclVersionOf(PAGE_ID, withAdmin(after)),
     });
     expect(audit!.log).toHaveBeenCalledTimes(1);
     expect(spy.tx).toEqual(['begin', 'commit']);
@@ -415,7 +432,7 @@ describe('page-ACL domain audit (#503)', () => {
     const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     try {
       const { service } = make({ after, audit: { log } });
-      await expect(service.addPermission(addDto(), admin)).resolves.toMatchObject({ version: aclVersionOf(PAGE_ID, after) });
+      await expect(service.addPermission(addDto(), admin)).resolves.toMatchObject({ version: aclVersionOf(PAGE_ID, withAdmin(after)) });
       await new Promise((r) => setImmediate(r)); // drain microtasks: the rejection's .catch has run
       expect(log).toHaveBeenCalledTimes(1);
       expect(warn).toHaveBeenCalledWith(expect.stringContaining('PAGE_ACL_AUDIT_FAILED action=add'));

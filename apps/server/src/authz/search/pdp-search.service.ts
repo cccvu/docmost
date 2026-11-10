@@ -690,7 +690,9 @@ export class PdpSearchService extends SearchService {
         );
       }
 
-      if (suggestion.includeGroups) {
+      // wiki-v2 #797: in remote mode group names are part of the workspace directory, which is not shown to wiki
+      // users; only a caller who administers the workspace or a space (and so may grant a space to a group) gets them.
+      if (suggestion.includeGroups && (await this.mayListGroups(userId, workspaceId, deadline))) {
         groups = await this.statement(deadline, 'suggest-groups', (trx) =>
           trx
             .selectFrom('groups')
@@ -834,6 +836,40 @@ export class PdpSearchService extends SearchService {
     }
 
     return authorized;
+  }
+
+  /**
+   * wiki-v2 #797: may this caller see group names in suggestions? Yes only with `workspace#admin_cascade`, or
+   * `space#administer` on at least one space of the workspace (archived ones included: a direct admin keeps it there).
+   * Decided by the PDP in the search lane; a PDP that cannot answer is a 503, never a silent "no groups" (a deny-shaped
+   * answer the client would cache as "there are none"). No PDP client → no groups (fail closed).
+   */
+  private async mayListGroups(userId: string, workspaceId: string, deadline: number): Promise<boolean> {
+    if (!this.pdp) return false;
+    const subject: AuthzSubject = { provider: 'docmost', externalId: userId };
+    const unavailable = () => {
+      this.logger.warn('SEARCH_PDP_UNAVAILABLE: the authorization service did not answer (group suggestions); answered 503');
+      return new ServiceUnavailableException('authorization is temporarily unavailable; retry');
+    };
+    const admin = await this.inPdpLane(deadline, 'suggest-groups-admin', () =>
+      this.pdp!.tryFilterResources(subject, 'admin_cascade', 'workspace', [workspaceId]),
+    );
+    if (admin === null) throw unavailable();
+    if (admin.includes(workspaceId)) return true;
+    const spaces: Array<{ id: string }> = await this.statement(deadline, 'suggest-groups-spaces', (trx) =>
+      trx.selectFrom('spaces').select(['id']).where('workspaceId', '=', workspaceId).execute(),
+    );
+    if (spaces.length === 0) return false;
+    const administered = await this.inPdpLane(deadline, 'suggest-groups-spaces', () =>
+      this.pdp!.tryFilterResources(
+        subject,
+        'administer',
+        'space',
+        spaces.map((r) => r.id),
+      ),
+    );
+    if (administered === null) throw unavailable();
+    return administered.length > 0;
   }
 
   /** The ids of `pageIds` `subject` may view. The PDP not answering is a 503, never an empty set. */

@@ -35,6 +35,7 @@ import { useTranslation } from "react-i18next";
 import { AvatarIconType } from "@/features/attachments/types/attachment.types.ts";
 import { PublicAuthButtons } from "@/features/public/components/public-auth-buttons.tsx";
 import { useFeedbackEntry } from "@/features/feedback/use-feedback-entry";
+import { isNativeAuthEnabled } from "@/features/auth-native/lib/auth-mode";
 import { FeedbackMenuItem } from "@/features/feedback/feedback-menu-item";
 import { FeedbackModal } from "@/features/feedback/feedback-modal";
 
@@ -101,13 +102,17 @@ export default function TopMenu() {
           {t("Workspace settings")}
         </Menu.Item>
 
-        <Menu.Item
-          component={Link}
-          to={APP_ROUTE.SETTINGS.WORKSPACE.MEMBERS}
-          leftSection={<IconUsers size={16} />}
-        >
-          {t("Manage members")}
-        </Menu.Item>
+        {/* CCC (wiki-v2 #797): in remote mode members are managed in the Admin Console and
+            the server does not serve the native members screen (directoryRead, 404). */}
+        {isNativeAuthEnabled() && (
+          <Menu.Item
+            component={Link}
+            to={APP_ROUTE.SETTINGS.WORKSPACE.MEMBERS}
+            leftSection={<IconUsers size={16} />}
+          >
+            {t("Manage members")}
+          </Menu.Item>
+        )}
 
         <Menu.Divider />
 

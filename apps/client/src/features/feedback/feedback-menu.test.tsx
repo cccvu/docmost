@@ -223,6 +223,18 @@ describe("avatar menu entry", () => {
     expect(screen.getByRole("menuitem", { name: "Logout" })).toBeTruthy();
   });
 
+  it("#797: no Manage members link in remote mode (the native screen is not served); native keeps it", async () => {
+    renderMenu();
+    openAccountMenu();
+    await screen.findByRole("menuitem", { name: "Logout" });
+    expect(screen.queryByRole("menuitem", { name: "Manage members" })).toBeNull();
+    cleanup();
+    native = true;
+    renderMenu();
+    openAccountMenu();
+    expect(await screen.findByRole("menuitem", { name: "Manage members" })).toBeTruthy();
+  });
+
   it("is hidden in native (standalone) mode and never calls the platform", async () => {
     native = true;
     renderMenu();

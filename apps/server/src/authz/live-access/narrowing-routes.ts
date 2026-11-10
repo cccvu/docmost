@@ -9,7 +9,8 @@
  * changes through the service bridge.
  *
  * Deliberately NOT here (ADR 0026 §4, "eventual, bounded"): trash / permanent delete (native and the #616
- * `conditionalDelete`), the metadata-only update (`conditionalUpdateMeta` — title/icon change no access), space and group delete,
+ * `conditionalDelete`), the metadata-only update (`conditionalUpdateMeta` — title/icon change no access), space and group delete
+ * (the service-bridge group delete refuses a group that still grants anything, #797),
  * workspace-member delete and deactivate, and the purely widening routes (native add member, add group member).
  * Those still reach live sessions through the relay signal and the sweep.
  *
@@ -40,4 +41,6 @@ export const NARROWING_ROUTES: ReadonlySet<string> = new Set([
   'ServiceSpaceController.addMember', // an upsert: an existing member's role is replaced (can demote)
   'ServiceSpaceController.changeMemberRole',
   'ServiceSpaceController.removeMember',
+  // wiki-v2 #797: leaving a group drops every grant the group carries (spaces, pages, role bindings naming it)
+  'ServiceGroupController.removeMember',
 ]);

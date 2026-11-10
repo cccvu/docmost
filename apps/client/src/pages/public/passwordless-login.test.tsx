@@ -223,7 +223,7 @@ describe("PasswordlessLogin — the OTP is reachable without destroying it", () 
     renderLogin();
     typeEmail();
     fireEvent.click(
-      screen.getByRole("button", { name: /email me a sign-in link and code/i }),
+      screen.getByRole("button", { name: /email me a sign-in link/i }),
     );
     await waitFor(() =>
       expect(screen.getByLabelText(/one-time code/i)).toBeTruthy(),
@@ -251,7 +251,7 @@ describe("PasswordlessLogin — the OTP is reachable without destroying it", () 
     await waitFor(() =>
       expect(
         screen.getByRole("button", {
-          name: /email me a sign-in link and code/i,
+          name: /email me a sign-in link/i,
         }),
       ).toBeTruthy(),
     );
@@ -312,7 +312,7 @@ describe("PasswordlessLogin — the OTP is reachable without destroying it", () 
     renderLogin();
     typeEmail();
     fireEvent.click(
-      screen.getByRole("button", { name: /email me a sign-in link and code/i }),
+      screen.getByRole("button", { name: /email me a sign-in link/i }),
     );
     await waitFor(() => expect(requestEmail).toHaveBeenCalledTimes(1));
     expect(requestEmail).toHaveBeenCalledWith("user@example.edu");
