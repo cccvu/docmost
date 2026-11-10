@@ -1,5 +1,6 @@
 import { BoundedCollabSocket } from './bounded-socket';
 import { COLLAB_MAX_PAYLOAD_BYTES, COLLAB_OUTBOUND_BUFFER_FACTOR } from './limits';
+import { CollabPreAuthSlots } from './preauth-slots';
 import { SocketLimitLog } from './socket-limit-log';
 
 /**
@@ -20,7 +21,7 @@ function harness() {
     close: jest.fn(),
   };
   const warn = jest.fn();
-  const socket = new BoundedCollabSocket(raw, inner, new SocketLimitLog({ warn }));
+  const socket = new BoundedCollabSocket(raw, inner, new SocketLimitLog({ warn }), new CollabPreAuthSlots());
   const frame = (bytes: number) => new Uint8Array(bytes);
   return { raw, inner, sent, warn, socket, frame };
 }

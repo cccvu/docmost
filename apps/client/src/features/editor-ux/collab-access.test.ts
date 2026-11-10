@@ -444,6 +444,25 @@ describe("a socket close with 1009 (a frame over the server's maxPayload) (#790)
     },
   );
 
+  // #790 (review S2): the server's per-user budgets close the SOCKET with 1013 (Try Again Later) and the per-user
+  // connection cap closes it with 4429, both with a reason the editor must never read as a refusal: the provider
+  // reconnects with its backoff, and the editor stays editable.
+  it.each([
+    [1013, "ccc:collab-try-later"],
+    [4429, "ccc:collab-user-connections"],
+  ])("a %s socket close (%s) is retried, never refused", (code, reason) => {
+    expect(classifyCollabCloseReason(reason, code)).toBe("other");
+    const step = nextCollabAccess(initialCollabAccess, rawClose(code, reason));
+    expect(step.state.refused).toBe(false);
+    expect(step.detach).toBe(false);
+    expect(step.disconnectSocket).toBe(false); // the provider's own reconnect is left running
+    expect(collabAllowsEditing(step.state)).toBe(true);
+    // the same reason on a per-document CLOSE while the socket is still up reconnects at once
+    const doc = nextCollabAccess(initialCollabAccess, { kind: "server-close", socketConnected: true, reason, code: 1000 });
+    expect(doc.reconnect).toBe(true);
+    expect(doc.state.refused).toBe(false);
+  });
+
   it("a per-document CLOSE (code 1000) is still judged by its reason alone", () => {
     expect(
       nextCollabAccess(initialCollabAccess, {

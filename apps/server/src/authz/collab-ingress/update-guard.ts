@@ -25,11 +25,12 @@
  * 4.x drops the frames that connection had queued (#1123), so a refused connection's later frames never reach here;
  * the guard still remembers the refusal and refuses any that do, as defense.
  *
- * Frame bounds (#790), in the same synchronous check, where Hocuspocus 4.7.1 leaves a gap: a per-connection SYNC
- * BUCKET (a SyncStep1, and a reader's Step2, each make 4.7.1 encode or snapshot the whole document); AWARENESS bounds
- * for every connection, readers too (each state's size before anything parses it; the client ids new to the document per
- * connection; and no newer state for a client id bound to another user, so nobody can move another user's cursor or
- * selection; the name and colour in a state are the client's own say, never checked); and Auth on an established
+ * Frame bounds (#790), in the same synchronous check, where Hocuspocus 4.7.1 leaves a gap: a SYNC BUDGET per (user,
+ * document) (a SyncStep1, and a reader's Step2, each make 4.7.1 encode or snapshot the whole document); AWARENESS bounds
+ * for every connection, readers too (each state's size before anything parses it; a budget per (user, document) of
+ * client ids new to the document; and no newer state for a client id bound to another user, so nobody can move
+ * another user's cursor or selection; the name and colour in a state are the client's own say, never checked); and Auth
+ * on an established
  * session or a message type 4.7.1's MessageReceiver does not handle (each one is otherwise handled without a limit, an
  * unhandled type with one unrate-limited console.error). The awareness RATE is not here: over-rate awareness frames are
  * dropped at the gateway (frame-address.ts), since a refusal here would end an honest editor's session.
@@ -37,12 +38,15 @@
  * Refusal = a throw of `{ code: 4422, reason }`: Hocuspocus closes that ONE document session and sends the reason (the
  * websocket stays up). Reasons the client acts on (apps/client features/editor-ux): `ccc:collab-update-refused:<rule>`
  * (stop sending, read-only, notice) and `ccc:collab-update-unresolved` (reconnect once). A socket whose sessions are
- * refused SOCKET_REFUSAL_BUDGET times is closed outright. `COLLAB_UPDATE_GUARD=report` logs instead of refusing.
+ * refused SOCKET_REFUSAL_BUDGET times is closed outright. An exhausted (user, document) budget is NOT a refusal: the
+ * socket is closed 1013 (`tryLater`), which the editor retries. `COLLAB_UPDATE_GUARD=report` logs instead of either.
  */
 import { Logger } from '@nestjs/common';
 import * as decoding from 'lib0/decoding';
 import { decodeUtf8 } from 'lib0/string';
 import * as Y from 'yjs';
+import { COLLAB_CONNECTIONS_PER_USER } from './limits';
+import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
 import {
   checkAttribute,
   checkElement,
@@ -72,16 +76,34 @@ const AWARENESS_BINDS_PER_CONNECTION = 32;
  */
 export const AWARENESS_BINDS_PER_USER = 256;
 /**
- * #790 sync bucket, per connection: SyncStep1 (Sync or SyncReply) and a read-only connection's Step2. An honest
- * provider sends one Step1 per open (HocuspocusProvider.onOpen; Docmost sets no `forceSyncInterval`), and a reader one
- * Step2 per open (its answer to the server's Step1). A burst of SYNC_BURST, then one per SYNC_REFILL_MS.
+ * #790 budgets per (user, document), kept across that user's connections and reconnects (a per-connection budget
+ * refilled on every reconnect, so only the 1/s auth rate bounded it). Exhausting one closes the SOCKET with 1013 (Try
+ * Again Later), which the editor treats as an ordinary close and retries with the provider's backoff: never a 4422
+ * refusal, which detaches the editor for good.
+ *
+ * Sync: SyncStep1 (Sync or SyncReply) and a read-only connection's Step2, each of which makes 4.7.1 encode or snapshot
+ * the whole document. An honest provider sends one Step1 per open (HocuspocusProvider.onOpen; Docmost sets no
+ * `forceSyncInterval`), and a reader one Step2 per open. The burst is two per connection of the per-user connection cap
+ * (limits.ts), so all of a user's tabs on one page reconnecting at once after a deploy pass; then one per
+ * SYNC_REFILL_MS (an editor reopened every 4 s, all day).
  */
-export const SYNC_BURST = 4;
-export const SYNC_REFILL_MS = 15_000;
+export const SYNC_BURST = 2 * COLLAB_CONNECTIONS_PER_USER;
+export const SYNC_REFILL_MS = 4_000;
 /** #790: one awareness state's JSON, in UTF-8 bytes (an honest state is a user name, a colour and a cursor). */
 export const AWARENESS_STATE_MAX_BYTES = 8 * 1024;
-/** #790: client ids per connection that the document's awareness has never held (`awareness.meta`). */
-export const AWARENESS_NEW_IDS_PER_CONNECTION = 32;
+/**
+ * #790: client ids new to the document's awareness (`awareness.meta`, which y-protocols never prunes while the document
+ * is loaded; a removal of an unknown id adds one too), per (user, document) as above. An honest page mount adds one (two
+ * if Yjs regenerates its id); the burst covers every tab of the per-user cap twice, then one per
+ * AWARENESS_NEW_IDS_REFILL_MS.
+ */
+export const AWARENESS_NEW_IDS_BURST = 2 * COLLAB_CONNECTIONS_PER_USER;
+export const AWARENESS_NEW_IDS_REFILL_MS = 4_000;
+/** (user, document) budgets kept in this process; past it the least recently used is dropped (a fresh budget). */
+export const USER_DOC_BUDGETS_MAX = 10_000;
+/** #790: the socket close for an exhausted budget: 1013 (RFC 6455 Try Again Later), retried by the provider. */
+export const COLLAB_TRY_LATER_CODE = 1013;
+export const TRY_LATER_REASON = 'ccc:collab-try-later';
 const LOGS_PER_MINUTE = 30;
 
 export const reasonFor = (rule: CollabRule): string => (rule === 'unresolved' ? UNRESOLVED_REASON : REFUSED_REASON_PREFIX + rule);
@@ -145,22 +167,25 @@ class DocGuard {
 }
 
 type Bucket = { tokens: number; at: number };
+type UserDocBudget = { sync: Bucket; ids: Bucket };
 
 export class CollabUpdateGuard {
   private readonly docs = new WeakMap<Y.Doc, DocGuard>();
   private readonly refusedConnections = new WeakMap<object, string>();
   private readonly socketRefusals = new WeakMap<object, number>();
-  /** #790: per connection, its sync bucket and the awareness client ids it introduced to the document. */
-  private readonly syncBuckets = new WeakMap<object, Bucket>();
+  /** #790: per (user, document) budgets, least recently used first; and per connection, the ids it already paid for. */
+  private readonly userDocBudgets = new Map<string, UserDocBudget>();
   private readonly awarenessNewIds = new WeakMap<object, Set<number>>();
   private readonly mode: CollabGuardMode;
   private readonly logger: GuardLogger;
+  private readonly limitLog: SocketLimitLog;
   private readonly now: () => number;
   private logWindow = { start: 0, count: 0, suppressed: 0 };
 
-  constructor(opts: { mode?: CollabGuardMode; logger?: GuardLogger; now?: () => number } = {}) {
+  constructor(opts: { mode?: CollabGuardMode; logger?: GuardLogger; limitLog?: SocketLimitLog; now?: () => number } = {}) {
     this.mode = opts.mode ?? COLLAB_UPDATE_GUARD_MODE;
     this.logger = opts.logger ?? new Logger('CollabUpdateGuard');
+    this.limitLog = opts.limitLog ?? collabSocketLimitLog;
     this.now = opts.now ?? Date.now;
   }
 
@@ -181,6 +206,15 @@ export class CollabUpdateGuard {
       if (!header.payload) return; // malformed: Hocuspocus refuses it itself
       const checked = this.checkAwareness(frame, header.payload);
       if (checked.violation) this.refuse(frame, header, checked.violation); // throws unless report mode
+      if (checked.fresh.size) {
+        const budget = this.budgetFor(frame);
+        if (!this.take(budget.ids, AWARENESS_NEW_IDS_BURST, AWARENESS_NEW_IDS_REFILL_MS, checked.fresh.size)) {
+          this.tryLater(frame, 'user_awareness_ids'); // throws unless report mode
+        }
+        const introduced = this.awarenessNewIds.get(frame.connection) ?? new Set<number>();
+        for (const id of checked.fresh) introduced.add(id);
+        this.awarenessNewIds.set(frame.connection, introduced);
+      }
       // Hocuspocus relays a reader's awareness too, so only a writer's binds: a reader could otherwise claim a writer's id.
       if (!frame.connection.readOnly && checked.entries) this.bindFromAwareness(this.docFor(frame.document), frame, checked.entries);
       return;
@@ -188,7 +222,7 @@ export class CollabUpdateGuard {
     if (header.type !== MESSAGE.Sync && header.type !== MESSAGE.SyncReply) return;
     // A Step1 makes Hocuspocus encode the whole document (its Step2 answer); a reader's Step2 makes it snapshot it.
     if (header.subtype === STEP1 || (header.subtype === STEP2 && frame.connection.readOnly)) {
-      if (!this.charge(this.syncBuckets, frame.connection, SYNC_BURST, SYNC_REFILL_MS)) this.refuse(frame, header, { rule: 'sync-rate' });
+      if (!this.take(this.budgetFor(frame).sync, SYNC_BURST, SYNC_REFILL_MS, 1)) this.tryLater(frame, 'user_sync_budget');
       return;
     }
     if (header.subtype !== STEP2 && header.subtype !== UPDATE) return; // Hocuspocus refuses an unknown subtype itself
@@ -207,29 +241,68 @@ export class CollabUpdateGuard {
     return this.docs.get(live)?.bindings.size ?? 0;
   }
 
-  /** A token bucket per connection in `buckets`: `burst`, refilled at one per `refillMs`. False = over budget. */
-  private charge(buckets: WeakMap<object, Bucket>, connection: object, burst: number, refillMs: number): boolean {
-    const now = this.now();
-    const prev = buckets.get(connection);
-    const tokens = prev ? Math.min(burst, prev.tokens + Math.max(0, now - prev.at) / refillMs) : burst;
-    const allowed = tokens >= 1;
-    buckets.set(connection, { tokens: allowed ? tokens - 1 : tokens, at: now });
-    return allowed;
+  /** How many (user, document) budgets are kept (specs and diagnostics). */
+  budgetCount(): number {
+    return this.userDocBudgets.size;
   }
+
+  /** The (user, document) budget of this frame's connection, made most recently used; the least recent past the cap goes. */
+  private budgetFor(frame: GuardFrame): UserDocBudget {
+    const key = `${String(frame.context?.user?.id ?? '')}\u0000${frame.document.name ?? ''}`;
+    const at = this.now();
+    let budget = this.userDocBudgets.get(key);
+    if (budget) this.userDocBudgets.delete(key);
+    else budget = { sync: { tokens: SYNC_BURST, at }, ids: { tokens: AWARENESS_NEW_IDS_BURST, at } };
+    this.userDocBudgets.set(key, budget);
+    if (this.userDocBudgets.size > USER_DOC_BUDGETS_MAX) this.userDocBudgets.delete(this.userDocBudgets.keys().next().value!);
+    return budget;
+  }
+
+  /** Take `n` tokens from `bucket` (`burst`, refilled one per `refillMs`); false, taking none, when it holds fewer. */
+  private take(bucket: Bucket, burst: number, refillMs: number, n: number): boolean {
+    const now = this.now();
+    bucket.tokens = Math.min(burst, bucket.tokens + Math.max(0, now - bucket.at) / refillMs);
+    bucket.at = now;
+    if (bucket.tokens < n) return false;
+    bucket.tokens -= n;
+    return true;
+  }
+
+  /**
+   * An exhausted (user, document) budget: close the SOCKET with 1013 first (so Hocuspocus's document CLOSE, sent next,
+   * is dropped by the closing socket and the editor sees only a retryable socket close), then throw so this frame and
+   * the ones queued behind it are not applied. Logged `COLLAB_SOCKET_LIMIT`, rate-limited. Report mode only logs.
+   */
+  private tryLater(frame: GuardFrame, limit: string): void {
+    this.limitLog.log(limit, { userId: String(frame.context?.user?.id ?? '') });
+    if (this.mode === 'report') return;
+    try {
+      frame.connection.webSocket?.close(COLLAB_TRY_LATER_CODE, TRY_LATER_REASON);
+    } catch {
+      // already closing
+    }
+    throw { code: COLLAB_TRY_LATER_CODE, reason: TRY_LATER_REASON };
+  }
+
 
   /**
    * The awareness bounds, for every connection. Each state's size is read from its length prefix and checked before
    * anything decodes or parses it (Hocuspocus then JSON.parses every state, twice). Entries per frame are not capped (a
-   * provider's timeout removal can carry the whole room), but a client id twice in one frame is never honest, and only
-   * AWARENESS_NEW_IDS_PER_CONNECTION ids the document's awareness has never held may come from one connection.
+   * provider's timeout removal can carry the whole room), but a client id twice in one frame is never honest. The ids
+   * the document's awareness has never held (`fresh`, not counting ids this connection already paid for) are charged to
+   * the sender's (user, document) budget by the caller.
    *
    * A state for a client id bound to ANOTHER user (by its structs or its own awareness) is refused `foreign-client`:
    * the sender would replace that user's cursor and selection (and the name and colour shown with them) for every
    * peer. The name and colour in a sender's OWN state are its own say: nothing checks them. Two kinds of entry about
-   * another user's id are honest and pass: a removal (state `null`: a provider's `timeout` removal of a peer that went quiet), and an echo at a clock
-   * the server already holds (a 3.x provider resending what it was relayed), which y-protocols ignores anyway.
+   * another user's id are honest and pass: a removal (state `null`: a provider's `timeout` removal of a peer that went
+   * quiet), and an echo at a clock the server already holds (a 3.x provider resending what it was relayed), which
+   * y-protocols ignores anyway.
    */
-  private checkAwareness(frame: GuardFrame, payload: Uint8Array): { violation: Violation | null; entries: AwarenessEntry[] | null } {
+  private checkAwareness(
+    frame: GuardFrame,
+    payload: Uint8Array,
+  ): { violation: Violation | null; entries: AwarenessEntry[] | null; fresh: Set<number> } {
     const entries: AwarenessEntry[] = [];
     const meta = frame.document.awareness?.meta;
     const bindings = this.docs.get(frame.document)?.bindings;
@@ -237,7 +310,7 @@ export class CollabUpdateGuard {
     const introduced = this.awarenessNewIds.get(frame.connection) ?? new Set<number>();
     const fresh = new Set<number>();
     const seen = new Set<number>();
-    const refused = { violation: { rule: 'awareness' } as Violation, entries: null };
+    const refused = { violation: { rule: 'awareness' } as Violation, entries: null, fresh };
     try {
       const d = decoding.createDecoder(payload);
       const n = decoding.readVarUint(d);
@@ -253,18 +326,15 @@ export class CollabUpdateGuard {
         const owner = bindings?.get(clientID);
         if (owner !== undefined && owner !== userId && !isNullState(state)) {
           const held = meta?.get(clientID)?.clock;
-          if (held === undefined || clock > held) return { violation: { rule: 'foreign-client' }, entries: null };
+          if (held === undefined || clock > held) return { violation: { rule: 'foreign-client' }, entries: null, fresh };
         }
         if (!meta?.has(clientID) && !introduced.has(clientID)) fresh.add(clientID);
         entries.push({ clientID, clock, state });
       }
     } catch {
-      return { violation: null, entries: null }; // malformed: Hocuspocus refuses it itself
+      return { violation: null, entries: null, fresh: new Set() }; // malformed: Hocuspocus refuses it itself
     }
-    if (introduced.size + fresh.size > AWARENESS_NEW_IDS_PER_CONNECTION) return refused;
-    for (const id of fresh) introduced.add(id);
-    this.awarenessNewIds.set(frame.connection, introduced);
-    return { violation: null, entries };
+    return { violation: null, entries, fresh };
   }
 
   private inspect(frame: GuardFrame, header: Header, payload: Uint8Array): void {

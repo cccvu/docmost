@@ -24,6 +24,19 @@ export const COLLAB_WS_SERVER_OPTIONS: ServerOptions & { maxFragments: number; m
   maxBufferedChunks: 65_536, // one maxPayload message in 128-byte TCP reads
 };
 
+/**
+ * Unauthenticated collab sockets per process (preauth-slots.ts): past it the upgrade is refused 503. Each holds at most
+ * the pre-auth queue (8 MiB) plus one partial frame (8 MiB, `maxPayload`), so all of them together hold at most
+ * 16 x 16 MiB = 256 MiB of native memory. The task is 4096 MiB and its V8 and Go heap caps sum to 3072 MiB (docmost
+ * 1024, its conversion worker 1024, platform 512, SpiceDB 512; ecs.tf, check-infra-config §27), so everything outside
+ * a heap (Buffers, ws, stacks, code) shares the remaining 1024 MiB; this bound takes at most a quarter of it. An honest
+ * socket is unauthenticated for one token verify and its reads (well under a second), so 16 serve tens of opens a second;
+ * a burst past that (every tab reconnecting after a deploy) is refused and retried by the provider's backoff.
+ */
+export const COLLAB_PREAUTH_SOCKETS = 16;
+/** A socket not authenticated this long after it opened is terminated (preauth-slots.ts). 4.7.1's own is 60–120 s. */
+export const COLLAB_PREAUTH_DEADLINE_MS = 15_000;
+
 /** Hocuspocus 4.7.1 options; the rest stay at upstream defaults (1000 queued messages, 60 s `timeout`). */
 export const COLLAB_HOCUSPOCUS_OPTIONS = {
   maxPendingDocuments: 4, // Docmost opens one document per socket; the default is 100 concurrent onAuthenticate runs

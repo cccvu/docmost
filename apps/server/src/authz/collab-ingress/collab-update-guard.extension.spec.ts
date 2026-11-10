@@ -25,6 +25,7 @@ import {
   CollabUpdateGuard,
   SOCKET_REFUSAL_BUDGET,
   SYNC_BURST,
+  TRY_LATER_REASON,
   UNRESOLVED_REASON,
   type CollabGuardMode,
 } from './update-guard';
@@ -343,17 +344,23 @@ describe('#790 frame bounds through a real Hocuspocus 4.7.1', () => {
     expect(sock.closeReasons()).toEqual([REFUSED('auth')]);
   });
 
-  it(`a SyncStep1 flood is refused sync-rate after ${SYNC_BURST}; so is a reader's Step2 flood`, async () => {
+  it(`a SyncStep1 flood past ${SYNC_BURST} closes the SOCKET 1013 and sends no refusal (the editor retries); so does a reader's Step2 flood`, async () => {
     const s = await server();
     const writer = await s.connect('attacker');
-    writer.deliver(...Array.from({ length: SYNC_BURST + 1 }, () => step1Frame(new Y.Doc())));
+    writer.deliver(...Array.from({ length: SYNC_BURST + 5 }, () => step1Frame(new Y.Doc())));
     await settle();
-    expect(writer.closeReasons()).toEqual([REFUSED('sync-rate')]);
+    expect(writer.closed).toEqual({ code: 1013, reason: TRY_LATER_REASON });
+    expect(writer.closeReasons()).toEqual([]); // no document CLOSE: a 4422 reason would detach the editor for good
+    const again = await s.connect('attacker'); // a reconnect gets no fresh budget
+    again.deliver(step1Frame(new Y.Doc()));
+    await settle();
+    expect(again.closed).toEqual({ code: 1013, reason: TRY_LATER_REASON });
     const reader = await s.connect('reader');
     const step2 = syncFrame(Y.encodeStateAsUpdate(s.live()), SYNC.Step2);
     reader.deliver(step1Frame(s.live()), ...Array.from({ length: SYNC_BURST }, () => step2));
     await settle();
-    expect(reader.closeReasons()).toEqual([REFUSED('sync-rate')]);
+    expect(reader.closed).toEqual({ code: 1013, reason: TRY_LATER_REASON });
+    expect(reader.closeReasons()).toEqual([]);
   });
 
   it('an honest open passes for a writer and a reader: Step1, Step2, awareness, then updates', async () => {

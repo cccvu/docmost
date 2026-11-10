@@ -104,7 +104,6 @@ export type CollabRule =
   | 'schema'
   | 'foreign-client'
   | 'stateless'
-  | 'sync-rate'
   | 'awareness'
   | 'auth'
   | 'message-type'
