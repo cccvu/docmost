@@ -35,6 +35,8 @@ import {
 } from '../authz/page-write/doc-version';
 // #716 R4 / #790: the direct write's first store, which Hocuspocus 4.x's `transact` no longer runs.
 import { storeDirectWriteNow } from '../authz/page-write/direct-store';
+// #790: the settle waits for every pending store, including one queued behind another (Hocuspocus 4.x).
+import { drainDocumentStores } from '../authz/page-write/settle-drain';
 import {
   insertAsOwnClient,
   PreparedContent,
@@ -78,14 +80,11 @@ export class CollaborationHandler {
         // authoritative and there is nothing to flush. `reason` is absent here ON PURPOSE: this is a
         // successful settle with nothing to do, which the caller must NOT confuse with a failure.
         if (!doc) return { flushed: false };
-        const debounceId = `onStoreDocument-${documentName}`;
         try {
-          if (hocuspocus.debouncer.isDebounced(debounceId)) {
-            await hocuspocus.debouncer.executeNow(debounceId);
-          }
-          // Drain a store that was already executing when we arrived.
-          await doc.saveMutex.runExclusive(async () => undefined);
-          // #390: if the store we just forced (or drained) FAILED to persist, the row does not hold what this
+          // Run the pending store, then wait for every store already executing or queued behind one (#790:
+          // Hocuspocus 4.x hides a queued store from `isDebounced`, so one mutex drain is not enough).
+          await drainDocumentStores(hocuspocus.debouncer, doc, documentName);
+          // #390: if the LAST store we forced (or drained) FAILED to persist, the row does not hold what this
           // document contains — reporting success here would let a guarded /v1 write trust a version the row
           // never received. `reason: 'error'` fails the guarded write closed (503), same as a thrown settle.
           if (hasStoreFailure(doc)) {

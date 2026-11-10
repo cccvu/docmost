@@ -38,7 +38,10 @@ describe('CollaborationHandler.flushPageContent (content settle, issue 282)', ()
 
   const makeDoc = () => {
     const runExclusive = jest.fn(async (fn: () => Promise<unknown>) => fn());
-    return { doc: { saveMutex: { runExclusive } }, runExclusive };
+    return {
+      doc: { saveMutex: { runExclusive, isLocked: () => false } },
+      runExclusive,
+    };
   };
 
   const makeHocuspocus = (
@@ -46,6 +49,7 @@ describe('CollaborationHandler.flushPageContent (content settle, issue 282)', ()
     debouncer: Partial<{
       isDebounced: jest.Mock;
       executeNow: jest.Mock;
+      isCurrentlyExecuting: jest.Mock;
     }> = {},
   ) => {
     const documents = new Map<string, unknown>();
@@ -55,6 +59,8 @@ describe('CollaborationHandler.flushPageContent (content settle, issue 282)', ()
       debouncer: {
         isDebounced: debouncer.isDebounced ?? jest.fn(() => false),
         executeNow: debouncer.executeNow ?? jest.fn(),
+        isCurrentlyExecuting:
+          debouncer.isCurrentlyExecuting ?? jest.fn(() => false),
       },
     };
   };
@@ -149,7 +155,7 @@ describe('CollaborationHandler.flushPageContent (content settle, issue 282)', ()
       order.push('executeNow');
     });
     const hocuspocus = makeHocuspocus(
-      { saveMutex: { runExclusive } },
+      { saveMutex: { runExclusive, isLocked: () => false } },
       { isDebounced: jest.fn(() => true), executeNow },
     );
 
@@ -281,6 +287,7 @@ describe('CollaborationHandler.flushPageContent (content settle, issue 282)', ()
         runExclusive: jest.fn(async () => {
           throw new Error('mutex failed');
         }),
+        isLocked: () => false,
       },
     });
 

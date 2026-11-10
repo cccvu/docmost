@@ -687,8 +687,10 @@ describe('CollaborationHandler.conditionalUpdatePageContent — #716', () => {
     it('the settle digest is reused by the following write when nothing changed in between', async () => {
       const { doc } = build();
       const flush = new CollaborationHandler().getHandlers({
-        documents: new Map([[DOC, Object.assign(doc, { saveMutex: { runExclusive: async () => undefined } })]]),
-        debouncer: { isDebounced: () => false },
+        documents: new Map([
+          [DOC, Object.assign(doc, { saveMutex: { runExclusive: async () => undefined, isLocked: () => false } })],
+        ]),
+        debouncer: { isDebounced: () => false, isCurrentlyExecuting: () => false },
       } as never).flushPageContent;
       const settled = await flush(DOC, { withDigest: true });
       expect(settled).toEqual({ flushed: true, contentDigest: stableHash(LIVE) });
