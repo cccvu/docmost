@@ -45,4 +45,8 @@ export enum ServiceScope {
   // up; they never write), but distinct from pages:read / content:read: validate-content is CPU-heavy (an HTML/Markdown
   // parse of up to 1 MiB) and title-candidates scans a parent's children, so both get their own, smaller rate bucket.
   PagesImportRead = 'pages:import:read',
+  // wiki-v2 #797: the governed group control plane (list/read groups and memberships vs create/rename/delete groups,
+  // add/remove members and the default-group ensure). Distinct read and write scopes, as for spaces.
+  GroupsRead = 'groups:read',
+  GroupsWrite = 'groups:write',
 }

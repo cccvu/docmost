@@ -18,6 +18,7 @@ import { RemoteOnlyGuard } from '../authz/mode/remote-only.guard';
 import { RequireServiceScope, ServiceAuthGuard, serviceCredentialIdOf } from './service-auth.guard';
 import { ServiceScope } from './service-scope';
 import {
+  AddedSpaceMember,
   CreatedSpace,
   RawSpaceMember,
   ServiceSpaceService,
@@ -49,6 +50,10 @@ import { parseSubCollectionQuery } from './dto/sub-collection-page.dto';
  * `members/preview` answers what a member write would do without writing (same scope as the write; not a narrowing
  * route — it narrows nothing). A create may be KEYED (`idempotencyKey` + `idempotencyNamespace` + `fingerprint`): a
  * repeat answers the space it created with `replayed: true` and re-runs nothing.
+ *
+ * #797: a member add names a user (`externalId`) or a group (`groupId`) and may be `mode: 'atLeast'`; every write that
+ * raises a membership is checked against what the acting human holds on the space (403 `grant_exceeds_actor`), and the
+ * workspace's default group is never added or re-roled (400 `basic_group_not_grantable`). See ServiceSpaceService.
  */
 @Controller('service/spaces')
 @UseGuards(RemoteOnlyGuard, ServiceAuthGuard)
@@ -138,7 +143,7 @@ export class ServiceSpaceController {
   async addMember(
     @Param('spaceId', ParseUUIDPipe) spaceId: string,
     @Body() dto: AddSpaceMemberDto,
-  ): Promise<{ memberId: string; userId: string; version: string }> {
+  ): Promise<AddedSpaceMember> {
     return this.service.addMember(spaceId, dto);
   }
 

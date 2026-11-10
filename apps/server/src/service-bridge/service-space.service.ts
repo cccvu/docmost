@@ -11,6 +11,7 @@ import { InjectKysely } from 'nestjs-kysely';
 import { sql } from 'kysely';
 import { KyselyDB, KyselyTransaction } from '@docmost/db/types/kysely.types';
 import {
+  AddMemberMode,
   AddSpaceMemberDto,
   CreateSpaceDto,
   SPACE_ROLES,
@@ -18,6 +19,8 @@ import {
   SpaceMemberRole,
   UpdateSpaceDto,
 } from './dto/space-admin.dto';
+import { basicNotGrantable, isDefaultGroup } from './default-group';
+import { CeilingMode, SpaceGrantCeiling, withGrantCeiling } from './space-grant-ceiling';
 import { SubCollectionPage } from './dto/sub-collection-page.dto';
 import { ServiceBridgeService } from './service-bridge.service';
 import { WorkspaceResolver } from './workspace-resolver';
@@ -69,6 +72,19 @@ export interface RawSpaceMember {
   role: string;
   createdAt: string;
   version: string;
+}
+
+/**
+ * What a member add answers. #797: exactly one of `userId` / `groupId` is set (the subject the add named), and
+ * `applied` is false only when `mode: 'atLeast'` left an existing live membership as it was (then `memberId` and
+ * `version` are that membership's).
+ */
+export interface AddedSpaceMember {
+  memberId: string;
+  userId: string | null;
+  groupId: string | null;
+  version: string;
+  applied: boolean;
 }
 
 /** #616: what a member add / role change / removal WOULD do (`POST …/members/preview`). */
@@ -153,6 +169,26 @@ const ROLE_RANK: Record<SpaceMemberRole, number> = { reader: 1, writer: 2, admin
 const rank = (role: string | null | undefined): number =>
   (SPACE_ROLES as readonly unknown[]).includes(role) ? ROLE_RANK[role as SpaceMemberRole] : 0;
 
+/** #797: 404 `group_not_found` — no live group with that id in this workspace. */
+const groupNotFound = () =>
+  refusal(new NotFoundException({ message: 'group not found', code: 'group_not_found' }), 'group_not_found');
+
+/** The member an add names: exactly one of a user (by externalId) and a group (#797). */
+type MemberSubject = { kind: 'user'; externalId: string } | { kind: 'group'; groupId: string };
+
+/** An add's resolved target. `userId` is null only in a preview of an identity with no shadow user yet. */
+type AddTarget =
+  | { kind: 'user'; userId: string | null; isSelf: boolean }
+  | { kind: 'group'; groupId: string; isSelf: boolean };
+
+/** Exactly one of `externalId` / `groupId` (the DTO enforces it at the edge; a preview and a direct call land here). */
+function memberSubjectOf(dto: { externalId?: string; groupId?: string }): MemberSubject {
+  const hasUser = dto.externalId !== undefined && dto.externalId !== null;
+  const hasGroup = dto.groupId !== undefined && dto.groupId !== null;
+  if (hasUser === hasGroup) throw new BadRequestException('exactly one of externalId or groupId is required');
+  return hasUser ? { kind: 'user', externalId: dto.externalId as string } : { kind: 'group', groupId: dto.groupId as string };
+}
+
 /** The 403 body carries a machine-readable `code` the platform maps to its `self_grant` problem. */
 const selfGrant = () =>
   refusal(
@@ -202,6 +238,12 @@ const selfGrant = () =>
  * now also answers the new version. A lock not got in time, a deadlock or a statement timeout is a retryable 503
  * `engine_busy`. `previewMember` runs the same decisions under the same locks and rolls back; it only LOOKS UP shadow
  * users (never provisions one) and writes nothing.
+ *
+ * Groups and ceilings (wiki-v2 #797): an add names a user (`externalId`) or a group (`groupId`), never both. Every
+ * write that RAISES a membership is checked against what the acting human holds on the space (INV-2,
+ * `space-grant-ceiling.ts`: 403 `grant_exceeds_actor`, decided from the actor's own rows under the space lock first and
+ * from the PDP only after a settle fence); a demotion, a same-role write and a removal are not. The workspace's default
+ * group is never added or re-roled (INV-5, `default-group.ts`: 400 `basic_group_not_grantable`); removing it stays allowed.
  */
 @Injectable()
 export class ServiceSpaceService {
@@ -212,6 +254,7 @@ export class ServiceSpaceService {
     private readonly workspaces: WorkspaceResolver,
     private readonly bridge: ServiceBridgeService,
     private readonly ledger?: IdempotencyLedgerService, // #616 keyed create (appended)
+    private readonly ceiling?: SpaceGrantCeiling, // #797 INV-2 (appended; a raise without it is a 500, never a pass)
   ) {}
 
   /** Derive a valid, lowercased Docmost slug from a source string; null if nothing usable remains. */
@@ -512,36 +555,50 @@ export class ServiceSpaceService {
   }
 
   /**
-   * Add (or re-add / re-role) a shadow user as a space member. The platform validates the identity first. Answers the
-   * membership's version. No `expectedVersion`: there is no version before the add.
+   * Add (or re-add / re-role) a member: a shadow user (`externalId`) or, #797, a group of this workspace (`groupId`).
+   * The platform validates the identity first. Answers the membership's version. No `expectedVersion`: there is no
+   * version before the add.
+   *
+   * #797: a group add locks the live group row `FOR UPDATE` after the space row (so a concurrent group delete either
+   * sees the new membership — `group_in_use` — or this add sees no group — 404 `group_not_found`), refuses the
+   * workspace's default group (400 `basic_group_not_grantable`, INV-5), applies rule M to the actor's membership of the
+   * group, and upserts on `(space_id, group_id)`. `mode: 'atLeast'` never lowers an existing live membership. A
+   * raise is checked against the actor's own holdings (INV-2, `space-grant-ceiling.ts`): 403 `grant_exceeds_actor`.
    */
-  async addMember(
-    spaceId: string,
-    dto: AddSpaceMemberDto,
-  ): Promise<{ memberId: string; userId: string; version: string }> {
+  async addMember(spaceId: string, dto: AddSpaceMemberDto): Promise<AddedSpaceMember> {
+    const subject = memberSubjectOf(dto);
     // Fast 404/400 BEFORE provisioning (no shadow user is created for a dead space); everything slow — the
     // workspace + both shadow users — is resolved before the transaction so the space lock is held briefly.
     await this.loadSpaceRow(spaceId, { activeOnly: true });
-    const { userId: memberUserId } = await this.bridge.provisionShadowUser({ externalId: dto.externalId });
+    const memberUserId =
+      subject.kind === 'user' ? (await this.bridge.provisionShadowUser({ externalId: subject.externalId })).userId : null;
     const { userId: addedById } = await this.bridge.provisionShadowUser({
       externalId: dto.addedByExternalId,
     });
     const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
-    return this.versionedTx(false, async (trx) => {
-      await this.lockSpace(trx, workspaceId, spaceId, true);
-      await this.decideAdd(trx, spaceId, memberUserId, memberUserId === addedById, dto.role);
-      const res = await sql<{ id: string }>`
-        insert into space_members (user_id, space_id, role, added_by_id)
-        values (${memberUserId}, ${spaceId}, ${dto.role}, ${addedById})
-        on conflict (space_id, user_id) do update set role = excluded.role, deleted_at = null, updated_at = now()
-        returning id
-      `.execute(trx);
-      return {
-        memberId: res.rows[0].id,
-        userId: memberUserId,
-        version: memberRowVersion(spaceId, { userId: memberUserId, groupId: null, role: dto.role, deletedAt: null }),
-      };
-    });
+    const mode = dto.mode ?? 'set';
+    return withGrantCeiling(this.fenceOnly, (ceilingMode) =>
+      this.versionedTx(false, async (trx) => {
+        await this.lockSpace(trx, workspaceId, spaceId, true);
+        const target: AddTarget =
+          subject.kind === 'user'
+            ? { kind: 'user', userId: memberUserId as string, isSelf: memberUserId === addedById }
+            : await this.groupTarget(trx, workspaceId, subject.groupId, addedById);
+        const decided = await this.decideAdd(trx, {
+          workspaceId,
+          spaceId,
+          target,
+          role: dto.role,
+          mode,
+          actorUserId: addedById,
+          actorExternalId: dto.addedByExternalId,
+          ceilingMode,
+        });
+        if (decided.kind === 'unchanged') return this.addedView(spaceId, target, decided.row, false);
+        const id = await this.upsertMember(trx, spaceId, target, dto.role, addedById);
+        return this.addedView(spaceId, target, { id, role: dto.role }, true);
+      }),
+    );
   }
 
   /** Re-role a live member. Answers the membership's new version; `expectedVersion` compared under the row lock. */
@@ -555,15 +612,26 @@ export class ServiceSpaceService {
     const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
     // Looked up, never provisioned: an actor with no shadow user cannot be covered by any membership row.
     const actorId = await this.bridge.findShadowUserId(actorExternalId);
-    return this.versionedTx(expectedVersion !== undefined, async (trx) => {
-      await this.lockSpace(trx, workspaceId, spaceId, true);
-      const row = await this.decideRoleChange(trx, spaceId, memberId, role, actorId, expectedVersion);
-      await sql`
-        update space_members set role = ${role}, updated_at = now()
-        where id = ${memberId} and space_id = ${spaceId}
-      `.execute(trx);
-      return { version: memberRowVersion(spaceId, { ...row, role, deletedAt: null }) };
-    });
+    return withGrantCeiling(this.fenceOnly, (ceilingMode) =>
+      this.versionedTx(expectedVersion !== undefined, async (trx) => {
+        await this.lockSpace(trx, workspaceId, spaceId, true);
+        const row = await this.decideRoleChange(trx, {
+          workspaceId,
+          spaceId,
+          memberId,
+          role,
+          actorUserId: actorId,
+          actorExternalId,
+          expectedVersion,
+          ceilingMode,
+        });
+        await sql`
+          update space_members set role = ${role}, updated_at = now()
+          where id = ${memberId} and space_id = ${spaceId}
+        `.execute(trx);
+        return { version: memberRowVersion(spaceId, { ...row, role, deletedAt: null }) };
+      }),
+    );
   }
 
   /** Remove a member. Allowed on an ARCHIVED space too (as before) — and still guarded: there a direct admin
@@ -580,12 +648,13 @@ export class ServiceSpaceService {
 
   /**
    * #616: what a member add / role change / removal WOULD do. The same decisions as the real write (rule M, the
-   * last-admin guard, the version compare), in a transaction under the same locks, rolled back. Shadow users are only
-   * LOOKED UP (`findShadowUserId`), never provisioned: an add of an identity with no shadow user yet reports
-   * `provisionsAccount: true`, and rule M then compares the two identities by their shadow email, which is exactly how
-   * provisioning would have resolved them. A state-dependent refusal is `{ outcome: 'refused', code }` (`self_grant`,
-   * `last_admin`, `member_not_found`, `space_archived`, `precondition_failed`); a missing space is a 404 and a
-   * malformed body a 400, as on the real route.
+   * last-admin guard, the version compare, #797's INV-2 ceiling and INV-5), in a transaction under the same locks,
+   * rolled back. Shadow users are only LOOKED UP (`findShadowUserId`), never provisioned: an add of an identity with no
+   * shadow user yet reports `provisionsAccount: true`, and rule M then compares the two identities by their shadow
+   * email, which is exactly how provisioning would have resolved them. A state-dependent refusal is
+   * `{ outcome: 'refused', code }` (`self_grant`, `last_admin`, `member_not_found`, `space_archived`,
+   * `precondition_failed`, `grant_exceeds_actor`, `basic_group_not_grantable`, `group_not_found`); a missing space is a 404,
+   * a malformed body a 400, and an undecidable ceiling a 503, as on the real route.
    */
   async previewMember(spaceId: string, dto: SpaceMemberPreviewDto): Promise<SpaceMemberPreview> {
     const workspaceId = await this.workspaces.resolveDefaultWorkspaceId();
@@ -597,42 +666,82 @@ export class ServiceSpaceService {
     try {
       switch (dto.action) {
         case 'add': {
-          const externalId = need(dto.externalId, 'externalId');
+          const subject = memberSubjectOf(dto);
           const addedByExternalId = need(dto.addedByExternalId, 'addedByExternalId');
           const role = need(dto.role, 'role');
-          const memberUserId = await this.bridge.findShadowUserId(externalId);
+          const memberUserId = subject.kind === 'user' ? await this.bridge.findShadowUserId(subject.externalId) : null;
           const addedById = await this.bridge.findShadowUserId(addedByExternalId);
           // Provisioning maps an externalId to ONE shadow user by its lower-cased shadow email.
           const isSelf =
-            memberUserId !== null && addedById !== null
-              ? memberUserId === addedById
-              : shadowEmailFor(externalId) === shadowEmailFor(addedByExternalId);
-          return await this.versionedTx(
-            true,
-            async (trx) => {
-              await this.lockSpace(trx, workspaceId, spaceId, true);
-              const live = memberUserId ? await this.liveUserRow(trx, spaceId, memberUserId) : undefined;
-              const row = live && { userId: memberUserId, groupId: null, role: live.role, deletedAt: null };
-              current = this.snapshotOf(spaceId, row);
-              await this.decideAdd(trx, spaceId, memberUserId, isSelf, role);
-              return this.previewOf(current, role, memberUserId === null);
-            },
-            true,
+            subject.kind !== 'user'
+              ? false
+              : memberUserId !== null && addedById !== null
+                ? memberUserId === addedById
+                : shadowEmailFor(subject.externalId) === shadowEmailFor(addedByExternalId);
+          const provisionsAccount = subject.kind === 'user' && memberUserId === null;
+          return await withGrantCeiling(this.fenceOnly, (ceilingMode) =>
+            this.versionedTx(
+              true,
+              async (trx) => {
+                await this.lockSpace(trx, workspaceId, spaceId, true);
+                let target: AddTarget;
+                if (subject.kind === 'user') {
+                  target = { kind: 'user', userId: memberUserId, isSelf };
+                  const live = memberUserId ? await this.liveUserRow(trx, spaceId, memberUserId) : undefined;
+                  current = this.snapshotOf(
+                    spaceId,
+                    live && { userId: memberUserId, groupId: null, role: live.role, deletedAt: null },
+                  );
+                } else {
+                  target = await this.groupTarget(trx, workspaceId, subject.groupId, addedById);
+                  const live = await this.liveGroupRow(trx, spaceId, subject.groupId);
+                  current = this.snapshotOf(
+                    spaceId,
+                    live && { userId: null, groupId: subject.groupId, role: live.role, deletedAt: null },
+                  );
+                }
+                const decided = await this.decideAdd(trx, {
+                  workspaceId,
+                  spaceId,
+                  target,
+                  role,
+                  mode: dto.mode ?? 'set',
+                  actorUserId: addedById,
+                  actorExternalId: addedByExternalId,
+                  ceilingMode,
+                });
+                if (decided.kind === 'unchanged') return this.previewOf(current, current.role, false);
+                return this.previewOf(current, role, provisionsAccount);
+              },
+              true,
+            ),
           );
         }
         case 'update': {
           const memberId = need(dto.memberId, 'memberId');
           const role = need(dto.role, 'role');
-          const actorId = await this.bridge.findShadowUserId(need(dto.actorExternalId, 'actorExternalId'));
-          return await this.versionedTx(
-            true,
-            async (trx) => {
-              await this.lockSpace(trx, workspaceId, spaceId, true);
-              current = this.snapshotOf(spaceId, await this.memberRow(trx, spaceId, memberId, true));
-              await this.decideRoleChange(trx, spaceId, memberId, role, actorId, dto.expectedVersion);
-              return this.previewOf(current, role, false);
-            },
-            true,
+          const actorExternalId = need(dto.actorExternalId, 'actorExternalId');
+          const actorId = await this.bridge.findShadowUserId(actorExternalId);
+          return await withGrantCeiling(this.fenceOnly, (ceilingMode) =>
+            this.versionedTx(
+              true,
+              async (trx) => {
+                await this.lockSpace(trx, workspaceId, spaceId, true);
+                current = this.snapshotOf(spaceId, await this.memberRow(trx, spaceId, memberId, true));
+                await this.decideRoleChange(trx, {
+                  workspaceId,
+                  spaceId,
+                  memberId,
+                  role,
+                  actorUserId: actorId,
+                  actorExternalId,
+                  expectedVersion: dto.expectedVersion,
+                  ceilingMode,
+                });
+                return this.previewOf(current, role, false);
+              },
+              true,
+            ),
           );
         }
         case 'remove': {
@@ -681,39 +790,171 @@ export class ServiceSpaceService {
     };
   }
 
-  // ---- the member-write decisions, shared by the writes and the preview (the caller holds the space lock) --------
-
-  /** An add (an upsert on (space, user)): rule M on the member's live row, then the last-admin guard. */
-  private async decideAdd(
-    trx: KyselyTransaction,
+  /** The add's answer: the membership row it wrote (or, `applied: false`, the one it left as it was). */
+  private addedView(
     spaceId: string,
-    memberUserId: string | null,
-    isSelf: boolean,
-    role: SpaceMemberRole,
-  ): Promise<void> {
-    // The upsert re-roles an existing LIVE row, so it can demote the last admin like a PATCH can.
-    const row = memberUserId ? await this.liveUserRow(trx, spaceId, memberUserId) : undefined;
-    // Rule M: adding yourself, or raising your own row (a soft-deleted one ranks 0), is refused.
-    if (isSelf && rank(role) > rank(row?.role)) throw selfGrant();
-    if (row?.role === 'admin' && role !== 'admin') await this.assertAnotherAdmin(trx, spaceId, row.id);
+    target: AddTarget,
+    row: { id: string; role: string },
+    applied: boolean,
+  ): AddedSpaceMember {
+    const userId = target.kind === 'user' ? (target.userId as string) : null;
+    const groupId = target.kind === 'group' ? target.groupId : null;
+    return {
+      memberId: row.id,
+      userId,
+      groupId,
+      version: memberRowVersion(spaceId, { userId, groupId, role: row.role, deletedAt: null }),
+      applied,
+    };
   }
 
-  /** A role change: the live row (404), the version compare (412), rule M (403), the last-admin guard (409). */
-  private async decideRoleChange(
+  /** The add's upsert on `(space, user)` or `(space, group)`: re-roles (and revives) an existing row. */
+  private async upsertMember(
     trx: KyselyTransaction,
     spaceId: string,
-    memberId: string,
+    target: AddTarget,
     role: SpaceMemberRole,
-    actorId: string | null,
-    expectedVersion: string | undefined,
+    addedById: string,
+  ): Promise<string> {
+    if (target.kind === 'user') {
+      const res = await sql<{ id: string }>`
+        insert into space_members (user_id, space_id, role, added_by_id)
+        values (${target.userId}, ${spaceId}, ${role}, ${addedById})
+        on conflict (space_id, user_id) do update set role = excluded.role, deleted_at = null, updated_at = now()
+        returning id
+      `.execute(trx);
+      return res.rows[0].id;
+    }
+    try {
+      const res = await sql<{ id: string }>`
+        insert into space_members (group_id, space_id, role, added_by_id)
+        values (${target.groupId}, ${spaceId}, ${role}, ${addedById})
+        on conflict (space_id, group_id) do update set role = excluded.role, deleted_at = null, updated_at = now()
+        returning id
+      `.execute(trx);
+      return res.rows[0].id;
+    } catch (e) {
+      // The group row is locked, so its foreign key cannot fail; if it ever does, a 404, never a 500.
+      if ((e as { code?: string })?.code === '23503') throw groupNotFound();
+      throw e;
+    }
+  }
+
+  /**
+   * #797: a group add's target. Locks the group row `FOR UPDATE` (live, in this workspace: else 404
+   * `group_not_found`), refuses the default group (400 `basic_group_not_grantable`, INV-5), and resolves whether the actor
+   * is IN the group (rule M: adding or raising a group you belong to is raising your own access).
+   */
+  private async groupTarget(
+    trx: KyselyTransaction,
+    workspaceId: string,
+    groupId: string,
+    actorUserId: string | null,
+  ): Promise<AddTarget> {
+    const res = await sql<{ id: string; isDefault: boolean }>`
+      select id, is_default from groups
+      where id = ${groupId} and workspace_id = ${workspaceId} and deleted_at is null
+      for update
+    `.execute(trx);
+    const group = res.rows[0];
+    if (!group) throw groupNotFound();
+    if (group.isDefault) throw basicNotGrantable();
+    const isSelf = actorUserId !== null && (await this.covers(trx, { userId: null, groupId: group.id }, actorUserId));
+    return { kind: 'group', groupId: group.id, isSelf };
+  }
+
+  /** The ceiling, required whenever a write raises a membership (a wiring bug is a 500, never an unchecked grant). */
+  private requireCeiling(): SpaceGrantCeiling {
+    if (!this.ceiling) throw new InternalServerErrorException('space grant ceiling unavailable');
+    return this.ceiling;
+  }
+
+  /** What `withGrantCeiling` needs: the fence, resolved only when a decision actually needs the PDP. */
+  private readonly fenceOnly = { fence: () => this.requireCeiling().fence() };
+
+  // ---- the member-write decisions, shared by the writes and the preview (the caller holds the space lock) --------
+
+  /**
+   * An add (an upsert on (space, user|group)): rule M on the member's live row, `atLeast`, the INV-2 ceiling on a
+   * raise, then the last-admin guard. Answers `unchanged` (with the live row) when `atLeast` leaves it as it is.
+   */
+  private async decideAdd(
+    trx: KyselyTransaction,
+    a: {
+      workspaceId: string;
+      spaceId: string;
+      target: AddTarget;
+      role: SpaceMemberRole;
+      mode: AddMemberMode;
+      actorUserId: string | null;
+      actorExternalId: string;
+      ceilingMode: CeilingMode;
+    },
+  ): Promise<{ kind: 'write' } | { kind: 'unchanged'; row: { id: string; role: string } }> {
+    const { spaceId, target, role } = a;
+    // The upsert re-roles an existing LIVE row, so it can demote the last admin like a PATCH can.
+    const row =
+      target.kind === 'user'
+        ? target.userId
+          ? await this.liveUserRow(trx, spaceId, target.userId)
+          : undefined
+        : await this.liveGroupRow(trx, spaceId, target.groupId);
+    const raises = rank(role) > rank(row?.role);
+    // Rule M: adding yourself (or a group you are in), or raising such a row (a soft-deleted one ranks 0), is refused.
+    if (target.isSelf && raises) throw selfGrant();
+    // #797 `atLeast`: an existing live membership at or above the role is left exactly as it is.
+    if (a.mode === 'atLeast' && row && !raises) return { kind: 'unchanged', row };
+    // INV-2: a raise must be covered by what the actor holds on this space.
+    if (raises) {
+      await this.requireCeiling().assertCovers(trx, a.ceilingMode, {
+        workspaceId: a.workspaceId,
+        spaceId,
+        actorUserId: a.actorUserId,
+        actorExternalId: a.actorExternalId,
+        role,
+      });
+    }
+    if (row?.role === 'admin' && role !== 'admin') await this.assertAnotherAdmin(trx, spaceId, row.id);
+    return { kind: 'write' };
+  }
+
+  /**
+   * A role change: the live row (404), the version compare (412), INV-5 (409 on a default-group row), rule M (403),
+   * the INV-2 ceiling on a raise (403), the last-admin guard (409).
+   */
+  private async decideRoleChange(
+    trx: KyselyTransaction,
+    c: {
+      workspaceId: string;
+      spaceId: string;
+      memberId: string;
+      role: SpaceMemberRole;
+      actorUserId: string | null;
+      actorExternalId: string;
+      expectedVersion: string | undefined;
+      ceilingMode: CeilingMode;
+    },
   ): Promise<MemberRow> {
+    const { spaceId, memberId, role } = c;
     // `id AND space_id`: a memberId from another space is a 404 (never a cross-space write, and never
     // "not self" — the row must be found before rule M can be judged).
     const row = await this.memberRow(trx, spaceId, memberId, true);
     if (!row) throw memberNotFound();
-    assertExpectedVersion(expectedVersion, memberRowVersion(spaceId, row));
-    if (rank(role) > rank(row.role) && actorId !== null && (await this.covers(trx, row, actorId))) {
+    assertExpectedVersion(c.expectedVersion, memberRowVersion(spaceId, row));
+    // INV-5: a default-group membership is never re-roled (only removed).
+    if (row.groupId !== null && (await isDefaultGroup(trx, row.groupId, c.workspaceId))) throw basicNotGrantable();
+    const raises = rank(role) > rank(row.role);
+    if (raises && c.actorUserId !== null && (await this.covers(trx, row, c.actorUserId))) {
       throw selfGrant();
+    }
+    if (raises) {
+      await this.requireCeiling().assertCovers(trx, c.ceilingMode, {
+        workspaceId: c.workspaceId,
+        spaceId,
+        actorUserId: c.actorUserId,
+        actorExternalId: c.actorExternalId,
+        role,
+      });
     }
     if (row.role === 'admin' && role !== 'admin') await this.assertAnotherAdmin(trx, spaceId, memberId);
     return row;
@@ -757,6 +998,20 @@ export class ServiceSpaceService {
     const cur = await sql<{ id: string; role: string }>`
       select id, role from space_members
       where space_id = ${spaceId} and user_id = ${userId} and deleted_at is null
+      for update
+    `.execute(trx);
+    return cur.rows[0];
+  }
+
+  /** #797: a group's LIVE membership row in the space, locked `FOR UPDATE` (what the group add upsert would re-role). */
+  private async liveGroupRow(
+    trx: KyselyTransaction,
+    spaceId: string,
+    groupId: string,
+  ): Promise<{ id: string; role: string } | undefined> {
+    const cur = await sql<{ id: string; role: string }>`
+      select id, role from space_members
+      where space_id = ${spaceId} and group_id = ${groupId} and deleted_at is null
       for update
     `.execute(trx);
     return cur.rows[0];

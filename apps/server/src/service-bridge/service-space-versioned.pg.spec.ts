@@ -16,6 +16,7 @@ import {
   mkReadModelDb,
   createReadModelTables,
 } from './read-model-pg.testkit';
+import { allowAllCeiling } from './space-grant-ceiling.testkit';
 
 /**
  * #616 Stage 2 on real Postgres: the space and membership versions, their atomic compares, and the member preview.
@@ -118,7 +119,7 @@ d('ServiceSpaceService versions + previews on real Postgres (#616)', () => {
 
     const resolver = fakeWorkspaceResolver(WS);
     const bridge = new ServiceBridgeService(db as any, new UserRepo(db as any), {} as any, {} as any, resolver, {} as any);
-    svc = new ServiceSpaceService(db as any, resolver, bridge);
+    svc = new ServiceSpaceService(db as any, resolver, bridge, undefined, allowAllCeiling());
     content = new ServiceContentService(db as any, resolver);
   });
 
