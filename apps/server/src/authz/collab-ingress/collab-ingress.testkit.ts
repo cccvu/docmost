@@ -42,11 +42,18 @@ export const step1Frame = (doc: Y.Doc, docName = DOC_NAME): Uint8Array =>
     encoding.writeVarUint8Array(e, Y.encodeStateVector(doc));
   }, docName);
 
-export const authFrame = (token: string, docName = DOC_NAME): Uint8Array =>
+export const authFrame = (token: string, docName = DOC_NAME, authType = 0): Uint8Array =>
   frame((e) => {
     encoding.writeVarUint(e, MSG.Auth);
-    encoding.writeVarUint(e, 0);
+    encoding.writeVarUint(e, authType);
     encoding.writeVarString(e, token);
+  }, docName);
+
+/** A frame of any message type, with an optional body (#790: types Hocuspocus 4.7.1 does not handle from a client). */
+export const typedFrame = (type: number, body: (e: encoding.Encoder) => void = () => undefined, docName = DOC_NAME): Uint8Array =>
+  frame((e) => {
+    encoding.writeVarUint(e, type);
+    body(e);
   }, docName);
 
 export const statelessFrame = (payload: string, type: number = MSG.Stateless, docName = DOC_NAME): Uint8Array =>
@@ -56,7 +63,7 @@ export const statelessFrame = (payload: string, type: number = MSG.Stateless, do
   }, docName);
 
 /** An awareness frame (y-protocols `encodeAwarenessUpdate` layout). `state: null` removes the client. */
-export const awarenessFrame = (entries: Array<{ clientID: number; clock?: number; state: unknown }>, docName = DOC_NAME): Uint8Array =>
+export const awarenessFrame = (entries: Array<{ clientID: number; clock?: number; state: unknown; json?: string }>, docName = DOC_NAME): Uint8Array =>
   frame((e) => {
     encoding.writeVarUint(e, MSG.Awareness);
     const inner = encoding.createEncoder();
@@ -64,7 +71,7 @@ export const awarenessFrame = (entries: Array<{ clientID: number; clock?: number
     for (const entry of entries) {
       encoding.writeVarUint(inner, entry.clientID);
       encoding.writeVarUint(inner, entry.clock ?? 1);
-      encoding.writeVarString(inner, JSON.stringify(entry.state));
+      encoding.writeVarString(inner, entry.json ?? JSON.stringify(entry.state)); // `json`: the state's raw text
     }
     encoding.writeVarUint8Array(e, encoding.toUint8Array(inner));
   }, docName);

@@ -8,6 +8,7 @@ import { serverSchema } from '../page-write/prelim-content';
 import { isDuplicateWriteKey, recordWriteKey, WRITE_IDEM_MAP } from '../page-write/write-idem';
 import {
   ALL_NODES_DOC,
+  authFrame,
   awarenessFrame,
   contentOf,
   deepJson,
@@ -17,11 +18,24 @@ import {
   renderLikeABrowser,
   spliceVarString,
   statelessFrame,
+  step1Frame,
   SYNC,
   syncFrame,
+  typedFrame,
 } from './collab-ingress.testkit';
 import { INT_ATTRS, STRING_ATTRS } from './content-rules';
-import { COLLAB_REFUSAL_CODE, CollabUpdateGuard, SOCKET_REFUSAL_BUDGET, UNRESOLVED_REASON, type CollabGuardMode } from './update-guard';
+import {
+  AWARENESS_BINDS_PER_DOCUMENT,
+  AWARENESS_NEW_IDS_PER_CONNECTION,
+  AWARENESS_STATE_MAX_BYTES,
+  COLLAB_REFUSAL_CODE,
+  CollabUpdateGuard,
+  SOCKET_REFUSAL_BUDGET,
+  SYNC_BURST,
+  SYNC_REFILL_MS,
+  UNRESOLVED_REASON,
+  type CollabGuardMode,
+} from './update-guard';
 
 /**
  * #781 (ADR 0036): the collab update guard refuses, BEFORE it applies, a frame that would make any browser's y-tiptap
@@ -37,7 +51,7 @@ const REFUSED = (rule: string) => `ccc:collab-update-refused:${rule}`;
 
 type Conn = { readOnly: boolean; webSocket: { close: jest.Mock }; context: { user: { id: string } } };
 
-function setup(opts: { mode?: CollabGuardMode; seed?: unknown | Y.Doc; seedY?: (f: Y.XmlFragment, d: Y.Doc) => void; legacy?: Uint8Array } = {}) {
+function setup(opts: { mode?: CollabGuardMode; seed?: unknown | Y.Doc; seedY?: (f: Y.XmlFragment, d: Y.Doc) => void; legacy?: Uint8Array; now?: () => number } = {}) {
   const live = new Y.Doc() as Y.Doc & { name: string };
   live.name = DOC_NAME;
   if (opts.seed) {
@@ -51,7 +65,7 @@ function setup(opts: { mode?: CollabGuardMode; seed?: unknown | Y.Doc; seedY?: (
   }
   if (opts.legacy) Y.applyUpdate(live, opts.legacy); // stored before the guard ever saw the document
   const logs: string[] = [];
-  const guard = new CollabUpdateGuard({ mode: opts.mode ?? 'enforce', logger: { warn: (m: string) => logs.push(m) } });
+  const guard = new CollabUpdateGuard({ mode: opts.mode ?? 'enforce', logger: { warn: (m: string) => logs.push(m) }, now: opts.now });
   // The peer receives every update the live document broadcasts.
   const peer = new Y.Doc();
   if (!opts.legacy) {
@@ -882,5 +896,154 @@ describe('#781 the Yjs internals the guard reads (re-check on a Yjs 14 / Hocuspo
     Y.applyUpdate(d, Y.encodeStateAsUpdate(src, sv));
     expect(Y.decodeUpdateV2(d.store.pendingStructs!.update).structs.length).toBeGreaterThan(0);
     expect(Y.decodeUpdateV2(d.store.pendingDs!).ds.clients.size).toBe(1);
+  });
+});
+
+describe('#790 frame bounds: the sync bucket', () => {
+  const clocked = () => {
+    let t = 1_000_000;
+    const s = setup({ seed: SEED, now: () => t });
+    return { s, advance: (ms: number) => (t += ms) };
+  };
+
+  it(`a writer's SyncStep1: ${SYNC_BURST} pass, the next is refused sync-rate (Sync and SyncReply alike)`, () => {
+    for (const type of [MSG.Sync, MSG.SyncReply]) {
+      const { s } = clocked();
+      const c = s.conn('writer');
+      const frame = type === MSG.Sync ? step1Frame(s.live) : syncFrame(Y.encodeStateVector(s.live), SYNC.Step1, MSG.SyncReply);
+      for (let i = 0; i < SYNC_BURST; i++) expect(s.deliver(c, frame)).toBe('applied');
+      expect(s.deliver(c, frame)).toBe(REFUSED('sync-rate'));
+      expect(s.deliver(s.conn('writer'), frame)).toBe('applied'); // a new session (a reconnect) has its own bucket
+    }
+  });
+
+  it(`refills one token per ${SYNC_REFILL_MS} ms, never above the burst`, () => {
+    const { s, advance } = clocked();
+    const c = s.conn('writer');
+    advance(10 * SYNC_REFILL_MS); // idle before the first frame: still only the burst
+    for (let i = 0; i < SYNC_BURST; i++) expect(s.deliver(c, step1Frame(s.live))).toBe('applied');
+    advance(SYNC_REFILL_MS - 1);
+    const d = s.conn('writer');
+    for (let i = 0; i < SYNC_BURST; i++) s.deliver(d, step1Frame(s.live));
+    advance(1);
+    expect(s.deliver(c, step1Frame(s.live))).toBe('applied'); // one token back after exactly SYNC_REFILL_MS
+    expect(s.deliver(c, step1Frame(s.live))).toBe(REFUSED('sync-rate'));
+    advance(100 * SYNC_REFILL_MS);
+    for (let i = 0; i < SYNC_BURST; i++) expect(s.deliver(d, step1Frame(s.live))).toBe('applied'); // capped at the burst
+    expect(s.deliver(d, step1Frame(s.live))).toBe(REFUSED('sync-rate'));
+  });
+
+  it("a reader's Step2 is counted (4.7.1 snapshots the whole document for it); its Update is not (an O(1) nack)", () => {
+    const { s } = clocked();
+    const reader = s.conn('reader', true);
+    const update = new RemoteClient(s.live).edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'x '));
+    expect(s.deliver(reader, step1Frame(s.live))).toBe('applied');
+    for (let i = 0; i < 20; i++) expect(s.deliver(reader, syncFrame(update, SYNC.Update))).toBe('applied'); // y-tiptap's per-element deletes on a legacy page
+    for (let i = 1; i < SYNC_BURST; i++) expect(s.deliver(reader, syncFrame(update, SYNC.Step2))).toBe('applied');
+    expect(s.deliver(reader, syncFrame(update, SYNC.Step2))).toBe(REFUSED('sync-rate'));
+  });
+
+  it("an honest open passes: one Step1, a Step2, awareness, then a stream of updates (a writer's Step2 and Updates are not counted)", () => {
+    const { s } = clocked();
+    const c = s.conn('writer');
+    const client = new RemoteClient(s.live, 4242);
+    expect(s.deliver(c, step1Frame(client.doc))).toBe('applied');
+    expect(s.send(c, client.edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'offline ')), SYNC.Step2)).toBe('applied');
+    expect(s.deliver(c, awarenessFrame([{ clientID: 4242, state: { user: { name: 'W' } } }]))).toBe('applied');
+    for (let i = 0; i < 3 * SYNC_BURST; i++) {
+      expect(s.send(c, client.edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, `${i} `)))).toBe('applied');
+    }
+    const reader = s.conn('reader', true);
+    expect(s.deliver(reader, step1Frame(s.live))).toBe('applied');
+    expect(s.deliver(reader, syncFrame(Y.encodeStateAsUpdate(s.live), SYNC.Step2))).toBe('applied');
+  });
+});
+
+describe('#790 frame bounds: awareness, for writers and readers', () => {
+  const big = 'x'.repeat(AWARENESS_STATE_MAX_BYTES);
+  /** A state whose JSON text is exactly `bytes` UTF-8 bytes. */
+  const stateOf = (bytes: number) => ({ json: JSON.stringify({ n: big.slice(0, bytes - 8) }) });
+
+  it.each([['writer', false], ['reader', true]] as const)(
+    'a %s: a state over AWARENESS_STATE_MAX_BYTES is refused before anything parses it; one at the bound passes',
+    (_who, readOnly) => {
+      const s = setup({ seed: SEED });
+      expect(stateOf(AWARENESS_STATE_MAX_BYTES).json.length).toBe(AWARENESS_STATE_MAX_BYTES);
+      expect(s.deliver(s.conn('a', readOnly), awarenessFrame([{ clientID: 11, state: null, ...stateOf(AWARENESS_STATE_MAX_BYTES) }]))).toBe('applied');
+      const parse = jest.spyOn(JSON, 'parse');
+      try {
+        // Not even valid JSON past the bound: a guard that parsed it first would throw, not refuse.
+        const json = '{'.repeat(AWARENESS_STATE_MAX_BYTES + 1);
+        expect(s.deliver(s.conn('b', readOnly), awarenessFrame([{ clientID: 12, state: null, json }]))).toBe(REFUSED('awareness'));
+        // Bytes, not UTF-16 units: 4100 two-byte characters are 8200 bytes.
+        expect(s.deliver(s.conn('c', readOnly), awarenessFrame([{ clientID: 13, state: { n: 'é'.repeat(4100) } }]))).toBe(REFUSED('awareness'));
+        expect(parse.mock.calls.filter(([text]) => typeof text === 'string' && text.length > 4000)).toEqual([]);
+      } finally {
+        parse.mockRestore();
+      }
+      expect(s.guard.bindingCount(s.live)).toBe(readOnly ? 0 : 2); // a reader binds nothing; a writer: live's own id + its state
+    },
+  );
+
+  it.each([['writer', false], ['reader', true]] as const)(
+    `a %s: at most ${AWARENESS_NEW_IDS_PER_CONNECTION} client ids new to the document per connection, counted across frames`,
+    (_who, readOnly) => {
+      const s = setup({ seed: SEED });
+      const c = s.conn('a', readOnly);
+      const ids = (from: number, n: number) => Array.from({ length: n }, (_, i) => ({ clientID: from + i, state: {} }));
+      expect(s.deliver(c, awarenessFrame(ids(100, AWARENESS_NEW_IDS_PER_CONNECTION - 1)))).toBe('applied');
+      expect(s.deliver(c, awarenessFrame(ids(100, AWARENESS_NEW_IDS_PER_CONNECTION - 1)))).toBe('applied'); // the same ids again
+      expect(s.deliver(c, awarenessFrame(ids(500, 1)))).toBe('applied');
+      expect(s.deliver(c, awarenessFrame(ids(600, 1)))).toBe(REFUSED('awareness'));
+      expect(s.deliver(s.conn('b', readOnly), awarenessFrame(ids(700, AWARENESS_NEW_IDS_PER_CONNECTION)))).toBe('applied'); // per connection
+    },
+  );
+
+  it.each([['writer', false], ['reader', true]] as const)(
+    'a %s: ids the document awareness already holds are not counted (a timeout removal of a 200-peer room passes)',
+    (_who, readOnly) => {
+      const s = setup({ seed: SEED });
+      const meta = new Map<number, { clock: number }>();
+      for (let i = 0; i < 200; i++) meta.set(1000 + i, { clock: 3 });
+      (s.live as unknown as { awareness: unknown }).awareness = { meta };
+      const room = Array.from({ length: 200 }, (_, i) => ({ clientID: 1000 + i, clock: 4, state: null }));
+      expect(s.deliver(s.conn('a', readOnly), awarenessFrame(room))).toBe('applied');
+      expect(s.deliver(s.conn('a', readOnly), awarenessFrame([...room, ...room.slice(0, AWARENESS_NEW_IDS_PER_CONNECTION).map((e) => ({ ...e, clientID: e.clientID + 5000 }))]))).toBe('applied');
+    },
+  );
+
+  it('a client id twice in one frame is refused (y-protocols never encodes one twice)', () => {
+    const s = setup({ seed: SEED });
+    expect(s.deliver(s.conn('a', true), awarenessFrame([{ clientID: 5, state: {} }, { clientID: 5, clock: 2, state: {} }]))).toBe(REFUSED('awareness'));
+  });
+
+  it(`awareness binds stop at ${AWARENESS_BINDS_PER_DOCUMENT} per document (never a refusal)`, () => {
+    const s = setup({ seed: SEED });
+    const perConn = AWARENESS_NEW_IDS_PER_CONNECTION;
+    let next = 10_000;
+    for (let n = 0; n < AWARENESS_BINDS_PER_DOCUMENT / perConn + 2; n++) {
+      const entries = Array.from({ length: perConn }, () => ({ clientID: next++, state: { user: {} } }));
+      expect(s.deliver(s.conn(`w${n}`), awarenessFrame(entries))).toBe('applied');
+    }
+    expect(s.guard.bindingCount(s.live)).toBe(1 + AWARENESS_BINDS_PER_DOCUMENT); // live's own id + the cap
+  });
+});
+
+describe('#790 frame bounds: Auth on an established session and unknown message types', () => {
+  it('an Auth frame is refused auth (only an established session reaches the guard), any subtype', () => {
+    const s = setup({ seed: SEED });
+    for (const authType of [0, 1, 2]) {
+      expect(s.deliver(s.conn('a'), authFrame('token', DOC_NAME, authType))).toBe(REFUSED('auth'));
+    }
+  });
+
+  it('a type 4.7.1 does not handle is refused message-type; every type an honest provider sends passes', () => {
+    const s = setup({ seed: SEED });
+    for (const type of [MSG.SyncStatus, 9, 10, 11, 127, 300]) expect(s.deliver(s.conn('a'), typedFrame(type))).toBe(REFUSED('message-type'));
+    const c = s.conn('writer');
+    expect(s.deliver(c, typedFrame(MSG.QueryAwareness))).toBe('applied');
+    expect(s.deliver(c, step1Frame(s.live))).toBe('applied');
+    expect(s.deliver(c, awarenessFrame([{ clientID: 9, state: {} }]))).toBe('applied');
+    expect(s.deliver(c, typedFrame(MSG.Close))).toBe('applied'); // a provider's detach
   });
 });

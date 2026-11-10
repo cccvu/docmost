@@ -25,6 +25,9 @@ import { jwtDecode } from "jwt-decode";
  *       - `ccc:collab-update-unresolved` → the server could not decide; reconnect ONCE. The retry is spent until
  *         `sync-acked` (every frame this provider sent was applied), NOT until the next authentication, which
  *         happens before the replay is judged; a second one before that is treated as refused.
+ *   - #790: a SOCKET close with code 1009 (the server's ws "message too big": this browser sent a frame over the
+ *     server's maxPayload) is refused too. The provider would reconnect and resend the same frame (its Step2 answer
+ *     to the server's Step1) every second, forever. Only a raw socket close carries a code other than 1000.
  *
  * Pure and dependency-free so it is unit-tested without a provider; page-editor.tsx wires it (seam 169).
  */
@@ -54,9 +57,14 @@ export const initialCollabAccess: CollabAccessState = {
 export const COLLAB_UPDATE_REFUSED_PREFIX = "ccc:collab-update-refused:";
 export const COLLAB_UPDATE_UNRESOLVED = "ccc:collab-update-unresolved";
 
+/** #790: the ws close code for a message over the server's `maxPayload` (RFC 6455 "Message Too Big"). */
+export const WS_CLOSE_MESSAGE_TOO_BIG = 1009;
+
 export function classifyCollabCloseReason(
   reason: string | undefined,
+  code?: number,
 ): "refused" | "unresolved" | "other" {
+  if (code === WS_CLOSE_MESSAGE_TOO_BIG) return "refused";
   if (typeof reason !== "string") return "other";
   if (reason.startsWith(COLLAB_UPDATE_REFUSED_PREFIX)) return "refused";
   if (reason === COLLAB_UPDATE_UNRESOLVED) return "unresolved";
@@ -64,7 +72,13 @@ export function classifyCollabCloseReason(
 }
 
 export type CollabAccessEvent =
-  | { kind: "server-close"; socketConnected: boolean; reason?: string }
+  | {
+      kind: "server-close";
+      socketConnected: boolean;
+      reason?: string;
+      /** #790: the close code (a document CLOSE is always 1000; a raw socket close carries the socket's own). */
+      code?: number;
+    }
   | { kind: "auth-failed"; tokenExpired: boolean }
   | { kind: "refresh-failed" }
   | { kind: "authenticated"; scope: string | undefined }
@@ -98,7 +112,7 @@ export function nextCollabAccess(
   if (prev.refused) return { state: prev, ...NO_ACTION };
   switch (event.kind) {
     case "server-close": {
-      const reason = classifyCollabCloseReason(event.reason);
+      const reason = classifyCollabCloseReason(event.reason, event.code);
       if (reason === "refused") return refusedStep(prev);
       if (reason === "unresolved") {
         if (prev.unresolvedRetried) return refusedStep(prev);

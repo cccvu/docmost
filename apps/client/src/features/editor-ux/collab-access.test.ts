@@ -9,6 +9,7 @@ import {
   initialCollabAccess,
   isCollabTokenExpired,
   nextCollabAccess,
+  WS_CLOSE_MESSAGE_TOO_BIG,
 } from "./collab-access";
 
 /** An unsigned JWT with the given exp (seconds). jwt-decode only decodes. */
@@ -395,5 +396,57 @@ describe("collab token expiry (the refreshed token, not the one captured at moun
     expect(isCollabTokenExpired(stale, now)).toBe(true);
     expect(isCollabTokenExpired(undefined, now)).toBe(true);
     expect(isCollabTokenExpired("not-a-jwt", now)).toBe(true);
+  });
+});
+
+// cccvu/wiki-v2#790 — the server's ws closes a socket whose frame exceeds its maxPayload with 1009. The provider would
+// reconnect and resend the same frame every second, forever, so that close is a refusal like the guard's.
+describe("a socket close with 1009 (a frame over the server's maxPayload) (#790)", () => {
+  const rawClose = (code: number | undefined, reason = "") =>
+    ({ kind: "server-close", socketConnected: false, reason, code }) as const;
+
+  it("is refused: detach, stop editing, the generic notice, never reconnect or refetch", () => {
+    expect(WS_CLOSE_MESSAGE_TOO_BIG).toBe(1009);
+    expect(classifyCollabCloseReason("", 1009)).toBe("refused");
+    for (const step of [
+      nextCollabAccess(initialCollabAccess, rawClose(1009)),
+      nextCollabAccess(initialCollabAccess, rawClose(1009, "Max payload size exceeded")),
+    ]) {
+      expect(step.detach).toBe(true);
+      expect(step.reconnect).toBe(false);
+      expect(step.refreshToken).toBe(false);
+      expect(step.markDisconnected).toBe(false);
+      expect(step.state.refused).toBe(true);
+      expect(collabAllowsEditing(step.state)).toBe(false);
+    }
+  });
+
+  it.each([1000, 1001, 1006, 1011, 4408, 4422, undefined])(
+    "any other raw socket close (%s) stays an ordinary close the provider recovers from",
+    (code) => {
+      expect(classifyCollabCloseReason("", code)).toBe("other");
+      const step = nextCollabAccess(initialCollabAccess, rawClose(code));
+      expect(step).toEqual({
+        state: initialCollabAccess,
+        reconnect: false,
+        refreshToken: false,
+        markDisconnected: false,
+        detach: false,
+      });
+    },
+  );
+
+  it("a per-document CLOSE (code 1000) is still judged by its reason alone", () => {
+    expect(
+      nextCollabAccess(initialCollabAccess, {
+        kind: "server-close",
+        socketConnected: true,
+        reason: "Server closed the connection",
+        code: 1000,
+      }).reconnect,
+    ).toBe(true);
+    expect(classifyCollabCloseReason(COLLAB_UPDATE_UNRESOLVED, 1000)).toBe(
+      "unresolved",
+    );
   });
 });

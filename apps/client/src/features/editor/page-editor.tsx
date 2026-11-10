@@ -236,6 +236,7 @@ export default function PageEditor({
             kind: "server-close",
             socketConnected: socket.status === WebSocketStatus.Connected,
             reason: event?.reason, // CCC (#781): a document CLOSE always says code 1000; the reason is the signal
+            code: event?.code, // CCC (#790): a raw socket close carries its own code (1009: a frame over maxPayload)
           }),
         onUnsyncedChanges: ({ number }) => {
           if (number === 0) onCollabAccess({ kind: "sync-acked" }); // CCC (#781)
