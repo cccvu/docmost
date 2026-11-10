@@ -61,12 +61,29 @@ describe('#790 BoundedCollabSocket', () => {
   it('terminates a client that never reads, owed SyncStep2 after SyncStep2, and drops the frame', () => {
     const { raw, sent, socket, frame, warn } = harness();
     for (let i = 0; i < 20; i++) socket.send(frame(8 * MiB));
-    // passes while buffered <= 8 MiB + 8 MiB before the send: 0, 8, 16 -> three frames, the fourth terminates
-    expect(sent).toEqual(Array(3).fill(8 * MiB));
+    // the frame is counted before it is queued: 0 + 8 and 8 + 8 fit 8 MiB + 8 MiB, 16 + 8 does not
+    expect(sent).toEqual(Array(2).fill(8 * MiB));
+    expect(raw.bufferedAmount).toBe(16 * MiB);
     expect(raw.terminate).toHaveBeenCalledTimes(1);
     expect(warn.mock.calls).toEqual([
-      [`COLLAB_SOCKET_LIMIT {"limit":"outbound_buffer","bufferedBytes":${24 * MiB},"allowanceBytes":${16 * MiB}}`],
+      [`COLLAB_SOCKET_LIMIT {"limit":"outbound_buffer","bufferedBytes":${16 * MiB},"frameBytes":${8 * MiB},"allowanceBytes":${16 * MiB}}`],
     ]);
+  });
+
+  it('never holds more than 8 MiB plus its largest frame, whatever mix of frame sizes it is owed', () => {
+    for (const sizes of [
+      [1 * MiB, 2 * MiB, 4 * MiB, 8 * MiB, 8 * MiB, 8 * MiB], // each frame bigger than the last: the allowance grows with it
+      [8 * MiB, 7 * MiB, 8 * MiB - 1, 8 * MiB, 6 * MiB],
+      Array(400).fill(100 * 1024),
+    ]) {
+      const { raw, socket, frame } = harness();
+      let peak = 0;
+      for (const n of sizes) {
+        socket.send(frame(n));
+        peak = Math.max(peak, raw.bufferedAmount);
+      }
+      expect(peak).toBeLessThanOrEqual(COLLAB_OUTBOUND_BUFFER_FACTOR * COLLAB_MAX_PAYLOAD_BYTES + Math.max(...sizes));
+    }
   });
 
   it('terminates a client that never reads small broadcasts once past the allowance', () => {
@@ -74,7 +91,7 @@ describe('#790 BoundedCollabSocket', () => {
     const n = (8 * MiB) / (64 * 1024) + 10;
     for (let i = 0; i < n; i++) socket.send(frame(64 * 1024));
     expect(raw.terminate).toHaveBeenCalledTimes(1);
-    expect(sent.length).toBe((8 * MiB) / (64 * 1024) + 2);
+    expect(sent.length).toBe((8 * MiB) / (64 * 1024) + 1);
   });
 
   it('reports the raw socket closing, so Hocuspocus stops sending to a socket the client closed', () => {

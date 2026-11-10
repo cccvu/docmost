@@ -26,9 +26,7 @@ import {
 import { INT_ATTRS, STRING_ATTRS } from './content-rules';
 import {
   AWARENESS_BINDS_PER_USER,
-  AWARENESS_BURST,
   AWARENESS_NEW_IDS_PER_CONNECTION,
-  AWARENESS_REFILL_PER_SECOND,
   AWARENESS_STATE_MAX_BYTES,
   COLLAB_REFUSAL_CODE,
   CollabUpdateGuard,
@@ -1058,52 +1056,19 @@ describe('#790 frame bounds: Auth on an established session and unknown message 
   });
 });
 
-describe('#790 awareness: the per-connection rate', () => {
-  const clocked = () => {
-    let t = 2_000_000;
-    const s = setup({ seed: SEED, now: () => t });
-    return { s, advance: (ms: number) => (t += ms) };
-  };
-  const cursor = (clock: number) => awarenessFrame([{ clientID: 4242, clock, state: { user: { name: 'W' }, cursor: { anchor: clock, head: clock } } }]);
-
+describe('#790 awareness: no rate refusal in the guard (the rate is a drop at the gateway, frame-address.ts)', () => {
   it.each([['writer', false], ['reader', true]] as const)(
-    `a %s: a burst of ${AWARENESS_BURST} passes, the next is refused awareness-rate; QueryAwareness counts too`,
+    'a %s sending 1000 cursor frames in one millisecond is never refused: a refusal would end an honest session',
     (_who, readOnly) => {
-      const { s } = clocked();
+      const s = setup({ seed: SEED, now: () => 2_000_000 });
       const c = s.conn('a', readOnly);
-      for (let i = 1; i <= AWARENESS_BURST - 1; i++) expect(s.deliver(c, cursor(i))).toBe('applied');
-      expect(s.deliver(c, typedFrame(MSG.QueryAwareness))).toBe('applied');
-      expect(s.deliver(c, cursor(AWARENESS_BURST + 1))).toBe(REFUSED('awareness-rate'));
-      expect(s.deliver(s.conn('a', readOnly), cursor(1))).toBe('applied'); // a new session has its own bucket
+      for (let clock = 1; clock <= 1000; clock++) {
+        const frame = awarenessFrame([{ clientID: 4242, clock, state: { user: { name: 'W' }, cursor: { anchor: clock, head: clock } } }]);
+        expect(s.deliver(c, frame)).toBe('applied');
+      }
+      for (let i = 0; i < 100; i++) expect(s.deliver(c, typedFrame(MSG.QueryAwareness))).toBe('applied');
     },
   );
-
-  it('honest editing never meets it: a held arrow key (33/s) for a minute, then a fast mouse-drag (60/s) for 3 s', () => {
-    const { s, advance } = clocked();
-    const c = s.conn('writer');
-    let clock = 0;
-    for (let i = 0; i < 33 * 60; i++) {
-      expect(s.deliver(c, cursor(++clock))).toBe('applied');
-      advance(1000 / 33);
-    }
-    for (let i = 0; i < 60 * 3; i++) {
-      expect(s.deliver(c, cursor(++clock))).toBe('applied');
-      advance(1000 / 60);
-    }
-    expect(AWARENESS_REFILL_PER_SECOND).toBeGreaterThan(33);
-  });
-
-  it('a flood is held to the refill rate', () => {
-    const { s, advance } = clocked();
-    const c = s.conn('flooder');
-    let clock = 0;
-    let applied = 0;
-    for (let ms = 0; ms < 10_000; ms++) {
-      for (let k = 0; k < 2 && !s.guard['refusedConnections'].has(c); k++) if (s.deliver(c, cursor(++clock)) === 'applied') applied++;
-      advance(1);
-    }
-    expect(applied).toBeLessThanOrEqual(AWARENESS_BURST + 10 * AWARENESS_REFILL_PER_SECOND + 1);
-  });
 });
 
 describe('#790 awareness: no state for another user\'s client id', () => {

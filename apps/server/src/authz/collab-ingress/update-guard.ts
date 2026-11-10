@@ -27,11 +27,12 @@
  *
  * Frame bounds (#790), in the same synchronous check, where Hocuspocus 4.7.1 leaves a gap: a per-connection SYNC
  * BUCKET (a SyncStep1, and a reader's Step2, each make 4.7.1 encode or snapshot the whole document); AWARENESS bounds
- * for every connection, readers too (a per-connection AWARENESS BUCKET, as 4.7.1 relays every awareness frame to every
- * peer; each state's size before anything parses it; the client ids new to the document per connection; and no state
- * for a client id bound to another user, so nobody can speak as another user's cursor); and Auth on an established
+ * for every connection, readers too (each state's size before anything parses it; the client ids new to the document per
+ * connection; and no newer state for a client id bound to another user, so nobody can move another user's cursor or
+ * selection; the name and colour in a state are the client's own say, never checked); and Auth on an established
  * session or a message type 4.7.1's MessageReceiver does not handle (each one is otherwise handled without a limit, an
- * unhandled type with one unrate-limited console.error).
+ * unhandled type with one unrate-limited console.error). The awareness RATE is not here: over-rate awareness frames are
+ * dropped at the gateway (frame-address.ts), since a refusal here would end an honest editor's session.
  *
  * Refusal = a throw of `{ code: 4422, reason }`: Hocuspocus closes that ONE document session and sends the reason (the
  * websocket stays up). Reasons the client acts on (apps/client features/editor-ux): `ccc:collab-update-refused:<rule>`
@@ -81,15 +82,6 @@ export const SYNC_REFILL_MS = 15_000;
 export const AWARENESS_STATE_MAX_BYTES = 8 * 1024;
 /** #790: client ids per connection that the document's awareness has never held (`awareness.meta`). */
 export const AWARENESS_NEW_IDS_PER_CONNECTION = 32;
-/**
- * #790 awareness bucket, per connection: Awareness and QueryAwareness frames (Hocuspocus relays each awareness frame
- * to every peer). An honest provider sends one per local awareness change (with no `flushDelay`, which Docmost does not
- * set): y-tiptap's cursor plugin sets the cursor on every selection change, so a keystroke, a held arrow key (key repeat
- * is at most ~33/s) or a mouse-drag selection (one per character crossed) each send one, and y-protocols renews the
- * state every 15 s. A refill of 40/s stays above any key repeat; a burst of 200 holds a fast drag for seconds.
- */
-export const AWARENESS_BURST = 200;
-export const AWARENESS_REFILL_PER_SECOND = 40;
 const LOGS_PER_MINUTE = 30;
 
 export const reasonFor = (rule: CollabRule): string => (rule === 'unresolved' ? UNRESOLVED_REASON : REFUSED_REASON_PREFIX + rule);
@@ -160,7 +152,6 @@ export class CollabUpdateGuard {
   private readonly socketRefusals = new WeakMap<object, number>();
   /** #790: per connection, its sync bucket and the awareness client ids it introduced to the document. */
   private readonly syncBuckets = new WeakMap<object, Bucket>();
-  private readonly awarenessBuckets = new WeakMap<object, Bucket>();
   private readonly awarenessNewIds = new WeakMap<object, Set<number>>();
   private readonly mode: CollabGuardMode;
   private readonly logger: GuardLogger;
@@ -186,11 +177,6 @@ export class CollabUpdateGuard {
     // Auth re-runs onTokenSync, or logs, per frame. An honest provider authenticates once per open.
     if (header.type === MESSAGE.Auth) return this.refuse(frame, header, { rule: 'auth' });
     if (!HANDLED.has(header.type)) return this.refuse(frame, header, { rule: 'message-type' });
-    if (header.type === MESSAGE.Awareness || header.type === MESSAGE.QueryAwareness) {
-      if (!this.charge(this.awarenessBuckets, frame.connection, AWARENESS_BURST, 1000 / AWARENESS_REFILL_PER_SECOND)) {
-        return this.refuse(frame, header, { rule: 'awareness-rate' });
-      }
-    }
     if (header.type === MESSAGE.Awareness) {
       if (!header.payload) return; // malformed: Hocuspocus refuses it itself
       const checked = this.checkAwareness(frame, header.payload);
@@ -238,8 +224,9 @@ export class CollabUpdateGuard {
    * AWARENESS_NEW_IDS_PER_CONNECTION ids the document's awareness has never held may come from one connection.
    *
    * A state for a client id bound to ANOTHER user (by its structs or its own awareness) is refused `foreign-client`:
-   * the sender would speak as that user's cursor and name. Two kinds of entry about another user's id are honest and
-   * pass: a removal (state `null`: a provider's `timeout` removal of a peer that went quiet), and an echo at a clock
+   * the sender would replace that user's cursor and selection (and the name and colour shown with them) for every
+   * peer. The name and colour in a sender's OWN state are its own say: nothing checks them. Two kinds of entry about
+   * another user's id are honest and pass: a removal (state `null`: a provider's `timeout` removal of a peer that went quiet), and an echo at a clock
    * the server already holds (a 3.x provider resending what it was relayed), which y-protocols ignores anyway.
    */
   private checkAwareness(frame: GuardFrame, payload: Uint8Array): { violation: Violation | null; entries: AwarenessEntry[] | null } {

@@ -1,7 +1,8 @@
 /**
  * CCC collab integration — NOT upstream Docmost code (#790, ADR 0036).
  *
- * Every bound the collab socket path adds on top of Hocuspocus 4.7.1, in one place. Each is wired at one seam:
+ * The socket and per-user bounds the collab path adds on top of Hocuspocus 4.7.1 (the keepalive and stall timing live in
+ * socket-keepalive.ts, the per-frame guard rules and their constants in update-guard.ts). Each is wired at one seam:
  * the ws server (adapter/collab-ws.adapter.ts), the Hocuspocus options and the per-socket checks
  * (collaboration.gateway.ts, seam #3), the per-user auth rate and connection cap (authentication.extension.ts, seam
  * #213), and the ws error log (collaboration.module.ts, seam #227).
@@ -45,10 +46,11 @@ export const COLLAB_DOCUMENTS_PER_SOCKET = COLLAB_HOCUSPOCUS_OPTIONS.maxPendingD
 export const COLLAB_AUTH_FRAMES_PER_SOCKET = 2 * COLLAB_DOCUMENTS_PER_SOCKET;
 
 /**
- * Outbound: terminate when ws's `bufferedAmount` exceeds this many maxPayloads plus the largest frame sent so far. One
- * maxPayload above the largest frame: an honest slow client holds at most the largest frame it was sent (a SyncStep2)
- * plus what is relayed while it drains it, and the largest relayed frame is one peer frame (at most maxPayload). Past
- * that it is behind by more than the biggest thing it could be owed.
+ * Outbound: terminate rather than send a frame that would take ws's `bufferedAmount` past this many maxPayloads plus
+ * the largest frame sent so far (this one included). One maxPayload above the largest frame: an honest slow client holds
+ * at most the largest frame it was sent (a SyncStep2) plus what is relayed while it drains it, and the largest relayed
+ * frame is one peer frame (at most maxPayload). Past that it is behind by more than the biggest thing it could be owed.
+ * A socket therefore never holds more than 8 MiB plus its largest frame (16 MiB for any frame up to maxPayload).
  */
 export const COLLAB_OUTBOUND_BUFFER_FACTOR = 1;
 
@@ -60,6 +62,18 @@ export const COLLAB_OUTBOUND_BUFFER_FACTOR = 1;
  * COLLAB_OUTBOUND_BUFFER_FACTOR x 8 MiB plus its largest frame, and a stalled one is cut off (socket-keepalive.ts).
  */
 export const COLLAB_CONNECTIONS_PER_USER = 32;
+
+/**
+ * Awareness and QueryAwareness frames per socket (frame-address.ts): a burst of COLLAB_AWARENESS_BURST, then
+ * COLLAB_AWARENESS_REFILL_PER_SECOND. Hocuspocus relays each awareness frame to every peer. Past it the frame is DROPPED,
+ * never refused: awareness is a lossy last-state channel (every frame carries each client's whole state at a higher
+ * clock, so a later frame supersedes a dropped one), and an honest provider can exceed any fixed rate: it sends one
+ * frame per selection change (Docmost sets no `flushDelay`), and a mouse-drag selection changes it once per pointer
+ * event, at the display's refresh rate (120 Hz and up). A refusal would end that editor's session for a cursor. A
+ * dropped final frame leaves peers a stale cursor until the next change or y-protocols' 15 s renewal.
+ */
+export const COLLAB_AWARENESS_BURST = 200;
+export const COLLAB_AWARENESS_REFILL_PER_SECOND = 40;
 
 /** onAuthenticate runs per user id: burst 64 (a tab opens one document per socket), then one per second. */
 export const COLLAB_AUTH_BURST = 64;

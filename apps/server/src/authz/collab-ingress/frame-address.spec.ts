@@ -1,7 +1,13 @@
 import * as encoding from 'lib0/encoding';
 import * as decoding from 'lib0/decoding';
 import { admitCollabFrame, isCollabFrameAddress } from './frame-address';
-import { COLLAB_AUTH_FRAMES_PER_SOCKET, COLLAB_DOCUMENTS_PER_SOCKET, COLLAB_HOCUSPOCUS_OPTIONS } from './limits';
+import {
+  COLLAB_AUTH_FRAMES_PER_SOCKET,
+  COLLAB_AWARENESS_BURST,
+  COLLAB_AWARENESS_REFILL_PER_SECOND,
+  COLLAB_DOCUMENTS_PER_SOCKET,
+  COLLAB_HOCUSPOCUS_OPTIONS,
+} from './limits';
 import { logCollabSocketError, SocketLimitLog } from './socket-limit-log';
 
 /** #790: the gateway admits a frame only when its document name is `page.<uuid>`. */
@@ -233,5 +239,80 @@ describe('#790 admitCollabFrame: Auth frames per socket (a refused Auth can othe
     expect(decoding.readVarUint(d)).toBe(2); // what Hocuspocus reads
     for (let i = 0; i < COLLAB_AUTH_FRAMES_PER_SOCKET; i++) expect(admitCollabFrame(ws, padded, limitLog)).toBe(true);
     expect(admitCollabFrame(ws, padded, limitLog)).toBe(false);
+  });
+});
+
+describe('#790 admitCollabFrame: the awareness rate (over-rate awareness is dropped, never refused)', () => {
+  const AWARENESS = 1;
+  const QUERY_AWARENESS = 3;
+  const clocked = () => {
+    let t = 5_000_000;
+    const ws = { readyState: 1, terminate: jest.fn(() => (ws.readyState = 2)) };
+    const warn = jest.fn();
+    const limitLog = new SocketLimitLog({ warn });
+    const admit = (type: number, name = pageN(1)) => admitCollabFrame(ws, typed(name, type), limitLog, () => t);
+    return { ws, warn, admit, advance: (ms: number) => (t += ms) };
+  };
+
+  it(`admits a burst of ${COLLAB_AWARENESS_BURST} (QueryAwareness counts too), drops the next, and leaves the socket up and unlogged`, () => {
+    const { ws, warn, admit } = clocked();
+    for (let i = 0; i < COLLAB_AWARENESS_BURST - 1; i++) expect(admit(AWARENESS)).toBe(true);
+    expect(admit(QUERY_AWARENESS)).toBe(true);
+    for (let i = 0; i < 50; i++) expect(admit(AWARENESS)).toBe(false);
+    expect(admit(QUERY_AWARENESS)).toBe(false);
+    expect(ws.terminate).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('never drops a Sync frame (that would lose an edit) or an Auth frame, however empty the bucket', () => {
+    const { ws, admit } = clocked();
+    for (let i = 0; i < COLLAB_AWARENESS_BURST + 10; i++) admit(AWARENESS);
+    for (let i = 0; i < 1000; i++) expect(admit(0)).toBe(true); // Sync
+    expect(admit(2)).toBe(true); // Auth
+    expect(admit(7)).toBe(true); // Close
+    expect(ws.terminate).not.toHaveBeenCalled();
+  });
+
+  it(`refills at ${COLLAB_AWARENESS_REFILL_PER_SECOND}/s up to the burst, and the bucket is per socket`, () => {
+    const { admit, advance } = clocked();
+    for (let i = 0; i < COLLAB_AWARENESS_BURST; i++) admit(AWARENESS);
+    expect(admit(AWARENESS)).toBe(false);
+    advance(1000 / COLLAB_AWARENESS_REFILL_PER_SECOND);
+    expect(admit(AWARENESS)).toBe(true);
+    expect(admit(AWARENESS)).toBe(false);
+    advance(3_600_000);
+    let admitted = 0;
+    for (let i = 0; i < COLLAB_AWARENESS_BURST * 3; i++) if (admit(AWARENESS)) admitted++;
+    expect(admitted).toBe(COLLAB_AWARENESS_BURST);
+    expect(clocked().admit(AWARENESS)).toBe(true); // another socket has its own bucket
+  });
+
+  it('a flood is held to the refill rate after the burst', () => {
+    const { ws, admit, advance } = clocked();
+    let admitted = 0;
+    for (let ms = 0; ms < 10_000; ms++) {
+      for (let k = 0; k < 2; k++) if (admit(AWARENESS)) admitted++;
+      advance(1);
+    }
+    expect(admitted).toBeLessThanOrEqual(COLLAB_AWARENESS_BURST + 10 * COLLAB_AWARENESS_REFILL_PER_SECOND + 1);
+    expect(admitted).toBeGreaterThanOrEqual(COLLAB_AWARENESS_BURST + 10 * COLLAB_AWARENESS_REFILL_PER_SECOND - 1);
+    expect(ws.terminate).not.toHaveBeenCalled();
+  });
+
+  it('honest editing: a held arrow key (33/s) for a minute loses nothing; a 240 Hz drag for 10 s only thins its cursor frames', () => {
+    const { ws, admit, advance } = clocked();
+    for (let i = 0; i < 33 * 60; i++) {
+      expect(admit(AWARENESS)).toBe(true);
+      advance(1000 / 33);
+    }
+    let admitted = 0;
+    for (let i = 0; i < 240 * 10; i++) {
+      if (admit(AWARENESS)) admitted++;
+      advance(1000 / 240);
+    }
+    expect(admitted).toBeGreaterThan(COLLAB_AWARENESS_BURST); // peers keep seeing the cursor move
+    expect(ws.terminate).not.toHaveBeenCalled(); // and the session never ends
+    advance(1000);
+    expect(admit(AWARENESS)).toBe(true); // the frame after the drag gets through
   });
 });

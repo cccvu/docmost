@@ -5,10 +5,12 @@
  *
  * Hocuspocus's `Connection.send` never looks at `bufferedAmount`, so a client that stops reading keeps the server
  * queueing every broadcast, awareness echo and SyncStep2 it is owed, without limit, in ws's send buffer. On each
- * send this terminates the raw socket (and drops the frame) once `bufferedAmount` exceeds
- * COLLAB_OUTBOUND_BUFFER_FACTOR x COLLAB_MAX_PAYLOAD_BYTES plus the largest frame this socket has been sent. An honest
- * slow client draining one big SyncStep2 stays under it: the allowance grows with that frame, and a peer's frame relayed
- * meanwhile is at most one maxPayload (limits.ts). This checks only when something is sent; a socket owed nothing more
+ * send this terminates the raw socket (and drops the frame) when sending it would take `bufferedAmount` past
+ * COLLAB_OUTBOUND_BUFFER_FACTOR x COLLAB_MAX_PAYLOAD_BYTES plus the largest frame this socket has been sent, this one
+ * included. The frame is counted BEFORE it is queued, so a socket never holds more than that: 16 MiB for frames up to
+ * maxPayload, however many of them it is owed. An honest slow client draining one big SyncStep2 stays under it: the
+ * allowance grows with that frame, and what is relayed meanwhile fits in one maxPayload (limits.ts). This checks only
+ * when something is sent; a socket owed nothing more
  * that stops reading is cut off by the stall check on the keepalive tick (socket-keepalive.ts).
  *
  * `readyState` is the raw socket's once it is closing, so Hocuspocus stops sending to a socket the client closed
@@ -36,20 +38,26 @@ export class BoundedCollabSocket implements WebSocketLike {
     private readonly limitLog: SocketLimitLog = collabSocketLimitLog,
   ) {}
 
+  /** The ws socket underneath (socket-documents.ts keys a socket's document connections by it). */
+  get rawSocket(): RawCollabSocket {
+    return this.raw;
+  }
+
   get readyState(): number {
     return Math.max(this.inner.readyState, this.raw.readyState);
   }
 
   send(message: Uint8Array): void {
     if (this.readyState !== OPEN) return;
-    const allowance = COLLAB_OUTBOUND_BUFFER_FACTOR * COLLAB_MAX_PAYLOAD_BYTES + this.largestSent;
+    const largest = Math.max(this.largestSent, message.byteLength);
+    const allowance = COLLAB_OUTBOUND_BUFFER_FACTOR * COLLAB_MAX_PAYLOAD_BYTES + largest;
     const buffered = this.raw.bufferedAmount;
-    if (buffered > allowance) {
-      this.limitLog.log('outbound_buffer', { bufferedBytes: buffered, allowanceBytes: allowance });
+    if (buffered + message.byteLength > allowance) {
+      this.limitLog.log('outbound_buffer', { bufferedBytes: buffered, frameBytes: message.byteLength, allowanceBytes: allowance });
       this.raw.terminate();
       return;
     }
-    if (message.byteLength > this.largestSent) this.largestSent = message.byteLength;
+    this.largestSent = largest;
     this.inner.send(message);
   }
 

@@ -14,8 +14,8 @@
  * - `admitCollabUserConnection`, in `onAuthenticate` right after the per-user auth rate and before any user, session,
  *   page or PDP read (authentication.extension.ts, seam #213): a user already at the cap is refused without a DB call;
  * - the `connected` hook: authentications run concurrently, so several can pass that check together; one that would
- *   take the user past the cap is closed there (`connection.close`), and the editor sees a close it reconnects from,
- *   to be refused at the first check.
+ *   take the user past the cap is closed there (`connection.close`, then its socket, which would otherwise stay open
+ *   holding no document), and the editor sees a close it reconnects from, to be refused at the first check.
  * A refusal throws `{ reason }` with no `message` (Hocuspocus logs `error.message`), logged once, rate-limited, as
  * `COLLAB_SOCKET_LIMIT {"limit":"user_connections"}`. The editor treats it as any refusal (collab-access.ts: refetch the
  * token once, then the connection-lost state).
@@ -24,6 +24,7 @@
  * extension's hook), and ranks just below the update guard so its `connected` runs before any extension's that awaits.
  */
 import { COLLAB_CONNECTIONS_PER_USER } from './limits';
+import { collabSocketDocuments, type CollabSocketDocuments, type CountedConnection } from './socket-documents';
 import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
 
 export const COLLAB_USER_CONNECTIONS_REASON = 'ccc:collab-user-connections';
@@ -83,7 +84,10 @@ interface ConnectionHookPayload {
   context?: { user?: { id?: unknown } };
 }
 interface ConnectedPayload extends ConnectionHookPayload {
-  connection?: { close(event?: { code?: number; reason?: string }): void };
+  connection?: CountedConnection & {
+    close(event?: { code?: number; reason?: string }): void;
+    webSocket?: { close?(code?: number, reason?: string): void };
+  };
 }
 
 const keyOf = (p: ConnectionHookPayload): string | null =>
@@ -101,15 +105,22 @@ export class CollabUserConnectionsExtension {
   readonly priority = 9_000;
   readonly extensionName = 'CollabUserConnections';
 
-  constructor(readonly connections: CollabUserConnections = processConnections) {}
+  constructor(
+    readonly connections: CollabUserConnections = processConnections,
+    readonly socketDocuments: CollabSocketDocuments = collabSocketDocuments,
+  ) {}
 
   async connected(payload: ConnectedPayload): Promise<void> {
     try {
+      this.socketDocuments.track(payload.connection); // every connection, a user's or not (socket-documents.ts)
       const user = userOf(payload);
       const key = keyOf(payload);
       if (!user || !key) return; // not a user's connection: nothing to count
       if (!this.connections.hold(user, key)) {
-        payload.connection?.close({ code: COLLAB_USER_CONNECTIONS_CLOSE_CODE, reason: COLLAB_USER_CONNECTIONS_REASON });
+        const refusal = { code: COLLAB_USER_CONNECTIONS_CLOSE_CODE, reason: COLLAB_USER_CONNECTIONS_REASON };
+        payload.connection?.close(refusal);
+        // The socket too: it holds no document now (one per socket in Docmost), and the editor reconnects on either close.
+        payload.connection?.webSocket?.close?.(refusal.code, refusal.reason);
       }
     } catch {
       // never throw from a hook: it would skip every later extension's `connected`

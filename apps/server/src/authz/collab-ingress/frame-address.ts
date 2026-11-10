@@ -24,9 +24,18 @@
  *   refuses its Auth, so the next Auth re-runs `onAuthenticate`; a token that does not verify never reaches the per-user
  *   auth rate (auth-rate.ts), which needs the verified user id.
  * Past either, the socket is terminated and the frame dropped.
+ * - an awareness rate: Awareness and QueryAwareness frames past a burst of COLLAB_AWARENESS_BURST, then
+ *   COLLAB_AWARENESS_REFILL_PER_SECOND, are DROPPED and the socket stays up (limits.ts says why a drop, not a refusal).
+ *   Here, before RedisSync and Hocuspocus, a dropped frame is never proxied, queued or relayed, and the update guard
+ *   never sees it. Nothing else is ever dropped: a dropped Sync frame would lose an edit.
  */
 import * as decoding from 'lib0/decoding';
-import { COLLAB_AUTH_FRAMES_PER_SOCKET, COLLAB_DOCUMENTS_PER_SOCKET } from './limits';
+import {
+  COLLAB_AUTH_FRAMES_PER_SOCKET,
+  COLLAB_AWARENESS_BURST,
+  COLLAB_AWARENESS_REFILL_PER_SECOND,
+  COLLAB_DOCUMENTS_PER_SOCKET,
+} from './limits';
 import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
 
 const NAME = /^page\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -34,6 +43,9 @@ const NAME = /^page\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 const NAME_BYTES = 41;
 const OPEN = 1;
 const AUTH = 2; // Hocuspocus MessageType.Auth
+const AWARENESS = 1; // Hocuspocus MessageType.Awareness
+const QUERY_AWARENESS = 3; // Hocuspocus MessageType.QueryAwareness
+const AWARENESS_REFILL_MS = 1000 / COLLAB_AWARENESS_REFILL_PER_SECOND;
 
 const asBytes = (data: Uint8Array | ArrayBuffer): Uint8Array => (data instanceof Uint8Array ? data : new Uint8Array(data));
 
@@ -63,6 +75,9 @@ function messageType(frame: Uint8Array): number | null {
 interface SocketFrames {
   readonly names: Set<string>;
   auths: number;
+  /** The awareness bucket: tokens left, and when they were last counted. */
+  awarenessTokens: number;
+  awarenessAt: number;
 }
 const perSocket = new WeakMap<object, SocketFrames>();
 
@@ -73,24 +88,44 @@ export interface AddressedSocket {
 }
 
 /**
- * The gateway's check on every inbound frame, on both paths: false (drop it) when the socket is no longer open, and
- * false after terminating the socket when the frame does not name `page.<uuid>`, names one document more than
- * COLLAB_DOCUMENTS_PER_SOCKET, or is one Auth frame more than COLLAB_AUTH_FRAMES_PER_SOCKET.
+ * The gateway's check on every inbound frame, on both paths: false (drop it) when the socket is no longer open; false
+ * after terminating the socket when the frame does not name `page.<uuid>`, names one document more than
+ * COLLAB_DOCUMENTS_PER_SOCKET, or is one Auth frame more than COLLAB_AUTH_FRAMES_PER_SOCKET; and false, with the socket
+ * left up, for an awareness frame over the socket's awareness rate.
  */
-export function admitCollabFrame(ws: AddressedSocket, data: Uint8Array | ArrayBuffer, limitLog: SocketLimitLog = collabSocketLimitLog): boolean {
+export function admitCollabFrame(
+  ws: AddressedSocket,
+  data: Uint8Array | ArrayBuffer,
+  limitLog: SocketLimitLog = collabSocketLimitLog,
+  now: () => number = Date.now,
+): boolean {
   if (ws.readyState !== OPEN) return false;
   const frame = asBytes(data);
   const name = frameAddress(frame);
   if (name === null) return refuse(ws, limitLog, 'frame_address', { frameBytes: frame.byteLength });
   let seen = perSocket.get(ws);
-  if (!seen) perSocket.set(ws, (seen = { names: new Set(), auths: 0 }));
+  if (!seen) perSocket.set(ws, (seen = { names: new Set(), auths: 0, awarenessTokens: COLLAB_AWARENESS_BURST, awarenessAt: now() }));
   if (!seen.names.has(name)) {
     if (seen.names.size >= COLLAB_DOCUMENTS_PER_SOCKET) return refuse(ws, limitLog, 'socket_documents', { documents: seen.names.size + 1 });
     seen.names.add(name);
   }
-  if (messageType(frame) === AUTH && ++seen.auths > COLLAB_AUTH_FRAMES_PER_SOCKET) {
+  const type = messageType(frame);
+  if (type === AUTH && ++seen.auths > COLLAB_AUTH_FRAMES_PER_SOCKET) {
     return refuse(ws, limitLog, 'socket_auth_frames', { authFrames: seen.auths });
   }
+  if (type === AWARENESS || type === QUERY_AWARENESS) return chargeAwareness(seen, now());
+  return true;
+}
+
+/** One token from the socket's awareness bucket; false (drop the frame, unlogged: a drop costs nothing) when empty. */
+function chargeAwareness(seen: SocketFrames, at: number): boolean {
+  const tokens = Math.min(COLLAB_AWARENESS_BURST, seen.awarenessTokens + Math.max(0, at - seen.awarenessAt) / AWARENESS_REFILL_MS);
+  seen.awarenessAt = at;
+  if (tokens < 1) {
+    seen.awarenessTokens = tokens;
+    return false;
+  }
+  seen.awarenessTokens = tokens - 1;
   return true;
 }
 

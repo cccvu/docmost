@@ -3,8 +3,11 @@ import { join } from 'node:path';
 import * as ts from 'typescript';
 import { Hocuspocus } from '@hocuspocus/server';
 import { authFrame, FakeSocket } from './collab-ingress.testkit';
-import { COLLAB_PING_INTERVAL_MS, COLLAB_STALL_INTERVALS, keepCollabSocketAlive } from './socket-keepalive';
+import { BoundedCollabSocket } from './bounded-socket';
+import { CollabSocketDocuments } from './socket-documents';
+import { COLLAB_EMPTY_INTERVALS, COLLAB_PING_INTERVAL_MS, COLLAB_STALL_INTERVALS, keepCollabSocketAlive } from './socket-keepalive';
 import { SocketLimitLog } from './socket-limit-log';
+import { CollabUserConnections, CollabUserConnectionsExtension } from './user-connections';
 
 /**
  * #790: Hocuspocus 4.x sends no pings and reaps a connection that received nothing for `timeout`. The gateway pings
@@ -122,6 +125,70 @@ describe('#790 the stall check: a socket that stops reading is closed, a slow on
   });
 });
 
+describe('#790 CollabSocketDocuments', () => {
+  const conn = (webSocket: object, present = true) => {
+    const closers: Array<() => void> = [];
+    return {
+      c: { webSocket, document: { hasConnection: () => present }, onClose: (cb: () => void) => closers.push(cb) },
+      close: () => closers.forEach((cb) => cb()),
+    };
+  };
+
+  it('a socket that never held a document is not "empty"; one that held and closed every document is', () => {
+    const docs = new CollabSocketDocuments();
+    const ws = {};
+    expect(docs.holdsNoDocument(ws)).toBe(false); // never authenticated: Hocuspocus's own pre-auth deadline applies
+    const a = conn(ws);
+    const b = conn(ws);
+    docs.track(a.c);
+    docs.track(b.c);
+    expect(docs.holdsNoDocument(ws)).toBe(false);
+    a.close();
+    expect(docs.holdsNoDocument(ws)).toBe(false);
+    b.close();
+    b.close(); // a second close never goes below zero
+    expect(docs.holdsNoDocument(ws)).toBe(true);
+    docs.track(conn(ws).c); // a new document on the same socket
+    expect(docs.holdsNoDocument(ws)).toBe(false);
+  });
+
+  it('keys by the raw ws socket under the gateway\'s BoundedCollabSocket; a connection already closed counts as held then closed', () => {
+    const docs = new CollabSocketDocuments();
+    const raw = new FakeSocket();
+    const bounded = new BoundedCollabSocket(raw, raw as never);
+    docs.track(conn(bounded, false).c);
+    expect(docs.holdsNoDocument(raw)).toBe(true);
+    expect(docs.holdsNoDocument(bounded)).toBe(false);
+    docs.track(undefined); // never throws on a payload without a connection
+    docs.track({});
+  });
+});
+
+describe('#790 the empty-socket reaper', () => {
+  afterEach(() => jest.useRealTimers());
+
+  it(`terminates (and logs) a socket that held a document and held none for ${COLLAB_EMPTY_INTERVALS} ticks in a row`, () => {
+    jest.useFakeTimers();
+    const sock = new PongingSocket();
+    const warn = jest.fn();
+    let empty = false;
+    keepCollabSocketAlive(sock, () => undefined, 1_000, new SocketLimitLog({ warn }), () => empty);
+    jest.advanceTimersByTime(10_000);
+    expect(sock.terminated).toBe(false);
+    empty = true;
+    jest.advanceTimersByTime(1_000);
+    empty = false; // it opened a document again: the count restarts
+    jest.advanceTimersByTime(1_000);
+    empty = true;
+    jest.advanceTimersByTime(1_000);
+    expect(sock.terminated).toBe(false);
+    jest.advanceTimersByTime(1_000);
+    expect(sock.terminated).toBe(true);
+    expect(warn.mock.calls).toEqual([['COLLAB_SOCKET_LIMIT {"limit":"socket_empty","emptyMs":2000}']]);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+});
+
 // Margins: Hocuspocus checks every `timeout` and reaps past it, so a reaped socket is closed within 2 x TIMEOUT; a
 // kept-alive one is touched every 25 ms, so only an event-loop stall longer than TIMEOUT could close it.
 const TIMEOUT = 400;
@@ -184,6 +251,59 @@ describe('through a real Hocuspocus 4.7.1 (timeout shortened to 400 ms)', () => 
     sock.answer = false;
     await settle(2.5 * TIMEOUT);
     expect(sock.closed?.code).toBe(CONNECTION_TIMEOUT);
+  });
+});
+
+describe('#790 through a real Hocuspocus 4.7.1: a socket left holding no document is reaped', () => {
+  const open: Hocuspocus[] = [];
+  const sockets: FakeSocket[] = [];
+  afterEach(async () => {
+    for (const s of sockets.splice(0)) s.close(1000, 'test over');
+    for (const hp of open.splice(0)) hp.closeConnections();
+    await settle(5);
+  });
+  const run = (reap: boolean) => {
+    const docs = new CollabSocketDocuments();
+    const hp = new Hocuspocus({
+      quiet: true,
+      timeout: TIMEOUT,
+      extensions: [
+        new CollabUserConnectionsExtension(new CollabUserConnections(32, new SocketLimitLog({ warn: () => undefined })), docs),
+        { async onAuthenticate() { return { user: { id: 'u' } }; } },
+      ],
+    } as never);
+    open.push(hp);
+    const sock = new PongingSocket();
+    sockets.push(sock);
+    const clientConnection = sock.connect(hp);
+    const holdsNoDocument = reap ? (ws: object) => docs.holdsNoDocument(ws) : () => false;
+    keepCollabSocketAlive(sock, () => clientConnection.touch(), 25, new SocketLimitLog({ warn: () => undefined }), holdsNoDocument);
+    sock.deliver(authFrame('ok'));
+    const closeDocuments = () => {
+      for (const doc of hp.documents.values()) for (const conn of doc.getConnections()) conn.close({ code: 4403, reason: 'access-revoked' });
+    };
+    return { sock, closeDocuments };
+  };
+
+  it('control: after a document-level close, pongs keep the empty socket open past the idle timeout', async () => {
+    const { sock, closeDocuments } = run(false);
+    await settle(50);
+    closeDocuments();
+    await settle(2.5 * TIMEOUT);
+    expect(sock.closeReasons()).toEqual(['access-revoked']);
+    expect(sock.closed).toBeNull();
+  });
+
+  it('with the reaper, the same socket is terminated within two ticks; a socket still holding its document is not', async () => {
+    const { sock, closeDocuments } = run(true);
+    const kept = run(true);
+    await settle(50);
+    expect(sock.closed).toBeNull();
+    closeDocuments(); // closes the documents of `sock`'s server only
+    await settle(150);
+    expect(sock.terminated).toBe(true);
+    await settle(2.5 * TIMEOUT);
+    expect(kept.sock.closed).toBeNull();
   });
 });
 

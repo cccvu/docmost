@@ -69,22 +69,27 @@ describe('#790 CollabUserConnections', () => {
 });
 
 describe('#790 the extension hooks', () => {
-  const payload = (user: string | undefined, socketId: string, close = jest.fn()) => ({
+  const payload = (user: string | undefined, socketId: string, close = jest.fn(), socketClose = jest.fn()) => ({
     socketId,
     documentName: 'page.p',
     context: user === undefined ? {} : { user: { id: user } },
-    connection: { close },
+    connection: { close, webSocket: { close: socketClose } },
   });
 
-  it('holds at connected, releases at onDisconnect; closes (and never holds) a connection past the cap', async () => {
+  it('holds at connected, releases at onDisconnect; closes (and never holds) a connection past the cap, and its socket', async () => {
     const c = new CollabUserConnections(2, new SocketLimitLog({ warn: () => undefined }));
     const ext = new CollabUserConnectionsExtension(c);
     const closes = [jest.fn(), jest.fn(), jest.fn()];
-    await ext.connected(payload('u1', 's1', closes[0]));
-    await ext.connected(payload('u1', 's2', closes[1]));
-    await ext.connected(payload('u1', 's3', closes[2]));
+    const socketCloses = [jest.fn(), jest.fn(), jest.fn()];
+    await ext.connected(payload('u1', 's1', closes[0], socketCloses[0]));
+    await ext.connected(payload('u1', 's2', closes[1], socketCloses[1]));
+    await ext.connected(payload('u1', 's3', closes[2], socketCloses[2]));
     expect(closes.map((f) => f.mock.calls.length)).toEqual([0, 0, 1]);
     expect(closes[2]).toHaveBeenCalledWith({ code: 4429, reason: COLLAB_USER_CONNECTIONS_REASON });
+    // the socket too: left open it would hold no document, and a pong would keep it for good
+    expect(socketCloses.map((f) => f.mock.calls.length)).toEqual([0, 0, 1]);
+    expect(socketCloses[2]).toHaveBeenCalledWith(4429, COLLAB_USER_CONNECTIONS_REASON);
+    expect(closes[2].mock.invocationCallOrder[0]).toBeLessThan(socketCloses[2].mock.invocationCallOrder[0]); // the reason first
     expect(c.count('u1')).toBe(2);
     await ext.onDisconnect(payload('u1', 's3')); // the closed one: never held, so nothing is freed
     expect(c.count('u1')).toBe(2);
@@ -198,7 +203,7 @@ describe('#790 through a real Hocuspocus 4.7.1: one user, many sockets', () => {
     await settle();
     expect(connections.count('u1')).toBe(CAP);
     expect(authenticated(again)).toBe(true);
-    expect(extra.closed).toBeNull(); // the socket stays (a per-document refusal); its frames are bounded elsewhere
+    expect(extra.closed).toBeNull(); // refused in onAuthenticate: the socket stays, under its pre-auth deadline
   });
 
   it('concurrent connects that all pass the early check are cut back to the cap at connected', async () => {
@@ -210,6 +215,9 @@ describe('#790 through a real Hocuspocus 4.7.1: one user, many sockets', () => {
     expect(hp.getConnectionsCount()).toBe(CAP);
     const closed = socks.filter((s) => s.closeReasons().includes(COLLAB_USER_CONNECTIONS_REASON));
     expect(closed).toHaveLength(4);
+    // each over-cap socket is closed too (it would hold no document), after its reason was sent
+    for (const s of closed) expect(s.closed).toEqual({ code: 4429, reason: COLLAB_USER_CONNECTIONS_REASON });
+    expect(socks.filter((s) => s.closed === null)).toHaveLength(CAP);
   });
 
   it('a revalidator-style close of a document connection frees the slot (onDisconnect, not only socket close)', async () => {

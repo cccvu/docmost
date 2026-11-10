@@ -20,12 +20,20 @@
  * gone down across COLLAB_STALL_INTERVALS consecutive intervals: one minute in which it read nothing it was owed (the
  * ping itself adds two bytes a tick, so a stalled buffer grows). A slow client that drains anything at all between two
  * ticks passes; one that falls further behind than it reads for a whole minute is cut off, and it reconnects and
- * re-syncs. The send-time bound (bounded-socket.ts) caps the bytes in between.
+ * re-syncs. The send-time bound (bounded-socket.ts) caps the bytes in between. The stall check sees only what reaches
+ * ws's buffer: a client that stops reading its socket altogether first fills the kernel's and any proxy's buffers
+ * (megabytes, holding no Node memory), and it stops answering pings too, so Hocuspocus's idle timeout reaps it.
+ *
+ * Each tick also terminates (logged `COLLAB_SOCKET_LIMIT {"limit":"socket_empty"}`) a socket that has held a document
+ * connection and held none for COLLAB_EMPTY_INTERVALS consecutive ticks (socket-documents.ts says why such a socket
+ * would otherwise stay open for good, and why an honest editor never keeps one).
  */
+import { collabSocketDocuments } from './socket-documents';
 import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
 
 export const COLLAB_PING_INTERVAL_MS = 30_000;
 export const COLLAB_STALL_INTERVALS = 2;
+export const COLLAB_EMPTY_INTERVALS = 2;
 
 /** The `ws` WebSocket surface used here. */
 export interface PingableSocket {
@@ -44,12 +52,21 @@ export function keepCollabSocketAlive(
   touch: () => void,
   intervalMs: number = COLLAB_PING_INTERVAL_MS,
   limitLog: SocketLimitLog = collabSocketLimitLog,
+  holdsNoDocument: (ws: PingableSocket) => boolean = (s) => collabSocketDocuments.holdsNoDocument(s),
 ): void {
   ws.on('pong', () => touch());
   let previous = 0;
   let stalled = 0;
+  let empty = 0;
   const timer = setInterval(() => {
     if (ws.readyState !== OPEN) return;
+    empty = holdsNoDocument(ws) ? empty + 1 : 0;
+    if (empty >= COLLAB_EMPTY_INTERVALS) {
+      limitLog.log('socket_empty', { emptyMs: empty * intervalMs });
+      clearInterval(timer);
+      ws.terminate();
+      return;
+    }
     const buffered = ws.bufferedAmount;
     stalled = buffered > 0 && previous > 0 && buffered >= previous ? stalled + 1 : 0;
     previous = buffered;
