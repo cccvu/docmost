@@ -28,6 +28,7 @@ vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (s: string) => s }
 import { logout, openDocmostSession } from "@/features/auth/services/auth-service";
 import { verifyPasswordless } from "@/features/public/services/public-service.ts";
 import { usePasswordless } from "@/features/public/hooks/use-passwordless.ts";
+import { notifications } from "@mantine/notifications";
 
 describe("usePasswordless().completeSignIn — verify → BFF bridge → navigate", () => {
   beforeEach(() => vi.clearAllMocks());
@@ -160,5 +161,49 @@ describe("usePasswordless().completeSignIn — OAuth resume (#302)", () => {
     expect(assign).toHaveBeenCalledWith("/oauth/authorize"); // resume completes on the platform session alone
     expect(navigateMock).not.toHaveBeenCalled();
     expect(result.current.isVerifying).toBe(true); // spinner held through the redirect even on a bridge failure
+  });
+});
+
+// #797 — a first self-service sign-in: the platform reports `provisioned: true` once, and the hook shows a one-time,
+// sticky notice (the navigation swaps the page under it). Neutral text only: the fork carries no institution strings.
+describe("usePasswordless().completeSignIn — first self-service sign-in notice (#797)", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("provisioned: true → one sticky notice, shown after the bridge and before navigating", async () => {
+    (verifyPasswordless as any).mockResolvedValueOnce({ id: "u1", email: "a@b.edu", workspaceId: "ws", provisioned: true });
+    const { result } = renderHook(() => usePasswordless());
+    await act(async () => {
+      await result.current.completeSignIn({ token: "raw-link-token" });
+    });
+    expect(notifications.show).toHaveBeenCalledTimes(1);
+    const shown = (notifications.show as any).mock.calls[0][0];
+    expect(shown).toMatchObject({ id: "account-provisioned", title: "Your account is ready", autoClose: false });
+    expect(shown.message).toMatch(/basic access/i);
+    // Neutral: no address, domain or institution name in the notice.
+    expect(JSON.stringify(shown)).not.toMatch(/@|\.edu|\.org/i);
+    const bridgeOrder = (openDocmostSession as any).mock.invocationCallOrder[0];
+    const noticeOrder = (notifications.show as any).mock.invocationCallOrder[0];
+    expect(bridgeOrder).toBeLessThan(noticeOrder);
+    expect(noticeOrder).toBeLessThan(navigateMock.mock.invocationCallOrder[0]);
+  });
+
+  it.each([undefined, false])("provisioned: %s → no notice (an ordinary sign-in)", async (provisioned) => {
+    (verifyPasswordless as any).mockResolvedValueOnce({ id: "u1", email: "a@b.edu", workspaceId: "ws", provisioned });
+    const { result } = renderHook(() => usePasswordless());
+    await act(async () => {
+      await result.current.completeSignIn({ token: "raw-link-token" });
+    });
+    expect(notifications.show).not.toHaveBeenCalled();
+    expect(navigateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("no notice when the bridge fails (the sign-in was rolled back)", async () => {
+    (verifyPasswordless as any).mockResolvedValueOnce({ id: "u1", email: "a@b.edu", workspaceId: "ws", provisioned: true });
+    (openDocmostSession as any).mockRejectedValueOnce(new Error("bridge down"));
+    const { result } = renderHook(() => usePasswordless());
+    await act(async () => {
+      await expect(result.current.completeSignIn({ token: "raw-link-token" })).rejects.toThrow();
+    });
+    expect(notifications.show).not.toHaveBeenCalled();
   });
 });

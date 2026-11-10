@@ -84,6 +84,20 @@ export function usePasswordless() {
         await logout().catch(() => undefined);
         throw Object.assign(new Error("session-bridge-failed"), { stage: "bridge" as const });
       }
+      // #797: a first self-service sign-in. The platform reports it once (the account it creates or activates is
+      // never "provisioned" again), so this notice is one-time by construction. It stays until dismissed: the
+      // navigation below swaps the page underneath it. Neutral text only (no institution strings in the fork).
+      if (res?.provisioned === true) {
+        notifications.show({
+          id: "account-provisioned",
+          title: t("Your account is ready"),
+          message: t(
+            "You have basic access for now. To see a space, ask one of its administrators to add you.",
+          ),
+          autoClose: false,
+          withCloseButton: true,
+        });
+      }
       navigate(getPostLoginRedirect());
     } finally {
       // Leave the spinner up when a full-page redirect is under way (see above); only clear it for in-SPA
