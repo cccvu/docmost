@@ -77,6 +77,9 @@ export interface IPasswordlessVerifyResponse {
   // `oauth_resume` handle on the verify request and is telling the SPA to resume `/oauth/authorize` (a
   // full-page navigation back to a platform route) instead of going to the wiki home.
   resume?: boolean;
+  // Set (#797) only on the sign-in that CREATED or first activated this account through self-service sign-up — never
+  // again for the same account. The SPA shows a one-time notice that the account exists with basic access.
+  provisioned?: boolean;
 }
 
 // Verify EITHER a magic-link token OR an email + OTP. On success the platform sets the session cookie;
