@@ -3,27 +3,31 @@ import {
   Extension,
   Hocuspocus,
   IncomingMessage,
-  afterUnloadDocumentPayload,
   onConfigurePayload,
   onLoadDocumentPayload,
+  afterUnloadDocumentPayload,
+  WebSocketLike,
 } from '@hocuspocus/server';
+import { ConnectionTimeout, Unauthorized } from '@hocuspocus/common';
 import RedisClient from 'ioredis';
-import { readVarString } from 'lib0/decoding.js';
 import { CollabProxySocket } from './collab-proxy-socket';
 import {
-  BaseWebSocket,
+  ClientConnection,
   Configuration,
   CustomEvents,
   Pack,
   RSAMessage,
+  RSAMessageClose,
   RSAMessageCloseProxy,
   RSAMessageCustomEventComplete,
   RSAMessageCustomEventStart,
-  RSAMessagePong,
   RSAMessageProxy,
   RSAMessageUnload,
   SerializedHTTPRequest,
   Unpack,
+  OriginConnection,
+  ProxyConnection,
+  toWebRequest,
 } from './redis-sync.types';
 
 export type { Pack, SerializedHTTPRequest } from './redis-sync.types';
@@ -38,10 +42,10 @@ export class RedisSyncExtension<TCE extends CustomEvents> implements Extension {
   private sub: RedisClient;
   private readonly pack: Pack;
   private readonly unpack: Unpack;
-  private originSockets: Record<SocketId, BaseWebSocket> = {};
+  private originConnections: Record<SocketId, OriginConnection> = {};
   private locks: Record<DocumentName, NodeJS.Timeout> = {};
   private lockPromises: Record<DocumentName, Promise<ServerId | null>> = {};
-  private proxySockets: Record<SocketId, CollabProxySocket> = {};
+  private proxyConnections: Record<SocketId, ProxyConnection> = {};
   private readonly prefix: string;
   private readonly lockPrefix: string;
   private readonly msgChannel: string;
@@ -54,6 +58,9 @@ export class RedisSyncExtension<TCE extends CustomEvents> implements Extension {
   // @ts-ignore
   private pendingReplies: Record<number, PromiseWithResolvers<any>['resolve']> =
     {};
+  private deriveContext: (
+    serializedHTTPRequest: SerializedHTTPRequest,
+  ) => Record<string, any>;
 
   constructor(configuration: Configuration<TCE>) {
     const {
@@ -65,6 +72,7 @@ export class RedisSyncExtension<TCE extends CustomEvents> implements Extension {
       prefix,
       customEvents,
       customEventTTL,
+      deriveContext,
     } = configuration;
     this.pub = redis.duplicate();
     this.sub = redis.duplicate();
@@ -77,6 +85,7 @@ export class RedisSyncExtension<TCE extends CustomEvents> implements Extension {
     this.lockPrefix = `${this.prefix}Lock`;
     this.msgChannel = `${this.prefix}Msg`;
     this.customEvents = (customEvents as any) ?? ({} as any as CustomEvents);
+    this.deriveContext = deriveContext ?? (() => ({}));
     this.sub.subscribe(this.msgChannel, `${this.msgChannel}:${this.serverId}`);
     this.sub.on('messageBuffer', this.handleRedisMessage);
     this.pub.on('error', () => {});
@@ -87,19 +96,17 @@ export class RedisSyncExtension<TCE extends CustomEvents> implements Extension {
   }
 
   private closeProxy(socketId: string) {
-    const proxySocket = this.proxySockets[socketId];
-    if (proxySocket) {
-      proxySocket.emit(
-        'close',
-        1000,
-        Buffer.from('provider_initiated', 'utf-8'),
-      );
-      delete this.proxySockets[socketId];
+    const entry = this.proxyConnections[socketId];
+    if (entry) {
+      delete this.proxyConnections[socketId];
+      const { socket, clientConnection } = entry;
+      // The origin socket is already gone; don't echo a close message back
+      socket.markClosed();
+      clientConnection.handleClose({
+        code: 1000,
+        reason: 'provider_initiated',
+      });
     }
-  }
-
-  private pongProxy(socketId: string) {
-    this.proxySockets[socketId]?.emit('pong');
   }
 
   private handleProxyMessage(
@@ -107,24 +114,45 @@ export class RedisSyncExtension<TCE extends CustomEvents> implements Extension {
   ) {
     const { replyTo, message, serializedHTTPRequest } = msg;
     const { headers } = serializedHTTPRequest;
-    const socketId = headers['sec-websocket-key']!;
-    let socket = this.proxySockets[socketId];
-    if (!socket) {
-      socket = new CollabProxySocket(
+    const socketId = headers['sec-websocket-key'];
+    let entry = this.proxyConnections[socketId];
+    if (!entry) {
+      const socket = new CollabProxySocket(
         this.pub,
         this.pack,
         replyTo,
-        `${this.msgChannel}:${this.serverId}`,
         socketId,
       );
-      this.proxySockets[socketId] = socket;
-      this.instance.handleConnection(
-        socket as any,
-        serializedHTTPRequest as any,
-        {},
+      // A proxy connection with no live documents (client left the page, auth
+      // failed, or the origin server crashed) is reaped by hocuspocus' message
+      // timeout. Dispose it silently in that case: relaying the timeout close
+      // to the origin would kill the client's real socket, which may be busy
+      // serving other documents. Genuine protocol closes are still relayed.
+      socket.onClose = (code, reason) => {
+        delete this.proxyConnections[socketId];
+        if (code !== ConnectionTimeout.code) {
+          const msg: RSAMessageClose = {
+            type: 'close',
+            code,
+            reason,
+            socketId,
+          };
+          this.pub.publish(replyTo, this.pack(msg));
+        }
+      };
+      const clientConnection = this.instance.handleConnection(
+        socket,
+        toWebRequest(serializedHTTPRequest),
+        this.deriveContext(serializedHTTPRequest),
       );
+      entry = { clientConnection, socket };
+      this.proxyConnections[socketId] = entry;
     }
-    socket.emit('message', message);
+    entry.clientConnection.handleMessage(message);
+  }
+
+  private getLock(documentName: string) {
+    return this.pub.get(this.getKey(documentName));
   }
 
   private getOrClaimLock(documentName: string) {
@@ -166,10 +194,6 @@ export class RedisSyncExtension<TCE extends CustomEvents> implements Extension {
       this.closeProxy(msg.socketId);
       return;
     }
-    if (type === 'pong') {
-      this.pongProxy(msg.socketId);
-      return;
-    }
     if (type === 'unload') {
       delete this.lockPromises[msg.documentName];
       return;
@@ -198,22 +222,14 @@ export class RedisSyncExtension<TCE extends CustomEvents> implements Extension {
       return;
     }
     const { socketId } = msg;
-    const socket = this.originSockets[socketId];
-    if (!socket) {
+    const entry = this.originConnections[socketId];
+    if (!entry) {
       // origin socket already cleaned up
       return;
     }
+    const { socket } = entry;
     if (type === 'close') {
       socket.close(msg.code, msg.reason);
-    } else if (type === 'ping') {
-      // Reply instantly to the proxy socket, without forwarding to client
-      // The origin socket handles heartbeat for itself
-      const { replyTo, socketId } = msg;
-      const reply: RSAMessagePong = {
-        type: 'pong',
-        socketId,
-      };
-      this.pub.publish(`${replyTo}`, this.pack(reply));
     } else if (type === 'send') {
       socket.send(msg.message);
     }
@@ -251,6 +267,8 @@ export class RedisSyncExtension<TCE extends CustomEvents> implements Extension {
     eventName: TName,
     documentName: string,
     payload: any,
+    // if true, don't claim the lock. Useful for targeting pages that are currently open
+    onlyIfOpen = false,
   ) {
     const isDocLoadedOnInstance = this.instance.documents.has(documentName);
 
@@ -258,7 +276,14 @@ export class RedisSyncExtension<TCE extends CustomEvents> implements Extension {
       return this.handleEventLocally(eventName, documentName, payload);
     }
 
-    const proxyTo = await this.getOrClaimLockThrottled(documentName);
+    const proxyTo = await (onlyIfOpen
+      ? this.getLock(documentName)
+      : this.getOrClaimLockThrottled(documentName));
+
+    if (!proxyTo && onlyIfOpen) {
+      return;
+    }
+
     if (proxyTo && proxyTo !== this.serverId) {
       ++this.replyIdCounter; // bug in biome thinks this.replyIdCounter is not used if written on the line below
       const replyId = this.replyIdCounter;
@@ -277,7 +302,8 @@ export class RedisSyncExtension<TCE extends CustomEvents> implements Extension {
       const { promise, resolve, reject } = Promise.withResolvers();
       this.pendingReplies[replyId] = resolve;
       setTimeout(() => {
-        reject('TIMEOUT');
+        delete this.pendingReplies[replyId];
+        reject(new Error('TIMEOUT'));
       }, this.customEventTTL);
       return promise as Promise<ReturnType<TCE[TName]>>;
     }
@@ -296,36 +322,64 @@ export class RedisSyncExtension<TCE extends CustomEvents> implements Extension {
 
   /* WebSocket Server Hooks */
   onSocketOpen(
-    ws: BaseWebSocket,
+    ws: WebSocketLike,
     serializedHTTPRequest: SerializedHTTPRequest,
-    context = {},
-  ) {
-    const socketId = serializedHTTPRequest.headers['sec-websocket-key']!;
-    this.originSockets[socketId] = ws;
-    this.instance.handleConnection(
-      ws as any,
-      serializedHTTPRequest as any,
-      context,
+  ): ClientConnection {
+    const socketId = serializedHTTPRequest.headers['sec-websocket-key'];
+    const clientConnection = this.instance.handleConnection(
+      ws,
+      toWebRequest(serializedHTTPRequest),
+      this.deriveContext(serializedHTTPRequest),
     );
+    this.originConnections[socketId] = { clientConnection, socket: ws };
+    // CCC (UPSTREAM_MODIFICATIONS.md, #790): hand the connection back so the gateway can forward ws pongs to
+    // `touch()` (authz/collab-ingress/socket-keepalive.ts).
+    return clientConnection;
   }
 
   async onSocketMessage(
-    ws: BaseWebSocket,
     serializedHTTPRequest: SerializedHTTPRequest,
     detachableMsg: ArrayBuffer,
   ) {
-    const message = new Uint8Array(detachableMsg.slice());
-    const tmpMsg = new IncomingMessage(detachableMsg);
-    const documentName = readVarString(tmpMsg.decoder);
+    const socketId = serializedHTTPRequest.headers['sec-websocket-key'];
+    const entry = this.originConnections[socketId];
+    if (!entry) return;
+    const { clientConnection } = entry;
+
+    let message: Uint8Array;
+    let documentName: string;
+    try {
+      message = new Uint8Array(detachableMsg.slice());
+      const tmpMsg = new IncomingMessage(detachableMsg);
+      const documentNameAndSessionId = tmpMsg.readVarString();
+      // session-aware providers suffix the documentName with \0sessionId
+      const sepIdx = documentNameAndSessionId.indexOf('\0');
+      documentName =
+        sepIdx === -1
+          ? documentNameAndSessionId
+          : documentNameAndSessionId.slice(0, sepIdx);
+    } catch (error) {
+      entry.socket.close(Unauthorized.code, Unauthorized.reason);
+      return;
+    }
     const isDocLoadedOnInstance = this.instance.documents.has(documentName);
 
     if (isDocLoadedOnInstance) {
-      ws.emit('message', message);
+      clientConnection.handleMessage(message);
       return;
     }
 
     const proxyTo = await this.getOrClaimLockThrottled(documentName);
     if (proxyTo && proxyTo !== this.serverId) {
+      // Proxied messages bypass handleMessage, so refresh the connection's
+      // idle clock or hocuspocus' message timeout would reap the real socket.
+      // CCC (#790): through the public `touch()` only. Upstream also rewrote
+      // the private `connectionEstablishedAt`, which reopens the pre-auth
+      // deadline: frames naming a document another node owns would then keep
+      // an unauthenticated socket open forever. The cost: a socket whose every
+      // document is owned by another node (a rolling deploy's overlap; one
+      // collab node otherwise) is closed at that deadline and reconnects.
+      clientConnection.touch();
       // another server owns the doc
       const proxyMessage: RSAMessageProxy = {
         serializedHTTPRequest: serializedHTTPRequest,
@@ -338,16 +392,17 @@ export class RedisSyncExtension<TCE extends CustomEvents> implements Extension {
       return;
     }
     // This server owns the document, but hocuspocus hasn't loaded it yet
-    ws.emit('message', message);
+    clientConnection.handleMessage(message);
   }
 
   onSocketClose(socketId: string, code?: number, reason?: ArrayBuffer) {
-    const socket = this.originSockets[socketId];
-    if (!socket) return;
-    // at this point the socket is considered GC'd and we cannot call close
-    // The origin socket did not set up any connections for the proxy, so none of the hooks will work if we just emit
-    socket?.emit('close', code, reason);
-    delete this.originSockets[socketId];
+    const entry = this.originConnections[socketId];
+    if (!entry) return;
+    delete this.originConnections[socketId];
+    entry.clientConnection.handleClose({
+      code: code ?? 1000,
+      reason: reason ? Buffer.from(reason).toString() : '',
+    });
     const msg: RSAMessageCloseProxy = { type: 'closeProxy', socketId };
     this.pub.publish(this.msgChannel, this.pack(msg)).catch(() => {});
   }
@@ -372,6 +427,7 @@ export class RedisSyncExtension<TCE extends CustomEvents> implements Extension {
   }
 
   async onDestroy() {
+    this.pendingReplies = {};
     this.pub.disconnect(false);
     this.sub.disconnect(false);
   }

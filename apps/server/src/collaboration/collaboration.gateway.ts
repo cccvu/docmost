@@ -15,6 +15,7 @@ import {
   RedisSyncExtension,
   SerializedHTTPRequest,
 } from './extensions/redis-sync';
+import { toWebRequest } from './extensions/redis-sync/redis-sync.types';
 import { WsSocketWrapper } from './extensions/redis-sync/ws-socket-wrapper';
 import RedisClient from 'ioredis';
 import { pack, unpack } from 'msgpackr';
@@ -29,6 +30,7 @@ import {
 // (importless, so it is unit-testable outside the lib0 ESM graph); this method is a thin delegate.
 import { disconnectUserConnections } from '../authz/collab/disconnect-user-connections';
 import { CollabUpdateGuardExtension } from '../authz/collab-ingress/collab-update-guard.extension'; // CCC seam #3 (#781)
+import { keepCollabSocketAlive } from '../authz/collab-ingress/socket-keepalive'; // CCC seam #3 (#790)
 
 @Injectable()
 export class CollaborationGateway {
@@ -112,34 +114,44 @@ export class CollaborationGateway {
       const serializedHTTPRequest = this.serializeRequest(request);
       const socketId = serializedHTTPRequest.headers['sec-websocket-key'];
 
-      // Create wrapper socket that only receives events via emit()
-      // This prevents double-handling since Hocuspocus won't listen to raw WebSocket events
       const wrappedSocket = new WsSocketWrapper(client);
 
       // Route through RedisSync extension (this calls handleConnection internally)
-      this.redisSync.onSocketOpen(wrappedSocket as any, serializedHTTPRequest);
+      const clientConnection = this.redisSync.onSocketOpen(
+        wrappedSocket,
+        serializedHTTPRequest,
+      );
+      // CCC #790: Hocuspocus 4.x sends no pings; ping here and count each pong as activity.
+      keepCollabSocketAlive(client, () => clientConnection.touch());
 
-      // Forward raw WebSocket messages to the extension
       client.on('message', (data: ArrayBuffer) => {
-        this.redisSync!.onSocketMessage(
-          wrappedSocket as any,
-          serializedHTTPRequest,
-          data,
-        );
+        this.redisSync!.onSocketMessage(serializedHTTPRequest, data);
       });
 
-      // Forward close events
       client.on('close', (code: number, reason: Buffer) => {
-        this.redisSync!.onSocketClose(socketId, code, reason.buffer as ArrayBuffer);
-      });
-
-      // Forward pong events for keepalive
-      client.on('pong', (data: Buffer) => {
-        wrappedSocket.emit('pong', data);
+        this.redisSync!.onSocketClose(
+          socketId,
+          code,
+          new Uint8Array(reason).buffer,
+        );
       });
     } else {
       // Fallback to direct Hocuspocus connection
-      this.hocuspocus.handleConnection(client, request);
+      const clientConnection = this.hocuspocus.handleConnection(
+        client,
+        toWebRequest(this.serializeRequest(request)),
+      );
+
+      client.on('message', (data: Buffer) => {
+        clientConnection.handleMessage(new Uint8Array(data));
+      });
+
+      client.on('close', (code: number, reason: Buffer) => {
+        clientConnection.handleClose({ code, reason: reason.toString() });
+      });
+
+      // CCC #790: Hocuspocus 4.x sends no pings; ping here and count each pong as activity.
+      keepCollabSocketAlive(client, () => clientConnection.touch());
     }
   }
 
@@ -268,6 +280,7 @@ export class CollaborationGateway {
 
         if (this.hocuspocus.getDocumentsCount() === 0) resolve('');
         this.hocuspocus.closeConnections();
+        this.hocuspocus.flushPendingStores();
       } catch (error) {
         console.error(error);
       }
