@@ -58,7 +58,10 @@ export function reconcileRowIntoDoc(
     return { merged: false };
   }
 
-  Y.applyUpdate(document, missing);
+  // #790: under Hocuspocus 4.x every change to a live document schedules a store unless its origin opts out. This
+  // merge runs INSIDE a store that serializes it next, so it opts out: as under 3.4.4 it schedules nothing, and it
+  // cannot replace a pending human store's payload with one that has no user.
+  Y.applyUpdate(document, missing, RECONCILE_ORIGIN);
   rememberIfIntegrated(document, rowDigest);
   return { merged: true };
 }
@@ -76,6 +79,9 @@ export function reconcileRowIntoDoc(
  * holds pending structs: those are in its encoding but not in its state vector.
  */
 const coveredRows = new WeakMap<object, string>();
+
+/** Hocuspocus 4.x `LocalTransactionOrigin` with `skipStoreHooks` (a plain object: this file imports only yjs). */
+export const RECONCILE_ORIGIN = Object.freeze({ source: 'local' as const, skipStoreHooks: true });
 
 const bytesDigest = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('base64');
 

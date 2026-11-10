@@ -16,7 +16,7 @@ import { hasStoreFailure } from './store-failure-registry';
  * a lone UTF-16 surrogate into a mark attribute value and a mark attribute KEY (Yjs keeps both: a format value is
  * escaped JSON) and U+0000 into text and an element attribute (valid UTF-8, so it survives everywhere) used to make
  * every store of the page fail: jsonb refuses `\ud83d` (22P02) and `\u0000` (22P05), text refuses 0x00 (22021).
- * The REAL store path: Hocuspocus 3.4.4 (its update handling, debouncer and DirectConnection), the real
+ * The REAL store path: Hocuspocus 4.7.1 (its update handling, debouncer and DirectConnection), the real
  * PersistenceExtension and CollaborationHandler settle, the real PageRepo and `executeTx`, the postgres.js driver and a
  * real Postgres. Only the queues, the contributor history and the transclusion service are fakes.
  * Self-skips without AUTHZ_TEST_PG_URL; the `docmost-authz-pg` CI job provides Postgres.
@@ -37,9 +37,9 @@ const R = '\uFFFD';
 const HIGH = '\ud83d';
 const LOW = '\ude00';
 const EMOJI = '\ud83d\ude00'; // a paired surrogate (U+1F600)
-/** A WebSocket client's update arrives with its Connection as the transaction origin (anything truthy that is not the
- *  Redis origin makes Hocuspocus debounce a store, with this context). */
-const REMOTE = { context: { user: USER }, socketId: 'crafted-client' };
+/** A WebSocket client's update arrives with its Connection as the transaction origin (Hocuspocus 4.x's
+ *  `ConnectionTransactionOrigin`), so Hocuspocus debounces a store with that connection's context. */
+const REMOTE = { source: 'connection' as const, connection: { context: { user: USER }, socketId: 'crafted-client' } };
 
 type Json = { type: string; text?: string; attrs?: Record<string, unknown>; marks?: Json[]; content?: Json[] };
 
@@ -275,7 +275,7 @@ d('the collab store on real Postgres (#773)', () => {
     const second = stack(); // a fresh node: the document loads from the row's (raw) ydoc bytes
     const reloaded = await second.open();
     expect(storable(TiptapTransformer.fromYdoc(reloaded, 'default'))).toBe(false); // the raw value is still live
-    await second.persistence.onStoreDocument({ documentName: DOC, document: reloaded, context: { user: USER } } as never);
+    await second.persistence.onStoreDocument({ documentName: DOC, document: reloaded, lastContext: { user: USER } } as never);
 
     expect(storeFailures).toEqual([]);
     expect(hasStoreFailure(reloaded)).toBe(false);
@@ -333,7 +333,7 @@ d('the collab store on real Postgres (#773)', () => {
     expect(r.content.content![1].attrs?.textAlign).toEqual(stored);
 
     // It converges: the same live state stores as `unchanged` and keeps its version.
-    await s.persistence.onStoreDocument({ documentName: DOC, document: doc, context: { user: USER } } as never);
+    await s.persistence.onStoreDocument({ documentName: DOC, document: doc, lastContext: { user: USER } } as never);
     expect(storeFailures).toEqual([]);
     expect(s.updatePage).toHaveBeenCalledTimes(1);
     await expect(s.handlers.flushPageContent(DOC, { withDigest: true })).resolves.toEqual(settled);

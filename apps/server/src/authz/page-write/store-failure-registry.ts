@@ -36,7 +36,8 @@ export function hasStoreFailure(document: object): boolean {
 /**
  * #731 — one store per write instead of two (ADR 0031 amendment).
  *
- * A content write runs `DirectConnection.transact()`'s store and then `disconnect()`'s, and both serialize, read the
+ * A content write runs a store right after its transaction (direct-store.ts; Hocuspocus 3.4.4's `transact()` ran it
+ * itself) and then `disconnect()`'s, and both serialize, read the
  * locked row and reconcile the whole page. The second one has nothing new to persist when no transaction ran on the
  * document since the first one SUCCEEDED, so it is skipped: the persistence extension records the document's mutation
  * generation (doc-version.ts) at each successful store, and `isStoreCurrent` is true only while that generation is
@@ -50,7 +51,7 @@ export function hasStoreFailure(document: object): boolean {
  *   - it is recorded only after the store's transaction committed (a write, or the deep-equal no-op), never for a
  *     store that found no row or refused a blank clobber;
  *   - a FAILED store forgets it and records a failure, so `disconnect()`'s store still retries a failed
- *     `transact()` store in full (the R4 retry ADR 0031 kept the second store for).
+ *     first store in full (the R4 retry ADR 0031 kept the second store for).
  * A document whose transactions cannot be observed (no `on`) has no generation and is never skipped.
  */
 const storedAt = new WeakMap<object, number>();

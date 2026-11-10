@@ -100,7 +100,7 @@ describe('PersistenceExtension.onStoreDocument reconcile seam (#390)', () => {
   };
 
   const run = (ext: PersistenceExtension) =>
-    ext.onStoreDocument({ documentName: 'page.1', document, context } as any);
+    ext.onStoreDocument({ documentName: 'page.1', document, lastContext: context } as any);
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -214,7 +214,7 @@ describe('PersistenceExtension.onStoreDocument one-store-per-write seam (#731)',
     const ext = new PersistenceExtension({ findById, updatePage } as any, {} as any, queue, queue, queue, collabHistory, transclusion);
     return { ext, findById, updatePage, collabHistory };
   };
-  const run = (ext: PersistenceExtension) => ext.onStoreDocument({ documentName: 'page.1', document, context } as any);
+  const run = (ext: PersistenceExtension) => ext.onStoreDocument({ documentName: 'page.1', document, lastContext: context } as any);
 
   beforeEach(() => {
     jest.clearAllMocks();
@@ -226,7 +226,7 @@ describe('PersistenceExtension.onStoreDocument one-store-per-write seam (#731)',
 
   it('a current document skips the whole store: no row read, no write, contributors kept for the next store', async () => {
     const { ext, findById, updatePage, collabHistory } = build(ROW);
-    await ext.onChange({ documentName: 'page.1', context: { user: { id: 'human' } } } as any);
+    await ext.onChange({ documentName: 'page.1', context: { user: { id: 'human' } }, transactionOrigin: { source: 'connection', connection: {} } } as any);
     isStoreCurrent.mockReturnValueOnce(true);
     await expect(run(ext)).resolves.toBeUndefined();
     expect(isStoreCurrent).toHaveBeenCalledWith(document);
@@ -350,7 +350,7 @@ describe('PersistenceExtension.onStoreDocument post-store side-effect isolation 
   };
 
   const run = (ext: PersistenceExtension) =>
-    ext.onStoreDocument({ documentName: 'page.1', document, context } as any);
+    ext.onStoreDocument({ documentName: 'page.1', document, lastContext: context } as any);
 
   beforeEach(() => {
     jest.clearAllMocks();

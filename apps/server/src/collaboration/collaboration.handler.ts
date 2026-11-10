@@ -33,6 +33,8 @@ import {
   liveContentDigest,
   warmLiveContentDigest,
 } from '../authz/page-write/doc-version';
+// #716 R4 / #790: the direct write's first store, which Hocuspocus 4.x's `transact` no longer runs.
+import { storeDirectWriteNow } from '../authz/page-write/direct-store';
 import {
   insertAsOwnClient,
   PreparedContent,
@@ -192,7 +194,7 @@ export class CollaborationHandler {
             this.applyContentOperation(doc, prepared);
           },
         );
-        // #716 R4: the stores that followed the apply (transact's, then disconnect's retry) failed to persist it, and
+        // #716 R4: the stores that followed the apply (the one after the transaction, then disconnect's retry) failed to persist it, and
         // `disconnect()` unloads a document nobody else holds — the write may be lost. Not a 200: the outcome is
         // unknown (500 `write_outcome_unknown`, which the platform answers 504 "may have been applied").
         if (liveDoc && hasStoreFailure(liveDoc)) {
@@ -291,8 +293,8 @@ export class CollaborationHandler {
             prepared = prepareContentOperation(prosemirrorJson, operation);
             await yieldToEventLoop();
           }
-          // Refuse the COMMON case before opening a direct connection. `DirectConnection.transact()` and
-          // `.disconnect()` each run an immediate store, and on a refusal that store is not a no-op: the
+          // Refuse the COMMON case before opening a direct connection. The connection runs two immediate
+          // stores (after its transaction, and `.disconnect()`'s), and on a refusal they are not a no-op: the
           // live document has moved past the settled row by construction, so it would persist a human's
           // in-flight text under THIS caller's context — reassigning `lastUpdatedById` to the API/MCP
           // service account, rotating `updatedAt`, broadcasting `page.updated` under the caller's name,
@@ -380,7 +382,7 @@ export class CollaborationHandler {
             ? { applied: false, reason: 'applied_unconfirmed' }
             : { applied: false, reason: 'error' };
         }
-        // #716 R4: applied, but the stores that followed (transact's and disconnect's, the in-request retry) failed
+        // #716 R4: applied, but the stores that followed (the one after the transaction and disconnect's, the in-request retry) failed
         // to persist it. The append lives only in the resident document, and `disconnect()` unloads a document
         // nobody else holds — so this is not a 200.
         if (outcome.applied && liveDoc && hasStoreFailure(liveDoc)) {
@@ -445,6 +447,8 @@ export class CollaborationHandler {
       // one). A nested `applyUpdate` joins it, so a replace's delete + apply — and #429's key record — are one
       // atomic CRDT mutation: one update event, one broadcast, and peers never see the empty fragment between them.
       await connection.transact((doc) => doc.transact(() => fn(doc)));
+      // #716 R4 / #790: Hocuspocus 4.x's `transact` does not store; store now, so `disconnect()`'s store stays the retry.
+      await storeDirectWriteNow(hocuspocus, connection);
     } finally {
       await connection.disconnect();
     }
