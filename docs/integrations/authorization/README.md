@@ -132,6 +132,10 @@ You only implement a *caller* for these; the fork is the server. They fall into 
   restricted — by id, by subtree or as a full keyset scan, one SQL statement per response. It lets a platform
   project pages level-triggered (re-read what an event names instead of trusting its payload), so a reordered,
   retried or skipped event cannot leave a stale edge.
+- **Group control plane** (`groups`, 1.16.0, wiki-v2 #797; scopes `groups:read` / `groups:write`):
+  `GET`/`POST /api/service/groups`, `GET`/`PATCH`/`DELETE /api/service/groups/{groupId}`,
+  `GET .../groups/{groupId}/usage`, `GET`/`POST .../groups/{groupId}/members`, `DELETE .../groups/{groupId}/members/{externalId}`,
+  `POST /api/service/groups/memberships/lookup` and `POST /api/service/groups/default/ensure`.
 - **Collab** (`collab`): `POST /api/collab/revalidate` (re-check every live realtime connection after a
   narrowing access change and narrow the ones that lost access, #501; it replaced the per-page
   `force-disconnect` in 1.5.0) and `POST /api/collab/force-disconnect-user` (account disable, #455).
@@ -171,11 +175,30 @@ throttle. The engine logs
 kind, never the principal. An engine before 1.15.0 ignores the header and throttles every caller of a scope in one
 fixed 60 s window, with an uncoded 429 and no `Retry-After`.
 
+**1.16.0 (wiki-v2 #797).** A group control plane under `/api/service/groups` (above): data only, the platform
+authorizes first. Members are added by `externalId` only (1..200 per call; a group is never a member of a group). The
+workspace's default group changes only through `ensureDefaultGroup`, which is refused
+(`409 { code: basic_group_has_grants }`) while any live space membership or page grant names it; every other write to
+it is `409 { code: default_group_immutable }`. A group that still grants anything is not deleted
+(`409 { code: group_in_use, spaceCount, pageCount }`), and removing a member is a narrowing route
+(`Authz-Propagation`). `addSpaceMember` / `previewSpaceMember` take `externalId` XOR `groupId` and an optional
+`mode` (`set`, the default, or `atLeast`, which never lowers), and answer `groupId` and `applied`; `userId` is null
+for a group. A member write that RAISES a membership must be covered by what the acting human holds on the space:
+reader needs `space#view`, writer `space#edit` and `space#share`, admin a live direct admin membership (own or through
+a group) or `workspace#admin_cascade`, else `403 { code: grant_exceeds_actor }`; a settle fence not confirmed is
+`503 { code: grant_unconfirmed }`. The default group is never granted on a space
+(`400 { code: basic_group_not_grantable }`). In remote mode the relayed page-ACL routes (`/api/pages/add-permission`,
+and an `update-permission` that raises) apply the same ceiling on the page: reader needs `page#view`, writer
+`page#edit`, or `workspace#admin_cascade` (`403 { code: grant_exceeds_actor }`, retryable
+`503 { code: grant_ceiling_unconfirmed }`), and refuse a group grantee on an add or a raise
+(`400 { code: group_grant_not_allowed_on_restricted_page }`; existing group grants stay). The native directory reads
+are refused (below), and `search/suggest` returns groups only to a caller who administers the workspace or a space.
+
 **Native routes refused in remote mode (1.10.0; wiki-v2 #502, #598, #636).** In `AUTHZ_MODE=remote` the engine
 answers `404` to every authenticated caller of the native routes below, before any permission check, and forwards one
 audit row per refusal (its event in brackets) to `/audit/ingest`. A session minted before the switch to remote (an
-owner's included) gets the same `404`. Reads stay reachable (member lists, the invite list, group reads). Native
-mode keeps every route.
+owner's included) gets the same `404`. Since 1.16.0 (wiki-v2 #797) the directory reads are refused too; only the
+public `invites/info` stays reachable. Native mode keeps every route.
 - Space hard delete: `POST /api/spaces/delete` (`space.hard_delete_refused`). Remove a space with
   `POST /api/service/spaces/{id}/archive`.
 - Space create: `POST /api/spaces/create` (`space.native_create_refused`). Use `POST /api/service/spaces`.
@@ -185,10 +208,13 @@ mode keeps every route.
   and `/api/workspace/invites/{create,resend,revoke,link}` (`workspace.native_admin_refused`). Workspace settings go
   through `PATCH /api/service/workspace/settings`.
 - Group admin: `POST /api/groups/create`, `.../update`, `.../delete` and `/api/groups/members/{add,remove}`
-  (`group.native_admin_refused`). The bridge has no group write.
+  (`group.native_admin_refused`). Use `/api/service/groups` (1.16.0).
 - Email change: `POST /api/users/update` when the body has an `email` key, even `null` or unchanged
   (`user.native_email_change_refused`). In remote mode a user's email is identity, which the platform owns. The
   name and preference forms still work.
+- Directory reads (1.16.0, wiki-v2 #797): `POST /api/workspace/members`, `/api/workspace/invites`, `/api/groups`,
+  `/api/groups/info`, `/api/groups/members` and `/api/spaces/members` (`directory.native_read_refused`). The
+  platform console is the governed view.
 
 In remote mode `users.role` confers no workspace authority either: a native-phase owner session gets the member
 ability on every route gated on workspace permissions (1.10.0, #636).
