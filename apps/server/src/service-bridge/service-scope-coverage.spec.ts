@@ -12,6 +12,7 @@ import { ServicePageController } from './service-page.controller';
 import { ServiceContentController } from './service-content.controller';
 import { ServiceAttachmentController } from './service-attachment.controller';
 import { AuthzChangeController } from './authz-change.controller';
+import { ServiceGroupController } from './service-group.controller';
 
 // Derived from the module's own registration (not a hand-maintained list) so a controller added to
 // ServiceBridgeModule can never escape these assertions. The named imports below pin the KNOWN set: if one
@@ -24,6 +25,7 @@ const KNOWN_CONTROLLERS = [
   ServiceContentController,
   ServiceAttachmentController,
   AuthzChangeController,
+  ServiceGroupController,
 ];
 const CONTROLLERS = Reflect.getMetadata(MODULE_METADATA.CONTROLLERS, ServiceBridgeModule) as Array<
   new (...args: any[]) => unknown
@@ -83,6 +85,18 @@ const EXPECTED_SCOPE: Record<string, ServiceScope> = {
   'AuthzChangeController.changes': ServiceScope.ChangesRead,
   'AuthzChangeController.getSnapshot': ServiceScope.ChangesRead,
   'AuthzChangeController.pagesState': ServiceScope.PagesAuthzRead, // #545: its own (larger) rate bucket
+  // #797 the group control plane: reads (the membership lookup and the usage read included) vs writes.
+  'ServiceGroupController.list': ServiceScope.GroupsRead,
+  'ServiceGroupController.get': ServiceScope.GroupsRead,
+  'ServiceGroupController.listMembers': ServiceScope.GroupsRead,
+  'ServiceGroupController.lookupMemberships': ServiceScope.GroupsRead, // a POST that only reads
+  'ServiceGroupController.usage': ServiceScope.GroupsRead,
+  'ServiceGroupController.create': ServiceScope.GroupsWrite,
+  'ServiceGroupController.update': ServiceScope.GroupsWrite,
+  'ServiceGroupController.delete': ServiceScope.GroupsWrite,
+  'ServiceGroupController.addMembers': ServiceScope.GroupsWrite,
+  'ServiceGroupController.removeMember': ServiceScope.GroupsWrite,
+  'ServiceGroupController.ensureDefault': ServiceScope.GroupsWrite,
 };
 
 /**

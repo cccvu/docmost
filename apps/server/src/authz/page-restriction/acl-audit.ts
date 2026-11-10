@@ -77,12 +77,14 @@ export function aclAuditPayload(
 
 /**
  * #673: a refused page-ACL write that is a self-dealing attempt — a grant or re-role naming the actor or their group
- * (A1, `self_grant`), or lifting a restriction from a page the actor cannot edit (A3, `actor_cannot_edit`). Those are
- * the refusals worth a reviewer's attention: an admin reaching for content they cannot see. Every other refusal (the
+ * (A1, `self_grant`), lifting a restriction from a page the actor cannot edit (A3, `actor_cannot_edit`), or granting
+ * more than the actor holds on the page (INV-4 / A4, `grant_exceeds_actor`, #797). Those are the refusals worth a
+ * reviewer's attention: an admin reaching for content they cannot see. INV-6's group refusal is a policy answer to a
+ * request shape (the picker offers groups), not a reach for content, so it stays unaudited like the state conflicts. Every other refusal (the
  * page is not restricted, a sub-page would be exposed, a stale version, no such grant) is a state conflict and stays
  * unaudited, as an applied no-op does.
  */
-export const AUDITED_ACL_REFUSALS: ReadonlySet<string> = new Set(['self_grant', 'actor_cannot_edit']);
+export const AUDITED_ACL_REFUSALS: ReadonlySet<string> = new Set(['self_grant', 'actor_cannot_edit', 'grant_exceeds_actor']);
 
 /** Not an upstream `AuditEvent`: the platform ingest accepts any event name (see the module note above). */
 export const ACL_WRITE_REFUSED_EVENT = 'page.acl_write_refused';
@@ -103,5 +105,47 @@ export function aclRefusalAuditPayload(
     resourceId: page.id,
     spaceId: page.spaceId,
     metadata: { surface: 'engine', outcome: 'denied', action, reason },
+  };
+}
+
+/** Not an upstream `AuditEvent` (#797): a grant that passed INV-4 ONLY through the workspace-admin disjunct. */
+export const ACL_ADMIN_OVERRIDE_EVENT = 'page.acl_admin_override_grant';
+
+/** The log token emitted with every {@link ACL_ADMIN_OVERRIDE_EVENT} row (an alarm-worthy signal, #797 / P4). */
+export const ACL_ADMIN_OVERRIDE_LOG_TOKEN = 'PAGE_ACL_ADMIN_OVERRIDE';
+
+/**
+ * #797 INV-4: the extra row an APPLIED grant (add, or an update that raises a role) emits when it passed the ceiling only
+ * because the actor is a workspace admin — they could not view (reader) or edit (writer) the restricted page themselves.
+ * Emitted next to the write's ordinary row, so every workspace-admin reach into restricted content is visible on its
+ * own. Ids and roles only, like every row here; the grantees are the write's `added` + `changed` (capped).
+ */
+export function aclAdminOverridePayload(
+  action: 'add' | 'update',
+  page: Pick<Page, 'id' | 'spaceId'>,
+  effect: AclEffect,
+  role: string,
+  pageAccessUnconfirmed: boolean,
+): AuditLogPayload {
+  const grantees = [
+    ...effect.added.map(grantEntry),
+    ...effect.changed.map((c) => ({ ...subjectOf(c), role: c.toRole })),
+  ];
+  const metadata: Record<string, unknown> = {
+    surface: 'engine',
+    outcome: 'allowed',
+    basis: 'admin_cascade',
+    action,
+    role,
+    grantees: grantees.slice(0, ACL_AUDIT_LIST_CAP),
+  };
+  if (grantees.length > ACL_AUDIT_LIST_CAP) metadata.truncated = { grantees: grantees.length };
+  if (pageAccessUnconfirmed) metadata.pageAccess = 'unconfirmed';
+  return {
+    event: ACL_ADMIN_OVERRIDE_EVENT as string as AuditEventType,
+    resourceType: AuditResource.PAGE,
+    resourceId: page.id,
+    spaceId: page.spaceId,
+    metadata,
   };
 }

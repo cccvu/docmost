@@ -22,6 +22,7 @@ import { ServicePageLifecycleService } from './service-page-lifecycle.service';
 import { ServicePageImportService } from './service-page-import.service';
 import { spyKysely, SpyQuery } from './kysely-spy.testkit';
 import { requestQueue } from '../editor-compat/content-parse/content-parse.service';
+import { allowAllCeiling } from './space-grant-ceiling.testkit';
 
 /**
  * CCC service-bridge — NOT upstream Docmost code. Wire-level proof for incident #181.
@@ -158,7 +159,7 @@ describe('service-bridge member mutation refusals on the wire (#486)', () => {
       providers: [
         {
           provide: ServiceSpaceService,
-          useValue: new ServiceSpaceService(spy.db, { resolveDefaultWorkspaceId: async () => WS } as any, bridge as any),
+          useValue: new ServiceSpaceService(spy.db, { resolveDefaultWorkspaceId: async () => WS } as any, bridge as any, undefined, allowAllCeiling()),
         },
       ],
     })
@@ -265,7 +266,7 @@ describe('service-bridge versioned writes + member preview on the wire (#616)', 
       providers: [
         {
           provide: ServiceSpaceService,
-          useValue: new ServiceSpaceService(spy.db, { resolveDefaultWorkspaceId: async () => WS } as any, bridge as any),
+          useValue: new ServiceSpaceService(spy.db, { resolveDefaultWorkspaceId: async () => WS } as any, bridge as any, undefined, allowAllCeiling()),
         },
       ],
     })
@@ -393,7 +394,7 @@ describe('service-bridge keyed space create on the wire (#616)', () => {
       providers: [
         {
           provide: ServiceSpaceService,
-          useValue: new ServiceSpaceService(spy.db, { resolveDefaultWorkspaceId: async () => WS } as any, bridge as any, ledger as any),
+          useValue: new ServiceSpaceService(spy.db, { resolveDefaultWorkspaceId: async () => WS } as any, bridge as any, ledger as any, allowAllCeiling()),
         },
       ],
     })

@@ -7,7 +7,14 @@ import { MintSessionDto } from './mint-session.dto';
 import { ProvisionUserDto } from './provision-user.dto';
 import { SessionExternalIdDto } from './session-external-id.dto';
 import { LookupUsersDto } from './lookup-users.dto';
-import { CreateSpaceDto, UpdateSpaceMemberDto } from './space-admin.dto';
+import { AddSpaceMemberDto, CreateSpaceDto, SpaceMemberPreviewDto, UpdateSpaceMemberDto } from './space-admin.dto';
+import {
+  AddGroupMembersDto,
+  CreateGroupDto,
+  EnsureDefaultGroupDto,
+  GroupMembershipLookupDto,
+  UpdateGroupDto,
+} from './group-admin.dto';
 import { PageAuthzStateDto } from './page-authz-state.dto';
 import { TitleCandidatesDto, ValidateContentDto } from './page-import.dto';
 
@@ -354,6 +361,70 @@ describe('service-bridge DTO validation (constraints are load-bearing)', () => {
         { idempotencyKey: null },
       ]) {
         expect(await errCount(CreateSpaceDto, { ...base, ...keyed, ...over })).toBeGreaterThan(0);
+      }
+    });
+  });
+
+  // wiki-v2 #797: a space add names exactly one subject; the group DTOs take identities by externalId only.
+  describe('AddSpaceMemberDto (externalId XOR groupId, optional mode)', () => {
+    const base = { role: 'writer', addedByExternalId: 'ext-a' };
+    it('accepts a user add, a group add, and both modes', async () => {
+      expect(await errCount(AddSpaceMemberDto, { ...base, externalId: 'ext-b' })).toBe(0);
+      expect(await errCount(AddSpaceMemberDto, { ...base, groupId: UUID })).toBe(0);
+      expect(await errCount(AddSpaceMemberDto, { ...base, groupId: UUID, mode: 'atLeast' })).toBe(0);
+      expect(await errCount(AddSpaceMemberDto, { ...base, externalId: 'ext-b', mode: 'set' })).toBe(0);
+    });
+    it('rejects neither, both, a non-uuid group, a bad externalId and an unknown mode', async () => {
+      expect(await errCount(AddSpaceMemberDto, base)).toBeGreaterThan(0);
+      expect(await errCount(AddSpaceMemberDto, { ...base, externalId: 'ext-b', groupId: UUID })).toBeGreaterThan(0);
+      expect(await errCount(AddSpaceMemberDto, { ...base, groupId: 'nope' })).toBeGreaterThan(0);
+      expect(await errCount(AddSpaceMemberDto, { ...base, externalId: 'bad id' })).toBeGreaterThan(0);
+      expect(await errCount(AddSpaceMemberDto, { ...base, externalId: 'ext-b', mode: 'lower' })).toBeGreaterThan(0);
+      expect(await errCount(AddSpaceMemberDto, { role: 'writer', externalId: 'ext-b' })).toBeGreaterThan(0); // no actor
+    });
+    it('the preview validates groupId and mode as the add does', async () => {
+      expect(await errCount(SpaceMemberPreviewDto, { action: 'add', groupId: UUID, role: 'reader', addedByExternalId: 'a', mode: 'atLeast' })).toBe(0);
+      expect(await errCount(SpaceMemberPreviewDto, { action: 'add', groupId: 'nope' })).toBeGreaterThan(0);
+      expect(await errCount(SpaceMemberPreviewDto, { action: 'add', mode: 'down' })).toBeGreaterThan(0);
+    });
+  });
+
+  describe('group DTOs (#797)', () => {
+    const ids = (n: number) => Array.from({ length: n }, (_, i) => `ext-${i}`);
+    it('create/update need a 1..100-char trimmed name and the actor; description ≤ 500', async () => {
+      expect(await errCount(CreateGroupDto, { name: 'Team', actorExternalId: 'a' })).toBe(0);
+      expect(await errCount(CreateGroupDto, { name: '   ', actorExternalId: 'a' })).toBeGreaterThan(0);
+      expect(await errCount(CreateGroupDto, { name: 'x'.repeat(101), actorExternalId: 'a' })).toBeGreaterThan(0);
+      expect(await errCount(CreateGroupDto, { name: 'Team' })).toBeGreaterThan(0);
+      expect(await errCount(CreateGroupDto, { name: 'Team', description: 'd'.repeat(501), actorExternalId: 'a' })).toBeGreaterThan(0);
+      expect(await errCount(UpdateGroupDto, { description: '', actorExternalId: 'a' })).toBe(0);
+      expect(await errCount(UpdateGroupDto, { name: 'x' })).toBeGreaterThan(0);
+    });
+    it('member add: 1..200 externalIds of the shadow charset (never an empty batch)', async () => {
+      expect(await errCount(AddGroupMembersDto, { externalIds: ids(200), actorExternalId: 'a' })).toBe(0);
+      expect(await errCount(AddGroupMembersDto, { externalIds: ids(201), actorExternalId: 'a' })).toBeGreaterThan(0);
+      expect(await errCount(AddGroupMembersDto, { externalIds: [], actorExternalId: 'a' })).toBeGreaterThan(0);
+      expect(await errCount(AddGroupMembersDto, { externalIds: ['bad id'], actorExternalId: 'a' })).toBeGreaterThan(0);
+    });
+    it('ensure: 0..200 externalIds and a name; lookup: one externalId', async () => {
+      expect(await errCount(EnsureDefaultGroupDto, { name: 'Basic', externalIds: [] })).toBe(0);
+      expect(await errCount(EnsureDefaultGroupDto, { name: 'Basic', externalIds: ids(201) })).toBeGreaterThan(0);
+      expect(await errCount(EnsureDefaultGroupDto, { externalIds: [] })).toBeGreaterThan(0);
+      expect(await errCount(GroupMembershipLookupDto, { externalId: 'ext-1' })).toBe(0);
+      expect(await errCount(GroupMembershipLookupDto, { externalId: 'a b' })).toBeGreaterThan(0);
+    });
+    // "Bridge group routes accept only user externalIds": no member-carrying DTO has a group field, so the whitelisting
+    // ValidationPipe can never hand a group id to the service (forbidNonWhitelisted proves the key is not a property).
+    it.each([
+      ['AddGroupMembersDto', AddGroupMembersDto, { externalIds: ['ext-1'], actorExternalId: 'a' }],
+      ['EnsureDefaultGroupDto', EnsureDefaultGroupDto, { name: 'Basic', externalIds: ['ext-1'] }],
+    ] as const)('%s has no group-id member field', async (_n, cls, ok) => {
+      for (const key of ['groupId', 'groupIds', 'memberGroupIds', 'userIds']) {
+        const errs = await validate(plainToInstance(cls as any, { ...ok, [key]: [UUID] }) as object, {
+          whitelist: true,
+          forbidNonWhitelisted: true,
+        });
+        expect([key, errs.some((e) => e.property === key)]).toEqual([key, true]);
       }
     });
   });

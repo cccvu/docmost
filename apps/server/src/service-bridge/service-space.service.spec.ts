@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { ServiceSpaceService } from './service-space.service';
 import { spyKysely, SpyQuery } from './kysely-spy.testkit';
+import { allowAllCeiling } from './space-grant-ceiling.testkit';
 
 const workspaces = () => ({ resolveDefaultWorkspaceId: jest.fn(async () => 'ws1') }) as any;
 const bridge = () =>
@@ -22,7 +23,7 @@ const bridge = () =>
 
 const make = (respond: (q: SpyQuery) => unknown[]) => {
   const spy = spyKysely(respond);
-  return { svc: new ServiceSpaceService(spy.db, workspaces(), bridge()), spy };
+  return { svc: new ServiceSpaceService(spy.db, workspaces(), bridge(), undefined, allowAllCeiling()), spy };
 };
 
 // Raw `sql` keeps its literal (unquoted, indented) text, so match with lowercased `includes`.
@@ -111,7 +112,7 @@ describe('ServiceSpaceService.create — keyed (#616)', () => {
         expect(s).toBe(slot);
       }),
     };
-    const svc = new ServiceSpaceService(spy.db, workspaces(), b, ledger as any);
+    const svc = new ServiceSpaceService(spy.db, workspaces(), b, ledger as any, allowAllCeiling());
     return { svc, spy, ledger, order, b };
   };
   const inserts = (spy: { calls: SpyQuery[] }) =>
@@ -190,7 +191,7 @@ describe('ServiceSpaceService.create — keyed (#616)', () => {
     expect(noCred.b.provisionShadowUser).not.toHaveBeenCalled();
     expect(noCred.spy.tx).toEqual([]);
     const spy = spyKysely(() => []);
-    const noLedger = new ServiceSpaceService(spy.db, workspaces(), bridge());
+    const noLedger = new ServiceSpaceService(spy.db, workspaces(), bridge(), undefined, allowAllCeiling());
     await expect(noLedger.create(keyed as any, 'shared')).rejects.toThrow(/keyed create unavailable/);
     expect(spy.tx).toEqual([]);
   });
@@ -384,7 +385,7 @@ describe('ServiceSpaceService member mutations — last-admin invariant (#486)',
 
     it('locks inside the transaction AFTER the pre-check and provisioning, then upserts on commit', async () => {
       const { svc, spy } = make(respondTo({ member: null }));
-      await expect(svc.addMember('sp1', dto('writer'))).resolves.toEqual({ memberId: 'm1', userId: 'docmost-ext-m', ...VERSIONED });
+      await expect(svc.addMember('sp1', dto('writer'))).resolves.toEqual({ memberId: 'm1', userId: 'docmost-ext-m', groupId: null, applied: true, ...VERSIONED });
       expect(spy.tx).toEqual(['begin', 'commit']);
       expect(idx(spy, 'from spaces s')).toBeLessThan(idx(spy, 'for no key update')); // fast pre-check first
       expect(idx(spy, 'for no key update')).toBeLessThan(idx(spy, 'insert into space_members'));

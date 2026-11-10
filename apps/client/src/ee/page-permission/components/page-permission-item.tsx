@@ -17,6 +17,13 @@ import {
 } from "@/ee/page-permission/types/page-permission-role-data";
 import classes from "./page-permission.module.css";
 
+// CCC (wiki-v2 #797): role order, for offering a group grant only its current role or lower.
+const ROLE_RANK: Record<string, number> = {
+  [PagePermissionRole.READER]: 1,
+  [PagePermissionRole.WRITER]: 2,
+};
+const roleRank = (role: string): number => ROLE_RANK[role] ?? 0;
+
 type PagePermissionItemProps = {
   member: IPagePermissionMember;
   onRoleChange: (memberId: string, type: "user" | "group", role: string) => void;
@@ -75,7 +82,15 @@ export function PagePermissionItem({
             </Menu.Target>
 
             <Menu.Dropdown>
-              {pagePermissionRoleData.map((role) => (
+              {/* CCC (wiki-v2 #797, INV-6): a group grant on a restricted page may be kept or
+                  lowered, never raised — offer only its current role or lower. */}
+              {pagePermissionRoleData
+                .filter(
+                  (role) =>
+                    member.type !== "group" ||
+                    roleRank(role.value) <= roleRank(member.role),
+                )
+                .map((role) => (
                 <Menu.Item
                   key={role.value}
                   onClick={() => onRoleChange(member.id, member.type, role.value)}

@@ -155,6 +155,13 @@ const REQUESTS: Record<string, { body: Record<string, unknown>; svc: Svc; method
     svc: 'user',
     method: 'update',
   },
+  // #797 directoryRead
+  'WorkspaceController.getWorkspaceMembers': { body: {}, svc: 'workspace', method: 'getWorkspaceUsers' },
+  'WorkspaceController.getInvitations': { body: {}, svc: 'invitation', method: 'getInvitations' },
+  'GroupController.getWorkspaceGroups': { body: {}, svc: 'group', method: 'getWorkspaceGroups' },
+  'GroupController.getGroup': { body: { groupId: GROUP_ID }, svc: 'group', method: 'getGroupInfo' },
+  'GroupController.getGroupMembers': { body: { groupId: GROUP_ID }, svc: 'groupUser', method: 'getGroupUsers' },
+  'SpaceController.getSpaceMembers': { body: { spaceId: SPACE_ID }, svc: 'spaceMember', method: 'getSpaceMembers' },
 };
 
 const stubService = (methods: string[]) =>
@@ -163,11 +170,11 @@ const stubService = (methods: string[]) =>
 async function bootApp(mode: AuthzMode, { withRefusal = true } = {}) {
   const methodsOf = (svc: Svc) => Object.values(REQUESTS).filter((r) => r.svc === svc).map((r) => r.method);
   const services: Record<Svc, Record<string, jest.Mock>> = {
-    space: stubService(methodsOf('space')),
+    space: stubService([...methodsOf('space'), 'getSpaceInfo']), // + one read, to show reads stay reachable
     spaceMember: stubService(methodsOf('spaceMember')),
     workspace: stubService(methodsOf('workspace')),
     invitation: stubService(methodsOf('invitation')),
-    group: stubService([...methodsOf('group'), 'getGroupInfo']), // + one read, to show reads stay reachable
+    group: stubService(methodsOf('group')),
     groupUser: stubService(methodsOf('groupUser')),
     user: stubService(methodsOf('user')),
   };
@@ -185,7 +192,7 @@ async function bootApp(mode: AuthzMode, { withRefusal = true } = {}) {
       ...(withRefusal ? [{ provide: APP_INTERCEPTOR, useClass: RemoteNativeRefusalInterceptor }] : []),
       { provide: SpaceService, useValue: services.space },
       { provide: SpaceMemberService, useValue: services.spaceMember },
-      { provide: SpaceMemberRepo, useValue: {} },
+      { provide: SpaceMemberRepo, useValue: { getUserSpaceRoles: jest.fn().mockResolvedValue([]) } },
       { provide: WorkspaceService, useValue: services.workspace },
       { provide: WorkspaceInvitationService, useValue: services.invitation },
       { provide: WorkspaceRepo, useValue: {} },
@@ -280,10 +287,10 @@ describe('every remote refusal key over HTTP (#636)', () => {
       expect(h.forward).not.toHaveBeenCalled();
     });
 
-    it('a read on a refused controller stays reachable (the SPA uses it as a member)', async () => {
-      const res = await post(h, '/groups/info', { groupId: GROUP_ID });
+    it('a read outside the directory on a refused controller stays reachable (the SPA uses it as a member)', async () => {
+      const res = await post(h, '/spaces/info', { spaceId: SPACE_ID });
       expect(res.statusCode).toBe(HttpStatus.OK);
-      expect(h.services.group.getGroupInfo).toHaveBeenCalledTimes(1);
+      expect(h.services.space.getSpaceInfo).toHaveBeenCalledTimes(1);
       expect(h.forward).not.toHaveBeenCalled();
     });
   });
