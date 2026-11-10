@@ -1,10 +1,9 @@
-import { FormEvent, useState } from "react";
+import { ChangeEvent, FormEvent, useRef, useState } from "react";
 import {
   Anchor,
   Button,
   Container,
   Group,
-  PinInput,
   Stack,
   Text,
   TextInput,
@@ -16,13 +15,24 @@ import { useTranslation } from "react-i18next";
 import { notifications } from "@mantine/notifications";
 import { PublicShell } from "@/features/public/components/public-shell.tsx";
 import { usePasswordless } from "@/features/public/hooks/use-passwordless.ts";
+import { useResendCooldown } from "@/features/public/hooks/use-resend-cooldown.ts";
+import {
+  OTP_INPUT_MAX_LENGTH,
+  RESEND_COOLDOWN_SECONDS,
+  hasMinimumDigits,
+  isBulkEntry,
+  isCompleteOtp,
+  isRateLimited,
+  normalizeOtp,
+  tooManyRequestsMessage,
+} from "@/features/public/otp-code.ts";
 import APP_ROUTE from "@/lib/app-route.ts";
 import { getAppName } from "@/lib/config.ts";
 
 /**
  * Passwordless sign-in (magic link + OTP). Two steps, reachable two ways:
  *   1. enter email → request a sign-in email (response is always generic — no account disclosure);
- *   2. the code step → click the emailed link OR type the 6-digit code here.
+ *   2. the code step → click the emailed link OR enter the emailed code here.
  *
  * Step 2 is ALSO reachable WITHOUT requesting anything, via "I already have a code" (#319 review).
  * That path is load-bearing, not a convenience: issuing supersedes every prior live token for the
@@ -33,6 +43,11 @@ import { getAppName } from "@/lib/config.ts";
  * fragment a mail rewriter dropped (ADR 0018); a recovery path that invalidates the credential it
  * recovers is not one. Reaching this step is a pure client-side state change: it discloses nothing
  * and costs nothing, because the code itself is still verified server-side.
+ *
+ * The code field (#815) is ONE text field, not a row of cells: the code is moving from 6 to 8 digits, eight cells
+ * overflow a 360 px phone, and a row of cells cannot take a pasted "1234 5678". It takes 6 to 12 digits with spaces
+ * and hyphens ignored (`otp-code.ts`), so either length works across the rollout. A paste or an autofill of a whole
+ * code submits it once; typing never does, so a person who types always presses the button themselves.
  */
 export default function PasswordlessLogin() {
   const { t } = useTranslation();
@@ -44,34 +59,83 @@ export default function PasswordlessLogin() {
   // Arrived at the code step holding a code we did NOT just issue (see the docblock). Kept separate
   // from `sent` so the copy can stay truthful: "check your email" is a lie if we sent nothing.
   const [haveCode, setHaveCode] = useState(false);
+  // A code-format or verify error, shown on the field itself (role="alert", so it is announced).
+  const [otpError, setOtpError] = useState<string | null>(null);
+  // The last code a paste or autofill submitted on its own: each such entry submits once, never in a loop.
+  const autoSubmitted = useRef<string | null>(null);
+  const otpRef = useRef<HTMLInputElement>(null);
+  const cooldown = useResendCooldown(RESEND_COOLDOWN_SECONDS);
 
   async function onRequest(e: FormEvent) {
     e.preventDefault();
     const trimmed = email.trim();
     if (!trimmed) return;
-    if (await requestEmail(trimmed)) setSent(true);
+    if (await requestEmail(trimmed)) {
+      setSent(true);
+      cooldown.start();
+    }
   }
 
-  async function onVerify(e: FormEvent) {
-    e.preventDefault();
+  async function verifyCode(code: string) {
     // The address can legitimately be blank here: "I already have a code" reaches this step without one.
-    if (!email.trim() || otp.length < 6) return;
+    if (!email.trim()) return;
+    if (!isCompleteOtp(code)) {
+      setOtpError(t("Enter the code from your email. It is 6 to 12 digits."));
+      otpRef.current?.focus();
+      return;
+    }
+    setOtpError(null);
     try {
-      await completeSignIn({ email: email.trim(), otp });
+      await completeSignIn({ email: email.trim(), otp: normalizeOtp(code) });
     } catch (err) {
       // Distinguish "the code was fine but the session bridge failed" from "bad code" (see use-passwordless).
-      const bridge = (err as { stage?: string })?.stage === "bridge";
-      notifications.show({
-        color: "red",
-        message: bridge
-          ? t(
-              "You're verified, but we couldn't open your workspace session. Please try again.",
-            )
-          : t(
-              "That code is invalid, expired, or already used. Request a new one.",
-            ),
-      });
-      if (!bridge) setOtp("");
+      if ((err as { stage?: string })?.stage === "bridge") {
+        notifications.show({
+          color: "red",
+          message: t(
+            "You're verified, but we couldn't open your workspace session. Please try again.",
+          ),
+        });
+        return;
+      }
+      if (isRateLimited(err)) {
+        // A throttle says so and keeps the code: it may still be good once the wait is over.
+        setOtpError(tooManyRequestsMessage(err, t));
+      } else {
+        setOtpError(
+          t(
+            "That code is invalid, expired, or already used. Request a new one.",
+          ),
+        );
+        setOtp("");
+      }
+      otpRef.current?.focus();
+    }
+  }
+
+  function onVerify(e: FormEvent) {
+    e.preventDefault();
+    void verifyCode(otp);
+  }
+
+  function onOtpChange(e: ChangeEvent<HTMLInputElement>) {
+    const next = e.currentTarget.value;
+    const inputType = (e.nativeEvent as Partial<InputEvent> | undefined)
+      ?.inputType;
+    const bulk = isBulkEntry(otp, next, inputType);
+    setOtp(next);
+    setOtpError(null);
+    // A pasted or autofilled whole code submits itself, once. Typing never does.
+    const code = normalizeOtp(next);
+    if (
+      bulk &&
+      isCompleteOtp(next) &&
+      email.trim() &&
+      !isVerifying &&
+      autoSubmitted.current !== code
+    ) {
+      autoSubmitted.current = code;
+      void verifyCode(next);
     }
   }
 
@@ -141,15 +205,25 @@ export default function PasswordlessLogin() {
           ) : (
             <>
               {/* role="status" announces the step change to screen readers when we swap email→code. */}
-              <Text c="dimmed" ta="center" mb="lg" role="status">
+              <Text
+                c="dimmed"
+                ta="center"
+                mb={sent ? "xs" : "lg"}
+                role="status"
+              >
                 {sent
                   ? t(
-                      "Check your email and open the sign-in link. If the email also has a 6-digit code, you can enter it below instead. It expires shortly and can be used once.",
+                      "Check your email and open the sign-in link. If the email also has a code, you can enter it below instead. It expires shortly and can be used once.",
                     )
                   : t(
-                      "Enter the 6-digit code from your sign-in email. It expires shortly and can be used once.",
+                      "Enter the code from your sign-in email. It expires shortly and can be used once.",
                     )}
               </Text>
+              {sent && (
+                <Text c="dimmed" ta="center" size="sm" mb="lg">
+                  {t("Can't find it? Check your Junk or Clutter folder.")}
+                </Text>
+              )}
               <form onSubmit={onVerify}>
                 <Stack align="center" gap="md">
                   {/*
@@ -167,32 +241,45 @@ export default function PasswordlessLogin() {
                     required
                     w="100%"
                     // Focus follows the field that is actually empty. Arriving via "I already have a
-                    // code" there is no address yet, so focusing the PinInput would skip straight past
+                    // code" there is no address yet, so focusing the code field would skip straight past
                     // it — and because Mantine puts `disabled` on the submit button as the NATIVE
                     // attribute, that button leaves the tab order while either field is incomplete. The
-                    // next Tab from the last code cell would then land on "Resend email", whose Enter
+                    // next Tab from the code field would then land on "Resend email", whose Enter
                     // supersedes the code just typed. Focusing here keeps the order honest.
                     autoFocus={!sent}
                     value={email}
                     onChange={(e) => setEmail(e.currentTarget.value)}
                   />
-                  <PinInput
-                    length={6}
-                    type="number"
+                  {/*
+                    One text field (#815): 6 to 12 digits, spaces and hyphens ignored, so "1234 5678" pastes
+                    whole. Plain text, never type="number", which drops a leading zero and refuses the space.
+                    WCAG 2.2 SC 3.3.8: paste and the OS one-time-code autofill both work, and nothing has to be
+                    retyped. The error is the field's own, with role="alert" so it is announced.
+                  */}
+                  <TextInput
+                    ref={otpRef}
+                    id="verify-otp"
+                    label={t("One-time code")}
                     inputMode="numeric"
-                    oneTimeCode
+                    autoComplete="one-time-code"
+                    autoCapitalize="off"
+                    autoCorrect="off"
+                    spellCheck={false}
+                    maxLength={OTP_INPUT_MAX_LENGTH}
+                    w="100%"
                     // Only when we just sent the email: then the address is already known and the code
                     // is the empty field. See the note on the TextInput above.
                     autoFocus={sent}
                     value={otp}
-                    onChange={setOtp}
-                    aria-label={t("One-time code")}
+                    onChange={onOtpChange}
+                    error={otpError}
+                    errorProps={{ role: "alert" }}
                   />
                   <Button
                     type="submit"
                     fullWidth
                     loading={isVerifying}
-                    disabled={otp.length < 6 || !email.trim()}
+                    disabled={!hasMinimumDigits(otp) || !email.trim()}
                   >
                     {t("Sign in with code")}
                   </Button>
@@ -212,16 +299,24 @@ export default function PasswordlessLogin() {
                     // holding on the way. Mirrors onRequest, which already gets this right.
                     if (await requestEmail(email.trim())) {
                       setOtp("");
+                      setOtpError(null);
+                      autoSubmitted.current = null;
                       setSent(true);
+                      cooldown.start();
                     }
                   }}
                   loading={isRequesting}
                   // Reachable with a blank address since the entry guard moved to this step. Firing
                   // requestEmail("") surfaces the catch-all "we couldn't send" toast, which blames a
-                  // transient outage for an empty field sitting visibly above it.
-                  disabled={!email.trim()}
+                  // transient outage for an empty field sitting visibly above it. Also held for 60 s
+                  // after a send (#815): each resend supersedes the code that may still be on its way.
+                  disabled={!email.trim() || cooldown.remaining > 0}
                 >
-                  {t("Resend email")}
+                  {cooldown.remaining > 0
+                    ? t("Resend email ({{seconds}}s)", {
+                        seconds: cooldown.remaining,
+                      })
+                    : t("Resend email")}
                 </Button>
                 <Button
                   variant="subtle"
@@ -230,6 +325,9 @@ export default function PasswordlessLogin() {
                     setSent(false);
                     setHaveCode(false);
                     setOtp("");
+                    setOtpError(null);
+                    autoSubmitted.current = null;
+                    cooldown.reset();
                   }}
                 >
                   {t("Use a different email")}

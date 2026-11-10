@@ -11,6 +11,7 @@ import {
   verifyPasswordless,
 } from "@/features/public/services/public-service.ts";
 import APP_ROUTE, { getPostLoginRedirect } from "@/lib/app-route.ts";
+import { isRateLimited, tooManyRequestsMessage } from "@/features/public/otp-code.ts";
 
 /**
  * Passwordless sign-in orchestration (magic link + OTP). Reuses the SAME two-step the password login
@@ -30,10 +31,14 @@ export function usePasswordless() {
     try {
       await requestPasswordless({ email });
       return true;
-    } catch {
+    } catch (err) {
+      // #815: a throttle is not an outage. Say so, and say how long (Retry-After when the response carries one);
+      // "try again in a moment" would send the person straight back into the same limit.
       notifications.show({
         color: "red",
-        message: t("We couldn't send a sign-in email right now. Please try again in a moment."),
+        message: isRateLimited(err)
+          ? tooManyRequestsMessage(err, t)
+          : t("We couldn't send a sign-in email right now. Please try again in a moment."),
       });
       return false;
     } finally {

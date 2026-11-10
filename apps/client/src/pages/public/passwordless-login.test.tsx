@@ -1,12 +1,26 @@
-import { describe, it, expect, beforeAll, beforeEach, vi } from "vitest";
-import { render, screen, fireEvent, waitFor } from "@testing-library/react";
+import {
+  describe,
+  it,
+  expect,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  vi,
+} from "vitest";
+import {
+  act,
+  render,
+  screen,
+  fireEvent,
+  waitFor,
+} from "@testing-library/react";
 import { MantineProvider } from "@mantine/core";
 import { MemoryRouter } from "react-router-dom";
 
 /**
  * THE OTP-RECOVERY invariant (issue #319 review).
  *
- * Every magic-link email also carries a 6-digit code, and that code is the documented recovery path
+ * Every magic-link email also carries a one-time code, and that code is the documented recovery path
  * (ADR 0018) for a link whose fragment a mail rewriter dropped — it is the entire reason the cutover
  * to a fragment-only link was judged safe, and it is the email-independent leg of the
  * `admin:login-link` break-glass.
@@ -21,7 +35,11 @@ const requestEmail = vi.fn(async () => true);
 const completeSignIn = vi.fn(async () => {});
 
 vi.mock("react-i18next", () => ({
-  useTranslation: () => ({ t: (k: string) => k }),
+  useTranslation: () => ({
+    // Interpolates like i18next does for a key with no translation (the key is the English text).
+    t: (k: string, o?: Record<string, unknown>) =>
+      k.replace(/{{(\w+)}}/g, (_: string, n: string) => String(o?.[n])),
+  }),
 }));
 vi.mock("react-helmet-async", () => ({ Helmet: () => null }));
 vi.mock("@/features/public/components/public-shell.tsx", () => ({
@@ -69,13 +87,46 @@ function typeEmail(value = "user@example.edu") {
   fireEvent.change(screen.getByLabelText(/email/i), { target: { value } });
 }
 
-function fillOtp(digits = "111111") {
-  const inputs = Array.from(
-    document.querySelectorAll<HTMLInputElement>('input[inputmode="numeric"]'),
-  ).slice(0, 6);
-  inputs.forEach((input, i) =>
-    fireEvent.change(input, { target: { value: digits[i] } }),
+function otpField() {
+  return screen.getByLabelText(/one-time code/i) as HTMLInputElement;
+}
+
+// Typing: one `insertText` input event per character, as a keyboard produces. Never auto-submits (#815).
+function typeOtp(text = "111111") {
+  const field = otpField();
+  for (const ch of text) {
+    fireEvent.input(field, {
+      target: { value: field.value + ch },
+      inputType: "insertText",
+      data: ch,
+    });
+  }
+}
+
+// A paste: the whole text lands in ONE input event of type `insertFromPaste` (replacing what was there, as a
+// select-all paste does).
+function pasteOtp(text: string) {
+  fireEvent.input(otpField(), {
+    target: { value: text },
+    inputType: "insertFromPaste",
+    data: text,
+  });
+}
+
+function http(status: number, headers: Record<string, string> = {}) {
+  return Object.assign(new Error(`HTTP ${status}`), {
+    isAxiosError: true,
+    response: { status, headers, data: {} },
+  });
+}
+
+async function openCodeStep(withEmail = true) {
+  renderLogin();
+  if (withEmail) typeEmail();
+  fireEvent.click(
+    screen.getByRole("button", { name: /i already have a code/i }),
   );
+  await waitFor(() => expect(otpField()).toBeTruthy());
 }
 
 describe("PasswordlessLogin — the OTP is reachable without destroying it", () => {
@@ -105,7 +156,7 @@ describe("PasswordlessLogin — the OTP is reachable without destroying it", () 
       expect(screen.getByLabelText(/one-time code/i)).toBeTruthy(),
     );
 
-    fillOtp();
+    typeOtp();
     fireEvent.click(screen.getByRole("button", { name: /sign in with code/i }));
 
     await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
@@ -151,7 +202,7 @@ describe("PasswordlessLogin — the OTP is reachable without destroying it", () 
     );
     const submit = screen.getByRole("button", { name: /sign in with code/i });
 
-    fillOtp();
+    typeOtp();
     // A full code but no address: the button must still be out of reach.
     expect(submit.hasAttribute("disabled")).toBe(true);
 
@@ -169,7 +220,7 @@ describe("PasswordlessLogin — the OTP is reachable without destroying it", () 
     await waitFor(() =>
       expect(screen.getByLabelText(/one-time code/i)).toBeTruthy(),
     );
-    fillOtp();
+    typeOtp();
 
     // Submitting the FORM directly bypasses both the disabled button and native `required` validation,
     // so what is left is the guard inside onVerify — and nothing else.
@@ -228,10 +279,7 @@ describe("PasswordlessLogin — the OTP is reachable without destroying it", () 
     await waitFor(() =>
       expect(screen.getByLabelText(/one-time code/i)).toBeTruthy(),
     );
-    const cells = Array.from(
-      document.querySelectorAll<HTMLInputElement>('input[inputmode="numeric"]'),
-    );
-    expect(cells).toContain(document.activeElement as HTMLInputElement);
+    expect(document.activeElement).toBe(otpField());
   });
 
   it("RETURNS to the email step via 'Use a different email'", async () => {
@@ -269,20 +317,10 @@ describe("PasswordlessLogin — the OTP is reachable without destroying it", () 
     await waitFor(() =>
       expect(screen.getByLabelText(/one-time code/i)).toBeTruthy(),
     );
-    fillOtp();
+    typeOtp();
     fireEvent.click(screen.getByRole("button", { name: /resend email/i }));
     await waitFor(() => expect(requestEmail).toHaveBeenCalledTimes(1));
-    await waitFor(() =>
-      expect(
-        Array.from(
-          document.querySelectorAll<HTMLInputElement>(
-            'input[inputmode="numeric"]',
-          ),
-        )
-          .slice(0, 6)
-          .every((i) => i.value === ""),
-      ).toBe(true),
-    );
+    await waitFor(() => expect(otpField().value).toBe(""));
     // ...and the copy flips to the sent wording, which is the other half of `setSent(true)`. Without
     // this the success branch was unasserted in either direction: dropping it left the suite green.
     await waitFor(() =>
@@ -316,5 +354,230 @@ describe("PasswordlessLogin — the OTP is reachable without destroying it", () 
     );
     await waitFor(() => expect(requestEmail).toHaveBeenCalledTimes(1));
     expect(requestEmail).toHaveBeenCalledWith("user@example.edu");
+  });
+});
+
+/**
+ * #815 — ONE code field for a 6- or 8-digit code (the platform moves to 8 one release after this ships). It takes 6 to
+ * 12 digits with spaces and hyphens ignored; a paste or autofill of a whole code submits it once; typing never does.
+ */
+describe("PasswordlessLogin — the code field takes 6 to 12 digits (#815)", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("a pasted grouped 8-digit code ('1234 5678') submits itself, separators stripped", async () => {
+    await openCodeStep();
+    pasteOtp("1234 5678");
+    await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
+    expect(completeSignIn).toHaveBeenCalledWith({
+      email: "user@example.edu",
+      otp: "12345678",
+    });
+    // One field, not a row of cells: the whole code is in it.
+    expect(otpField().value).toBe("1234 5678");
+  });
+
+  it("a pasted 6-digit code submits itself too (the length today)", async () => {
+    await openCodeStep();
+    pasteOtp("123456");
+    await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
+    expect(completeSignIn).toHaveBeenCalledWith({
+      email: "user@example.edu",
+      otp: "123456",
+    });
+  });
+
+  it("an autofill that reports no input type still submits (the length jump is the tell)", async () => {
+    await openCodeStep();
+    fireEvent.change(otpField(), { target: { value: "87654321" } });
+    await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
+    expect(completeSignIn).toHaveBeenCalledWith({
+      email: "user@example.edu",
+      otp: "87654321",
+    });
+  });
+
+  it("auto-submits ONCE: pasting the same code again does not submit it again", async () => {
+    await openCodeStep();
+    pasteOtp("1234 5678");
+    await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
+    pasteOtp("12345678");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(completeSignIn).toHaveBeenCalledTimes(1);
+    // ...but the button still works for a deliberate retry.
+    fireEvent.click(screen.getByRole("button", { name: /sign in with code/i }));
+    await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(2));
+  });
+
+  it("TYPING a full code never submits it; the person presses the button", async () => {
+    await openCodeStep();
+    const submit = screen.getByRole("button", { name: /sign in with code/i });
+    typeOtp("12345");
+    // Five digits: not yet.
+    expect(submit.hasAttribute("disabled")).toBe(true);
+    typeOtp("678");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(completeSignIn).not.toHaveBeenCalled();
+    // Six or more digits: the button is offered (positive control for the wait above).
+    await waitFor(() => expect(submit.hasAttribute("disabled")).toBe(false));
+    fireEvent.click(submit);
+    await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
+    expect(completeSignIn).toHaveBeenCalledWith({
+      email: "user@example.edu",
+      otp: "12345678",
+    });
+  });
+
+  it("a typed hyphen is ignored on submit", async () => {
+    await openCodeStep();
+    typeOtp("1234-5678");
+    fireEvent.click(screen.getByRole("button", { name: /sign in with code/i }));
+    await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
+    expect(completeSignIn).toHaveBeenCalledWith({
+      email: "user@example.edu",
+      otp: "12345678",
+    });
+  });
+
+  it("a paste with no address yet does not submit; the button does once the address is in", async () => {
+    await openCodeStep(false);
+    pasteOtp("1234 5678");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(completeSignIn).not.toHaveBeenCalled();
+    typeEmail();
+    fireEvent.click(screen.getByRole("button", { name: /sign in with code/i }));
+    await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
+  });
+
+  it("a malformed code is explained in an announced error, and not sent", async () => {
+    await openCodeStep();
+    typeOtp("1234567890123"); // 13 digits
+    fireEvent.click(screen.getByRole("button", { name: /sign in with code/i }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(
+      "Enter the code from your email. It is 6 to 12 digits.",
+    );
+    expect(completeSignIn).not.toHaveBeenCalled();
+    expect(otpField().getAttribute("aria-invalid")).toBe("true");
+  });
+
+  it("a wrong code is announced on the field and the field is cleared", async () => {
+    completeSignIn.mockRejectedValueOnce(http(401));
+    await openCodeStep();
+    pasteOtp("1234 5678");
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toMatch(/invalid, expired, or already used/);
+    expect(otpField().value).toBe("");
+    expect(document.activeElement).toBe(otpField());
+  });
+
+  it("a 429 says to wait (Retry-After honored) and KEEPS the code", async () => {
+    completeSignIn.mockRejectedValueOnce(http(429, { "retry-after": "120" }));
+    await openCodeStep();
+    pasteOtp("1234 5678");
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(
+      "Too many requests. Wait 2 minutes, then try again.",
+    );
+    expect(otpField().value).toBe("1234 5678");
+  });
+
+  it("a 429 with no Retry-After says 'a few minutes'", async () => {
+    completeSignIn.mockRejectedValueOnce(http(429));
+    await openCodeStep();
+    typeOtp("12345678");
+    fireEvent.click(screen.getByRole("button", { name: /sign in with code/i }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toBe(
+      "Too many requests. Wait a few minutes, then try again.",
+    );
+  });
+
+  it("the field is one numeric one-time-code text field", async () => {
+    await openCodeStep();
+    const field = otpField();
+    expect(field.getAttribute("inputmode")).toBe("numeric");
+    expect(field.getAttribute("autocomplete")).toBe("one-time-code");
+    expect(field.type).toBe("text"); // never type="number": that drops a leading zero and refuses a space
+    expect(
+      document.querySelectorAll('input[autocomplete="one-time-code"]'),
+    ).toHaveLength(1);
+  });
+
+  it("after a send: the Junk hint shows; it does not when nothing was sent", async () => {
+    await openCodeStep();
+    expect(screen.queryByText(/Check your Junk or Clutter folder/)).toBeNull();
+    fireEvent.click(
+      screen.getByRole("button", { name: /use a different email/i }),
+    );
+    typeEmail();
+    fireEvent.click(
+      screen.getByRole("button", { name: /email me a sign-in link/i }),
+    );
+    expect(
+      await screen.findByText(
+        "Can't find it? Check your Junk or Clutter folder.",
+      ),
+    ).toBeTruthy();
+  });
+});
+
+describe("PasswordlessLogin — the 60 s resend countdown (#815)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.useFakeTimers();
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("holds Resend for 60 s after a send, then offers it again", async () => {
+    renderLogin();
+    typeEmail();
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: /email me a sign-in link/i }),
+      );
+    });
+    expect(requestEmail).toHaveBeenCalledTimes(1);
+    const resend = () => screen.getByRole("button", { name: /resend email/i });
+    expect(resend().textContent).toBe("Resend email (60s)");
+    expect(resend().hasAttribute("disabled")).toBe(true);
+
+    for (let i = 0; i < 30; i++) {
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+    }
+    expect(resend().textContent).toBe("Resend email (30s)");
+    expect(resend().hasAttribute("disabled")).toBe(true);
+
+    for (let i = 0; i < 30; i++) {
+      act(() => {
+        vi.advanceTimersByTime(1000);
+      });
+    }
+    expect(resend().textContent).toBe("Resend email");
+    expect(resend().hasAttribute("disabled")).toBe(false);
+
+    // A resend restarts the countdown.
+    await act(async () => {
+      fireEvent.click(resend());
+    });
+    expect(requestEmail).toHaveBeenCalledTimes(2);
+    expect(resend().textContent).toBe("Resend email (60s)");
+  });
+
+  it("a FAILED send starts no countdown", async () => {
+    renderLogin();
+    typeEmail();
+    fireEvent.click(
+      screen.getByRole("button", { name: /i already have a code/i }),
+    );
+    requestEmail.mockResolvedValueOnce(false);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /resend email/i }));
+    });
+    expect(requestEmail).toHaveBeenCalledTimes(1);
+    const resend = screen.getByRole("button", { name: /resend email/i });
+    expect(resend.textContent).toBe("Resend email");
+    expect(resend.hasAttribute("disabled")).toBe(false);
   });
 });
