@@ -1,5 +1,5 @@
 // #731: how much whole-page work ONE content write does on the engine's event loop, counted exactly — so a regression
-// is a red test, never a timing flake. The REAL stack: Hocuspocus 3.4.4 (its DirectConnection, debouncer and load
+// is a red test, never a timing flake. The REAL stack: Hocuspocus 4.7.1 (its DirectConnection, debouncer and load
 // path), the real PersistenceExtension and CollaborationHandler, real yjs, the real tiptap transformer and content
 // builder. Only the database (an in-memory `pages` row with jsonb/bytea round-trip semantics) and the queues are fakes.
 //
@@ -135,17 +135,19 @@ const settleTimers = async () => {
 const lockedReads = (db: ReturnType<typeof fakeDb>) => db.findById.mock.calls.filter((c) => c[1]?.withLock).length;
 const rowHas = (db: ReturnType<typeof fakeDb>, text: string) => JSON.stringify(db.row.content).includes(text);
 
-describe('#731 whole-page passes per content write (real Hocuspocus 3.4.4)', () => {
+describe('#731 whole-page passes per content write (real Hocuspocus 4.7.1)', () => {
   let passes: ReturnType<typeof passCounter>;
   beforeEach(() => {
     passes = passCounter();
   });
   afterEach(() => jest.restoreAllMocks());
 
-  it('the installed @hocuspocus/server is 3.4.4 (the load-in-place and two-store analysis is of that source: re-review on a bump)', () => {
+  // #790: under 4.7.1 `DirectConnection.transact()` stores nothing (it schedules a debounced store) and `disconnect()`
+  // stores once, so the first of the two stores is the handler's own (direct-store.ts). Re-review both on a bump.
+  it('the installed @hocuspocus/server is 4.7.1 (the load-in-place and two-store analysis is of that source: re-review on a bump)', () => {
     const pkg = JSON.parse(readFileSync(join(dirname(require.resolve('@hocuspocus/server')), '..', 'package.json'), 'utf8'));
     expect(pkg.name).toBe('@hocuspocus/server');
-    expect(pkg.version).toBe('3.4.4');
+    expect(pkg.version).toBe('4.7.1');
   });
 
   it('NON-RESIDENT replace: one load apply, one store that runs (the second is skipped), one encode, one fromYdoc', async () => {
@@ -158,7 +160,7 @@ describe('#731 whole-page passes per content write (real Hocuspocus 3.4.4)', () 
 
     expect(s.loadHook).toHaveBeenCalledTimes(1);
     expect(await s.loadHook.mock.results[0].value).toBeUndefined(); // filled in place: nothing for Hocuspocus to re-apply
-    expect(s.storeHook).toHaveBeenCalledTimes(2); // transact() + disconnect()
+    expect(s.storeHook).toHaveBeenCalledTimes(2); // the store after the transaction (direct-store.ts) + disconnect()
     expect(lockedReads(s.db)).toBe(1); // …of which ONE ran
     expect(s.db.updatePage).toHaveBeenCalledTimes(1);
     expect(passes.counts).toEqual({ encode: 1, apply: 1, diff: 0, fromYdoc: 1, toYdoc: 0 });
@@ -210,7 +212,7 @@ describe('#731 whole-page passes per content write (real Hocuspocus 3.4.4)', () 
     await keeper.disconnect();
   });
 
-  it('a FAILED transact() store is retried by disconnect()\'s store: both run, the write answers applied', async () => {
+  it('a FAILED first store (the one after the transaction) is retried by disconnect()\'s store: both run, the write answers applied', async () => {
     const s = stack(page('A'));
     s.db.failNext(true); // the first updatePage throws, the retry succeeds
     passes.reset();
@@ -233,12 +235,11 @@ describe('#731 whole-page passes per content write (real Hocuspocus 3.4.4)', () 
     ).resolves.toEqual({ applied: false, reason: 'applied_unconfirmed' });
     expect(lockedReads(s.db)).toBe(2);
     expect(rowHas(s.db, 'A paragraph')).toBe(true); // nothing persisted
-    // The settle runs the next store in full (not skipped) and persists what the live document holds.
+    // The next store runs in full (not skipped) and persists what the live document holds.
     s.db.findById.mockClear();
-    await keeper.transact(() => undefined); // keeper's store: a store with no new transaction since the failure
+    await keeper.disconnect(); // keeper's store: a store with no new transaction since the failure
     expect(lockedReads(s.db)).toBe(1);
     expect(rowHas(s.db, 'B paragraph 1499')).toBe(true);
-    await keeper.disconnect();
   });
 
   it('the native updatePageContent: the same single store (a failed one still answers write_outcome_unknown)', async () => {
@@ -257,7 +258,7 @@ describe('#731 whole-page passes per content write (real Hocuspocus 3.4.4)', () 
     expect(err?.getResponse?.()).toMatchObject({ code: 'write_outcome_unknown' });
   });
 
-  it('an edit that lands while the transact() store awaits the database makes disconnect()\'s store run and persist it', async () => {
+  it('an edit that lands while the first store awaits the database makes disconnect()\'s store run and persist it', async () => {
     const s = stack(page('A'));
     const keeper = await s.hocuspocus.openDirectConnection(DOC, { user: USER });
     const doc = s.hocuspocus.documents.get(DOC)!;
@@ -292,10 +293,32 @@ describe('#731 whole-page passes per content write (real Hocuspocus 3.4.4)', () 
     await expect(
       s.handlers.conditionalUpdatePageContent(DOC, { prosemirrorJson: page('B', 10), operation: 'append', user: USER }),
     ).resolves.toEqual({ applied: true });
-    expect(passes.counts.diff).toBe(1); // the transact store diffed the changed bytes; the disconnect store was skipped
+    expect(passes.counts.diff).toBe(1); // the first store diffed the changed bytes; the disconnect store was skipped
     expect(rowHas(s.db, 'out-of-band')).toBe(true);
     expect(rowHas(s.db, 'B paragraph 9')).toBe(true);
     expect(TiptapTransformer.fromYdoc(doc, 'default').content.length).toBeGreaterThan(800);
+    await keeper.disconnect();
+  });
+
+  it('#790: a store that folds an out-of-band row write in schedules no further store (its merge opts out)', async () => {
+    // Hocuspocus 4.x debounces a store for EVERY change unless the origin sets skipStoreHooks. The reconcile's merge
+    // runs inside a store that persists it next; scheduling another would run later with no user in its context (or
+    // replace a human's pending store's payload). 3.4.4 scheduled nothing for it either.
+    const s = stack(page('A', 50));
+    const keeper = await s.hocuspocus.openDirectConnection(DOC, { user: USER });
+    const doc = s.hocuspocus.documents.get(DOC)!;
+    const id = `onStoreDocument-${DOC}`;
+    await keeper.transact((d) => d.getXmlFragment('default').insert(0, [new Y.XmlText('pending ')]));
+    expect(s.hocuspocus.debouncer.isDebounced(id)).toBe(true); // 4.x: transact schedules (does not run) a store
+    const other = new Y.Doc();
+    Y.applyUpdate(other, s.db.row.ydoc!);
+    other.getXmlFragment('default').insert(0, [new Y.XmlText('out-of-band ')]);
+    s.db.row.ydoc = Buffer.from(Y.encodeStateAsUpdate(other));
+    await expect(s.handlers.flushPageContent(DOC)).resolves.toEqual({ flushed: true }); // runs the store: it folds in
+    expect(rowHas(s.db, 'out-of-band')).toBe(true);
+    expect(rowHas(s.db, 'pending')).toBe(true);
+    expect(JSON.stringify(TiptapTransformer.fromYdoc(doc, 'default'))).toContain('out-of-band');
+    expect(s.hocuspocus.debouncer.isDebounced(id)).toBe(false);
     await keeper.disconnect();
   });
 

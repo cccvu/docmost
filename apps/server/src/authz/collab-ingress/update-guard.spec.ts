@@ -8,6 +8,7 @@ import { serverSchema } from '../page-write/prelim-content';
 import { isDuplicateWriteKey, recordWriteKey, WRITE_IDEM_MAP } from '../page-write/write-idem';
 import {
   ALL_NODES_DOC,
+  authFrame,
   awarenessFrame,
   contentOf,
   deepJson,
@@ -17,11 +18,32 @@ import {
   renderLikeABrowser,
   spliceVarString,
   statelessFrame,
+  step1Frame,
   SYNC,
   syncFrame,
+  typedFrame,
 } from './collab-ingress.testkit';
 import { INT_ATTRS, STRING_ATTRS } from './content-rules';
-import { COLLAB_REFUSAL_CODE, CollabUpdateGuard, SOCKET_REFUSAL_BUDGET, UNRESOLVED_REASON, type CollabGuardMode } from './update-guard';
+import { COLLAB_CONNECTIONS_PER_USER } from './limits';
+import { SocketLimitLog } from './socket-limit-log';
+import {
+  AWARENESS_BINDS_PER_USER,
+  AWARENESS_NEW_IDS_BURST,
+  AWARENESS_NEW_IDS_REFILL_MS,
+  COLLAB_TRY_LATER_CODE,
+  AWARENESS_STATE_MAX_BYTES,
+  COLLAB_REFUSAL_CODE,
+  CollabUpdateGuard,
+  SOCKET_REFUSAL_BUDGET,
+  SYNC_BURST,
+  SYNC_REFILL_MS,
+  TRY_LATER_REASON,
+  USER_DOC_BUDGETS_MAX,
+  USER_SYNC_BURST,
+  USER_SYNC_REFILL_MS,
+  UNRESOLVED_REASON,
+  type CollabGuardMode,
+} from './update-guard';
 
 /**
  * #781 (ADR 0036): the collab update guard refuses, BEFORE it applies, a frame that would make any browser's y-tiptap
@@ -34,10 +56,12 @@ import { COLLAB_REFUSAL_CODE, CollabUpdateGuard, SOCKET_REFUSAL_BUDGET, UNRESOLV
  */
 const schema = serverSchema();
 const REFUSED = (rule: string) => `ccc:collab-update-refused:${rule}`;
+/** #790: an exhausted (user, document) budget: the socket closed 1013, never a 4422 refusal. */
+const TRY_LATER = 'try-later';
 
 type Conn = { readOnly: boolean; webSocket: { close: jest.Mock }; context: { user: { id: string } } };
 
-function setup(opts: { mode?: CollabGuardMode; seed?: unknown | Y.Doc; seedY?: (f: Y.XmlFragment, d: Y.Doc) => void; legacy?: Uint8Array } = {}) {
+function setup(opts: { mode?: CollabGuardMode; seed?: unknown | Y.Doc; seedY?: (f: Y.XmlFragment, d: Y.Doc) => void; legacy?: Uint8Array; now?: () => number } = {}) {
   const live = new Y.Doc() as Y.Doc & { name: string };
   live.name = DOC_NAME;
   if (opts.seed) {
@@ -51,7 +75,13 @@ function setup(opts: { mode?: CollabGuardMode; seed?: unknown | Y.Doc; seedY?: (
   }
   if (opts.legacy) Y.applyUpdate(live, opts.legacy); // stored before the guard ever saw the document
   const logs: string[] = [];
-  const guard = new CollabUpdateGuard({ mode: opts.mode ?? 'enforce', logger: { warn: (m: string) => logs.push(m) } });
+  const limitLogs: string[] = [];
+  const guard = new CollabUpdateGuard({
+    mode: opts.mode ?? 'enforce',
+    logger: { warn: (m: string) => logs.push(m) },
+    limitLog: new SocketLimitLog({ warn: (m: string) => limitLogs.push(m) }),
+    now: opts.now,
+  });
   // The peer receives every update the live document broadcasts.
   const peer = new Y.Doc();
   if (!opts.legacy) {
@@ -65,6 +95,12 @@ function setup(opts: { mode?: CollabGuardMode; seed?: unknown | Y.Doc; seedY?: (
       const ret = guard.check({ connection: c, document: live, update: frame, context: c.context });
       expect(ret).toBeUndefined(); // never a promise
     } catch (err: any) {
+      if (err?.code === COLLAB_TRY_LATER_CODE) {
+        expect(err).toEqual({ code: COLLAB_TRY_LATER_CODE, reason: TRY_LATER_REASON });
+        // the socket is closed FIRST, so Hocuspocus's document CLOSE (sent after the throw) never reaches the editor
+        expect(c.webSocket.close).toHaveBeenLastCalledWith(COLLAB_TRY_LATER_CODE, TRY_LATER_REASON);
+        return TRY_LATER;
+      }
       expect(err).toEqual({ code: COLLAB_REFUSAL_CODE, reason: expect.any(String) });
       return err.reason;
     }
@@ -74,7 +110,7 @@ function setup(opts: { mode?: CollabGuardMode; seed?: unknown | Y.Doc; seedY?: (
   const send = (c: Conn, update: Uint8Array, subtype: number = SYNC.Update, type: number = MSG.Sync) =>
     deliver(c, syncFrame(update, subtype, type), update);
   const snapshot = () => ({ live: Y.encodeStateAsUpdate(live), peer: Y.encodeStateAsUpdate(peer) });
-  return { live, guard, peer, logs, conn, send, deliver, snapshot };
+  return { live, guard, peer, logs, limitLogs, conn, send, deliver, snapshot };
 }
 
 /** The same update with no guard, on a copy: the control arm. */
@@ -468,9 +504,12 @@ describe('#781 B4: a client id is bound to its user (forged clocks)', () => {
 
   it('accepted: awareness echoes, a reader claiming a writer\'s id, a remount resending a bound peer\'s cached structs', () => {
     const { s, victim, vc } = victimSetup();
+    const meta = new Map<number, { clock: number }>();
+    (s.live as unknown as { awareness: unknown }).awareness = { meta };
     expect(s.deliver(s.conn('reader', true), awarenessFrame([{ clientID: 1001, state: { user: {} } }]))).toBe('applied');
+    meta.set(1001, { clock: 1 }); // Hocuspocus applied and relayed it
     expect(s.send(vc, victim.edit(s.live, () => textOf(find(victim.doc, 'paragraph')).insert(0, 'v1 ')))).toBe('applied'); // reader did not bind
-    expect(s.deliver(s.conn('peer'), awarenessFrame([{ clientID: 1001, state: { user: {} } }]))).toBe('applied'); // an echo
+    expect(s.deliver(s.conn('peer'), awarenessFrame([{ clientID: 1001, state: { user: {} } }]))).toBe('applied'); // an echo of what was relayed
     // A remount: a fresh doc loaded from IndexedDB holds the victim's structs and sends them back (already in live).
     const remount = new Y.Doc();
     Y.applyUpdate(remount, Y.encodeStateAsUpdate(s.live));
@@ -882,5 +921,299 @@ describe('#781 the Yjs internals the guard reads (re-check on a Yjs 14 / Hocuspo
     Y.applyUpdate(d, Y.encodeStateAsUpdate(src, sv));
     expect(Y.decodeUpdateV2(d.store.pendingStructs!.update).structs.length).toBeGreaterThan(0);
     expect(Y.decodeUpdateV2(d.store.pendingDs!).ds.clients.size).toBe(1);
+  });
+});
+
+describe('#790 frame bounds: the sync budget, per (user, document), across connections', () => {
+  const clocked = () => {
+    let t = 1_000_000;
+    const s = setup({ seed: SEED, now: () => t });
+    return { s, advance: (ms: number) => (t += ms) };
+  };
+
+  it(`a user's SyncStep1s: ${SYNC_BURST} pass across reconnects, the next closes the socket 1013 (Sync and SyncReply alike)`, () => {
+    for (const type of [MSG.Sync, MSG.SyncReply]) {
+      const { s } = clocked();
+      const frame = type === MSG.Sync ? step1Frame(s.live) : syncFrame(Y.encodeStateVector(s.live), SYNC.Step1, MSG.SyncReply);
+      // one Step1 per connection: a reconnect loop gets no fresh budget
+      for (let i = 0; i < SYNC_BURST; i++) expect(s.deliver(s.conn('writer'), frame)).toBe('applied');
+      const last = s.conn('writer');
+      expect(s.deliver(last, frame)).toBe(TRY_LATER);
+      expect(s.limitLogs).toEqual(['COLLAB_SOCKET_LIMIT {"limit":"user_sync_budget","userId":"writer"}']);
+      expect(s.deliver(s.conn('other-user'), frame)).toBe('applied'); // per user
+      expect(s.logs.filter((l) => l.includes('COLLAB_UPDATE_REFUSED'))).toEqual([]); // never a 4422 refusal
+    }
+  });
+
+  /** A Step1 for another page, through the same guard: 'applied' or TRY_LATER. */
+  const onPage = (s: ReturnType<typeof setup>, user: string, n: number) => {
+    const doc = new Y.Doc() as Y.Doc & { name: string };
+    doc.name = `page.00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+    const c = s.conn(user);
+    try {
+      s.guard.check({ connection: c, document: doc, update: step1Frame(doc), context: c.context });
+      return 'applied';
+    } catch (err: any) {
+      expect(err).toEqual({ code: COLLAB_TRY_LATER_CODE, reason: TRY_LATER_REASON });
+      return TRY_LATER;
+    }
+  };
+
+  it(`a new page buys no new burst: ${USER_SYNC_BURST} Step1s per user across all pages, then one per ${USER_SYNC_REFILL_MS} ms`, () => {
+    const { s, advance } = clocked();
+    for (let n = 1; n <= USER_SYNC_BURST; n++) expect(onPage(s, 'reader', n)).toBe('applied'); // one Step1 on each of 64 pages
+    expect(onPage(s, 'reader', 1000)).toBe(TRY_LATER); // a fresh page, but the user's budget is spent
+    expect(onPage(s, 'someone-else', 1000)).toBe('applied');
+    advance(USER_SYNC_REFILL_MS);
+    expect(onPage(s, 'reader', 1001)).toBe('applied');
+    expect(onPage(s, 'reader', 1002)).toBe(TRY_LATER);
+  });
+
+  it('the per-page budget still binds within the user budget: one page cannot spend more than its own burst', () => {
+    const { s, advance } = clocked();
+    for (let i = 0; i < SYNC_BURST; i++) expect(s.deliver(s.conn('writer'), step1Frame(s.live))).toBe('applied');
+    advance(10 * USER_SYNC_REFILL_MS); // the user budget refills 10, the page budget 2
+    expect(s.deliver(s.conn('writer'), step1Frame(s.live))).toBe('applied');
+    expect(s.deliver(s.conn('writer'), step1Frame(s.live))).toBe('applied');
+    expect(s.deliver(s.conn('writer'), step1Frame(s.live))).toBe(TRY_LATER); // the page is spent, the user is not
+    expect(onPage(s, 'writer', 7)).toBe('applied'); // so another page still opens
+  });
+
+  it(`refills one per ${SYNC_REFILL_MS} ms, never above the burst`, () => {
+    const { s, advance } = clocked();
+    advance(10 * SYNC_REFILL_MS); // idle before the first frame: still only the burst
+    for (let i = 0; i < SYNC_BURST; i++) expect(s.deliver(s.conn('writer'), step1Frame(s.live))).toBe('applied');
+    advance(SYNC_REFILL_MS - 1);
+    expect(s.deliver(s.conn('writer'), step1Frame(s.live))).toBe(TRY_LATER);
+    advance(1);
+    expect(s.deliver(s.conn('writer'), step1Frame(s.live))).toBe('applied'); // one back after exactly SYNC_REFILL_MS
+    expect(s.deliver(s.conn('writer'), step1Frame(s.live))).toBe(TRY_LATER);
+    advance(100 * SYNC_REFILL_MS);
+    for (let i = 0; i < SYNC_BURST; i++) expect(s.deliver(s.conn('writer'), step1Frame(s.live))).toBe('applied'); // capped
+    expect(s.deliver(s.conn('writer'), step1Frame(s.live))).toBe(TRY_LATER);
+  });
+
+  it(`every tab of the per-user connection cap (${COLLAB_CONNECTIONS_PER_USER}) reconnecting at once after a deploy passes, readers too`, () => {
+    for (const readOnly of [false, true]) {
+      const { s } = clocked();
+      for (let i = 0; i < COLLAB_CONNECTIONS_PER_USER; i++) {
+        const c = s.conn('many-tabs', readOnly);
+        expect(s.deliver(c, step1Frame(s.live))).toBe('applied');
+        if (readOnly) expect(s.deliver(c, syncFrame(Y.encodeStateAsUpdate(s.live), SYNC.Step2))).toBe('applied');
+      }
+      expect(s.limitLogs).toEqual([]);
+    }
+  });
+
+  it("a reader's Step2 is counted (4.7.1 snapshots the whole document for it); its Update is not (an O(1) nack)", () => {
+    const { s } = clocked();
+    const reader = s.conn('reader', true);
+    const update = new RemoteClient(s.live).edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'x '));
+    expect(s.deliver(reader, step1Frame(s.live))).toBe('applied');
+    for (let i = 0; i < 200; i++) expect(s.deliver(reader, syncFrame(update, SYNC.Update))).toBe('applied'); // y-tiptap's per-element deletes on a legacy page
+    for (let i = 1; i < SYNC_BURST; i++) expect(s.deliver(reader, syncFrame(update, SYNC.Step2))).toBe('applied');
+    expect(s.deliver(reader, syncFrame(update, SYNC.Step2))).toBe(TRY_LATER);
+  });
+
+  it("an honest open passes: one Step1, a Step2, awareness, then a stream of updates (a writer's Step2 and Updates are not counted)", () => {
+    const { s } = clocked();
+    const c = s.conn('writer');
+    const client = new RemoteClient(s.live, 4242);
+    expect(s.deliver(c, step1Frame(client.doc))).toBe('applied');
+    expect(s.send(c, client.edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'offline ')), SYNC.Step2)).toBe('applied');
+    expect(s.deliver(c, awarenessFrame([{ clientID: 4242, state: { user: { name: 'W' } } }]))).toBe('applied');
+    for (let i = 0; i < 3 * SYNC_BURST; i++) {
+      expect(s.send(c, client.edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, `${i} `)))).toBe('applied');
+    }
+    const reader = s.conn('reader', true);
+    expect(s.deliver(reader, step1Frame(s.live))).toBe('applied');
+    expect(s.deliver(reader, syncFrame(Y.encodeStateAsUpdate(s.live), SYNC.Step2))).toBe('applied');
+  });
+
+  it('report mode logs an exhausted budget and closes nothing', () => {
+    const s = setup({ seed: SEED, mode: 'report', now: () => 1 });
+    for (let i = 0; i < SYNC_BURST + 3; i++) expect(s.deliver(s.conn('writer'), step1Frame(s.live))).toBe('applied');
+    expect(s.limitLogs).toHaveLength(3);
+  });
+
+  it(`the budgets map is bounded (${USER_DOC_BUDGETS_MAX}); the least recently used is dropped`, () => {
+    const s = setup({ seed: SEED, now: () => 1 });
+    for (let i = 0; i < SYNC_BURST; i++) s.deliver(s.conn('kept'), step1Frame(s.live));
+    for (let i = 0; i < USER_DOC_BUDGETS_MAX + 50; i++) s.deliver(s.conn(`u${i}`), step1Frame(s.live));
+    expect(s.guard.budgetCount()).toBe(USER_DOC_BUDGETS_MAX);
+    // 'kept' was the least recently used, so it is gone, and comes back with a fresh budget
+    expect(s.deliver(s.conn('kept'), step1Frame(s.live))).toBe('applied');
+  });
+});
+
+describe('#790 frame bounds: awareness, for writers and readers', () => {
+  const big = 'x'.repeat(AWARENESS_STATE_MAX_BYTES);
+  /** A state whose JSON text is exactly `bytes` UTF-8 bytes. */
+  const stateOf = (bytes: number) => ({ json: JSON.stringify({ n: big.slice(0, bytes - 8) }) });
+
+  it.each([['writer', false], ['reader', true]] as const)(
+    'a %s: a state over AWARENESS_STATE_MAX_BYTES is refused before anything parses it; one at the bound passes',
+    (_who, readOnly) => {
+      const s = setup({ seed: SEED });
+      expect(stateOf(AWARENESS_STATE_MAX_BYTES).json.length).toBe(AWARENESS_STATE_MAX_BYTES);
+      expect(s.deliver(s.conn('a', readOnly), awarenessFrame([{ clientID: 11, state: null, ...stateOf(AWARENESS_STATE_MAX_BYTES) }]))).toBe('applied');
+      const parse = jest.spyOn(JSON, 'parse');
+      try {
+        // Not even valid JSON past the bound: a guard that parsed it first would throw, not refuse.
+        const json = '{'.repeat(AWARENESS_STATE_MAX_BYTES + 1);
+        expect(s.deliver(s.conn('b', readOnly), awarenessFrame([{ clientID: 12, state: null, json }]))).toBe(REFUSED('awareness'));
+        // Bytes, not UTF-16 units: 4100 two-byte characters are 8200 bytes.
+        expect(s.deliver(s.conn('c', readOnly), awarenessFrame([{ clientID: 13, state: { n: 'é'.repeat(4100) } }]))).toBe(REFUSED('awareness'));
+        expect(parse.mock.calls.filter(([text]) => typeof text === 'string' && text.length > 4000)).toEqual([]);
+      } finally {
+        parse.mockRestore();
+      }
+      expect(s.guard.bindingCount(s.live)).toBe(readOnly ? 0 : 2); // a reader binds nothing; a writer: live's own id + its state
+    },
+  );
+
+  it.each([['writer', false], ['reader', true]] as const)(
+    `a %s: ${AWARENESS_NEW_IDS_BURST} client ids new to the document per (user, document), across reconnects; past it the socket closes 1013`,
+    (_who, readOnly) => {
+      let t = 1_000_000;
+      const s = setup({ seed: SEED, now: () => t });
+      const ids = (from: number, n: number) => Array.from({ length: n }, (_, i) => ({ clientID: from + i, state: {} }));
+      const c = s.conn('a', readOnly);
+      expect(s.deliver(c, awarenessFrame(ids(100, AWARENESS_NEW_IDS_BURST / 2)))).toBe('applied');
+      expect(s.deliver(c, awarenessFrame(ids(100, AWARENESS_NEW_IDS_BURST / 2)))).toBe('applied'); // the same ids again: paid for
+      // a reconnect does not refill it
+      expect(s.deliver(s.conn('a', readOnly), awarenessFrame(ids(500, AWARENESS_NEW_IDS_BURST / 2)))).toBe('applied');
+      expect(s.deliver(s.conn('a', readOnly), awarenessFrame(ids(600, 1)))).toBe(TRY_LATER);
+      expect(s.deliver(s.conn('b', readOnly), awarenessFrame(ids(700, AWARENESS_NEW_IDS_BURST)))).toBe('applied'); // per user
+      t += AWARENESS_NEW_IDS_REFILL_MS;
+      expect(s.deliver(s.conn('a', readOnly), awarenessFrame(ids(800, 1)))).toBe('applied'); // refilled one
+      expect(s.deliver(s.conn('a', readOnly), awarenessFrame(ids(900, 2)))).toBe(TRY_LATER); // a frame is charged whole
+    },
+  );
+
+  it(`every tab of the per-user cap (${COLLAB_CONNECTIONS_PER_USER}) announcing its id after a deploy passes`, () => {
+    const s = setup({ seed: SEED, now: () => 1 });
+    for (let i = 0; i < COLLAB_CONNECTIONS_PER_USER; i++) {
+      const c = s.conn('many-tabs');
+      expect(s.deliver(c, awarenessFrame([{ clientID: 50_000 + i, state: { user: { name: 'M' } } }]))).toBe('applied');
+      expect(s.deliver(c, awarenessFrame([{ clientID: 50_000 + i, clock: 2, state: { user: { name: 'M' } } }]))).toBe('applied');
+    }
+    expect(s.limitLogs).toEqual([]);
+  });
+
+  it.each([['writer', false], ['reader', true]] as const)(
+    'a %s: ids the document awareness already holds are not counted (a timeout removal of a 200-peer room passes)',
+    (_who, readOnly) => {
+      const s = setup({ seed: SEED });
+      const meta = new Map<number, { clock: number }>();
+      for (let i = 0; i < 200; i++) meta.set(1000 + i, { clock: 3 });
+      (s.live as unknown as { awareness: unknown }).awareness = { meta };
+      const room = Array.from({ length: 200 }, (_, i) => ({ clientID: 1000 + i, clock: 4, state: null }));
+      expect(s.deliver(s.conn('a', readOnly), awarenessFrame(room))).toBe('applied');
+      expect(s.deliver(s.conn('a', readOnly), awarenessFrame([...room, ...room.slice(0, AWARENESS_NEW_IDS_BURST).map((e) => ({ ...e, clientID: e.clientID + 5000 }))]))).toBe('applied');
+    },
+  );
+
+  it('a client id twice in one frame is refused (y-protocols never encodes one twice)', () => {
+    const s = setup({ seed: SEED });
+    expect(s.deliver(s.conn('a', true), awarenessFrame([{ clientID: 5, state: {} }, { clientID: 5, clock: 2, state: {} }]))).toBe(REFUSED('awareness'));
+  });
+
+  it(`awareness binds stop at ${AWARENESS_BINDS_PER_USER} per user per document (never a refusal); other users still bind`, () => {
+    let t = 1_000_000;
+    const s = setup({ seed: SEED, now: () => t });
+    const perConn = 32;
+    let next = 10_000;
+    // one writer over many connections (reconnects), over time (its new-id budget refills), tries to use up every bind
+    for (let n = 0; n < AWARENESS_BINDS_PER_USER / perConn + 4; n++) {
+      const entries = Array.from({ length: perConn }, () => ({ clientID: next++, state: { user: {} } }));
+      expect(s.deliver(s.conn('hog'), awarenessFrame(entries))).toBe('applied');
+      t += perConn * AWARENESS_NEW_IDS_REFILL_MS;
+    }
+    expect(s.guard.bindingCount(s.live)).toBe(1 + AWARENESS_BINDS_PER_USER); // live's own id + the hog's cap
+    // an honest user who opens the page afterwards still binds its id, so its cursor cannot be spoken for
+    expect(s.deliver(s.conn('honest'), awarenessFrame([{ clientID: 99_999, state: { user: { name: 'H' } } }]))).toBe('applied');
+    expect(s.guard.bindingCount(s.live)).toBe(2 + AWARENESS_BINDS_PER_USER);
+    expect(s.deliver(s.conn('hog'), awarenessFrame([{ clientID: 99_999, clock: 2, state: { user: { name: 'H' } } }]))).toBe(REFUSED('foreign-client'));
+  });
+});
+
+describe('#790 frame bounds: Auth on an established session and unknown message types', () => {
+  it('an Auth frame is refused auth (only an established session reaches the guard), any subtype', () => {
+    const s = setup({ seed: SEED });
+    for (const authType of [0, 1, 2]) {
+      expect(s.deliver(s.conn('a'), authFrame('token', DOC_NAME, authType))).toBe(REFUSED('auth'));
+    }
+  });
+
+  it('a type 4.7.1 does not handle is refused message-type; every type an honest provider sends passes', () => {
+    const s = setup({ seed: SEED });
+    for (const type of [MSG.SyncStatus, 9, 10, 11, 127, 300]) expect(s.deliver(s.conn('a'), typedFrame(type))).toBe(REFUSED('message-type'));
+    const c = s.conn('writer');
+    expect(s.deliver(c, typedFrame(MSG.QueryAwareness))).toBe('applied');
+    expect(s.deliver(c, step1Frame(s.live))).toBe('applied');
+    expect(s.deliver(c, awarenessFrame([{ clientID: 9, state: {} }]))).toBe('applied');
+    expect(s.deliver(c, typedFrame(MSG.Close))).toBe('applied'); // a provider's detach
+  });
+});
+
+describe('#790 awareness: no rate refusal in the guard (the rate is a drop at the gateway, frame-address.ts)', () => {
+  it.each([['writer', false], ['reader', true]] as const)(
+    'a %s sending 1000 cursor frames in one millisecond is never refused: a refusal would end an honest session',
+    (_who, readOnly) => {
+      const s = setup({ seed: SEED, now: () => 2_000_000 });
+      const c = s.conn('a', readOnly);
+      for (let clock = 1; clock <= 1000; clock++) {
+        const frame = awarenessFrame([{ clientID: 4242, clock, state: { user: { name: 'W' }, cursor: { anchor: clock, head: clock } } }]);
+        expect(s.deliver(c, frame)).toBe('applied');
+      }
+      for (let i = 0; i < 100; i++) expect(s.deliver(c, typedFrame(MSG.QueryAwareness))).toBe('applied');
+    },
+  );
+});
+
+describe('#790 awareness: no state for another user\'s client id', () => {
+  const withMeta = () => {
+    const s = setup({ seed: SEED });
+    const meta = new Map<number, { clock: number }>();
+    (s.live as unknown as { awareness: unknown }).awareness = { meta };
+    return { s, meta };
+  };
+
+  it('control: before any binding, a writer can announce a state for any id (nothing says whose it is)', () => {
+    const { s } = withMeta();
+    expect(s.deliver(s.conn('attacker'), awarenessFrame([{ clientID: 1001, clock: 5, state: { user: { name: 'Victim' } } }]))).toBe('applied');
+  });
+
+  it.each([['writer', false], ['reader', true]] as const)(
+    'a %s announcing a newer state for an id bound to another user is refused foreign-client',
+    (_who, readOnly) => {
+      const { s, meta } = withMeta();
+      expect(s.deliver(s.conn('victim'), awarenessFrame([{ clientID: 1001, clock: 1, state: { user: { name: 'V' } } }]))).toBe('applied');
+      meta.set(1001, { clock: 1 });
+      expect(s.deliver(s.conn('attacker', readOnly), awarenessFrame([{ clientID: 1001, clock: 2, state: { user: { name: 'Fake' } } }]))).toBe(REFUSED('foreign-client'));
+      // an id no awareness ever held but bound by its structs is protected too
+      const bound = new RemoteClient(s.live, 2002);
+      expect(s.send(s.conn('victim'), bound.edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'v ')))).toBe('applied');
+      expect(s.deliver(s.conn('attacker', readOnly), awarenessFrame([{ clientID: 2002, clock: 1, state: { user: {} } }]))).toBe(REFUSED('foreign-client'));
+      // and the server's own
+      expect(s.deliver(s.conn('attacker', readOnly), awarenessFrame([{ clientID: s.live.clientID, clock: 1, state: {} }]))).toBe(REFUSED('foreign-client'));
+    },
+  );
+
+  it('honest traffic about another user\'s id passes: a timeout removal, an echo at a held clock; the owner itself always', () => {
+    const { s, meta } = withMeta();
+    const victim = s.conn('victim');
+    expect(s.deliver(victim, awarenessFrame([{ clientID: 1001, clock: 3, state: { user: { name: 'V' } } }]))).toBe('applied');
+    meta.set(1001, { clock: 3 });
+    // a peer's provider removes a peer that went quiet: clock + 1, state null
+    expect(s.deliver(s.conn('peer'), awarenessFrame([{ clientID: 1001, clock: 4, state: null }]))).toBe('applied');
+    // a 3.x provider echoes what it was relayed
+    expect(s.deliver(s.conn('peer'), awarenessFrame([{ clientID: 1001, clock: 3, state: { user: { name: 'V' } } }]))).toBe('applied');
+    // the owner, on the same or a new connection (a reconnect after a deploy keeps the Y.Doc and its id)
+    expect(s.deliver(victim, awarenessFrame([{ clientID: 1001, clock: 5, state: { user: { name: 'V' } } }]))).toBe('applied');
+    expect(s.deliver(s.conn('victim'), awarenessFrame([{ clientID: 1001, clock: 6, state: { user: { name: 'V' } } }]))).toBe('applied');
+    // one frame can mix a peer's removal with the sender's own state (y-protocols batches changed clients)
+    expect(s.deliver(s.conn('peer'), awarenessFrame([{ clientID: 1001, clock: 7, state: null }, { clientID: 3003, clock: 1, state: { user: { name: 'P' } } }]))).toBe('applied');
   });
 });

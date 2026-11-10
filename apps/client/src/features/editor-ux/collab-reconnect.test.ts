@@ -7,7 +7,7 @@ import {
 } from "./collab-reconnect";
 
 /**
- * A socket that behaves like @hocuspocus/provider 3.4.4's HocuspocusProviderWebsocket: `disconnect()` keeps the
+ * A socket that behaves like @hocuspocus/provider 4.7.1's HocuspocusProviderWebsocket: `disconnect()` keeps the
  * status Connected until the browser's close event (`close()` here), and `connect()` is a no-op while Connected.
  */
 function fakeSocket(status: WebSocketStatus = WebSocketStatus.Connected) {

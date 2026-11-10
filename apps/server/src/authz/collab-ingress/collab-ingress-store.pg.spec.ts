@@ -16,7 +16,7 @@ import { CollabUpdateGuardExtension } from './collab-update-guard.extension';
 import { CollabUpdateGuard } from './update-guard';
 
 /**
- * #781 on real Postgres (ADR 0036): the REAL store path (Hocuspocus 3.4.4, the real PersistenceExtension and
+ * #781 on real Postgres (ADR 0036): the REAL store path (Hocuspocus 4.7.1, the real PersistenceExtension and
  * CollaborationHandler settle, PageRepo, postgres.js, Postgres) with the collab update guard in front of it, fed by fake
  * WebSocket clients. Control arms apply the same bytes with no guard and show the damage: a store that fails on every
  * attempt (the #773-style wedge) and a forged or deleted `/v1` idempotency-ledger entry. Treatment arms show the CLOSE,
@@ -44,8 +44,9 @@ const settle = async () => {
   for (let i = 0; i < 8; i++) await new Promise((r) => setImmediate(r));
 };
 const textOf = (el: Y.XmlElement): Y.XmlText => el.toArray().find((c) => c instanceof Y.XmlText) as Y.XmlText;
-/** A server-side `/v1` write: any truthy, non-Redis origin makes Hocuspocus debounce a store with this context. */
-const V1_WRITE = { context: { user: USERS.editor }, socketId: 'v1-write' };
+/** A server-side `/v1` write's origin, as Hocuspocus 4.x's `DirectConnection.transact` sets it: a local origin carrying the
+ *  caller's context, so Hocuspocus debounces a store with that context. */
+const V1_WRITE = { source: 'local' as const, context: { user: USERS.editor } };
 
 d('the collab store behind the ingress guard (#781)', () => {
   let pg: postgres.Sql;
@@ -84,11 +85,12 @@ d('the collab store behind the ingress guard (#781)', () => {
     const handlers = new CollaborationHandler().getHandlers(hocuspocus);
     const connect = async (token: string, sock = new FakeSocket()) => {
       if (!sockets.includes(sock)) sockets.push(sock);
-      if (!sock.listenerCount('message')) hocuspocus.handleConnection(sock as never, { headers: {}, url: '/' } as never);
+      if (!sock.listenerCount('message')) sock.connect(hocuspocus);
       sock.deliver(authFrame(token, DOC));
       // The document loads from Postgres: wait for real I/O, not only for the event loop to turn.
       const deadline = Date.now() + 5_000;
-      while (!(hocuspocus.documents.get(DOC) as any)?.connections?.has(sock)) {
+      // Hocuspocus 4.x keys a document's connections by Connection, not by socket.
+      while (!hocuspocus.documents.get(DOC)?.getConnections().some((c) => c.webSocket === (sock as never))) {
         if (Date.now() > deadline) throw new Error(`connection ${token} was not established`);
         await new Promise((r) => setTimeout(r, 5));
       }

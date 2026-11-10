@@ -7,11 +7,14 @@ import { CollabUpdateGuardExtension } from './collab-update-guard.extension';
 import { CollabUpdateGuard } from './update-guard';
 
 /**
- * #781 wiring fitness (ADR 0036). Hocuspocus 3.4.4 runs `beforeHandleMessage` hooks as one promise chain per frame and
- * applies the frame when the chain resolves. Frames therefore apply in the order they arrived ONLY while every frame's
- * chain has the same length and no hook awaits anything; the guard's shadow replica is exact only under that order.
- * So: the guard is the FIRST extension, it is the ONLY `beforeHandleMessage` in the server, and it never returns a
- * promise (it returns undefined or throws synchronously).
+ * #781 wiring fitness (ADR 0036). Hocuspocus 4.7.1 handles one frame at a time per connection: it awaits the
+ * `beforeHandleMessage` hooks (one promise chain), then applies the frame, and the apply itself first awaits the
+ * `beforeSync` hooks (Sync frames) or the `beforeHandleAwareness` hooks (awareness frames). Frames of different
+ * connections interleave, so they apply in the order the guard checked them ONLY while every frame's path from check to
+ * apply has the same length and no hook on it awaits anything; the guard's shadow replica is exact only under that
+ * order. So: the guard is the FIRST extension, it is the ONLY `beforeHandleMessage` in the server, it never returns a
+ * promise (it returns undefined or throws synchronously), and no server source defines a `beforeSync` or
+ * `beforeHandleAwareness` hook (#790: either would sit on that path).
  */
 const SRC = join(__dirname, '..', '..');
 const posix = (p: string) => p.split(sep).join('/');
@@ -26,6 +29,23 @@ function sources(dir: string, out: string[] = []): string[] {
   return out;
 }
 const parse = (file: string) => ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true);
+
+/** True when `sf` defines a hook named `name`: a method, an object-literal property or a class property. */
+function definesHook(sf: ts.SourceFile, name: string): boolean {
+  let found = false;
+  const visit = (n: ts.Node) => {
+    const named =
+      (ts.isMethodDeclaration(n) || ts.isPropertyAssignment(n) || ts.isPropertyDeclaration(n) || ts.isMethodSignature(n) || ts.isShorthandPropertyAssignment(n)) &&
+      n.name.getText() === name;
+    if (named) found = true;
+    ts.forEachChild(n, visit);
+  };
+  visit(sf);
+  return found;
+}
+/** Every server source (specs and testkits excluded) that defines a hook named `name`. */
+const definersOf = (name: string): string[] =>
+  [...new Set(sources(SRC).filter((file) => definesHook(parse(file), name)).map((file) => posix(relative(SRC, file))))];
 
 describe('#781 the collab update guard is wired first, alone and synchronous', () => {
   it('the gateway constructs Hocuspocus with the guard extension FIRST in `extensions`', () => {
@@ -53,18 +73,31 @@ describe('#781 the collab update guard is wired first, alone and synchronous', (
   });
 
   it('no other server source defines a beforeHandleMessage hook', () => {
-    const definers: string[] = [];
-    for (const file of sources(SRC)) {
-      const sf = parse(file);
-      const visit = (n: ts.Node) => {
-        const named = (ts.isMethodDeclaration(n) || ts.isPropertyAssignment(n) || ts.isPropertyDeclaration(n) || ts.isMethodSignature(n)) && n.name.getText() === 'beforeHandleMessage';
-        if (named) definers.push(posix(relative(SRC, file)));
-        ts.forEachChild(n, visit);
-      };
-      visit(sf);
+    // anti-vacuity: the scan sees the guard itself
+    expect(definersOf('beforeHandleMessage')).toEqual(['authz/collab-ingress/collab-update-guard.extension.ts']);
+  });
+
+  it.each(['beforeSync', 'beforeHandleAwareness'])(
+    'no server source defines a %s hook (Hocuspocus 4.7.1 awaits it between the guard and the apply)',
+    (hook) => {
+      expect(definersOf(hook)).toEqual([]);
+    },
+  );
+
+  it('the hook scan detects every way an extension can define a hook (anti-vacuity for the empty lists above)', () => {
+    const shapes = [
+      'class E { beforeSync() {} }',
+      'class E { async beforeSync(p) {} }',
+      'class E { beforeSync = () => undefined; }',
+      'const e = { beforeSync() {} };',
+      'const e = { beforeSync: () => undefined };',
+      'const beforeSync = () => undefined; const e = { beforeSync };',
+    ];
+    for (const text of shapes) {
+      const sf = ts.createSourceFile('x.ts', text, ts.ScriptTarget.Latest, true);
+      expect([text, definesHook(sf, 'beforeSync')]).toEqual([text, true]);
     }
-    expect(definers.length).toBeGreaterThan(0); // anti-vacuity: the scan saw the guard
-    expect([...new Set(definers)]).toEqual(['authz/collab-ingress/collab-update-guard.extension.ts']);
+    expect(definesHook(ts.createSourceFile('x.ts', 'const beforeSyncNot = 1; call(beforeSync);', ts.ScriptTarget.Latest, true), 'beforeSync')).toBe(false);
   });
 
   it('its hook is not async, and returns undefined (never a promise) for every kind of frame', () => {

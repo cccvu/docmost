@@ -12,17 +12,31 @@ import {
   readServerFrame,
   RemoteClient,
   renderLikeABrowser,
+  step1Frame,
   SYNC,
   syncFrame,
+  typedFrame,
 } from './collab-ingress.testkit';
+import * as encoding from 'lib0/encoding';
 import { CollabUpdateGuardExtension } from './collab-update-guard.extension';
-import { COLLAB_REFUSAL_CODE, CollabUpdateGuard, SOCKET_REFUSAL_BUDGET, UNRESOLVED_REASON, type CollabGuardMode } from './update-guard';
+import {
+  AWARENESS_STATE_MAX_BYTES,
+  COLLAB_REFUSAL_CODE,
+  CollabUpdateGuard,
+  SOCKET_REFUSAL_BUDGET,
+  SYNC_BURST,
+  TRY_LATER_REASON,
+  UNRESOLVED_REASON,
+  type CollabGuardMode,
+} from './update-guard';
 
 /**
- * #781 (ADR 0036) through a REAL Hocuspocus 3.4.4: its ClientConnection queueing, its hook chain (the guard is a hook in
- * a promise chain, so every frame's chain must stay the same length for frames to apply in FIFO order), its
- * `Connection.close` on a hook rejection (a document-level CLOSE carrying our reason; the websocket stays up), and its
- * apply path. Frames are delivered the way `ws` does for one TCP chunk: synchronously, back to back.
+ * #781 (ADR 0036) through a REAL Hocuspocus 4.7.1: its ClientConnection queueing, its per-connection message queue
+ * (one frame at a time per connection; frames of different connections interleave), its hook chain (the guard is a hook
+ * in a promise chain, so every frame's check-to-apply path must stay the same length for frames to apply in the order
+ * they were checked), its `Connection.close` on a hook rejection (a document-level CLOSE carrying our reason; the
+ * websocket stays up), and its apply path. Frames are delivered the way `ws` does for one TCP chunk: synchronously,
+ * back to back, each handed to the `ClientConnection` as the gateway does.
  */
 const REFUSED = (rule: string) => `ccc:collab-update-refused:${rule}`;
 const SEED = {
@@ -47,7 +61,7 @@ const settle = async () => {
 const open: Hocuspocus[] = [];
 const sockets: FakeSocket[] = [];
 
-/** `guard: false` is the control arm: the same server with no guard. `refuseOnly` is a naive guard with no state. */
+/** `guard: 'none'` is the control arm: the same server with no guard. `refuse-unknown-mark` is a naive guard with no state. */
 async function server(opts: { guard?: 'real' | 'none' | 'refuse-unknown-mark'; mode?: CollabGuardMode } = {}) {
   const logs: string[] = [];
   const guard = new CollabUpdateGuard({ mode: opts.mode ?? 'enforce', logger: { warn: (m: string) => logs.push(m) } });
@@ -55,7 +69,7 @@ async function server(opts: { guard?: 'real' | 'none' | 'refuse-unknown-mark'; m
   const extensions: any[] = [];
   if ((opts.guard ?? 'real') === 'real') extensions.push(new CollabUpdateGuardExtension(guard));
   if (opts.guard === 'refuse-unknown-mark') {
-    // What Hocuspocus does with a stateless guard: it refuses the one frame and keeps applying the rest of the burst.
+    // A stateless guard: it refuses the one frame and remembers nothing (3.4.4 then applied the rest of the burst).
     extensions.push({
       beforeHandleMessage({ update }: { update: Uint8Array }) {
         if (Buffer.from(update).includes(Buffer.from('evilMark'))) throw { code: 4422, reason: REFUSED('unknown-mark') };
@@ -82,7 +96,7 @@ async function server(opts: { guard?: 'real' | 'none' | 'refuse-unknown-mark'; m
   const connect = async (token: string) => {
     const sock = new FakeSocket();
     sockets.push(sock);
-    hp.handleConnection(sock as never, { headers: {}, url: '/' } as never);
+    sock.connect(hp);
     sock.deliver(authFrame(token));
     await settle();
     return sock;
@@ -107,13 +121,17 @@ afterEach(async () => {
   jest.restoreAllMocks();
 });
 
+const sameState = (a: Y.Doc, b: Y.Doc) => Buffer.from(Y.encodeStateVector(a)).equals(Buffer.from(Y.encodeStateVector(b)));
 const textOf = (el: Y.XmlElement): Y.XmlText => el.toArray().find((c) => c instanceof Y.XmlText) as Y.XmlText;
 const badMark = (live: Y.Doc) => new RemoteClient(live).edit(live, (f) => textOf(f.get(0) as Y.XmlElement).format(0, 3, { evilMark: {} }));
 /** Refused in the SHADOW step (not by the stateless pre-pass), so the refusal rebuilds the shadow. */
 const badSchema = (live: Y.Doc) => new RemoteClient(live).edit(live, (f) => (f.get(0) as Y.XmlElement).insert(0, [new Y.XmlElement('paragraph')]));
 
-describe('#781 races through a real Hocuspocus 3.4.4', () => {
-  it('frames sent after a refused one are not applied (Hocuspocus 3.4.4 would apply them after the CLOSE)', async () => {
+describe('#781 races through a real Hocuspocus 4.7.1', () => {
+  // Hocuspocus 3.4.4 applied the frames already queued behind a refused one after its CLOSE, so only a guard that
+  // remembered the refusal (`refusedConnections`) stopped them. 4.x (#1123) empties the connection's queue when a hook
+  // throws, so even a stateless guard drops them now: both arms assert that, and the guard keeps its memory as defense.
+  it('frames sent after a refused one are not applied (by Hocuspocus 4.x itself, and by the guard)', async () => {
     for (const arm of ['refuse-unknown-mark', 'real'] as const) {
       const s = await server({ guard: arm });
       const sock = await s.connect('attacker');
@@ -125,15 +143,14 @@ describe('#781 races through a real Hocuspocus 3.4.4', () => {
       expect(sock.closeReasons()).toEqual([REFUSED('unknown-mark')]);
       const text = renderLikeABrowser(live).text;
       expect(text).toContain('A ');
-      if (arm === 'refuse-unknown-mark') expect(text).toContain('C '); // control: applied after the CLOSE
-      else expect(text).not.toContain('C ');
+      expect(text).not.toContain('C '); // control too: 4.x drops the refused connection's queued frames
     }
   });
 
   it('burst [A ok, B bad] + [C reusing A\'s ids, D formatting them]: the rebuild after B keeps in-flight A, so D is refused', async () => {
     for (const arm of ['none', 'real'] as const) {
       const s = await server({ guard: arm });
-      await s.connect('peer'); // keeps the document loaded after both attacker sessions are closed
+      const peerSock = await s.connect('peer'); // keeps the document loaded after both attacker sessions are closed
       const one = await s.connect('attacker');
       const two = await s.connect('attacker2');
       const live = s.live();
@@ -169,6 +186,11 @@ describe('#781 races through a real Hocuspocus 3.4.4', () => {
       expect(two.closeReasons()).toEqual([REFUSED('schema')]);
       expect(renderLikeABrowser(live)).toMatchObject({ deleted: false, threw: false });
       expect(renderLikeABrowser(live).text).toContain('code');
+      // #790: a refusal no longer rebuilds the shadow (it still holds D); the next frame rebuilds it from live and passes.
+      expect(sameState(s.guard.shadowOf(live)!, live)).toBe(false);
+      peerSock.deliver(syncFrame(new RemoteClient(live).edit(live, (f) => textOf(f.get(1) as Y.XmlElement).insert(0, 'peer '))));
+      await settle();
+      expect(peerSock.closeReasons()).toEqual([]);
       expect(contentOf(s.guard.shadowOf(live)!)).toEqual(contentOf(live));
     }
   });
@@ -237,6 +259,7 @@ describe('#781 races through a real Hocuspocus 3.4.4', () => {
     Object.defineProperty(shadow, 'store', { get: () => { throw new Error('mirror boom'); } });
     const received = updatesReceived(peer);
     live.transact(() => textOf(live.getXmlFragment('default').get(0) as Y.XmlElement).insert(0, 'server1 '));
+    await settle(); // 4.x merges one event-loop turn's updates into one broadcast (flushDelay 0): one per turn here
     live.transact(() => textOf(live.getXmlFragment('default').get(0) as Y.XmlElement).insert(0, 'server2 '));
     await settle();
     expect(updatesReceived(peer)).toBe(received + 2);
@@ -285,5 +308,124 @@ describe('#781 B4 through Hocuspocus: client ids bind to users', () => {
     victim.deliver(syncFrame(mine.edit(live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'AGAIN '))));
     await settle();
     expect(renderLikeABrowser(live).text).toContain('AGAIN MINE victim text');
+  });
+});
+
+describe('#790 frame bounds through a real Hocuspocus 4.7.1', () => {
+  const errors = () => (console.error as jest.Mock).mock.calls.length;
+  const BURST = 5;
+
+  it.each([
+    ['an Auth frame on an established session (a non-Token subtype: 4.7.1 logs it)', () => authFrame('attacker', DOC_NAME, 1), 'auth'],
+    ['a type 4.7.1 handles only server-to-client (SyncStatus)', () => typedFrame(MSG.SyncStatus, (e) => encoding.writeVarInt(e, 1)), 'message-type'],
+    ['an unknown type', () => typedFrame(42), 'message-type'],
+  ])('%s: refused with ONE Hocuspocus log line, where the control logs one per frame and stays up', async (_name, make, rule) => {
+    for (const arm of ['none', 'real'] as const) {
+      const s = await server({ guard: arm });
+      const sock = await s.connect('attacker');
+      const before = errors();
+      sock.deliver(...Array.from({ length: BURST }, make));
+      await settle();
+      if (arm === 'none') {
+        expect(errors() - before).toBe(BURST);
+        expect(sock.closeReasons()).toEqual([]);
+        continue;
+      }
+      expect(errors() - before).toBe(1); // Connection.processMessages's "closing connection … because of exception"
+      expect(sock.closeReasons()).toEqual([REFUSED(rule)]);
+    }
+  });
+
+  it('a Token-subtype Auth on an established session (4.7.1 re-runs onTokenSync for it) is refused auth', async () => {
+    const s = await server();
+    const sock = await s.connect('attacker');
+    sock.deliver(authFrame('attacker'));
+    await settle();
+    expect(sock.closeReasons()).toEqual([REFUSED('auth')]);
+  });
+
+  it(`a SyncStep1 flood past ${SYNC_BURST} closes the SOCKET 1013 and sends no refusal (the editor retries); so does a reader's Step2 flood`, async () => {
+    const s = await server();
+    const writer = await s.connect('attacker');
+    writer.deliver(...Array.from({ length: SYNC_BURST + 5 }, () => step1Frame(new Y.Doc())));
+    await settle();
+    expect(writer.closed).toEqual({ code: 1013, reason: TRY_LATER_REASON });
+    expect(writer.closeReasons()).toEqual([]); // no document CLOSE: a 4422 reason would detach the editor for good
+    const again = await s.connect('attacker'); // a reconnect gets no fresh budget
+    again.deliver(step1Frame(new Y.Doc()));
+    await settle();
+    expect(again.closed).toEqual({ code: 1013, reason: TRY_LATER_REASON });
+    const reader = await s.connect('reader');
+    const step2 = syncFrame(Y.encodeStateAsUpdate(s.live()), SYNC.Step2);
+    reader.deliver(step1Frame(s.live()), ...Array.from({ length: SYNC_BURST }, () => step2));
+    await settle();
+    expect(reader.closed).toEqual({ code: 1013, reason: TRY_LATER_REASON });
+    expect(reader.closeReasons()).toEqual([]);
+  });
+
+  it('an honest open passes for a writer and a reader: Step1, Step2, awareness, then updates', async () => {
+    const s = await server();
+    for (const who of ['victim', 'reader']) {
+      const sock = await s.connect(who);
+      const client = new RemoteClient(s.live());
+      sock.deliver(
+        step1Frame(client.doc),
+        syncFrame(client.edit(s.live(), (f) => textOf(f.get(1) as Y.XmlElement).insert(0, `${who} `)), SYNC.Step2),
+        awarenessFrame([{ clientID: client.doc.clientID, state: { user: { name: who } } }]),
+      );
+      for (let i = 0; i < 3 * SYNC_BURST; i++) sock.deliver(syncFrame(client.edit(s.live(), (f) => textOf(f.get(1) as Y.XmlElement).insert(0, `${i}`))));
+      await settle();
+      expect(sock.closeReasons()).toEqual([]);
+    }
+  });
+
+  it('a reader\'s oversized awareness state is refused before Hocuspocus parses and relays it (the control relays it)', async () => {
+    for (const arm of ['none', 'real'] as const) {
+      const s = await server({ guard: arm });
+      await s.connect('peer'); // keeps the document loaded after the reader's session is closed
+      const reader = await s.connect('reader');
+      reader.deliver(awarenessFrame([{ clientID: 4040, state: { name: 'x'.repeat(AWARENESS_STATE_MAX_BYTES) } }]));
+      await settle();
+      const relayed = (s.live() as unknown as { awareness: { getStates(): Map<number, unknown> } }).awareness.getStates().has(4040);
+      if (arm === 'none') {
+        expect(relayed).toBe(true);
+        expect(reader.closeReasons()).toEqual([]);
+        continue;
+      }
+      expect(relayed).toBe(false);
+      expect(reader.closeReasons()).toEqual([REFUSED('awareness')]);
+    }
+  });
+
+  it('a refusal leaves the shadow as it is; the next honest frame rebuilds it and passes; bindings stay constant over K refusals', async () => {
+    const s = await server();
+    const peer = await s.connect('peer');
+    const live = s.live();
+    const pc = new RemoteClient(live, 7777);
+    const honest = (t: string) => {
+      pc.sync(live);
+      return syncFrame(pc.edit(live, (f) => textOf(f.get(1) as Y.XmlElement).insert(0, t)));
+    };
+    peer.deliver(honest('p0 '));
+    await settle();
+    const counts: number[] = [];
+    for (let k = 1; k <= 5; k++) {
+      const shadow = s.guard.shadowOf(live)!;
+      expect(shadow).toBeTruthy();
+      const attacker = await s.connect('attacker');
+      attacker.deliver(syncFrame(badSchema(live))); // refused in the shadow step
+      await settle();
+      expect(attacker.closeReasons()).toEqual([REFUSED('schema')]);
+      expect(s.guard.shadowOf(live)).toBe(shadow); // not rebuilt by the refusal
+      expect(sameState(shadow, live)).toBe(false); // it still holds the refused frame
+      peer.deliver(honest(`p${k} `));
+      await settle();
+      expect(peer.closeReasons()).toEqual([]);
+      expect(s.guard.shadowOf(live)).not.toBe(shadow); // rebuilt by the next frame that needed it
+      expect(contentOf(s.guard.shadowOf(live)!)).toEqual(contentOf(live));
+      expect(renderLikeABrowser(live).text).toContain(`p${k} `);
+      counts.push(s.guard.bindingCount(live));
+    }
+    expect(new Set(counts)).toEqual(new Set([counts[0]]));
   });
 });

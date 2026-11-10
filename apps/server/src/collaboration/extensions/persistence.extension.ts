@@ -104,8 +104,8 @@ export class PersistenceExtension implements Extension {
     }
 
     // CCC #731 (UPSTREAM_MODIFICATIONS.md #122): fill Hocuspocus's own `document` and return nothing. A returned
-    // doc is re-encoded and re-applied by Hocuspocus 3.4.4 (one more page-sized encode + apply per load); a hook
-    // that returns nothing skips that step, and nothing is listening to the document yet.
+    // doc other than `document` is re-encoded and re-applied by Hocuspocus (one more page-sized encode + apply per
+    // load); a hook that returns nothing skips that step, and nothing is listening to the document yet.
     if (page.ydoc) {
       this.logger.debug(`ydoc loaded from db: ${pageId}`);
 
@@ -134,11 +134,11 @@ export class PersistenceExtension implements Extension {
   }
 
   async onStoreDocument(data: onStoreDocumentPayload) {
-    const { documentName, document, context } = data;
+    const { documentName, document, lastContext } = data;
 
     // CCC #731: nothing ran on the document since its last successful store (a content write's `disconnect()`
-    // store after its `transact()` store) — nothing to persist. Before consuming the contributors, which stay for
-    // the next real store. Never throws.
+    // store after the store that follows its transaction) — nothing to persist. Before consuming the contributors,
+    // which stay for the next real store. Never throws.
     if (isStoreCurrent(document)) return;
 
     const pageId = getPageId(documentName);
@@ -242,7 +242,7 @@ export class PersistenceExtension implements Extension {
             content: tiptapJson,
             textContent: textContent,
             ydoc: ydocState,
-            lastUpdatedById: context.user.id,
+            lastUpdatedById: lastContext.user.id,
             contributorIds: contributorIds,
           },
           pageId,
@@ -299,12 +299,12 @@ export class PersistenceExtension implements Extension {
               JSON.stringify({
                 type: 'page.updated',
                 updatedAt: new Date().toISOString(),
-                lastUpdatedById: context?.user?.id,
-                lastUpdatedBy: context?.user
+                lastUpdatedById: lastContext?.user?.id,
+                lastUpdatedBy: lastContext?.user
                   ? {
-                      id: context.user?.id,
-                      name: context.user?.name,
-                      avatarUrl: context.user?.avatarUrl,
+                      id: lastContext.user?.id,
+                      name: lastContext.user?.name,
+                      avatarUrl: lastContext.user?.avatarUrl,
                     }
                   : undefined,
               }),
@@ -392,6 +392,10 @@ export class PersistenceExtension implements Extension {
 
   async onChange(data: onChangePayload) {
     const documentName = data.documentName;
+    // CCC #790 (UPSTREAM_MODIFICATIONS.md #122): only a websocket editor is a contributor, as under Hocuspocus 3.4.4.
+    // 4.x also hands a direct connection's context to onChange (its `transact` origin carries it), which would make
+    // every /v1, MCP and comment-mark writer a contributor.
+    if ((data.transactionOrigin as { source?: unknown } | null)?.source !== 'connection') return;
     const userId = data.context?.user?.id;
 
     if (!userId) return;

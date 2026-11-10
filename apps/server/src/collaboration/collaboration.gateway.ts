@@ -15,11 +15,13 @@ import {
   RedisSyncExtension,
   SerializedHTTPRequest,
 } from './extensions/redis-sync';
+import { toWebRequest } from './extensions/redis-sync/redis-sync.types';
 import { WsSocketWrapper } from './extensions/redis-sync/ws-socket-wrapper';
 import RedisClient from 'ioredis';
 import { pack, unpack } from 'msgpackr';
 import { nanoid } from 'nanoid';
 import * as os from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { CollabWsAdapter } from './adapter/collab-ws.adapter';
 import {
   CollaborationHandler,
@@ -29,6 +31,11 @@ import {
 // (importless, so it is unit-testable outside the lib0 ESM graph); this method is a thin delegate.
 import { disconnectUserConnections } from '../authz/collab/disconnect-user-connections';
 import { CollabUpdateGuardExtension } from '../authz/collab-ingress/collab-update-guard.extension'; // CCC seam #3 (#781)
+import { keepCollabSocketAlive } from '../authz/collab-ingress/socket-keepalive'; // CCC seam #3 (#790)
+import { COLLAB_HOCUSPOCUS_OPTIONS } from '../authz/collab-ingress/limits'; // CCC seam #3 (#790)
+import { BoundedCollabSocket } from '../authz/collab-ingress/bounded-socket'; // CCC seam #3 (#790)
+import { admitCollabFrame } from '../authz/collab-ingress/frame-address'; // CCC seam #3 (#790)
+import { CollabUserConnectionsExtension } from '../authz/collab-ingress/user-connections'; // CCC seam #3 (#790)
 
 @Injectable()
 export class CollaborationGateway {
@@ -61,8 +68,10 @@ export class CollaborationGateway {
       // "not resident ⇒ row authoritative" invariant holds, and RedisSync releases the doc lock on unload as
       // designed. See UPSTREAM_MODIFICATIONS.md. (Upstream default is true; Docmost had set it to false.)
       unloadImmediately: true,
+      ...COLLAB_HOCUSPOCUS_OPTIONS, // CCC #790: pending documents and the pre-auth queue (authz/collab-ingress/limits)
       extensions: [
         new CollabUpdateGuardExtension(), // CCC #781: refuses a malformed frame before it applies; first, synchronous
+        new CollabUserConnectionsExtension(), // CCC #790: the per-user connection cap (authz/collab-ingress/user-connections)
         this.authenticationExtension,
         this.persistenceExtension,
         this.loggerExtension,
@@ -99,7 +108,9 @@ export class CollaborationGateway {
       method: request.method ?? 'GET',
       url: request.url ?? '/',
       headers: {
-        'sec-websocket-key': request.headers['sec-websocket-key'] ?? '',
+        // CCC #790: RedisSync's socket id rides in this header slot (every RedisSync peer reads it there), and is a
+        // server-made UUID: the client's own header would let one socket name another's connection.
+        'sec-websocket-key': randomUUID(),
         'sec-websocket-protocol':
           request.headers['sec-websocket-protocol'] ?? '',
       },
@@ -112,34 +123,50 @@ export class CollaborationGateway {
       const serializedHTTPRequest = this.serializeRequest(request);
       const socketId = serializedHTTPRequest.headers['sec-websocket-key'];
 
-      // Create wrapper socket that only receives events via emit()
-      // This prevents double-handling since Hocuspocus won't listen to raw WebSocket events
-      const wrappedSocket = new WsSocketWrapper(client);
+      // CCC #790: the outbound bound (authz/collab-ingress/bounded-socket)
+      const wrappedSocket = new BoundedCollabSocket(
+        client,
+        new WsSocketWrapper(client),
+      );
 
       // Route through RedisSync extension (this calls handleConnection internally)
-      this.redisSync.onSocketOpen(wrappedSocket as any, serializedHTTPRequest);
+      const clientConnection = this.redisSync.onSocketOpen(
+        wrappedSocket,
+        serializedHTTPRequest,
+      );
+      // CCC #790: Hocuspocus 4.x sends no pings; ping here and count each pong as activity.
+      keepCollabSocketAlive(client, () => clientConnection.touch());
 
-      // Forward raw WebSocket messages to the extension
       client.on('message', (data: ArrayBuffer) => {
-        this.redisSync!.onSocketMessage(
-          wrappedSocket as any,
-          serializedHTTPRequest,
-          data,
-        );
+        if (!admitCollabFrame(client, data)) return; // CCC #790: `page.<uuid>` only, before RedisSync keys it
+        this.redisSync!.onSocketMessage(serializedHTTPRequest, data);
       });
 
-      // Forward close events
       client.on('close', (code: number, reason: Buffer) => {
-        this.redisSync!.onSocketClose(socketId, code, reason.buffer as ArrayBuffer);
-      });
-
-      // Forward pong events for keepalive
-      client.on('pong', (data: Buffer) => {
-        wrappedSocket.emit('pong', data);
+        this.redisSync!.onSocketClose(
+          socketId,
+          code,
+          new Uint8Array(reason).buffer,
+        );
       });
     } else {
       // Fallback to direct Hocuspocus connection
-      this.hocuspocus.handleConnection(client, request);
+      const clientConnection = this.hocuspocus.handleConnection(
+        new BoundedCollabSocket(client, new WsSocketWrapper(client)), // CCC #790: the outbound bound
+        toWebRequest(this.serializeRequest(request)),
+      );
+
+      client.on('message', (data: Buffer) => {
+        if (!admitCollabFrame(client, data)) return; // CCC #790: `page.<uuid>` only
+        clientConnection.handleMessage(new Uint8Array(data));
+      });
+
+      client.on('close', (code: number, reason: Buffer) => {
+        clientConnection.handleClose({ code, reason: reason.toString() });
+      });
+
+      // CCC #790: Hocuspocus 4.x sends no pings; ping here and count each pong as activity.
+      keepCollabSocketAlive(client, () => clientConnection.touch());
     }
   }
 
@@ -268,6 +295,7 @@ export class CollaborationGateway {
 
         if (this.hocuspocus.getDocumentsCount() === 0) resolve('');
         this.hocuspocus.closeConnections();
+        this.hocuspocus.flushPendingStores();
       } catch (error) {
         console.error(error);
       }

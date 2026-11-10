@@ -10,24 +10,43 @@
  * applied to the shadow inside `Y.transact(shadow, …, origin, local=false)` — what y-protocols does to live — and
  * inspected inside that transaction, before Yjs's cleanup garbage-collects or merges anything: every struct from the
  * transaction's `beforeState` to the store's end, plus `tr.deleteSet`. So Yjs itself resolves parents, origins, splits
- * and pending structs. A refused frame leaves the shadow ahead of live, so the shadow is rebuilt from live plus the
+ * and pending structs. A refused frame leaves the shadow ahead of live, so the next frame rebuilds it from live plus the
  * frames accepted but not yet applied (`inflight`), keeping it an exact image of live's future.
  *
- * Ordering (Hocuspocus 3.4.4): `beforeHandleMessage` hooks run as one promise chain per frame; the frame applies when
- * its chain resolves. Frames apply in arrival order only while every chain has the same length, so this guard is
- * synchronous (returns undefined or throws, never a promise), runs first, and is the only such hook
- * (collab-update-guard.wiring.spec.ts). Accepted frames have applied by the next macrotask: `setImmediate` clears the
- * in-flight list. Hocuspocus 3.4.4 also applies frames that were already in its chain when it CLOSEs a refused
- * connection, so a refused connection's later frames are refused here too.
+ * Ordering (Hocuspocus 4.7.1, `Connection.processMessages` and `MessageReceiver.apply`): each document connection
+ * queues its frames and handles one at a time: it awaits the `beforeHandleMessage` hooks (one promise chain), then the
+ * apply, which first awaits the `beforeSync` hooks (Sync frames) or the `beforeHandleAwareness` hooks (awareness
+ * frames). So one connection's frames are strictly sequential, but frames of DIFFERENT connections interleave, and they
+ * apply in the order this guard checked them only while every frame's path from check to apply has the same length and
+ * waits on nothing but microtasks. Hence this guard is synchronous (returns undefined or throws, never a promise), runs
+ * first, and is the only `beforeHandleMessage`, and the server defines no `beforeSync` or `beforeHandleAwareness` hook
+ * (collab-update-guard.wiring.spec.ts). The in-flight list is still needed for that cross-connection interleaving.
+ * Accepted frames have applied by the next macrotask: `setImmediate` clears the in-flight list. When a hook throws,
+ * 4.x drops the frames that connection had queued (#1123), so a refused connection's later frames never reach here;
+ * the guard still remembers the refusal and refuses any that do, as defense.
+ *
+ * Frame bounds (#790), in the same synchronous check, where Hocuspocus 4.7.1 leaves a gap: a SYNC BUDGET per (user,
+ * document) and per user (a SyncStep1, and a reader's Step2, each make 4.7.1 encode or snapshot the whole document);
+ * AWARENESS bounds for every connection, readers too (each state's size before anything parses it; a budget per (user, document) of
+ * client ids new to the document; and no newer state for a client id bound to another user, so nobody can move
+ * another user's cursor or selection; the name and colour in a state are the client's own say, never checked); and Auth
+ * on an established
+ * session or a message type 4.7.1's MessageReceiver does not handle (each one is otherwise handled without a limit, an
+ * unhandled type with one unrate-limited console.error). The awareness RATE is not here: over-rate awareness frames are
+ * dropped at the gateway (frame-address.ts), since a refusal here would end an honest editor's session.
  *
  * Refusal = a throw of `{ code: 4422, reason }`: Hocuspocus closes that ONE document session and sends the reason (the
  * websocket stays up). Reasons the client acts on (apps/client features/editor-ux): `ccc:collab-update-refused:<rule>`
  * (stop sending, read-only, notice) and `ccc:collab-update-unresolved` (reconnect once). A socket whose sessions are
- * refused SOCKET_REFUSAL_BUDGET times is closed outright. `COLLAB_UPDATE_GUARD=report` logs instead of refusing.
+ * refused SOCKET_REFUSAL_BUDGET times is closed outright. An exhausted (user, document) budget is NOT a refusal: the
+ * socket is closed 1013 (`tryLater`), which the editor retries. `COLLAB_UPDATE_GUARD=report` logs instead of either.
  */
 import { Logger } from '@nestjs/common';
 import * as decoding from 'lib0/decoding';
+import { decodeUtf8 } from 'lib0/string';
 import * as Y from 'yjs';
+import { COLLAB_CONNECTIONS_PER_USER } from './limits';
+import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
 import {
   checkAttribute,
   checkElement,
@@ -50,12 +69,61 @@ export const UNRESOLVED_REASON = 'ccc:collab-update-unresolved';
 export const SOCKET_REFUSAL_BUDGET = 3;
 /** An honest connection announces one client id (two after Yjs regenerates one); this only bounds memory. */
 const AWARENESS_BINDS_PER_CONNECTION = 32;
+/**
+ * Awareness-sourced binds per user per document, across that user's connections: past it awareness stops binding that
+ * user's ids (never a refusal). Per user, so one writer cannot use up the binds every other user's ids need. An honest
+ * user binds one id per editor they open on the page while it stays loaded (each page mount is a fresh Y.Doc).
+ */
+export const AWARENESS_BINDS_PER_USER = 256;
+/**
+ * #790 budgets per (user, document), kept across that user's connections and reconnects (a per-connection budget
+ * refilled on every reconnect, so only the 1/s auth rate bounded it). Exhausting one closes the SOCKET with 1013 (Try
+ * Again Later), which the editor treats as an ordinary close and retries with the provider's backoff: never a 4422
+ * refusal, which detaches the editor for good.
+ *
+ * Sync: SyncStep1 (Sync or SyncReply) and a read-only connection's Step2, each of which makes 4.7.1 encode or snapshot
+ * the whole document. An honest provider sends one Step1 per open (HocuspocusProvider.onOpen; Docmost sets no
+ * `forceSyncInterval`), and a reader one Step2 per open. The burst is two per connection of the per-user connection cap
+ * (limits.ts), so all of a user's tabs on one page reconnecting at once after a deploy pass; then one per
+ * SYNC_REFILL_MS (an editor reopened every 4 s, all day).
+ */
+export const SYNC_BURST = 2 * COLLAB_CONNECTIONS_PER_USER;
+export const SYNC_REFILL_MS = 4_000;
+/**
+ * #790: the same sync frames per USER across all documents, charged together with the per-(user, document) budget, so
+ * that opening a new page (a fresh per-document budget) does not buy another burst: the same burst (all 32 tabs
+ * reconnecting after a deploy, each on its own page, pass), then one per USER_SYNC_REFILL_MS.
+ */
+export const USER_SYNC_BURST = 2 * COLLAB_CONNECTIONS_PER_USER;
+export const USER_SYNC_REFILL_MS = 1_000;
+/** #790: one awareness state's JSON, in UTF-8 bytes (an honest state is a user name, a colour and a cursor). */
+export const AWARENESS_STATE_MAX_BYTES = 8 * 1024;
+/**
+ * #790: client ids new to the document's awareness (`awareness.meta`, which y-protocols never prunes while the document
+ * is loaded; a removal of an unknown id adds one too), per (user, document) as above. An honest page mount adds one (two
+ * if Yjs regenerates its id); the burst covers every tab of the per-user cap twice, then one per
+ * AWARENESS_NEW_IDS_REFILL_MS.
+ */
+export const AWARENESS_NEW_IDS_BURST = 2 * COLLAB_CONNECTIONS_PER_USER;
+export const AWARENESS_NEW_IDS_REFILL_MS = 4_000;
+/** (user, document) budgets kept in this process; past it the least recently used is dropped (a fresh budget). */
+export const USER_DOC_BUDGETS_MAX = 10_000;
+/** #790: the socket close for an exhausted budget: 1013 (RFC 6455 Try Again Later), retried by the provider. */
+export const COLLAB_TRY_LATER_CODE = 1013;
+export const TRY_LATER_REASON = 'ccc:collab-try-later';
 const LOGS_PER_MINUTE = 30;
 
 export const reasonFor = (rule: CollabRule): string => (rule === 'unresolved' ? UNRESOLVED_REASON : REFUSED_REASON_PREFIX + rule);
 
-/** Hocuspocus 3.4.4 MessageType values and y-protocols sync subtypes. */
-const MESSAGE = { Sync: 0, Awareness: 1, SyncReply: 4, Stateless: 5, BroadcastStateless: 6 } as const;
+/** Hocuspocus 4.7.1 MessageType values and y-protocols sync subtypes. */
+const MESSAGE = { Sync: 0, Awareness: 1, Auth: 2, QueryAwareness: 3, SyncReply: 4, Stateless: 5, BroadcastStateless: 6, Close: 7 } as const;
+/**
+ * The client message types 4.7.1's `MessageReceiver.apply` handles and an honest provider may send on an established
+ * session (Stateless is refused on its own rule above, Auth on an established session on `auth`). Anything else falls
+ * to its `default:` branch: one unrate-limited console.error per frame, and the session stays up.
+ */
+const HANDLED = new Set<number>([MESSAGE.Sync, MESSAGE.Awareness, MESSAGE.QueryAwareness, MESSAGE.SyncReply, MESSAGE.Close]);
+const STEP1 = 0;
 const STEP2 = 1;
 const UPDATE = 2;
 /** The binding owner of the server's own client ids (live's, the shadow's): never a user id. */
@@ -79,6 +147,8 @@ export interface GuardFrame {
   context?: { user?: { id?: string } };
 }
 type Header = { type: number; subtype?: number; payload?: Uint8Array | null };
+/** One awareness entry, its state still the undecoded UTF-8 JSON. */
+type AwarenessEntry = { clientID: number; clock: number; state: Uint8Array };
 type ShadowResult = { violation: Violation | null; binds: Map<number, string>; applied: boolean };
 type Ranges = Map<number, Array<[number, number]>>;
 
@@ -96,20 +166,34 @@ class DocGuard {
   readonly inflight: Uint8Array[] = [];
   flushScheduled = false;
   readonly awarenessBinds = new WeakMap<object, number>();
+  /** Awareness-sourced binds on this document per user, across that user's connections (AWARENESS_BINDS_PER_USER). */
+  readonly awarenessBindsByUser = new Map<string, number>();
+  /** The client id bound to SERVER for the current shadow: unbound again when a rebuild replaces that shadow. */
+  shadowBinding: number | null = null;
   constructor(readonly live: Y.Doc & { name?: string }) {}
 }
+
+type Bucket = { tokens: number; at: number };
+type UserDocBudget = { sync: Bucket; ids: Bucket };
 
 export class CollabUpdateGuard {
   private readonly docs = new WeakMap<Y.Doc, DocGuard>();
   private readonly refusedConnections = new WeakMap<object, string>();
   private readonly socketRefusals = new WeakMap<object, number>();
+  /** #790: per (user, document) budgets, least recently used first; and per connection, the ids it already paid for. */
+  private readonly userDocBudgets = new Map<string, UserDocBudget>();
+  private readonly awarenessNewIds = new WeakMap<object, Set<number>>();
   private readonly mode: CollabGuardMode;
   private readonly logger: GuardLogger;
+  private readonly limitLog: SocketLimitLog;
+  private readonly now: () => number;
   private logWindow = { start: 0, count: 0, suppressed: 0 };
 
-  constructor(opts: { mode?: CollabGuardMode; logger?: GuardLogger } = {}) {
+  constructor(opts: { mode?: CollabGuardMode; logger?: GuardLogger; limitLog?: SocketLimitLog; now?: () => number } = {}) {
     this.mode = opts.mode ?? COLLAB_UPDATE_GUARD_MODE;
     this.logger = opts.logger ?? new Logger('CollabUpdateGuard');
+    this.limitLog = opts.limitLog ?? collabSocketLimitLog;
+    this.now = opts.now ?? Date.now;
   }
 
   /** Synchronous: returns undefined (apply the frame) or throws `{ code, reason }` (refuse it). Never a promise. */
@@ -121,14 +205,39 @@ export class CollabUpdateGuard {
     if (header.type === MESSAGE.Stateless || header.type === MESSAGE.BroadcastStateless) {
       return this.refuse(frame, header, { rule: 'stateless' }); // nothing in Docmost sends one; a broadcast reaches every peer
     }
+    // Only an established session's frames reach this hook (Hocuspocus consumes the Auth that establishes it): a second
+    // Auth re-runs onTokenSync, or logs, per frame. An honest provider authenticates once per open.
+    if (header.type === MESSAGE.Auth) return this.refuse(frame, header, { rule: 'auth' });
+    if (!HANDLED.has(header.type)) return this.refuse(frame, header, { rule: 'message-type' });
     if (header.type === MESSAGE.Awareness) {
+      if (!header.payload) return; // malformed: Hocuspocus refuses it itself
+      const checked = this.checkAwareness(frame, header.payload);
+      if (checked.violation) this.refuse(frame, header, checked.violation); // throws unless report mode
+      if (checked.fresh.size) {
+        const budget = this.budgetFor(frame);
+        if (!this.take(budget.ids, AWARENESS_NEW_IDS_BURST, AWARENESS_NEW_IDS_REFILL_MS, checked.fresh.size)) {
+          this.tryLater(frame, 'user_awareness_ids'); // throws unless report mode
+        }
+        const introduced = this.awarenessNewIds.get(frame.connection) ?? new Set<number>();
+        for (const id of checked.fresh) introduced.add(id);
+        this.awarenessNewIds.set(frame.connection, introduced);
+      }
       // Hocuspocus relays a reader's awareness too, so only a writer's binds: a reader could otherwise claim a writer's id.
-      if (!frame.connection.readOnly && header.payload) this.bindFromAwareness(this.docFor(frame.document), frame, header.payload);
+      if (!frame.connection.readOnly && checked.entries) this.bindFromAwareness(this.docFor(frame.document), frame, checked.entries);
       return;
     }
     if (header.type !== MESSAGE.Sync && header.type !== MESSAGE.SyncReply) return;
-    if (header.subtype !== STEP2 && header.subtype !== UPDATE) return; // Step1 applies nothing
-    if (frame.connection.readOnly) return; // Hocuspocus never applies a read-only connection's update
+    // A Step1 makes Hocuspocus encode the whole document (its Step2 answer); a reader's Step2 makes it snapshot it.
+    if (header.subtype === STEP1 || (header.subtype === STEP2 && frame.connection.readOnly)) {
+      const ok = this.takeBoth(
+        [this.budgetFor(frame, true).sync, USER_SYNC_BURST, USER_SYNC_REFILL_MS],
+        [this.budgetFor(frame).sync, SYNC_BURST, SYNC_REFILL_MS],
+      );
+      if (!ok) this.tryLater(frame, 'user_sync_budget');
+      return;
+    }
+    if (header.subtype !== STEP2 && header.subtype !== UPDATE) return; // Hocuspocus refuses an unknown subtype itself
+    if (frame.connection.readOnly) return; // Hocuspocus never applies a read-only connection's update (it only nacks it)
     if (!header.payload) return this.refuse(frame, header, { rule: 'undecodable' });
     this.inspect(frame, header, header.payload);
   }
@@ -136,6 +245,120 @@ export class CollabUpdateGuard {
   /** The shadow replica of `live` (specs and diagnostics). */
   shadowOf(live: Y.Doc): Y.Doc | null {
     return this.docs.get(live)?.shadow ?? null;
+  }
+
+  /** How many client ids are bound on `live` (specs and diagnostics). */
+  bindingCount(live: Y.Doc): number {
+    return this.docs.get(live)?.bindings.size ?? 0;
+  }
+
+  /** How many (user, document) budgets are kept (specs and diagnostics). */
+  budgetCount(): number {
+    return this.userDocBudgets.size;
+  }
+
+  /** The (user, document) budget of this frame's connection, made most recently used; the least recent past the cap goes. */
+  private budgetFor(frame: GuardFrame, wholeUser = false): UserDocBudget {
+    const user = String(frame.context?.user?.id ?? '');
+    const key = wholeUser ? `${user}\u0001` : `${user}\u0000${frame.document.name ?? ''}`;
+    const at = this.now();
+    let budget = this.userDocBudgets.get(key);
+    if (budget) this.userDocBudgets.delete(key);
+    else budget = { sync: { tokens: wholeUser ? USER_SYNC_BURST : SYNC_BURST, at }, ids: { tokens: AWARENESS_NEW_IDS_BURST, at } };
+    this.userDocBudgets.set(key, budget);
+    if (this.userDocBudgets.size > USER_DOC_BUDGETS_MAX) this.userDocBudgets.delete(this.userDocBudgets.keys().next().value!);
+    return budget;
+  }
+
+  /** One token from each bucket, or none from either. */
+  private takeBoth(...buckets: Array<[Bucket, number, number]>): boolean {
+    const now = this.now();
+    for (const [bucket, burst, refillMs] of buckets) {
+      bucket.tokens = Math.min(burst, bucket.tokens + Math.max(0, now - bucket.at) / refillMs);
+      bucket.at = now;
+    }
+    if (buckets.some(([bucket]) => bucket.tokens < 1)) return false;
+    for (const [bucket] of buckets) bucket.tokens -= 1;
+    return true;
+  }
+
+  /** Take `n` tokens from `bucket` (`burst`, refilled one per `refillMs`); false, taking none, when it holds fewer. */
+  private take(bucket: Bucket, burst: number, refillMs: number, n: number): boolean {
+    const now = this.now();
+    bucket.tokens = Math.min(burst, bucket.tokens + Math.max(0, now - bucket.at) / refillMs);
+    bucket.at = now;
+    if (bucket.tokens < n) return false;
+    bucket.tokens -= n;
+    return true;
+  }
+
+  /**
+   * An exhausted (user, document) budget: close the SOCKET with 1013 first (so Hocuspocus's document CLOSE, sent next,
+   * is dropped by the closing socket and the editor sees only a retryable socket close), then throw so this frame and
+   * the ones queued behind it are not applied. Logged `COLLAB_SOCKET_LIMIT`, rate-limited. Report mode only logs.
+   */
+  private tryLater(frame: GuardFrame, limit: string): void {
+    this.limitLog.log(limit, { userId: String(frame.context?.user?.id ?? '') });
+    if (this.mode === 'report') return;
+    try {
+      frame.connection.webSocket?.close(COLLAB_TRY_LATER_CODE, TRY_LATER_REASON);
+    } catch {
+      // already closing
+    }
+    throw { code: COLLAB_TRY_LATER_CODE, reason: TRY_LATER_REASON };
+  }
+
+
+  /**
+   * The awareness bounds, for every connection. Each state's size is read from its length prefix and checked before
+   * anything decodes or parses it (Hocuspocus then JSON.parses every state, twice). Entries per frame are not capped (a
+   * provider's timeout removal can carry the whole room), but a client id twice in one frame is never honest. The ids
+   * the document's awareness has never held (`fresh`, not counting ids this connection already paid for) are charged to
+   * the sender's (user, document) budget by the caller.
+   *
+   * A state for a client id bound to ANOTHER user (by its structs or its own awareness) is refused `foreign-client`:
+   * the sender would replace that user's cursor and selection (and the name and colour shown with them) for every
+   * peer. The name and colour in a sender's OWN state are its own say: nothing checks them. Two kinds of entry about
+   * another user's id are honest and pass: a removal (state `null`: a provider's `timeout` removal of a peer that went
+   * quiet), and an echo at a clock the server already holds (a 3.x provider resending what it was relayed), which
+   * y-protocols ignores anyway.
+   */
+  private checkAwareness(
+    frame: GuardFrame,
+    payload: Uint8Array,
+  ): { violation: Violation | null; entries: AwarenessEntry[] | null; fresh: Set<number> } {
+    const entries: AwarenessEntry[] = [];
+    const meta = frame.document.awareness?.meta;
+    const bindings = this.docs.get(frame.document)?.bindings;
+    const userId = String(frame.context?.user?.id ?? '');
+    const introduced = this.awarenessNewIds.get(frame.connection) ?? new Set<number>();
+    const fresh = new Set<number>();
+    const seen = new Set<number>();
+    const refused = { violation: { rule: 'awareness' } as Violation, entries: null, fresh };
+    try {
+      const d = decoding.createDecoder(payload);
+      const n = decoding.readVarUint(d);
+      for (let i = 0; i < n; i++) {
+        const clientID = decoding.readVarUint(d);
+        const clock = decoding.readVarUint(d);
+        const length = decoding.readVarUint(d); // the state's JSON, in UTF-8 bytes
+        if (length > AWARENESS_STATE_MAX_BYTES || d.pos + length > payload.length) return refused;
+        const state = payload.subarray(d.pos, d.pos + length);
+        d.pos += length;
+        if (seen.has(clientID)) return refused;
+        seen.add(clientID);
+        const owner = bindings?.get(clientID);
+        if (owner !== undefined && owner !== userId && !isNullState(state)) {
+          const held = meta?.get(clientID)?.clock;
+          if (held === undefined || clock > held) return { violation: { rule: 'foreign-client' }, entries: null, fresh };
+        }
+        if (!meta?.has(clientID) && !introduced.has(clientID)) fresh.add(clientID);
+        entries.push({ clientID, clock, state });
+      }
+    } catch {
+      return { violation: null, entries: null, fresh: new Set() }; // malformed: Hocuspocus refuses it itself
+    }
+    return { violation: null, entries, fresh };
   }
 
   private inspect(frame: GuardFrame, header: Header, payload: Uint8Array): void {
@@ -149,7 +372,9 @@ export class CollabUpdateGuard {
     const result = this.applyToShadow(doc, payload, userId);
     violation ??= result.violation;
     if (violation && this.mode === 'enforce') {
-      this.rebuild(doc); // the shadow holds the refused frame; live never will
+      // The shadow holds the refused frame; live never will. Rebuilt lazily by the next frame that needs it (ensureShadow),
+      // so a refuse/reconnect loop pays no rebuild per refusal.
+      doc.dirty = true;
       return this.refuse(frame, header, violation);
     }
     if (violation) this.refuse(frame, header, violation); // report mode: logged, and the frame applies
@@ -294,7 +519,14 @@ export class CollabUpdateGuard {
       for (const frame of doc.inflight) Y.applyUpdate(shadow, frame, MIRROR);
       doc.shadow = shadow;
       doc.dirty = false;
-      if (!doc.bindings.has(shadow.clientID)) doc.bindings.set(shadow.clientID, SERVER);
+      // The replaced shadow is gone, and so is any reason to reserve its client id: one binding per rebuild otherwise.
+      const replaced = doc.shadowBinding;
+      if (replaced !== null && replaced !== live.clientID && doc.bindings.get(replaced) === SERVER) doc.bindings.delete(replaced);
+      doc.shadowBinding = null;
+      if (!doc.bindings.has(shadow.clientID)) {
+        doc.bindings.set(shadow.clientID, SERVER);
+        doc.shadowBinding = shadow.clientID;
+      }
       if (!doc.audited) this.audit(doc, shadow);
       return true;
     } catch {
@@ -369,28 +601,28 @@ export class CollabUpdateGuard {
     });
   }
 
-  private bindFromAwareness(doc: DocGuard, frame: GuardFrame, payload: Uint8Array): void {
+  /** A writer's awareness entries (already within checkAwareness's bounds) bind the client ids they announce. */
+  private bindFromAwareness(doc: DocGuard, frame: GuardFrame, entries: AwarenessEntry[]): void {
     const userId = String(frame.context?.user?.id ?? '');
     try {
-      const d = decoding.createDecoder(payload);
-      const n = decoding.readVarUint(d);
-      for (let i = 0; i < n; i++) {
-        const clientID = decoding.readVarUint(d);
-        const clock = decoding.readVarUint(d);
-        const state = JSON.parse(decoding.readVarString(d));
-        if (state === null || doc.bindings.has(clientID)) continue;
-        // An echo: every provider sends the peer states it receives back to the server. The server already holds this
-        // client's state at this clock (it relayed it), so the echo says nothing about who owns the id: a writer's echo
-        // of a READER's state would otherwise bind the reader's id to the writer, refusing the reader once promoted.
+      for (const { clientID, clock, state } of entries) {
+        if (doc.bindings.has(clientID)) continue;
+        // An echo (a provider's `timeout` removal of a peer, or a 3.x provider resending what it was relayed): the server
+        // already holds this client's state at this clock (it relayed it), so the echo says nothing about who owns the
+        // id: a writer's echo of a READER's state would otherwise bind the reader's id to the writer, refusing the reader
+        // once promoted.
         const held = frame.document.awareness?.meta.get(clientID)?.clock;
         if (held !== undefined && held >= clock) continue;
+        if (JSON.parse(decodeUtf8(state)) === null) continue; // at most AWARENESS_STATE_MAX_BYTES
         const used = doc.awarenessBinds.get(frame.connection) ?? 0;
-        if (used >= AWARENESS_BINDS_PER_CONNECTION) return;
+        const byUser = doc.awarenessBindsByUser.get(userId) ?? 0;
+        if (used >= AWARENESS_BINDS_PER_CONNECTION || byUser >= AWARENESS_BINDS_PER_USER) return;
         doc.bindings.set(clientID, userId);
         doc.awarenessBinds.set(frame.connection, used + 1);
+        doc.awarenessBindsByUser.set(userId, byUser + 1);
       }
     } catch {
-      // a malformed awareness frame: Hocuspocus refuses it itself
+      // a state that is not JSON: Hocuspocus refuses the frame itself
     }
   }
 
@@ -437,6 +669,10 @@ export class CollabUpdateGuard {
     else this.logWindow.suppressed++;
   }
 }
+
+/** The UTF-8 bytes `null`: y-protocols' encoding of a removed state (`JSON.stringify(null)`). */
+const isNullState = (state: Uint8Array): boolean =>
+  state.length === 4 && state[0] === 0x6e && state[1] === 0x75 && state[2] === 0x6c && state[3] === 0x6c;
 
 /** The frame header, decoded exactly as Hocuspocus's MessageReceiver does (one sync message per frame, V1). */
 function readHeader(update: Uint8Array): Header | null {

@@ -15,16 +15,23 @@ import { jwtDecode } from "jwt-decode";
  *     one is live, e.g. the user signed in again); a second refusal with no successful authentication in
  *     between, or a refetch that fails, means access is lost: stop editing and show the connection-lost
  *     status. An expired token refetches every time, as upstream did; a refetch that fails is lost there too
- *     (upstream left that editor editable with nothing syncing);
+ *     (upstream left that editor editable with nothing syncing). #790: a lost editor also closes its socket and
+ *     opens it again after COLLAB_LOST_RETRY_MS, or when the tab becomes visible again, never at the provider's pace;
  *   - a successful authentication → the server's scope decides whether the editor may edit;
  *   - #781: the server's collab ingress guard refuses a frame it will not apply with that same per-document CLOSE,
  *     and the provider reports it as code 1000, so the REASON is the only signal:
  *       - `ccc:collab-update-refused:<rule>` → detach the provider (a refused provider stays attached and keeps
  *         sending), stop editing, show the refusal notice, and never reconnect: this browser's copy would be
- *         replayed and refused again. Final until the page reloads;
+ *         replayed and refused again. Final until the page reloads. #790: close the editor's socket too (each page
+ *         editor has its own); with nothing attached it would otherwise idle, or reconnect every 30 s (the
+ *         provider's message timeout), for as long as the tab stays open. Reload and Discard reload the page, so
+ *         they need no socket;
  *       - `ccc:collab-update-unresolved` → the server could not decide; reconnect ONCE. The retry is spent until
  *         `sync-acked` (every frame this provider sent was applied), NOT until the next authentication, which
  *         happens before the replay is judged; a second one before that is treated as refused.
+ *   - #790: a SOCKET close with code 1009 (the server's ws "message too big": this browser sent a frame over the
+ *     server's maxPayload) is refused too. The provider would reconnect and resend the same frame (its Step2 answer
+ *     to the server's Step1) every second, forever. Only a raw socket close carries a code other than 1000.
  *
  * Pure and dependency-free so it is unit-tested without a provider; page-editor.tsx wires it (seam 169).
  */
@@ -54,9 +61,14 @@ export const initialCollabAccess: CollabAccessState = {
 export const COLLAB_UPDATE_REFUSED_PREFIX = "ccc:collab-update-refused:";
 export const COLLAB_UPDATE_UNRESOLVED = "ccc:collab-update-unresolved";
 
+/** #790: the ws close code for a message over the server's `maxPayload` (RFC 6455 "Message Too Big"). */
+export const WS_CLOSE_MESSAGE_TOO_BIG = 1009;
+
 export function classifyCollabCloseReason(
   reason: string | undefined,
+  code?: number,
 ): "refused" | "unresolved" | "other" {
+  if (code === WS_CLOSE_MESSAGE_TOO_BIG) return "refused";
   if (typeof reason !== "string") return "other";
   if (reason.startsWith(COLLAB_UPDATE_REFUSED_PREFIX)) return "refused";
   if (reason === COLLAB_UPDATE_UNRESOLVED) return "unresolved";
@@ -64,7 +76,13 @@ export function classifyCollabCloseReason(
 }
 
 export type CollabAccessEvent =
-  | { kind: "server-close"; socketConnected: boolean; reason?: string }
+  | {
+      kind: "server-close";
+      socketConnected: boolean;
+      reason?: string;
+      /** #790: the close code (a document CLOSE is always 1000; a raw socket close carries the socket's own). */
+      code?: number;
+    }
   | { kind: "auth-failed"; tokenExpired: boolean }
   | { kind: "refresh-failed" }
   | { kind: "authenticated"; scope: string | undefined }
@@ -81,13 +99,27 @@ export interface CollabAccessStep {
   markDisconnected: boolean;
   /** #781: detach the provider so it stops sending (and keep it detached). */
   detach: boolean;
+  /** #790: close the editor's socket (after a refusal, for good; after a loss, until `retryAfterMs`). */
+  disconnectSocket: boolean;
+  /** #790: lost: try the socket again after this many ms (0: no timer). */
+  retryAfterMs: number;
 }
+
+/**
+ * #790: how long a lost editor waits before it opens its socket again (the tab becoming visible again also reopens it,
+ * page-editor.tsx). The server closes a socket right after refusing its authentication and counts every unauthenticated
+ * socket against a process-wide pool, so a lost editor that kept reconnecting at the provider's pace (about once a
+ * second) would hold a slot of that pool for as long as the tab stayed open.
+ */
+export const COLLAB_LOST_RETRY_MS = 60_000;
 
 const NO_ACTION = {
   reconnect: false,
   refreshToken: false,
   markDisconnected: false,
   detach: false,
+  disconnectSocket: false,
+  retryAfterMs: 0,
 } as const;
 
 export function nextCollabAccess(
@@ -98,7 +130,7 @@ export function nextCollabAccess(
   if (prev.refused) return { state: prev, ...NO_ACTION };
   switch (event.kind) {
     case "server-close": {
-      const reason = classifyCollabCloseReason(event.reason);
+      const reason = classifyCollabCloseReason(event.reason, event.code);
       if (reason === "refused") return refusedStep(prev);
       if (reason === "unresolved") {
         if (prev.unresolvedRetried) return refusedStep(prev);
@@ -143,11 +175,14 @@ export function nextCollabAccess(
   }
 }
 
+/** Access lost: show the connection-lost status, close the socket, and try again in COLLAB_LOST_RETRY_MS (#790). */
 function lostStep(prev: CollabAccessState): CollabAccessStep {
   return {
     ...NO_ACTION,
     state: { ...prev, lost: true },
     markDisconnected: true,
+    disconnectSocket: true,
+    retryAfterMs: COLLAB_LOST_RETRY_MS,
   };
 }
 
@@ -156,7 +191,12 @@ function lostStep(prev: CollabAccessState): CollabAccessStep {
  * untrue (nothing retries); the refusal notice says what happened and offers the recovery.
  */
 function refusedStep(prev: CollabAccessState): CollabAccessStep {
-  return { ...NO_ACTION, state: { ...prev, refused: true }, detach: true };
+  return {
+    ...NO_ACTION,
+    state: { ...prev, refused: true },
+    detach: true,
+    disconnectSocket: true,
+  };
 }
 
 /** The editor may edit only if the page allows it AND the server still lets this connection write. */

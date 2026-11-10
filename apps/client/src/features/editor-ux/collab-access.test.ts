@@ -1,7 +1,11 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  COLLAB_LOST_RETRY_MS,
   COLLAB_UPDATE_REFUSED_PREFIX,
   COLLAB_UPDATE_UNRESOLVED,
+  CollabAccessEvent,
   CollabAccessState,
   classifyCollabCloseReason,
   collabAllowsEditing,
@@ -9,6 +13,7 @@ import {
   initialCollabAccess,
   isCollabTokenExpired,
   nextCollabAccess,
+  WS_CLOSE_MESSAGE_TOO_BIG,
 } from "./collab-access";
 
 /** An unsigned JWT with the given exp (seconds). jwt-decode only decodes. */
@@ -208,6 +213,7 @@ describe("collab update refusal (#781)", () => {
     (rule) => {
       const step = nextCollabAccess(initialCollabAccess, close(refused(rule)));
       expect(step.detach).toBe(true);
+      expect(step.disconnectSocket).toBe(true); // #790: the editor's now-empty socket closes too
       expect(step.reconnect).toBe(false);
       expect(step.refreshToken).toBe(false);
       expect(step.state.refused).toBe(true);
@@ -223,6 +229,7 @@ describe("collab update refusal (#781)", () => {
       close(refused("mark"), false),
     );
     expect(step.detach).toBe(true);
+    expect(step.disconnectSocket).toBe(true); // #790: and stays closed (the socket's own retry stops)
     expect(step.reconnect).toBe(false);
     expect(step.state.refused).toBe(true);
   });
@@ -238,6 +245,7 @@ describe("collab update refusal (#781)", () => {
       expect(step.reconnect).toBe(false);
       expect(step.refreshToken).toBe(false);
       expect(step.detach).toBe(false); // already detached
+      expect(step.disconnectSocket).toBe(false); // already closed
       expect(step.markDisconnected).toBe(false);
       expect(collabAllowsEditing(step.state)).toBe(false);
     }
@@ -350,6 +358,8 @@ describe("collab update refusal (#781)", () => {
         refreshToken: false,
         markDisconnected: false,
         detach: false,
+        disconnectSocket: false,
+        retryAfterMs: 0,
       });
       expect(live.state).toBe(initialCollabAccess);
       const dead = nextCollabAccess(initialCollabAccess, close(reason, false));
@@ -395,5 +405,170 @@ describe("collab token expiry (the refreshed token, not the one captured at moun
     expect(isCollabTokenExpired(stale, now)).toBe(true);
     expect(isCollabTokenExpired(undefined, now)).toBe(true);
     expect(isCollabTokenExpired("not-a-jwt", now)).toBe(true);
+  });
+});
+
+// cccvu/wiki-v2#790 — the server's ws closes a socket whose frame exceeds its maxPayload with 1009. The provider would
+// reconnect and resend the same frame every second, forever, so that close is a refusal like the guard's.
+describe("a socket close with 1009 (a frame over the server's maxPayload) (#790)", () => {
+  const rawClose = (code: number | undefined, reason = "") =>
+    ({ kind: "server-close", socketConnected: false, reason, code }) as const;
+
+  it("is refused: detach, stop editing, the generic notice, never reconnect or refetch", () => {
+    expect(WS_CLOSE_MESSAGE_TOO_BIG).toBe(1009);
+    expect(classifyCollabCloseReason("", 1009)).toBe("refused");
+    for (const step of [
+      nextCollabAccess(initialCollabAccess, rawClose(1009)),
+      nextCollabAccess(initialCollabAccess, rawClose(1009, "Max payload size exceeded")),
+    ]) {
+      expect(step.detach).toBe(true);
+      expect(step.reconnect).toBe(false);
+      expect(step.refreshToken).toBe(false);
+      expect(step.markDisconnected).toBe(false);
+      expect(step.state.refused).toBe(true);
+      expect(collabAllowsEditing(step.state)).toBe(false);
+    }
+  });
+
+  it.each([1000, 1001, 1006, 1011, 4408, 4422, undefined])(
+    "any other raw socket close (%s) stays an ordinary close the provider recovers from",
+    (code) => {
+      expect(classifyCollabCloseReason("", code)).toBe("other");
+      const step = nextCollabAccess(initialCollabAccess, rawClose(code));
+      expect(step).toEqual({
+        state: initialCollabAccess,
+        reconnect: false,
+        refreshToken: false,
+        markDisconnected: false,
+        detach: false,
+        disconnectSocket: false,
+        retryAfterMs: 0,
+      });
+    },
+  );
+
+  // #790 (review S2): the server's per-user budgets close the SOCKET with 1013 (Try Again Later) and the per-user
+  // connection cap closes it with 4429, both with a reason the editor must never read as a refusal: the provider
+  // reconnects with its backoff, and the editor stays editable.
+  it.each([
+    [1013, "ccc:collab-try-later"],
+    [4429, "ccc:collab-user-connections"],
+  ])("a %s socket close (%s) is retried, never refused", (code, reason) => {
+    expect(classifyCollabCloseReason(reason, code)).toBe("other");
+    const step = nextCollabAccess(initialCollabAccess, rawClose(code, reason));
+    expect(step.state.refused).toBe(false);
+    expect(step.detach).toBe(false);
+    expect(step.disconnectSocket).toBe(false); // the provider's own reconnect is left running
+    expect(collabAllowsEditing(step.state)).toBe(true);
+    // the same reason on a per-document CLOSE while the socket is still up reconnects at once
+    const doc = nextCollabAccess(initialCollabAccess, { kind: "server-close", socketConnected: true, reason, code: 1000 });
+    expect(doc.reconnect).toBe(true);
+    expect(doc.state.refused).toBe(false);
+  });
+
+  it("a per-document CLOSE (code 1000) is still judged by its reason alone", () => {
+    expect(
+      nextCollabAccess(initialCollabAccess, {
+        kind: "server-close",
+        socketConnected: true,
+        reason: "Server closed the connection",
+        code: 1000,
+      }).reconnect,
+    ).toBe(true);
+    expect(classifyCollabCloseReason(COLLAB_UPDATE_UNRESOLVED, 1000)).toBe(
+      "unresolved",
+    );
+  });
+});
+
+// cccvu/wiki-v2#790 — only a refusal closes the socket: every other step keeps it (reconnect and token refresh need it).
+describe("disconnectSocket", () => {
+  it("is false for every event that is neither a refusal nor a loss", () => {
+    const events: CollabAccessEvent[] = [
+      { kind: "server-close", socketConnected: true },
+      { kind: "server-close", socketConnected: false, code: 1006 },
+      { kind: "server-close", socketConnected: true, reason: COLLAB_UPDATE_UNRESOLVED },
+      { kind: "auth-failed", tokenExpired: true },
+      { kind: "auth-failed", tokenExpired: false },
+      { kind: "authenticated", scope: "read-write" },
+      { kind: "sync-acked" },
+    ];
+    for (const event of events) {
+      expect([event, nextCollabAccess(initialCollabAccess, event).disconnectSocket]).toEqual([event, false]);
+    }
+  });
+
+  // #790: the server closes a socket right after refusing its authentication and counts every unauthenticated socket
+  // in a process-wide pool. A lost editor that kept reconnecting at the provider's pace (about once a second) would
+  // hold a slot of that pool for as long as the tab stayed open, so a loss closes the socket and retries slowly.
+  it("a loss (a second refusal, or a refetch that fails) closes the socket and retries after COLLAB_LOST_RETRY_MS, never refused", () => {
+    const refetched = nextCollabAccess(initialCollabAccess, { kind: "auth-failed", tokenExpired: false });
+    expect(refetched.disconnectSocket).toBe(false); // the first refusal refetches the token once (#537)
+    for (const step of [
+      nextCollabAccess(refetched.state, { kind: "auth-failed", tokenExpired: false }),
+      nextCollabAccess(initialCollabAccess, { kind: "refresh-failed" }),
+    ]) {
+      expect(step.state.lost).toBe(true);
+      expect(step.state.refused).toBe(false);
+      expect(step.markDisconnected).toBe(true);
+      expect(step.disconnectSocket).toBe(true);
+      expect(step.detach).toBe(false); // the provider stays attached, so a later authentication recovers it
+      expect(step.retryAfterMs).toBe(COLLAB_LOST_RETRY_MS);
+      expect(COLLAB_LOST_RETRY_MS).toBeGreaterThanOrEqual(30_000);
+      // the retry is judged like any other open: a later authentication clears the loss
+      const back = nextCollabAccess(step.state, { kind: "authenticated", scope: "read-write" });
+      expect(collabAllowsEditing(back.state)).toBe(true);
+    }
+    // a refusal on the retry, after the one refetch was spent, is a loss again (no refetch loop)
+    const lost = nextCollabAccess(refetched.state, { kind: "auth-failed", tokenExpired: false });
+    const again = nextCollabAccess(lost.state, { kind: "auth-failed", tokenExpired: false });
+    expect(again.retryAfterMs).toBe(COLLAB_LOST_RETRY_MS);
+    expect(again.refreshToken).toBe(false);
+    // no other step schedules a retry
+    for (const event of [
+      { kind: "server-close", socketConnected: true },
+      { kind: "authenticated", scope: "read-write" },
+      { kind: "sync-acked" },
+    ] as CollabAccessEvent[]) {
+      expect(nextCollabAccess(initialCollabAccess, event).retryAfterMs).toBe(0);
+    }
+  });
+
+  it("is true for a 1009 socket close (a frame over the server's maxPayload)", () => {
+    const step = nextCollabAccess(initialCollabAccess, {
+      kind: "server-close",
+      socketConnected: false,
+      code: WS_CLOSE_MESSAGE_TOO_BIG,
+    });
+    expect(step.disconnectSocket).toBe(true);
+  });
+});
+
+// cccvu/wiki-v2#790 — the wiring in page-editor.tsx (seam 169): the step closes the socket, and nothing reopens it.
+describe("page-editor wiring", () => {
+  const source = readFileSync(
+    join(__dirname, "..", "editor", "page-editor.tsx"),
+    "utf8",
+  );
+  it("a lost editor's retry timer reconnects only while it is still current and still lost, and is cleared on unmount", () => {
+    expect(source).toMatch(/if \(step\.retryAfterMs\) \{[\s\S]*?clearTimeout\(lostRetry\);[\s\S]*?lostRetry = setTimeout\(\(\) => \{\s*if \(isCurrent\(\) && collabAccessRef\.current\.lost\) socket\.connect\(\);\s*\}, step\.retryAfterMs\);/);
+    expect(source).toMatch(/return \(\) => \{\s*clearTimeout\(lostRetry\);/);
+  });
+
+  it("a disconnectSocket step disconnects the editor's socket, after the detach", () => {
+    const detach = source.indexOf("if (step.detach) remote.detach();");
+    const disconnect = source.indexOf(
+      "if (step.disconnectSocket) socket.disconnect();",
+    );
+    expect(detach).toBeGreaterThan(-1);
+    expect(disconnect).toBeGreaterThan(detach);
+  });
+  it("a refused editor is not current (a token refetch in flight cannot reopen) and the visibility effect never reconnects it", () => {
+    expect(source).toMatch(
+      /const isCurrent = \(\) =>\s*providersRef\.current\?\.socket === socket &&\s*!collabAccessRef\.current\.refused;/,
+    );
+    expect(source).toMatch(
+      /if \(!providersReady \|\| !providersRef\.current\) return;\s*if \(collabAccessRef\.current\.refused\) return;/,
+    );
   });
 });

@@ -2,10 +2,12 @@
  * CCC authorization integration — NOT upstream Docmost code (#781, ADR 0036).
  *
  * The Hocuspocus extension that puts the collab update guard (update-guard.ts) in front of every client frame. Its one
- * hook, `beforeHandleMessage`, is the only Hocuspocus 3.4.4 hook that runs before a frame applies (`beforeSync` is not
- * awaited; `onChange` runs after the broadcast). Registered FIRST by the gateway (seam #3) and outranking every other
- * extension, and deliberately synchronous: Hocuspocus chains the hooks of each frame as promises, and frames apply in
- * arrival order only while every frame's chain has the same length. It is the only `beforeHandleMessage` in the server
+ * hook, `beforeHandleMessage`, is the first Hocuspocus 4.7.1 hook a frame meets and the only one every frame meets
+ * before it applies (4.7.1 then awaits `beforeSync` for a Sync frame and `beforeHandleAwareness` for an awareness frame;
+ * `onChange` runs after the apply). Registered FIRST by the gateway (seam #3) and outranking every other extension, and
+ * deliberately synchronous: Hocuspocus chains the hooks of each frame as promises, and frames of different connections
+ * apply in the order they were checked only while every frame's path from check to apply has the same length. It is
+ * the only `beforeHandleMessage` in the server, and no `beforeSync` or `beforeHandleAwareness` hook exists
  * (collab-update-guard.wiring.spec.ts).
  */
 import type { beforeHandleMessagePayload } from '@hocuspocus/server';

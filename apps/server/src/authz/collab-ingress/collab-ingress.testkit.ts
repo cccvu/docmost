@@ -1,7 +1,7 @@
 /**
  * CCC authorization integration — NOT upstream Docmost code (#781, ADR 0036).
  *
- * Shared helpers for the collab-ingress specs: Hocuspocus 3.4.4 wire frames, a remote Yjs client, a peer that renders
+ * Shared helpers for the collab-ingress specs: Hocuspocus 4.7.1 wire frames, a remote Yjs client, a peer that renders
  * with the editor's own binding (@tiptap/y-tiptap 3.0.5, the library every browser runs), and a fixture holding every
  * node and mark of the server schema. NOT a jest suite and not built (`.testkit.ts`, see tsconfig.build.json).
  */
@@ -11,11 +11,12 @@ import * as decoding from 'lib0/decoding';
 import * as Y from 'yjs';
 import { initProseMirrorDoc } from '@tiptap/y-tiptap';
 import { TiptapTransformer } from '@hocuspocus/transformer';
+import type { Hocuspocus } from '@hocuspocus/server';
 import { serverSchema } from '../page-write/prelim-content';
 
 export const DOC_NAME = 'page.00000000-0000-4000-8000-000000000781';
 
-/** Hocuspocus 3.4.4 message types (`types.ts` MessageType) and y-protocols sync subtypes. */
+/** Hocuspocus 4.7.1 message types (`types.ts` MessageType) and y-protocols sync subtypes. */
 export const MSG = { Sync: 0, Awareness: 1, Auth: 2, QueryAwareness: 3, SyncReply: 4, Stateless: 5, BroadcastStateless: 6, Close: 7, SyncStatus: 8 } as const;
 export const SYNC = { Step1: 0, Step2: 1, Update: 2 } as const;
 
@@ -41,11 +42,18 @@ export const step1Frame = (doc: Y.Doc, docName = DOC_NAME): Uint8Array =>
     encoding.writeVarUint8Array(e, Y.encodeStateVector(doc));
   }, docName);
 
-export const authFrame = (token: string, docName = DOC_NAME): Uint8Array =>
+export const authFrame = (token: string, docName = DOC_NAME, authType = 0): Uint8Array =>
   frame((e) => {
     encoding.writeVarUint(e, MSG.Auth);
-    encoding.writeVarUint(e, 0);
+    encoding.writeVarUint(e, authType);
     encoding.writeVarString(e, token);
+  }, docName);
+
+/** A frame of any message type, with an optional body (#790: types Hocuspocus 4.7.1 does not handle from a client). */
+export const typedFrame = (type: number, body: (e: encoding.Encoder) => void = () => undefined, docName = DOC_NAME): Uint8Array =>
+  frame((e) => {
+    encoding.writeVarUint(e, type);
+    body(e);
   }, docName);
 
 export const statelessFrame = (payload: string, type: number = MSG.Stateless, docName = DOC_NAME): Uint8Array =>
@@ -55,7 +63,7 @@ export const statelessFrame = (payload: string, type: number = MSG.Stateless, do
   }, docName);
 
 /** An awareness frame (y-protocols `encodeAwarenessUpdate` layout). `state: null` removes the client. */
-export const awarenessFrame = (entries: Array<{ clientID: number; clock?: number; state: unknown }>, docName = DOC_NAME): Uint8Array =>
+export const awarenessFrame = (entries: Array<{ clientID: number; clock?: number; state: unknown; json?: string }>, docName = DOC_NAME): Uint8Array =>
   frame((e) => {
     encoding.writeVarUint(e, MSG.Awareness);
     const inner = encoding.createEncoder();
@@ -63,7 +71,7 @@ export const awarenessFrame = (entries: Array<{ clientID: number; clock?: number
     for (const entry of entries) {
       encoding.writeVarUint(inner, entry.clientID);
       encoding.writeVarUint(inner, entry.clock ?? 1);
-      encoding.writeVarString(inner, JSON.stringify(entry.state));
+      encoding.writeVarString(inner, entry.json ?? JSON.stringify(entry.state)); // `json`: the state's raw text
     }
     encoding.writeVarUint8Array(e, encoding.toUint8Array(inner));
   }, docName);
@@ -154,22 +162,40 @@ export function spliceVarString(update: Uint8Array, placeholder: string, replace
 /** A nested JSON object `depth` levels deep, as a string (JSON.parse is iterative, JSON.stringify is not). */
 export const deepJson = (depth: number): string => '{"a":'.repeat(depth) + '1' + '}'.repeat(depth);
 
-/** A fake `ws` socket for an in-process Hocuspocus `handleConnection`. */
+/**
+ * A fake `ws` socket for an in-process Hocuspocus `handleConnection`. Hocuspocus 4.x listens to no socket events: its
+ * integration drives the returned `ClientConnection`, so `connect` wires it the way the gateway's standalone path does.
+ */
 export class FakeSocket extends EventEmitter {
   readyState = 1;
   readonly sent: Uint8Array[] = [];
   closed: { code?: number; reason?: string } | null = null;
   binaryType = 'nodebuffer';
+  /** ws's bytes queued but not yet written (#790: the outbound bounds read it); the specs move it by hand. */
+  bufferedAmount = 0;
+  terminated = false;
   send(message: Uint8Array, cb?: (err?: Error) => void): void {
     this.sent.push(new Uint8Array(message));
     cb?.();
   }
   ping(): void {}
+  /** ws's `terminate()`: the socket closes with 1006 and no close frame. */
+  terminate(): void {
+    this.terminated = true;
+    this.close(1006, '');
+  }
   close(code?: number, reason?: string): void {
     if (this.closed) return;
     this.closed = { code, reason };
     this.readyState = 3;
     this.emit('close', code, Buffer.from(reason ?? ''));
+  }
+  /** Hand this socket to Hocuspocus as the gateway does (collaboration.gateway.ts, the standalone path). */
+  connect(hp: Pick<Hocuspocus, 'handleConnection'>, request: Request = new Request('http://localhost/')): ReturnType<Hocuspocus['handleConnection']> {
+    const clientConnection = hp.handleConnection(this as never, request);
+    this.on('message', (data: Buffer) => clientConnection.handleMessage(new Uint8Array(data)));
+    this.on('close', (code: number, reason: Buffer) => clientConnection.handleClose({ code, reason: reason.toString() }));
+    return clientConnection;
   }
   /** Deliver frames as one TCP chunk would: synchronously, in order. */
   deliver(...frames: Uint8Array[]): void {

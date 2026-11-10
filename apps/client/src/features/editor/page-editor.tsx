@@ -153,6 +153,7 @@ export default function PageEditor({
   const collabAccessRef = useRef<CollabAccessState>(initialCollabAccess);
 
   useEffect(() => {
+    let lostRetry: ReturnType<typeof setTimeout> | undefined; // CCC (#790): a lost editor's next try
     if (!providersRef.current) {
       const documentName = `page.${pageId}`;
       const ydoc = new Y.Doc();
@@ -187,8 +188,11 @@ export default function PageEditor({
           // ignore unrelated stateless messages
         }
       };
-      // False once this editor unmounted or moved to another page: a late callback then changes nothing.
-      const isCurrent = () => providersRef.current?.socket === socket;
+      // False once this editor unmounted or moved to another page: a late callback then changes nothing. CCC (#790):
+      // false once refused too, so a token refetch already in flight never reopens the closed socket.
+      const isCurrent = () =>
+        providersRef.current?.socket === socket &&
+        !collabAccessRef.current.refused;
       const onCollabAccess = (event: CollabAccessEvent) => {
         const step = nextCollabAccess(collabAccessRef.current, event);
         collabAccessRef.current = step.state;
@@ -199,6 +203,14 @@ export default function PageEditor({
         // CCC (#501, #537): reopen on the socket's own `disconnect`, never on a timer (collab-reconnect.ts).
         if (step.reconnect) reopenCollabSocket(socket, isCurrent);
         if (step.detach) remote.detach(); // CCC (#781): a refused provider stops sending (see attach() below)
+        if (step.disconnectSocket) socket.disconnect(); // CCC (#790): a refused or lost editor's socket closes
+        if (step.retryAfterMs) {
+          // CCC (#790): a lost editor tries again later, not at the provider's pace (collab-access.ts)
+          clearTimeout(lostRetry);
+          lostRetry = setTimeout(() => {
+            if (isCurrent() && collabAccessRef.current.lost) socket.connect();
+          }, step.retryAfterMs);
+        }
         if (step.refreshToken) {
           void refetchCollabTokenAndReopen({
             refetch: refetchCollabToken,
@@ -236,6 +248,7 @@ export default function PageEditor({
             kind: "server-close",
             socketConnected: socket.status === WebSocketStatus.Connected,
             reason: event?.reason, // CCC (#781): a document CLOSE always says code 1000; the reason is the signal
+            code: event?.code, // CCC (#790): a raw socket close carries its own code (1009: a frame over maxPayload)
           }),
         onUnsyncedChanges: ({ number }) => {
           if (number === 0) onCollabAccess({ kind: "sync-acked" }); // CCC (#781)
@@ -255,6 +268,7 @@ export default function PageEditor({
     }
     // Only destroy on final unmount
     return () => {
+      clearTimeout(lostRetry); // CCC (#790)
       providersRef.current?.socket.destroy();
       providersRef.current?.remote.destroy();
       providersRef.current?.local.destroy();
@@ -265,6 +279,7 @@ export default function PageEditor({
   // Only connect/disconnect on tab/idle, not destroy
   useEffect(() => {
     if (!providersReady || !providersRef.current) return;
+    if (collabAccessRef.current.refused) return; // CCC (#790): a refused editor's socket stays closed
     const socket = providersRef.current.socket;
 
     if (

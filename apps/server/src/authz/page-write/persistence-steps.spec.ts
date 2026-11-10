@@ -1,5 +1,5 @@
 // #731 F2/F3: the persistence seam's load reads `content` only for a legacy row, and its store yields a loop turn
-// between its page-sized steps, never inside the snapshot. The REAL stack (Hocuspocus 3.4.4, PersistenceExtension,
+// between its page-sized steps, never inside the snapshot. The REAL stack (Hocuspocus 4.7.1, PersistenceExtension,
 // CollaborationHandler, yjs, the tiptap transformer); only the `pages` row and the queues are fakes, as in
 // content-write-passes.spec.ts.
 const mockTx = { inside: false };

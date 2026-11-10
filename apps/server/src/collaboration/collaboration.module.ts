@@ -16,6 +16,7 @@ import { TransclusionService } from '../core/page/transclusion/transclusion.serv
 import { TransclusionModule } from '../core/page/transclusion/transclusion.module';
 import { StorageModule } from '../integrations/storage/storage.module';
 import { EnvironmentModule } from '../integrations/environment/environment.module';
+import { logCollabSocketError } from '../authz/collab-ingress/socket-limit-log'; // CCC seam #227 (wiki-v2 #790)
 
 @Module({
   providers: [
@@ -57,9 +58,9 @@ export class CollaborationModule implements OnModuleInit, OnModuleDestroy {
     wss.on('connection', (client: WebSocket, request: IncomingMessage) => {
       this.collaborationGateway.handleConnection(client, request);
 
-      client.on('error', (error) => {
-        this.logger.error('WebSocket client error:', error);
-      });
+      // CCC (wiki-v2 #790, UPSTREAM_MODIFICATIONS #227): a client's ws errors are its own frames past the bounds;
+      // logged rate-limited as COLLAB_SOCKET_LIMIT (authz/collab-ingress/socket-limit-log).
+      client.on('error', (error) => logCollabSocketError(error));
     });
 
     wss.on('error', (error) =>

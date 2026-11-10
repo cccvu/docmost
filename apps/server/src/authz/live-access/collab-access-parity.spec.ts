@@ -5,6 +5,9 @@ import { NotFoundException, ServiceUnavailableException, UnauthorizedException }
 jest.mock('../../collaboration/collaboration.util', () => ({
   getPageId: (name: string) => name.split('.')[1],
 }));
+// #790: the per-user auth rate (burst 64) would refuse this matrix's later cases for its one user; this spec is about the
+// access decision, and collab-ingress/auth-rate.spec.ts pins the rate on the same extension.
+jest.mock('../collab-ingress/auth-rate', () => ({ chargeCollabAuth: () => undefined }));
 
 import { AuthenticationExtension } from '../../collaboration/extensions/authentication.extension';
 import { PdpSpaceMemberRepo } from '../pdp-space-member.repo';

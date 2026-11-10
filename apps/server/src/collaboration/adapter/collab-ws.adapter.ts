@@ -1,10 +1,14 @@
 import { WebSocketServer } from 'ws';
+import { COLLAB_WS_SERVER_OPTIONS } from '../../authz/collab-ingress/limits'; // CCC (wiki-v2 #790)
+import { holdCollabPreAuth, verifyCollabUpgrade } from '../../authz/collab-ingress/preauth-slots'; // CCC (wiki-v2 #790)
 
 export class CollabWsAdapter {
   private readonly wss: WebSocketServer;
 
   constructor() {
-    this.wss = new WebSocketServer({ noServer: true });
+    // CCC (wiki-v2 #790, UPSTREAM_MODIFICATIONS): inbound frame bounds; Hocuspocus never configures ws. The upgrade is
+    // refused 503 past the process's unauthenticated-socket cap; an admitted one takes its slot in the callback below.
+    this.wss = new WebSocketServer({ noServer: true, ...COLLAB_WS_SERVER_OPTIONS, verifyClient: verifyCollabUpgrade });
   }
 
   handleUpgrade(path: string, httpServer: any) {
@@ -15,6 +19,7 @@ export class CollabWsAdapter {
 
         if (pathname === path) {
           this.wss.handleUpgrade(request, socket, head, (ws) => {
+            holdCollabPreAuth(ws, socket); // CCC (wiki-v2 #790): the unauthenticated slot, counting this TCP socket's bytes
             this.wss.emit('connection', ws, request);
           });
         } else if (pathname === '/socket.io/') {
