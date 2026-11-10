@@ -59,7 +59,8 @@ export interface CeilingInput {
   role: SpaceMemberRole;
 }
 
-const ROLE_RANK: Record<SpaceMemberRole, number> = { reader: 1, writer: 2, admin: 3 };
+/** A live membership of rank ≥ the requested role's covers it locally (pinned by grant-ceiling-parity.spec.ts). */
+export const ROLE_RANK: Readonly<Record<SpaceMemberRole, number>> = Object.freeze({ reader: 1, writer: 2, admin: 3 });
 const rankOf = (role: string | null | undefined): number =>
   (SPACE_ROLES as readonly unknown[]).includes(role) ? ROLE_RANK[role as SpaceMemberRole] : 0;
 

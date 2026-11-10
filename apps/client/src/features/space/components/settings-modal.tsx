@@ -139,16 +139,18 @@ export default function SpaceSettingsModal({
                     </Group>
                   )}
 
-                  <SpaceMembersList
-                    spaceId={space?.id}
-                    readOnly={
-                      membershipManagedExternally ||
-                      spaceAbility.cannot(
+                  {/* CCC (wiki-v2 #797): in remote mode the native member list is not served (the
+                      server's directoryRead refusal answers 404), so render only the note above —
+                      an empty list would read as "this space has no members". */}
+                  {!membershipManagedExternally && (
+                    <SpaceMembersList
+                      spaceId={space?.id}
+                      readOnly={spaceAbility.cannot(
                         SpaceCaslAction.Manage,
                         SpaceCaslSubject.Member,
-                      )
-                    }
-                  />
+                      )}
+                    />
+                  )}
                 </Tabs.Panel>
 
                 {showSecurityTab && (

@@ -11,6 +11,9 @@ import { useTranslation } from "react-i18next";
 interface MultiMemberSelectProps {
   value?: string[];
   onChange: (value: string[]) => void;
+  /** CCC (wiki-v2 #797): offer groups too (default). `false` for a restricted page, which
+      takes per-person grants only (INV-6: the server refuses every group grant there). */
+  includeGroups?: boolean;
 }
 
 const renderMultiSelectOption: MultiSelectProps["renderOption"] = ({
@@ -34,14 +37,18 @@ const renderMultiSelectOption: MultiSelectProps["renderOption"] = ({
   </Group>
 );
 
-export function MultiMemberSelect({ value, onChange }: MultiMemberSelectProps) {
+export function MultiMemberSelect({
+  value,
+  onChange,
+  includeGroups = true,
+}: MultiMemberSelectProps) {
   const { t } = useTranslation();
   const [searchValue, setSearchValue] = useState("");
   const [debouncedQuery] = useDebouncedValue(searchValue, 500);
   const { data: suggestion, isLoading } = useSearchSuggestionsQuery({
     query: debouncedQuery,
     includeUsers: true,
-    includeGroups: true,
+    includeGroups,
   });
   const [data, setData] = useState([]);
 
@@ -56,7 +63,7 @@ export function MultiMemberSelect({ value, onChange }: MultiMemberSelectProps) {
         type: "user",
       }));
 
-      const groupItems = suggestion?.groups.map((group: IGroup) => ({
+      const groupItems = (includeGroups ? suggestion?.groups ?? [] : []).map((group: IGroup) => ({
         value: `group-${group.id}`,
         label: group.name,
         type: "group",
@@ -81,7 +88,7 @@ export function MultiMemberSelect({ value, onChange }: MultiMemberSelectProps) {
 
       setData(newData);
     }
-  }, [suggestion, t]);
+  }, [suggestion, t, includeGroups]);
 
   return (
     <MultiSelect
@@ -91,7 +98,9 @@ export function MultiMemberSelect({ value, onChange }: MultiMemberSelectProps) {
       hidePickedOptions
       maxDropdownHeight={300}
       label={t("Add members")}
-      placeholder={t("Search for users and groups")}
+      placeholder={
+        includeGroups ? t("Search for users and groups") : t("Search for users")
+      }
       searchable
       searchValue={searchValue}
       onSearchChange={setSearchValue}
