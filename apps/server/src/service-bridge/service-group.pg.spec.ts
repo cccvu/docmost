@@ -187,7 +187,11 @@ d('ServiceGroupService on real Postgres (#797)', () => {
       expect(first).toHaveLength(3); // limit + 1: the platform detects hasMore
       const last = first[1];
       const next = await svc.listMembers(g, { limit: 2, before: { createdAt: last.addedAt, id: last.memberId } });
-      expect([...first.slice(0, 2), ...next].map((m) => m.memberId)).toEqual(all.map((m) => m.memberId));
+      // Compare against ONE paged listing, not the unpaged `all`: the paged order is (created_at to the millisecond,
+      // id::text), the unpaged one (created_at, id), so two members added within one millisecond can sort differently.
+      const onePage = await svc.listMembers(g, { limit: 100 });
+      expect(onePage.map((m) => m.memberId).sort()).toEqual(all.map((m) => m.memberId).sort());
+      expect([...first.slice(0, 2), ...next].map((m) => m.memberId)).toEqual(onePage.map((m) => m.memberId));
     });
 
     it('looks up the live groups one identity is in, without provisioning it', async () => {
