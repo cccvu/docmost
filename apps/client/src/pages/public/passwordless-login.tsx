@@ -92,9 +92,7 @@ export default function PasswordlessLogin() {
           {!sent && !haveCode ? (
             <>
               <Text c="dimmed" ta="center" mb="lg">
-                {t(
-                  "Enter your email and we'll send you a sign-in link and a one-time code.",
-                )}
+                {t("Enter your email and we'll send you a sign-in link.")}
               </Text>
               <form onSubmit={onRequest}>
                 <TextInput
@@ -108,7 +106,7 @@ export default function PasswordlessLogin() {
                   onChange={(e) => setEmail(e.currentTarget.value)}
                 />
                 <Button type="submit" fullWidth mt="lg" loading={isRequesting}>
-                  {t("Email me a sign-in link and code")}
+                  {t("Email me a sign-in link")}
                 </Button>
               </form>
               <Text ta="center" mt="md" size="sm" c="dimmed">
@@ -126,8 +124,8 @@ export default function PasswordlessLogin() {
                 {/*
                   NEVER `disabled`. Mantine's Anchor ships no `:disabled` rule — its only styling is the link
                   colour, a pointer cursor and a hover underline — so a disabled one looks completely live and
-                  swallows the click in silence. The user's next move is then "Email me a sign-in link and
-                  code", which supersedes the very code they came to redeem: the #319 failure arriving through
+                  swallows the click in silence. The user's next move is then "Email me a sign-in link",
+                  which supersedes the very code they came to redeem: the #319 failure arriving through
                   a different door. The address is collected on the next step instead, where it is visible and
                   correctable.
                 */}
@@ -146,7 +144,7 @@ export default function PasswordlessLogin() {
               <Text c="dimmed" ta="center" mb="lg" role="status">
                 {sent
                   ? t(
-                      "Check your email. Open the sign-in link, or enter the 6-digit code below. Both expire shortly and can be used once.",
+                      "Check your email and open the sign-in link. If the email also has a 6-digit code, you can enter it below instead. It expires shortly and can be used once.",
                     )
                   : t(
                       "Enter the 6-digit code from your sign-in email. It expires shortly and can be used once.",
