@@ -171,11 +171,19 @@ export class FakeSocket extends EventEmitter {
   readonly sent: Uint8Array[] = [];
   closed: { code?: number; reason?: string } | null = null;
   binaryType = 'nodebuffer';
+  /** ws's bytes queued but not yet written (#790: the outbound bounds read it); the specs move it by hand. */
+  bufferedAmount = 0;
+  terminated = false;
   send(message: Uint8Array, cb?: (err?: Error) => void): void {
     this.sent.push(new Uint8Array(message));
     cb?.();
   }
   ping(): void {}
+  /** ws's `terminate()`: the socket closes with 1006 and no close frame. */
+  terminate(): void {
+    this.terminated = true;
+    this.close(1006, '');
+  }
   close(code?: number, reason?: string): void {
     if (this.closed) return;
     this.closed = { code, reason };

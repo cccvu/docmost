@@ -106,6 +106,7 @@ export type CollabRule =
   | 'stateless'
   | 'sync-rate'
   | 'awareness'
+  | 'awareness-rate'
   | 'auth'
   | 'message-type'
   | 'undecodable'

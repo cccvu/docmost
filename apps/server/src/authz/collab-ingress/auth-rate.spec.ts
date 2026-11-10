@@ -6,7 +6,7 @@ jest.mock('../../collaboration/collaboration.util', () => ({
 
 import { Logger, UnauthorizedException } from '@nestjs/common';
 import { AuthenticationExtension } from '../../collaboration/extensions/authentication.extension';
-import { COLLAB_AUTH_RATE_REASON, CollabAuthRate } from './auth-rate';
+import { COLLAB_AUTH_RATE_REASON, COLLAB_INVALID_TOKEN_REASON, CollabAuthRate } from './auth-rate';
 import { COLLAB_AUTH_BURST } from './limits';
 import { SocketLimitLog } from './socket-limit-log';
 
@@ -123,13 +123,16 @@ describe('#790 the collab connect charges the rate after the token verifies and 
     expect(reads()).toBe(before + 2);
   });
 
-  it('a token that does not verify is refused without charging anyone', async () => {
+  it('a token that does not verify is refused without charging anyone, and with no message Hocuspocus would log', async () => {
     jest.spyOn(Date, 'now').mockImplementation(() => 9_000_000);
     const { ext, setVerify, reads } = repos();
     const user = `bad-${Math.random()}`;
     setVerify(jest.fn(async (_t: string) => Promise.reject(new Error("bad token"))));
     for (let i = 0; i < COLLAB_AUTH_BURST + 5; i++) {
-      await expect(attempt(ext, user, i)).rejects.toBeInstanceOf(UnauthorizedException);
+      const refused = await attempt(ext, user, i).catch((e: unknown) => e);
+      // exactly the reason Hocuspocus sends for a refusal that names none, so the client sees what it always saw
+      expect(refused).toEqual({ reason: COLLAB_INVALID_TOKEN_REASON });
+      expect(refused).not.toHaveProperty('message');
     }
     expect(reads()).toBe(0);
     setVerify(jest.fn(async (t: string) => ({ sub: t, workspaceId: 'w1', sessionId: 's1' })));

@@ -1,7 +1,10 @@
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   COLLAB_UPDATE_REFUSED_PREFIX,
   COLLAB_UPDATE_UNRESOLVED,
+  CollabAccessEvent,
   CollabAccessState,
   classifyCollabCloseReason,
   collabAllowsEditing,
@@ -209,6 +212,7 @@ describe("collab update refusal (#781)", () => {
     (rule) => {
       const step = nextCollabAccess(initialCollabAccess, close(refused(rule)));
       expect(step.detach).toBe(true);
+      expect(step.disconnectSocket).toBe(true); // #790: the editor's now-empty socket closes too
       expect(step.reconnect).toBe(false);
       expect(step.refreshToken).toBe(false);
       expect(step.state.refused).toBe(true);
@@ -224,6 +228,7 @@ describe("collab update refusal (#781)", () => {
       close(refused("mark"), false),
     );
     expect(step.detach).toBe(true);
+    expect(step.disconnectSocket).toBe(true); // #790: and stays closed (the socket's own retry stops)
     expect(step.reconnect).toBe(false);
     expect(step.state.refused).toBe(true);
   });
@@ -239,6 +244,7 @@ describe("collab update refusal (#781)", () => {
       expect(step.reconnect).toBe(false);
       expect(step.refreshToken).toBe(false);
       expect(step.detach).toBe(false); // already detached
+      expect(step.disconnectSocket).toBe(false); // already closed
       expect(step.markDisconnected).toBe(false);
       expect(collabAllowsEditing(step.state)).toBe(false);
     }
@@ -351,6 +357,7 @@ describe("collab update refusal (#781)", () => {
         refreshToken: false,
         markDisconnected: false,
         detach: false,
+        disconnectSocket: false,
       });
       expect(live.state).toBe(initialCollabAccess);
       const dead = nextCollabAccess(initialCollabAccess, close(reason, false));
@@ -432,6 +439,7 @@ describe("a socket close with 1009 (a frame over the server's maxPayload) (#790)
         refreshToken: false,
         markDisconnected: false,
         detach: false,
+        disconnectSocket: false,
       });
     },
   );
@@ -447,6 +455,58 @@ describe("a socket close with 1009 (a frame over the server's maxPayload) (#790)
     ).toBe(true);
     expect(classifyCollabCloseReason(COLLAB_UPDATE_UNRESOLVED, 1000)).toBe(
       "unresolved",
+    );
+  });
+});
+
+// cccvu/wiki-v2#790 — only a refusal closes the socket: every other step keeps it (reconnect and token refresh need it).
+describe("disconnectSocket", () => {
+  it("is false for every event that is not a refusal", () => {
+    const events: CollabAccessEvent[] = [
+      { kind: "server-close", socketConnected: true },
+      { kind: "server-close", socketConnected: false, code: 1006 },
+      { kind: "server-close", socketConnected: true, reason: COLLAB_UPDATE_UNRESOLVED },
+      { kind: "auth-failed", tokenExpired: true },
+      { kind: "auth-failed", tokenExpired: false },
+      { kind: "refresh-failed" },
+      { kind: "authenticated", scope: "read-write" },
+      { kind: "sync-acked" },
+    ];
+    for (const event of events) {
+      expect([event, nextCollabAccess(initialCollabAccess, event).disconnectSocket]).toEqual([event, false]);
+    }
+  });
+
+  it("is true for a 1009 socket close (a frame over the server's maxPayload)", () => {
+    const step = nextCollabAccess(initialCollabAccess, {
+      kind: "server-close",
+      socketConnected: false,
+      code: WS_CLOSE_MESSAGE_TOO_BIG,
+    });
+    expect(step.disconnectSocket).toBe(true);
+  });
+});
+
+// cccvu/wiki-v2#790 — the wiring in page-editor.tsx (seam 169): the step closes the socket, and nothing reopens it.
+describe("page-editor wiring", () => {
+  const source = readFileSync(
+    join(__dirname, "..", "editor", "page-editor.tsx"),
+    "utf8",
+  );
+  it("a disconnectSocket step disconnects the editor's socket, after the detach", () => {
+    const detach = source.indexOf("if (step.detach) remote.detach();");
+    const disconnect = source.indexOf(
+      "if (step.disconnectSocket) socket.disconnect();",
+    );
+    expect(detach).toBeGreaterThan(-1);
+    expect(disconnect).toBeGreaterThan(detach);
+  });
+  it("a refused editor is not current (a token refetch in flight cannot reopen) and the visibility effect never reconnects it", () => {
+    expect(source).toMatch(
+      /const isCurrent = \(\) =>\s*providersRef\.current\?\.socket === socket &&\s*!collabAccessRef\.current\.refused;/,
+    );
+    expect(source).toMatch(
+      /if \(!providersReady \|\| !providersRef\.current\) return;\s*if \(collabAccessRef\.current\.refused\) return;/,
     );
   });
 });

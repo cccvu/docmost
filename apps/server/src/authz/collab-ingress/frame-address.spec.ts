@@ -1,7 +1,8 @@
 import * as encoding from 'lib0/encoding';
 import * as decoding from 'lib0/decoding';
 import { admitCollabFrame, isCollabFrameAddress } from './frame-address';
-import { SocketLimitLog } from './socket-limit-log';
+import { COLLAB_AUTH_FRAMES_PER_SOCKET, COLLAB_DOCUMENTS_PER_SOCKET, COLLAB_HOCUSPOCUS_OPTIONS } from './limits';
+import { logCollabSocketError, SocketLimitLog } from './socket-limit-log';
 
 /** #790: the gateway admits a frame only when its document name is `page.<uuid>`. */
 const frameFor = (name: string, body: number[] = [0, 0, 0]): Uint8Array => {
@@ -15,10 +16,8 @@ const V7 = '01890a5d-ac96-774b-bcce-b302099a8057';
 
 describe('#790 isCollabFrameAddress', () => {
   it.each([
-    ['uuid v4, lower case', `page.${V4}`],
-    ['uuid v4, upper case', `page.${V4.toUpperCase()}`],
+    ['uuid v4', `page.${V4}`],
     ['uuid v7', `page.${V7}`],
-    ['uuid v7, upper case', `page.${V7.toUpperCase()}`],
     ['the nil uuid', 'page.00000000-0000-0000-0000-000000000000'],
   ])('admits %s', (_label, name) => {
     const frame = frameFor(name);
@@ -40,6 +39,11 @@ describe('#790 isCollabFrameAddress', () => {
     ['a uuid without dashes, padded', `page.${V4.replace(/-/g, '')}xxxx`],
     ['a non-ASCII name of the right byte length', `page.${V4.slice(0, -2)}é`],
     ['a huge name', `page.${V4}`.repeat(200_000)],
+    // Postgres compares uuids case-blind: an upper-case alias would load a second live document for the same page
+    ['uuid v4, upper case', `page.${V4.toUpperCase()}`],
+    ['uuid v7, upper case', `page.${V7.toUpperCase()}`],
+    ['uuid v4, one upper-case hex digit', `page.${V4.replace('f', 'F')}`],
+    ['an upper-case prefix', `PAGE.${V4}`],
   ])('refuses %s', (_label, name) => {
     expect(isCollabFrameAddress(frameFor(name))).toBe(false);
   });
@@ -104,6 +108,30 @@ describe('#790 admitCollabFrame (the gateway check)', () => {
   });
 });
 
+describe('#790 logCollabSocketError (the collab module\'s ws client error listener)', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('logs ws\'s error code only, rate-limited: a client sending 1000 oversized frames writes 30 lines', () => {
+    jest.spyOn(Date, 'now').mockImplementation(() => 7_000_000);
+    const warn = jest.fn();
+    const limitLog = new SocketLimitLog({ warn });
+    const err = Object.assign(new RangeError('Max payload size exceeded secret-bytes'), { code: 'WS_ERR_UNSUPPORTED_MESSAGE_LENGTH' });
+    for (let i = 0; i < 1000; i++) logCollabSocketError(err, limitLog);
+    expect(warn).toHaveBeenCalledTimes(30);
+    expect(warn.mock.calls[0][0]).toBe('COLLAB_SOCKET_LIMIT {"limit":"ws_error","code":"WS_ERR_UNSUPPORTED_MESSAGE_LENGTH"}');
+    expect(warn.mock.calls.join('')).not.toContain('secret');
+  });
+
+  it('an error with no code, or a code that is not a ws code, is logged as unknown', () => {
+    const warn = jest.fn();
+    const limitLog = new SocketLimitLog({ warn });
+    logCollabSocketError(new Error('x'), limitLog);
+    logCollabSocketError({ code: 'not a code {"json"}' }, limitLog);
+    logCollabSocketError(null, limitLog);
+    expect(warn.mock.calls.map((c) => c[0])).toEqual(Array(3).fill('COLLAB_SOCKET_LIMIT {"limit":"ws_error","code":"unknown"}'));
+  });
+});
+
 describe('#790 SocketLimitLog', () => {
   afterEach(() => jest.restoreAllMocks());
 
@@ -120,5 +148,90 @@ describe('#790 SocketLimitLog', () => {
       'COLLAB_SOCKET_LIMIT {"limit":"log_suppressed","count":15}',
       'COLLAB_SOCKET_LIMIT {"limit":"auth_rate","userId":"u1"}',
     ]);
+  });
+});
+
+/** A uuid-named page frame of message `type` (Auth = 2) with an optional raw type encoding. */
+const pageN = (n: number) => `page.${n.toString(16).padStart(8, '0')}-0000-4000-8000-000000000790`;
+const typed = (name: string, type: number) => frameFor(name, [type, 0, 0]);
+
+describe('#790 admitCollabFrame: distinct documents per socket (before RedisSync claims a Redis lock per name)', () => {
+  const socket = () => {
+    const ws = { readyState: 1, terminate: jest.fn(() => (ws.readyState = 2)) };
+    return ws;
+  };
+
+  it(`is at least Hocuspocus's maxPendingDocuments, so Hocuspocus's own bound is what an honest socket meets first`, () => {
+    expect(COLLAB_DOCUMENTS_PER_SOCKET).toBeGreaterThanOrEqual(COLLAB_HOCUSPOCUS_OPTIONS.maxPendingDocuments);
+  });
+
+  it(`admits frames for ${COLLAB_DOCUMENTS_PER_SOCKET} names, any number of times each; the next new name terminates`, () => {
+    const ws = socket();
+    const warn = jest.fn();
+    const limitLog = new SocketLimitLog({ warn });
+    for (let round = 0; round < 3; round++) {
+      for (let i = 0; i < COLLAB_DOCUMENTS_PER_SOCKET; i++) expect(admitCollabFrame(ws, typed(pageN(i), 0), limitLog)).toBe(true);
+    }
+    expect(ws.terminate).not.toHaveBeenCalled();
+    expect(admitCollabFrame(ws, typed(pageN(99), 0), limitLog)).toBe(false);
+    expect(ws.terminate).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls).toEqual([[`COLLAB_SOCKET_LIMIT {"limit":"socket_documents","documents":${COLLAB_DOCUMENTS_PER_SOCKET + 1}}`]]);
+  });
+
+  it('a flood of fresh names in one TCP read reaches the downstream handler at most the cap times', () => {
+    const ws = socket();
+    const limitLog = new SocketLimitLog({ warn: () => undefined });
+    let forwarded = 0;
+    for (let i = 0; i < 1500; i++) if (admitCollabFrame(ws, typed(pageN(i), 0), limitLog)) forwarded++;
+    expect(forwarded).toBe(COLLAB_DOCUMENTS_PER_SOCKET);
+    expect(ws.terminate).toHaveBeenCalledTimes(1);
+  });
+
+  it('the count is per socket', () => {
+    const limitLog = new SocketLimitLog({ warn: () => undefined });
+    for (let s = 0; s < 3; s++) {
+      const ws = socket();
+      for (let i = 0; i < COLLAB_DOCUMENTS_PER_SOCKET; i++) expect(admitCollabFrame(ws, typed(pageN(i), 0), limitLog)).toBe(true);
+    }
+  });
+});
+
+describe('#790 admitCollabFrame: Auth frames per socket (a refused Auth can otherwise be retried forever)', () => {
+  const socket = () => {
+    const ws = { readyState: 1, terminate: jest.fn(() => (ws.readyState = 2)) };
+    return ws;
+  };
+
+  it(`admits ${COLLAB_AUTH_FRAMES_PER_SOCKET} Auth frames, terminates on the next; other types are not counted`, () => {
+    const ws = socket();
+    const warn = jest.fn();
+    const limitLog = new SocketLimitLog({ warn });
+    const page = pageN(1);
+    for (let i = 0; i < 50; i++) expect(admitCollabFrame(ws, typed(page, 0), limitLog)).toBe(true); // Sync
+    for (let i = 0; i < 50; i++) expect(admitCollabFrame(ws, typed(page, 1), limitLog)).toBe(true); // Awareness
+    for (let i = 0; i < COLLAB_AUTH_FRAMES_PER_SOCKET; i++) expect(admitCollabFrame(ws, typed(page, 2), limitLog)).toBe(true);
+    expect(ws.terminate).not.toHaveBeenCalled();
+    expect(admitCollabFrame(ws, typed(page, 2), limitLog)).toBe(false);
+    expect(ws.terminate).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls).toEqual([[`COLLAB_SOCKET_LIMIT {"limit":"socket_auth_frames","authFrames":${COLLAB_AUTH_FRAMES_PER_SOCKET + 1}}`]]);
+  });
+
+  it('an honest open (one Auth per document, then sync and awareness) is far inside the budget', () => {
+    expect(COLLAB_AUTH_FRAMES_PER_SOCKET).toBeGreaterThanOrEqual(COLLAB_DOCUMENTS_PER_SOCKET);
+  });
+
+  it('counts the type as lib0 reads it: a non-minimal varint 2 (0x82 0x00) is an Auth frame too', () => {
+    const ws = socket();
+    const limitLog = new SocketLimitLog({ warn: () => undefined });
+    const name = pageN(1);
+    const e = encoding.createEncoder();
+    encoding.writeVarString(e, name);
+    const head = encoding.toUint8Array(e);
+    const padded = new Uint8Array([...head, 0x82, 0x00, 0, 0]);
+    const d = decoding.createDecoder(padded);
+    decoding.readVarString(d);
+    expect(decoding.readVarUint(d)).toBe(2); // what Hocuspocus reads
+    for (let i = 0; i < COLLAB_AUTH_FRAMES_PER_SOCKET; i++) expect(admitCollabFrame(ws, padded, limitLog)).toBe(true);
+    expect(admitCollabFrame(ws, padded, limitLog)).toBe(false);
   });
 });

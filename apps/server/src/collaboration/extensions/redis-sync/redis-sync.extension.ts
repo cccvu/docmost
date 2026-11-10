@@ -148,7 +148,10 @@ export class RedisSyncExtension<TCE extends CustomEvents> implements Extension {
       entry = { clientConnection, socket };
       this.proxyConnections[socketId] = entry;
     }
-    entry.clientConnection.handleMessage(message);
+    // CCC (#790): a copy, as the origin path makes. msgpackr's `message` is a view into the Redis reply buffer, and a
+    // lib0 before 0.2.120 reads a length prefix past a view's end into whatever that buffer holds next (the workspace
+    // pins 0.2.120, which throws instead; this keeps the decode inside the frame whatever lib0 resolves).
+    entry.clientConnection.handleMessage(new Uint8Array(message));
   }
 
   private getLock(documentName: string) {

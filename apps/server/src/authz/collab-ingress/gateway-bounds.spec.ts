@@ -41,7 +41,9 @@ import { Logger } from '@nestjs/common';
 import { Hocuspocus } from '@hocuspocus/server';
 import { CollaborationGateway } from '../../collaboration/collaboration.gateway';
 import { BoundedCollabSocket } from './bounded-socket';
-import { COLLAB_HOCUSPOCUS_OPTIONS } from './limits';
+import { COLLAB_AUTH_FRAMES_PER_SOCKET, COLLAB_DOCUMENTS_PER_SOCKET, COLLAB_HOCUSPOCUS_OPTIONS } from './limits';
+import { CollabUpdateGuardExtension } from './collab-update-guard.extension';
+import { CollabUserConnectionsExtension } from './user-connections';
 
 /**
  * #790 wiring: on BOTH gateway paths every inbound frame passes the `page.<uuid>` address check before RedisSync or
@@ -75,6 +77,15 @@ const frame = (name: string): Buffer => {
   return Buffer.from(encoding.toUint8Array(e));
 };
 const PAGE = frame('page.01890a5d-ac96-774b-bcce-b302099a8057');
+const pageN = (n: number) => frame(`page.${n.toString(16).padStart(8, '0')}-0000-4000-8000-000000000790`);
+const authN = (n: number) => {
+  const e = encoding.createEncoder();
+  encoding.writeVarString(e, `page.${n.toString(16).padStart(8, '0')}-0000-4000-8000-000000000790`);
+  encoding.writeVarUint(e, 2); // Auth
+  encoding.writeVarUint(e, 0);
+  encoding.writeVarString(e, 'token');
+  return Buffer.from(encoding.toUint8Array(e));
+};
 const JUNK = frame('collabLock:anything');
 
 const gateway = (withRedis: boolean) =>
@@ -133,6 +144,24 @@ describe('#790 gateway bounds: the RedisSync path', () => {
     expect(ws.terminate).toHaveBeenCalledTimes(1);
   });
 
+  it(`a flood of fresh page names reaches RedisSync (a Redis SET NX each) only ${COLLAB_DOCUMENTS_PER_SOCKET} times`, () => {
+    const gw = gateway(true);
+    const ws = new FakeWs();
+    gw.handleConnection(ws as never, request());
+    for (let i = 0; i < 1500; i++) ws.emit('message', pageN(i));
+    expect(redis.onSocketMessage).toHaveBeenCalledTimes(COLLAB_DOCUMENTS_PER_SOCKET);
+    expect(ws.terminate).toHaveBeenCalledTimes(1);
+  });
+
+  it(`Auth frames past ${COLLAB_AUTH_FRAMES_PER_SOCKET} on one socket never reach RedisSync`, () => {
+    const gw = gateway(true);
+    const ws = new FakeWs();
+    gw.handleConnection(ws as never, request());
+    for (let i = 0; i < 100; i++) ws.emit('message', authN(1));
+    expect(redis.onSocketMessage).toHaveBeenCalledTimes(COLLAB_AUTH_FRAMES_PER_SOCKET);
+    expect(ws.terminate).toHaveBeenCalledTimes(1);
+  });
+
   it('a non-reading socket is cut off through the bounded socket RedisSync was given', () => {
     const gw = gateway(true);
     const ws = new FakeWs();
@@ -149,6 +178,14 @@ describe('#790 gateway bounds: the standalone path', () => {
   it('Hocuspocus writes through the bounded socket', () => {
     gateway(false).handleConnection(new FakeWs() as never, request());
     expect(hpConnections[0].socket).toBeInstanceOf(BoundedCollabSocket);
+  });
+
+  it(`a flood of fresh page names reaches Hocuspocus only ${COLLAB_DOCUMENTS_PER_SOCKET} times`, () => {
+    const gw = gateway(false);
+    const ws = new FakeWs();
+    gw.handleConnection(ws as never, request());
+    for (let i = 0; i < 100; i++) ws.emit('message', pageN(i));
+    expect(hpConnections[0].handleMessage).toHaveBeenCalledTimes(COLLAB_DOCUMENTS_PER_SOCKET);
   });
 
   it('forwards a page frame and terminates on a junk-named one', () => {
@@ -171,6 +208,24 @@ describe('#790 gateway bounds: configuration and source', () => {
     (Hocuspocus as unknown as jest.Mock).mockClear();
     gateway(true);
     expect((Hocuspocus as unknown as jest.Mock).mock.calls[0][0]).toMatchObject(COLLAB_HOCUSPOCUS_OPTIONS);
+  });
+
+  it('registers the per-user connection cap right after the update guard, ranked below it and above RedisSync', () => {
+    (Hocuspocus as unknown as jest.Mock).mockClear();
+    gateway(false);
+    const extensions = (Hocuspocus as unknown as jest.Mock).mock.calls[0][0].extensions as unknown[];
+    expect(extensions[0]).toBeInstanceOf(CollabUpdateGuardExtension);
+    expect(extensions[1]).toBeInstanceOf(CollabUserConnectionsExtension);
+    const ext = extensions[1] as CollabUserConnectionsExtension;
+    expect(ext.priority).toBeLessThan(new CollabUpdateGuardExtension().priority);
+    expect(ext.priority).toBeGreaterThan(1000);
+  });
+
+  it("the collab module logs a client's ws errors only through the rate-limited COLLAB_SOCKET_LIMIT logger", () => {
+    const text = readFileSync(join(__dirname, '..', '..', 'collaboration', 'collaboration.module.ts'), 'utf8');
+    const code = text.replace(/\/\/.*$/gm, '');
+    expect(code).toMatch(/client\.on\('error',\s*\(error\)\s*=>\s*logCollabSocketError\(error\)\)/);
+    expect(code).not.toMatch(/WebSocket client error/);
   });
 
   it('no gateway or RedisSync source reads the client request’s sec-websocket-key', () => {

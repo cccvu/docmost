@@ -21,7 +21,10 @@ import { jwtDecode } from "jwt-decode";
  *     and the provider reports it as code 1000, so the REASON is the only signal:
  *       - `ccc:collab-update-refused:<rule>` → detach the provider (a refused provider stays attached and keeps
  *         sending), stop editing, show the refusal notice, and never reconnect: this browser's copy would be
- *         replayed and refused again. Final until the page reloads;
+ *         replayed and refused again. Final until the page reloads. #790: close the editor's socket too (each page
+ *         editor has its own); with nothing attached it would otherwise idle, or reconnect every 30 s (the
+ *         provider's message timeout), for as long as the tab stays open. Reload and Discard reload the page, so
+ *         they need no socket;
  *       - `ccc:collab-update-unresolved` → the server could not decide; reconnect ONCE. The retry is spent until
  *         `sync-acked` (every frame this provider sent was applied), NOT until the next authentication, which
  *         happens before the replay is judged; a second one before that is treated as refused.
@@ -95,6 +98,8 @@ export interface CollabAccessStep {
   markDisconnected: boolean;
   /** #781: detach the provider so it stops sending (and keep it detached). */
   detach: boolean;
+  /** #790: close the editor's socket after the detach, and never reopen it (nothing is attached to it any more). */
+  disconnectSocket: boolean;
 }
 
 const NO_ACTION = {
@@ -102,6 +107,7 @@ const NO_ACTION = {
   refreshToken: false,
   markDisconnected: false,
   detach: false,
+  disconnectSocket: false,
 } as const;
 
 export function nextCollabAccess(
@@ -170,7 +176,12 @@ function lostStep(prev: CollabAccessState): CollabAccessStep {
  * untrue (nothing retries); the refusal notice says what happened and offers the recovery.
  */
 function refusedStep(prev: CollabAccessState): CollabAccessStep {
-  return { ...NO_ACTION, state: { ...prev, refused: true }, detach: true };
+  return {
+    ...NO_ACTION,
+    state: { ...prev, refused: true },
+    detach: true,
+    disconnectSocket: true,
+  };
 }
 
 /** The editor may edit only if the page allows it AND the server still lets this connection write. */

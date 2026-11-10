@@ -7,7 +7,9 @@
  * queueing every broadcast, awareness echo and SyncStep2 it is owed, without limit, in ws's send buffer. On each
  * send this terminates the raw socket (and drops the frame) once `bufferedAmount` exceeds
  * COLLAB_OUTBOUND_BUFFER_FACTOR x COLLAB_MAX_PAYLOAD_BYTES plus the largest frame this socket has been sent. An honest
- * slow client draining one big SyncStep2 stays under it: the allowance grows with that frame. There is no timer.
+ * slow client draining one big SyncStep2 stays under it: the allowance grows with that frame, and a peer's frame relayed
+ * meanwhile is at most one maxPayload (limits.ts). This checks only when something is sent; a socket owed nothing more
+ * that stops reading is cut off by the stall check on the keepalive tick (socket-keepalive.ts).
  *
  * `readyState` is the raw socket's once it is closing, so Hocuspocus stops sending to a socket the client closed
  * (the backported WsSocketWrapper keeps its own, which only its own `close()` moves).

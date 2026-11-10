@@ -25,8 +25,10 @@ import {
 } from './collab-ingress.testkit';
 import { INT_ATTRS, STRING_ATTRS } from './content-rules';
 import {
-  AWARENESS_BINDS_PER_DOCUMENT,
+  AWARENESS_BINDS_PER_USER,
+  AWARENESS_BURST,
   AWARENESS_NEW_IDS_PER_CONNECTION,
+  AWARENESS_REFILL_PER_SECOND,
   AWARENESS_STATE_MAX_BYTES,
   COLLAB_REFUSAL_CODE,
   CollabUpdateGuard,
@@ -482,9 +484,12 @@ describe('#781 B4: a client id is bound to its user (forged clocks)', () => {
 
   it('accepted: awareness echoes, a reader claiming a writer\'s id, a remount resending a bound peer\'s cached structs', () => {
     const { s, victim, vc } = victimSetup();
+    const meta = new Map<number, { clock: number }>();
+    (s.live as unknown as { awareness: unknown }).awareness = { meta };
     expect(s.deliver(s.conn('reader', true), awarenessFrame([{ clientID: 1001, state: { user: {} } }]))).toBe('applied');
+    meta.set(1001, { clock: 1 }); // Hocuspocus applied and relayed it
     expect(s.send(vc, victim.edit(s.live, () => textOf(find(victim.doc, 'paragraph')).insert(0, 'v1 ')))).toBe('applied'); // reader did not bind
-    expect(s.deliver(s.conn('peer'), awarenessFrame([{ clientID: 1001, state: { user: {} } }]))).toBe('applied'); // an echo
+    expect(s.deliver(s.conn('peer'), awarenessFrame([{ clientID: 1001, state: { user: {} } }]))).toBe('applied'); // an echo of what was relayed
     // A remount: a fresh doc loaded from IndexedDB holds the victim's structs and sends them back (already in live).
     const remount = new Y.Doc();
     Y.applyUpdate(remount, Y.encodeStateAsUpdate(s.live));
@@ -1017,15 +1022,20 @@ describe('#790 frame bounds: awareness, for writers and readers', () => {
     expect(s.deliver(s.conn('a', true), awarenessFrame([{ clientID: 5, state: {} }, { clientID: 5, clock: 2, state: {} }]))).toBe(REFUSED('awareness'));
   });
 
-  it(`awareness binds stop at ${AWARENESS_BINDS_PER_DOCUMENT} per document (never a refusal)`, () => {
+  it(`awareness binds stop at ${AWARENESS_BINDS_PER_USER} per user per document (never a refusal); other users still bind`, () => {
     const s = setup({ seed: SEED });
     const perConn = AWARENESS_NEW_IDS_PER_CONNECTION;
     let next = 10_000;
-    for (let n = 0; n < AWARENESS_BINDS_PER_DOCUMENT / perConn + 2; n++) {
+    // one writer over many connections (reconnects) tries to use up every bind
+    for (let n = 0; n < AWARENESS_BINDS_PER_USER / perConn + 4; n++) {
       const entries = Array.from({ length: perConn }, () => ({ clientID: next++, state: { user: {} } }));
-      expect(s.deliver(s.conn(`w${n}`), awarenessFrame(entries))).toBe('applied');
+      expect(s.deliver(s.conn('hog'), awarenessFrame(entries))).toBe('applied');
     }
-    expect(s.guard.bindingCount(s.live)).toBe(1 + AWARENESS_BINDS_PER_DOCUMENT); // live's own id + the cap
+    expect(s.guard.bindingCount(s.live)).toBe(1 + AWARENESS_BINDS_PER_USER); // live's own id + the hog's cap
+    // an honest user who opens the page afterwards still binds its id, so its cursor cannot be spoken for
+    expect(s.deliver(s.conn('honest'), awarenessFrame([{ clientID: 99_999, state: { user: { name: 'H' } } }]))).toBe('applied');
+    expect(s.guard.bindingCount(s.live)).toBe(2 + AWARENESS_BINDS_PER_USER);
+    expect(s.deliver(s.conn('hog'), awarenessFrame([{ clientID: 99_999, clock: 2, state: { user: { name: 'H' } } }]))).toBe(REFUSED('foreign-client'));
   });
 });
 
@@ -1045,5 +1055,99 @@ describe('#790 frame bounds: Auth on an established session and unknown message 
     expect(s.deliver(c, step1Frame(s.live))).toBe('applied');
     expect(s.deliver(c, awarenessFrame([{ clientID: 9, state: {} }]))).toBe('applied');
     expect(s.deliver(c, typedFrame(MSG.Close))).toBe('applied'); // a provider's detach
+  });
+});
+
+describe('#790 awareness: the per-connection rate', () => {
+  const clocked = () => {
+    let t = 2_000_000;
+    const s = setup({ seed: SEED, now: () => t });
+    return { s, advance: (ms: number) => (t += ms) };
+  };
+  const cursor = (clock: number) => awarenessFrame([{ clientID: 4242, clock, state: { user: { name: 'W' }, cursor: { anchor: clock, head: clock } } }]);
+
+  it.each([['writer', false], ['reader', true]] as const)(
+    `a %s: a burst of ${AWARENESS_BURST} passes, the next is refused awareness-rate; QueryAwareness counts too`,
+    (_who, readOnly) => {
+      const { s } = clocked();
+      const c = s.conn('a', readOnly);
+      for (let i = 1; i <= AWARENESS_BURST - 1; i++) expect(s.deliver(c, cursor(i))).toBe('applied');
+      expect(s.deliver(c, typedFrame(MSG.QueryAwareness))).toBe('applied');
+      expect(s.deliver(c, cursor(AWARENESS_BURST + 1))).toBe(REFUSED('awareness-rate'));
+      expect(s.deliver(s.conn('a', readOnly), cursor(1))).toBe('applied'); // a new session has its own bucket
+    },
+  );
+
+  it('honest editing never meets it: a held arrow key (33/s) for a minute, then a fast mouse-drag (60/s) for 3 s', () => {
+    const { s, advance } = clocked();
+    const c = s.conn('writer');
+    let clock = 0;
+    for (let i = 0; i < 33 * 60; i++) {
+      expect(s.deliver(c, cursor(++clock))).toBe('applied');
+      advance(1000 / 33);
+    }
+    for (let i = 0; i < 60 * 3; i++) {
+      expect(s.deliver(c, cursor(++clock))).toBe('applied');
+      advance(1000 / 60);
+    }
+    expect(AWARENESS_REFILL_PER_SECOND).toBeGreaterThan(33);
+  });
+
+  it('a flood is held to the refill rate', () => {
+    const { s, advance } = clocked();
+    const c = s.conn('flooder');
+    let clock = 0;
+    let applied = 0;
+    for (let ms = 0; ms < 10_000; ms++) {
+      for (let k = 0; k < 2 && !s.guard['refusedConnections'].has(c); k++) if (s.deliver(c, cursor(++clock)) === 'applied') applied++;
+      advance(1);
+    }
+    expect(applied).toBeLessThanOrEqual(AWARENESS_BURST + 10 * AWARENESS_REFILL_PER_SECOND + 1);
+  });
+});
+
+describe('#790 awareness: no state for another user\'s client id', () => {
+  const withMeta = () => {
+    const s = setup({ seed: SEED });
+    const meta = new Map<number, { clock: number }>();
+    (s.live as unknown as { awareness: unknown }).awareness = { meta };
+    return { s, meta };
+  };
+
+  it('control: before any binding, a writer can announce a state for any id (nothing says whose it is)', () => {
+    const { s } = withMeta();
+    expect(s.deliver(s.conn('attacker'), awarenessFrame([{ clientID: 1001, clock: 5, state: { user: { name: 'Victim' } } }]))).toBe('applied');
+  });
+
+  it.each([['writer', false], ['reader', true]] as const)(
+    'a %s announcing a newer state for an id bound to another user is refused foreign-client',
+    (_who, readOnly) => {
+      const { s, meta } = withMeta();
+      expect(s.deliver(s.conn('victim'), awarenessFrame([{ clientID: 1001, clock: 1, state: { user: { name: 'V' } } }]))).toBe('applied');
+      meta.set(1001, { clock: 1 });
+      expect(s.deliver(s.conn('attacker', readOnly), awarenessFrame([{ clientID: 1001, clock: 2, state: { user: { name: 'Fake' } } }]))).toBe(REFUSED('foreign-client'));
+      // an id no awareness ever held but bound by its structs is protected too
+      const bound = new RemoteClient(s.live, 2002);
+      expect(s.send(s.conn('victim'), bound.edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'v ')))).toBe('applied');
+      expect(s.deliver(s.conn('attacker', readOnly), awarenessFrame([{ clientID: 2002, clock: 1, state: { user: {} } }]))).toBe(REFUSED('foreign-client'));
+      // and the server's own
+      expect(s.deliver(s.conn('attacker', readOnly), awarenessFrame([{ clientID: s.live.clientID, clock: 1, state: {} }]))).toBe(REFUSED('foreign-client'));
+    },
+  );
+
+  it('honest traffic about another user\'s id passes: a timeout removal, an echo at a held clock; the owner itself always', () => {
+    const { s, meta } = withMeta();
+    const victim = s.conn('victim');
+    expect(s.deliver(victim, awarenessFrame([{ clientID: 1001, clock: 3, state: { user: { name: 'V' } } }]))).toBe('applied');
+    meta.set(1001, { clock: 3 });
+    // a peer's provider removes a peer that went quiet: clock + 1, state null
+    expect(s.deliver(s.conn('peer'), awarenessFrame([{ clientID: 1001, clock: 4, state: null }]))).toBe('applied');
+    // a 3.x provider echoes what it was relayed
+    expect(s.deliver(s.conn('peer'), awarenessFrame([{ clientID: 1001, clock: 3, state: { user: { name: 'V' } } }]))).toBe('applied');
+    // the owner, on the same or a new connection (a reconnect after a deploy keeps the Y.Doc and its id)
+    expect(s.deliver(victim, awarenessFrame([{ clientID: 1001, clock: 5, state: { user: { name: 'V' } } }]))).toBe('applied');
+    expect(s.deliver(s.conn('victim'), awarenessFrame([{ clientID: 1001, clock: 6, state: { user: { name: 'V' } } }]))).toBe('applied');
+    // one frame can mix a peer's removal with the sender's own state (y-protocols batches changed clients)
+    expect(s.deliver(s.conn('peer'), awarenessFrame([{ clientID: 1001, clock: 7, state: null }, { clientID: 3003, clock: 1, state: { user: { name: 'P' } } }]))).toBe('applied');
   });
 });

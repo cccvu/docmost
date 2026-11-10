@@ -67,3 +67,16 @@ const processRate = new CollabAuthRate();
 export function chargeCollabAuth(userId: string): void {
   if (!processRate.charge(String(userId))) throw { reason: COLLAB_AUTH_RATE_REASON };
 }
+
+/**
+ * The refusal for a collab token that does not verify (authentication.extension.ts, seam #213): `{ reason }` with no
+ * `message`, so Hocuspocus logs nothing (it logs `error.message` of a failed hook, once per attempt, and a token that
+ * does not verify never reaches the per-user rate). The reason is the one Hocuspocus sends for a refusal that names
+ * none (4.7.1 `ClientConnection`: `error.reason ?? "permission-denied"`), so the client sees what it saw before; the
+ * editor decides "expired?" from the token it sent, never from the reason (page-editor.tsx, collab-access.ts). How
+ * many times one socket may try is bounded by its Auth frames (frame-address.ts).
+ */
+export const COLLAB_INVALID_TOKEN_REASON = 'permission-denied';
+export function invalidCollabTokenRefusal(): { reason: string } {
+  return { reason: COLLAB_INVALID_TOKEN_REASON };
+}

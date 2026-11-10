@@ -3,7 +3,8 @@ import { join } from 'node:path';
 import * as ts from 'typescript';
 import { Hocuspocus } from '@hocuspocus/server';
 import { authFrame, FakeSocket } from './collab-ingress.testkit';
-import { COLLAB_PING_INTERVAL_MS, keepCollabSocketAlive } from './socket-keepalive';
+import { COLLAB_PING_INTERVAL_MS, COLLAB_STALL_INTERVALS, keepCollabSocketAlive } from './socket-keepalive';
+import { SocketLimitLog } from './socket-limit-log';
 
 /**
  * #790: Hocuspocus 4.x sends no pings and reaps a connection that received nothing for `timeout`. The gateway pings
@@ -61,6 +62,63 @@ describe('keepCollabSocketAlive (#790)', () => {
 
   it('pings well inside Hocuspocus\'s default 60 s idle timeout', () => {
     expect(COLLAB_PING_INTERVAL_MS).toBeLessThanOrEqual(30_000);
+  });
+});
+
+describe('#790 the stall check: a socket that stops reading is closed, a slow one is not', () => {
+  afterEach(() => jest.useRealTimers());
+  const MiB = 1024 * 1024;
+  const run = () => {
+    jest.useFakeTimers();
+    const sock = new PongingSocket(); // answers every ping: a pong proves nothing about reading
+    const warn = jest.fn();
+    keepCollabSocketAlive(sock, () => undefined, 1_000, new SocketLimitLog({ warn }));
+    return { sock, warn };
+  };
+
+  it(`terminates (and logs) a socket whose non-empty buffer has not gone down for ${COLLAB_STALL_INTERVALS} intervals in a row`, () => {
+    const { sock, warn } = run();
+    sock.bufferedAmount = 6 * MiB; // owed a SyncStep2 it never reads
+    jest.advanceTimersByTime(1_000); // first sample
+    sock.bufferedAmount += 2; // the ping it could not read either
+    jest.advanceTimersByTime(1_000);
+    expect(sock.terminated).toBe(false);
+    sock.bufferedAmount += 2;
+    jest.advanceTimersByTime(1_000);
+    expect(sock.terminated).toBe(true);
+    expect(warn.mock.calls).toEqual([[`COLLAB_SOCKET_LIMIT {"limit":"outbound_stalled","bufferedBytes":${6 * MiB + 4},"stalledMs":2000}`]]);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+
+  it('a slow client that drains anything between two ticks is never closed, even with broadcasts arriving', () => {
+    const { sock, warn } = run();
+    sock.bufferedAmount = 8 * MiB;
+    for (let tick = 0; tick < 60; tick++) {
+      jest.advanceTimersByTime(1_000);
+      sock.bufferedAmount = Math.max(1, sock.bufferedAmount - 100 * 1024 + 4 * 1024); // reads 100 KiB a tick, owed 4 KiB more
+    }
+    expect(sock.terminated).toBe(false);
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('progress resets the count: one stalled interval, a drain, one more stalled interval is not a stall', () => {
+    const { sock } = run();
+    sock.bufferedAmount = 1000;
+    jest.advanceTimersByTime(1_000);
+    sock.bufferedAmount = 1000; // stalled once
+    jest.advanceTimersByTime(1_000);
+    sock.bufferedAmount = 900; // read something
+    jest.advanceTimersByTime(1_000);
+    sock.bufferedAmount = 900; // stalled once again
+    jest.advanceTimersByTime(1_000);
+    expect(sock.terminated).toBe(false);
+  });
+
+  it('an empty buffer is never a stall (an idle, healthy editor)', () => {
+    const { sock } = run();
+    jest.advanceTimersByTime(100_000);
+    expect(sock.terminated).toBe(false);
+    expect(sock.pings).toBe(100);
   });
 });
 

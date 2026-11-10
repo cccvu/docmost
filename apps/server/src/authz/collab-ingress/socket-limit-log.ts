@@ -37,3 +37,14 @@ export class SocketLimitLog {
 
 /** The process-wide log every bound writes to. */
 export const collabSocketLimitLog = new SocketLimitLog();
+
+/**
+ * A collab ws client's `error` event (collaboration.module.ts, seam #227). ws emits it only for what the peer sent: a
+ * frame past `maxPayload`, `maxFragments` or `maxBufferedChunks` (limits.ts), or any other protocol violation, so a
+ * client controls how often it fires. Logged here, rate-limited, with ws's error code only (never its message or any
+ * client bytes); ws closes the socket itself.
+ */
+export function logCollabSocketError(error: unknown, limitLog: SocketLimitLog = collabSocketLimitLog): void {
+  const code = (error as { code?: unknown } | null)?.code;
+  limitLog.log('ws_error', { code: typeof code === 'string' && /^[A-Z0-9_]{1,64}$/.test(code) ? code : 'unknown' });
+}

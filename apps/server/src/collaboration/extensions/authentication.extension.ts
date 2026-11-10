@@ -17,7 +17,8 @@ import { getPageId } from '../collaboration.util';
 import { JwtCollabPayload, JwtType } from '../../core/auth/dto/jwt-payload';
 import { UserSessionRepo } from '@docmost/db/repos/session/user-session.repo';
 import { isWsConnectionLive } from '../../authz/ws-connection/ws-connection-live';
-import { chargeCollabAuth } from '../../authz/collab-ingress/auth-rate';
+import { chargeCollabAuth, invalidCollabTokenRefusal } from '../../authz/collab-ingress/auth-rate';
+import { admitCollabUserConnection } from '../../authz/collab-ingress/user-connections';
 
 @Injectable()
 export class AuthenticationExtension implements Extension {
@@ -41,14 +42,17 @@ export class AuthenticationExtension implements Extension {
     try {
       jwtPayload = await this.tokenService.verifyJwt(token, JwtType.COLLAB);
     } catch (error) {
-      throw new UnauthorizedException('Invalid collab token');
+      // CCC (wiki-v2 #790, UPSTREAM_MODIFICATIONS #213): no `message`, so Hocuspocus logs nothing per bad token.
+      throw invalidCollabTokenRefusal();
     }
 
     const userId = jwtPayload.sub;
     const workspaceId = jwtPayload.workspaceId;
 
-    // CCC (wiki-v2 #790, UPSTREAM_MODIFICATIONS #213): a per-user rate on authentication, before any read.
+    // CCC (wiki-v2 #790, UPSTREAM_MODIFICATIONS #213): a per-user rate on authentication and a per-user connection
+    // cap, before any read.
     chargeCollabAuth(userId);
+    admitCollabUserConnection(userId);
 
     const user = await this.userRepo.findById(userId, workspaceId);
 
