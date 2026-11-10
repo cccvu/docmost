@@ -11,6 +11,25 @@ import { ServicePageController } from './service-page.controller';
 import { ServiceContentController } from './service-content.controller';
 import { ServiceAttachmentController } from './service-attachment.controller';
 import { AuthzChangeController } from './authz-change.controller';
+import { ServiceGroupController } from './service-group.controller';
+import {
+  AddedGroupMembers,
+  EnsuredDefaultGroup,
+  GroupMembershipSummary,
+  GroupUsage,
+  GroupView,
+  RawGroupMember,
+} from './service-group.service';
+import {
+  AddGroupMembersDto,
+  CreateGroupDto,
+  EnsureDefaultGroupDto,
+  GROUP_MEMBER_BATCH_MAX,
+  GROUP_NAME_MAX_LENGTH,
+  GroupMembershipLookupDto,
+  UpdateGroupDto,
+} from './dto/group-admin.dto';
+import { AddSpaceMemberDto } from './dto/space-admin.dto';
 import { RATE_PRINCIPAL_HEADER, RATE_PRINCIPAL_PATTERN } from './service-auth.guard';
 import {
   CONTENT_DESCENDANT_MAX_DEPTH,
@@ -114,7 +133,7 @@ const CONTROLLERS = Reflect.getMetadata(MODULE_METADATA.CONTROLLERS, ServiceBrid
   new (...args: any[]) => unknown
 >;
 // The reviewed set (kept as imports so a removal from the module is a visible diff here too).
-void [ServiceBridgeController, ServiceWorkspaceController, ServiceSpaceController, ServicePageController, ServiceContentController, ServiceAttachmentController, AuthzChangeController];
+void [ServiceBridgeController, ServiceWorkspaceController, ServiceSpaceController, ServicePageController, ServiceContentController, ServiceAttachmentController, AuthzChangeController, ServiceGroupController];
 
 const METHOD_NAME: Record<number, string> = {
   [RequestMethod.GET]: 'get',
@@ -301,6 +320,13 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     PublicLabelSummary: keysOf<PublicLabelSummary>({ name: true, pageCount: true }),
     PublicActivityEvent: keysOf<PublicActivityEvent>({ key: true, type: true, occurredAt: true, actorId: true, actorName: true, pageId: true, spaceId: true, pageTitle: true, commentId: true, versionId: true }),
     SpaceCommentPolicy: keysOf<SpaceCommentPolicy>({ allowViewerComments: true }),
+    // #797 groups.
+    GroupView: keysOf<GroupView>({ id: true, name: true, description: true, isDefault: true, memberCount: true, createdAt: true }),
+    RawGroupMember: keysOf<RawGroupMember>({ memberId: true, userId: true, externalId: true, addedAt: true }),
+    GroupMembershipSummary: keysOf<GroupMembershipSummary>({ id: true, name: true, isDefault: true }),
+    GroupUsage: keysOf<GroupUsage>({ spaces: true, pages: true }),
+    AddedGroupMembers: keysOf<AddedGroupMembers>({ added: true, alreadyMember: true }),
+    EnsuredDefaultGroup: keysOf<EnsuredDefaultGroup>({ groupId: true, renamed: true, added: true }),
   };
 
   // The 5 inline (non-component) scalar bodies, tied to the CONTROLLER return types (a signature change reds).
@@ -310,7 +336,10 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
   const DEFAULT_WS = keysOf<Awaited<ReturnType<ServiceWorkspaceController['getDefault']>>>({ workspaceId: true });
   // #616: `replayed` is present only on a keyed create, so it is the one optional key.
   const CREATE_SPACE = keysOf<Awaited<ReturnType<ServiceSpaceController['create']>>>({ id: true, slug: true, name: true, replayed: true });
-  const ADD_MEMBER = keysOf<Awaited<ReturnType<ServiceSpaceController['addMember']>>>({ memberId: true, userId: true, version: true });
+  // #797: `groupId` (null for a user add) and `applied` (false only for an `atLeast` no-op) join the add's answer.
+  const ADD_MEMBER = keysOf<Awaited<ReturnType<ServiceSpaceController['addMember']>>>({ memberId: true, userId: true, groupId: true, version: true, applied: true });
+  const GROUP_LOOKUP = keysOf<Awaited<ReturnType<ServiceGroupController['lookupMemberships']>>>({ groups: true });
+  const GROUP_REMOVE_MEMBER = keysOf<Awaited<ReturnType<ServiceGroupController['removeMember']>>>({ removed: true });
   const RESOLVE_PAGE_SPACE = keysOf<Awaited<ReturnType<ServicePageController['resolveSpace']>>>({ pageId: true, spaceId: true });
   const SEARCH_PAGE = keysOf<ContentSearchResult>({ items: true, hasMore: true });
   const RESOLVE_ATTACHMENT_PAGE = keysOf<Awaited<ReturnType<ServiceAttachmentController['resolvePage']>>>({ attachmentId: true, pageId: true, spaceId: true });
@@ -361,6 +390,17 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     { id: 'listContentLabels', method: 'post', path: '/api/service/content/labels/list', expect: { kind: 'items', name: 'PublicLabelSummary' } },
     { id: 'listContentActivity', method: 'post', path: '/api/service/content/activity/list', expect: { kind: 'items', name: 'PublicActivityEvent' } },
     { id: 'getSpaceCommentPolicy', method: 'post', path: '/api/service/content/spaces/comment-policy', expect: { kind: 'ref', name: 'SpaceCommentPolicy' } },
+    // #797 groups.
+    { id: 'listGroups', method: 'get', path: '/api/service/groups', expect: { kind: 'array', name: 'GroupView' } },
+    { id: 'createGroup', method: 'post', path: '/api/service/groups', expect: { kind: 'ref', name: 'GroupView' } },
+    { id: 'getGroup', method: 'get', path: '/api/service/groups/{groupId}', expect: { kind: 'ref', name: 'GroupView' } },
+    { id: 'updateGroup', method: 'patch', path: '/api/service/groups/{groupId}', expect: { kind: 'ref', name: 'GroupView' } },
+    { id: 'getGroupUsage', method: 'get', path: '/api/service/groups/{groupId}/usage', expect: { kind: 'ref', name: 'GroupUsage' } },
+    { id: 'listGroupMembers', method: 'get', path: '/api/service/groups/{groupId}/members', expect: { kind: 'array', name: 'RawGroupMember' } },
+    { id: 'addGroupMembers', method: 'post', path: '/api/service/groups/{groupId}/members', expect: { kind: 'ref', name: 'AddedGroupMembers' } },
+    { id: 'removeGroupMember', method: 'delete', path: '/api/service/groups/{groupId}/members/{externalId}', expect: { kind: 'inline', keys: GROUP_REMOVE_MEMBER } },
+    { id: 'lookupGroupMemberships', method: 'post', path: '/api/service/groups/memberships/lookup', expect: { kind: 'inline', keys: GROUP_LOOKUP } },
+    { id: 'ensureDefaultGroup', method: 'post', path: '/api/service/groups/default/ensure', expect: { kind: 'ref', name: 'EnsuredDefaultGroup' } },
   ];
 
   // #545: the request is typed against the DTO (a field added on either side fails) and its caps are the DTO's.
@@ -454,7 +494,8 @@ describe('service-bridge.openapi.json member-mutation refusals (#486)', () => {
       expect(refName(o.responses['403'])).toBe('MemberWriteForbidden');
     }
     const branches = responses.MemberWriteForbidden.content['application/json'].schema.anyOf.map(refName);
-    expect(branches.sort()).toEqual(['Error', 'SelfGrantError']);
+    expect(branches.sort()).toEqual(['Error', 'GrantExceedsActorError', 'SelfGrantError']); // #797 adds INV-2
+    expect(SPEC.components.schemas.GrantExceedsActorError.properties.code.const).toBe('grant_exceeds_actor');
     const selfGrant = SPEC.components.schemas.SelfGrantError;
     expect(selfGrant.properties.code.const).toBe('self_grant');
     expect([...selfGrant.required].sort()).toEqual(['code', 'message']);
@@ -501,7 +542,7 @@ describe('service-bridge.openapi.json versions + member preview (#616)', () => {
     const preview = S.components.schemas.SpaceMemberPreviewRequest;
     expect(preview.additionalProperties).toBe(false);
     expect(sorted(preview.properties)).toEqual(
-      keysOf<SpaceMemberPreviewDto>({ action: true, externalId: true, addedByExternalId: true, memberId: true, role: true, actorExternalId: true, expectedVersion: true }),
+      keysOf<SpaceMemberPreviewDto>({ action: true, externalId: true, groupId: true, mode: true, addedByExternalId: true, memberId: true, role: true, actorExternalId: true, expectedVersion: true }),
     );
     expect(preview.required).toEqual(['action']);
     expect(preview.properties.action.enum).toEqual(['add', 'update', 'remove']);
@@ -809,5 +850,63 @@ describe('service-bridge.openapi.json rate principal and 429 (#780)', () => {
     // The anon bucket's refusal has its own code: a credential fault the integrator must not read as its caller's load.
     expect(S.components.schemas.RateLimitedError.properties.code.enum).toEqual(['rate_limited', 'service_auth_throttled']);
     expect(S.components.schemas.RateLimitedError.required).toEqual(['code', 'message']);
+  });
+});
+
+/**
+ * wiki-v2 #797 — the group control plane and the group branch of a space add are part of the wire contract: the request
+ * schemas carry exactly the fork DTO keys (a field added on either side fails), are closed, require what the DTO
+ * requires, and their caps are the DTO's. A member add names identities by externalId only (no group-id field).
+ */
+describe('service-bridge.openapi.json groups + group space adds (#797)', () => {
+  const S = SPEC as any;
+  const sorted = (o: object): string[] => Object.keys(o).sort();
+  const keysOf = <T,>(m: Record<keyof T, true>): string[] => Object.keys(m).sort();
+  const schema = (n: string) => S.components.schemas[n];
+
+  it('the group request schemas carry exactly the DTO keys, closed, with the DTO caps', () => {
+    const cases: Array<[string, string[], string[]]> = [
+      ['CreateGroupRequest', keysOf<CreateGroupDto>({ name: true, description: true, actorExternalId: true }), ['actorExternalId', 'name']],
+      ['UpdateGroupRequest', keysOf<UpdateGroupDto>({ name: true, description: true, actorExternalId: true }), ['actorExternalId']],
+      ['AddGroupMembersRequest', keysOf<AddGroupMembersDto>({ externalIds: true, actorExternalId: true }), ['actorExternalId', 'externalIds']],
+      ['GroupMembershipLookupRequest', keysOf<GroupMembershipLookupDto>({ externalId: true }), ['externalId']],
+      ['EnsureDefaultGroupRequest', keysOf<EnsureDefaultGroupDto>({ name: true, description: true, externalIds: true }), ['externalIds', 'name']],
+    ];
+    for (const [name, keys, required] of cases) {
+      expect([name, sorted(schema(name).properties)]).toEqual([name, keys]);
+      expect([name, schema(name).additionalProperties]).toEqual([name, false]);
+      expect([name, [...schema(name).required].sort()]).toEqual([name, required]);
+    }
+    expect(schema('AddGroupMembersRequest').properties.externalIds.maxItems).toBe(GROUP_MEMBER_BATCH_MAX);
+    expect(schema('AddGroupMembersRequest').properties.externalIds.minItems).toBe(1);
+    expect(schema('EnsureDefaultGroupRequest').properties.externalIds.maxItems).toBe(GROUP_MEMBER_BATCH_MAX);
+    expect(schema('EnsureDefaultGroupRequest').properties.externalIds.minItems).toBe(0);
+    expect(schema('CreateGroupRequest').properties.name.maxLength).toBe(GROUP_NAME_MAX_LENGTH);
+  });
+
+  it('AddSpaceMemberRequest carries exactly the DTO keys, with externalId XOR groupId', () => {
+    const add = schema('AddSpaceMemberRequest');
+    expect(sorted(add.properties)).toEqual(
+      keysOf<AddSpaceMemberDto>({ externalId: true, groupId: true, role: true, mode: true, addedByExternalId: true }),
+    );
+    expect(add.additionalProperties).toBe(false);
+    expect([...add.required].sort()).toEqual(['addedByExternalId', 'role']);
+    expect(add.oneOf).toEqual([{ required: ['externalId'] }, { required: ['groupId'] }]);
+    expect(schema('AddMemberMode').enum).toEqual(['set', 'atLeast']);
+  });
+
+  it('the group member remove declares Authz-Propagation (a narrowing route), and the group writes their 409', () => {
+    const op = (path: string, method: string) => S.paths[path][method];
+    expect(op('/api/service/groups/{groupId}/members/{externalId}', 'delete').responses['200'].headers['Authz-Propagation']).toBeDefined();
+    for (const [path, method] of [
+      ['/api/service/groups', 'post'],
+      ['/api/service/groups/{groupId}', 'patch'],
+      ['/api/service/groups/{groupId}', 'delete'],
+      ['/api/service/groups/{groupId}/members', 'post'],
+      ['/api/service/groups/default/ensure', 'post'],
+    ]) {
+      expect([path, method, op(path, method).responses['409'].$ref]).toEqual([path, method, '#/components/responses/GroupConflict']);
+    }
+    expect(schema('GroupInUseError').properties.code.const).toBe('group_in_use');
   });
 });

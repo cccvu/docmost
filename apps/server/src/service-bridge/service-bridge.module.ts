@@ -32,6 +32,11 @@ import { SearchModule } from '../core/search/search.module';
 // #616: the create-idempotency ledger (CCC authz/idempotency) for the keyed space create. Nest instantiates it once
 // with ConditionalPageModule's import, so its installer and sweep run once per process.
 import { IdempotencyLedgerModule } from '../authz/idempotency/idempotency-ledger.module';
+// #797: the group control plane, and the space-grant ceiling (INV-2), which asks the PDP through its own client.
+import { ServiceGroupController } from './service-group.controller';
+import { ServiceGroupService } from './service-group.service';
+import { SpaceGrantCeiling } from './space-grant-ceiling';
+import { HttpAuthzClient } from '../authz/http-authz.client';
 
 /**
  * CCC service-bridge — NOT upstream Docmost code.
@@ -55,6 +60,7 @@ import { IdempotencyLedgerModule } from '../authz/idempotency/idempotency-ledger
     ServiceContentController,
     ServiceAttachmentController,
     AuthzChangeController,
+    ServiceGroupController, // #797 (appended)
   ],
   providers: [
     ServiceBridgeService,
@@ -74,6 +80,9 @@ import { IdempotencyLedgerModule } from '../authz/idempotency/idempotency-ledger
     PageRestrictionGuardInstaller, // #493/#545 (appended)
     ServicePageImportService, // #616 import helpers (appended)
     PageContentParser, // #616: parses through the app's PageService, resolved lazily (appended)
+    ServiceGroupService, // #797 (appended)
+    SpaceGrantCeiling, // #797 INV-2 (appended)
+    HttpAuthzClient, // #797: the ceiling's PDP client (stateless; each authz module provides its own)
     // #493/#545: the page guards' DB refusals → 409 (inner to AppModule's audit interceptor; see the class).
     { provide: APP_INTERCEPTOR, useClass: PageGuardConflictInterceptor },
   ],

@@ -78,10 +78,10 @@ const run = (interceptor: RemoteNativeRefusalInterceptor, context: ExecutionCont
 describe('RemoteNativeRefusalInterceptor — every table key (#636)', () => {
   it('the parametrisation is not vacuous: every family contributes and every key is a case', () => {
     expect(new Set(CASES.map(([, f]) => f.id))).toEqual(
-      new Set(['spaceHardDelete', 'spaceNativeCreate', 'workspaceAdmin', 'groupAdmin', 'spaceMember', 'userEmail']),
+      new Set(['spaceHardDelete', 'spaceNativeCreate', 'workspaceAdmin', 'groupAdmin', 'spaceMember', 'userEmail', 'directoryRead']),
     );
     expect(CASES).toHaveLength(REMOTE_REFUSED_ROUTES.size);
-    expect(REMOTE_REFUSED_ROUTES.size).toBe(20); // 1 + 1 + 9 + 5 + 3 + 1
+    expect(REMOTE_REFUSED_ROUTES.size).toBe(26); // 1 + 1 + 9 + 5 + 3 + 1 + 6 (#797 directoryRead)
   });
 
   describe.each(CASES)('%s', (_label, family, key, entry) => {
@@ -305,6 +305,7 @@ describe('RemoteNativeRefusalInterceptor — every table key (#636)', () => {
         ['groupAdmin', 'group.native_admin_refused', 'group', 'platform_only'],
         ['spaceMember', 'space.native_member_refused', 'space', 'platform_only'],
         ['userEmail', 'user.native_email_change_refused', 'user', 'identity_platform_owned'],
+        ['directoryRead', 'directory.native_read_refused', 'workspace', 'directory_platform_owned'], // #797
       ]);
     });
 

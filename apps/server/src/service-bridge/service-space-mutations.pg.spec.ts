@@ -14,6 +14,7 @@ import {
   mkReadModelDb,
   createReadModelTables,
 } from './read-model-pg.testkit';
+import { allowAllCeiling } from './space-grant-ceiling.testkit';
 
 /**
  * Real-Postgres proof of the space control-plane MUTATION invariants (#486). The unit spec
@@ -149,12 +150,18 @@ d('ServiceSpaceService member mutations on real Postgres (#486)', () => {
         created_at timestamptz not null default now(), updated_at timestamptz not null default now(),
         constraint group_users_group_id_user_id_unique unique (group_id, user_id)
       )`;
+    // #797: a group row's re-role reads `groups.is_default` (INV-5). GROUP is not a default group, so no row is needed.
+    await pg`
+      create table groups (
+        id uuid primary key, name varchar, is_default boolean not null default false, workspace_id uuid,
+        deleted_at timestamptz
+      )`;
     // A child table with an FK to spaces: proves the space lock does not block FK KEY SHARE.
     await pg`create table fk_probe (id serial primary key, space_id uuid not null references spaces(id))`;
 
     const resolver = fakeWorkspaceResolver(WS);
     bridge = new ServiceBridgeService(db as any, new UserRepo(db as any), {} as any, {} as any, resolver, {} as any);
-    svc = new ServiceSpaceService(db as any, resolver, bridge);
+    svc = new ServiceSpaceService(db as any, resolver, bridge, undefined, allowAllCeiling());
   });
 
   afterAll(async () => {
