@@ -185,6 +185,8 @@ d('PageRestrictionService versioned writes on real Postgres (#616)', () => {
           checks.length === 1 && (checks[0] as { permission: string }).permission === 'administer'
             ? [true]
             : checks.map((_c, i) => pdp[i] ?? true),
+        // #797: INV-4's settle fence (the ceiling allows here; page-grant-ceiling.pg.spec.ts is its subject).
+        settleProjection: async () => ({ status: 'confirmed' as const }),
       } as never,
       { invalidateSpaceRestrictionCache: async (spaceId: string) => void invalidations.push(spaceId) } as never,
     );

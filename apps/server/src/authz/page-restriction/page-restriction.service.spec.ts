@@ -71,7 +71,7 @@ function makeService(opts: {
   page?: { id: string; spaceId: string; workspaceId: string } | undefined;
   accessSeq?: (undefined | { id: string })[];
   /** The grant row `updatePermission` locks (`select … from page_permissions … for update`); none by default. */
-  grant?: { id: string };
+  grant?: { id: string; role?: string };
   /** AUTHZ_MODE (default `native`, where restrict keeps upstream's writer self-grant). */
   mode?: 'native' | 'remote';
   /** What `tryCheckBulk` answers for A2/A3 (null = the PDP failed); all-true by default. */
@@ -136,9 +136,19 @@ function makeService(opts: {
   const initialAccess = seq?.[0];
   const spy = spyKysely((q: SpyQuery) => {
     if (q.sql.includes('from page_access pa left join page_permissions')) {
-      return initialAccess ? [{ accessId: initialAccess.id, userId: null, groupId: null, role: null }] : [];
+      // #797 INV-4: the admin actor holds a writer grant on the restricted page (so its own grants are within the
+      // ceiling, which page-grant-ceiling.spec.ts covers), plus the row `grant` names for an update.
+      if (!initialAccess) return [];
+      type Row = { accessId: string; userId: string | null; groupId: string | null; role: string };
+      const rows: Row[] = [{ accessId: initialAccess.id, userId: ADMIN_ID, groupId: null, role: 'writer' }];
+      if (opts.grant) {
+        const role = opts.grant.role ?? 'reader';
+        rows.push({ accessId: initialAccess.id, userId: TARGET_USER, groupId: null, role });
+        rows.push({ accessId: initialAccess.id, userId: null, groupId: TARGET_GROUP, role });
+      }
+      return rows;
     }
-    if (q.sql.includes('from "page_permissions"')) return opts.grant ? [opts.grant] : [];
+    if (q.sql.includes('from "page_permissions"')) return opts.grant ? [{ role: 'reader', ...opts.grant }] : [];
     if (q.sql.includes('from "group_users"')) return opts.inGroup ? [{ groupId: TARGET_GROUP }] : [];
     if (q.sql.includes('from "pages" as "c"')) return opts.darkChild ? [{ id: 'child' }] : [];
     return [];
@@ -532,12 +542,16 @@ describe('PageRestrictionService — A1: no self page-grant (#486)', () => {
     expect(pagePermissionRepo.insertPagePermissions).not.toHaveBeenCalled();
   });
 
-  it('allows granting a group the actor is not in, and other users', async () => {
+  it('allows granting other users; a group the actor is not in passes A1 and is then refused by INV-6 (#797)', async () => {
     const { service, pagePermissionRepo } = makeService({ role: 'admin', accessSeq: [{ id: ACCESS_ID }] });
-    await expect(
-      service.addPermission(grant({ userIds: [TARGET_USER], groupIds: [TARGET_GROUP] }), userOf(ADMIN_ID)),
-    ).resolves.toEqual(WRITTEN);
-    expect(pagePermissionRepo.insertPagePermissions).toHaveBeenCalled();
+    await expect(service.addPermission(grant({ userIds: [TARGET_USER] }), userOf(ADMIN_ID))).resolves.toEqual(WRITTEN);
+    expect(pagePermissionRepo.insertPagePermissions).toHaveBeenCalledTimes(1);
+    const err = await service
+      .addPermission(grant({ userIds: [TARGET_USER], groupIds: [TARGET_GROUP] }), userOf(ADMIN_ID))
+      .catch((e) => e);
+    expect(err).toBeInstanceOf(BadRequestException);
+    expect(refusalCodeOf(err)).toBe('group_grant_not_allowed_on_restricted_page');
+    expect(pagePermissionRepo.insertPagePermissions).toHaveBeenCalledTimes(1);
   });
 
   it('refuses re-roling your own grant or your own group grant (no transaction opened)', async () => {
