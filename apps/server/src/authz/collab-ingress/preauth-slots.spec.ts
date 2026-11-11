@@ -15,7 +15,8 @@ import {
   COLLAB_PREAUTH_DEADLINE_MS,
   COLLAB_PREAUTH_SOCKETS,
 } from './limits';
-import { answerCollabUpgrade, collabPreAuthSlots, CollabPreAuthSlots } from './preauth-slots';
+import { answerCollabUpgrade, CollabPreAuthSlots } from './preauth-slots';
+import { CollabSocketBounds } from './socket-bounds';
 import { EventEmitter } from 'node:events';
 import { SocketLimitLog } from './socket-limit-log';
 
@@ -46,9 +47,14 @@ class Sock {
 describe('#790 CollabPreAuthSlots', () => {
   afterEach(() => jest.useRealTimers());
 
+  it('takes its bounds by name (#810 N7): positional numbers, which could be swapped silently, no longer type-check', () => {
+    // @ts-expect-error positional numbers are no longer accepted (scripts/ci/docmost-server-typecheck.mjs fails if they are)
+    expect(new CollabPreAuthSlots(4, 60_000).admit()).toBe(true);
+  });
+
   it('admits below the cap, refuses (logged) at it; a release or a close frees a slot; release is idempotent', () => {
     const warn = jest.fn();
-    const slots = new CollabPreAuthSlots(2, 60_000, new SocketLimitLog({ warn }));
+    const slots = new CollabPreAuthSlots({ cap: 2, deadlineMs: 60_000, limitLog: new SocketLimitLog({ warn }) });
     const [a, b, c] = [new Sock(), new Sock(), new Sock()];
     expect(slots.admit()).toBe(true);
     slots.hold(a);
@@ -71,7 +77,7 @@ describe('#790 CollabPreAuthSlots', () => {
   it(`terminates (and logs) a socket still unauthenticated ${COLLAB_PREAUTH_DEADLINE_MS} ms after it opened; an authenticated one is left alone`, () => {
     jest.useFakeTimers();
     const warn = jest.fn();
-    const slots = new CollabPreAuthSlots(4, COLLAB_PREAUTH_DEADLINE_MS, new SocketLimitLog({ warn }));
+    const slots = new CollabPreAuthSlots({ cap: 4, deadlineMs: COLLAB_PREAUTH_DEADLINE_MS, limitLog: new SocketLimitLog({ warn }) });
     const [slow, quick] = [new Sock(), new Sock()];
     slots.hold(slow);
     slots.hold(quick);
@@ -88,7 +94,7 @@ describe('#790 CollabPreAuthSlots', () => {
   });
 
   it('answers the upgrade 503 with Retry-After at the cap, synchronously', () => {
-    const slots = new CollabPreAuthSlots(1, 60_000, quietLog());
+    const slots = new CollabPreAuthSlots({ cap: 1, deadlineMs: 60_000, limitLog: quietLog() });
     const done = jest.fn();
     answerCollabUpgrade(slots, done);
     expect(done).toHaveBeenLastCalledWith(true);
@@ -114,7 +120,7 @@ describe('#790 CollabPreAuthSlots', () => {
 
   it('counts what the TCP socket delivers while unauthenticated: past the byte cap it terminates (logged); after release it stops counting', () => {
     const warn = jest.fn();
-    const slots = new CollabPreAuthSlots(4, 60_000, new SocketLimitLog({ warn }), 1000, 2000, 1_000_000);
+    const slots = new CollabPreAuthSlots({ cap: 4, deadlineMs: 60_000, limitLog: new SocketLimitLog({ warn }), socketBytes: 1000, closeGraceMs: 2000, totalBytes: 1_000_000 });
     const [greedy, honest] = [new Sock(), new Sock()];
     const [tg, th] = [new EventEmitter(), new EventEmitter()];
     slots.hold(greedy, tg as never);
@@ -137,7 +143,7 @@ describe('#790 CollabPreAuthSlots', () => {
   it('past the total budget the socket holding the most is cut, not the small honest ones, until the total is under', () => {
     const warn = jest.fn();
     // per socket 10,000 bytes, all of them together 10,000
-    const slots = new CollabPreAuthSlots(8, 60_000, new SocketLimitLog({ warn }), 10_000, 2000, 10_000);
+    const slots = new CollabPreAuthSlots({ cap: 8, deadlineMs: 60_000, limitLog: new SocketLimitLog({ warn }), socketBytes: 10_000, closeGraceMs: 2000, totalBytes: 10_000 });
     const honest = [new Sock(), new Sock(), new Sock()];
     const [big1, big2] = [new Sock(), new Sock()];
     const t = new Map<Sock, EventEmitter>();
@@ -164,7 +170,7 @@ describe('#790 CollabPreAuthSlots', () => {
   });
 
   it('a page whose SyncStep1 is 1 MiB (about 150,000 client ids) still opens before auth', () => {
-    const slots = new CollabPreAuthSlots(8, 60_000, quietLog());
+    const slots = new CollabPreAuthSlots({ cap: 8, deadlineMs: 60_000, limitLog: quietLog() });
     const sock = new Sock();
     const tr = new EventEmitter();
     slots.hold(sock, tr as never);
@@ -176,7 +182,7 @@ describe('#790 CollabPreAuthSlots', () => {
   it(`a refused socket keeps its slot while it closes, for at most ${COLLAB_PREAUTH_CLOSE_GRACE_MS} ms`, () => {
     jest.useFakeTimers();
     const warn = jest.fn();
-    const slots = new CollabPreAuthSlots(4, 60_000, new SocketLimitLog({ warn }));
+    const slots = new CollabPreAuthSlots({ cap: 4, deadlineMs: 60_000, limitLog: new SocketLimitLog({ warn }) });
     const [slow, prompt] = [new Sock(), new Sock()];
     slots.hold(slow);
     slots.hold(prompt);
@@ -225,7 +231,7 @@ describe('#790 through a real Hocuspocus 4.7.1: Authenticated frees the slot, Pe
     const sock = new FakeSocket();
     sockets.push(sock);
     slots.hold(sock); // as the ws adapter does at the upgrade
-    const bounded = new BoundedCollabSocket(sock, new WsSocketWrapper(sock as never), quietLog(), slots);
+    const bounded = new BoundedCollabSocket(sock, new WsSocketWrapper(sock as never), { preAuth: slots, limitLog: quietLog() });
     const cc = hp.handleConnection(bounded, new Request('http://localhost/'));
     sock.on('message', (data: Buffer) => cc.handleMessage(new Uint8Array(data)));
     sock.on('close', (code: number, reason: Buffer) => cc.handleClose({ code, reason: reason.toString() }));
@@ -234,7 +240,7 @@ describe('#790 through a real Hocuspocus 4.7.1: Authenticated frees the slot, Pe
   };
 
   it('a verified token frees its slot and keeps its socket; a refused one is closed 4401 after its PermissionDenied reply', async () => {
-    const slots = new CollabPreAuthSlots(8, 60_000, quietLog());
+    const slots = new CollabPreAuthSlots({ cap: 8, deadlineMs: 60_000, limitLog: quietLog() });
     const closing = jest.spyOn(slots, 'closing');
     const hp = server();
     const ok = connect(hp, slots, 'ok');
@@ -251,7 +257,7 @@ describe('#790 through a real Hocuspocus 4.7.1: Authenticated frees the slot, Pe
   });
 
   it('refused editors reconnecting over and over never fill the pool: an honest socket still gets a slot', async () => {
-    const slots = new CollabPreAuthSlots(4, 60_000, quietLog());
+    const slots = new CollabPreAuthSlots({ cap: 4, deadlineMs: 60_000, limitLog: quietLog() });
     const hp = server();
     for (let i = 0; i < 40; i++) {
       connect(hp, slots, 'nope');
@@ -270,17 +276,19 @@ describe('#790 through a real Hocuspocus 4.7.1: Authenticated frees the slot, Pe
 describe('#790 through the real ws adapter: the upgrade check, the slot and the byte count', () => {
   let server: Server;
   let adapter: CollabWsAdapter;
+  let bounds: CollabSocketBounds;
   let port: number;
   const clients: WebSocket[] = [];
   const fillers: Sock[] = [];
 
   beforeEach(async () => {
     server = createServer();
-    adapter = new CollabWsAdapter();
+    bounds = new CollabSocketBounds(); // per test: nothing one test holds reaches the next
+    adapter = new CollabWsAdapter(bounds);
     const wss = adapter.handleUpgrade('/collab', server);
     // As the gateway does on both paths: the bounded socket frees the slot on its first Authenticated reply.
     wss.on('connection', (ws: WebSocket) => {
-      const bounded = new BoundedCollabSocket(ws, new WsSocketWrapper(ws as never));
+      const bounded = new BoundedCollabSocket(ws, new WsSocketWrapper(ws as never), { preAuth: bounds.preAuth });
       ws.on('message', (data: Buffer) => {
         if (data.toString() === 'authenticate-me') bounded.send(new OutgoingMessage('page.x').writeAuthenticated(false).toUint8Array());
       });
@@ -289,12 +297,12 @@ describe('#790 through the real ws adapter: the upgrade check, the slot and the 
     port = (server.address() as AddressInfo).port;
   });
   afterEach(async () => {
-    for (const f of fillers.splice(0)) collabPreAuthSlots.release(f);
+    for (const f of fillers.splice(0)) bounds.preAuth.release(f);
     for (const c of clients.splice(0)) c.terminate();
     adapter.destroy();
     await new Promise<void>((r) => server.close(() => r()));
     await settle(30);
-    expect(collabPreAuthSlots.size).toBe(0); // nothing leaks
+    expect(bounds.preAuth.size).toBe(0); // nothing leaks
   });
 
   /** Open a client; resolves 'open' or the HTTP status the upgrade was refused with. */
@@ -309,10 +317,10 @@ describe('#790 through the real ws adapter: the upgrade check, the slot and the 
   const closed = (ws: WebSocket) => new Promise<number>((r) => ws.once('close', (code) => r(code)));
   /** Take all but `free` slots with stand-ins (512 real sockets would only slow the spec down). */
   const fill = (free: number) => {
-    while (collabPreAuthSlots.size < COLLAB_PREAUTH_SOCKETS - free) {
+    while (bounds.preAuth.size < COLLAB_PREAUTH_SOCKETS - free) {
       const f = new Sock();
       fillers.push(f);
-      collabPreAuthSlots.hold(f);
+      bounds.preAuth.hold(f);
     }
   };
 
@@ -322,17 +330,17 @@ describe('#790 through the real ws adapter: the upgrade check, the slot and the 
     const opened = results.filter((r) => r.outcome === 'open');
     expect(opened).toHaveLength(6);
     expect(results.filter((r) => r.outcome === 503)).toHaveLength(6);
-    expect(collabPreAuthSlots.size).toBe(COLLAB_PREAUTH_SOCKETS);
+    expect(bounds.preAuth.size).toBe(COLLAB_PREAUTH_SOCKETS);
     expect((await dial()).outcome).toBe(503);
 
     opened[0].ws.send('authenticate-me'); // the server sends its Authenticated reply: the slot is freed
     await settle(30);
-    expect(collabPreAuthSlots.size).toBe(COLLAB_PREAUTH_SOCKETS - 1);
+    expect(bounds.preAuth.size).toBe(COLLAB_PREAUTH_SOCKETS - 1);
     expect((await dial()).outcome).toBe('open');
 
     opened[1].ws.close();
     await settle(30);
-    expect(collabPreAuthSlots.size).toBe(COLLAB_PREAUTH_SOCKETS - 1);
+    expect(bounds.preAuth.size).toBe(COLLAB_PREAUTH_SOCKETS - 1);
     expect((await dial()).outcome).toBe('open');
   });
 
@@ -343,7 +351,7 @@ describe('#790 through the real ws adapter: the upgrade check, the slot and the 
     expect(other.outcome).toBe('open');
     other.ws.send('authenticate-me');
     await settle(30);
-    expect(collabPreAuthSlots.size).toBe(67);
+    expect(bounds.preAuth.size).toBe(67);
   });
 
   it(`terminates an unauthenticated socket past ${COLLAB_PREAUTH_SOCKET_BYTES} bytes, a partial frame included; an honest one is kept`, async () => {
@@ -358,6 +366,6 @@ describe('#790 through the real ws adapter: the upgrade check, the slot and the 
     expect(await code).toBe(1006);
     await settle(30);
     expect(honest.ws.readyState).toBe(WebSocket.OPEN);
-    expect(collabPreAuthSlots.size).toBe(1);
+    expect(bounds.preAuth.size).toBe(1);
   });
 });

@@ -6,6 +6,7 @@ jest.mock('../../collaboration/collaboration.util', () => ({
 import { UnauthorizedException } from '@nestjs/common';
 import { JwtStrategy } from '../../core/auth/strategies/jwt.strategy';
 import { AuthenticationExtension } from '../../collaboration/extensions/authentication.extension';
+import { CollabSocketBounds } from '../collab-ingress/socket-bounds';
 import { JwtPayload } from '../../core/auth/dto/jwt-payload';
 import { isWsConnectionLive } from './ws-connection-live';
 
@@ -80,6 +81,7 @@ const collabLive = async (userRepo: unknown, userSessionRepo: unknown, p: JwtPay
     { getUserSpaceRoles: async () => [{ userId: SUB, role: 'writer' }] } as any,
     { canUserEditPage: async () => ({ hasAnyRestriction: false, canAccess: true, canEdit: true }) } as any,
     userSessionRepo as any,
+    new CollabSocketBounds(),
   );
   try {
     await ext.onAuthenticate({ documentName: 'page.p1', token: 't', connectionConfig: { readOnly: false } } as any);

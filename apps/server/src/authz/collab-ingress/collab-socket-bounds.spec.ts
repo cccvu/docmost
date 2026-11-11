@@ -7,7 +7,7 @@ import { Hocuspocus } from '@hocuspocus/server';
 import { CollabWsAdapter } from '../../collaboration/adapter/collab-ws.adapter';
 import { PAGE_MAX_YDOC_BYTES, PAGE_MAX_YDOC_BYTES_CEILING } from '../page-write/page-size';
 import { COLLAB_HOCUSPOCUS_OPTIONS, COLLAB_MAX_PAYLOAD_BYTES, COLLAB_PREAUTH_SOCKET_BYTES, COLLAB_WS_SERVER_OPTIONS } from './limits';
-import { collabPreAuthSlots } from './preauth-slots';
+import { CollabSocketBounds } from './socket-bounds';
 
 /**
  * #790: the inbound bounds are effective where they are wired. The ws limits through the REAL collab ws adapter
@@ -38,12 +38,13 @@ describe('#790 ws limits through the collab ws adapter', () => {
 
   beforeAll(async () => {
     http = createServer();
-    adapter = new CollabWsAdapter();
+    const bounds = new CollabSocketBounds();
+    adapter = new CollabWsAdapter(bounds);
     wss = adapter.handleUpgrade('/collab', http);
     wss.on('connection', (ws) => {
       // As if it had authenticated: maxPayload is the bound on an authenticated socket (before that, the pre-auth byte
       // count terminates it far sooner: preauth-slots.spec.ts).
-      collabPreAuthSlots.release(ws);
+      bounds.preAuth.release(ws);
       ws.on('message', (data: Buffer) => received.push(data.byteLength));
       ws.on('error', () => undefined); // collaboration.module.ts logs a client error; ws closes the socket itself
     });

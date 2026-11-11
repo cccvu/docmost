@@ -7,8 +7,8 @@
  * Hocuspocus 4.7.1 lets a socket whose Auth was refused send Auth again without limit, and every attempt re-runs
  * `onAuthenticate` (several DB reads and a PDP check). Sockets are cheap too: a refused editor that reconnects in a
  * loop pays the same cost on every new socket. So the bucket is per user id (the JWT `sub`), across sockets: burst
- * COLLAB_AUTH_BURST, refill COLLAB_AUTH_REFILL_PER_SECOND. One process-wide Map; a bucket that has refilled to full
- * carries no state, so a sweep (at most once a minute) drops those.
+ * COLLAB_AUTH_BURST, refill COLLAB_AUTH_REFILL_PER_SECOND. One Map per process (the instance `CollabSocketBounds`
+ * owns); a bucket that has refilled to full carries no state, so a sweep (at most once a minute) drops those.
  *
  * An empty bucket is refused with COLLAB_AUTH_RATE_REASON (auth-refusal.ts: no `message`, so Hocuspocus logs
  * nothing), logged once, rate-limited, as `COLLAB_SOCKET_LIMIT {"limit":"auth_rate"}`.
@@ -22,11 +22,18 @@ interface Bucket {
   at: number;
 }
 
+export interface CollabAuthRateOptions {
+  limitLog?: SocketLimitLog;
+}
+
 export class CollabAuthRate {
   private readonly buckets = new Map<string, Bucket>();
   private lastSweep = 0;
+  private readonly limitLog: SocketLimitLog;
 
-  constructor(private readonly limitLog: SocketLimitLog = collabSocketLimitLog) {}
+  constructor({ limitLog = collabSocketLimitLog }: CollabAuthRateOptions = {}) {
+    this.limitLog = limitLog;
+  }
 
   /** Take one authentication for `userId`; false when its bucket is empty. */
   charge(userId: string, now: number = Date.now()): boolean {
@@ -58,9 +65,10 @@ function refill(bucket: Bucket, now: number): number {
   return Math.min(COLLAB_AUTH_BURST, bucket.tokens + (Math.max(0, now - bucket.at) / 1000) * COLLAB_AUTH_REFILL_PER_SECOND);
 }
 
-const processRate = new CollabAuthRate();
-
-/** Charge one collab authentication to `userId`; throws `{ reason }` (no `message`) when the user is over the rate. */
-export function chargeCollabAuth(userId: string): void {
-  if (!processRate.charge(String(userId))) throw collabAuthRefusal(COLLAB_AUTH_RATE_REASON);
+/**
+ * Charge one collab authentication to `userId` in `rate` (through `CollabSocketBounds.chargeAuth`); throws `{ reason }`
+ * (no `message`) when the user is over the rate.
+ */
+export function chargeCollabAuth(userId: string, rate: CollabAuthRate): void {
+  if (!rate.charge(String(userId))) throw collabAuthRefusal(COLLAB_AUTH_RATE_REASON);
 }

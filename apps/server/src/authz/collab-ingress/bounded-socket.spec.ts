@@ -21,7 +21,7 @@ function harness() {
     close: jest.fn(),
   };
   const warn = jest.fn();
-  const socket = new BoundedCollabSocket(raw, inner, new SocketLimitLog({ warn }), new CollabPreAuthSlots());
+  const socket = new BoundedCollabSocket(raw, inner, { preAuth: new CollabPreAuthSlots(), limitLog: new SocketLimitLog({ warn }) });
   const frame = (bytes: number) => new Uint8Array(bytes);
   return { raw, inner, sent, warn, socket, frame };
 }

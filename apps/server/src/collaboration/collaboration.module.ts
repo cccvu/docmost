@@ -17,6 +17,7 @@ import { TransclusionModule } from '../core/page/transclusion/transclusion.modul
 import { StorageModule } from '../integrations/storage/storage.module';
 import { EnvironmentModule } from '../integrations/environment/environment.module';
 import { logCollabSocketError } from '../authz/collab-ingress/socket-limit-log'; // CCC seam #227 (wiki-v2 #790)
+import { CollabSocketBounds, collabSocketBoundsProvider } from '../authz/collab-ingress/socket-bounds'; // CCC seam #227 (wiki-v2 #810)
 
 @Module({
   providers: [
@@ -28,6 +29,7 @@ import { logCollabSocketError } from '../authz/collab-ingress/socket-limit-log';
     CollabHistoryService,
     CollaborationHandler,
     TransclusionService,
+    collabSocketBoundsProvider, // CCC (wiki-v2 #810): one CollabSocketBounds per process, injected below and into §3/§213
   ],
   exports: [CollaborationGateway],
   imports: [
@@ -47,10 +49,11 @@ export class CollaborationModule implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly collaborationGateway: CollaborationGateway,
     private readonly httpAdapterHost: HttpAdapterHost,
+    private readonly collabSocketBounds: CollabSocketBounds, // CCC (wiki-v2 #810)
   ) {}
 
   onModuleInit() {
-    this.collabWsAdapter = new CollabWsAdapter();
+    this.collabWsAdapter = new CollabWsAdapter(this.collabSocketBounds);
     const httpServer = this.httpAdapterHost.httpAdapter.getHttpServer();
 
     const wss = this.collabWsAdapter.handleUpgrade(this.path, httpServer);

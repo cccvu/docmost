@@ -12,6 +12,7 @@ import { UserSessionRepo } from '@docmost/db/repos/session/user-session.repo';
 import { TokenService } from '../../core/auth/services/token.service';
 import { SessionService } from '../../core/session/session.service';
 import { AuthenticationExtension } from '../../collaboration/extensions/authentication.extension';
+import { CollabSocketBounds } from '../collab-ingress/socket-bounds';
 import {
   PG_URL,
   bootstrapSchema,
@@ -99,6 +100,7 @@ d('the collab connect re-checks the collab token session on real Postgres (#537)
       { getUserSpaceRoles: async (userId: string) => [{ userId, role: 'writer' }] } as any,
       { canUserEditPage: async () => ({ hasAnyRestriction: false, canAccess: true, canEdit: true }) } as any,
       userSessionRepo,
+      new CollabSocketBounds(),
     );
   });
 

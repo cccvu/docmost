@@ -20,14 +20,15 @@
  * sends frees the slot, and a `PermissionDenied` reply sent while the socket holds one closes the socket (4401,
  * `permission-denied`, after the reply, so the editor still reads it and runs its token refetch), which then keeps the
  * slot only until it has closed. This is the one place that sees the replies of documents this node owns and of
- * documents RedisSync proxies to another node. Without the close, Hocuspocus 4.7.1 leaves a refused socket open and
- * the provider reconnecting it keeps a slot for as long as the editor stays open.
+ * documents RedisSync proxies to another node, so the close stays here rather than in a second wrapper on the send path.
+ * Without the close, Hocuspocus 4.7.1 leaves a refused socket open and the provider reconnecting it keeps a slot for as
+ * long as the editor stays open. Built only by `CollabSocketBounds.open` (socket-bounds.ts).
  */
 import * as decoding from 'lib0/decoding';
 import { MessageType, type WebSocketLike } from '@hocuspocus/server';
 import { AuthMessageType, WsReadyStates } from '@hocuspocus/common';
 import { COLLAB_MAX_PAYLOAD_BYTES, COLLAB_OUTBOUND_BUFFER_FACTOR } from './limits';
-import { collabPreAuthSlots, type CollabPreAuthSlots, type PreAuthSocket } from './preauth-slots';
+import type { CollabPreAuthSlots, PreAuthSocket } from './preauth-slots';
 import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
 
 /** The socket close after a refused authentication (the 4401 Hocuspocus's own Unauthorized close uses). */
@@ -53,15 +54,25 @@ export interface RawCollabSocket extends PreAuthSocket {
   terminate(): void;
 }
 
+export interface BoundedCollabSocketOptions {
+  /** The process's pre-auth slots, the same instance the ws adapter took this socket's slot from (socket-bounds.ts). */
+  preAuth: CollabPreAuthSlots;
+  limitLog?: SocketLimitLog;
+}
+
 export class BoundedCollabSocket implements WebSocketLike {
   private largestSent = 0;
+  private readonly preAuth: CollabPreAuthSlots;
+  private readonly limitLog: SocketLimitLog;
 
   constructor(
     private readonly raw: RawCollabSocket,
     private readonly inner: WebSocketLike,
-    private readonly limitLog: SocketLimitLog = collabSocketLimitLog,
-    private readonly preAuth: CollabPreAuthSlots = collabPreAuthSlots,
-  ) {}
+    { preAuth, limitLog = collabSocketLimitLog }: BoundedCollabSocketOptions,
+  ) {
+    this.preAuth = preAuth;
+    this.limitLog = limitLog;
+  }
 
   /** The ws socket underneath (socket-documents.ts keys a socket's document connections by it). */
   get rawSocket(): RawCollabSocket {

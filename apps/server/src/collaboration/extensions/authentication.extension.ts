@@ -17,9 +17,8 @@ import { getPageId } from '../collaboration.util';
 import { JwtCollabPayload, JwtType } from '../../core/auth/dto/jwt-payload';
 import { UserSessionRepo } from '@docmost/db/repos/session/user-session.repo';
 import { isWsConnectionLive } from '../../authz/ws-connection/ws-connection-live';
-import { chargeCollabAuth } from '../../authz/collab-ingress/auth-rate';
 import { invalidCollabTokenRefusal } from '../../authz/collab-ingress/auth-refusal';
-import { admitCollabUserConnection } from '../../authz/collab-ingress/user-connections';
+import { CollabSocketBounds } from '../../authz/collab-ingress/socket-bounds';
 
 @Injectable()
 export class AuthenticationExtension implements Extension {
@@ -32,6 +31,7 @@ export class AuthenticationExtension implements Extension {
     private readonly spaceMemberRepo: SpaceMemberRepo,
     private readonly pagePermissionRepo: PagePermissionRepo,
     private readonly userSessionRepo: UserSessionRepo,
+    private readonly collabSocketBounds: CollabSocketBounds, // CCC (wiki-v2 #810): the process's collab socket bounds
   ) {}
 
   async onAuthenticate(data: onAuthenticatePayload) {
@@ -52,8 +52,8 @@ export class AuthenticationExtension implements Extension {
 
     // CCC (wiki-v2 #790, UPSTREAM_MODIFICATIONS #213): a per-user rate on authentication and a per-user connection
     // cap, before any read.
-    chargeCollabAuth(userId);
-    admitCollabUserConnection(userId);
+    this.collabSocketBounds.chargeAuth(userId);
+    this.collabSocketBounds.admitUser(userId);
 
     const user = await this.userRepo.findById(userId, workspaceId);
 

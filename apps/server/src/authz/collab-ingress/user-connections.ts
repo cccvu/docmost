@@ -11,8 +11,9 @@
  * fails, or whose socket closes before the connection is set up, never reaches `connected`, so it holds nothing.
  *
  * Enforced twice:
- * - `admitCollabUserConnection`, in `onAuthenticate` right after the per-user auth rate and before any user, session,
- *   page or PDP read (authentication.extension.ts, seam #213): a user already at the cap is refused without a DB call;
+ * - `admitCollabUserConnection` (through `CollabSocketBounds.admitUser`), in `onAuthenticate` right after the per-user
+ *   auth rate and before any user, session, page or PDP read (authentication.extension.ts, seam #213): a user already at
+ *   the cap is refused without a DB call;
  * - the `connected` hook: authentications run concurrently, so several can pass that check together; one that would
  *   take the user past the cap is closed there (`connection.close`, then its socket, which would otherwise stay open
  *   holding no document), and the editor sees a close it reconnects from, to be refused at the first check.
@@ -25,16 +26,24 @@
  */
 import { COLLAB_USER_CONNECTIONS_REASON, collabAuthRefusal } from './auth-refusal';
 import { COLLAB_CONNECTIONS_PER_USER } from './limits';
-import { collabSocketDocuments, type CollabSocketDocuments, type CountedConnection } from './socket-documents';
+import type { CollabSocketDocuments, CountedConnection } from './socket-documents';
 import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
+
+export interface CollabUserConnectionsOptions {
+  /** Connections one user may hold in this process: COLLAB_CONNECTIONS_PER_USER. */
+  cap?: number;
+  limitLog?: SocketLimitLog;
+}
 
 export class CollabUserConnections {
   private readonly held = new Map<string, Set<string>>();
+  private readonly cap: number;
+  private readonly limitLog: SocketLimitLog;
 
-  constructor(
-    private readonly cap: number = COLLAB_CONNECTIONS_PER_USER,
-    private readonly limitLog: SocketLimitLog = collabSocketLimitLog,
-  ) {}
+  constructor({ cap = COLLAB_CONNECTIONS_PER_USER, limitLog = collabSocketLimitLog }: CollabUserConnectionsOptions = {}) {
+    this.cap = cap;
+    this.limitLog = limitLog;
+  }
 
   /** False (logged) when `userId` already holds the cap. Takes nothing. */
   admit(userId: string): boolean {
@@ -69,10 +78,11 @@ export class CollabUserConnections {
   }
 }
 
-const processConnections = new CollabUserConnections();
-
-/** In `onAuthenticate`: throws `{ reason }` (no `message`) when `userId` already holds the cap. */
-export function admitCollabUserConnection(userId: string, connections: CollabUserConnections = processConnections): void {
+/**
+ * In `onAuthenticate` (through `CollabSocketBounds.admitUser`): throws `{ reason }` (no `message`) when `userId` already
+ * holds the cap in `connections`, the registry the gateway's `connected` hook writes.
+ */
+export function admitCollabUserConnection(userId: string, connections: CollabUserConnections): void {
   if (!connections.admit(String(userId))) throw collabAuthRefusal(COLLAB_USER_CONNECTIONS_REASON);
 }
 
@@ -104,9 +114,10 @@ export class CollabUserConnectionsExtension {
   readonly priority = 9_000;
   readonly extensionName = 'CollabUserConnections';
 
+  /** Both registries are the process's own, from `CollabSocketBounds` (socket-bounds.ts), which builds this once. */
   constructor(
-    readonly connections: CollabUserConnections = processConnections,
-    readonly socketDocuments: CollabSocketDocuments = collabSocketDocuments,
+    readonly connections: CollabUserConnections,
+    readonly socketDocuments: CollabSocketDocuments,
   ) {}
 
   async connected(payload: ConnectedPayload): Promise<void> {

@@ -9,13 +9,14 @@ import { AuthenticationExtension } from '../../collaboration/extensions/authenti
 import { CollabAuthRate } from './auth-rate';
 import { COLLAB_AUTH_RATE_REASON, COLLAB_INVALID_TOKEN_REASON } from './auth-refusal';
 import { COLLAB_AUTH_BURST } from './limits';
+import { CollabSocketBounds } from './socket-bounds';
 import { SocketLimitLog } from './socket-limit-log';
 
 /** #790: the per-user collab authentication rate (burst 64, one a second), charged before any read. */
 describe('#790 CollabAuthRate', () => {
   const rate = () => {
     const warn = jest.fn();
-    return { warn, r: new CollabAuthRate(new SocketLimitLog({ warn })) };
+    return { warn, r: new CollabAuthRate({ limitLog: new SocketLimitLog({ warn }) }) };
   };
 
   it('admits a burst of 64 for one user, refuses the 65th, and leaves another user alone', () => {
@@ -75,6 +76,7 @@ describe('#790 the collab connect charges the rate after the token verifies and 
       spaceMemberRepo as any,
       pagePermissionRepo as any,
       sessions as any,
+      new CollabSocketBounds(),
     );
     const reads = () =>
       userRepo.findById.mock.calls.length +

@@ -5,12 +5,13 @@
  * bounds cannot cover it, and without this the total is bounded only at the edge, which a client reaching the load
  * balancer directly skips.
  *
- * - **At the upgrade** (`verifyCollabUpgrade`, the ws server's `verifyClient`, seam §226): past
+ * - **At the upgrade** (`CollabSocketBounds.verifyUpgrade`, the ws server's `verifyClient`, seam §226): past
  *   COLLAB_PREAUTH_SOCKETS held slots the upgrade is refused `503` with `Retry-After`, before ws creates a socket or
  *   reads a frame byte. The browser sees a failed connection, which the provider retries with backoff.
- * - **A slot is held** from the upgrade (`holdCollabPreAuth`, called by the ws adapter with the upgraded TCP socket,
- *   seam §226) until the socket's first `Authenticated` reply is SENT (`BoundedCollabSocket.send`, which sees the
- *   replies of documents this node owns and of documents RedisSync proxies to another node alike), or the socket closes.
+ * - **A slot is held** from the upgrade (`CollabSocketBounds.holdUpgraded`, called by the ws adapter with the upgraded
+ *   TCP socket, seam §226) until the socket's first `Authenticated` reply is SENT (`BoundedCollabSocket.send`, which
+ *   sees the replies of documents this node owns and of documents RedisSync proxies to another node alike), or the
+ *   socket closes.
  * - **Bytes**: while it holds a slot, every byte the socket's TCP socket delivers is counted (Node's public `data`
  *   event, so a partial frame ws is still assembling counts too). Its pre-auth queue and any partial frame are made of
  *   those bytes. One socket past COLLAB_PREAUTH_SOCKET_BYTES is terminated (`preauth_bytes`); and when all of them
@@ -25,8 +26,10 @@
  *
  * ws's check runs synchronously and the adapter's upgrade callback follows in the same call (no `await` between the
  * 503 decision and the slot being taken), so concurrent upgrades cannot all pass one free slot.
+ *
+ * One instance per process, owned by `CollabSocketBounds` (socket-bounds.ts), which the adapter takes the slot from and
+ * every `BoundedCollabSocket` releases it to: an adapter and a gateway on different instances would leak every slot.
  */
-import type { IncomingMessage } from 'http';
 import {
   COLLAB_PREAUTH_CLOSE_GRACE_MS,
   COLLAB_PREAUTH_DEADLINE_MS,
@@ -50,18 +53,46 @@ export interface PreAuthTransport {
 
 type Held = { socket: PreAuthSocket; timer: ReturnType<typeof setTimeout>; detach: () => void; bytes: number };
 
+/** Every bound defaults to its limits.ts constant; specs override them by name. */
+export interface CollabPreAuthSlotsOptions {
+  /** Slots (unauthenticated sockets) the process may hold: COLLAB_PREAUTH_SOCKETS. */
+  cap?: number;
+  /** From the upgrade to the first Authenticated reply: COLLAB_PREAUTH_DEADLINE_MS. */
+  deadlineMs?: number;
+  /** A refused socket's slot while it closes: COLLAB_PREAUTH_CLOSE_GRACE_MS. */
+  closeGraceMs?: number;
+  /** Bytes one unauthenticated socket may deliver: COLLAB_PREAUTH_SOCKET_BYTES. */
+  socketBytes?: number;
+  /** Bytes all of them together may deliver: COLLAB_PREAUTH_TOTAL_BYTES. */
+  totalBytes?: number;
+  limitLog?: SocketLimitLog;
+}
+
 export class CollabPreAuthSlots {
   private readonly held = new Map<object, Held>();
   private totalBytes = 0;
+  private readonly cap: number;
+  private readonly deadlineMs: number;
+  private readonly closeGraceMs: number;
+  private readonly socketBytesCap: number;
+  private readonly totalBytesCap: number;
+  private readonly limitLog: SocketLimitLog;
 
-  constructor(
-    private readonly cap: number = COLLAB_PREAUTH_SOCKETS,
-    private readonly deadlineMs: number = COLLAB_PREAUTH_DEADLINE_MS,
-    private readonly limitLog: SocketLimitLog = collabSocketLimitLog,
-    private readonly socketBytesCap: number = COLLAB_PREAUTH_SOCKET_BYTES,
-    private readonly closeGraceMs: number = COLLAB_PREAUTH_CLOSE_GRACE_MS,
-    private readonly totalBytesCap: number = COLLAB_PREAUTH_TOTAL_BYTES,
-  ) {}
+  constructor({
+    cap = COLLAB_PREAUTH_SOCKETS,
+    deadlineMs = COLLAB_PREAUTH_DEADLINE_MS,
+    closeGraceMs = COLLAB_PREAUTH_CLOSE_GRACE_MS,
+    socketBytes = COLLAB_PREAUTH_SOCKET_BYTES,
+    totalBytes = COLLAB_PREAUTH_TOTAL_BYTES,
+    limitLog = collabSocketLimitLog,
+  }: CollabPreAuthSlotsOptions = {}) {
+    this.cap = cap;
+    this.deadlineMs = deadlineMs;
+    this.closeGraceMs = closeGraceMs;
+    this.socketBytesCap = socketBytes;
+    this.totalBytesCap = totalBytes;
+    this.limitLog = limitLog;
+  }
 
   /** At the upgrade: false (logged) when the process already holds the cap. Takes nothing. */
   admit(): boolean {
@@ -160,27 +191,10 @@ export class CollabPreAuthSlots {
   }
 }
 
-/** The process's slots: checked and taken at the upgrade (the ws adapter), released by `BoundedCollabSocket`. */
-export const collabPreAuthSlots = new CollabPreAuthSlots();
-
-type VerifyCallback = (verified: boolean, code?: number, message?: string, headers?: Record<string, string>) => void;
+export type VerifyCallback = (verified: boolean, code?: number, message?: string, headers?: Record<string, string>) => void;
 
 /** Answer an upgrade from `slots`, synchronously: admitted, or a 503 with `Retry-After`. */
 export function answerCollabUpgrade(slots: CollabPreAuthSlots, done: VerifyCallback): void {
   if (slots.admit()) done(true);
   else done(false, 503, 'Service Unavailable', { 'Retry-After': '5' });
-}
-
-/**
- * The collab ws server's `verifyClient`. Exactly two parameters: ws calls the two-argument form with a callback (and
- * answers 401 for the one-argument form), and this answers it synchronously, so ws completes the upgrade and calls the
- * adapter's callback (`holdCollabPreAuth`) in the same call.
- */
-export function verifyCollabUpgrade(_info: { req: IncomingMessage }, done: VerifyCallback): void {
-  answerCollabUpgrade(collabPreAuthSlots, done);
-}
-
-/** The ws adapter's upgrade callback: the new ws socket takes its slot, counting the TCP socket it was upgraded from. */
-export function holdCollabPreAuth(ws: PreAuthSocket, transport: PreAuthTransport): void {
-  collabPreAuthSlots.hold(ws, transport);
 }
