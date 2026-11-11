@@ -80,8 +80,10 @@ const LEDGER_DOMAIN_H1 = 'ccc-write-idem/v1';
  *
  * `entry` is the only form ever RECORDED: the `h1:` digest (see the file header for why never the id or key).
  * The NUL separators are unambiguous because a UUID user id cannot contain NUL, so distinct `(userId, key)`
- * pairs hash distinct inputs. The pre-digest raw composite is held privately and only ever READ, by
- * `isDuplicateWriteKey`: pass the whole `ScopedWriteKey` there, never `.entry` alone (that skips the legacy read).
+ * pairs hash distinct inputs (the input is UTF-8, which is lossless: the golden vectors in write-idem.spec.ts
+ * pin it with non-ASCII keys). The pre-digest raw composite is held privately and only ever READ, by
+ * `isDuplicateWriteKey`, which accepts only a `ScopedWriteKey` (`.entry` would skip the legacy read and does
+ * not type-check there).
  */
 export class ScopedWriteKey {
   readonly #legacyEntry: string;
@@ -126,12 +128,11 @@ export function scopedWriteKey(userId: string, key: string): ScopedWriteKey {
  * duplicate must leave the doc untouched so the closing store is a genuine no-op). Call inside the transaction,
  * BEFORE applying content; on `true` the caller returns a no-op outcome without mutating.
  *
- * Production passes a `ScopedWriteKey`, which also reads the legacy raw entry. A plain string is checked as the
- * exact ledger entry, for specs and the ingress guard tests that seed entries directly.
+ * Takes a `ScopedWriteKey` only (never a string, `.entry` included), so every check also reads the legacy raw
+ * entry and is scoped to the acting user (S1). Specs that need a raw entry seed the map directly.
  */
-export function isDuplicateWriteKey(doc: Y.Doc, key: ScopedWriteKey | string): boolean {
-  const ledger = doc.getMap(WRITE_IDEM_MAP);
-  return typeof key === 'string' ? ledger.has(key) : key.isRecordedIn(ledger);
+export function isDuplicateWriteKey(doc: Y.Doc, key: ScopedWriteKey): boolean {
+  return key.isRecordedIn(doc.getMap(WRITE_IDEM_MAP));
 }
 
 /**
@@ -142,7 +143,7 @@ export function isDuplicateWriteKey(doc: Y.Doc, key: ScopedWriteKey | string): b
  */
 export function recordWriteKey(
   doc: Y.Doc,
-  key: ScopedWriteKey | string,
+  key: ScopedWriteKey,
   nowMs: number,
   retentionMs: number = WRITE_IDEM_RETENTION_MS,
   maxEntries: number = WRITE_IDEM_MAX_ENTRIES,
@@ -160,6 +161,7 @@ export function recordWriteKey(
     );
     for (let i = 0; i < over && i < oldest.length; i++) ledger.delete(oldest[i][0]);
   }
-  // A ScopedWriteKey records its digest only (never its legacy raw form).
-  ledger.set(typeof key === 'string' ? key : key.entry, nowMs);
+  // The digest only, never the legacy raw form. A `ScopedWriteKey`-only signature means no caller can record a
+  // raw or unscoped entry through here (write-idem.fitness.spec.ts keeps every other writer of the root out).
+  ledger.set(key.entry, nowMs);
 }
