@@ -113,7 +113,8 @@ export type CollabRule =
   | 'shadow-unavailable'
   | 'conflict-scan'
   | 'client-ids'
-  | 'delete-order';
+  | 'delete-order'
+  | 'cross-list';
 
 /** A refusal. `node`/`mark`/`key` are set only to names the schema declares: a log or a response never echoes input. */
 export interface Violation {

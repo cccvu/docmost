@@ -14,7 +14,8 @@
  * frames accepted but not yet applied (`inflight`), keeping it an exact image of live's future. Both the stateless
  * pre-pass and the shadow judge only what Yjs will integrate: a struct live already holds in full (a y-indexeddb
  * remount resends the whole local copy, the server's own `/v1` ledger entries and pre-#781 content included) is a
- * no-op in Yjs and is not refused for its content (see `heldByLive`).
+ * no-op in Yjs and is not refused for its content (see `heldByLive`). The shadow also reads where Yjs LINKED each new
+ * item, not only the parent it names: an item linked after a neighbour of another list is refused `cross-list`.
  *
  * Ordering (Hocuspocus 4.7.1, `Connection.processMessages` and `MessageReceiver.apply`): each document connection
  * queues its frames and handles one at a time: it awaits the `beforeHandleMessage` hooks (one promise chain), then the
@@ -951,6 +952,16 @@ function checkStruct(item: Y.Item, root: Y.AbstractType<any> | undefined, touche
   const parent = item.parent as Y.AbstractType<any>;
   const parentKind = kindOf(parent);
   if (rootOf(parent) !== root) return { rule: 'root' };
+  // An item is linked after its `left`, into that neighbour's list. Yjs derives the parent FROM the left for a struct
+  // with an origin (getMissing), but the tail of a partly known struct (Item.integrate, offset > 0) is linked after the
+  // same client's previous clock while keeping the parent getMissing resolved (from the wire, or from the ORIGINAL
+  // origin). So a crafted frame names one list and lands in another, one this guard never checks: a string in the root
+  // list wedges every browser and the store; a keyed tail writes another element's attribute and deletes the value it
+  // follows. A remote integration never does it honestly: that previous clock is the same original struct (same parent,
+  // same key), and `right` is always `left.right` or the head of the item's own list, so `left` is the one to read.
+  // Before the `deleted` return: a tail deleted on arrival is still linked into the foreign list.
+  const left = item.left;
+  if (left !== null && (left.parent !== parent || left.parentSub !== item.parentSub)) return { rule: 'cross-list' };
   // #816: Yjs never writes a keyed item with a rightOrigin (typeMapSet and redo leave it null; a split copies it), and one
   // re-walks its key's history. Checked here, not in the pre-pass: an item with an origin or a rightOrigin takes its key
   // from them at integrate time (Yjs's readItem reads parentSub only when both are null), so the wire never shows it.
