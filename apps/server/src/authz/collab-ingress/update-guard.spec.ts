@@ -1574,21 +1574,19 @@ describe('#816 the per-user collab CPU budget (a debt)', () => {
   it('a rebuild a refusal made necessary is charged to the refused user, never to the co-editor who triggers it', () => {
     const { s, cpu, edit } = cpuSetup();
     cpu.apply = 1;
-    cpu.rebuild = 1_500;
+    cpu.rebuild = 200; // small enough that several rounds rebuild before the refused user is in debt
     const results: string[] = [];
-    let attacker = '';
-    for (let round = 0; round < 6; round++) {
-      // a frame refused in the shadow step (an object image src), which leaves the shadow dirty
-      const bad = new RemoteClient(s.live).edit(s.live, (f) => {
-        const img = new Y.XmlElement('image');
-        img.setAttribute('src', { evil: round } as never);
-        f.insert(1, [img]);
-      });
-      attacker = s.send(s.conn('attacker'), bad);
-      results.push(s.send(s.conn('co-editor'), edit())); // each one rebuilds the shadow
+    const attacker: string[] = [];
+    const rounds = 10;
+    for (let round = 0; round < rounds; round++) {
+      attacker.push(s.send(s.conn('attacker'), badImage(s, round)));
+      results.push(s.send(s.conn('co-editor'), edit())); // after each refusal, rebuilds the shadow
     }
     expect(results.every((r) => r === 'applied')).toBe(true);
-    expect(attacker).toBe(TRY_LATER); // the rebuilds were the attacker's
+    const refusedInShadow = attacker.filter((r) => r !== TRY_LATER && r !== 'applied').length;
+    expect(refusedInShadow).toBeGreaterThanOrEqual(3); // the co-editor rebuilt after each of these
+    expect(attacker[rounds - 1]).toBe(TRY_LATER); // the rebuilds were the attacker's
+    expect(s.guard.cpuBalance('co-editor')).toBe(USER_COLLAB_CPU_BURST_MS - rounds * 2 * cpu.apply); // its own applies only
   });
 
   it('report mode only logs', () => {

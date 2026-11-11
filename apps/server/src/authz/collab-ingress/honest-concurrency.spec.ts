@@ -299,7 +299,9 @@ describe('#816 honest concurrency never meets the CPU bounds', () => {
     expect(Y.decodeStateVector(Y.encodeStateVector(c.doc)).size - Y.decodeStateVector(Y.encodeStateVector(seedDoc)).size).toBeGreaterThan(4);
     expect(h.results.refused).toEqual([]);
     if (process.env.CONFLICT_SCAN_TALLY) console.log(JSON.stringify({ worstLowest: h.results.lowestBalance }));
-    expect(h.results.lowestBalance).toBeGreaterThan(0); // a 2000-paragraph paste, a 176k-step Step2: never in debt
+    // a 2000-paragraph paste, then a 176k-step Step2: never in debt. Real CPU clock: measured ~1,590 of 2,000 ms left on
+    // the dev box (~4.7x headroom); a runner that much slower would fail here, which is the signal to re-measure.
+    expect(h.results.lowestBalance).toBeGreaterThan(0);
     expect(contentOf(h.live)).toEqual(contentOf(c.doc));
   });
 
