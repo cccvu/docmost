@@ -2,6 +2,7 @@
 // does), so both connection paths are exercised exactly as wired.
 const hpConnections: Array<{ socket: unknown; handleMessage: jest.Mock }> = [];
 jest.mock('@hocuspocus/server', () => ({
+  MessageType: jest.requireActual('@hocuspocus/server').MessageType, // the real wire constants (frame-admission, bounded-socket)
   Hocuspocus: jest.fn().mockImplementation(() => ({
     configuration: { extensions: [] as unknown[] },
     handleConnection: (socket: unknown) => {

@@ -3,6 +3,7 @@
 // machinery actually runs here. This spec lives under authz/ (fork-owned) so it does not add an undocumented
 // file to the upstream-owned collaboration/ tree.
 jest.mock('@hocuspocus/server', () => ({
+  MessageType: jest.requireActual('@hocuspocus/server').MessageType, // the update guard reads the real wire constants
   Hocuspocus: jest.fn().mockImplementation(() => ({
     configuration: { extensions: [] as unknown[] },
   })),

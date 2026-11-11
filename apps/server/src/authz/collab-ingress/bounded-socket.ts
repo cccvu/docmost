@@ -24,14 +24,12 @@
  * the provider reconnecting it keeps a slot for as long as the editor stays open.
  */
 import * as decoding from 'lib0/decoding';
-import type { WebSocketLike } from '@hocuspocus/server';
+import { MessageType, type WebSocketLike } from '@hocuspocus/server';
+import { AuthMessageType, WsReadyStates } from '@hocuspocus/common';
 import { COLLAB_MAX_PAYLOAD_BYTES, COLLAB_OUTBOUND_BUFFER_FACTOR } from './limits';
 import { collabPreAuthSlots, type CollabPreAuthSlots, type PreAuthSocket } from './preauth-slots';
 import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
 
-const AUTH = 2; // Hocuspocus MessageType.Auth
-const PERMISSION_DENIED = 1; // @hocuspocus/common AuthMessageType.PermissionDenied
-const AUTHENTICATED = 2; // @hocuspocus/common AuthMessageType.Authenticated
 /** The socket close after a refused authentication (the 4401 Hocuspocus's own Unauthorized close uses). */
 export const COLLAB_DENIED_CLOSE_CODE = 4401;
 
@@ -40,9 +38,9 @@ export function authReplyOf(frame: Uint8Array): 'authenticated' | 'denied' | nul
   try {
     const d = decoding.createDecoder(frame);
     decoding.readVarString(d);
-    if (decoding.readVarUint(d) !== AUTH) return null;
+    if (decoding.readVarUint(d) !== MessageType.Auth) return null;
     const subtype = decoding.readVarUint(d);
-    return subtype === AUTHENTICATED ? 'authenticated' : subtype === PERMISSION_DENIED ? 'denied' : null;
+    return subtype === AuthMessageType.Authenticated ? 'authenticated' : subtype === AuthMessageType.PermissionDenied ? 'denied' : null;
   } catch {
     return null;
   }
@@ -54,8 +52,6 @@ export interface RawCollabSocket extends PreAuthSocket {
   readonly bufferedAmount: number;
   terminate(): void;
 }
-
-const OPEN = 1;
 
 export class BoundedCollabSocket implements WebSocketLike {
   private largestSent = 0;
@@ -77,7 +73,7 @@ export class BoundedCollabSocket implements WebSocketLike {
   }
 
   send(message: Uint8Array): void {
-    if (this.readyState !== OPEN) return;
+    if (this.readyState !== WsReadyStates.Open) return;
     const largest = Math.max(this.largestSent, message.byteLength);
     const allowance = COLLAB_OUTBOUND_BUFFER_FACTOR * COLLAB_MAX_PAYLOAD_BYTES + largest;
     const buffered = this.raw.bufferedAmount;

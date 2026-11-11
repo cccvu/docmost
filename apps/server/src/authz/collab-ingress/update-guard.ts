@@ -45,6 +45,7 @@ import { Logger } from '@nestjs/common';
 import * as decoding from 'lib0/decoding';
 import { decodeUtf8 } from 'lib0/string';
 import * as Y from 'yjs';
+import { MessageType } from '@hocuspocus/server';
 import { COLLAB_CONNECTIONS_PER_USER } from './limits';
 import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
 import {
@@ -115,14 +116,13 @@ const LOGS_PER_MINUTE = 30;
 
 export const reasonFor = (rule: CollabRule): string => (rule === 'unresolved' ? UNRESOLVED_REASON : REFUSED_REASON_PREFIX + rule);
 
-/** Hocuspocus 4.7.1 MessageType values and y-protocols sync subtypes. */
-const MESSAGE = { Sync: 0, Awareness: 1, Auth: 2, QueryAwareness: 3, SyncReply: 4, Stateless: 5, BroadcastStateless: 6, Close: 7 } as const;
 /**
  * The client message types 4.7.1's `MessageReceiver.apply` handles and an honest provider may send on an established
  * session (Stateless is refused on its own rule above, Auth on an established session on `auth`). Anything else falls
  * to its `default:` branch: one unrate-limited console.error per frame, and the session stays up.
  */
-const HANDLED = new Set<number>([MESSAGE.Sync, MESSAGE.Awareness, MESSAGE.QueryAwareness, MESSAGE.SyncReply, MESSAGE.Close]);
+const HANDLED = new Set<number>([MessageType.Sync, MessageType.Awareness, MessageType.QueryAwareness, MessageType.SyncReply, MessageType.CLOSE]);
+/** y-protocols/sync message subtypes (messageYjsSyncStep1/2/Update; y-protocols is not a declared dependency here). */
 const STEP1 = 0;
 const STEP2 = 1;
 const UPDATE = 2;
@@ -202,14 +202,14 @@ export class CollabUpdateGuard {
     if (earlier) throw { code: COLLAB_REFUSAL_CODE, reason: earlier };
     const header = readHeader(frame.update);
     if (!header) return; // not decodable as a frame: Hocuspocus refuses it itself
-    if (header.type === MESSAGE.Stateless || header.type === MESSAGE.BroadcastStateless) {
+    if (header.type === MessageType.Stateless || header.type === MessageType.BroadcastStateless) {
       return this.refuse(frame, header, { rule: 'stateless' }); // nothing in Docmost sends one; a broadcast reaches every peer
     }
     // Only an established session's frames reach this hook (Hocuspocus consumes the Auth that establishes it): a second
     // Auth re-runs onTokenSync, or logs, per frame. An honest provider authenticates once per open.
-    if (header.type === MESSAGE.Auth) return this.refuse(frame, header, { rule: 'auth' });
+    if (header.type === MessageType.Auth) return this.refuse(frame, header, { rule: 'auth' });
     if (!HANDLED.has(header.type)) return this.refuse(frame, header, { rule: 'message-type' });
-    if (header.type === MESSAGE.Awareness) {
+    if (header.type === MessageType.Awareness) {
       if (!header.payload) return; // malformed: Hocuspocus refuses it itself
       const checked = this.checkAwareness(frame, header.payload);
       if (checked.violation) this.refuse(frame, header, checked.violation); // throws unless report mode
@@ -226,7 +226,7 @@ export class CollabUpdateGuard {
       if (!frame.connection.readOnly && checked.entries) this.bindFromAwareness(this.docFor(frame.document), frame, checked.entries);
       return;
     }
-    if (header.type !== MESSAGE.Sync && header.type !== MESSAGE.SyncReply) return;
+    if (header.type !== MessageType.Sync && header.type !== MessageType.SyncReply) return;
     // A Step1 makes Hocuspocus encode the whole document (its Step2 answer); a reader's Step2 makes it snapshot it.
     if (header.subtype === STEP1 || (header.subtype === STEP2 && frame.connection.readOnly)) {
       const ok = this.takeBoth(
@@ -680,12 +680,12 @@ function readHeader(update: Uint8Array): Header | null {
     const d = decoding.createDecoder(update);
     decoding.readVarString(d);
     const type = decoding.readVarUint(d);
-    if (type === MESSAGE.Sync || type === MESSAGE.SyncReply) {
+    if (type === MessageType.Sync || type === MessageType.SyncReply) {
       const subtype = decoding.readVarUint(d);
       if (subtype !== STEP2 && subtype !== UPDATE) return { type, subtype };
       return { type, subtype, payload: tryRead(() => decoding.readVarUint8Array(d)) };
     }
-    if (type === MESSAGE.Awareness) return { type, payload: tryRead(() => decoding.readVarUint8Array(d)) };
+    if (type === MessageType.Awareness) return { type, payload: tryRead(() => decoding.readVarUint8Array(d)) };
     return { type };
   } catch {
     return null;

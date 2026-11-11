@@ -1,6 +1,9 @@
 import * as encoding from 'lib0/encoding';
 import * as decoding from 'lib0/decoding';
-import { admitCollabFrame, isCollabFrameAddress } from './frame-address';
+import { admitCollabFrame, isCollabFrameAddress } from './frame-admission';
+import { MessageType } from '@hocuspocus/server';
+import { AuthMessageType, WsReadyStates } from '@hocuspocus/common';
+import { MSG } from './collab-ingress.testkit';
 import {
   COLLAB_AUTH_FRAMES_PER_SOCKET,
   COLLAB_AWARENESS_BURST,
@@ -314,5 +317,32 @@ describe('#790 admitCollabFrame: the awareness rate (over-rate awareness is drop
     expect(ws.terminate).not.toHaveBeenCalled(); // and the session never ends
     advance(1000);
     expect(admit(AWARENESS)).toBe(true); // the frame after the drag gets through
+  });
+});
+
+describe('#810 (A5): the wire constants come from Hocuspocus 4.7.1, and are the values the wire uses', () => {
+  it('MessageType, AuthMessageType and WsReadyStates match the literal wire values (testkit MSG is the independent oracle)', () => {
+    expect({
+      Sync: MessageType.Sync,
+      Awareness: MessageType.Awareness,
+      Auth: MessageType.Auth,
+      QueryAwareness: MessageType.QueryAwareness,
+      SyncReply: MessageType.SyncReply,
+      Stateless: MessageType.Stateless,
+      BroadcastStateless: MessageType.BroadcastStateless,
+      Close: MessageType.CLOSE,
+      SyncStatus: MessageType.SyncStatus,
+    }).toEqual(MSG);
+    expect([MessageType.Ping, MessageType.Pong]).toEqual([9, 10]);
+    expect([AuthMessageType.Token, AuthMessageType.PermissionDenied, AuthMessageType.Authenticated]).toEqual([0, 1, 2]);
+    expect(WsReadyStates.Open).toBe(1);
+  });
+
+  it('trap, documented: a bare 4.7.1 provider Pong ([10], no document name) is refused frame_address', () => {
+    // The 4.7.1 server sends no app-level Ping (the keepalive uses ws protocol pings), so no honest provider sends this.
+    // If a future Hocuspocus server starts app-level pings, its providers' Pongs would terminate every socket here.
+    const ws = { readyState: 1, terminate: jest.fn() };
+    expect(admitCollabFrame(ws, new Uint8Array([MessageType.Pong]), new SocketLimitLog({ warn: () => undefined }))).toBe(false);
+    expect(ws.terminate).toHaveBeenCalledTimes(1);
   });
 });

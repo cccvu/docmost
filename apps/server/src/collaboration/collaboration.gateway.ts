@@ -34,7 +34,7 @@ import { CollabUpdateGuardExtension } from '../authz/collab-ingress/collab-updat
 import { keepCollabSocketAlive } from '../authz/collab-ingress/socket-keepalive'; // CCC seam #3 (#790)
 import { COLLAB_HOCUSPOCUS_OPTIONS } from '../authz/collab-ingress/limits'; // CCC seam #3 (#790)
 import { BoundedCollabSocket } from '../authz/collab-ingress/bounded-socket'; // CCC seam #3 (#790)
-import { admitCollabFrame } from '../authz/collab-ingress/frame-address'; // CCC seam #3 (#790)
+import { admitCollabFrame } from '../authz/collab-ingress/frame-admission'; // CCC seam #3 (#790)
 import { CollabUserConnectionsExtension } from '../authz/collab-ingress/user-connections'; // CCC seam #3 (#790)
 
 @Injectable()

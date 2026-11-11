@@ -3,6 +3,8 @@ import { initProseMirrorDoc, prosemirrorJSONToYDoc, updateYFragment } from '@tip
 import { Node as PMNode } from '@tiptap/pm/model';
 import { TableMap } from '@tiptap/pm/tables';
 import { TiptapTransformer } from '@hocuspocus/transformer';
+import { MessageType } from '@hocuspocus/server';
+import * as encoding from 'lib0/encoding';
 import { htmlToJson, jsonToHtml } from '../../collaboration/collaboration.util';
 import { serverSchema } from '../page-write/prelim-content';
 import { isDuplicateWriteKey, recordWriteKey, WRITE_IDEM_MAP } from '../page-write/write-idem';
@@ -1157,7 +1159,7 @@ describe('#790 frame bounds: Auth on an established session and unknown message 
   });
 });
 
-describe('#790 awareness: no rate refusal in the guard (the rate is a drop at the gateway, frame-address.ts)', () => {
+describe('#790 awareness: no rate refusal in the guard (the rate is a drop at the gateway, frame-admission.ts)', () => {
   it.each([['writer', false], ['reader', true]] as const)(
     'a %s sending 1000 cursor frames in one millisecond is never refused: a refusal would end an honest session',
     (_who, readOnly) => {
@@ -1215,5 +1217,43 @@ describe('#790 awareness: no state for another user\'s client id', () => {
     expect(s.deliver(s.conn('victim'), awarenessFrame([{ clientID: 1001, clock: 6, state: { user: { name: 'V' } } }]))).toBe('applied');
     // one frame can mix a peer's removal with the sender's own state (y-protocols batches changed clients)
     expect(s.deliver(s.conn('peer'), awarenessFrame([{ clientID: 1001, clock: 7, state: null }, { clientID: 3003, clock: 1, state: { user: { name: 'P' } } }]))).toBe('applied');
+  });
+});
+
+describe('#810 (A5): every Hocuspocus MessageType is classified, from the library enum', () => {
+  // The guard reads Hocuspocus's own enum (no local copy). This pins each member's outcome on an established session, so
+  // a Hocuspocus bump that adds a type goes red here until someone classifies it.
+  const EXPECTED: Record<string, 'applied' | string> = {
+    Sync: 'applied',
+    Awareness: 'applied',
+    Auth: REFUSED('auth'),
+    QueryAwareness: 'applied',
+    SyncReply: 'applied',
+    Stateless: REFUSED('stateless'),
+    BroadcastStateless: REFUSED('stateless'),
+    CLOSE: 'applied',
+    SyncStatus: REFUSED('message-type'),
+    Ping: REFUSED('message-type'),
+    Pong: REFUSED('message-type'),
+  };
+
+  it('the table covers exactly the enum members a client can put on the wire (Unknown = -1 is not a varint)', () => {
+    const members = Object.entries(MessageType).filter(([, v]) => typeof v === 'number' && v >= 0).map(([k]) => k);
+    expect(members.sort()).toEqual(Object.keys(EXPECTED).sort());
+    expect(MessageType.Unknown).toBe(-1);
+  });
+
+  it.each(Object.keys(EXPECTED))('%s', (name) => {
+    const s = setup({ seed: SEED });
+    const type = MessageType[name as keyof typeof MessageType] as number;
+    // Sync and SyncReply carry a Step1 so the frame reaches the HANDLED check (a bodiless one is left to Hocuspocus)
+    const frame =
+      type === MessageType.Sync || type === MessageType.SyncReply
+        ? typedFrame(type, (e) => {
+            encoding.writeVarUint(e, SYNC.Step1);
+            encoding.writeVarUint8Array(e, Y.encodeStateVector(s.live));
+          })
+        : typedFrame(type);
+    expect(s.deliver(s.conn('writer'), frame)).toBe(EXPECTED[name]);
   });
 });

@@ -70,7 +70,7 @@ export const COLLAB_HOCUSPOCUS_OPTIONS = {
 } as const;
 
 /**
- * Distinct document names one socket may ever address (frame-address.ts), checked before RedisSync keys a name in Redis
+ * Distinct document names one socket may ever address (frame-admission.ts), checked before RedisSync keys a name in Redis
  * and before Hocuspocus's own `maxPendingDocuments`. Docmost opens one document per socket (page-editor.tsx makes a
  * websocket per page editor); this is that limit's value, so an honest socket never meets either. One, not more: once a
  * socket has authenticated, Hocuspocus 4.7.1 applies no deadline to a second document it never authenticates, so its
@@ -79,7 +79,7 @@ export const COLLAB_HOCUSPOCUS_OPTIONS = {
 export const COLLAB_DOCUMENTS_PER_SOCKET = COLLAB_HOCUSPOCUS_OPTIONS.maxPendingDocuments;
 
 /**
- * Auth frames one socket may ever send (frame-address.ts). The provider sends one per document when the socket opens
+ * Auth frames one socket may ever send (frame-admission.ts). The provider sends one per document when the socket opens
  * (HocuspocusProvider.onOpen); a token refetch reopens the socket (collab-reconnect.ts), so it never re-authenticates on
  * the same socket. Two per document of COLLAB_DOCUMENTS_PER_SOCKET is headroom. Each Auth that Hocuspocus 4.7.1 refuses
  * clears that document's state, so without this a socket could re-run `onAuthenticate` (and its token verify) forever.
@@ -105,7 +105,7 @@ export const COLLAB_OUTBOUND_BUFFER_FACTOR = 1;
 export const COLLAB_CONNECTIONS_PER_USER = 32;
 
 /**
- * Awareness and QueryAwareness frames per socket (frame-address.ts): a burst of COLLAB_AWARENESS_BURST, then
+ * Awareness and QueryAwareness frames per socket (frame-admission.ts): a burst of COLLAB_AWARENESS_BURST, then
  * COLLAB_AWARENESS_REFILL_PER_SECOND. Hocuspocus relays each awareness frame to every peer. Past it the frame is DROPPED,
  * never refused: awareness is a lossy last-state channel (every frame carries each client's whole state at a higher
  * clock, so a later frame supersedes a dropped one), and an honest provider can exceed any fixed rate: it sends one

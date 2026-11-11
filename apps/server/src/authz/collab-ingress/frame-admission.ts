@@ -1,6 +1,10 @@
 /**
  * CCC collab integration — NOT upstream Docmost code (#790, ADR 0036).
  *
+ * The gateway's check on every inbound collab frame, on both paths (RedisSync and standalone), before RedisSync or
+ * Hocuspocus sees it. Both are synchronous, so a burst of frames in one TCP read is checked frame by frame.
+ *
+ * ## The address
  * Every Hocuspocus frame starts with its document name (a lib0 varString). RedisSync turns that name into a Redis
  * key (`collabLock:<name>`, a SET NX per frame for a document this node has not loaded) before anything
  * authenticates the socket, and Hocuspocus allocates a queue per name. Docmost only ever opens `page.<uuid>`
@@ -15,21 +19,25 @@
  * decoding it. A non-minimal varint (one no lib0 encoder writes) is refused too, so the name checked here is exactly
  * the name lib0's `readVarString` returns downstream.
  *
- * Per socket, before RedisSync or Hocuspocus sees the frame (both synchronous, so a burst of frames in one TCP read is
- * counted frame by frame):
+ * ## Per-socket budgets (past either, the socket is terminated and the frame dropped)
  * - at most COLLAB_DOCUMENTS_PER_SOCKET distinct names ever. RedisSync claims a Redis lock (a SET NX, a 5 s timer) for
  *   every name this node has not loaded BEFORE Hocuspocus counts its `maxPendingDocuments`, so without this one
  *   unauthenticated socket could make Redis (shared with the platform) take a SET per frame;
  * - at most COLLAB_AUTH_FRAMES_PER_SOCKET Auth frames ever. Hocuspocus 4.7.1 clears a document's state when it
  *   refuses its Auth, so the next Auth re-runs `onAuthenticate`; a token that does not verify never reaches the per-user
  *   auth rate (auth-rate.ts), which needs the verified user id.
- * Past either, the socket is terminated and the frame dropped.
- * - an awareness rate: Awareness and QueryAwareness frames past a burst of COLLAB_AWARENESS_BURST, then
- *   COLLAB_AWARENESS_REFILL_PER_SECOND, are DROPPED and the socket stays up (limits.ts says why a drop, not a refusal).
- *   Here, before RedisSync and Hocuspocus, a dropped frame is never proxied, queued or relayed, and the update guard
- *   never sees it. Nothing else is ever dropped: a dropped Sync frame would lose an edit.
+ *
+ * ## The awareness rate (a drop, not a refusal)
+ * Awareness and QueryAwareness frames past a burst of COLLAB_AWARENESS_BURST, then COLLAB_AWARENESS_REFILL_PER_SECOND,
+ * are DROPPED and the socket stays up (limits.ts says why a drop, not a refusal). Here, before RedisSync and
+ * Hocuspocus, a dropped frame is never proxied, queued or relayed, and the update guard never sees it. Nothing else is
+ * ever dropped: a dropped Sync frame would lose an edit.
+ *
+ * Message types are Hocuspocus's own `MessageType` (the wire values are pinned in frame-admission.spec.ts).
  */
 import * as decoding from 'lib0/decoding';
+import { MessageType } from '@hocuspocus/server';
+import { WsReadyStates } from '@hocuspocus/common';
 import {
   COLLAB_AUTH_FRAMES_PER_SOCKET,
   COLLAB_AWARENESS_BURST,
@@ -41,10 +49,6 @@ import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
 const NAME = /^page\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** `page.` + a 36-character UUID; below 128, so its varint is the single byte 41. */
 const NAME_BYTES = 41;
-const OPEN = 1;
-const AUTH = 2; // Hocuspocus MessageType.Auth
-const AWARENESS = 1; // Hocuspocus MessageType.Awareness
-const QUERY_AWARENESS = 3; // Hocuspocus MessageType.QueryAwareness
 const AWARENESS_REFILL_MS = 1000 / COLLAB_AWARENESS_REFILL_PER_SECOND;
 
 const asBytes = (data: Uint8Array | ArrayBuffer): Uint8Array => (data instanceof Uint8Array ? data : new Uint8Array(data));
@@ -99,7 +103,7 @@ export function admitCollabFrame(
   limitLog: SocketLimitLog = collabSocketLimitLog,
   now: () => number = Date.now,
 ): boolean {
-  if (ws.readyState !== OPEN) return false;
+  if (ws.readyState !== WsReadyStates.Open) return false;
   const frame = asBytes(data);
   const name = frameAddress(frame);
   if (name === null) return refuse(ws, limitLog, 'frame_address', { frameBytes: frame.byteLength });
@@ -110,10 +114,10 @@ export function admitCollabFrame(
     seen.names.add(name);
   }
   const type = messageType(frame);
-  if (type === AUTH && ++seen.auths > COLLAB_AUTH_FRAMES_PER_SOCKET) {
+  if (type === MessageType.Auth && ++seen.auths > COLLAB_AUTH_FRAMES_PER_SOCKET) {
     return refuse(ws, limitLog, 'socket_auth_frames', { authFrames: seen.auths });
   }
-  if (type === AWARENESS || type === QUERY_AWARENESS) return chargeAwareness(seen, now());
+  if (type === MessageType.Awareness || type === MessageType.QueryAwareness) return chargeAwareness(seen, now());
   return true;
 }
 
