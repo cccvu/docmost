@@ -113,7 +113,12 @@ export type CollabRule =
   | 'shadow-unavailable'
   | 'conflict-scan'
   | 'client-ids'
-  | 'delete-order';
+  | 'delete-order'
+  // #827 (collab-reasons.ts): a Step2/Update payload over PAGE_MAX_YDOC_BYTES, a second shadow-apply deadline, growth
+  // of a page still over a structure cap after compaction
+  | 'frame-too-large'
+  | 'apply-deadline'
+  | 'page-full';
 
 /** A refusal. `node`/`mark`/`key` are set only to names the schema declares: a log or a response never echoes input. */
 export interface Violation {

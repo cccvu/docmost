@@ -11,11 +11,13 @@ import {
   WebSocketStatus,
 } from "@hocuspocus/provider";
 import {
+  COLLAB_COMPACTING_BASE_MS,
   COLLAB_LOST_RETRY_MS,
   COLLAB_TRY_LATER_BASE_MS,
   collabAllowsEditing,
   collabRetryDelay,
 } from "./collab-access";
+import { COLLAB_UNSYNCED_KEY, CollabLocalCopy } from "./collab-epoch";
 import { createCollabAccessController } from "./collab-access-controller";
 import { reopensOnVisible } from "./collab-reconnect";
 import {
@@ -45,6 +47,8 @@ function setup(
     refetch?: () => Promise<RefetchResult>;
     random?: () => number;
     network?: EventTarget;
+    epoch?: number;
+    local?: (ydoc: Y.Doc) => CollabLocalCopy;
   } = {},
 ) {
   const socket = new HocuspocusProviderWebsocket({
@@ -52,6 +56,7 @@ function setup(
     WebSocketPolyfill: ScriptedSocket,
   });
   const ydoc = new Y.Doc();
+  const local = options.local?.(ydoc);
   const markDisconnected = vi.fn();
   const refetchToken = vi.fn(
     options.refetch ??
@@ -68,6 +73,8 @@ function setup(
     markDisconnected,
     random: options.random ?? (() => 1),
     network: options.network ?? null,
+    epoch: options.epoch,
+    local,
   });
   const remote = new HocuspocusProvider({
     websocketProvider: socket,
@@ -78,7 +85,7 @@ function setup(
   access.bind(remote);
   remote.attach();
   live.push({ socket, remote });
-  return { socket, remote, ydoc, access, markDisconnected, refetchToken };
+  return { socket, remote, ydoc, local, access, markDisconnected, refetchToken };
 }
 
 const sockets = () => ScriptedSocket.instances;
@@ -117,8 +124,9 @@ describe("the provider under test", () => {
       join(__dirname, "..", "editor", "page-editor.tsx"),
       "utf8",
     );
+    // #827: the url carries the copy's epoch (collab-epoch.ts), nothing else
     expect(source).toMatch(
-      /new HocuspocusProviderWebsocket\(\{\s*url: collaborationURL,\s*\}\)/,
+      /new HocuspocusProviderWebsocket\(\{\s*url: withCollabEpoch\(collaborationURL, collabEpoch\.epoch\), \/\/ CCC \(#827\)\s*\}\)/,
     );
   });
 
@@ -238,9 +246,13 @@ describe("try later (#810, F2, T2)", () => {
       expect(sockets()).toHaveLength(1); // the provider's own 1 s reconnect never ran
       await advance(1);
       expect(sockets()).toHaveLength(2);
-      // the retry is judged like any open: an authentication resets the wait
+      // the retry is judged like any open. #827: an authentication alone keeps the wait (a load can still trip);
+      // the server's Step2 (the provider's `synced`) resets it
       const second = await openLatest();
       second.receive(serverFrames.authenticated(DOC));
+      await flush();
+      expect(access.state.tryLaterAttempts).toBe(1);
+      second.receive(serverFrames.syncStep2(DOC, new Y.Doc()));
       await flush();
       expect(access.state.tryLaterAttempts).toBe(0);
       expect(sockets()).toHaveLength(2);
@@ -476,5 +488,132 @@ describe("reopensOnVisible (#810, EXT-4)", () => {
     expect(reopensOnVisible("visible", WebSocketStatus.Connected, closed)).toBe(
       false,
     );
+  });
+});
+
+// cccvu/wiki-v2#827 — the page-level answers through the real provider: an epoch-stale refusal stops this copy for
+// good and names the new epoch, a compaction is waited out read-only, and the dirty marker sees the provider's origin.
+describe("#827 through the real provider", () => {
+  it("an epoch-stale load refusal detaches and closes for good, naming the new epoch (no refetch, no retry)", async () => {
+    const { access, refetchToken, markDisconnected, ydoc } = setup({ epoch: 1 });
+    const first = await openLatest();
+    first.receive(serverFrames.authenticated(DOC));
+    first.receive(
+      serverFrames.permissionDenied(DOC, "ccc:collab-update-refused:epoch-stale:2"),
+    );
+    await flush();
+    expect(access.state.epochChangedTo).toBe(2);
+    expect(access.state.refusalKind).toBe("compacted");
+    expect(collabAllowsEditing(access.state)).toBe(false);
+    expect(refetchToken).not.toHaveBeenCalled();
+    expect(markDisconnected).not.toHaveBeenCalled();
+    await advance(COLLAB_LOST_RETRY_MS * 2);
+    expect(sockets()).toHaveLength(1); // nothing reconnects this lineage
+    const sentBefore = first.sent.length;
+    ydoc.getText("t").insert(0, "after"); // detached: an edit is not sent
+    expect(first.sent.length).toBe(sentBefore);
+  });
+
+  it("an epoch-stale refusal naming this copy's own epoch is an ordinary refusal (no switch, no loop)", async () => {
+    const { access } = setup({ epoch: 2 });
+    const first = await openLatest();
+    first.receive(
+      serverFrames.permissionDenied(DOC, "ccc:collab-update-refused:epoch-stale:2"),
+    );
+    await flush();
+    expect(access.state.refused).toBe(true);
+    expect(access.state.refusalKind).toBe("generic");
+    expect(access.state.epochChangedTo).toBeNull();
+  });
+
+  it("a compaction close is waited out read-only from 2 s; the next sync ends it", async () => {
+    const { access, markDisconnected, refetchToken } = setup({ random: () => 1 });
+    const first = await openLatest();
+    first.receive(serverFrames.authenticated(DOC));
+    await flush();
+    first.serverClose(1013, "ccc:collab-page-compacting");
+    await flush();
+    expect(access.state.compacting).toBe(true);
+    expect(collabAllowsEditing(access.state)).toBe(false);
+    expect(markDisconnected).toHaveBeenCalledTimes(1);
+    await advance(COLLAB_COMPACTING_BASE_MS - 1);
+    expect(sockets()).toHaveLength(1);
+    await advance(1);
+    expect(sockets()).toHaveLength(2);
+    const second = await openLatest();
+    second.receive(serverFrames.authenticated(DOC));
+    await flush();
+    expect(access.state.compacting).toBe(true); // authenticated is not loaded
+    second.receive(serverFrames.syncStep2(DOC, new Y.Doc()));
+    await flush();
+    expect(access.state.compacting).toBe(false);
+    expect(collabAllowsEditing(access.state)).toBe(true);
+    expect(refetchToken).not.toHaveBeenCalled();
+  });
+
+  it("a load refused while compacting waits again, longer each time (an authentication does not reset it)", async () => {
+    const { access } = setup({ random: () => 1 });
+    for (const wait of [2_000, 4_000, 8_000]) {
+      const s = await openLatest();
+      s.receive(serverFrames.authenticated(DOC));
+      s.receive(serverFrames.permissionDenied(DOC, "ccc:collab-page-compacting"));
+      s.serverClose(4401);
+      await flush();
+      expect(access.state.compacting).toBe(true);
+      const before = sockets().length;
+      await advance(wait - 1);
+      expect(sockets()).toHaveLength(before);
+      await advance(1);
+      expect(sockets()).toHaveLength(before + 1);
+    }
+  });
+
+  function memoryLocal(ydoc: Y.Doc) {
+    const store = new Map<string, unknown>();
+    return {
+      doc: ydoc,
+      store,
+      get: async (key: string) => store.get(key),
+      set: async (key: string, value: number) => store.set(key, value),
+    };
+  }
+
+  it("the copy is dirty from a local edit until the server acknowledged it; the server's own updates never dirty it", async () => {
+    const { access, ydoc, local } = setup({ local: memoryLocal });
+    expect(await access.isCopyDirty()).toBe(false);
+    const first = await openLatest();
+    first.receive(serverFrames.authenticated(DOC));
+    const serverDoc = new Y.Doc();
+    serverDoc.getText("t").insert(0, "server content");
+    first.receive(serverFrames.syncStep2(DOC, serverDoc)); // applied with the provider as origin
+    await flush();
+    expect(ydoc.getText("t").toString()).toBe("server content");
+    expect(await access.isCopyDirty()).toBe(false);
+    ydoc.getText("t").insert(0, "typed ");
+    expect(await access.isCopyDirty()).toBe(true);
+    expect((local as ReturnType<typeof memoryLocal>).store.get(COLLAB_UNSYNCED_KEY)).toBe(1);
+    // the provider counts its Step1 (reset to 1) and the update: two acknowledgements bring it to 0
+    first.receive(serverFrames.syncStatus(DOC));
+    first.receive(serverFrames.syncStatus(DOC));
+    await flush();
+    expect(await access.isCopyDirty()).toBe(false);
+    expect((local as ReturnType<typeof memoryLocal>).store.get(COLLAB_UNSYNCED_KEY)).toBe(0);
+  });
+
+  it("a refused frame (a nack) leaves the copy dirty", async () => {
+    const { access, ydoc } = setup({ local: memoryLocal });
+    const first = await openLatest();
+    first.receive(serverFrames.authenticated(DOC));
+    await flush();
+    ydoc.getText("t").insert(0, "typed");
+    first.receive(serverFrames.syncStatus(DOC, false));
+    first.receive(serverFrames.syncStatus(DOC, false));
+    await flush();
+    expect(await access.isCopyDirty()).toBe(true);
+  });
+
+  it("without a local copy, the copy reads dirty (never switch away from what cannot be checked)", async () => {
+    const { access } = setup();
+    expect(await access.isCopyDirty()).toBe(true);
   });
 });

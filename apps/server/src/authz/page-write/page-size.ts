@@ -23,6 +23,14 @@
  * Unit: ydoc bytes bound node count AND string amplification together (a node count misses long repeated strings).
  * Default 3 MiB (`PAGE_MAX_YDOC_BYTES`, clamped to [1, 8] MiB): ~6× the largest real page measured (0.52 MB),
  * ~1.4× a Google-Docs-maximum page (`legit-990k`, 2.26 MB). Comparable products cap at ~1.5–5 MB of equivalent.
+ *
+ * #827 (ADR 0036 amendment): editor growth is now bounded too, but not here. The collab guard refuses a Step2/Update
+ * frame larger than this cap before decoding it (`frame-too-large`), and counts per-page structure caps (structs,
+ * client ids, children of one element, load walk steps: collab-ingress/doc-bounds.ts). A page past a cap is compacted
+ * (page-write/compaction.ts): rebuilt from its visible content, which sheds the history these bytes also count. A page
+ * still over a cap after compaction is `page-full`: the guard refuses editor growth, and the collab handler refuses an
+ * API append/prepend with this file's `page_too_large` (`refusesGrowth`, seam #2); a replace still works. So the bytes
+ * measured here can also shrink now, when a compaction rewrites the row's ydoc.
  */
 import { Logger, ServiceUnavailableException, UnprocessableEntityException } from '@nestjs/common';
 import { sql } from 'kysely';

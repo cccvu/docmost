@@ -5,6 +5,8 @@ import * as Y from 'yjs';
 import { syncFrame, awarenessFrame, statelessFrame, MSG, RemoteClient } from './collab-ingress.testkit';
 import { CollabUpdateGuardExtension } from './collab-update-guard.extension';
 import { CollabUpdateGuard } from './update-guard';
+import { requestCompaction } from '../page-write/compaction-registry';
+import { COLLAB_LOAD_TRY_LATER_REASON, COLLAB_PAGE_COMPACTING_REASON } from './collab-reasons';
 
 /**
  * #781 wiring fitness (ADR 0036). Hocuspocus 4.7.1 handles one frame at a time per connection: it awaits the
@@ -14,7 +16,8 @@ import { CollabUpdateGuard } from './update-guard';
  * apply has the same length and no hook on it awaits anything; the guard's shadow replica is exact only under that
  * order. So: the guard is the FIRST extension, it is the ONLY `beforeHandleMessage` in the server, it never returns a
  * promise (it returns undefined or throws synchronously), and no server source defines a `beforeSync` or
- * `beforeHandleAwareness` hook (#790: either would sit on that path).
+ * `beforeHandleAwareness` hook (#790: either would sit on that path). #827 adds the join and load hooks, synchronous
+ * too: a load gate that awaited first could share its refusal with a co-loader.
  */
 const SRC = join(__dirname, '..', '..');
 const posix = (p: string) => p.split(sep).join('/');
@@ -100,17 +103,58 @@ describe('#781 the collab update guard is wired first, alone and synchronous', (
     expect(definesHook(ts.createSourceFile('x.ts', 'const beforeSyncNot = 1; call(beforeSync);', ts.ScriptTarget.Latest, true), 'beforeSync')).toBe(false);
   });
 
-  it('its hook is not async, and returns undefined (never a promise) for every kind of frame', () => {
+  it('#827: its hooks are exactly the frame hook, the join gate and the load pair, and none is async', () => {
     const sf = parse(join(__dirname, 'collab-update-guard.extension.ts'));
-    let asyncHook = true;
+    const hooks = new Map<string, boolean>();
     const visit = (n: ts.Node) => {
-      if (ts.isMethodDeclaration(n) && n.name.getText() === 'beforeHandleMessage') {
-        asyncHook = !!ts.getModifiers(n)?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword);
+      if (ts.isClassDeclaration(n) && n.name?.text === 'CollabUpdateGuardExtension') {
+        for (const m of n.members) {
+          if (!ts.isMethodDeclaration(m) && !ts.isPropertyDeclaration(m)) continue;
+          if (ts.getModifiers(m)?.some((x) => x.kind === ts.SyntaxKind.PrivateKeyword)) continue;
+          const isAsync = !!ts.getModifiers(m)?.some((x) => x.kind === ts.SyntaxKind.AsyncKeyword);
+          hooks.set(m.name.getText(), isAsync);
+        }
       }
       ts.forEachChild(n, visit);
     };
     visit(sf);
-    expect(asyncHook).toBe(false);
+    expect([...hooks.keys()].sort()).toEqual(['afterLoadDocument', 'beforeHandleMessage', 'extensionName', 'onAuthenticate', 'onLoadDocument', 'priority']);
+    expect([...hooks.values()].every((isAsync) => !isAsync)).toBe(true);
+  });
+
+  it('#827: the join and load gates refuse by a synchronous throw of { reason } (no co-loader shares it); afterLoadDocument never throws', () => {
+    const guard = new CollabUpdateGuard({ logger: { warn: () => undefined } });
+    const ext = new CollabUpdateGuardExtension(guard);
+    const live = new Y.Doc() as Y.Doc & { name: string };
+    live.name = 'page.p';
+    // a join to a resident document that drains
+    requestCompaction(live, { reason: 'structs', userId: null, drain: true });
+    const join = { instance: { documents: new Map([['page.p', live]]) }, documentName: 'page.p', context: {} };
+    let refused: unknown;
+    try {
+      ext.onAuthenticate(join as never);
+    } catch (err) {
+      refused = err;
+    }
+    expect(refused).toEqual({ reason: COLLAB_PAGE_COMPACTING_REASON });
+    expect(ext.onAuthenticate({ ...join, documentName: 'page.q' } as never)).toBeUndefined();
+    // a socket's load while its user is in debt; the same load from a DirectConnection is admitted
+    guard.chargeLoad('u', 1e9, guard.wallClock());
+    const load = (headers: Headers) => ({ document: new Y.Doc(), context: { user: { id: 'u' } }, requestHeaders: headers });
+    let thrown: unknown;
+    try {
+      ext.onLoadDocument(load(new Headers({ 'sec-websocket-key': 'k' })) as never);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toEqual({ reason: COLLAB_LOAD_TRY_LATER_REASON });
+    const direct = load(new Headers());
+    expect(ext.onLoadDocument(direct as never)).toBeUndefined();
+    expect(ext.afterLoadDocument(direct as never)).toBeUndefined();
+    expect(ext.afterLoadDocument({ document: undefined } as never)).toBeUndefined();
+  });
+
+  it('its frame hook returns undefined (never a promise) for every kind of frame', () => {
 
     const ext = new CollabUpdateGuardExtension(new CollabUpdateGuard({ logger: { warn: () => undefined } }));
     const live = new Y.Doc() as Y.Doc & { name: string };

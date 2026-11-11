@@ -25,6 +25,7 @@ import {
   syncFrame,
   typedFrame,
 } from './collab-ingress.testkit';
+import { COLLAB_PAGE_COMPACTING_REASON } from './collab-reasons';
 import { CONFLICT_SCAN_STEPS_PER_FRAME } from './conflict-scan';
 import {
   basePage,
@@ -76,6 +77,8 @@ const schema = serverSchema();
 const REFUSED = (rule: string) => `ccc:collab-update-refused:${rule}`;
 /** #790: an exhausted (user, document) budget: the socket closed 1013, never a 4422 refusal. */
 const TRY_LATER = 'try-later';
+/** #827: the socket closed 1013 with the compacting reason. */
+const COMPACTING = 'compacting';
 
 type Conn = { readOnly: boolean; webSocket: { close: jest.Mock }; context: { user: { id: string } } };
 
@@ -116,6 +119,10 @@ function setup(
       const ret = guard.check({ connection: c, document: live, update: frame, context: c.context });
       expect(ret).toBeUndefined(); // never a promise
     } catch (err: any) {
+      if (err?.code === COLLAB_TRY_LATER_CODE && err?.reason === COLLAB_PAGE_COMPACTING_REASON) {
+        expect(c.webSocket.close).toHaveBeenLastCalledWith(COLLAB_TRY_LATER_CODE, COLLAB_PAGE_COMPACTING_REASON);
+        return COMPACTING; // #827: a 1013 that names the compaction
+      }
       if (err?.code === COLLAB_TRY_LATER_CODE) {
         expect(err).toEqual({ code: COLLAB_TRY_LATER_CODE, reason: TRY_LATER_REASON });
         // the socket is closed FIRST, so Hocuspocus's document CLOSE (sent after the throw) never reaches the editor
@@ -1169,9 +1176,11 @@ describe('#790 frame bounds: Auth on an established session and unknown message 
 
   it('a type 4.7.1 does not handle is refused message-type; every type an honest provider sends passes', () => {
     const s = setup({ seed: SEED });
-    for (const type of [MSG.SyncStatus, 9, 10, 11, 127, 300]) expect(s.deliver(s.conn('a'), typedFrame(type))).toBe(REFUSED('message-type'));
+    // #827: QueryAwareness too: the 4.7.1 provider never sends it, and 4.7.1 answers it by encoding every awareness state
+    for (const type of [MSG.SyncStatus, MSG.QueryAwareness, 9, 10, 11, 127, 300]) {
+      expect(s.deliver(s.conn('a'), typedFrame(type))).toBe(REFUSED('message-type'));
+    }
     const c = s.conn('writer');
-    expect(s.deliver(c, typedFrame(MSG.QueryAwareness))).toBe('applied');
     expect(s.deliver(c, step1Frame(s.live))).toBe('applied');
     expect(s.deliver(c, awarenessFrame([{ clientID: 9, state: {} }]))).toBe('applied');
     expect(s.deliver(c, typedFrame(MSG.Close))).toBe('applied'); // a provider's detach
@@ -1188,7 +1197,6 @@ describe('#790 awareness: no rate refusal in the guard (the rate is a drop at th
         const frame = awarenessFrame([{ clientID: 4242, clock, state: { user: { name: 'W' }, cursor: { anchor: clock, head: clock } } }]);
         expect(s.deliver(c, frame)).toBe('applied');
       }
-      for (let i = 0; i < 100; i++) expect(s.deliver(c, typedFrame(MSG.QueryAwareness))).toBe('applied');
     },
   );
 });
@@ -1246,7 +1254,7 @@ describe('#810 (A5): every Hocuspocus MessageType is classified, from the librar
     Sync: 'applied',
     Awareness: 'applied',
     Auth: REFUSED('auth'),
-    QueryAwareness: 'applied',
+    QueryAwareness: REFUSED('message-type'), // #827: no 4.7.1 provider sends it; 4.7.1 encodes every state for nothing
     SyncReply: 'applied',
     Stateless: REFUSED('stateless'),
     BroadcastStateless: REFUSED('stateless'),

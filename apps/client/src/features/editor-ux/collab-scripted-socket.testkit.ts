@@ -140,6 +140,11 @@ export const serverFrames = {
     frame(documentName, MessageType.Sync, (e) =>
       syncProtocol.writeSyncStep2(e, doc),
     ),
+  /** #827: the server's acknowledgement of one sync frame it applied (the provider's unsynced count goes down). */
+  syncStatus: (documentName: string, applied = true) =>
+    frame(documentName, MessageType.SyncStatus, (e) =>
+      encoding.writeVarInt(e, applied ? 1 : 0),
+    ),
 };
 
 /** One frame the client sent: its document name, message type and the decoder positioned after them. */

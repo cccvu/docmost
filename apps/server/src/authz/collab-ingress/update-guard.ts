@@ -45,6 +45,23 @@
  * shadow step is timed and charged twice (live applies it again), and a frame that arrives while that user's balance is
  * negative closes the socket 1013 before any work. A rebuild a refusal made necessary is charged to the refused user.
  *
+ * Yjs bounds (#827, doc-bounds.ts). What the meter cannot count (formatting cleanup after a delete, struct splits,
+ * load-order inversion) runs under a wall-clock deadline (deadline.ts), innermost inside the meter: a frame's shadow
+ * apply (T_FRAME_MS; a timeout discards the shadow, and the first one for a (user, document) is a 1013 `frame_deadline`,
+ * a repeat with nothing accepted in between the 4422 `apply-deadline`, so a GC pause passes and a deterministic frame
+ * does not), every rebuild (a load, under the step budget W_MAX too), a server-local update mirrored into the shadow,
+ * and the probe. A Step2/Update payload over PAGE_MAX_YDOC_BYTES is refused `frame-too-large` before it is decoded.
+ * Per-page structure caps (structs, client ids, live children of one element, load walk steps) are counted on what each
+ * frame touched: past a soft cap compaction is requested for the next unload; a frame that grows the page past a hard
+ * cap closes 1013 `ccc:collab-page-compacting` and the page drains (every socket closed 1013) so it can compact; a page
+ * still over a cap after compaction is `page-full` (growth refused 4422, deletes pass). The probe, a few seconds after
+ * accepted growth, loads the shadow's encoding into a scratch document under the step budget (never swapped in), so an
+ * inversion no cap can see is caught within one probe interval. A connection's FIRST frame is checked against the
+ * page's lineage epoch (`?cccEpoch`, compaction-registry.ts): a copy of another lineage is refused 4422
+ * `epoch-stale:<N>` before the server answers anything, readers and report mode included. Joins to, and frames for, a
+ * document that is compacting, draining or superseded get the 1013 compacting close. QueryAwareness is refused
+ * `message-type`: no 4.7.1 provider sends it, and 4.7.1 encodes every awareness state for it and discards the result.
+ *
  * Refusal = a throw of `{ code: 4422, reason }`: Hocuspocus closes that ONE document session and sends the reason (the
  * websocket stays up). Reasons the client acts on (apps/client features/editor-ux): `ccc:collab-update-refused:<rule>`
  * (stop sending, read-only, notice) and `ccc:collab-update-unresolved` (reconnect once). A socket whose sessions are
@@ -55,9 +72,38 @@ import { Logger } from '@nestjs/common';
 import * as decoding from 'lib0/decoding';
 import { decodeUtf8 } from 'lib0/string';
 import * as Y from 'yjs';
-import { MessageType } from '@hocuspocus/server';
+import { isTransactionOrigin, MessageType } from '@hocuspocus/server';
+import { PAGE_MAX_YDOC_BYTES } from '../page-write/page-size';
+import {
+  canStartCompaction,
+  compactionArmed,
+  isClosedForCompaction,
+  isPageFull,
+  lineageEpoch,
+  LINEAGE_ROOT,
+  markPageFull,
+  requestCompaction,
+  type CompactionReason,
+} from '../page-write/compaction-registry';
 import { COLLAB_CONNECTIONS_PER_USER } from './limits';
 import { ConflictScan, installConflictScanMeter, type ConflictScanMeter } from './conflict-scan';
+import { COLLAB_PAGE_COMPACTING_REASON, epochStaleReason } from './collab-reasons';
+import { isDeadlineExceeded, runWithDeadline, type DeadlineRunner } from './deadline';
+import {
+  C_MAX,
+  COMPACTION_MIN_INTERVAL_MS,
+  E_MAX,
+  LOAD_DEADLINE_MS,
+  MIRROR_DEADLINE_MS,
+  PROBE_DEADLINE_MS,
+  PROBE_DEBOUNCE_MS,
+  PROBE_MIN_INTERVAL_MS,
+  readerStep2ChargeMs,
+  S_MAX,
+  softCap,
+  T_FRAME_MS,
+  W_MAX,
+} from './doc-bounds';
 import { collabSocketLimitLog, RateLimitedWarn, type SocketLimit, type SocketLimitLog } from './socket-limit-log';
 import {
   checkAttribute,
@@ -154,9 +200,11 @@ export const reasonFor = (rule: CollabRule): string => (rule === 'unresolved' ? 
 /**
  * The client message types 4.7.1's `MessageReceiver.apply` handles and an honest provider may send on an established
  * session (Stateless is refused on its own rule above, Auth on an established session on `auth`). Anything else falls
- * to its `default:` branch: one unrate-limited console.error per frame, and the session stays up.
+ * to its `default:` branch: one unrate-limited console.error per frame, and the session stays up. #827: QueryAwareness
+ * is left out (refused `message-type`): the 4.7.1 provider never sends it, and 4.7.1 answers one by encoding every
+ * awareness state and discarding the result (no reply callback on a connection), a pure CPU sink.
  */
-const HANDLED = new Set<number>([MessageType.Sync, MessageType.Awareness, MessageType.QueryAwareness, MessageType.SyncReply, MessageType.CLOSE]);
+const HANDLED = new Set<number>([MessageType.Sync, MessageType.Awareness, MessageType.SyncReply, MessageType.CLOSE]);
 /** y-protocols/sync message subtypes (messageYjsSyncStep1/2/Update; y-protocols is not a declared dependency here). */
 const STEP1 = 0;
 const STEP2 = 1;
@@ -173,21 +221,96 @@ export interface GuardConnection {
   readOnly: boolean;
   webSocket?: { close(code?: number, reason?: string): void };
 }
+/**
+ * Hocuspocus's Document: a Y.Doc with its page name, the awareness it has applied (`meta`: clientID → clock), and (#827)
+ * its socket connections, which a drain closes.
+ */
+export type GuardDocument = Y.Doc & {
+  name?: string;
+  awareness?: { meta: Map<number, { clock: number }> };
+  getConnections?(): Array<{ webSocket?: { close(code?: number, reason?: string): void } }>;
+};
 /** The subset of Hocuspocus's `beforeHandleMessagePayload` the guard reads. */
 export interface GuardFrame {
   connection: GuardConnection;
-  /** Hocuspocus's Document: a Y.Doc with its page name and the awareness it has applied (`meta`: clientID → clock). */
-  document: Y.Doc & { name?: string; awareness?: { meta: Map<number, { clock: number }> } };
+  document: GuardDocument;
   update: Uint8Array;
   context?: { user?: { id?: string } };
+  /** #827: the connection's request query; `cccEpoch` is the lineage epoch of the client's local copy (absent = 0). */
+  requestParameters?: { get(name: string): string | null };
+}
+/** #827: the per-page structure caps (doc-bounds.ts); specs pass smaller ones. */
+export interface DocCaps {
+  structs: number;
+  clientIds: number;
+  children: number;
+  steps: number;
+}
+/** #827: the deadlines, in ms (doc-bounds.ts). */
+export interface GuardDeadlines {
+  frame: number;
+  load: number;
+  probe: number;
+  mirror: number;
+}
+export type ScheduleTimer = (fn: () => void, ms: number) => { cancel(): void };
+const timerSchedule: ScheduleTimer = (fn, ms) => {
+  const timer = setTimeout(fn, ms);
+  timer.unref?.();
+  return { cancel: () => clearTimeout(timer) };
+};
+export interface CollabGuardOptions {
+  mode?: CollabGuardMode;
+  logger?: GuardLogger;
+  limitLog?: SocketLimitLog;
+  now?: () => number;
+  cpuNow?: () => number;
+  /** #827: the deadline runner (deadline.ts); specs inject one that times out on cue. */
+  runWithDeadline?: DeadlineRunner;
+  /** #827: the largest Step2/Update payload; PAGE_MAX_YDOC_BYTES. */
+  maxFrameBytes?: number;
+  caps?: Partial<DocCaps>;
+  deadlines?: Partial<GuardDeadlines>;
+  /** #827: the probe's timer (unref'd setTimeout). */
+  schedule?: ScheduleTimer;
 }
 type Header = { type: number; subtype?: number; payload?: Uint8Array | null };
 /** One awareness entry, its state still the undecoded UTF-8 JSON. */
 type AwarenessEntry = { clientID: number; clock: number; state: Uint8Array };
 /** #816: what a refusal line may add: numbers and fixed words only, never a value from the frame. */
 type RefusalLog = { steps?: number; stage?: 'conflict-scan' };
-type ShadowResult = { violation: Violation | null; binds: Map<number, string>; applied: boolean; log?: RefusalLog };
+type ShadowResult = {
+  violation: Violation | null;
+  binds: Map<number, string>;
+  applied: boolean;
+  log?: RefusalLog;
+  /** #827: the shadow apply ran out of time (the shadow is discarded; live never applies the frame). */
+  timedOut?: boolean;
+  /** Legacy pending structs a frame released that the rules would refuse: logged after the apply, never refused. */
+  reportOnly: Violation[];
+  /** #827: structs integrated at new clocks (growth), the most live children of an element the frame added a child to,
+   *  the change in the store's struct count, and its client ids before and after. */
+  added: number;
+  children: number;
+  structDelta: number;
+  clientsBefore: number;
+  clientsAfter: number;
+};
+/** What `inspectTransaction` finds inside the transaction. `extra`: struct-array lengths, mid-transaction, of clients a
+ *  delete reached that the pre-pass did not name (a keyed overwrite deletes the key's previous item). */
+type Inspection = { violation: Violation | null; binds: Map<number, string>; reportOnly: Violation[]; added: number; children: number; extra: Map<number, number> };
 type Ranges = Map<number, Array<[number, number]>>;
+type PrePass = {
+  violation: Violation | null;
+  /** The client ids of its structs (Skips excepted). */
+  clients: Set<number>;
+  /** #827: other client ids whose struct arrays the apply can split or merge: dependencies (origin, rightOrigin, parent)
+   *  and delete-set clients. */
+  reaches: Set<number>;
+  /** #827: per client, the clock its structs end at: what live must hold once it applied the frame. */
+  ends: Map<number, number>;
+};
+type ShadowState = 'ready' | 'unavailable' | 'compacting';
 
 /** Per live Document: its shadow, client-id bindings and audit results. Dropped with the document (`destroy`). */
 class DocGuard {
@@ -207,14 +330,33 @@ class DocGuard {
   readonly awarenessBindsByUser = new Map<string, number>();
   /** The client id bound to SERVER for the current shadow: unbound again when a rebuild replaces that shadow. */
   shadowBinding: number | null = null;
-  /** #816: the user whose refused frame left the shadow dirty: the rebuild is charged to them, not the next sender. */
+  /** #816: the user whose refused frame left the shadow dirty: the rebuild is charged to them, not the next sender.
+   *  SERVER (#827): a server-caused rebuild (a mirror failure), charged to no one. */
   dirtiedBy: string | null = null;
-  constructor(readonly live: Y.Doc & { name?: string }) {}
+  /** #827: structs in the shadow's store (exact after a rebuild, a mirror and a probe; moved by each frame's delta). */
+  structs = 0;
+  /** #827: walk steps of the last full load of the page (a rebuild or a probe). */
+  steps = 0;
+  /** #827: the page cannot be replicated within the load bounds: every writer frame closes 1013 until it compacts. */
+  overBounds = false;
+  /** #827: per in-flight frame, client → the clock live must reach once it applied it (replaces an O(ids) state cover). */
+  readonly targets: Array<Map<number, number>> = [];
+  /** #827: frames accepted and applied to the shadow since the last flush: live's connection-origin updates are their
+   *  echoes. One with none outstanding was never inspected, so the shadow is stale. */
+  pendingEchoes = 0;
+  /** #827: the probe: who grew the page since the last one (charged for it), its timer, when it last ran. */
+  readonly writersSinceProbe = new Set<string>();
+  probeTimer: { cancel(): void } | null = null;
+  probeQueued = false;
+  lastProbeAt = Number.NEGATIVE_INFINITY;
+  destroyed = false;
+  constructor(readonly live: GuardDocument) {}
 }
 
 type Bucket = { tokens: number; at: number };
-/** `cpu` (milliseconds, #816) is only used on the whole-user entry. */
-type UserDocBudget = { sync: Bucket; ids: Bucket; cpu: Bucket };
+/** `cpu` (milliseconds, #816) is only used on the whole-user entry. `deadline` (#827): shadow-apply timeouts since this
+ *  (user, document)'s last accepted frame (the strike rule). */
+type UserDocBudget = { sync: Bucket; ids: Bucket; cpu: Bucket; deadline: number };
 
 export class CollabUpdateGuard {
   private readonly docs = new WeakMap<Y.Doc, DocGuard>();
@@ -235,15 +377,29 @@ export class CollabUpdateGuard {
   });
   private readonly cpuNow: () => number;
   private readonly meter: ConflictScanMeter;
+  /** #827: named so deadline.fitness.spec.ts finds every call. */
+  private readonly runWithDeadline: DeadlineRunner;
+  private readonly maxFrameBytes: number;
+  private readonly caps: DocCaps;
+  private readonly deadlines: GuardDeadlines;
+  private readonly schedule: ScheduleTimer;
+  /** #827: connections whose first frame passed the epoch rule. */
+  private readonly epochChecked = new WeakSet<object>();
+  /** #827: probes due, run one per macrotask (each is synchronous work of up to PROBE_DEADLINE_MS). */
+  private readonly probeQueue: DocGuard[] = [];
+  private probeDraining = false;
 
-  constructor(
-    opts: { mode?: CollabGuardMode; logger?: GuardLogger; limitLog?: SocketLimitLog; now?: () => number; cpuNow?: () => number } = {},
-  ) {
+  constructor(opts: CollabGuardOptions = {}) {
     this.mode = opts.mode ?? COLLAB_UPDATE_GUARD_MODE;
     this.logger = opts.logger ?? new Logger('CollabUpdateGuard');
     this.limitLog = opts.limitLog ?? collabSocketLimitLog;
     this.now = opts.now ?? Date.now;
     this.cpuNow = opts.cpuNow ?? (() => performance.now());
+    this.runWithDeadline = opts.runWithDeadline ?? runWithDeadline;
+    this.maxFrameBytes = opts.maxFrameBytes ?? PAGE_MAX_YDOC_BYTES;
+    this.caps = { structs: S_MAX, clientIds: C_MAX, children: E_MAX, steps: W_MAX, ...opts.caps };
+    this.deadlines = { frame: T_FRAME_MS, load: LOAD_DEADLINE_MS, probe: PROBE_DEADLINE_MS, mirror: MIRROR_DEADLINE_MS, ...opts.deadlines };
+    this.schedule = opts.schedule ?? timerSchedule;
     // Throws when yjs changed shape, so the server refuses to boot rather than run unbounded (#816).
     this.meter = installConflictScanMeter(Y);
   }
@@ -254,6 +410,10 @@ export class CollabUpdateGuard {
     if (earlier) throw { code: COLLAB_REFUSAL_CODE, reason: earlier };
     const header = readHeader(frame.update);
     if (!header) return; // not decodable as a frame: Hocuspocus refuses it itself
+    // #827: the page's lineage gates, in every mode (they keep lineages apart; they are not content rules). A provider's
+    // detach still closes its session as asked.
+    if (header.type !== MessageType.CLOSE && isClosedForCompaction(frame.document)) return this.compacting(frame, true);
+    if (!this.epochChecked.has(frame.connection)) this.checkEpoch(frame, header);
     if (header.type === MessageType.Stateless || header.type === MessageType.BroadcastStateless) {
       return this.refuse(frame, header, { rule: 'stateless' }); // nothing in Docmost sends one; a broadcast reaches every peer
     }
@@ -279,6 +439,10 @@ export class CollabUpdateGuard {
       return;
     }
     if (header.type !== MessageType.Sync && header.type !== MessageType.SyncReply) return;
+    // #827: before anything decodes it, readers too (a reader's Step2 is snapshot-checked). The ws cap stays 8 MiB.
+    if ((header.subtype === STEP2 || header.subtype === UPDATE) && header.payload && header.payload.length > this.maxFrameBytes) {
+      return this.refuse(frame, header, { rule: 'frame-too-large' });
+    }
     // A Step1 makes Hocuspocus encode the whole document (its Step2 answer); a reader's Step2 makes it snapshot it.
     if (header.subtype === STEP1 || (header.subtype === STEP2 && frame.connection.readOnly)) {
       const ok = this.takeBoth(
@@ -286,6 +450,7 @@ export class CollabUpdateGuard {
         [this.budgetFor(frame).sync, SYNC_BURST, SYNC_REFILL_MS],
       );
       if (!ok) this.tryLater(frame, 'user_sync_budget');
+      if (header.subtype === STEP2) this.chargeReaderStep2(frame, header.payload?.length ?? 0);
       return;
     }
     if (header.subtype !== STEP2 && header.subtype !== UPDATE) return; // Hocuspocus refuses an unknown subtype itself
@@ -309,6 +474,54 @@ export class CollabUpdateGuard {
     return this.userDocBudgets.size;
   }
 
+  /** #827: the structure counts the guard holds for `live` (specs and diagnostics). */
+  pageCounts(live: Y.Doc): { structs: number; clientIds: number; steps: number } | null {
+    const doc = this.docs.get(live);
+    return doc ? { structs: doc.structs, clientIds: doc.shadow?.store.clients.size ?? 0, steps: doc.steps } : null;
+  }
+
+  /** #827: run `live`'s probe now (specs and diagnostics); false when there is nothing to probe. */
+  probeNow(live: Y.Doc): boolean {
+    const doc = this.docs.get(live);
+    if (!doc) return false;
+    doc.probeTimer?.cancel();
+    doc.probeTimer = null;
+    return this.probe(doc);
+  }
+
+  /** #827: the clocks the load hooks charge with (collab-update-guard.extension.ts). */
+  cpuClock(): number {
+    return this.cpuNow();
+  }
+  wallClock(): number {
+    return this.now();
+  }
+
+  /**
+   * #827: may a socket's load of a page start for `user`? Not while that user is in collab CPU debt (a load is charged
+   * to the socket that caused it, so a reload loop pays for itself): logged `load_debt`. Report mode only logs.
+   */
+  admitLoad(user: string): boolean {
+    if (this.cpuBalance(user) >= 0) return true;
+    this.limitLog.log('load_debt', { userId: user });
+    return this.mode === 'report';
+  }
+
+  /** #827: charge a socket's load (its load transactions' time) to `user`, as a frame's work is charged. */
+  chargeLoad(user: string, ms: number, workStarted: number): void {
+    this.chargeCpu(user, ms, workStarted);
+  }
+
+  /**
+   * #827: may a connection join the resident `document` (undefined: not resident)? Not while it is compacting, draining
+   * or superseded: its sockets are being closed so it can unload, and a superseded one must never serve. Every mode.
+   */
+  admitJoin(document: object | undefined, user: string): boolean {
+    if (document === undefined || !isClosedForCompaction(document)) return true;
+    this.limitLog.log('page_compacting', { userId: user });
+    return false;
+  }
+
   /** The (user, document) budget of this frame's connection, made most recently used; the least recent past the cap goes. */
   private budgetFor(frame: GuardFrame, wholeUser = false): UserDocBudget {
     return this.budgetOf(String(frame.context?.user?.id ?? ''), wholeUser ? null : (frame.document.name ?? ''));
@@ -326,6 +539,7 @@ export class CollabUpdateGuard {
         sync: { tokens: wholeUser ? USER_SYNC_BURST : SYNC_BURST, at },
         ids: { tokens: AWARENESS_NEW_IDS_BURST, at },
         cpu: { tokens: USER_COLLAB_CPU_BURST_MS, at },
+        deadline: 0,
       };
     }
     this.userDocBudgets.set(key, budget);
@@ -394,6 +608,65 @@ export class CollabUpdateGuard {
     throw { code: COLLAB_TRY_LATER_CODE, reason: TRY_LATER_REASON };
   }
 
+  /**
+   * #827: the page is compacting, draining or must compact first: close this frame's SOCKET 1013 with the compacting
+   * reason (non-detaching: the editor waits read-only and retries), then throw. `always`: the lineage gates, which hold
+   * in report mode too; otherwise report mode only logs.
+   */
+  private compacting(frame: GuardFrame, always = false): void {
+    this.limitLog.log('page_compacting', { userId: String(frame.context?.user?.id ?? '') });
+    if (this.mode === 'report' && !always) return;
+    try {
+      frame.connection.webSocket?.close(COLLAB_TRY_LATER_CODE, COLLAB_PAGE_COMPACTING_REASON);
+    } catch {
+      // already closing
+    }
+    throw { code: COLLAB_TRY_LATER_CODE, reason: COLLAB_PAGE_COMPACTING_REASON };
+  }
+
+  /**
+   * #827: a connection's first frame names the lineage of its client's copy (`?cccEpoch`, absent = 0). Another lineage
+   * is refused 4422 `epoch-stale:<page's epoch>` before the server answers anything (a Step1's answer would merge the
+   * page into the old copy, and the copy's Step2 would merge back): readers too, in report mode too, and not counted
+   * toward the socket's refusal budget (an honest stale tab is not misbehaving). Later frames of the connection get the
+   * same answer.
+   */
+  private checkEpoch(frame: GuardFrame, header: Header): void {
+    this.epochChecked.add(frame.connection);
+    let epoch: number;
+    try {
+      epoch = lineageEpoch(frame.document);
+    } catch {
+      return this.refuse(frame, header, { rule: 'internal' }); // a malformed lineage root: fail closed, never guess
+    }
+    if (clientEpoch(frame.requestParameters) === epoch) return;
+    const reason = epochStaleReason(epoch);
+    this.log('COLLAB_UPDATE_REFUSED', frame.document, {
+      rule: 'epoch-stale',
+      epoch,
+      userId: frame.context?.user?.id,
+      msgType: header.type,
+      readOnly: frame.connection.readOnly,
+      mode: this.mode,
+    });
+    this.refusedConnections.set(frame.connection, reason);
+    throw { code: COLLAB_REFUSAL_CODE, reason };
+  }
+
+  /**
+   * #827: a reader's Step2 makes 4.7.1 decode it and snapshot the whole page. Charged to the reader's CPU debt (its
+   * bytes, and the page's structs), never refused on size below the frame cap; a reader in debt waits (1013).
+   */
+  private chargeReaderStep2(frame: GuardFrame, bytes: number): void {
+    const userId = String(frame.context?.user?.id ?? '');
+    if (!this.take(this.budgetFor(frame, true).cpu, USER_COLLAB_CPU_BURST_MS, CPU_MS_REFILL_EVERY_MS, 0)) {
+      this.tryLater(frame, 'user_collab_cpu'); // throws unless report mode
+    }
+    const known = this.docs.get(frame.document);
+    const structs = known?.shadow ? known.structs : structCount(frame.document.store);
+    this.chargeCpu(userId, readerStep2ChargeMs(bytes, structs), this.now());
+  }
+
 
   /**
    * The awareness bounds, for every connection. Each state's size is read from its length prefix and checked before
@@ -455,7 +728,7 @@ export class CollabUpdateGuard {
       this.tryLater(frame, 'user_collab_cpu'); // throws unless report mode
     }
     // From here every exit is charged (#816): the pre-pass and any rebuild once, the shadow apply twice (live applies the
-    // frame again). A rebuild someone else's refusal made necessary is theirs.
+    // frame again). A rebuild someone else's refusal made necessary is theirs; one the server caused is no one's (#827).
     const workStarted = this.now();
     const started = this.cpuNow();
     let othersMs = 0;
@@ -469,19 +742,27 @@ export class CollabUpdateGuard {
       violation ??= this.chargeNewClientIds(frame, pre.clients);
       if (violation && this.mode === 'enforce') return this.refuse(frame, header, violation);
       // 2. The shadow step.
-      const blame = doc.dirty && doc.dirtiedBy !== null && doc.dirtiedBy !== userId ? doc.dirtiedBy : null;
+      const dirtier = doc.dirty ? doc.dirtiedBy : null;
+      const blame = dirtier !== null && dirtier !== userId ? dirtier : null;
       const rebuildStarted = blame === null ? 0 : this.cpuNow();
       const rebuildWallStarted = blame === null ? 0 : this.now();
       const ready = this.ensureShadow(doc);
       if (blame !== null) {
         othersMs = this.cpuNow() - rebuildStarted;
-        this.chargeCpu(blame, othersMs, rebuildWallStarted); // shadow-only work: once
+        if (blame !== SERVER) this.chargeCpu(blame, othersMs, rebuildWallStarted); // shadow-only work: once
       }
-      if (!ready) return this.refuse(frame, header, violation ?? { rule: 'shadow-unavailable' });
+      // #827: a page past the load bounds is replicated by no one until it compacts; its writers wait (1013).
+      if (ready === 'compacting') return this.compacting(frame);
+      if (ready !== 'ready') return this.refuse(frame, header, violation ?? { rule: 'shadow-unavailable' });
       const applyStarted = this.cpuNow();
-      const result = this.applyToShadow(doc, payload, userId);
+      const result = this.applyToShadow(doc, payload, userId, pre);
       applyMs = this.cpuNow() - applyStarted;
+      if (result.timedOut) {
+        applyMs = 0; // live never applies it: its time is charged once
+        return this.deadlineStrike(frame, header);
+      }
       violation ??= result.violation;
+      if (!violation) for (const v of result.reportOnly) this.log('COLLAB_LEGACY_PENDING_INVALID', doc.live, { rule: v.rule });
       if (violation && this.mode === 'enforce') {
         // The shadow holds the refused frame; live never will. Rebuilt lazily by the next frame that needs it
         // (ensureShadow), so a refuse/reconnect loop pays no rebuild per refusal, and that rebuild is this user's.
@@ -490,12 +771,114 @@ export class CollabUpdateGuard {
         return this.refuse(frame, header, violation, result.log);
       }
       if (violation) this.refuse(frame, header, violation, result.log); // report mode: logged, and the frame applies
+      // 3. #827: the per-page structure caps, on what the frame changed.
+      const caps = result.applied ? this.checkCaps(doc, result, userId) : 'ok';
+      if (caps !== 'ok' && this.mode === 'enforce') {
+        doc.dirty = true; // the shadow holds the refused frame, as above
+        doc.dirtiedBy = userId;
+      }
+      if (caps === 'full') this.refuse(frame, header, { rule: 'page-full' }); // throws unless report mode
+      if (caps === 'compact') this.compacting(frame); // throws unless report mode
+      this.budgetFor(frame).deadline = 0; // an accepted frame clears the strike
       for (const [client, user] of result.binds) if (!doc.bindings.has(client)) doc.bindings.set(client, user);
       // A frame the shadow could not apply is not replayed into a rebuild (it would fail every rebuild from then on).
-      if (result.applied) doc.inflight.push(payload.slice());
+      if (result.applied) {
+        doc.inflight.push(payload.slice());
+        doc.targets.push(pre.ends);
+        doc.pendingEchoes++;
+        if (result.added > 0) this.scheduleProbe(doc, userId);
+      }
       this.scheduleFlush(doc);
     } finally {
       this.chargeCpu(userId, this.cpuNow() - started - othersMs + applyMs, workStarted);
+    }
+  }
+
+  /**
+   * #827: a frame whose shadow apply ran out of time. The first for this (user, document) since its last accepted frame
+   * closes the socket 1013 (`frame_deadline`: a GC pause or a busy host passes on the retry); a repeat is refused 4422
+   * `apply-deadline` (a provider resends the same Step2 on reconnect, so a deterministic frame lands here).
+   */
+  private deadlineStrike(frame: GuardFrame, header: Header): void {
+    const budget = this.budgetFor(frame);
+    if (budget.deadline > 0) return this.refuse(frame, header, { rule: 'apply-deadline' });
+    budget.deadline = 1;
+    this.tryLater(frame, 'frame_deadline');
+  }
+
+  /**
+   * #827: the structure caps after an accepted shadow apply, counted on what the frame touched. A frame that GROWS the
+   * page past a hard cap is refused: `full` when the page is still over it after a compaction (its visible content is
+   * too big), else `compact` (the page drains and compacts). Under the hard caps, the frame's counts are kept, and past a
+   * soft cap compaction is requested for the next unload. Deletes always pass.
+   */
+  private checkCaps(doc: DocGuard, result: ShadowResult, userId: string): 'ok' | 'full' | 'compact' {
+    const structs = doc.structs + result.structDelta;
+    const clients = result.clientsAfter;
+    const hard: CompactionReason | null =
+      result.added > 0 && structs > this.caps.structs
+        ? 'structs'
+        : clients > result.clientsBefore && clients > this.caps.clientIds
+          ? 'client_ids'
+          : result.children > this.caps.children
+            ? 'children'
+            : null;
+    let verdict: 'ok' | 'full' | 'compact' = 'ok';
+    if (hard !== null) {
+      verdict = this.pageIsFull(doc) ? 'full' : 'compact';
+      if (verdict === 'compact') this.needsCompaction(doc, hard, userId, true);
+      if (this.mode === 'enforce') return verdict; // refused: the counts stay those of the page without it
+    }
+    doc.structs = structs;
+    const soft: CompactionReason | null =
+      structs >= softCap(this.caps.structs)
+        ? 'structs'
+        : clients >= softCap(this.caps.clientIds)
+          ? 'client_ids'
+          : result.children >= softCap(this.caps.children)
+            ? 'children'
+            : null;
+    if (soft !== null) this.needsCompaction(doc, soft, userId, false);
+    return verdict;
+  }
+
+  /**
+   * #827: a page over a hard cap whose lineage was compacted within COMPACTION_MIN_INTERVAL_MS (or that compaction
+   * marked full): no compaction can run before then, and the last one did not bring it under. Marked page-full.
+   */
+  private pageIsFull(doc: DocGuard): boolean {
+    if (isPageFull(doc.live)) return true;
+    const at = lineageAt(doc.live);
+    if (at === null || !compactionArmed() || this.now() - at >= COMPACTION_MIN_INTERVAL_MS) return false;
+    markPageFull(doc.live);
+    return true;
+  }
+
+  /**
+   * #827: the page needs compaction. `hard` drains it now (closes every socket 1013, so it unloads and compacts) when a
+   * compaction can start and the guard enforces; otherwise compaction waits for the next unload (before compaction is
+   * armed, during another's, or within the per-page interval). Logged once per request. Never throws.
+   */
+  private needsCompaction(doc: DocGuard, reason: CompactionReason, userId: string | null, hard: boolean): void {
+    try {
+      const drain = hard && this.mode === 'enforce' && canStartCompaction(pageIdOf(doc.live) ?? '');
+      if (requestCompaction(doc.live, { reason, userId, drain })) {
+        this.log('COLLAB_PAGE_COMPACTION', doc.live, { event: 'requested', reason, drain, structs: doc.structs, steps: doc.steps, userId });
+      }
+      if (drain) this.drain(doc.live);
+    } catch {
+      // the guard's own bookkeeping: never a reason to fail the frame path
+    }
+  }
+
+  /** #827: close every socket connection of `live` 1013 with the compacting reason, so the page unloads and compacts. */
+  private drain(live: GuardDocument): void {
+    for (const connection of live.getConnections?.() ?? []) {
+      try {
+        connection.webSocket?.close(COLLAB_TRY_LATER_CODE, COLLAB_PAGE_COMPACTING_REASON);
+      } catch {
+        // already closing
+      }
     }
   }
 
@@ -522,56 +905,119 @@ export class CollabUpdateGuard {
   }
 
   /**
-   * The frame applied to the shadow inside the conflict-scan meter (#816). A trip or a meter failure throws out of
-   * Yjs's stack, before the item it was replaying integrates; the scope says which, never the error's identity.
+   * The frame applied to the shadow inside the conflict-scan meter (#816), and (#827) under the frame deadline, innermost,
+   * so the meter's own `finally` runs after a timeout. A trip or a meter failure throws out of Yjs's stack, before the
+   * item it was replaying integrates; the scope says which, never the error's identity. A timeout skipped Yjs's
+   * cleanup (`shadow._transaction` stays set): that shadow is thrown away.
    */
-  private applyToShadow(doc: DocGuard, payload: Uint8Array, userId: string): ShadowResult {
+  private applyToShadow(doc: DocGuard, payload: Uint8Array, userId: string, pre: PrePass): ShadowResult {
     const shadow = doc.shadow!;
-    const pendingBefore = pendingRanges(shadow.store);
+    const store = shadow.store;
+    const pendingBefore = pendingRanges(store);
+    // #827: the struct arrays this apply can change, their lengths now (the store's struct count moves by their deltas).
+    const tracked = new Map<number, number>();
+    for (const ids of [pre.clients, pre.reaches, pendingBefore.keys()]) for (const client of ids) tracked.set(client, lengthOf(store, client));
+    const clientsBefore = store.clients.size;
     const scan = new ConflictScan(shadow, this.mode === 'enforce');
-    let out: ShadowResult = { violation: { rule: 'internal' }, binds: new Map(), applied: false };
+    const failed = (violation: Violation, log?: RefusalLog): ShadowResult => ({
+      violation,
+      binds: new Map(),
+      applied: false,
+      log,
+      reportOnly: [],
+      added: 0,
+      children: 0,
+      structDelta: 0,
+      clientsBefore,
+      clientsAfter: clientsBefore,
+    });
+    let out: Inspection | null = null;
     try {
       this.meter.metered(scan, () =>
-        Y.transact(
-          shadow,
-          (tr) => {
-            Y.applyUpdate(shadow, payload, INSPECT); // V1, as y-protocols reads Step2 and Update
-            out = this.inspectTransaction(doc, tr, userId, pendingBefore);
-          },
-          INSPECT,
-          false,
+        this.runWithDeadline(
+          () =>
+            Y.transact(
+              shadow,
+              (tr) => {
+                Y.applyUpdate(shadow, payload, INSPECT); // V1, as y-protocols reads Step2 and Update
+                out = this.inspectTransaction(doc, tr, userId, pendingBefore, pre.clients, tracked);
+              },
+              INSPECT,
+              false,
+            ),
+          this.deadlines.frame,
         ),
       );
-    } catch {
+    } catch (err) {
       doc.dirty = true;
       doc.dirtiedBy = userId;
-      if (scan.trip !== null) {
-        return { violation: { rule: 'conflict-scan' }, binds: new Map(), applied: false, log: { steps: scan.trip.steps } };
+      if (isDeadlineExceeded(err)) {
+        doc.shadow = null; // cut mid-transaction: never reused
+        return { ...failed({ rule: 'apply-deadline' }), timedOut: true };
       }
-      const log: RefusalLog | undefined = scan.failure !== null ? { stage: 'conflict-scan' } : undefined;
-      return { violation: { rule: 'internal' }, binds: new Map(), applied: false, log };
+      if (scan.trip !== null) return failed({ rule: 'conflict-scan' }, { steps: scan.trip.steps });
+      return failed({ rule: 'internal' }, scan.failure !== null ? { stage: 'conflict-scan' } : undefined);
     }
+    const found = out as Inspection | null;
+    if (found === null) return failed({ rule: 'internal' });
+    let structDelta = 0;
+    for (const [client, before] of tracked) structDelta += lengthOf(store, client) - before;
+    for (const [client, mid] of found.extra) structDelta += lengthOf(store, client) - mid;
+    const result: ShadowResult = {
+      violation: found.violation,
+      binds: found.binds,
+      applied: true,
+      reportOnly: found.reportOnly,
+      added: found.added,
+      children: found.children,
+      structDelta,
+      clientsBefore,
+      clientsAfter: store.clients.size,
+    };
     // Report mode: the meter counted past the cap and threw nothing; the frame is logged as it would have been refused.
-    if (scan.trip !== null) return { ...out, violation: { rule: 'conflict-scan' }, log: { steps: scan.steps } };
-    return out;
+    if (scan.trip !== null) return { ...result, violation: { rule: 'conflict-scan' }, log: { steps: scan.steps } };
+    return result;
   }
 
-  /** Inside the transaction, after the frame integrated and before any GC or merge. */
-  private inspectTransaction(doc: DocGuard, tr: Y.Transaction, userId: string, pendingBefore: Ranges) {
+  /**
+   * Inside the transaction, after the frame integrated and before any GC or merge. Runs under the frame deadline: it
+   * reads the shadow and the guard's state and writes nothing outside its result (no log, no timer).
+   */
+  private inspectTransaction(
+    doc: DocGuard,
+    tr: Y.Transaction,
+    userId: string,
+    pendingBefore: Ranges,
+    frameClients: Set<number>,
+    tracked: Map<number, number>,
+  ): Inspection {
     const shadow = tr.doc;
     const store = shadow.store;
     const root = shadow.share.get('default');
     const touched = new Set<Y.AbstractType<any>>();
+    const grew = new Set<Y.AbstractType<any>>();
     const newTypes: Y.AbstractType<any>[] = [];
     const binds = new Map<number, string>();
     const reportOnly: Violation[] = [];
-    const result = (violation: Violation | null): ShadowResult => ({ violation, binds, applied: true });
+    let added = 0;
+    const result = (violation: Violation | null): Inspection => {
+      let children = 0;
+      for (const type of grew) children = Math.max(children, (type as Y.XmlFragment).length); // the root or an element
+      const extra = new Map<number, number>();
+      for (const client of tr.deleteSet.clients.keys()) if (!tracked.has(client)) extra.set(client, lengthOf(store, client));
+      return { violation, binds, reportOnly, added, children, extra };
+    };
 
-    for (const [client, structs] of store.clients) {
+    // #827: new clocks come only from the frame's structs and the pending structs it releases (never O(ids)).
+    const clients = new Set(frameClients);
+    for (const client of pendingBefore.keys()) clients.add(client);
+    for (const client of clients) {
+      const structs = store.clients.get(client);
       const before = tr.beforeState.get(client) ?? 0;
-      if (Y.getState(store, client) <= before) continue;
+      if (!structs || Y.getState(store, client) <= before) continue;
       for (let i = Y.findIndexSS(structs, before); i < structs.length; i++) {
         const struct = structs[i];
+        added++;
         const legacy = inRanges(doc.legacyPending, client, struct.id.clock, struct.length);
         if (!legacy) {
           // Client-id binding, on NEW clocks only: a remount honestly resends a peer's structs live already has.
@@ -585,7 +1031,7 @@ export class CollabUpdateGuard {
           }
         }
         if (!(struct instanceof Y.Item)) continue; // GC: no content, no parent
-        const v = checkStruct(struct, root, touched, newTypes);
+        const v = checkStruct(struct, root, touched, newTypes, grew);
         if (v && legacy) reportOnly.push(v);
         else if (v) return result(v);
       }
@@ -609,7 +1055,7 @@ export class CollabUpdateGuard {
       const check = checkElement(type as Y.XmlElement);
       if (check.ok || check.empty) continue; // an emptied container loses nothing (see content-rules.ts)
       if (doc.legacyInvalid.has(idOf(type))) continue; // invalid before this frame, already deleted on every open
-      return result(check.violation);
+      return result(check.violation!);
     }
     // A table's extent is a property of the whole table: a changed cell span, row or cell can widen it.
     const tables = new Set<Y.XmlElement>();
@@ -623,29 +1069,47 @@ export class CollabUpdateGuard {
     }
     // Structs that wait for a missing dependency would integrate later, unchecked and blamed on whoever sends it.
     if (!covers(pendingBefore, pendingRanges(store))) return result({ rule: 'unresolved' });
-    for (const v of reportOnly) this.log('COLLAB_LEGACY_PENDING_INVALID', doc.live, { rule: v.rule });
     return result(null);
   }
 
-  private docFor(live: Y.Doc & { name?: string }): DocGuard {
+  private docFor(live: GuardDocument): DocGuard {
     const known = this.docs.get(live);
     if (known) return known;
     const created = new DocGuard(live);
     created.bindings.set(live.clientID, SERVER);
     // The mirror NEVER throws: a throw in a Yjs 'update' listener stops every later listener and wedges the document's
     // cleanup for good. On any failure the shadow is only marked dirty (the next frame rebuilds it).
-    const mirror = (update: Uint8Array) => {
+    const mirror = (update: Uint8Array, origin: unknown) => {
+      // #827: a connection's update is the echo of a frame this guard accepted and already applied to the shadow
+      // (Hocuspocus applies one only after its beforeHandleMessage resolved). One with no such frame outstanding was
+      // never inspected: the shadow no longer equals live.
+      if (isTransactionOrigin(origin) && origin.source === 'connection') {
+        if (created.pendingEchoes === 0 && created.shadow !== null && !created.dirty) {
+          created.dirty = true;
+          created.dirtiedBy = SERVER;
+        }
+        return;
+      }
       const shadow = created.shadow;
       if (!shadow || created.dirty) return;
       try {
-        Y.applyUpdate(shadow, update, MIRROR);
-      } catch {
+        // #827: a server-local update (an API write, a Redis-relayed or reconcile update) is bounded too; live already
+        // holds it, so a timeout is never a refusal: the shadow is dropped and the page compacts.
+        this.runWithDeadline(() => Y.applyUpdate(shadow, update, MIRROR), this.deadlines.mirror);
+        created.structs = structCount(shadow.store); // O(ids): server writes are rare
+      } catch (err) {
+        created.shadow = null;
         created.dirty = true;
+        created.dirtiedBy = SERVER; // a server-caused rebuild is charged to no one
+        if (isDeadlineExceeded(err)) setImmediate(() => this.needsCompaction(created, 'mirror_deadline', null, true));
       }
     };
     live.on('update', mirror);
     live.once('destroy', () => {
       live.off('update', mirror);
+      created.destroyed = true;
+      created.probeTimer?.cancel();
+      created.probeTimer = null;
       created.shadow = null;
       this.docs.delete(live);
     });
@@ -653,91 +1117,100 @@ export class CollabUpdateGuard {
     return created;
   }
 
-  private ensureShadow(doc: DocGuard): boolean {
-    if (doc.unavailable) return false;
-    if (doc.shadow && !doc.dirty && statesCover(doc.shadow.store, doc.live.store)) return true;
+  private ensureShadow(doc: DocGuard): ShadowState {
+    if (doc.unavailable) return 'unavailable';
+    if (doc.overBounds) return 'compacting';
+    // #827: no O(ids) state comparison: every live change reaches the mirror, which marks the shadow dirty unless it
+    // applied it or it is the echo of an inspected frame; a frame accepted but never applied is caught at the flush.
+    if (doc.shadow && !doc.dirty) return 'ready';
     return this.rebuild(doc);
   }
 
-  /** The shadow from live plus the frames accepted but not yet applied: exactly what live will hold. */
-  private rebuild(doc: DocGuard): boolean {
-    if (doc.unavailable) return false;
+  /**
+   * The shadow from live plus the frames accepted but not yet applied: exactly what live will hold. #827: built as a
+   * load, under the step budget (W_MAX, the walk steps a full load of the page makes) and the load deadline, so it
+   * also measures the page. A page past either cannot be replicated: it compacts, and until then its writers wait.
+   * The first build's audit runs in the same bounded call and is committed only once the build succeeded.
+   */
+  private rebuild(doc: DocGuard): ShadowState {
+    if (doc.unavailable) return 'unavailable';
     const live = doc.live;
+    let state: Uint8Array;
     try {
-      const shadow = new Y.Doc({ gc: live.gc, gcFilter: live.gcFilter });
-      shadow.getXmlFragment('default');
-      Y.applyUpdate(shadow, Y.encodeStateAsUpdate(live), MIRROR);
-      for (const frame of doc.inflight) Y.applyUpdate(shadow, frame, MIRROR);
-      doc.shadow = shadow;
-      doc.dirty = false;
-      doc.dirtiedBy = null;
-      // The replaced shadow is gone, and so is any reason to reserve its client id: one binding per rebuild otherwise.
-      const replaced = doc.shadowBinding;
-      if (replaced !== null && replaced !== live.clientID && doc.bindings.get(replaced) === SERVER) doc.bindings.delete(replaced);
-      doc.shadowBinding = null;
-      if (!doc.bindings.has(shadow.clientID)) {
-        doc.bindings.set(shadow.clientID, SERVER);
-        doc.shadowBinding = shadow.clientID;
-      }
-      if (!doc.audited) this.audit(doc, shadow);
-      return true;
+      state = Y.encodeStateAsUpdate(live);
     } catch {
-      // A live document Yjs cannot encode (a legacy value too deep for lib0's encoder): fail closed, logged once.
-      doc.unavailable = true;
-      doc.shadow = null;
-      this.logger.warn(`COLLAB_SHADOW_UNAVAILABLE ${JSON.stringify({ pageId: pageIdOf(live) })}`);
-      return false;
+      return this.markUnavailable(doc); // a live document Yjs cannot encode (a legacy value too deep for lib0's encoder)
     }
+    const shadow = new Y.Doc({ gc: live.gc, gcFilter: live.gcFilter });
+    shadow.getXmlFragment('default');
+    const scan = new ConflictScan(shadow, this.mode === 'enforce', this.caps.steps);
+    const inflight = doc.inflight;
+    const audit = !doc.audited;
+    let audited: Audit | null;
+    try {
+      audited = this.meter.metered(scan, () =>
+        this.runWithDeadline(() => {
+          Y.applyUpdate(shadow, state, MIRROR);
+          for (const frame of inflight) Y.applyUpdate(shadow, frame, MIRROR);
+          return audit ? auditShadow(shadow) : null;
+        }, this.deadlines.load),
+      );
+    } catch (err) {
+      doc.shadow = null;
+      doc.dirty = true;
+      if (!isDeadlineExceeded(err) && scan.trip === null) return this.markUnavailable(doc);
+      doc.overBounds = true;
+      doc.steps = scan.trip?.steps ?? scan.steps;
+      this.needsCompaction(doc, scan.trip !== null ? 'load_steps' : 'rebuild_deadline', null, true);
+      return 'compacting';
+    }
+    doc.shadow = shadow;
+    doc.dirty = false;
+    doc.dirtiedBy = null;
+    doc.structs = structCount(shadow.store);
+    doc.steps = scan.steps;
+    // The replaced shadow is gone, and so is any reason to reserve its client id: one binding per rebuild otherwise.
+    const replaced = doc.shadowBinding;
+    if (replaced !== null && replaced !== live.clientID && doc.bindings.get(replaced) === SERVER) doc.bindings.delete(replaced);
+    doc.shadowBinding = null;
+    if (!doc.bindings.has(shadow.clientID)) {
+      doc.bindings.set(shadow.clientID, SERVER);
+      doc.shadowBinding = shadow.clientID;
+    }
+    if (audited) this.commitAudit(doc, audited);
+    this.measured(doc, scan.trip !== null, 'load_steps'); // report mode counts past the budget
+    return 'ready';
   }
 
-  /** First build only: a report-only audit of the stored content (legacy rows), at no extra cost. */
-  private audit(doc: DocGuard, shadow: Y.Doc): void {
+  /** #827: after a full load of the page (a rebuild, a probe): over the step budget drains, near a cap requests. */
+  private measured(doc: DocGuard, over: boolean, overReason: CompactionReason): void {
+    if (over || doc.steps > this.caps.steps) return this.needsCompaction(doc, overReason, null, true);
+    const soft: CompactionReason | null =
+      doc.steps >= softCap(this.caps.steps)
+        ? 'load_steps'
+        : doc.structs >= softCap(this.caps.structs)
+          ? 'structs'
+          : (doc.shadow?.store.clients.size ?? 0) >= softCap(this.caps.clientIds)
+            ? 'client_ids'
+            : null;
+    if (soft !== null) this.needsCompaction(doc, soft, null, false);
+  }
+
+  private markUnavailable(doc: DocGuard): ShadowState {
+    // Fail closed, logged once: every frame to this document is refused until it unloads.
+    doc.unavailable = true;
+    doc.shadow = null;
+    this.logger.warn(`COLLAB_SHADOW_UNAVAILABLE ${JSON.stringify({ pageId: pageIdOf(doc.live) })}`);
+    return 'unavailable';
+  }
+
+  /** First build only: the report-only audit of the stored content (legacy rows), computed by `auditShadow`. */
+  private commitAudit(doc: DocGuard, audit: Audit): void {
     doc.audited = true;
-    doc.legacyPending = pendingRanges(shadow.store);
-    const rules: Record<string, number> = {};
-    const root = shadow.getXmlFragment('default');
-    /** Elements every browser's y-tiptap deletes on open (invalid, or emptied and then invalid). */
-    const gone = new Set<Y.AbstractType<any>>();
-    const stack: Array<[Y.AbstractType<any>, number]> = [[root, 0]];
-    while (stack.length) {
-      const [type, depth] = stack.pop()!;
-      const check: ElementCheck = depth > COLLAB_LIMITS.elementDepth ? { ok: false, violation: { rule: 'element-depth' }, empty: false } : checkElement(type as Y.XmlElement);
-      if (!check.ok && type !== root) gone.add(type);
-      const tableSize = type !== root && (type as Y.XmlElement).nodeName === 'table' ? checkYTable(type as Y.XmlElement) : null;
-      if (tableSize && check.ok) {
-        doc.legacyInvalid.add(idOf(type)); // a legacy table past the extent bound: reported, its edits not refused for it
-        rules['table-size'] = (rules['table-size'] ?? 0) + 1;
-      }
-      if (!check.ok && !check.empty) {
-        doc.legacyInvalid.add(idOf(type));
-        rules[check.violation.rule] = (rules[check.violation.rule] ?? 0) + 1;
-      }
-      for (let item = type._start; item !== null; item = item.right) {
-        if (!item.deleted && item.content instanceof Y.ContentType && kindOf(item.content.type) === 'element') {
-          stack.push([item.content.type, depth + 1]);
-        }
-      }
-    }
-    // y-tiptap's cascade: deleting an invalid element can leave its parent invalid, and every browser then deletes the
-    // parent too, one transaction (one frame) per element. Each parent left invalid and non-empty is legacy as well, so
-    // the deletes of every browser that opens the page are accepted, never refused on every open.
-    const queue = [...gone];
-    while (queue.length) {
-      const parent = queue.pop()!._item?.parent as Y.AbstractType<any> | undefined;
-      if (!parent || gone.has(parent) || !isVisible(parent)) continue;
-      const check = checkElement(parent as Y.XmlElement, gone);
-      if (check.ok) continue;
-      if (!check.empty) {
-        doc.legacyInvalid.add(idOf(parent));
-        rules[`cascade:${check.violation!.rule}`] = (rules[`cascade:${check.violation!.rule}`] ?? 0) + 1;
-      }
-      if (parent !== root) {
-        gone.add(parent);
-        queue.push(parent);
-      }
-    }
+    doc.legacyPending = audit.legacyPending;
+    for (const id of audit.legacyInvalid) doc.legacyInvalid.add(id);
     if (doc.legacyInvalid.size) {
-      this.logger.warn(`COLLAB_STORED_CONTENT_INVALID ${JSON.stringify({ pageId: pageIdOf(doc.live), elements: doc.legacyInvalid.size, rules })}`);
+      this.logger.warn(`COLLAB_STORED_CONTENT_INVALID ${JSON.stringify({ pageId: pageIdOf(doc.live), elements: doc.legacyInvalid.size, rules: audit.rules })}`);
     }
   }
 
@@ -747,10 +1220,97 @@ export class CollabUpdateGuard {
     setImmediate(() => {
       doc.flushScheduled = false;
       doc.inflight.length = 0;
-      // Every accepted frame has applied by now. A shadow still ahead of live means one did not: rebuild before trusting it.
-      const shadow = doc.shadow;
-      if (shadow && !statesCover(doc.live.store, shadow.store)) doc.dirty = true;
+      doc.pendingEchoes = 0;
+      const targets = doc.targets.splice(0);
+      // Every accepted frame has applied by now. A shadow still ahead of live means one did not: rebuild before trusting
+      // it. #827: checked on the clocks each frame's structs end at, O(frame clients), never every id the page holds.
+      if (!doc.shadow || doc.dirty) return;
+      for (const target of targets) {
+        for (const [client, end] of target) {
+          if (Y.getState(doc.live.store, client) < end) {
+            doc.dirty = true;
+            return;
+          }
+        }
+      }
     });
+  }
+
+  /**
+   * #827: the probe, armed by accepted growth: PROBE_DEBOUNCE_MS after it, and at most one per PROBE_MIN_INTERVAL_MS per
+   * document. So continuous typing probes every interval, and a load-order inversion or reorder (which no cap sees: a
+   * one-struct frame can make every later load walk millions of steps) is caught within one.
+   */
+  private scheduleProbe(doc: DocGuard, userId: string): void {
+    doc.writersSinceProbe.add(userId);
+    if (doc.probeTimer !== null || doc.probeQueued || doc.destroyed) return;
+    const now = this.now();
+    const at = Math.max(now + PROBE_DEBOUNCE_MS, doc.lastProbeAt + PROBE_MIN_INTERVAL_MS);
+    doc.probeTimer = this.schedule(() => {
+      doc.probeTimer = null;
+      this.enqueueProbe(doc);
+    }, at - now);
+  }
+
+  /** One probe per macrotask, process-wide: probes due together never stack into one stall. */
+  private enqueueProbe(doc: DocGuard): void {
+    if (doc.destroyed || doc.probeQueued) return;
+    doc.probeQueued = true;
+    this.probeQueue.push(doc);
+    if (this.probeDraining) return;
+    this.probeDraining = true;
+    const next = () => {
+      const due = this.probeQueue.shift();
+      if (due) {
+        due.probeQueued = false;
+        try {
+          this.probe(due);
+        } catch {
+          // never out of a timer
+        }
+      }
+      if (this.probeQueue.length) setImmediate(next);
+      else this.probeDraining = false;
+    };
+    setImmediate(next);
+  }
+
+  /**
+   * #827: load the shadow's encoding into a scratch document under the step budget and the probe deadline, and measure
+   * it. The scratch document is then dropped: NEVER swapped in as the shadow (a reload can order concurrent structs
+   * unlike live). Its cost is charged to everyone who grew the page since the last probe. Over the budget, or out of
+   * time: the page drains and compacts. Returns false when there was nothing to probe (the next rebuild measures).
+   */
+  private probe(doc: DocGuard): boolean {
+    const writers = [...doc.writersSinceProbe];
+    doc.writersSinceProbe.clear();
+    doc.lastProbeAt = this.now();
+    const shadow = doc.shadow;
+    if (doc.destroyed || !shadow || doc.dirty) return false;
+    const workStarted = this.now();
+    const started = this.cpuNow();
+    let over = false;
+    let steps = 0;
+    try {
+      const state = Y.encodeStateAsUpdate(shadow);
+      const scratch = new Y.Doc({ gc: doc.live.gc, gcFilter: doc.live.gcFilter });
+      const scan = new ConflictScan(scratch, true, this.caps.steps);
+      try {
+        this.meter.metered(scan, () => this.runWithDeadline(() => Y.applyUpdate(scratch, state), this.deadlines.probe));
+      } catch {
+        over = true; // a trip, the deadline, or Yjs failing on its own encoding: fail closed
+      }
+      steps = scan.trip?.steps ?? scan.steps;
+      over ||= scan.trip !== null;
+    } catch {
+      over = true;
+    }
+    const ms = this.cpuNow() - started;
+    for (const writer of writers) this.chargeCpu(writer, ms, workStarted);
+    doc.steps = steps;
+    doc.structs = structCount(shadow.store); // exact again: frame deltas only approximate a split's merge
+    this.measured(doc, over, 'probe');
+    return true;
   }
 
   /** A writer's awareness entries (already within checkAwareness's bounds) bind the client ids they announce. */
@@ -848,23 +1408,36 @@ const tryRead = (read: () => Uint8Array): Uint8Array | null => {
 /**
  * The stateless rules, on the decoded frame (no document state, so already-known structs are checked too), and the
  * client ids of its structs (Skips excepted: they integrate nothing). `Y.decodeUpdate` keeps the wire order of the
- * delete set (`readDeleteSet` appends, it never sorts).
+ * delete set (`readDeleteSet` appends, it never sorts). #827: also the other client ids the apply can split or merge
+ * (dependencies and delete ranges), and the clock each client's structs end at.
  */
-function prePass(payload: Uint8Array): { violation: Violation | null; clients: Set<number> } {
+function prePass(payload: Uint8Array): PrePass {
   const clients = new Set<number>();
+  const reaches = new Set<number>();
+  const ends = new Map<number, number>();
   let decoded: { structs: Array<Y.Item | Y.GC | Y.Skip>; ds: { clients: Map<number, Array<{ clock: number; len: number }>> } };
   try {
     decoded = Y.decodeUpdate(payload) as typeof decoded;
   } catch {
-    return { violation: { rule: 'undecodable' }, clients }; // e.g. a lib0 `readAny` value deep enough to overflow the decoder
+    return { violation: { rule: 'undecodable' }, clients, reaches, ends }; // e.g. a lib0 `readAny` value deep enough to overflow the decoder
   }
   let violation: Violation | null = null;
   for (const struct of decoded.structs) {
     if (struct instanceof Y.Skip) continue;
-    clients.add(struct.id.client);
-    if (struct instanceof Y.Item) violation ??= structRule(struct);
+    const client = struct.id.client;
+    clients.add(client);
+    const end = struct.id.clock + struct.length;
+    if (end > (ends.get(client) ?? 0)) ends.set(client, end);
+    if (struct instanceof Y.Item) {
+      violation ??= structRule(struct);
+      if (struct.origin) reaches.add(struct.origin.client);
+      if (struct.rightOrigin) reaches.add(struct.rightOrigin.client);
+      const parent = struct.parent as unknown;
+      if (parent instanceof Y.ID) reaches.add(parent.client);
+    }
   }
-  return { violation: violation ?? deleteOrder(decoded.ds.clients), clients };
+  for (const client of decoded.ds.clients.keys()) reaches.add(client);
+  return { violation: violation ?? deleteOrder(decoded.ds.clients), clients, reaches, ends };
 }
 
 function structRule(struct: Y.Item): Violation | null {
@@ -914,7 +1487,13 @@ function deleteOrder(ds: Map<number, Array<{ clock: number; len: number }>>): Vi
  * Root, kind and value rules for one struct the frame added, and what it touches: the element whose children or
  * attributes changed, the element owning a changed XmlText, and every element the frame created.
  */
-function checkStruct(item: Y.Item, root: Y.AbstractType<any> | undefined, touched: Set<Y.AbstractType<any>>, newTypes: Y.AbstractType<any>[]): Violation | null {
+function checkStruct(
+  item: Y.Item,
+  root: Y.AbstractType<any> | undefined,
+  touched: Set<Y.AbstractType<any>>,
+  newTypes: Y.AbstractType<any>[],
+  grew: Set<Y.AbstractType<any>>,
+): Violation | null {
   const parent = item.parent as Y.AbstractType<any>;
   const parentKind = kindOf(parent);
   if (rootOf(parent) !== root) return { rule: 'root' };
@@ -950,6 +1529,7 @@ function checkStruct(item: Y.Item, root: Y.AbstractType<any> | undefined, touche
   else if (parent === root) return { rule: 'child-kind' }; // any root XmlText stops the page opening (even if the root is legacy)
   newTypes.push(type);
   touched.add(parent);
+  grew.add(parent); // #827: a live child added to `parent` (E, the children cap)
   return null;
 }
 
@@ -995,10 +1575,75 @@ function isVisible(type: Y.AbstractType<any>): boolean {
 const idOf = (type: Y.AbstractType<any>): string => (type._item ? `${type._item.id.client}:${type._item.id.clock}` : 'root');
 const pageIdOf = (live: { name?: string }): string | undefined => live.name?.replace(/^page\./, '');
 
-/** Does store `a` hold every clock store `b` holds? */
-function statesCover(a: Y.Doc['store'], b: Y.Doc['store']): boolean {
-  for (const client of b.clients.keys()) if (Y.getState(a, client) < Y.getState(b, client)) return false;
-  return true;
+/** #827: structs in a store, O(client ids): only where Yjs already paid O(structs) (a rebuild, a probe, a mirror). */
+function structCount(store: Y.Doc['store']): number {
+  let n = 0;
+  for (const structs of store.clients.values()) n += structs.length;
+  return n;
+}
+const lengthOf = (store: Y.Doc['store'], client: number): number => store.clients.get(client)?.length ?? 0;
+
+/** #827: the lineage epoch a connection's client claims for its copy (`?cccEpoch`); absent = 0, malformed = NaN. */
+function clientEpoch(params: GuardFrame['requestParameters']): number {
+  const raw = params?.get('cccEpoch');
+  if (raw === null || raw === undefined) return 0;
+  return /^(0|[1-9][0-9]{0,14})$/.test(raw) ? Number(raw) : Number.NaN;
+}
+
+/** #827: when the page's lineage was written (a compaction), or null (never compacted, or a value compaction never writes). */
+function lineageAt(live: Y.Doc): number | null {
+  if (!live.share.has(LINEAGE_ROOT)) return null;
+  const at = live.getMap<unknown>(LINEAGE_ROOT).get('at');
+  return typeof at === 'number' && Number.isFinite(at) ? at : null;
+}
+
+/** The report-only audit of a freshly built shadow (legacy rows): pure, so it runs inside the rebuild's bounds. */
+type Audit = { legacyPending: Ranges; legacyInvalid: string[]; rules: Record<string, number> };
+function auditShadow(shadow: Y.Doc): Audit {
+  const legacyInvalid = new Set<string>();
+  const rules: Record<string, number> = {};
+  const root = shadow.getXmlFragment('default');
+  /** Elements every browser's y-tiptap deletes on open (invalid, or emptied and then invalid). */
+  const gone = new Set<Y.AbstractType<any>>();
+  const stack: Array<[Y.AbstractType<any>, number]> = [[root, 0]];
+  while (stack.length) {
+    const [type, depth] = stack.pop()!;
+    const check: ElementCheck = depth > COLLAB_LIMITS.elementDepth ? { ok: false, violation: { rule: 'element-depth' }, empty: false } : checkElement(type as Y.XmlElement);
+    if (!check.ok && type !== root) gone.add(type);
+    const tableSize = type !== root && (type as Y.XmlElement).nodeName === 'table' ? checkYTable(type as Y.XmlElement) : null;
+    if (tableSize && check.ok) {
+      legacyInvalid.add(idOf(type)); // a legacy table past the extent bound: reported, its edits not refused for it
+      rules['table-size'] = (rules['table-size'] ?? 0) + 1;
+    }
+    if (!check.ok && !check.empty) {
+      legacyInvalid.add(idOf(type));
+      rules[check.violation!.rule] = (rules[check.violation!.rule] ?? 0) + 1;
+    }
+    for (let item = type._start; item !== null; item = item.right) {
+      if (!item.deleted && item.content instanceof Y.ContentType && kindOf(item.content.type) === 'element') {
+        stack.push([item.content.type, depth + 1]);
+      }
+    }
+  }
+  // y-tiptap's cascade: deleting an invalid element can leave its parent invalid, and every browser then deletes the
+  // parent too, one transaction (one frame) per element. Each parent left invalid and non-empty is legacy as well, so
+  // the deletes of every browser that opens the page are accepted, never refused on every open.
+  const queue = [...gone];
+  while (queue.length) {
+    const parent = queue.pop()!._item?.parent as Y.AbstractType<any> | undefined;
+    if (!parent || gone.has(parent) || !isVisible(parent)) continue;
+    const check = checkElement(parent as Y.XmlElement, gone);
+    if (check.ok) continue;
+    if (!check.empty) {
+      legacyInvalid.add(idOf(parent));
+      rules[`cascade:${check.violation!.rule}`] = (rules[`cascade:${check.violation!.rule}`] ?? 0) + 1;
+    }
+    if (parent !== root) {
+      gone.add(parent);
+      queue.push(parent);
+    }
+  }
+  return { legacyPending: pendingRanges(shadow.store), legacyInvalid: [...legacyInvalid], rules };
 }
 
 /** The ID ranges of a store's pending structs and pending deletes (both V2 updates). */

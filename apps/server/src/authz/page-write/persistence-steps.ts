@@ -9,6 +9,8 @@ import { TiptapTransformer } from '@hocuspocus/transformer';
 import { storeGenerationOf } from './store-failure-registry';
 // CCC #773: the stored projection is made storable (no lone surrogate or NUL) before anything reads or writes it.
 import { storeSafeJson } from './store-safe-json';
+// #827: a load waits for the page's compaction in flight, so it reads the compacted row, never the one being replaced.
+import { awaitCompaction } from './compaction-registry';
 
 /** The subset of `PageRepo.findById` the load uses. */
 type FindPageById<P> = (
@@ -25,11 +27,17 @@ type FindPageById<P> = (
  * again with its content. The second read is the one the load uses in full, so the branches see what a single read at
  * that moment would have returned: a row that gained a ydoc in between loads from it, and a row deleted in between is
  * "page not found".
+ *
+ * #827: first, it waits for a compaction of the page that is in flight (one started by a failed load, or at an unload
+ * on this node). That one rewrites the row's ydoc; a load that read the row before it lands would serve the old
+ * lineage, which the compacted row then refuses to merge. `awaitCompaction` never rejects, and a compaction is bounded
+ * (its build by a deadline, its write by lock and statement timeouts).
  */
 export async function findPageRowForLoad<P extends { ydoc?: unknown }>(
   findById: FindPageById<P>,
   pageId: string,
 ): Promise<P | undefined | null> {
+  await awaitCompaction(pageId);
   const page = await findById(pageId, { includeYdoc: true });
   if (!page || page.ydoc) return page;
   return findById(pageId, { includeContent: true, includeYdoc: true });
@@ -55,7 +63,15 @@ export interface StoreSnapshot {
  */
 export function snapshotForStore(document: Y.Doc): StoreSnapshot {
   const generation = storeGenerationOf(document);
-  const json = storeSafeJson(TiptapTransformer.fromYdoc(document, 'default'));
+  const json = storedProjection(document);
   const state = Buffer.from(Y.encodeStateAsUpdate(document));
   return { generation, json, state };
+}
+
+/**
+ * The JSON a store writes as the page's `content`: `storeSafeJson(fromYdoc(document))` (#773). #827: compaction
+ * rebuilds a page from exactly this, so its ADR 0019 digest (`stableHash` of it) is the one a conditional write names.
+ */
+export function storedProjection(document: Y.Doc): any {
+  return storeSafeJson(TiptapTransformer.fromYdoc(document, 'default'));
 }

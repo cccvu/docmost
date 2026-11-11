@@ -43,6 +43,14 @@ import {
   prepareContentOperation,
   yieldToEventLoop,
 } from '../authz/page-write/replace-update';
+// CCC #827: no direct write to a page that compacts (a retryable 503, nothing changed), no growth of a page still over a
+// structure cap after compaction (the API cap's `page_too_large`), and a load refused as too costly is that 503 too.
+import {
+  assertDocWritable,
+  refusesGrowth,
+  rethrowDirectOpenRefusal,
+} from '../authz/page-write/compaction';
+import { PageTooLargeException } from '../authz/page-write/page-size';
 
 export type CollabEventHandlers = ReturnType<
   CollaborationHandler['getHandlers']
@@ -189,6 +197,7 @@ export class CollaborationHandler {
           documentName,
           { user },
           (doc) => {
+            if (refusesGrowth(doc, operation)) throw new PageTooLargeException(); // CCC #827: before any mutation
             liveDoc = doc;
             this.applyContentOperation(doc, prepared);
           },
@@ -353,8 +362,9 @@ export class CollaborationHandler {
                 outcome = { applied: false, reason: 'precondition' };
                 return;
               }
-              // #716: the page cap, after the dedup and the CAS (see `refuseOverCap`), before any mutation.
-              if (refuseOverCap) {
+              // #716: the page cap, after the dedup and the CAS (see `refuseOverCap`), before any mutation. CCC #827: so is a
+              // page still over a structure cap after compaction (`refusesGrowth`, an append/prepend only).
+              if (refuseOverCap || refusesGrowth(doc, operation)) {
                 outcome = { applied: false, reason: 'too_large' };
                 return;
               }
@@ -436,12 +446,14 @@ export class CollaborationHandler {
     // yield between the resident pre-check and the transaction (#282). The CAS, dedup and cap inside the transaction
     // decide atomically either way.
     const loads = hocuspocus.documents?.has(documentName) === false;
-    const connection = await hocuspocus.openDirectConnection(
-      documentName,
-      context,
-    );
+    const connection = await hocuspocus
+      .openDirectConnection(documentName, context)
+      .catch(rethrowDirectOpenRefusal); // CCC #827: a load refused as too costly is a retryable 503
     try {
       if (loads) await yieldToEventLoop();
+      // CCC #827: no write while the page compacts, drains or was superseded (503, nothing changed). Before any Yjs
+      // transaction, so a refusal does not even bump the document's generation, and after the last yield.
+      assertDocWritable(connection.document);
       // #716: ONE Yjs transaction around the whole callback (Hocuspocus's DirectConnection.transact does not open
       // one). A nested `applyUpdate` joins it, so a replace's delete + apply — and #429's key record — are one
       // atomic CRDT mutation: one update event, one broadcast, and peers never see the empty fragment between them.

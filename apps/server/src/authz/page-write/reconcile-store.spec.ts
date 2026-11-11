@@ -2,7 +2,15 @@
 // CRDT merge semantics the fix depends on are actually exercised rather than mocked. Docs are modelled as a
 // root XmlFragment 'default' of paragraph elements, matching the shape TiptapTransformer produces.
 import * as Y from 'yjs';
-import { markRowCovered, reconcileRowIntoDoc } from './reconcile-store';
+import {
+  coveredRowDigest,
+  ForeignLineageError,
+  lineageEpochOfStructs,
+  markRowCovered,
+  readRootMapEntries,
+  reconcileRowIntoDoc,
+} from './reconcile-store';
+import { isSuperseded, LINEAGE_ROOT, supersededBy, writeLineage } from './compaction-registry';
 
 function paragraph(text: string): Y.XmlElement {
   const el = new Y.XmlElement('paragraph');
@@ -172,5 +180,91 @@ describe('reconcileRowIntoDoc memo (#731)', () => {
     const diff = spyDiff();
     reconcileRowIntoDoc(resident, own);
     expect(diff).toHaveBeenCalledTimes(1);
+  });
+});
+
+// #827 — a FOREIGN lineage is refused, never merged: compaction rebuilds a page under a new lineage epoch, so a union
+// with a copy of another epoch would duplicate every node (the #390 bounded edge above, now for every page).
+describe('reconcileRowIntoDoc foreign lineage (#827)', () => {
+  /** A compaction's output: a fresh document holding `texts`, at `epoch`. */
+  function compacted(texts: string[], epoch: number): Y.Doc {
+    const doc = docWith(texts);
+    writeLineage(doc, epoch, 0);
+    return doc;
+  }
+  const refusal = (fn: () => unknown): ForeignLineageError => {
+    try {
+      fn();
+    } catch (err) {
+      return err as ForeignLineageError;
+    }
+    throw new Error('expected a ForeignLineageError');
+  };
+
+  it('a row compacted since this copy loaded: refused, the copy superseded (epoch named), nothing merged', () => {
+    const stale = docWith(['one', 'two']); // loaded before the compaction (epoch 0)
+    const row = compacted(['one', 'two'], 3);
+    const before = Buffer.from(Y.encodeStateVector(stale));
+
+    const err = refusal(() => reconcileRowIntoDoc(stale, rowBytesOf(row)));
+
+    expect(err).toBeInstanceOf(ForeignLineageError);
+    expect(err.why).toBe('row-compacted');
+    expect(err.rowEpoch).toBe(3);
+    expect(isSuperseded(stale)).toBe(true);
+    expect(supersededBy(stale)).toBe(3);
+    expect(Buffer.from(Y.encodeStateVector(stale))).toEqual(before); // untouched: no duplicate
+    expect(len(stale)).toBe(2);
+  });
+
+  it('this copy compacted, the row an older lineage (an older node stored over it): refused too', () => {
+    const copy = compacted(['one', 'two'], 1);
+    const olderRow = docWith(['one', 'two', 'three']);
+
+    const err = refusal(() => reconcileRowIntoDoc(copy, rowBytesOf(olderRow)));
+
+    expect(err.why).toBe('resident-compacted');
+    expect(err.rowEpoch).toBe(0);
+    expect(isSuperseded(copy)).toBe(true);
+    expect(len(copy)).toBe(2);
+  });
+
+  it('the same lineage still merges an out-of-band write (#390 unchanged on a compacted page)', () => {
+    const base = compacted(['base'], 2);
+    const residentCopy = new Y.Doc();
+    Y.applyUpdate(residentCopy, rowBytesOf(base));
+    const rowCopy = new Y.Doc();
+    Y.applyUpdate(rowCopy, rowBytesOf(base));
+    rowCopy.getXmlFragment('default').insert(1, [paragraph('out-of-band')]);
+
+    expect(reconcileRowIntoDoc(residentCopy, rowBytesOf(rowCopy)).merged).toBe(true);
+    expect(residentCopy.getXmlFragment('default').toString()).toContain('out-of-band');
+    expect(isSuperseded(residentCopy)).toBe(false);
+  });
+
+  it('the row covered by the copy (normal operation) is never inspected for lineage', () => {
+    const copy = compacted(['a'], 5);
+    const row = rowBytesOf(copy);
+    expect(reconcileRowIntoDoc(copy, row).merged).toBe(false);
+    expect(coveredRowDigest(copy)).not.toBeNull();
+    expect(isSuperseded(copy)).toBe(false);
+  });
+
+  it('readRootMapEntries / lineageEpochOfStructs read the lineage from bytes without integrating them', () => {
+    const doc = compacted(['x'], 9);
+    const { structs, ds } = Y.decodeUpdate(rowBytesOf(doc));
+    expect(lineageEpochOfStructs(structs, ds)).toBe(9);
+    const { entries, unresolved } = readRootMapEntries(structs, ds, LINEAGE_ROOT);
+    expect([...entries.keys()].sort()).toEqual(['at', 'epoch']);
+    expect(unresolved).toBe(0);
+    const plain = Y.decodeUpdate(rowBytesOf(docWith(['x'])));
+    expect(lineageEpochOfStructs(plain.structs, plain.ds)).toBe(0);
+    // element attributes are another type's entries: never read as the root's, never counted unresolved
+    const withAttrs = docWith(['x']);
+    const p = withAttrs.getXmlFragment('default').get(0) as Y.XmlElement;
+    p.setAttribute('textAlign', 'left');
+    p.setAttribute('textAlign', 'right');
+    const d2 = Y.decodeUpdate(rowBytesOf(withAttrs));
+    expect(readRootMapEntries(d2.structs, d2.ds, LINEAGE_ROOT)).toEqual({ entries: new Map(), unresolved: 0 });
   });
 });

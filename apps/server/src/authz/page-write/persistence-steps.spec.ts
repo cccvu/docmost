@@ -22,6 +22,8 @@ import { CollaborationHandler } from '../../collaboration/collaboration.handler'
 import { PersistenceExtension } from '../../collaboration/extensions/persistence.extension';
 import * as reconcile from './reconcile-store';
 import { findPageRowForLoad } from './persistence-steps';
+import { markSuperseded, registerInflight } from './compaction-registry';
+import { hasStoreFailure } from './store-failure-registry';
 
 const PAGE_ID = '99999999-9999-4999-8999-999999999999';
 const DOC = `page.${PAGE_ID}`;
@@ -123,6 +125,50 @@ describe('findPageRowForLoad (#731 F2)', () => {
     await expect(findPageRowForLoad(gained, 'p')).resolves.toMatchObject({ ydoc: Buffer.from([2]) });
     const deleted = jest.fn().mockResolvedValueOnce({ id: 'p', ydoc: null }).mockResolvedValueOnce(undefined);
     await expect(findPageRowForLoad(deleted, 'p')).resolves.toBeUndefined();
+  });
+});
+
+describe('findPageRowForLoad waits for the page\'s compaction in flight (#827)', () => {
+  it('reads the row only once the compaction settled (it rewrites the ydoc), even a failed one', async () => {
+    let settle!: (v?: unknown) => void;
+    let fail!: (e: unknown) => void;
+    registerInflight('p827', new Promise((resolve) => (settle = resolve)));
+    const findById = jest.fn(async () => ({ id: 'p827', ydoc: Buffer.from([1]) }));
+    const load = findPageRowForLoad(findById, 'p827');
+    await settleTimers();
+    expect(findById).not.toHaveBeenCalled();
+    settle();
+    await expect(load).resolves.toMatchObject({ id: 'p827' });
+    registerInflight('p827b', new Promise((_r, reject) => (fail = reject)));
+    const other = findPageRowForLoad(findById, 'p827b');
+    fail(new Error('compaction failed'));
+    await expect(other).resolves.toMatchObject({ id: 'p827' });
+    // another page never waits
+    findById.mockClear();
+    registerInflight('p827c', new Promise(() => undefined));
+    await findPageRowForLoad(findById, 'p827d');
+    expect(findById).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('PersistenceExtension.onStoreDocument skips a superseded document (#827, seam #122)', () => {
+  it('a copy a compaction superseded never stores; its settle fails closed', async () => {
+    const s = stack(page('seed', 3));
+    const conn = await s.hocuspocus.openDirectConnection(DOC, { user: USER });
+    const doc = s.hocuspocus.documents.get(DOC)!;
+    let settled: unknown;
+    try {
+      doc.getXmlFragment('default').insert(0, [new Y.XmlElement('paragraph')]); // unsaved: the next store would run
+      markSuperseded(doc, 1);
+      settled = await s.handlers.flushPageContent(DOC, { withDigest: true });
+    } finally {
+      await conn.disconnect(); // always: an open connection keeps jest from exiting
+      await settleTimers();
+    }
+    expect(settled).toEqual({ flushed: false, reason: 'error' });
+    expect(lockedReads(s)).toBe(0);
+    expect(s.updatePage).not.toHaveBeenCalled();
+    expect(hasStoreFailure(doc)).toBe(true);
   });
 });
 

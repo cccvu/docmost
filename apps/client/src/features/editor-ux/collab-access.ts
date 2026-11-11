@@ -32,7 +32,7 @@ import { jwtDecode } from "jwt-decode";
  *   - #790: a SOCKET close with code 1009 (the server's ws "message too big": this browser sent a frame over the
  *     server's maxPayload) is refused too. The provider would reconnect and resend the same frame (its Step2 answer
  *     to the server's Step1) every second, forever. Only a raw socket close carries a code other than 1000.
- *     #810: the notice then leads with Discard (`refusedTooBig`): a reload replays the same oversized copy;
+ *     #810: the notice then leads with Discard (`refusalKind` too-big): a reload replays the same oversized copy;
  *   - #810: "try later" (the server's per-user auth rate, its per-user connection cap, its per-(user, document)
  *     budgets, and a draining node all say so, see TRY_LATER_*) → close the socket, show the disconnected status, and
  *     open it again after a jittered, growing wait (5 s doubling to COLLAB_LOST_RETRY_MS, `collabRetryDelay`). Never
@@ -41,6 +41,19 @@ import { jwtDecode } from "jwt-decode";
  *     is a FIXED 1 s with no backoff, so leaving these to the provider re-sent each refused attempt every second.
  *   - #810: every token refetch also closes the socket first. The server closes a refused socket (4401) right after
  *     its refusal, and the provider would reconnect it in 1 s with the OLD token, racing the refetch.
+ *   - #827: the page's lineage moved on (`ccc:collab-update-refused:epoch-stale:<N>`: the server compacted it, so this
+ *     copy can never merge) → detach and stop, like a refusal, and hand N to the page (`epochChangedTo`): a clean copy
+ *     switches to epoch N, a dirty one shows the Discard-first "compacted" notice (collab-epoch.ts). Checked before the
+ *     generic refused prefix, which it shares on purpose (a pre-#827 editor reads it as a refusal and Reload loads the
+ *     new bundle). An N equal to this copy's own epoch is an ordinary refusal: switching to it would loop;
+ *   - #827: the page is being compacted (`ccc:collab-page-compacting`, a close or an auth refusal) → read-only (an edit
+ *     made now would be in the old lineage and end in Discard), a banner, and a retry 2 s doubling to
+ *     COLLAB_LOST_RETRY_MS. A socket's load refused while its user is in CPU debt (`ccc:collab-load-try-later`) is an
+ *     ordinary try later. Both are pace hints that grant nothing, never the #537 refetch;
+ *   - #827: the try-later backoff resets on `synced` (the server's Step2 applied), not on `authenticated`: a load that
+ *     trips is refused AFTER the authentication, so resetting there kept the wait at 5 s forever;
+ *   - #827: the update guard's new rules are Discard-first (`refusalKind`): `frame-too-large` (as a 1009), the
+ *     `apply-deadline` strike ("too complex") and `page-full`. A reload would replay the same copy.
  *
  * Pure and dependency-free so it is unit-tested without a provider; `collab-access-controller.ts` carries out its
  * steps and page-editor.tsx wires the controller (seam 169).
@@ -57,11 +70,29 @@ export interface CollabAccessState {
   refused: boolean;
   /** #781: an `unresolved` close already reconnected; the next one is refused (reset only by `sync-acked`). */
   unresolvedRetried: boolean;
-  /** #810: the refusal was a 1009 (a frame over the server's maxPayload): only discarding this browser's copy helps. */
-  refusedTooBig: boolean;
-  /** #810: "try later" answers since the last successful authentication (the retry wait grows with it). */
+  /** #810, #827: which refusal notice: the Discard-first kinds say a reload would replay the same copy. */
+  refusalKind: CollabRefusalKind;
+  /** #810: "try later" answers since the last completed sync (#827: the retry wait grows with it). */
   tryLaterAttempts: number;
+  /** #827: the server is compacting the page: read-only, retrying, until the next completed sync. */
+  compacting: boolean;
+  /** #827: the page's lineage is now this epoch (the server compacted it); this copy is detached. */
+  epochChangedTo: number | null;
 }
+
+/**
+ * #810, #827: what the refusal notice says. `generic` offers Reload first; every other kind is Discard-first:
+ *   - too-big: a 1009, or `frame-too-large` (a frame over the page's size cap);
+ *   - too-complex: `apply-deadline` (a frame the server ran out of time applying, twice);
+ *   - page-full: `page-full` (the page is at its structure limit even after compaction);
+ *   - compacted: an epoch-stale refusal of a copy with unsaved changes (a clean copy switches instead).
+ */
+export type CollabRefusalKind =
+  | "generic"
+  | "too-big"
+  | "too-complex"
+  | "page-full"
+  | "compacted";
 
 export const initialCollabAccess: CollabAccessState = {
   lost: false,
@@ -69,8 +100,10 @@ export const initialCollabAccess: CollabAccessState = {
   refreshed: false,
   refused: false,
   unresolvedRetried: false,
-  refusedTooBig: false,
+  refusalKind: "generic",
   tryLaterAttempts: 0,
+  compacting: false,
+  epochChangedTo: null,
 };
 
 /** #781: the server's close reasons (`apps/server/src/authz/collab-ingress`). */
@@ -79,6 +112,52 @@ export const COLLAB_UPDATE_UNRESOLVED = "ccc:collab-update-unresolved";
 
 /** #790: the ws close code for a message over the server's `maxPayload` (RFC 6455 "Message Too Big"). */
 export const WS_CLOSE_MESSAGE_TOO_BIG = 1009;
+
+/**
+ * #827: the server's reasons (`apps/server/src/authz/collab-ingress/collab-reasons.ts`; the parity test holds them
+ * equal). The epoch-stale prefix extends COLLAB_UPDATE_REFUSED_PREFIX, so it is matched first.
+ */
+export const COLLAB_EPOCH_STALE_PREFIX = "ccc:collab-update-refused:epoch-stale:";
+export const COLLAB_PAGE_COMPACTING_REASON = "ccc:collab-page-compacting";
+export const COLLAB_LOAD_TRY_LATER_REASON = "ccc:collab-load-try-later";
+/** #827: the update guard's Discard-first rules (`ccc:collab-update-refused:<rule>`). */
+export const COLLAB_RULE_FRAME_TOO_LARGE = "frame-too-large";
+export const COLLAB_RULE_APPLY_DEADLINE = "apply-deadline";
+export const COLLAB_RULE_PAGE_FULL = "page-full";
+
+/** #827: an epoch as the server writes it (no sign, no leading zero, a safe integer); the parity test pins it. */
+export const COLLAB_EPOCH_PATTERN = /^(0|[1-9][0-9]{0,14})$/;
+
+/** #827: the epoch an epoch-stale reason names, or null for any other (or a malformed) reason. */
+export function parseEpochStaleReason(reason: string | undefined): number | null {
+  if (typeof reason !== "string" || !reason.startsWith(COLLAB_EPOCH_STALE_PREFIX)) {
+    return null;
+  }
+  const tail = reason.slice(COLLAB_EPOCH_STALE_PREFIX.length);
+  return COLLAB_EPOCH_PATTERN.test(tail) ? Number(tail) : null;
+}
+
+/** #810, #827: the notice a refusal gets, from its close code and reason. */
+export function collabRefusalKind(
+  reason: string | undefined,
+  code?: number,
+): CollabRefusalKind {
+  if (code === WS_CLOSE_MESSAGE_TOO_BIG) return "too-big";
+  switch (
+    typeof reason === "string" && reason.startsWith(COLLAB_UPDATE_REFUSED_PREFIX)
+      ? reason.slice(COLLAB_UPDATE_REFUSED_PREFIX.length)
+      : undefined
+  ) {
+    case COLLAB_RULE_FRAME_TOO_LARGE:
+      return "too-big";
+    case COLLAB_RULE_APPLY_DEADLINE:
+      return "too-complex";
+    case COLLAB_RULE_PAGE_FULL:
+      return "page-full";
+    default:
+      return "generic";
+  }
+}
 
 /**
  * #810: the server's "try later" signals, copied from `apps/server/src/authz/collab-ingress` (the parity test
@@ -91,21 +170,27 @@ export const WS_CLOSE_MESSAGE_TOO_BIG = 1009;
 export const TRY_LATER_AUTH_REASONS: readonly string[] = [
   "ccc:collab-auth-rate-limited",
   "ccc:collab-user-connections",
+  COLLAB_LOAD_TRY_LATER_REASON, // #827: a socket's load refused while its user is in CPU debt
 ];
 export const TRY_LATER_CLOSE_REASONS: readonly string[] = [
   "ccc:collab-try-later",
   "ccc:collab-user-connections",
+  COLLAB_LOAD_TRY_LATER_REASON,
 ];
 export const TRY_LATER_CLOSE_CODES: readonly number[] = [1013, 4429];
 
 export function classifyCollabCloseReason(
   reason: string | undefined,
   code?: number,
-): "refused" | "unresolved" | "try-later" | "other" {
+): "refused" | "epoch" | "unresolved" | "compacting" | "try-later" | "other" {
   if (code === WS_CLOSE_MESSAGE_TOO_BIG) return "refused";
   if (typeof reason === "string") {
+    // #827: before the refused prefix it extends (a malformed epoch is still "epoch": nextCollabAccess refuses it)
+    if (reason.startsWith(COLLAB_EPOCH_STALE_PREFIX)) return "epoch";
     if (reason.startsWith(COLLAB_UPDATE_REFUSED_PREFIX)) return "refused";
     if (reason === COLLAB_UPDATE_UNRESOLVED) return "unresolved";
+    // #827: before the 1013 code fallback, which it is sent with
+    if (reason === COLLAB_PAGE_COMPACTING_REASON) return "compacting";
     if (TRY_LATER_CLOSE_REASONS.includes(reason)) return "try-later";
   }
   if (typeof code === "number" && TRY_LATER_CLOSE_CODES.includes(code)) {
@@ -131,7 +216,9 @@ export type CollabAccessEvent =
   | { kind: "refresh-failed" }
   | { kind: "authenticated"; scope: string | undefined }
   /** #781: the provider's unsynced-changes count reached 0 — the server applied every frame it was sent. */
-  | { kind: "sync-acked" };
+  | { kind: "sync-acked" }
+  /** #827: the provider synced (the server's Step2 applied): the page loaded, so stop waiting. */
+  | { kind: "synced" };
 
 export interface CollabAccessStep {
   state: CollabAccessState;
@@ -163,6 +250,9 @@ export const COLLAB_TRY_LATER_BASE_MS = 5_000;
 /** #810: no jittered retry waits less than this. */
 export const COLLAB_RETRY_MIN_MS = 1_000;
 
+/** #827: the first wait after a "compacting" answer (a compaction takes seconds); it doubles like a try later. */
+export const COLLAB_COMPACTING_BASE_MS = 2_000;
+
 /**
  * #810: the wait the caller actually uses for a step's `retryAfterMs`: between half of it and all of it, so the
  * editors a deploy or an outage disconnected together do not come back together.
@@ -189,21 +279,27 @@ const NO_ACTION = {
   retryAfterMs: 0,
 } as const;
 
+/**
+ * `clientEpoch` (#827) is the lineage this editor's copy and socket claim (`?cccEpoch`, collab-epoch.ts).
+ */
 export function nextCollabAccess(
   prev: CollabAccessState,
   event: CollabAccessEvent,
+  clientEpoch = 0,
 ): CollabAccessStep {
   // #781: refused is final. The provider is detached, so nothing should arrive; if something does, ignore it.
   if (prev.refused) return { state: prev, ...NO_ACTION };
   switch (event.kind) {
     case "server-close": {
       const reason = classifyCollabCloseReason(event.reason, event.code);
+      if (reason === "epoch") return epochStep(prev, event.reason, clientEpoch);
       if (reason === "refused") {
-        return refusedStep(prev, event.code === WS_CLOSE_MESSAGE_TOO_BIG);
+        return refusedStep(prev, collabRefusalKind(event.reason, event.code));
       }
+      if (reason === "compacting") return compactingStep(prev);
       if (reason === "try-later") return tryLaterStep(prev);
       if (reason === "unresolved") {
-        if (prev.unresolvedRetried) return refusedStep(prev, false);
+        if (prev.unresolvedRetried) return refusedStep(prev, "generic");
         // Reconnect once (a closing socket is reconnected by the provider itself).
         return {
           ...NO_ACTION,
@@ -218,7 +314,24 @@ export function nextCollabAccess(
     case "sync-acked":
       if (!prev.unresolvedRetried) return { state: prev, ...NO_ACTION };
       return { state: { ...prev, unresolvedRetried: false }, ...NO_ACTION };
+    case "synced":
+      // #827: the server loaded the page and answered: the wait (and a compaction) is over. Same object when there
+      // is nothing to clear, so a sync does not re-render.
+      if (!prev.compacting && prev.tryLaterAttempts === 0) {
+        return { state: prev, ...NO_ACTION };
+      }
+      return {
+        state: { ...prev, compacting: false, tryLaterAttempts: 0 },
+        ...NO_ACTION,
+      };
     case "auth-failed":
+      // #827: a load refused for a stale lineage or a compaction, before the #537 path (the token verified).
+      if (parseEpochStaleReason(event.reason) !== null) {
+        return epochStep(prev, event.reason, clientEpoch);
+      }
+      if (event.reason === COLLAB_PAGE_COMPACTING_REASON) {
+        return compactingStep(prev);
+      }
       // #810: checked first: a rate-limited refusal implies the token verified, so a refetch would not help.
       if (
         typeof event.reason === "string" &&
@@ -255,7 +368,7 @@ export function nextCollabAccess(
           lost: false,
           readOnly: event.scope === "readonly",
           refreshed: false,
-          tryLaterAttempts: 0, // #810: a server that authenticates is no longer asking this editor to wait
+          // #827: `tryLaterAttempts` survives: a load that trips is refused after the authentication (`synced` resets it)
         },
       };
   }
@@ -274,7 +387,7 @@ function lostStep(prev: CollabAccessState): CollabAccessStep {
 
 /**
  * #810: the server asked this editor to try later. Close the socket and open it again after a wait that doubles with
- * each answer like it (5 s, 10 s, ... COLLAB_LOST_RETRY_MS), until an authentication resets it. Not lost, not
+ * each answer like it (5 s, 10 s, ... COLLAB_LOST_RETRY_MS), until a completed sync resets it (#827). Not lost, not
  * refused, no token refetch, still editable (edits wait in the Y doc, as offline); `refreshed` is untouched.
  */
 function tryLaterStep(prev: CollabAccessState): CollabAccessStep {
@@ -292,17 +405,55 @@ function tryLaterStep(prev: CollabAccessState): CollabAccessStep {
 }
 
 /**
+ * #827: the server is compacting the page. As a try later (close the socket, no refetch, never lost), but read-only
+ * and from COLLAB_COMPACTING_BASE_MS: the page comes back in seconds, under a new epoch.
+ */
+function compactingStep(prev: CollabAccessState): CollabAccessStep {
+  const retryAfterMs = Math.min(
+    COLLAB_LOST_RETRY_MS,
+    COLLAB_COMPACTING_BASE_MS * 2 ** Math.min(prev.tryLaterAttempts, 16),
+  );
+  return {
+    ...NO_ACTION,
+    state: {
+      ...prev,
+      compacting: true,
+      tryLaterAttempts: prev.tryLaterAttempts + 1,
+    },
+    markDisconnected: true,
+    disconnectSocket: true,
+    retryAfterMs,
+  };
+}
+
+/**
+ * #827: the server refused this copy's lineage. Detach and close for good, like a refusal (nothing of either lineage
+ * may merge into the other), and name the new epoch for the page to switch to. An epoch that cannot be read, or the
+ * one this copy already claims, is an ordinary refusal: switching to it would reconnect into the same answer.
+ */
+function epochStep(
+  prev: CollabAccessState,
+  reason: string | undefined,
+  clientEpoch: number,
+): CollabAccessStep {
+  const epoch = parseEpochStaleReason(reason);
+  if (epoch === null || epoch === clientEpoch) return refusedStep(prev, "generic");
+  const step = refusedStep(prev, "compacted");
+  return { ...step, state: { ...step.state, epochChangedTo: epoch } };
+}
+
+/**
  * #781: stop sending and stop editing. No `markDisconnected`: the header's "connection lost. Retrying..." would be
- * untrue (nothing retries); the refusal notice says what happened and offers the recovery. #810: `tooBig` (a 1009)
- * tells the notice that only discarding this browser's copy recovers.
+ * untrue (nothing retries); the refusal notice says what happened and offers the recovery. #810, #827: `kind` tells
+ * the notice whether only discarding this browser's copy recovers.
  */
 function refusedStep(
   prev: CollabAccessState,
-  tooBig: boolean,
+  kind: CollabRefusalKind,
 ): CollabAccessStep {
   return {
     ...NO_ACTION,
-    state: { ...prev, refused: true, refusedTooBig: tooBig },
+    state: { ...prev, refused: true, refusalKind: kind, compacting: false },
     detach: true,
     disconnectSocket: true,
   };
@@ -310,7 +461,9 @@ function refusedStep(
 
 /** The editor may edit only if the page allows it AND the server still lets this connection write. */
 export function collabAllowsEditing(state: CollabAccessState): boolean {
-  return !state.lost && !state.readOnly && !state.refused;
+  return (
+    !state.lost && !state.readOnly && !state.refused && !state.compacting
+  );
 }
 
 /**

@@ -1,5 +1,6 @@
 import * as Y from 'yjs';
-import { Hocuspocus } from '@hocuspocus/server';
+import * as decoding from 'lib0/decoding';
+import { Hocuspocus, OutgoingMessage } from '@hocuspocus/server';
 import { prosemirrorJSONToYDoc } from '@tiptap/y-tiptap';
 import { serverSchema } from '../page-write/prelim-content';
 import {
@@ -19,7 +20,11 @@ import {
 } from './collab-ingress.testkit';
 import * as encoding from 'lib0/encoding';
 import { CollabUpdateGuardExtension } from './collab-update-guard.extension';
-import { twoClientsShape } from './conflict-scan.testkit';
+import { basePage, rawUpdate, twoClientsShape } from './conflict-scan.testkit';
+import { markCompacting } from '../page-write/compaction-registry';
+import { COLLAB_LOAD_TRY_LATER_REASON, COLLAB_PAGE_COMPACTING_REASON } from './collab-reasons';
+import { runWithDeadline } from './deadline';
+import { SocketLimitLog } from './socket-limit-log';
 import {
   AWARENESS_STATE_MAX_BYTES,
   COLLAB_REFUSAL_CODE,
@@ -28,6 +33,7 @@ import {
   SYNC_BURST,
   TRY_LATER_REASON,
   UNRESOLVED_REASON,
+  USER_COLLAB_CPU_BURST_MS,
   type CollabGuardMode,
 } from './update-guard';
 
@@ -460,5 +466,174 @@ describe('#816 the conflict-scan meter through a real Hocuspocus 4.7.1', () => {
       expect(textOf(live.getXmlFragment('default').get(0) as Y.XmlElement).toString()).toMatch(/^honest /);
       expect(contentOf(s.guard.shadowOf(live)!)).toEqual(contentOf(live)); // rebuilt from live after the refusal
     }
+  });
+});
+
+/** The Auth answers the server sent: `permission-denied:<reason>` or `authenticated`. */
+function authAnswers(sock: FakeSocket): string[] {
+  return sock.sent.flatMap((data) => {
+    const d = decoding.createDecoder(data);
+    decoding.readVarString(d);
+    if (decoding.readVarUint(d) !== MSG.Auth) return [];
+    const sub = decoding.readVarUint(d); // 0 Token, 1 PermissionDenied, 2 Authenticated
+    return [sub === 1 ? `permission-denied:${decoding.readVarString(d)}` : sub === 2 ? 'authenticated' : `auth:${sub}`];
+  });
+}
+
+/**
+ * #827: the load and join hooks through a real Hocuspocus 4.7.1. `load` stands in for persistence: it awaits the row
+ * read (`readMs`), then applies the stored state, under a real vm deadline when `deadlineMs` is set (Track B's load).
+ */
+async function loadServer(opts: { stored: Uint8Array; readMs?: number; deadlineMs?: number; guard?: CollabUpdateGuard }) {
+  const guard = opts.guard ?? new CollabUpdateGuard({ logger: { warn: () => undefined }, limitLog: new SocketLimitLog({ warn: () => undefined }) });
+  const ext = new CollabUpdateGuardExtension(guard);
+  const authenticated: string[] = [];
+  const hp = new Hocuspocus({
+    quiet: true,
+    debounce: 5,
+    maxDebounce: 10,
+    extensions: [
+      ext,
+      {
+        async onAuthenticate(data: any) {
+          authenticated.push(data.token);
+          return { user: { id: data.token } };
+        },
+      },
+      {
+        async onLoadDocument({ document }: { document: Y.Doc }) {
+          await new Promise((r) => setTimeout(r, opts.readMs ?? 0));
+          if (opts.deadlineMs) runWithDeadline(() => Y.applyUpdate(document, opts.stored), opts.deadlineMs);
+          else Y.applyUpdate(document, opts.stored);
+        },
+      },
+    ],
+  } as never);
+  open.push(hp);
+  const socketRequest = () => new Request('http://localhost/', { headers: { 'sec-websocket-key': 'k' } });
+  const connect = async (token: string) => {
+    const sock = new FakeSocket();
+    sockets.push(sock);
+    sock.connect(hp, socketRequest());
+    sock.deliver(authFrame(token));
+    for (let i = 0; i < 20 && authAnswers(sock).length === 0; i++) await new Promise((r) => setTimeout(r, 5));
+    await settle();
+    return sock;
+  };
+  return { hp, guard, ext, authenticated, connect };
+}
+
+/** The inversion page (#827 c): a load walks MN² steps (about 0.1 s at 1000, 0.4 s at 2000). */
+function invertedPage(MN: number): Uint8Array {
+  const b = basePage('acde');
+  const at = (i: number): [number, number] => [1, b.first + i];
+  const ch = (origin: [number, number], right: [number, number]) => ({ origin, right, content: new Y.ContentString('z') });
+  Y.applyUpdate(b.doc, rawUpdate([{ client: 500, clock: 0, structs: Array.from({ length: MN }, () => ch(at(0), at(3))) }]));
+  Y.applyUpdate(b.doc, rawUpdate([{ client: 900_000, clock: 0, structs: Array.from({ length: MN }, (_, i) => ch(at(1), i ? [900_000, i - 1] : at(2))) }]));
+  return Y.encodeStateAsUpdate(b.doc);
+}
+
+describe('#827 QueryAwareness through a real Hocuspocus 4.7.1', () => {
+  it('control: 4.7.1 encodes every awareness state for it and drops the answer; treatment: refused message-type, nothing encoded', async () => {
+    for (const arm of ['none', 'real'] as const) {
+      const s = await server({ guard: arm });
+      const sock = await s.connect('attacker');
+      const spy = jest.spyOn(OutgoingMessage.prototype, 'createAwarenessUpdateMessage');
+      sock.deliver(typedFrame(MSG.QueryAwareness));
+      await settle();
+      if (arm === 'none') {
+        expect(spy).toHaveBeenCalled();
+        expect(sock.closeReasons()).toEqual([]);
+      } else {
+        expect(spy).not.toHaveBeenCalled();
+        expect(sock.closeReasons()).toEqual([REFUSED('message-type')]);
+      }
+      spy.mockRestore();
+    }
+  });
+});
+
+describe('#827 joins and loads through a real Hocuspocus 4.7.1', () => {
+  const stored = () => Y.encodeStateAsUpdate(prosemirrorJSONToYDoc(serverSchema(), SEED, 'default'));
+
+  it('a join to a resident document closed for compaction is refused try-later, before authentication runs', async () => {
+    const s = await loadServer({ stored: stored() });
+    const first = await s.connect('a');
+    expect(authAnswers(first)).toEqual(['authenticated']);
+    markCompacting(s.hp.documents.get(DOC_NAME)!);
+    const second = await s.connect('b');
+    expect(authAnswers(second)).toEqual([`permission-denied:${COLLAB_PAGE_COMPACTING_REASON}`]);
+    expect(s.authenticated).toEqual(['a']);
+  });
+
+  it("a socket's load is refused try-later while its user is in CPU debt; the API's DirectConnection never is", async () => {
+    const s = await loadServer({ stored: stored() });
+    s.guard.chargeLoad('debtor', USER_COLLAB_CPU_BURST_MS + 1_000, s.guard.wallClock());
+    const sock = await s.connect('debtor');
+    expect(authAnswers(sock)).toEqual(['authenticated', `permission-denied:${COLLAB_LOAD_TRY_LATER_REASON}`]);
+    expect(s.hp.documents.has(DOC_NAME)).toBe(false); // destroyed, never resident
+    const direct = await s.hp.openDirectConnection(DOC_NAME, { user: { id: 'debtor' } });
+    expect(contentOf(direct.document as Y.Doc)).toEqual(contentOf(prosemirrorJSONToYDoc(serverSchema(), SEED, 'default')));
+    await direct.disconnect();
+  });
+
+  it('control: without the gate the same socket loads (the gate is the only refusal)', async () => {
+    const s = await loadServer({ stored: stored() });
+    const sock = await s.connect('debtor');
+    expect(authAnswers(sock)).toEqual(['authenticated']);
+  });
+
+  it("a socket's load is charged its Yjs transactions' time only (never the row read); a DirectConnection's to no one", async () => {
+    const page = invertedPage(1000);
+    const s = await loadServer({ stored: page, readMs: 120 });
+    const charge = jest.spyOn(s.guard, 'chargeLoad');
+    const t0 = performance.now();
+    const sock = await s.connect('reader');
+    for (let i = 0; i < 200 && charge.mock.calls.length === 0; i++) await new Promise((r) => setTimeout(r, 5)); // the load ends after the Authenticated
+    const wall = performance.now() - t0;
+    expect(authAnswers(sock)).toEqual(['authenticated']);
+    expect(charge).toHaveBeenCalledTimes(1);
+    const [user, ms] = charge.mock.calls[0];
+    expect(user).toBe('reader');
+    expect(ms).toBeGreaterThan(0);
+    expect(ms).toBeLessThan(wall - 100); // the 120 ms read is not in it
+    // listeners gone: later transactions on the resident document charge nothing
+    const live = s.hp.documents.get(DOC_NAME)!;
+    const observers = (live as unknown as { _observers: Map<string, Set<unknown>> })._observers;
+    for (const event of ['beforeAllTransactions', 'afterAllTransactions']) expect(observers.get(event)?.size ?? 0).toBe(0);
+    live.transact(() => live.getXmlFragment('default').insert(0, [new Y.XmlElement('paragraph')]));
+    expect(charge).toHaveBeenCalledTimes(1);
+    sock.close(1000, 'bye');
+    await new Promise((r) => setTimeout(r, 50)); // unloaded
+    const direct = await s.hp.openDirectConnection(DOC_NAME, { user: { id: 'api' } });
+    expect(charge).toHaveBeenCalledTimes(1);
+    await direct.disconnect();
+  });
+
+  it('a load cut by its deadline (no afterAllTransactions: the vm skips Yjs cleanup) is charged when Hocuspocus destroys it', async () => {
+    const page = invertedPage(2000); // ~0.4 s to load in full
+    const s = await loadServer({ stored: page, deadlineMs: 40 });
+    const charge = jest.spyOn(s.guard, 'chargeLoad');
+    const sock = await s.connect('looper');
+    const answers = authAnswers(sock);
+    expect(answers[0]).toBe('authenticated');
+    expect(answers[1]).toMatch(/^permission-denied:/);
+    expect(s.hp.documents.has(DOC_NAME)).toBe(false);
+    expect(charge).toHaveBeenCalledTimes(1);
+    expect(charge.mock.calls[0][0]).toBe('looper');
+    expect(charge.mock.calls[0][1]).toBeGreaterThanOrEqual(30); // the cut transaction, until the destroy
+    expect(s.guard.cpuBalance('looper')).toBeLessThan(USER_COLLAB_CPU_BURST_MS - 30);
+  });
+
+  it('afterLoadDocument never throws, whatever the guard does', async () => {
+    const guard = new CollabUpdateGuard({ logger: { warn: () => undefined } });
+    const ext = new CollabUpdateGuardExtension(guard);
+    const doc = new Y.Doc();
+    ext.onLoadDocument({ document: doc, context: { user: { id: 'u' } }, requestHeaders: new Headers({ 'sec-websocket-key': 'k' }) } as never);
+    doc.transact(() => doc.getXmlFragment('default').insert(0, [new Y.XmlElement('paragraph')]));
+    jest.spyOn(guard, 'chargeLoad').mockImplementation(() => {
+      throw new Error('boom');
+    });
+    expect(ext.afterLoadDocument({ document: doc } as never)).toBeUndefined();
   });
 });
