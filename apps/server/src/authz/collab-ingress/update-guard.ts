@@ -3,8 +3,10 @@
  *
  * The collab update guard: refuses, BEFORE Hocuspocus applies it, a client frame that would make any browser's
  * y-tiptap delete content (its delete-on-error syncs to every peer), crash a render, or wedge the server's store; binds
- * each Yjs client id to the user who first used it; and keeps clients out of every root but `'default'` (the `/v1`
- * idempotency ledger, `__ccc_write_idem`, is server-only) and out of Stateless broadcasts.
+ * each Yjs client id to the user who announced it or first wrote it as their own (an id first seen in another client's
+ * relay of a lost lifetime's structs stays unbound until its author's awareness claims it); and keeps clients out of
+ * every root but `'default'` (the `/v1` idempotency ledger, `__ccc_write_idem`, is server-only) and out of Stateless
+ * broadcasts.
  *
  * How: each live Document gets a SHADOW replica (a second Y.Doc kept equal to live by a mirror listener). A frame is
  * applied to the shadow inside `Y.transact(shadow, …, origin, local=false)` — what y-protocols does to live — and
@@ -47,8 +49,9 @@
  *
  * Refusal = a throw of `{ code: 4422, reason }`: Hocuspocus closes that ONE document session and sends the reason (the
  * websocket stays up). Reasons the client acts on (apps/client features/editor-ux): `ccc:collab-update-refused:<rule>`
- * (stop sending, read-only, notice) and `ccc:collab-update-unresolved` (reconnect once). A socket whose sessions are
- * refused SOCKET_REFUSAL_BUDGET times is closed outright. An exhausted (user, document) budget is NOT a refusal: the
+ * (stop sending, read-only, notice) and `ccc:collab-update-unresolved` (reconnect once: a missing dependency, or new
+ * clocks at an id whose owner has only announced it so far, logged `foreign-client` at stage `unproven-owner`). A
+ * socket whose sessions are refused SOCKET_REFUSAL_BUDGET times is closed outright. An exhausted (user, document) budget is NOT a refusal: the
  * socket is closed 1013 (`tryLater`), which the editor retries. `COLLAB_UPDATE_GUARD=report` logs instead of either.
  */
 import { Logger } from '@nestjs/common';
@@ -81,6 +84,8 @@ export const UNRESOLVED_REASON = 'ccc:collab-update-unresolved';
 export const SOCKET_REFUSAL_BUDGET = 3;
 /** An honest connection announces one client id (two after Yjs regenerates one); this only bounds memory. */
 const AWARENESS_BINDS_PER_CONNECTION = 32;
+/** The ids one connection's own awareness announced that are remembered as its ownership evidence (memory bound only). */
+const ANNOUNCED_PER_CONNECTION = AWARENESS_BINDS_PER_CONNECTION;
 /**
  * Awareness-sourced binds per user per document, across that user's connections: past it awareness stops binding that
  * user's ids (never a refusal). Per user, so one writer cannot use up the binds every other user's ids need. An honest
@@ -184,9 +189,13 @@ export interface GuardFrame {
 type Header = { type: number; subtype?: number; payload?: Uint8Array | null };
 /** One awareness entry, its state still the undecoded UTF-8 JSON. */
 type AwarenessEntry = { clientID: number; clock: number; state: Uint8Array };
-/** #816: what a refusal line may add: numbers and fixed words only, never a value from the frame. */
-type RefusalLog = { steps?: number; stage?: 'conflict-scan' };
-type ShadowResult = { violation: Violation | null; binds: Map<number, string>; applied: boolean; log?: RefusalLog };
+/**
+ * #816: what a refusal line may add: numbers and fixed words only, never a value from the frame. `unproven-owner`: a
+ * `foreign-client` at an id whose owner has only announced it, answered `unresolved` (inspectTransaction).
+ */
+type RefusalLog = { steps?: number; stage?: 'conflict-scan' | 'unproven-owner' };
+/** `proven`: awareness-bound ids the sender wrote new clocks at as their owner (no longer `awarenessOnly` once accepted). */
+type ShadowResult = { violation: Violation | null; binds: Map<number, string>; proven?: Set<number>; applied: boolean; log?: RefusalLog };
 type Ranges = Map<number, Array<[number, number]>>;
 
 /** Per live Document: its shadow, client-id bindings and audit results. Dropped with the document (`destroy`). */
@@ -205,6 +214,17 @@ class DocGuard {
   readonly awarenessBinds = new WeakMap<object, number>();
   /** Awareness-sourced binds on this document per user, across that user's connections (AWARENESS_BINDS_PER_USER). */
   readonly awarenessBindsByUser = new Map<string, number>();
+  /**
+   * Per writer connection: the client ids its OWN awareness announced (a non-null state that is not an echo, or one
+   * for an id already bound to its user), whether or not the announcement bound the id. The evidence a struct bind
+   * needs (inspectTransaction). Absent = announced nothing.
+   */
+  readonly announced = new WeakMap<object, Set<number>>();
+  /**
+   * Ids bound by awareness whose owner has written no struct at a new clock in this lifetime. New clocks there from
+   * another user are answered `unresolved`, not refused (the owner's own Step2 may not have landed yet: the mirror race).
+   */
+  readonly awarenessOnly = new Set<number>();
   /** The client id bound to SERVER for the current shadow: unbound again when a rebuild replaces that shadow. */
   shadowBinding: number | null = null;
   /** #816: the user whose refused frame left the shadow dirty: the rebuild is charged to them, not the next sender. */
@@ -479,7 +499,7 @@ export class CollabUpdateGuard {
       }
       if (!ready) return this.refuse(frame, header, violation ?? { rule: 'shadow-unavailable' });
       const applyStarted = this.cpuNow();
-      const result = this.applyToShadow(doc, payload, userId);
+      const result = this.applyToShadow(doc, payload, userId, ownedBy(doc.announced.get(frame.connection)));
       applyMs = this.cpuNow() - applyStarted;
       violation ??= result.violation;
       if (violation && this.mode === 'enforce') {
@@ -491,6 +511,7 @@ export class CollabUpdateGuard {
       }
       if (violation) this.refuse(frame, header, violation, result.log); // report mode: logged, and the frame applies
       for (const [client, user] of result.binds) if (!doc.bindings.has(client)) doc.bindings.set(client, user);
+      for (const client of result.proven ?? []) doc.awarenessOnly.delete(client);
       // A frame the shadow could not apply is not replayed into a rebuild (it would fail every rebuild from then on).
       if (result.applied) doc.inflight.push(payload.slice());
       this.scheduleFlush(doc);
@@ -525,7 +546,7 @@ export class CollabUpdateGuard {
    * The frame applied to the shadow inside the conflict-scan meter (#816). A trip or a meter failure throws out of
    * Yjs's stack, before the item it was replaying integrates; the scope says which, never the error's identity.
    */
-  private applyToShadow(doc: DocGuard, payload: Uint8Array, userId: string): ShadowResult {
+  private applyToShadow(doc: DocGuard, payload: Uint8Array, userId: string, own: (client: number) => boolean): ShadowResult {
     const shadow = doc.shadow!;
     const pendingBefore = pendingRanges(shadow.store);
     const scan = new ConflictScan(shadow, this.mode === 'enforce');
@@ -536,7 +557,7 @@ export class CollabUpdateGuard {
           shadow,
           (tr) => {
             Y.applyUpdate(shadow, payload, INSPECT); // V1, as y-protocols reads Step2 and Update
-            out = this.inspectTransaction(doc, tr, userId, pendingBefore);
+            out = this.inspectTransaction(doc, tr, userId, own, pendingBefore);
           },
           INSPECT,
           false,
@@ -557,15 +578,16 @@ export class CollabUpdateGuard {
   }
 
   /** Inside the transaction, after the frame integrated and before any GC or merge. */
-  private inspectTransaction(doc: DocGuard, tr: Y.Transaction, userId: string, pendingBefore: Ranges) {
+  private inspectTransaction(doc: DocGuard, tr: Y.Transaction, userId: string, own: (client: number) => boolean, pendingBefore: Ranges) {
     const shadow = tr.doc;
     const store = shadow.store;
     const root = shadow.share.get('default');
     const touched = new Set<Y.AbstractType<any>>();
     const newTypes: Y.AbstractType<any>[] = [];
     const binds = new Map<number, string>();
+    const proven = new Set<number>();
     const reportOnly: Violation[] = [];
-    const result = (violation: Violation | null): ShadowResult => ({ violation, binds, applied: true });
+    const result = (violation: Violation | null, log?: RefusalLog): ShadowResult => ({ violation, binds, proven, applied: true, ...(log ? { log } : {}) });
 
     for (const [client, structs] of store.clients) {
       const before = tr.beforeState.get(client) ?? 0;
@@ -579,9 +601,18 @@ export class CollabUpdateGuard {
           if (owner === undefined) {
             // Only an id live never saw binds here. An id the stored document already holds (an earlier lifetime) binds
             // by awareness only: bindings are not persisted, so a claim on it after a reload is undetectable (ADR 0036).
-            if (!tr.beforeState.has(client)) binds.set(client, userId);
+            // And only to a sender whose connection announced it, or announced nothing (a pagehide-nulled awareness, a
+            // promoted reader: the rule before this evidence existed). Any other never-seen id is another client's
+            // structs relayed from a lifetime that lost them: it stays unbound, so its author's awareness claims it.
+            if (!tr.beforeState.has(client) && own(client)) binds.set(client, userId);
           } else if (owner !== userId) {
+            // The owner has only announced the id so far: its own Step2 may still be on the way while a peer relays its
+            // lost structs (the mirror race after a lost lifetime). Never applied either way; `unresolved` makes the
+            // sender reconnect once, and by then the owner's Step2 has made these clocks known.
+            if (doc.awarenessOnly.has(client)) return result({ rule: 'foreign-client' }, { stage: 'unproven-owner' });
             return result({ rule: 'foreign-client' });
+          } else if (doc.awarenessOnly.has(client)) {
+            proven.add(client);
           }
         }
         if (!(struct instanceof Y.Item)) continue; // GC: no content, no parent
@@ -753,23 +784,35 @@ export class CollabUpdateGuard {
     });
   }
 
-  /** A writer's awareness entries (already within checkAwareness's bounds) bind the client ids they announce. */
+  /**
+   * A writer's awareness entries (already within checkAwareness's bounds) bind the client ids they announce, and record
+   * them as the connection's ownership evidence (DocGuard.announced).
+   */
   private bindFromAwareness(doc: DocGuard, frame: GuardFrame, entries: AwarenessEntry[]): void {
     const userId = String(frame.context?.user?.id ?? '');
     try {
       for (const { clientID, clock, state } of entries) {
-        if (doc.bindings.has(clientID)) continue;
+        const owner = doc.bindings.get(clientID);
+        if (owner !== undefined && owner !== userId) continue; // another user's (an echo or a removal: checkAwareness)
         // An echo (a provider's `timeout` removal of a peer, or a 3.x provider resending what it was relayed): the server
         // already holds this client's state at this clock (it relayed it), so the echo says nothing about who owns the
         // id: a writer's echo of a READER's state would otherwise bind the reader's id to the writer, refusing the reader
-        // once promoted.
+        // once promoted. An echo of an id already bound to this user (a reconnect resending its own state) still
+        // announces it.
         const held = frame.document.awareness?.meta.get(clientID)?.clock;
-        if (held !== undefined && held >= clock) continue;
+        if (owner === undefined && held !== undefined && held >= clock) continue;
         if (JSON.parse(decodeUtf8(state)) === null) continue; // at most AWARENESS_STATE_MAX_BYTES
+        // Ownership evidence for this connection's struct binds, recorded whether or not the id binds below (past a
+        // bind budget the sender's own id is still its own).
+        const announced = doc.announced.get(frame.connection) ?? new Set<number>();
+        if (announced.size < ANNOUNCED_PER_CONNECTION) announced.add(clientID);
+        doc.announced.set(frame.connection, announced);
+        if (owner !== undefined) continue;
         const used = doc.awarenessBinds.get(frame.connection) ?? 0;
         const byUser = doc.awarenessBindsByUser.get(userId) ?? 0;
-        if (used >= AWARENESS_BINDS_PER_CONNECTION || byUser >= AWARENESS_BINDS_PER_USER) return;
+        if (used >= AWARENESS_BINDS_PER_CONNECTION || byUser >= AWARENESS_BINDS_PER_USER) continue;
         doc.bindings.set(clientID, userId);
+        doc.awarenessOnly.add(clientID);
         doc.awarenessBinds.set(frame.connection, used + 1);
         doc.awarenessBindsByUser.set(userId, byUser + 1);
       }
@@ -780,7 +823,8 @@ export class CollabUpdateGuard {
 
   /** Logs the refusal; in enforce mode also closes the session (throws) and counts against the socket's budget. */
   private refuse(frame: GuardFrame, header: Header, violation: Violation, extra?: RefusalLog): void {
-    const reason = reasonFor(violation.rule);
+    // An unproven owner's id: logged as the foreign-client it is, answered as a reconnect (inspectTransaction).
+    const reason = extra?.stage === 'unproven-owner' ? UNRESOLVED_REASON : reasonFor(violation.rule);
     this.log('COLLAB_UPDATE_REFUSED', frame.document, {
       rule: violation.rule,
       ...(violation.node ? { node: violation.node } : {}),
@@ -815,6 +859,17 @@ export class CollabUpdateGuard {
     this.logLines.warn(token, () => `${token} ${JSON.stringify({ ...fields, pageId: pageIdOf(live) })}`);
   }
 }
+
+/**
+ * May a struct at a never-seen id bind it to this connection's user? Yes when its own awareness announced that id, or
+ * announced none (the rule before this evidence: a sender that sends no awareness still gets it, ADR 0036 §4). An honest
+ * 4.7.1 provider sends its own awareness right after Auth and Step1, before its Step2 or any queued Update, so a sender
+ * that announced ids and writes another never-seen one is relaying a peer's structs.
+ */
+const ownedBy =
+  (announced: Set<number> | undefined) =>
+  (client: number): boolean =>
+    announced === undefined || announced.has(client);
 
 /** The UTF-8 bytes `null`: y-protocols' encoding of a removed state (`JSON.stringify(null)`). */
 const isNullState = (state: Uint8Array): boolean =>

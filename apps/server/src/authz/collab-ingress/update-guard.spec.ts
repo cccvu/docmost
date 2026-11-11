@@ -508,12 +508,15 @@ describe('#781 B4: a client id is bound to its user (forged clocks)', () => {
     expect(renderLikeABrowser(live2).text).not.toContain('MINE');
   });
 
-  it('bound by a non-readOnly awareness frame: the forged struct is foreign-client; the victim\'s own edits pass', () => {
+  it('bound by a non-readOnly awareness frame: the forged struct is never applied; the victim\'s own edits pass', () => {
     const { s, victim, vc } = victimSetup();
     expect(s.deliver(vc, awarenessFrame([{ clientID: 1001, state: { user: { name: 'V' } } }]))).toBe('applied');
-    expectRefused(s, s.conn('attacker'), forge(s, 1001, 'FORGED '), REFUSED('foreign-client'));
+    // Before the victim writes at its id, new clocks there are answered unresolved (refused, never applied: the mirror
+    // race after a lost lifetime, relay-binding.spec.ts); once it has written, they are foreign-client.
+    expectRefused(s, s.conn('attacker'), forge(s, 1001, 'FORGED '), UNRESOLVED_REASON);
     expect(s.send(vc, victim.edit(s.live, () => textOf(find(victim.doc, 'paragraph')).insert(0, 'MINE ')))).toBe('applied');
     expect(renderLikeABrowser(s.live).text).toContain('MINE');
+    expectRefused(s, s.conn('attacker'), forge(s, 1001, 'FORGED '), REFUSED('foreign-client'));
   });
 
   it('bound by the first new struct (a pagehide-nulled awareness, or a regenerated client id)', () => {
@@ -560,7 +563,7 @@ describe('#781 B4: a client id is bound to its user (forged clocks)', () => {
     const meta = new Map<number, { clock: number }>([[1001, { clock: 1 }]]);
     (s.live as unknown as { awareness: unknown }).awareness = { meta };
     expect(s.deliver(s.conn('victim'), awarenessFrame([{ clientID: 1001, clock: 2, state: { user: { name: 'V' } } }]))).toBe('applied');
-    expectRefused(s, s.conn('attacker'), forge(s, 1001, 'FORGED '), REFUSED('foreign-client'));
+    expectRefused(s, s.conn('attacker'), forge(s, 1001, 'FORGED '), UNRESOLVED_REASON); // bound by awareness only so far
   });
 
   it('the server\'s own client id is protected', () => {
