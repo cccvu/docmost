@@ -218,7 +218,12 @@ d('the collab store behind the ingress guard (#781)', () => {
     const n = node(true);
     const first = await n.connect('editor');
     const live = n.live();
-    live.transact(() => recordWriteKey(live, scopedWriteKey('u', 'api-key'), Date.now()), V1_WRITE);
+    // A real keyed write changes content with its key (a content-neutral write is not stored: persistence skips an
+    // unchanged row, and the ledger entry would never reach it).
+    live.transact(() => {
+      textOf(live.getXmlFragment('default').get(0) as Y.XmlElement).insert(9, ' v1');
+      recordWriteKey(live, scopedWriteKey('u', 'api-key'), Date.now());
+    }, V1_WRITE);
     await expect(n.handlers.flushPageContent(DOC)).resolves.toMatchObject({ flushed: true });
     // precondition: the ROW holds the ledger entry (else this is the crash residual below, a different case)
     const stored = new Y.Doc();
@@ -249,7 +254,7 @@ d('the collab store behind the ingress guard (#781)', () => {
     await expect(n.handlers.flushPageContent(DOC, { withDigest: true })).resolves.toMatchObject({ flushed: true });
     expect(remount.closeReasons()).toEqual([]);
     expect(storeFailures).toEqual([]);
-    expect(JSON.stringify((await row()).content)).toContain('"text":"seed text and more"');
+    expect(JSON.stringify((await row()).content)).toContain('"text":"seed text and more v1"');
   });
 
   it('residual (ADR 0036): a browser holding a ledger entry the crashed node never stored is refused on reconnect', async () => {
