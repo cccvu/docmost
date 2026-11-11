@@ -30,7 +30,9 @@
  * lock. Kept open, its document would never unload, and `destroy` would wait for the SIGKILL with the lock held. It
  * closes the SOCKET first, 1013 (try again later): the socket then reads as closing, so the document close after it
  * sends no CLOSE frame. The editor answers a document CLOSE by reopening at once (collab-access.ts), and the raw 1013
- * with the provider's backoff, by when the next node holds the document. A proxied connection's 1013 is relayed to the
+ * as "try later": it closes its socket and reopens it after its own jittered wait (5 s doubling to 60 s), by when the
+ * next node holds the document. Not the provider's backoff: Hocuspocus provider 4.7.1 reconnects a socket that had
+ * received a frame after a fixed ~1 s. A proxied connection's 1013 is relayed to the
  * node holding the real socket (CollabProxySocket); only 4408 is not.
  */
 import { COLLAB_USER_CONNECTIONS_REASON, collabAuthRefusal } from './auth-refusal';
@@ -118,7 +120,7 @@ const userOf = (p: ConnectionHookPayload): string | null => {
 /** Hocuspocus close code for the over-cap close (the update guard's refusals use 4422). */
 export const COLLAB_USER_CONNECTIONS_CLOSE_CODE = 4429;
 
-/** The close of a connection established while the process drains (#810): RFC 6455 1013, retried with backoff. */
+/** The close of a connection established while the process drains (#810): RFC 6455 1013, the editor's try-later wait. */
 export const COLLAB_DRAINING_CLOSE = { code: 1013, reason: 'Try Again Later' } as const;
 
 export class CollabUserConnectionsExtension {

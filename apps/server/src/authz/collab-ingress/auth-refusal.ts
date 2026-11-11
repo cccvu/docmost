@@ -8,9 +8,13 @@
  * (`Hocuspocus.hooks`: `[onAuthenticate] <message>`), once per attempt, so a refusal a client can trigger at will would
  * otherwise write a line per attempt; each refusal logs its own rate-limited `COLLAB_SOCKET_LIMIT` line instead
  * (socket-limit-log.ts). Hocuspocus answers the client with permission-denied carrying the reason (4.7.1
- * `ClientConnection`: `error.reason ?? "permission-denied"`). The editor (collab-access.ts) waits out
- * COLLAB_AUTH_RATE_REASON and COLLAB_USER_CONNECTIONS_REASON with its try-later backoff (5 s doubling to 60 s,
- * jittered), and treats any other reason as a refusal: it refetches the token once, then shows the connection lost.
+ * `ClientConnection`: `error.reason ?? "permission-denied"`). The editor (collab-access.ts), not the provider, paces
+ * what follows: Hocuspocus provider 4.7.1 reconnects a socket that had received a frame after a fixed ~1 s, with no
+ * backoff, so the editor closes the socket itself. COLLAB_AUTH_RATE_REASON and COLLAB_USER_CONNECTIONS_REASON (and a
+ * 1013 or 4429 close) are "try later": it reopens after its own jittered wait (5 s doubling to 60 s), never refetching
+ * the token and never marking the editor lost. Any other reason (this module's COLLAB_INVALID_TOKEN_REASON included) is
+ * a refusal: it closes the socket, refetches the token once (every time for an expired token), and after a second
+ * refusal with no authentication between shows the connection lost and retries after a jittered 30–60 s.
  */
 import { HttpException } from '@nestjs/common';
 import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
