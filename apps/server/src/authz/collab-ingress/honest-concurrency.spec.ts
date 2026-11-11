@@ -5,7 +5,7 @@ import { serverSchema } from '../page-write/prelim-content';
 import { awarenessFrame, contentOf, DOC_NAME, renderLikeABrowser, step1Frame, SYNC, syncFrame } from './collab-ingress.testkit';
 import { rawUpdate, unguardedSteps, type RawStruct } from './conflict-scan.testkit';
 import { SocketLimitLog } from './socket-limit-log';
-import { COLLAB_REFUSAL_CODE, COLLAB_TRY_LATER_CODE, CollabUpdateGuard } from './update-guard';
+import { COLLAB_REFUSAL_CODE, COLLAB_TRY_LATER_CODE, CollabUpdateGuard, USER_COLLAB_CPU_BURST_MS } from './update-guard';
 
 /**
  * #816 (ADR 0036): honest concurrency never trips the CPU bounds. A seeded corpus of 2–5 peers editing one page
@@ -14,8 +14,9 @@ import { COLLAB_REFUSAL_CODE, COLLAB_TRY_LATER_CODE, CollabUpdateGuard } from '.
  * session's unsent edits (a page's local copy) under a new client id, and latency both ways. Every frame goes through a
  * real CollabUpdateGuard in enforce mode before it applies: zero refusals, zero 1013s, and every peer converges.
  *
- * The CPU budget's clock is held still (`cpuNow`): this corpus runs far faster than people type, so wall time would
- * measure the test machine, not the editors. Its own specs are in update-guard.spec.ts.
+ * The CPU budget is charged on the real CPU clock (`performance.now`) while the wall clock is simulated (200 ms per op,
+ * slower than people type in bursts, faster than they type on average), so the corpus also shows how far an honest
+ * session stays from the debt: the lowest balance any user reached is asserted with a wide margin (ADR 0036 §6).
  */
 const schema = serverSchema();
 const SEEDS = 8;
@@ -54,10 +55,10 @@ function harness(seed: number) {
     logger: { warn: (m: string) => refusals.push(m) },
     limitLog: new SocketLimitLog({ warn: (m: string) => refusals.push(m) }),
     now: () => now,
-    cpuNow: () => 0,
+    cpuNow: () => performance.now(),
   });
   const peers: Peer[] = [];
-  const results = { frames: 0, refused: [] as string[] };
+  const results = { frames: 0, refused: [] as string[], lowestBalance: Infinity };
 
   /** A frame through the guard, then applied as Hocuspocus applies it. */
   const deliver = (peer: Peer, frame: Uint8Array, apply?: () => void): boolean => {
@@ -68,6 +69,7 @@ function harness(seed: number) {
       results.refused.push(`${err?.code === COLLAB_TRY_LATER_CODE ? '1013' : err?.code === COLLAB_REFUSAL_CODE ? '4422' : '?'} ${err?.reason}`);
       return false;
     }
+    results.lowestBalance = Math.min(results.lowestBalance, guard.cpuBalance(peer.user));
     apply?.();
     return true;
   };
@@ -237,9 +239,11 @@ function runSeed(seed: number) {
 
 describe('#816 honest concurrency never meets the CPU bounds', () => {
   it(`${SEEDS} seeded sessions of 2–5 concurrent editors: every frame accepted, every peer converges`, () => {
+    let lowest = Infinity;
     for (let seed = 1; seed <= SEEDS; seed++) {
       const h = runSeed(seed);
       seen.frames += h.results.frames;
+      lowest = Math.min(lowest, h.results.lowestBalance);
       expect({ seed, refused: h.results.refused }).toEqual({ seed, refused: [] });
       expect(h.refusals.filter((l) => !l.startsWith('COLLAB_STORED_CONTENT_INVALID'))).toEqual([]);
       const expected = contentOf(h.live);
@@ -247,7 +251,9 @@ describe('#816 honest concurrency never meets the CPU bounds', () => {
       expect(renderLikeABrowser(h.live)).toMatchObject({ deleted: false, threw: false });
     }
     // anti-vacuity: the corpus really sent frames of every kind it claims
-    if (process.env.CONFLICT_SCAN_TALLY) console.log(JSON.stringify(seen));
+    if (process.env.CONFLICT_SCAN_TALLY) console.log(JSON.stringify({ ...seen, lowest }));
+    // the CPU budget: no honest session came near the debt (a wide margin, so a slow CI runner stays far from it)
+    expect(lowest).toBeGreaterThan(USER_COLLAB_CPU_BURST_MS / 2);
     expect(seen.frames).toBeGreaterThan(SEEDS * 200);
     for (const n of Object.values(seen)) expect(n).toBeGreaterThan(0);
   });
@@ -292,6 +298,8 @@ describe('#816 honest concurrency never meets the CPU bounds', () => {
     h.connect(c);
     expect(Y.decodeStateVector(Y.encodeStateVector(c.doc)).size - Y.decodeStateVector(Y.encodeStateVector(seedDoc)).size).toBeGreaterThan(4);
     expect(h.results.refused).toEqual([]);
+    if (process.env.CONFLICT_SCAN_TALLY) console.log(JSON.stringify({ worstLowest: h.results.lowestBalance }));
+    expect(h.results.lowestBalance).toBeGreaterThan(0); // a 2000-paragraph paste, a 176k-step Step2: never in debt
     expect(contentOf(h.live)).toEqual(contentOf(c.doc));
   });
 

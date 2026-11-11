@@ -182,7 +182,7 @@ export function keyedHistoryShape(history: number, m: number, client = 60): Shap
 export function unguardedSteps(base: Y.Doc, frame: Uint8Array): number {
   const meter = installConflictScanMeter(Y);
   const copy = copyOf(base);
-  const scan = new ConflictScan(copy, false, Infinity, Infinity);
+  const scan = new ConflictScan(copy, false, Infinity);
   meter.metered(scan, () => Y.applyUpdate(copy, frame));
   return scan.steps;
 }

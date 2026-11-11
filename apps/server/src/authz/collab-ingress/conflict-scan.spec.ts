@@ -5,8 +5,6 @@ import { dirname } from 'node:path';
 import * as vm from 'node:vm';
 import * as Y from 'yjs';
 import {
-  CONFLICT_SCAN_STEPS_PER_FRAME,
-  CONFLICT_SCAN_STEPS_PER_ITEM,
   ConflictScan,
   ConflictScanMeterError,
   installConflictScanMeter,
@@ -113,7 +111,7 @@ describe('#816 the replay counts exactly what Yjs walks', () => {
       }
     };
     const apply = (doc: Y.Doc, update: Uint8Array) => {
-      scan = new ConflictScan(doc, false, Infinity, Infinity);
+      scan = new ConflictScan(doc, false, Infinity);
       try {
         meter.metered(scan, () => IY.applyUpdate(doc, update));
       } catch {
@@ -248,9 +246,9 @@ describe('#816 the meter is inert outside its scope, installs once, and refuses 
   it('a tripped scope throws inside, and afterwards (and for any other document) the wrapper never throws or counts', () => {
     const { base, frame } = twoClientsShape(50);
     const victim = copyOf(base);
-    const scan = new ConflictScan(victim, true, 10, 100);
+    const scan = new ConflictScan(victim, true, 100);
     expect(() => meter.metered(scan, () => Y.applyUpdate(victim, frame))).toThrow();
-    expect(scan.trip).toEqual({ cap: 'item', steps: 11 });
+    expect(scan.trip).toEqual({ steps: 101 });
     expect(meter.isActive()).toBe(false);
     // the same expensive frame, outside any scope: on another copy, and on the very document the scope tripped on
     const other = copyOf(base);
@@ -258,7 +256,7 @@ describe('#816 the meter is inert outside its scope, installs once, and refuses 
     expect(() => Y.applyUpdate(victim, frame)).not.toThrow();
     // inside a scope for ANOTHER document, nothing is metered
     const third = copyOf(base);
-    const elsewhere = new ConflictScan(new Y.Doc(), true, 0, 0);
+    const elsewhere = new ConflictScan(new Y.Doc(), true, 0);
     expect(() => meter.metered(elsewhere, () => Y.applyUpdate(third, frame))).not.toThrow();
     expect(elsewhere).toMatchObject({ steps: 0, items: 0, trip: null });
   });
@@ -272,21 +270,20 @@ describe('#816 the meter is inert outside its scope, installs once, and refuses 
     expect(meter.isActive()).toBe(false);
   });
 
-  it('the per-item and per-frame caps: the trip is recorded on the scope; report mode counts past it and never throws', () => {
+  it('the frame cap: the trip is recorded on the scope; report mode counts past it and never throws', () => {
     const { base, frame } = twoClientsShape(300);
     const total = unguardedSteps(base, frame);
     expect(total).toBe(300 * 300 + 299); // n·m, plus one break step per item after the first
     const perFrame = copyOf(base);
-    const byFrame = new ConflictScan(perFrame, true, Infinity, 1000);
+    const byFrame = new ConflictScan(perFrame, true, 1000);
     expect(() => meter.metered(byFrame, () => Y.applyUpdate(perFrame, frame))).toThrow();
-    expect(byFrame.trip).toEqual({ cap: 'frame', steps: 1001 });
+    expect(byFrame.trip).toEqual({ steps: 1001 });
     const reported = copyOf(base);
-    const report = new ConflictScan(reported, false, 10, 1000);
+    const report = new ConflictScan(reported, false, 1000);
     expect(() => meter.metered(report, () => Y.applyUpdate(reported, frame))).not.toThrow();
-    expect(report.trip).toEqual({ cap: 'item', steps: 11 });
+    expect(report.trip).toEqual({ steps: 1001 });
     expect(report.steps).toBe(total);
     expect(Y.encodeStateAsUpdate(reported)).toEqual(Y.encodeStateAsUpdate(unguardedDoc(base, frame)));
-    expect(CONFLICT_SCAN_STEPS_PER_ITEM).toBeLessThan(CONFLICT_SCAN_STEPS_PER_FRAME);
   });
 
   it('installs once: a second install returns the same meter and wraps nothing twice', () => {

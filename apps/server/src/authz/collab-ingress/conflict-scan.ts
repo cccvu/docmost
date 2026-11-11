@@ -10,12 +10,13 @@
  *
  * How: `installConflictScanMeter` wraps `Y.Item.prototype.integrate` once (idempotent, marked by a symbol). Inside a
  * `metered` scope for one document (the guard's shadow apply), the wrapper first REPLAYS the walks Yjs is about to make
- * for that item, read for read, using only the exported `compareIDs`, `getItem` and `createID` (never a splitting read):
+ * for that item, read for read, using the exported `compareIDs`, `getItem` and `createID` and the `_start`/`_map` fields
+ * Yjs's own loop reads (never a splitting read):
  * the `offset > 0` left resolution (:416-422), the entry condition (:425), the keyed pre-walk (:440-442), the loop's
  * case 1, case 2 and break (:459-482), and the keyed reconnect walk (:489-494). It counts one step per iteration and
- * throws past CONFLICT_SCAN_STEPS_PER_ITEM steps for one item or CONFLICT_SCAN_STEPS_PER_FRAME for the scope, BEFORE
- * delegating, so Yjs never pays the walk. The trip is recorded on the scope (`trip`); the thrown value is only a way
- * out of Yjs's stack and is never recognized by identity. In report mode it counts and never throws.
+ * throws past CONFLICT_SCAN_STEPS_PER_FRAME steps for the scope, BEFORE delegating, so Yjs never pays the walk. The
+ * trip is recorded on the scope (`trip`); the thrown value is only a way out of Yjs's stack and is never recognized by
+ * identity. In report mode it counts and never throws.
  *
  * It fails closed: an unexpected error inside the replay is recorded (`failure`) and rethrown as a
  * ConflictScanMeterError, which the guard refuses as `internal`. The replay makes only the reads Yjs's loop makes, in the
@@ -27,34 +28,37 @@
 import * as Y from 'yjs';
 
 /**
- * Steps one item may walk. The largest honest walks the #816 bench measured (2–5 peers, offline runs of up to 500 ops,
- * 2000-paragraph pastes, reconnects) were 5,810 steps for one item and 176,000 for one frame: an offline run of 500
- * edits merged where another editor had pasted 2000 paragraphs, each item walking past the paste. One step costs Yjs
- * about 20–60 ns, so an item at this cap costs a few milliseconds.
+ * Steps one frame may walk in total (all its items, pending structs released by it included): ~50 ms of Yjs per apply
+ * (about 140 ms of the server's for a frame accepted just under it: the replay and the shadow apply, then live's).
+ * The largest honest walks the #816 bench measured (2–5 peers, offline runs of up to 500 ops, 2000-paragraph pastes,
+ * reconnects) were 176,000 steps for one frame (5,810 for one item): an offline run of 500 edits merged where another
+ * editor had pasted 2000 paragraphs, each item walking past the paste. One step costs Yjs about 20–60 ns.
+ *
+ * There is no cap per item. One item's walk is linear in the concurrent structs it crosses, and those are another
+ * editor's to place: a co-editor can put 60,000 cheap siblings where someone is typing, and that person's next
+ * keystroke (sent before it saw them) walks all of them, about 3–7 ms of Yjs. A cap per item below this one would
+ * refuse that keystroke 4422 and detach an honest editor; the frame's total is what costs the process.
  */
-export const CONFLICT_SCAN_STEPS_PER_ITEM = 50_000;
-/** Steps one frame may walk in total (all its items, pending structs released by it included): ~50 ms per apply. */
 export const CONFLICT_SCAN_STEPS_PER_FRAME = 1_000_000;
 
 type YModule = typeof Y;
-type Trip = { cap: 'item' | 'frame'; steps: number };
+type Trip = { steps: number };
 
-/** One metered apply: its caps, its counts, and how it ended. */
+/** One metered apply: its cap, its counts, and how it ended. */
 export class ConflictScan {
-  /** Steps walked so far (report mode keeps counting past a cap). */
+  /** Steps walked so far (report mode keeps counting past the cap). */
   steps = 0;
   /** The most steps one item walked, and the steps of the last item replayed. */
   maxItem = 0;
   lastItem = 0;
   items = 0;
-  /** The first cap exceeded, with the steps at that point. */
+  /** The cap exceeded, with the steps at that point. */
   trip: Trip | null = null;
   /** An unexpected error inside the replay (the scan then fails closed). */
   failure: unknown = null;
   constructor(
     readonly doc: Y.Doc,
     readonly enforce: boolean,
-    readonly perItem: number = CONFLICT_SCAN_STEPS_PER_ITEM,
     readonly perFrame: number = CONFLICT_SCAN_STEPS_PER_FRAME,
   ) {}
 }
@@ -106,12 +110,10 @@ export function installConflictScanMeter(y: YModule = Y): ConflictScanMeter {
   const original = current as unknown as (this: Y.Item, transaction: Y.Transaction, offset: number) => void;
   let active: ConflictScan | null = null;
 
-  /** One step of `scan`'s walk for the current item; past a cap, record the trip and (enforce) leave Yjs's stack. */
+  /** One step of `scan`'s walk for the current item; past the cap, record the trip and (enforce) leave Yjs's stack. */
   const over = (scan: ConflictScan, itemSteps: number): void => {
     const total = scan.steps + itemSteps;
-    if (scan.trip === null && (itemSteps > scan.perItem || total > scan.perFrame)) {
-      scan.trip = itemSteps > scan.perItem ? { cap: 'item', steps: itemSteps } : { cap: 'frame', steps: total };
-    }
+    if (scan.trip === null && total > scan.perFrame) scan.trip = { steps: total };
     if (scan.trip !== null && scan.enforce) throw BUDGET;
   };
 

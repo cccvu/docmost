@@ -132,12 +132,16 @@ export const TRY_LATER_REASON = 'ccc:collab-try-later';
  */
 export const NEW_CLIENT_IDS_PER_FRAME = 64;
 /**
- * #816: collab CPU per USER, across documents, as a debt. Each writer frame's shadow step (the rebuild it needs, the
- * apply, the inspection) is timed and charged twice, since live applies the frame again, clamped per frame to the
- * burst. A frame that arrives while the balance is negative closes the socket 1013 before any work. So one large honest
- * frame always passes, and one user's sustained share is USER_COLLAB_CPU_REFILL_MS_PER_SECOND per second (a tenth of a
- * core). It bounds, in sustained use only, what the conflict-scan meter does not count (struct splits, formatting
- * cleanup, the element checks on a long list): never the first frame.
+ * #816: collab CPU per USER, across documents, as a debt. Every writer frame's work is timed from its pre-pass to its
+ * last exit, refused or not, and charged in full: the pre-pass decode and a rebuild once, the shadow apply and its
+ * inspection twice (live applies the frame again). A rebuild another user's refusal made necessary is charged to that
+ * user. The balance does not refill while the charged work runs, and a charge is never clamped, so a frame costing T
+ * leaves its sender about 20·T of wall clock in debt. A frame that arrives while the balance is negative closes the
+ * socket 1013 before any work. So one large honest frame always passes, and one user's sustained share is about
+ * USER_COLLAB_CPU_REFILL_MS_PER_SECOND per second (a tenth of a core, the burst aside), however large each frame is.
+ * It bounds, in sustained use only, what the conflict-scan meter does not count (struct splits, formatting cleanup,
+ * the element checks on a long list): never the first frame. Debt lives in the (user, document) LRU, so evicting the
+ * user's entry (USER_DOC_BUDGETS_MAX others touched since) forgives it.
  */
 export const USER_COLLAB_CPU_BURST_MS = 2_000;
 export const USER_COLLAB_CPU_REFILL_MS_PER_SECOND = 100;
@@ -180,7 +184,9 @@ export interface GuardFrame {
 type Header = { type: number; subtype?: number; payload?: Uint8Array | null };
 /** One awareness entry, its state still the undecoded UTF-8 JSON. */
 type AwarenessEntry = { clientID: number; clock: number; state: Uint8Array };
-type ShadowResult = { violation: Violation | null; binds: Map<number, string>; applied: boolean; log?: Record<string, unknown> };
+/** #816: what a refusal line may add: numbers and fixed words only, never a value from the frame. */
+type RefusalLog = { steps?: number; stage?: 'conflict-scan' };
+type ShadowResult = { violation: Violation | null; binds: Map<number, string>; applied: boolean; log?: RefusalLog };
 type Ranges = Map<number, Array<[number, number]>>;
 
 /** Per live Document: its shadow, client-id bindings and audit results. Dropped with the document (`destroy`). */
@@ -348,11 +354,23 @@ export class CollabUpdateGuard {
     bucket.at = now;
   }
 
-  /** #816: charge `ms` of collab CPU to `user` (clamped to one burst), into debt if need be. */
-  private chargeCpu(user: string, ms: number): void {
+  /**
+   * #816: charge `ms` of collab CPU to `user`, all of it, into debt if need be. The balance refills up to `workStarted`
+   * (wall clock) and not while the charged work ran: the event loop was that work's, so it earns nothing back.
+   */
+  private chargeCpu(user: string, ms: number, workStarted: number): void {
     const bucket = this.budgetOf(user, null).cpu;
-    this.refill(bucket, USER_COLLAB_CPU_BURST_MS, CPU_MS_REFILL_EVERY_MS);
-    bucket.tokens -= Math.min(USER_COLLAB_CPU_BURST_MS, Math.max(0, ms));
+    const now = this.now();
+    bucket.tokens = Math.min(USER_COLLAB_CPU_BURST_MS, bucket.tokens + Math.max(0, Math.min(now, workStarted) - bucket.at) / CPU_MS_REFILL_EVERY_MS);
+    bucket.at = Math.max(bucket.at, now);
+    bucket.tokens -= Math.max(0, ms);
+  }
+
+  /** A user's collab CPU balance now, in ms (specs and diagnostics): a full burst when none is kept. Touches nothing. */
+  cpuBalance(user: string): number {
+    const bucket = this.userDocBudgets.get(`${user}\u0001`)?.cpu;
+    if (!bucket) return USER_COLLAB_CPU_BURST_MS;
+    return Math.min(USER_COLLAB_CPU_BURST_MS, bucket.tokens + Math.max(0, this.now() - bucket.at) / CPU_MS_REFILL_EVERY_MS);
   }
 
   /**
@@ -431,26 +449,33 @@ export class CollabUpdateGuard {
     if (!this.take(this.budgetFor(frame, true).cpu, USER_COLLAB_CPU_BURST_MS, CPU_MS_REFILL_EVERY_MS, 0)) {
       this.tryLater(frame, 'user_collab_cpu'); // throws unless report mode
     }
-    // 1. Stateless pre-pass: a refusal here touches no shadow, so a refuse/reconnect loop costs no rebuild.
-    const pre = prePass(payload);
-    let violation = pre.violation;
-    if (violation && this.mode === 'enforce') return this.refuse(frame, header, violation);
-    // 1b. #816: client ids live has never seen, charged before anything integrates them.
-    violation ??= this.chargeNewClientIds(frame, pre.clients);
-    if (violation && this.mode === 'enforce') return this.refuse(frame, header, violation);
-    // 2. The shadow step, timed for the CPU budget. A rebuild someone else's refusal made necessary is theirs.
+    // From here every exit is charged (#816): the pre-pass and any rebuild once, the shadow apply twice (live applies the
+    // frame again). A rebuild someone else's refusal made necessary is theirs.
+    const workStarted = this.now();
     const started = this.cpuNow();
     let othersMs = 0;
+    let applyMs = 0;
     try {
+      // 1. Stateless pre-pass: a refusal here touches no shadow, so a refuse/reconnect loop costs no rebuild.
+      const pre = prePass(payload);
+      let violation = pre.violation;
+      if (violation && this.mode === 'enforce') return this.refuse(frame, header, violation);
+      // 1b. #816: client ids live has never seen, charged before anything integrates them.
+      violation ??= this.chargeNewClientIds(frame, pre.clients);
+      if (violation && this.mode === 'enforce') return this.refuse(frame, header, violation);
+      // 2. The shadow step.
       const blame = doc.dirty && doc.dirtiedBy !== null && doc.dirtiedBy !== userId ? doc.dirtiedBy : null;
       const rebuildStarted = blame === null ? 0 : this.cpuNow();
+      const rebuildWallStarted = blame === null ? 0 : this.now();
       const ready = this.ensureShadow(doc);
       if (blame !== null) {
         othersMs = this.cpuNow() - rebuildStarted;
-        this.chargeCpu(blame, othersMs); // shadow-only work: once
+        this.chargeCpu(blame, othersMs, rebuildWallStarted); // shadow-only work: once
       }
       if (!ready) return this.refuse(frame, header, violation ?? { rule: 'shadow-unavailable' });
+      const applyStarted = this.cpuNow();
       const result = this.applyToShadow(doc, payload, userId);
+      applyMs = this.cpuNow() - applyStarted;
       violation ??= result.violation;
       if (violation && this.mode === 'enforce') {
         // The shadow holds the refused frame; live never will. Rebuilt lazily by the next frame that needs it
@@ -465,7 +490,7 @@ export class CollabUpdateGuard {
       if (result.applied) doc.inflight.push(payload.slice());
       this.scheduleFlush(doc);
     } finally {
-      this.chargeCpu(userId, 2 * (this.cpuNow() - started - othersMs)); // live applies the frame again
+      this.chargeCpu(userId, this.cpuNow() - started - othersMs + applyMs, workStarted);
     }
   }
 
@@ -516,13 +541,13 @@ export class CollabUpdateGuard {
       doc.dirty = true;
       doc.dirtiedBy = userId;
       if (scan.trip !== null) {
-        return { violation: { rule: 'conflict-scan' }, binds: new Map(), applied: false, log: { steps: scan.trip.steps, cap: scan.trip.cap } };
+        return { violation: { rule: 'conflict-scan' }, binds: new Map(), applied: false, log: { steps: scan.trip.steps } };
       }
-      const log = scan.failure !== null ? { stage: 'conflict-scan' } : undefined;
+      const log: RefusalLog | undefined = scan.failure !== null ? { stage: 'conflict-scan' } : undefined;
       return { violation: { rule: 'internal' }, binds: new Map(), applied: false, log };
     }
-    // Report mode: the meter counted past a cap and threw nothing; the frame is logged as it would have been refused.
-    if (scan.trip !== null) return { ...out, violation: { rule: 'conflict-scan' }, log: { steps: scan.steps, cap: scan.trip.cap } };
+    // Report mode: the meter counted past the cap and threw nothing; the frame is logged as it would have been refused.
+    if (scan.trip !== null) return { ...out, violation: { rule: 'conflict-scan' }, log: { steps: scan.steps } };
     return out;
   }
 
@@ -749,14 +774,14 @@ export class CollabUpdateGuard {
   }
 
   /** Logs the refusal; in enforce mode also closes the session (throws) and counts against the socket's budget. */
-  private refuse(frame: GuardFrame, header: Header, violation: Violation, extra?: Record<string, unknown>): void {
+  private refuse(frame: GuardFrame, header: Header, violation: Violation, extra?: RefusalLog): void {
     const reason = reasonFor(violation.rule);
     this.log('COLLAB_UPDATE_REFUSED', frame.document, {
       rule: violation.rule,
       ...(violation.node ? { node: violation.node } : {}),
       ...(violation.mark ? { mark: violation.mark } : {}),
       ...(violation.key ? { key: violation.key } : {}),
-      ...extra, // #816: `steps` and `cap` for conflict-scan, `stage` for a meter failure; numbers and fixed words only
+      ...extra, // #816: `steps` for conflict-scan, `stage` for a meter failure; numbers and fixed words only
       userId: frame.context?.user?.id,
       msgType: header.type,
       ...(header.subtype !== undefined ? { syncType: header.subtype } : {}),
