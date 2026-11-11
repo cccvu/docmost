@@ -193,9 +193,24 @@ export const COLLAB_CONNECTIONS_PER_USER = 32;
  * frame per selection change (Docmost sets no `flushDelay`), and a mouse-drag selection changes it once per pointer
  * event, at the display's refresh rate (120 Hz and up). A refusal would end that editor's session for a cursor. A
  * dropped final frame leaves peers a stale cursor until the next change or y-protocols' 15 s renewal.
+ *
+ * #810: the bucket holds BYTES. A frame costs its length, at least COLLAB_AWARENESS_MIN_CHARGE_BYTES, so the bucket is
+ * COLLAB_AWARENESS_BURST frames of that size (100 KiB) and refills COLLAB_AWARENESS_REFILL_PER_SECOND of them a second
+ * (20 KiB/s). An honest frame is one state of about 300 B (a name, a colour, a cursor) or a removal list of about 10 B
+ * per id, so it is charged the minimum and the frame counts above hold exactly. Charged per frame, one socket could relay
+ * 64 own ids at AWARENESS_STATE_MAX_BYTES each, about 512 KiB a frame, 40 times a second, to every peer (about 20 MiB/s
+ * each). A frame larger than the whole bucket is never admitted: the guard caps a state at 8 KiB, and the 4.7.1 server
+ * never sends QueryAwareness, so no honest client answers one with every state it knows.
+ *
+ * `flushDelay` stays at Hocuspocus's 0 (#810): it already coalesces a document's broadcasts within one event-loop turn,
+ * and a positive value only adds latency unless several changes land per window (Hocuspocus 4.7.1's own guidance,
+ * `FlushOptions.flushDelay`). The per-sender byte bucket bounds what each peer is owed.
  */
 export const COLLAB_AWARENESS_BURST = 200;
 export const COLLAB_AWARENESS_REFILL_PER_SECOND = 40;
+export const COLLAB_AWARENESS_MIN_CHARGE_BYTES = 512;
+export const COLLAB_AWARENESS_BURST_BYTES = COLLAB_AWARENESS_BURST * COLLAB_AWARENESS_MIN_CHARGE_BYTES;
+export const COLLAB_AWARENESS_REFILL_BYTES_PER_SECOND = COLLAB_AWARENESS_REFILL_PER_SECOND * COLLAB_AWARENESS_MIN_CHARGE_BYTES;
 
 /** onAuthenticate runs per user id: burst 64 (a tab opens one document per socket), then one per second. */
 export const COLLAB_AUTH_BURST = 64;

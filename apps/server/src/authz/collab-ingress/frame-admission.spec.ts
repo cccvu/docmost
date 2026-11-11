@@ -7,6 +7,9 @@ import { MSG } from './collab-ingress.testkit';
 import {
   COLLAB_AUTH_FRAMES_PER_SOCKET,
   COLLAB_AWARENESS_BURST,
+  COLLAB_AWARENESS_BURST_BYTES,
+  COLLAB_AWARENESS_MIN_CHARGE_BYTES,
+  COLLAB_AWARENESS_REFILL_BYTES_PER_SECOND,
   COLLAB_AWARENESS_REFILL_PER_SECOND,
   COLLAB_DOCUMENTS_PER_SOCKET,
   COLLAB_HOCUSPOCUS_OPTIONS,
@@ -320,6 +323,89 @@ describe('#790 admitCollabFrame: the awareness rate (over-rate awareness is drop
     expect(ws.terminate).not.toHaveBeenCalled(); // and the session never ends
     advance(1000);
     expect(admit(AWARENESS)).toBe(true); // the frame after the drag gets through
+  });
+});
+
+describe('#810 admitCollabFrame: the awareness bucket charges bytes, at least COLLAB_AWARENESS_MIN_CHARGE_BYTES a frame', () => {
+  // Mutation arm (recorded in the #810 notes): charging COLLAB_AWARENESS_MIN_CHARGE_BYTES (one frame) whatever the
+  // frame's length turns the large-frame tests red, while the small-frame tests above stay green.
+  const AWARENESS = 1;
+  const KiB = 1024;
+  /** An Awareness frame of exactly `total` bytes on `name` (the gate reads only the name and the type). */
+  const sized = (total: number, name = pageN(1)): Uint8Array => {
+    const frame = new Uint8Array(total);
+    frame.set(typed(name, AWARENESS).subarray(0, 1 + 41 + 1));
+    return frame;
+  };
+  const clocked = () => {
+    let t = 9_000_000;
+    const ws = { readyState: 1, terminate: jest.fn(() => (ws.readyState = 2)) };
+    const warn = jest.fn();
+    const limitLog = new SocketLimitLog({ warn });
+    const admit = (frame: Uint8Array) => admitCollabFrame(ws, frame, limitLog, () => t);
+    return { ws, warn, admit, advance: (ms: number) => (t += ms) };
+  };
+
+  it('the byte bucket is the frame bucket at the minimum charge: 200 frames (100 KiB), then 40 frames (20 KiB) a second', () => {
+    expect(COLLAB_AWARENESS_MIN_CHARGE_BYTES).toBe(512);
+    expect(COLLAB_AWARENESS_BURST_BYTES).toBe(COLLAB_AWARENESS_BURST * COLLAB_AWARENESS_MIN_CHARGE_BYTES);
+    expect(COLLAB_AWARENESS_BURST_BYTES).toBe(100 * KiB);
+    expect(COLLAB_AWARENESS_REFILL_BYTES_PER_SECOND).toBe(COLLAB_AWARENESS_REFILL_PER_SECOND * COLLAB_AWARENESS_MIN_CHARGE_BYTES);
+    expect(COLLAB_AWARENESS_REFILL_BYTES_PER_SECOND).toBe(20 * KiB);
+  });
+
+  it('a 512 KiB frame (64 ids × 8 KiB states) is never admitted, from a full bucket or after an hour; the socket stays, nothing logged', () => {
+    const { ws, warn, admit, advance } = clocked();
+    let admitted = 0;
+    for (let i = 0; i < 50; i++) {
+      if (admit(sized(512 * KiB))) admitted++;
+      advance(3_600_000);
+    }
+    expect(admitted).toBe(0); // larger than the whole bucket: at most once per burst is never
+    expect(ws.terminate).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+    expect(admit(sized(300))).toBe(true); // the socket's honest awareness still flows
+  });
+
+  it('a burst-sized frame is admitted once per burst: dropped until the whole burst refilled (5 s), and it empties the bucket for small frames too', () => {
+    const { ws, warn, admit, advance } = clocked();
+    const refillMs = (1000 * COLLAB_AWARENESS_BURST_BYTES) / COLLAB_AWARENESS_REFILL_BYTES_PER_SECOND;
+    expect(refillMs).toBe(5_000);
+    expect(admit(sized(COLLAB_AWARENESS_BURST_BYTES))).toBe(true);
+    expect(admit(sized(COLLAB_AWARENESS_BURST_BYTES))).toBe(false);
+    expect(admit(sized(100))).toBe(false); // one bucket: the bytes are spent
+    advance(refillMs - 1);
+    expect(admit(sized(COLLAB_AWARENESS_BURST_BYTES))).toBe(false);
+    advance(1);
+    expect(admit(sized(COLLAB_AWARENESS_BURST_BYTES))).toBe(true);
+    expect(ws.terminate).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('a sustained flood of 7 KiB frames is held to the burst plus the byte refill (the bytes every peer is owed)', () => {
+    const { ws, admit, advance } = clocked();
+    const FRAME = 7 * KiB;
+    let bytes = 0;
+    for (let ms = 0; ms < 10_000; ms += 5) {
+      if (admit(sized(FRAME))) bytes += FRAME;
+      advance(5);
+    }
+    expect(bytes).toBeLessThanOrEqual(COLLAB_AWARENESS_BURST_BYTES + 10 * COLLAB_AWARENESS_REFILL_BYTES_PER_SECOND);
+    expect(bytes).toBeGreaterThan(COLLAB_AWARENESS_BURST_BYTES + 10 * COLLAB_AWARENESS_REFILL_BYTES_PER_SECOND - 2 * FRAME);
+    expect(ws.terminate).not.toHaveBeenCalled();
+  });
+
+  it('an honest 300 B state at 40/s for 60 s is never dropped; frames up to the minimum charge all cost the same', () => {
+    const { ws, admit, advance } = clocked();
+    for (let i = 0; i < 40 * 60; i++) {
+      expect(admit(sized(300))).toBe(true);
+      advance(1000 / 40);
+    }
+    expect(ws.terminate).not.toHaveBeenCalled();
+    const b = clocked();
+    let admitted = 0;
+    for (let i = 0; i < COLLAB_AWARENESS_BURST * 2; i++) if (b.admit(sized(COLLAB_AWARENESS_MIN_CHARGE_BYTES))) admitted++;
+    expect(admitted).toBe(COLLAB_AWARENESS_BURST);
   });
 });
 

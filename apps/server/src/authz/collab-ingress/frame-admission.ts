@@ -34,10 +34,12 @@
  * reaches this check, so a socket trickling one is still cut at the first-Auth deadline.
  *
  * ## The awareness rate (a drop, not a refusal)
- * Awareness and QueryAwareness frames past a burst of COLLAB_AWARENESS_BURST, then COLLAB_AWARENESS_REFILL_PER_SECOND,
- * are DROPPED and the socket stays up (limits.ts says why a drop, not a refusal). Here, before RedisSync and
- * Hocuspocus, a dropped frame is never proxied, queued or relayed, and the update guard never sees it. Nothing else is
- * ever dropped: a dropped Sync frame would lose an edit.
+ * Awareness and QueryAwareness frames past a burst of COLLAB_AWARENESS_BURST_BYTES, then
+ * COLLAB_AWARENESS_REFILL_BYTES_PER_SECOND, are DROPPED and the socket stays up (limits.ts says why a drop, not a
+ * refusal). A frame costs its length, at least COLLAB_AWARENESS_MIN_CHARGE_BYTES (#810: charged per frame, one socket
+ * could relay about 20 MiB/s to every peer), so small honest frames keep COLLAB_AWARENESS_BURST, then
+ * COLLAB_AWARENESS_REFILL_PER_SECOND. Here, before RedisSync and Hocuspocus, a dropped frame is never proxied, queued or
+ * relayed, and the update guard never sees it. Nothing else is ever dropped: a dropped Sync frame would lose an edit.
  *
  * Message types are Hocuspocus's own `MessageType` (the wire values are pinned in frame-admission.spec.ts).
  */
@@ -46,8 +48,9 @@ import { MessageType } from '@hocuspocus/server';
 import { WsReadyStates } from '@hocuspocus/common';
 import {
   COLLAB_AUTH_FRAMES_PER_SOCKET,
-  COLLAB_AWARENESS_BURST,
-  COLLAB_AWARENESS_REFILL_PER_SECOND,
+  COLLAB_AWARENESS_BURST_BYTES,
+  COLLAB_AWARENESS_MIN_CHARGE_BYTES,
+  COLLAB_AWARENESS_REFILL_BYTES_PER_SECOND,
   COLLAB_DOCUMENTS_PER_SOCKET,
 } from './limits';
 import { collabSocketLimitLog, type SocketLimit, type SocketLimitLog } from './socket-limit-log';
@@ -55,7 +58,6 @@ import { collabSocketLimitLog, type SocketLimit, type SocketLimitLog } from './s
 const NAME = /^page\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** `page.` + a 36-character UUID; below 128, so its varint is the single byte 41. */
 const NAME_BYTES = 41;
-const AWARENESS_REFILL_MS = 1000 / COLLAB_AWARENESS_REFILL_PER_SECOND;
 
 const asBytes = (data: Uint8Array | ArrayBuffer): Uint8Array => (data instanceof Uint8Array ? data : new Uint8Array(data));
 
@@ -85,7 +87,7 @@ function messageType(frame: Uint8Array): number | null {
 interface SocketFrames {
   readonly names: Set<string>;
   auths: number;
-  /** The awareness bucket: tokens left, and when they were last counted. */
+  /** The awareness bucket: bytes left, and when they were last counted. */
   awarenessTokens: number;
   awarenessAt: number;
 }
@@ -121,7 +123,7 @@ export function admitCollabFrame(
   const name = frameAddress(frame);
   if (name === null) return refuse(ws, limitLog, 'frame_address', { frameBytes: frame.byteLength });
   let seen = perSocket.get(ws);
-  if (!seen) perSocket.set(ws, (seen = { names: new Set(), auths: 0, awarenessTokens: COLLAB_AWARENESS_BURST, awarenessAt: now() }));
+  if (!seen) perSocket.set(ws, (seen = { names: new Set(), auths: 0, awarenessTokens: COLLAB_AWARENESS_BURST_BYTES, awarenessAt: now() }));
   if (!seen.names.has(name)) {
     if (seen.names.size >= COLLAB_DOCUMENTS_PER_SOCKET) return refuse(ws, limitLog, 'socket_documents', { documents: seen.names.size + 1 });
     seen.names.add(name);
@@ -131,19 +133,25 @@ export function admitCollabFrame(
     if (++seen.auths > COLLAB_AUTH_FRAMES_PER_SOCKET) return refuse(ws, limitLog, 'socket_auth_frames', { authFrames: seen.auths });
     if (seen.auths === 1) preAuth?.authArrived(ws);
   }
-  if (type === MessageType.Awareness || type === MessageType.QueryAwareness) return chargeAwareness(seen, now());
+  if (type === MessageType.Awareness || type === MessageType.QueryAwareness) return chargeAwareness(seen, now(), frame.byteLength);
   return true;
 }
 
-/** One token from the socket's awareness bucket; false (drop the frame, unlogged: a drop costs nothing) when empty. */
-function chargeAwareness(seen: SocketFrames, at: number): boolean {
-  const tokens = Math.min(COLLAB_AWARENESS_BURST, seen.awarenessTokens + Math.max(0, at - seen.awarenessAt) / AWARENESS_REFILL_MS);
+/**
+ * The frame's bytes (at least COLLAB_AWARENESS_MIN_CHARGE_BYTES) from the socket's awareness bucket; false (drop the
+ * frame, unlogged: a drop costs nothing) when it holds fewer. A frame larger than the whole bucket is never admitted.
+ * The refill is `ms × bytes-per-second / 1000`, so a minimum-size frame refills in exactly 1000 / REFILL_PER_SECOND ms.
+ */
+function chargeAwareness(seen: SocketFrames, at: number, frameBytes: number): boolean {
+  const cost = Math.max(frameBytes, COLLAB_AWARENESS_MIN_CHARGE_BYTES);
+  const refill = (Math.max(0, at - seen.awarenessAt) * COLLAB_AWARENESS_REFILL_BYTES_PER_SECOND) / 1000;
+  const tokens = Math.min(COLLAB_AWARENESS_BURST_BYTES, seen.awarenessTokens + refill);
   seen.awarenessAt = at;
-  if (tokens < 1) {
+  if (tokens < cost) {
     seen.awarenessTokens = tokens;
     return false;
   }
-  seen.awarenessTokens = tokens - 1;
+  seen.awarenessTokens = tokens - cost;
   return true;
 }
 
