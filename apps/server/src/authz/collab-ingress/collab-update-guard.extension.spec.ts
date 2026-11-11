@@ -28,6 +28,7 @@ import { SocketLimitLog } from './socket-limit-log';
 import {
   AWARENESS_STATE_MAX_BYTES,
   COLLAB_REFUSAL_CODE,
+  COLLAB_TRY_LATER_CODE,
   CollabUpdateGuard,
   SOCKET_REFUSAL_BUDGET,
   SYNC_BURST,
@@ -484,9 +485,15 @@ function authAnswers(sock: FakeSocket): string[] {
  * #827: the load and join hooks through a real Hocuspocus 4.7.1. `load` stands in for persistence: it awaits the row
  * read (`readMs`), then applies the stored state, under a real vm deadline when `deadlineMs` is set (Track B's load).
  */
-async function loadServer(opts: { stored: Uint8Array; readMs?: number; deadlineMs?: number; guard?: CollabUpdateGuard }) {
+async function loadServer(opts: {
+  stored: Uint8Array;
+  readMs?: number;
+  deadlineMs?: number;
+  guard?: CollabUpdateGuard;
+  ext?: (guard: CollabUpdateGuard) => CollabUpdateGuardExtension;
+}) {
   const guard = opts.guard ?? new CollabUpdateGuard({ logger: { warn: () => undefined }, limitLog: new SocketLimitLog({ warn: () => undefined }) });
-  const ext = new CollabUpdateGuardExtension(guard);
+  const ext = opts.ext ? opts.ext(guard) : new CollabUpdateGuardExtension(guard);
   const authenticated: string[] = [];
   const hp = new Hocuspocus({
     quiet: true,
@@ -496,6 +503,7 @@ async function loadServer(opts: { stored: Uint8Array; readMs?: number; deadlineM
       ext,
       {
         async onAuthenticate(data: any) {
+          if (data.token.startsWith('stranger')) throw new Error('denied'); // no valid token: 4.7.1 answers permission-denied
           authenticated.push(data.token);
           return { user: { id: data.token } };
         },
@@ -556,14 +564,49 @@ describe('#827 QueryAwareness through a real Hocuspocus 4.7.1', () => {
 describe('#827 joins and loads through a real Hocuspocus 4.7.1', () => {
   const stored = () => Y.encodeStateAsUpdate(prosemirrorJSONToYDoc(serverSchema(), SEED, 'default'));
 
-  it('a join to a resident document closed for compaction is refused try-later, before authentication runs', async () => {
+  /** Whether anything `sock` was sent (or closed with) names the compacting reason. */
+  const toldCompacting = (sock: FakeSocket) =>
+    sock.closed?.reason === COLLAB_PAGE_COMPACTING_REASON || sock.sent.some((m) => Buffer.from(m).includes(Buffer.from(COLLAB_PAGE_COMPACTING_REASON)));
+
+  it('an authenticated join to a resident document closed for compaction is closed 1013 compacting, with no frame sent', async () => {
     const s = await loadServer({ stored: stored() });
     const first = await s.connect('a');
     expect(authAnswers(first)).toEqual(['authenticated']);
-    markCompacting(s.hp.documents.get(DOC_NAME)!);
-    const second = await s.connect('b');
-    expect(authAnswers(second)).toEqual([`permission-denied:${COLLAB_PAGE_COMPACTING_REASON}`]);
-    expect(s.authenticated).toEqual(['a']);
+    const live = s.hp.documents.get(DOC_NAME)!;
+    markCompacting(live);
+    const second = await s.connect('b'); // sends its Auth only: a socket that never sends a frame
+    expect(s.authenticated).toEqual(['a', 'b']);
+    expect(authAnswers(second)).toEqual(['authenticated']);
+    expect(second.closed).toEqual({ code: COLLAB_TRY_LATER_CODE, reason: COLLAB_PAGE_COMPACTING_REASON });
+    first.close(1000, 'bye');
+    await new Promise((r) => setTimeout(r, 50));
+    expect(s.hp.documents.has(DOC_NAME)).toBe(false); // the joiner did not keep it resident
+  });
+
+  it('an UNauthenticated client holding the page id learns nothing of the compaction (control: a pre-auth gate leaks it)', async () => {
+    // control: the shape #827 first shipped, a join gate in onAuthenticate (this extension outranks the auth extension)
+    class PreAuthGate extends CollabUpdateGuardExtension {
+      onAuthenticate(payload: any): Promise<void> {
+        const resident = payload.instance.documents.get(payload.documentName);
+        if (!this.guard.admitJoin(resident, '')) throw { reason: COLLAB_PAGE_COMPACTING_REASON };
+        return undefined as unknown as Promise<void>;
+      }
+    }
+    for (const arm of ['pre-auth gate', 'treatment'] as const) {
+      const s = await loadServer({ stored: stored(), ext: arm === 'treatment' ? undefined : (g) => new PreAuthGate(g) });
+      await s.connect('a');
+      markCompacting(s.hp.documents.get(DOC_NAME)!);
+      const stranger = await s.connect('stranger');
+      expect(s.authenticated).toEqual(['a']);
+      if (arm === 'pre-auth gate') {
+        expect(authAnswers(stranger)).toEqual([`permission-denied:${COLLAB_PAGE_COMPACTING_REASON}`]);
+        continue;
+      }
+      // the same answer as for any page, compacting or not: the auth extension's own denial
+      expect(authAnswers(stranger)).toEqual(['permission-denied:permission-denied']);
+      expect(toldCompacting(stranger)).toBe(false);
+      expect(stranger.closed).toBeNull();
+    }
   });
 
   it("a socket's load is refused try-later while its user is in CPU debt; the API's DirectConnection never is", async () => {

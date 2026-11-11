@@ -30,18 +30,20 @@
  * document is read before it, outside the deadline. Its row's lineage and ledger are read from the decoded update
  * (reconcile-store.ts `readRootMapEntries`), which integrates nothing and so also works on a row too costly to load.
  *
- * Logs: `COLLAB_PAGE_COMPACTION requested|done|skipped …` and `COLLAB_COMPACTION_FAILED …` (first word = the token;
- * check-infra-config §14 lists them, informational until the collab alarms of #792).
+ * Logs: `COLLAB_PAGE_COMPACTION {"event":"requested"|"done"|"skipped"|"load_refused",…}` and `COLLAB_COMPACTION_FAILED
+ * {…}`, written only through collab-ingress/compaction-log.ts, the guard's emitter too (check-infra-config §14 lists
+ * the tokens, informational until the collab alarms of #792).
  */
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import * as Y from 'yjs';
-import { Logger, ServiceUnavailableException } from '@nestjs/common';
+import { ServiceUnavailableException } from '@nestjs/common';
 import { sql } from 'kysely';
 import { TiptapTransformer } from '@hocuspocus/transformer';
 import type { KyselyDB } from '@docmost/db/types/kysely.types';
 import { tiptapExtensions } from '../../collaboration/collaboration.util';
 import { ConflictScan, installConflictScanMeter, type ConflictScanMeter } from '../collab-ingress/conflict-scan';
+import { logCompactionFailed, logCompactionRequested, logPageCompaction } from '../collab-ingress/compaction-log';
 import { isDeadlineExceeded, runWithDeadline } from '../collab-ingress/deadline';
 import {
   COMPACTION_DEADLINE_MS,
@@ -80,8 +82,6 @@ import { hasStoreFailure, isStoreCurrent, recordStoreFailure, storeGenerationOf 
 import { storeSafeJson } from './store-safe-json';
 import { WRITE_IDEM_MAP } from './write-idem';
 import { yieldToEventLoop } from './yield-to-event-loop';
-
-const logger = new Logger('CollabCompaction');
 
 /**
  * The non-detaching try-later close code: update-guard.ts's COLLAB_TRY_LATER_CODE (1013), restated rather than imported
@@ -240,10 +240,7 @@ export function loadStoredYdoc(
   const ms = performance.now() - started;
   if (deadline || scan.trip !== null) {
     noteLoadTrip(pageId, digest ?? sha256(bytes), !deadline);
-    logger.warn(
-      `COLLAB_PAGE_COMPACTION load_refused page=${pageId} why=${deadline ? 'deadline' : 'steps'} steps=${scan.steps} ` +
-        `bytes=${bytes.length} ms=${round(ms)}`,
-    );
+    logPageCompaction('load_refused', pageId, { why: deadline ? 'deadline' : 'steps', steps: scan.steps, bytes: bytes.length, ms: round(ms) });
     startRowCompaction(storeOf(db), pageId, 'load_trip');
     throw pageCompactingRefusal();
   }
@@ -268,7 +265,7 @@ function requestIfOverSoftCaps(document: Y.Doc, pageId: string, stats: LoadStats
     userId: null,
     drain: over.some(([, n, cap]) => n >= cap),
   };
-  if (requestCompaction(document, request)) logCompactionRequested(pageId, request, stats);
+  if (requestCompaction(document, request)) logCompactionRequested(pageId, request, { structs: stats.structs, clientIds: stats.clients, steps: stats.steps });
 }
 
 // --- the unload (seam #122)
@@ -369,7 +366,7 @@ async function compactResident(
 
 function abandon(document: object, pageId: string, reason: CompactionReason, why: string): void {
   clearCompacting(document);
-  logger.warn(`COLLAB_PAGE_COMPACTION skipped page=${pageId} reason=${reason} why=${why}`);
+  logPageCompaction('skipped', pageId, { reason, why });
 }
 
 /** A socket that joined while the document compacted (its auth passed just before): try later, on the new lineage. */
@@ -418,7 +415,7 @@ export async function compactFromRow(
   try {
     const row = await store.readRow(pageId);
     if (!row || !row.ydoc || row.ydoc.length === 0) {
-      logger.warn(`COLLAB_PAGE_COMPACTION skipped page=${pageId} reason=${reason} why=no_ydoc`);
+      logPageCompaction('skipped', pageId, { reason, why: 'no_ydoc' });
       return 'skipped';
     }
     if (row.content === null || row.content === undefined) {
@@ -438,7 +435,7 @@ export async function compactFromRow(
     await yieldToEventLoop();
     const swap = await store.swapYdoc(pageId, built.update, { covered, contentHash: row.contentHash });
     if (!swap.swapped) {
-      logger.warn(`COLLAB_PAGE_COMPACTION skipped page=${pageId} reason=${reason} why=${swap.why}`);
+      logPageCompaction('skipped', pageId, { reason, why: swap.why });
       return 'skipped';
     }
     loadTrips.delete(pageId);
@@ -721,29 +718,25 @@ interface Counted extends PageCounts {
   bytes: number | null;
 }
 
-/** `COLLAB_PAGE_COMPACTION requested …`: compaction was asked for (log it when `requestCompaction` returns true). */
-export function logCompactionRequested(pageId: string, request: CompactionRequest, counts: PageCounts | null): void {
-  logger.warn(
-    `COLLAB_PAGE_COMPACTION requested page=${pageId} reason=${request.reason} drain=${request.drain}` +
-      (request.userId ? ` user=${request.userId}` : '') +
-      (counts ? ` structs=${counts.structs} ids=${counts.clients}` : ''),
-  );
-}
-
 function logCompactionDone(
   pageId: string,
   reason: CompactionReason,
   from: 'unload' | 'row',
   r: { fromEpoch: number; toEpoch: number; before: Counted; after: Counted; ms: number; ledgerDropped?: number },
 ): void {
-  logger.warn(
-    `COLLAB_PAGE_COMPACTION done page=${pageId} reason=${reason} from=${from} epoch=${r.fromEpoch}->${r.toEpoch} ` +
-      `structs=${r.before.structs}->${r.after.structs} ids=${r.before.clients}->${r.after.clients} ` +
-      `bytes=${r.before.bytes ?? '?'}->${r.after.bytes} ms=${round(r.ms)}` +
-      (r.ledgerDropped ? ` ledger_dropped=${r.ledgerDropped}` : ''),
-  );
+  logPageCompaction('done', pageId, {
+    reason,
+    from,
+    fromEpoch: r.fromEpoch,
+    toEpoch: r.toEpoch,
+    structsBefore: r.before.structs,
+    structsAfter: r.after.structs,
+    clientIdsBefore: r.before.clients,
+    clientIdsAfter: r.after.clients,
+    bytesBefore: r.before.bytes,
+    bytesAfter: r.after.bytes,
+    ms: round(r.ms),
+    ledgerDropped: r.ledgerDropped || undefined,
+  });
 }
 
-function logCompactionFailed(page: string, reason: CompactionReason | null, why: string, err: unknown): void {
-  logger.error(`COLLAB_COMPACTION_FAILED page=${page} reason=${reason ?? '?'} why=${why}`, err ?? undefined);
-}

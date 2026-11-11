@@ -75,7 +75,10 @@ function addParagraphs(doc, n, { text = 'paragraph text', bold = 0, at = null } 
     frag.insert(at === null ? frag.length : at, ps);
   });
 }
-/** `n` paragraphs, each with `marks` alternately bold and italic runs of text: about 2·marks + 2 structs each. */
+/**
+ * `n` paragraphs, each with `marks` alternately bold and italic runs of text: about 3·marks + 2 structs each. A
+ * fractional `marks` spreads the runs (paragraph i gets ⌊(i+1)·marks⌋ − ⌊i·marks⌋), so a page can hit an exact S.
+ */
 function richPage(n, marks) {
   const doc = new Y.Doc();
   doc.clientID = 1;
@@ -85,7 +88,8 @@ function richPage(n, marks) {
       const p = new Y.XmlElement('paragraph');
       const t = new Y.XmlText();
       p.insert(0, [t]);
-      for (let m = marks - 1; m >= 0; m--) t.insert(0, 'run' + m + ' ', m % 2 ? { italic: true } : { bold: true });
+      const here = Math.floor((i + 1) * marks) - Math.floor(i * marks);
+      for (let m = here - 1; m >= 0; m--) t.insert(0, 'run' + m + ' ', m % 2 ? { italic: true } : { bold: true });
       ps.push(p);
     }
     doc.getXmlFragment('default').insert(0, ps);
@@ -250,6 +254,60 @@ const benches = {
       const frag = editor.getXmlFragment('default');
       const [local, del] = time(() => captured(editor, () => frag.delete(0, frag.length)));
       out({ kind: 'honest.selectAll', paragraphs, bold: !!bold, marks, structs: structs(base), localDelete: r1(local), ...guardCost(base, del) });
+    }
+  },
+  'honest.selectAllAtS'() {
+    // the E_MAX decision (integration, #827): a select-all delete of a page at S_MAX (~150k structs) as its live
+    // children E grow; the rest of S is formatting runs inside the paragraphs. Median of 3 (each on a fresh copy).
+    for (const E of [10_000, 12_500, 13_000, 14_000, 15_000, 17_500, 20_000]) {
+      const marks = (150_000 / E - 2) / 3; // richPage: about 3·marks + 2 structs a paragraph
+      const base = richPage(E, marks);
+      const runs = [];
+      for (let i = 0; i < 3; i++) {
+        const editor = copy(base);
+        editor.clientID = 9;
+        const frag = editor.getXmlFragment('default');
+        const del = captured(editor, () => frag.delete(0, frag.length));
+        runs.push(guardCost(base, del));
+      }
+      const pick = (k) => r1(median(runs.map((r) => r[k])));
+      out({ kind: 'honest.selectAllAtS', paragraphs: E, marks, structs: structs(base), shadow: pick('shadow'), live: pick('live'), total: pick('total') });
+    }
+  },
+  'honest.pasteProse'() {
+    // a ~3 MiB paste of prose into an EMPTY page: paragraphs of `len` bytes with two bold words each. Its live children
+    // are 3 MiB / len, so it fits E_MAX only from len ≈ 3 MiB / E_MAX.
+    for (const len of [150, 210, 300, 500]) {
+      const word = 'lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore ';
+      const text = word.repeat(Math.ceil(len / word.length)).slice(0, len);
+      let n = Math.floor((2.9 * MiB) / (len + 12));
+      let u;
+      for (let tries = 0; tries < 6; tries++) {
+        const e = new Y.Doc();
+        e.clientID = 7;
+        u = captured(e, () => {
+          const frag = e.getXmlFragment('default');
+          e.transact(() => {
+            const ps = [];
+            for (let i = 0; i < n; i++) {
+              const p = new Y.XmlElement('paragraph');
+              const t = new Y.XmlText();
+              p.insert(0, [t]);
+              t.insert(0, text.slice(40));
+              t.insert(0, text.slice(20, 40), { bold: true });
+              t.insert(0, text.slice(6, 20));
+              t.insert(0, text.slice(0, 6), { bold: true });
+              ps.push(p);
+            }
+            frag.insert(0, ps);
+          });
+        });
+        if (u.length >= 2.85 * MiB && u.length <= 3 * MiB) break;
+        n = Math.floor(n * ((2.95 * MiB) / u.length));
+      }
+      const after = new Y.Doc();
+      Y.applyUpdate(after, u);
+      out({ kind: 'honest.pasteProse', paragraphBytes: len, paragraphs: n, structs: structs(after), ...guardCost(new Y.Doc(), u) });
     }
   },
   'honest.typingAtIds'() {

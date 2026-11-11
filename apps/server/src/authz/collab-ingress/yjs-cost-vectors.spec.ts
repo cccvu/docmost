@@ -10,6 +10,8 @@ import {
   writeLineage,
 } from '../page-write/compaction-registry';
 import { awarenessFrame, DOC_NAME, MSG, RemoteClient, SYNC, syncFrame, typedFrame, step1Frame } from './collab-ingress.testkit';
+import { buildCompacted, snapshotTree } from '../page-write/compaction';
+import { liveContentDigest } from '../page-write/doc-version';
 import { COLLAB_PAGE_COMPACTING_REASON, epochStaleReason } from './collab-reasons';
 import { ConflictScan, CONFLICT_SCAN_STEPS_PER_FRAME, installConflictScanMeter } from './conflict-scan';
 import { basePage, rawUpdate, type RawStruct } from './conflict-scan.testkit';
@@ -421,11 +423,14 @@ describe('#827 the struct and children caps (an honest select-all over a huge pa
     expect(cost(16_000)).toBeGreaterThan(8 * small); // 8x the children, more than 8x the time
   });
 
-  it('a frame adding a child past the children cap closes 1013 compacting; a delete over the cap passes', () => {
+  it('a frame adding a child past the children cap is page-full and drains nothing (compaction keeps every live child); a delete over the cap passes', () => {
     armed();
     const s = setup(paragraphs(20), { caps: { children: 20 } });
-    expect(s.send(s.conn('a'), addParagraph(s.live, 70))).toBe(COMPACTING);
-    expect(compactionRequest(s.live)).toMatchObject({ reason: 'children' });
+    const other = s.conn('other');
+    expect(s.send(s.conn('a'), addParagraph(s.live, 70))).toBe(REFUSED('page-full'));
+    expect(compactionRequest(s.live)).toBeNull();
+    expect(isDraining(s.live)).toBe(false);
+    expect(other.webSocket.close).not.toHaveBeenCalled();
     const s2 = setup(paragraphs(25), { caps: { children: 20 } });
     expect(s2.send(s2.conn('a'), editAs(s2.live, 71, (d) => d.getXmlFragment('default').delete(0, 2)))).toBe('applied');
   });
@@ -452,7 +457,7 @@ describe('#827 the struct and children caps (an honest select-all over a huge pa
     }
   });
 
-  it('a frame growing the page past the struct cap closes 1013 compacting and drains', () => {
+  it('a frame growing the page past the struct cap with LIVE structs (no history to shed) is page-full and drains nothing', () => {
     armed();
     const base = paragraphs(10);
     const s = setup(base, { caps: { structs: 60 } });
@@ -461,8 +466,9 @@ describe('#827 the struct and children caps (an honest select-all over a huge pa
     const grow = editAs(s.live, 70, (d) => {
       for (let i = 0; i < 40; i++) textOf(d, i % 10).insert(1, 'q');
     });
-    expect(s.send(s.conn('a'), grow)).toBe(COMPACTING);
-    expect(compactionRequest(s.live)).toMatchObject({ reason: 'structs', drain: true });
+    expect(s.send(s.conn('a'), grow)).toBe(REFUSED('page-full'));
+    expect(compactionRequest(s.live)).toBeNull();
+    // the history-heavy case drains: '#827 a hard cap drains only when compaction would bring the page under the soft caps'
   });
 
   it('page-full: still over a cap after compaction, growth is refused 4422 and deletes pass', () => {
@@ -480,6 +486,132 @@ describe('#827 the struct and children caps (an honest select-all over a huge pa
     const c = s.conn('a', false, 'cccEpoch=1');
     expect(s.send(c, addParagraph(s.live, 70))).toBe(REFUSED('page-full'));
     expect(isDraining(s.live)).toBe(false);
+  });
+});
+
+describe('#827 a hard cap drains only when compaction would bring the page under the soft caps', () => {
+  /** A ~3 MiB paste into `base` by `client`: `n` paragraphs of `text` (prose: two bold runs each), n sized to the cap. */
+  const paste = (base: Y.Doc, client: number, text: string, bold: boolean) => {
+    let n = Math.floor((2.9 * 1024 * 1024) / (text.length + (bold ? 124 : 6)));
+    for (;;) {
+      const update = editAs(base, client, (d) => {
+        const ps = Array.from({ length: n }, () => {
+          const p = new Y.XmlElement('paragraph');
+          const t = new Y.XmlText();
+          p.insert(0, [t]);
+          if (bold) {
+            t.insert(0, text.slice(40));
+            t.insert(0, text.slice(20, 40), { bold: true });
+            t.insert(0, text.slice(6, 20));
+            t.insert(0, text.slice(0, 6), { bold: true });
+          } else t.insert(0, text);
+          return p;
+        });
+        d.getXmlFragment('default').insert(0, ps);
+      });
+      if (update.length <= 3 * 1024 * 1024) return { update, n };
+      n = Math.floor(n * 0.97);
+    }
+  };
+  const NO_DEADLINE = { deadlines: { frame: 60_000, load: 60_000, probe: 60_000, mirror: 60_000 } };
+  const prose = 'Honest prose is mostly sentences of ordinary length, with a word in bold here and there, and paragraphs of a few lines. '.repeat(2).slice(0, 150);
+
+  it('an honest 3 MiB paste of prose (150-byte paragraphs) into an empty page is accepted at the real caps', () => {
+    armed();
+    const s = setup(paragraphs(1), NO_DEADLINE);
+    const { update, n } = paste(s.live, 70, prose, true);
+    expect(update.length).toBeGreaterThan(2.85 * 1024 * 1024);
+    expect(n).toBeGreaterThan(10_000); // past the 10k E_MAX this used to refuse
+    expect(s.send(s.conn('a'), update)).toBe('applied');
+    expect(s.live.getXmlFragment('default').length).toBe(n + 1);
+    expect(compactionRequest(s.live)).toBeNull(); // under every soft cap: nothing to compact
+  });
+
+  it('a pathological dense paste (3 MiB of 8-byte paragraphs) is page-full at the real caps, and nothing drains', () => {
+    armed();
+    const s = setup(paragraphs(1), NO_DEADLINE);
+    const other = s.conn('other');
+    const before = s.state();
+    const { update, n } = paste(s.live, 70, 'abcdefgh', false);
+    expect(n).toBeGreaterThan(14_000); // past E_MAX and S_MAX in live content: no compaction can shed it
+    expect(s.send(s.conn('a'), update)).toBe(REFUSED('page-full'));
+    expect(s.state().equals(before)).toBe(true);
+    expect(compactionRequest(s.live)).toBeNull();
+    expect(isDraining(s.live)).toBe(false);
+    expect(other.webSocket.close).not.toHaveBeenCalled();
+    // the page is not marked full: a smaller paste still lands
+    expect(s.send(s.conn('b'), paste(s.live, 71, prose, true).update)).toBe('applied');
+  });
+
+  /** `edits` single-character inserts each deleted again: tombstones only, the visible page unchanged. */
+  const withHistory = (edits: number, n = 5) => {
+    const doc = paragraphs(n, 'hello');
+    for (let i = 0; i < edits; i++) {
+      textOf(doc, i % n).insert(0, 'x');
+      textOf(doc, i % n).delete(0, 1);
+    }
+    return doc;
+  };
+
+  it('a history-heavy page over the struct cap drains, and its compaction brings the growth back under the soft cap', () => {
+    armed();
+    const CAP = 200;
+    const seed = withHistory(150);
+    const s = setup(seed, { caps: { structs: CAP } });
+    const other = s.conn('other');
+    expect(s.send(s.conn('a'), editAs(s.live, 70, (d) => textOf(d).insert(0, 'k')))).toBe('applied');
+    expect(s.guard.pageCounts(s.live)!.structs).toBeGreaterThan(softCap(CAP)); // soft: requested for the unload
+    expect(compactionRequest(s.live)).toMatchObject({ reason: 'structs', drain: false });
+    const grow = (doc: Y.Doc, client: number) =>
+      editAs(doc, client, (d) => {
+        for (let i = 0; i < 60; i++) textOf(d, i % 5).insert(1, 'q');
+      });
+    expect(s.send(s.conn('a'), grow(s.live, 70))).toBe(COMPACTING);
+    expect(compactionRequest(s.live)).toMatchObject({ reason: 'structs', drain: true });
+    expect(other.webSocket.close).toHaveBeenCalledWith(COLLAB_TRY_LATER_CODE, COLLAB_PAGE_COMPACTING_REASON);
+    // compaction (the unload's build) keeps the visible page only: the resent growth fits on the new lineage
+    const built = buildCompacted({ tree: snapshotTree(s.live.getXmlFragment('default')) }, [], 1, Date.now(), { digest: liveContentDigest(s.live) });
+    expect(built.counts.structs).toBeLessThan(40);
+    const compacted = new Y.Doc();
+    Y.applyUpdate(compacted, built.update);
+    const after = setup(compacted, { caps: { structs: CAP } });
+    expect(after.send(after.conn('a', false, 'cccEpoch=1'), grow(after.live, 72))).toBe('applied');
+    expect(after.guard.pageCounts(after.live)!.structs).toBeLessThan(softCap(CAP));
+  });
+
+  it('control: a page whose LIVE structs are past the soft cap is never asked to compact (soft) or drained (hard): page-full', () => {
+    armed();
+    const CAP = 200;
+    const s = setup(paragraphs(55, 'hello'), { caps: { structs: CAP } }); // 165 live structs, past softCap(200) = 160
+    const other = s.conn('other');
+    expect(s.send(s.conn('a'), editAs(s.live, 70, (d) => textOf(d).insert(0, 'k')))).toBe('applied');
+    expect(compactionRequest(s.live)).toBeNull(); // past the soft cap, but compaction would shed nothing
+    const grow = editAs(s.live, 70, (d) => {
+      for (let i = 0; i < 40; i++) textOf(d, i).insert(1, 'q');
+    });
+    expect(s.send(s.conn('a'), grow)).toBe(REFUSED('page-full'));
+    expect(isDraining(s.live)).toBe(false);
+    expect(other.webSocket.close).not.toHaveBeenCalled();
+  });
+
+  it('control: a history-heavy page whose live CHILDREN are past their soft cap is page-full on a struct cap (compaction keeps them)', () => {
+    armed();
+    const s = setup(withHistory(150, 9), { caps: { structs: 200, children: 10 } }); // 9 live paragraphs ≥ softCap(10) = 8
+    const other = s.conn('other');
+    const grow = editAs(s.live, 70, (d) => {
+      for (let i = 0; i < 60; i++) textOf(d, i % 9).insert(1, 'q');
+    });
+    expect(s.send(s.conn('a'), grow)).toBe(REFUSED('page-full'));
+    expect(isDraining(s.live)).toBe(false);
+    expect(other.webSocket.close).not.toHaveBeenCalled();
+    // the same when the children come with the frame itself (the editor would resend them onto the compacted page)
+    const t = setup(withHistory(150, 5), { caps: { structs: 200, children: 10 } });
+    const growWithChildren = editAs(t.live, 70, (d) => {
+      for (let i = 0; i < 40; i++) textOf(d, i % 5).insert(1, 'q');
+      d.getXmlFragment('default').insert(0, Array.from({ length: 4 }, () => new Y.XmlElement('paragraph'))); // 9 children
+    });
+    expect(t.send(t.conn('a'), growWithChildren)).toBe(REFUSED('page-full'));
+    expect(isDraining(t.live)).toBe(false);
   });
 });
 

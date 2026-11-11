@@ -34,12 +34,17 @@ import {
  * A Node or yjs bump re-runs the bench and updates both, and the assertions hold the margins.
  */
 const NODE22 = {
-  shadowHonestMax: 306.3, // select-all of 10k paragraphs, 230k structs (past S_MAX): the slowest honest shadow apply
+  shadowHonestMax: 319, // select-all at S_MAX and E_MAX (14k paragraphs, 150k structs): the slowest honest shadow apply
   shadowPaste3MiB: 260.6, // the densest 3 MiB paste (227k structs, past the caps)
   shadowOffline: 124.6, // #816's 176,000-step offline Step2
   shadowMeterAccepted: 82.1, // 998,999 steps, just under the #816 cap
-  selectAllAtE: 157.1, // 10k paragraphs, 60k structs
-  selectAllPastE: 551.2, // 20k paragraphs, 120k structs
+  selectAllAtE: 319, // shadow apply: 14k paragraphs at S_MAX (honest.selectAllAtS, the median of three runs)
+  selectAllAtEFrame: 638, // the whole frame: decode, shadow, live's apply
+  selectAllNextEFrame: 703, // 15k paragraphs at S_MAX: the next step of the sweep, past ~0.7 s
+  selectAllPastE: 574, // shadow apply: 20k paragraphs at S_MAX
+  pasteProse150: 306, // a 3 MiB paste of 150-byte prose paragraphs: 11,131 paragraphs, 111k structs (whole frame)
+  pasteProse150Paragraphs: 11_131,
+  pasteProse150Structs: 111_310,
   keystrokeAtC: 12.5, // 20k client ids
   keystrokePastC: 28.9, // 50k client ids
   loadCappedMetered: 165.3, // 140k structs, 20k ids
@@ -57,7 +62,7 @@ const NODE22 = {
   attackC4000Load: 1413.4, // #827 (c), every load
   attackC4000Steps: 16_011_999,
 };
-const NODE24 = { shadowHonestMax: 295.4, shadowPaste3MiB: 227.1, selectAllAtE: 157.1, keystrokeAtC: 13.0, loadCappedMetered: 133.2, vmUsPerCall: 40.4, vmOvershootMax: 1.7 };
+const NODE24 = { shadowHonestMax: 315, shadowPaste3MiB: 227.1, selectAllAtE: 315, keystrokeAtC: 13.0, loadCappedMetered: 133.2, vmUsPerCall: 40.4, vmOvershootMax: 1.7 };
 
 describe('#827 sizing: the bounds keep their margins over the measured honest work', () => {
   it('T_FRAME_MS is at least 2.5× the slowest honest shadow apply on node 22 and node 24, and under 1 s', () => {
@@ -68,9 +73,17 @@ describe('#827 sizing: the bounds keep their margins over the measured honest wo
   });
 
   it('the caps sit with at least 2× headroom over the honest work they allow, and below the shapes that stall', () => {
-    expect(E_MAX).toBe(10_000);
-    expect(T_FRAME_MS).toBeGreaterThanOrEqual(2 * NODE22.selectAllAtE * 2); // a select-all at E_MAX: shadow, then live
-    expect(NODE22.selectAllPastE).toBeGreaterThan(NODE22.selectAllAtE * 3); // why E is capped: superlinear past it
+    // E_MAX: the largest E of the sweep whose honest select-all at S_MAX stays ≤ ~0.7 s of frame (the next does not),
+    // with T_FRAME_MS's 2.5× margin over its shadow apply
+    expect(E_MAX).toBe(14_000);
+    expect(NODE22.selectAllAtEFrame).toBeLessThanOrEqual(700);
+    expect(NODE22.selectAllNextEFrame).toBeGreaterThan(700);
+    expect(T_FRAME_MS).toBeGreaterThanOrEqual(2.5 * NODE22.selectAllAtE);
+    expect(NODE22.selectAllPastE / NODE22.selectAllAtE).toBeGreaterThan(20_000 / 14_000); // why E is capped: superlinear past it
+    // an honest 3 MiB paste of prose (150-byte paragraphs) fits every cap under its soft cap
+    expect(NODE22.pasteProse150Paragraphs).toBeLessThan(softCap(E_MAX));
+    expect(NODE22.pasteProse150Structs).toBeLessThan(softCap(S_MAX));
+    expect(T_FRAME_MS).toBeGreaterThanOrEqual(2.5 * NODE22.pasteProse150);
     expect(C_MAX).toBe(20_000);
     // a keystroke at C_MAX, charged to the CPU debt (100 ms/s refill), leaves room for 5 keys/s with 1.5× to spare
     expect(5 * NODE22.keystrokeAtC * 1.5).toBeLessThan(100);
@@ -122,7 +135,7 @@ describe('#827 sizing: the bounds keep their margins over the measured honest wo
   it('the bench is the one the table names (anti-vacuity: it loads the real modules and measures each case)', () => {
     const bench = readFileSync(join(__dirname, 'yjs-bounds.sizing.bench.cjs'), 'utf8');
     for (const mod of ['deadline.ts', 'conflict-scan.ts', 'conflict-scan.testkit.ts']) expect(bench).toContain(`loadTs('${mod}')`);
-    for (const kind of ['vm.overhead', 'vm.cutoff', 'honest.paste', 'honest.offlineStep2', 'honest.meterAccepted', 'honest.selectAll', 'honest.typingAtIds', 'honest.loadCapped', 'honest.compaction', 'honest.readerStep2', 'attack.a', 'attack.b', 'attack.c']) {
+    for (const kind of ['vm.overhead', 'vm.cutoff', 'honest.paste', 'honest.offlineStep2', 'honest.meterAccepted', 'honest.selectAll', 'honest.selectAllAtS', 'honest.pasteProse', 'honest.typingAtIds', 'honest.loadCapped', 'honest.compaction', 'honest.readerStep2', 'attack.a', 'attack.b', 'attack.c']) {
       expect(bench).toContain(`'${kind}'`);
     }
     const table = readFileSync(join(__dirname, 'doc-bounds.ts'), 'utf8');

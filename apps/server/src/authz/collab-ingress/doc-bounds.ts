@@ -20,8 +20,21 @@
  *     a frame the meter accepts (998,999 steps)        82             81
  *     select-all, 10k paragraphs, 60k structs         157            157
  *     select-all, 10k paragraphs, 230k structs        306            295      (past S_MAX)
- *     select-all, 20k paragraphs, 120k structs        551            541      (past E_MAX: why E is capped)
+ *     select-all, 20k paragraphs, 120k structs        551            541      (past E_MAX)
  *     select-all, 50k paragraphs, 150k structs       2335           3028      (past E_MAX)
+ *   the E_MAX decision (honest.selectAllAtS): a select-all delete of a page AT S_MAX (150k structs), by its live
+ *   children E; shadow apply / the whole frame (decode + shadow + live's apply), median of 3 (13k–15k: the median of
+ *   three such runs; node 22 varied ≤ 1%, node 24 up to 11%)
+ *     E = 10,000                                    206 / 419      206 / 412
+ *     E = 12,500                                    273 / 544      283 / 569
+ *     E = 13,000                                    288 / 578      282 / 565
+ *     E = 14,000  ← E_MAX                           319 / 638      315 / 627
+ *     E = 15,000                                    350 / 703      350 / 698
+ *     E = 17,500                                    442 / 906      512 / 1059
+ *     E = 20,000                                    574 / 1147     615 / 1199    (superlinear in E: why E is capped)
+ *   a ~3 MiB paste of prose into an empty page (honest.pasteProse: two bold runs a paragraph), whole frame
+ *     150-byte paragraphs: 11,131 paragraphs, 111k structs   306      306      (fits E_MAX 14k; was past 10k)
+ *     210 / 300 / 500 bytes: 9,124 / 7,209 / 4,916 paragraphs  266 / 210 / 150
  *   keystroke (decode + shadow + live), by client ids:  5k 3.2, 20k 12.5, 50k 28.9   (node 24: 3.2, 13.0, 28.5)
  *   load of a page with 20k ids, metered (count mode): 80k structs 99, 140k 165, 320k 348 (node 24: 88, 133, 313);
  *     honest walk steps 40,001; encode (the probe's other half) 28 / 46 / 97
@@ -42,9 +55,9 @@ const MINUTE = 60_000;
 // --- deadlines (deadline.ts): a timeout means "outcome unknown", so the work's document is discarded
 
 /**
- * The shadow apply of one frame. ≥ 2.5× the slowest honest shadow apply measured (306 ms, a select-all past S_MAX;
- * 261 ms the densest 3 MiB paste), and ~3× the slowest under the caps (~240 ms). An accepted frame just under it costs
- * about 2·T of the process once (the shadow, then live), after which the sender's CPU debt applies.
+ * The shadow apply of one frame. ≥ 2.5× the slowest honest shadow apply measured (319 ms, a select-all at S_MAX and
+ * E_MAX; 306 ms past S_MAX; 261 ms the densest 3 MiB paste). An accepted frame just under it costs about 2·T of the
+ * process once (the shadow, then live), after which the sender's CPU debt applies.
  */
 export const T_FRAME_MS = 800;
 /**
@@ -66,8 +79,8 @@ export const COMPACTION_DEADLINE_MS = 3_000;
 // --- per-page structure caps (counted in the guard, O(touched))
 
 /**
- * Structs in the page's store. An honest select-all delete at S_MAX and E_MAX stays ~0.25 s, a load ~0.17 s, a
- * compaction ~0.15 s. The largest real page measured is 0.52 MB, about 25k structs: 6× headroom.
+ * Structs in the page's store. An honest select-all delete at S_MAX and E_MAX costs 0.32 s of shadow apply (0.64 s of
+ * frame), a load ~0.17 s, a compaction ~0.15 s. The largest real page measured is 0.52 MB, about 25k structs: 6× headroom.
  */
 export const S_MAX = 150_000;
 /**
@@ -78,15 +91,23 @@ export const S_MAX = 150_000;
 export const C_MAX = 20_000;
 /**
  * Live children of any one element (the root included). Yjs's delete-set merge splices once per run of a client's
- * struct array, so a select-all costs ~E·S: 157 ms at 10k paragraphs, 551 ms at 20k, 2.3 s at 50k.
+ * struct array, so a select-all costs ~c·E·S, and superlinear in E (the table: at S_MAX, 0.42 s of frame at 10k, 1.15 s
+ * at 20k). The LARGEST E whose honest select-all at S_MAX stays ≤ ~0.7 s of frame on Node 22 (638 ms; 15k is 703) and
+ * whose shadow apply (319 ms) keeps T_FRAME_MS's 2.5× margin (15k's 350 does not). So a 3 MiB paste
+ * of prose fits: paragraphs from ~110 bytes of text (about 3 MiB / 14k encoded), where 10k refused anything under ~150.
+ * Compaction keeps every live child: a page past E is page-full, never drained.
  */
-export const E_MAX = 10_000;
+export const E_MAX = 14_000;
 /**
  * Walk steps (the #816 meter's count) of a full load: ~0.6 s of Yjs at 88–95 ns per step (about 1.1 s with the meter
  * counting, before it trips). An honest page at the caps walks 40k; the inversion attack grows as M·N.
  */
 export const W_MAX = 6_000_000;
-/** Past this fraction of a cap, compaction is requested for the next unload; at the cap, the page drains and compacts. */
+/**
+ * Past this fraction of a cap, compaction is requested for the next unload; at the hard cap, the page drains and
+ * compacts. Either only when compaction would bring the page back under this fraction of every cap (its live structs
+ * and the live children of each element, which compaction keeps); otherwise growth past the hard cap is page-full.
+ */
 export const SOFT_CAP_FRACTION = 0.8;
 
 // --- the probe: in residency, catches what the caps cannot see (inversion, reorder) within one interval

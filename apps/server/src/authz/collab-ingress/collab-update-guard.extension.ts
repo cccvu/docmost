@@ -11,8 +11,14 @@
  * (collab-update-guard.wiring.spec.ts).
  *
  * #827 adds three hooks, each synchronous (a throw, never a rejection after an await) and first in its chain:
- *   - `onAuthenticate`: a join to a resident document that is compacting, draining or superseded is refused with the
- *     compacting try-later reason (the editor waits read-only and retries; the next load is the new lineage).
+ *   - `connected`: a join to a resident document that is compacting, draining or superseded closes the socket 1013 with
+ *     the compacting reason (the editor waits read-only and retries; the next load is the new lineage), so a socket that
+ *     joined during a drain and never sends a frame cannot keep the document resident. Deliberately AFTER
+ *     authentication: 4.7.1 runs `onAuthenticate` hooks by priority and this extension outranks the auth extension, so a
+ *     join gate there would tell a client holding nothing but a page id that the page exists and is compacting. The
+ *     frames a socket queued before it was authenticated reach the frame hook first (4.7.1 drains the queue, then runs
+ *     `connected`), which closes it the same way. Never throws: 4.7.1 awaits `connected` inside the auth path's try, and
+ *     a throw there would answer permission-denied to a socket already authenticated.
  *   - `onLoadDocument`: a SOCKET's load is refused try-later while its user is in collab CPU debt. Thrown before any
  *     await in the load chain, so no co-loader can share the rejection (4.7.1 reaches this hook through microtasks only,
  *     and no extension defines `onCreateDocument`). A DirectConnection (the API, no `sec-websocket-key`) is never gated.
@@ -24,12 +30,12 @@
 import type {
   afterLoadDocumentPayload,
   beforeHandleMessagePayload,
-  onAuthenticatePayload,
+  connectedPayload,
   onLoadDocumentPayload,
 } from '@hocuspocus/server';
 import type * as Y from 'yjs';
-import { COLLAB_LOAD_TRY_LATER_REASON, pageCompactingRefusal } from './collab-reasons';
-import { CollabUpdateGuard, type GuardFrame } from './update-guard';
+import { COLLAB_LOAD_TRY_LATER_REASON, COLLAB_PAGE_COMPACTING_REASON } from './collab-reasons';
+import { COLLAB_TRY_LATER_CODE, CollabUpdateGuard, type GuardFrame } from './update-guard';
 
 /** One load being timed: CPU ms of its Yjs transactions so far, and the transaction open now. */
 type LoadTiming = { user: string | null; ms: number; openedAt: number | null; wallStarted: number; detach: () => void };
@@ -65,10 +71,21 @@ export class CollabUpdateGuardExtension {
     return undefined as unknown as Promise<void>;
   }
 
-  /** #827: refuses (throws `{ reason }`) a join to a resident document closed for compaction. Synchronous. */
-  onAuthenticate(payload: onAuthenticatePayload): Promise<void> {
-    const resident = (payload.instance as unknown as { documents?: Map<string, object> } | undefined)?.documents?.get(payload.documentName);
-    if (!this.guard.admitJoin(resident, userOf(payload.context))) throw pageCompactingRefusal();
+  /**
+   * #827: a socket that joined a resident document closed for compaction (its auth passed after the drain started) is
+   * closed 1013 with the compacting reason. Post-authentication only (see the header). Synchronous, never throws.
+   */
+  connected(payload: connectedPayload): Promise<void> {
+    try {
+      const { connection } = payload;
+      const socket = connection?.webSocket as { readyState?: number; close(code: number, reason: string): void } | undefined;
+      // A socket its queued frames already closed (the frame hook) is not refused or logged twice.
+      if (socket && (socket.readyState ?? 1) <= 1 && !this.guard.admitJoin(connection.document, userOf(payload.context))) {
+        socket.close(COLLAB_TRY_LATER_CODE, COLLAB_PAGE_COMPACTING_REASON);
+      }
+    } catch {
+      // never out of this hook
+    }
     return undefined as unknown as Promise<void>;
   }
 

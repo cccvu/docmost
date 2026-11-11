@@ -103,7 +103,7 @@ describe('#781 the collab update guard is wired first, alone and synchronous', (
     expect(definesHook(ts.createSourceFile('x.ts', 'const beforeSyncNot = 1; call(beforeSync);', ts.ScriptTarget.Latest, true), 'beforeSync')).toBe(false);
   });
 
-  it('#827: its hooks are exactly the frame hook, the join gate and the load pair, and none is async', () => {
+  it('#827: its hooks are exactly the frame hook, the post-auth join gate and the load pair, and none is async', () => {
     const sf = parse(join(__dirname, 'collab-update-guard.extension.ts'));
     const hooks = new Map<string, boolean>();
     const visit = (n: ts.Node) => {
@@ -118,26 +118,30 @@ describe('#781 the collab update guard is wired first, alone and synchronous', (
       ts.forEachChild(n, visit);
     };
     visit(sf);
-    expect([...hooks.keys()].sort()).toEqual(['afterLoadDocument', 'beforeHandleMessage', 'extensionName', 'onAuthenticate', 'onLoadDocument', 'priority']);
+    // No onAuthenticate or onConnect: this extension outranks the auth extension, so a hook there would answer a client
+    // that has not authenticated (a compacting refusal would tell it the page exists and is compacting).
+    expect([...hooks.keys()].sort()).toEqual(['afterLoadDocument', 'beforeHandleMessage', 'connected', 'extensionName', 'onLoadDocument', 'priority']);
     expect([...hooks.values()].every((isAsync) => !isAsync)).toBe(true);
   });
 
-  it('#827: the join and load gates refuse by a synchronous throw of { reason } (no co-loader shares it); afterLoadDocument never throws', () => {
+  it('#827: the post-auth join gate closes the socket 1013 and never throws; the load gate throws { reason } synchronously (no co-loader shares it); afterLoadDocument never throws', () => {
     const guard = new CollabUpdateGuard({ logger: { warn: () => undefined } });
     const ext = new CollabUpdateGuardExtension(guard);
     const live = new Y.Doc() as Y.Doc & { name: string };
     live.name = 'page.p';
-    // a join to a resident document that drains
+    // an authenticated join to a resident document that drains: its socket is closed, nothing is thrown
     requestCompaction(live, { reason: 'structs', userId: null, drain: true });
-    const join = { instance: { documents: new Map([['page.p', live]]) }, documentName: 'page.p', context: {} };
-    let refused: unknown;
-    try {
-      ext.onAuthenticate(join as never);
-    } catch (err) {
-      refused = err;
-    }
-    expect(refused).toEqual({ reason: COLLAB_PAGE_COMPACTING_REASON });
-    expect(ext.onAuthenticate({ ...join, documentName: 'page.q' } as never)).toBeUndefined();
+    const socket = { readyState: 1, close: jest.fn() };
+    const joined = (document: Y.Doc) => ({ connection: { document, webSocket: socket }, documentName: 'page.p', context: {} });
+    expect(ext.connected(joined(live) as never)).toBeUndefined();
+    expect(socket.close).toHaveBeenCalledWith(1013, COLLAB_PAGE_COMPACTING_REASON);
+    socket.close.mockClear();
+    expect(ext.connected(joined(new Y.Doc()) as never)).toBeUndefined(); // a page not closed: untouched
+    expect(socket.close).not.toHaveBeenCalled();
+    socket.close.mockImplementation(() => {
+      throw new Error('gone');
+    });
+    expect(ext.connected(joined(live) as never)).toBeUndefined(); // a socket that throws on close: still nothing thrown
     // a socket's load while its user is in debt; the same load from a DirectConnection is admitted
     guard.chargeLoad('u', 1e9, guard.wallClock());
     const load = (headers: Headers) => ({ document: new Y.Doc(), context: { user: { id: 'u' } }, requestHeaders: headers });

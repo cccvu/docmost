@@ -155,6 +155,11 @@ let joinerRef: ReturnType<typeof joiner>;
 let restoreClock: () => void;
 let now = 1_000_000;
 let logged: string[];
+/** A compaction line (collab-ingress/compaction-log.ts): the token, one space, one JSON object. */
+const logLine = (line: string): Record<string, unknown> => {
+  const space = line.indexOf(' ');
+  return { token: line.slice(0, space), ...JSON.parse(line.slice(space + 1)) };
+};
 beforeEach(() => {
   logged = [];
   const capture = (line: unknown) => {
@@ -332,9 +337,9 @@ describe('loadStoredYdoc (#827): the bounded load', () => {
     const full = new Y.Doc();
     Y.applyUpdate(full, bytes);
     expect(countStructs(cut).structs).toBeLessThan(countStructs(full).structs);
-    expect(logged).toEqual([
-      expect.stringMatching(/^COLLAB_PAGE_COMPACTION load_refused page=\S+ why=steps /),
-      expect.stringMatching(/^COLLAB_PAGE_COMPACTION requested page=\S+ reason=load_trip drain=false$/),
+    expect(logged.map(logLine)).toEqual([
+      { token: 'COLLAB_PAGE_COMPACTION', event: 'load_refused', pageId, why: 'steps', steps: expect.any(Number), bytes: bytes.length, ms: expect.any(Number) },
+      { token: 'COLLAB_PAGE_COMPACTION', event: 'requested', pageId, reason: 'load_trip', drain: false },
     ]);
     expect(thrown).not.toHaveProperty('message');
     expect(isCompactionInflight(pageId)).toBe(true);
@@ -446,9 +451,24 @@ describe('compactOnUnload (#827)', () => {
     expect(ledgerOfDoc(loaded)).toEqual([{ key: 'u\u0000k', ts: 123 }]);
     expect(countStructs(loaded).clients).toBe(1);
     expect(isCompactionInflight(pageId)).toBe(false);
-    // one line, its token first (check-infra-config §14 reads the first word)
-    expect(logged).toEqual([
-      expect.stringMatching(new RegExp(`^COLLAB_PAGE_COMPACTION done page=${pageId} reason=structs from=unload epoch=0->1 structs=\\d+->\\d+ ids=\\d+->1 bytes=\\d+->\\d+ ms=\\d+$`)),
+    // one line, its token first (check-infra-config §14 reads the first word), then one JSON object (compaction-log.ts)
+    expect(logged.map(logLine)).toEqual([
+      {
+        token: 'COLLAB_PAGE_COMPACTION',
+        event: 'done',
+        pageId,
+        reason: 'structs',
+        from: 'unload',
+        fromEpoch: 0,
+        toEpoch: 1,
+        structsBefore: expect.any(Number),
+        structsAfter: expect.any(Number),
+        clientIdsBefore: expect.any(Number),
+        clientIdsAfter: 1,
+        bytesBefore: expect.any(Number),
+        bytesAfter: expect.any(Number),
+        ms: expect.any(Number),
+      },
     ]);
     // a superseded copy never stores again; its settle fails closed
     expect(skipStoreOfSuperseded(doc)).toBe(true);
@@ -565,7 +585,7 @@ describe('compactOnUnload (#827)', () => {
     expect(store.calls.swap).toBe(0);
     expect(isCompacting(doc)).toBe(false);
     expect(isSuperseded(doc)).toBe(false);
-    expect(logged).toEqual([expect.stringMatching(/^COLLAB_COMPACTION_FAILED page=\S+ reason=structs why=deadline$/)]);
+    expect(logged.map(logLine)).toEqual([{ token: 'COLLAB_COMPACTION_FAILED', pageId: expect.any(String), reason: 'structs', why: 'deadline' }]);
   });
 
   it('a compacted document compacts to the epoch after its own', async () => {
