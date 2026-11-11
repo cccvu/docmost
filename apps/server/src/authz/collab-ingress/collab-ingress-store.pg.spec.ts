@@ -218,12 +218,12 @@ d('the collab store behind the ingress guard (#781)', () => {
     const n = node(true);
     const first = await n.connect('editor');
     const live = n.live();
-    live.transact(() => recordWriteKey(live, 'api-key', Date.now()), V1_WRITE);
+    live.transact(() => recordWriteKey(live, scopedWriteKey('u', 'api-key'), Date.now()), V1_WRITE);
     await expect(n.handlers.flushPageContent(DOC)).resolves.toMatchObject({ flushed: true });
     // precondition: the ROW holds the ledger entry (else this is the crash residual below, a different case)
     const stored = new Y.Doc();
     Y.applyUpdate(stored, new Uint8Array((await row()).ydoc));
-    expect(isDuplicateWriteKey(stored, 'api-key')).toBe(true);
+    expect(isDuplicateWriteKey(stored, scopedWriteKey('u', 'api-key'))).toBe(true);
     // The browser's local copy holds the server's ledger item; a remount sends the whole copy back as an Update.
     const browser = new RemoteClient(live);
     const echo = Y.encodeStateAsUpdate(browser.doc);
@@ -238,7 +238,7 @@ d('the collab store behind the ingress guard (#781)', () => {
     // Hocuspocus answered SyncStatus(true): the Update was applied (a no-op), not refused
     const statuses = remount.sent.slice(sentBefore).filter((m) => readServerFrame(m).type === MSG.SyncStatus);
     expect(statuses.map((m) => m[m.length - 1])).toEqual([1]);
-    expect(isDuplicateWriteKey(live, 'api-key')).toBe(true);
+    expect(isDuplicateWriteKey(live, scopedWriteKey('u', 'api-key'))).toBe(true);
     await expect(n.handlers.flushPageContent(DOC)).resolves.toMatchObject({ flushed: true });
     const rowAfter = await row();
     expect(Buffer.from(rowAfter.ydoc).equals(Buffer.from(rowBefore.ydoc))).toBe(true);

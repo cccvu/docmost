@@ -760,13 +760,13 @@ describe('#781 a remount resending structs live already holds is not refused (th
   /** The seed's client: live holds its clocks, and no user is bound to it (live's own id is the server's). */
   const seedClient = (s: ReturnType<typeof setup>): number => ((textOf(find(s.live, 'paragraph')) as any)._start as Y.Item).id.client;
   const ARMS: Array<[string, (live: Y.Doc) => void]> = [
-    ['one live entry', (live) => live.transact(() => recordWriteKey(live, 'k1', Date.now()))],
+    ['one live entry', (live) => live.transact(() => recordWriteKey(live, scopedWriteKey('u', 'k1'), Date.now()))],
     [
       'every entry pruned (ContentDeleted)',
       (live) => {
-        live.transact(() => recordWriteKey(live, 'k1', 1_000));
-        live.transact(() => recordWriteKey(live, 'k2', 1_000_000, 10)); // prunes k1 by age
-        live.transact(() => live.getMap(WRITE_IDEM_MAP).delete('k2'));
+        live.transact(() => recordWriteKey(live, scopedWriteKey('u', 'k1'), 1_000));
+        live.transact(() => recordWriteKey(live, scopedWriteKey('u', 'k2'), 1_000_000, 10)); // prunes k1 by age
+        live.transact(() => live.getMap(WRITE_IDEM_MAP).delete(scopedWriteKey('u', 'k2').entry));
         expect(live.getMap(WRITE_IDEM_MAP).size).toBe(0);
       },
     ],
@@ -793,7 +793,7 @@ describe('#781 a remount resending structs live already holds is not refused (th
       expect(sameBytes(Y.encodeStateVector(s.guard.shadowOf(s.live)!), Y.encodeStateVector(s.live))).toBe(true);
       // Another user's shadow-stage refusal (a ledger overwrite) leaves the shadow dirty: the next frame's rebuild replays
       // the echo from the in-flight list, still a no-op, and the editor's next edit applies.
-      const overwrite = new RemoteClient(s.live).edit(s.live, (_f, d) => d.getMap(WRITE_IDEM_MAP).set('k1', 'x'));
+      const overwrite = new RemoteClient(s.live).edit(s.live, (_f, d) => d.getMap(WRITE_IDEM_MAP).set(scopedWriteKey('u', 'k1').entry, 'x'));
       expect(s.send(s.conn('attacker'), overwrite)).toBe(REFUSED('root'));
       const c = new RemoteClient(s.live);
       expect(s.send(editor, c.edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'next ')))).toBe('applied');
@@ -810,17 +810,17 @@ describe('#781 a remount resending structs live already holds is not refused (th
 
   it('the echo merged with an honest edit is applied; merged with a client ledger delete or overwrite it is refused root', () => {
     const s = setup({ seed: SEED });
-    s.live.transact(() => recordWriteKey(s.live, 'k1', Date.now()));
+    s.live.transact(() => recordWriteKey(s.live, scopedWriteKey('u', 'k1'), Date.now()));
     const edit = new RemoteClient(s.live).edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'new '));
     expect(s.send(s.conn('editor'), Y.mergeUpdates([remountEcho(s.live), edit]))).toBe('applied');
     expect(renderLikeABrowser(s.live).text).toBe('new victim text');
-    const changes: Array<(m: Y.Map<unknown>) => void> = [(m) => m.delete('k1'), (m) => m.set('k1', 'x')];
+    const changes: Array<(m: Y.Map<unknown>) => void> = [(m) => m.delete(scopedWriteKey('u', 'k1').entry), (m) => m.set(scopedWriteKey('u', 'k1').entry, 'x')];
     for (const change of changes) {
       const t = setup({ seed: SEED });
-      t.live.transact(() => recordWriteKey(t.live, 'k1', Date.now()));
+      t.live.transact(() => recordWriteKey(t.live, scopedWriteKey('u', 'k1'), Date.now()));
       const u = new RemoteClient(t.live).edit(t.live, (_f, d) => change(d.getMap(WRITE_IDEM_MAP)));
       expectRefused(t, t.conn('attacker'), Y.mergeUpdates([remountEcho(t.live), u]), REFUSED('root'));
-      expect(isDuplicateWriteKey(t.live, 'k1')).toBe(true);
+      expect(isDuplicateWriteKey(t.live, scopedWriteKey('u', 'k1'))).toBe(true);
     }
   });
 
@@ -840,7 +840,7 @@ describe('#781 a remount resending structs live already holds is not refused (th
 
   it('a struct live holds only in part (a straddle on a root live holds) is judged whole by the pre-pass', () => {
     const s = setup({ seed: SEED });
-    s.live.transact(() => recordWriteKey(s.live, 'k1', Date.now()));
+    s.live.transact(() => recordWriteKey(s.live, scopedWriteKey('u', 'k1'), Date.now()));
     const client = seedClient(s);
     const state = Y.getState(s.live.store, client);
     const u = rawUpdate([
@@ -855,7 +855,7 @@ describe('#781 a remount resending structs live already holds is not refused (th
 
     // the upper boundary: a struct new by exactly ONE clock is still judged whole (`clock + length <= state`, not `- 1`)
     const t = setup({ seed: SEED });
-    t.live.transact(() => recordWriteKey(t.live, 'k1', Date.now()));
+    t.live.transact(() => recordWriteKey(t.live, scopedWriteKey('u', 'k1'), Date.now()));
     const c2 = seedClient(t);
     const st = Y.getState(t.live.store, c2);
     const byOne = rawUpdate([
