@@ -213,6 +213,44 @@ d('the collab store behind the ingress guard (#781)', () => {
     }
   });
 
+  it('a writer\'s y-indexeddb remount after a keyed /v1 write (its ledger entry stored) is applied, a no-op', async () => {
+    const n = node(true);
+    const first = await n.connect('editor');
+    const live = n.live();
+    live.transact(() => recordWriteKey(live, 'api-key', Date.now()), V1_WRITE);
+    await expect(n.handlers.flushPageContent(DOC)).resolves.toMatchObject({ flushed: true });
+    // precondition: the ROW holds the ledger entry (else this is the crash residual below, a different case)
+    const stored = new Y.Doc();
+    Y.applyUpdate(stored, new Uint8Array((await row()).ydoc));
+    expect(isDuplicateWriteKey(stored, 'api-key')).toBe(true);
+    // The browser's local copy holds the server's ledger item; a remount sends the whole copy back as an Update.
+    const browser = new RemoteClient(live);
+    const echo = Y.encodeStateAsUpdate(browser.doc);
+    expect(Y.decodeUpdate(echo).structs.some((st) => st instanceof Y.Item && (st.parent as unknown) === WRITE_IDEM_MAP)).toBe(true);
+    const rowBefore = await row();
+    const remount = await n.connect('editor');
+    const sentBefore = remount.sent.length;
+    remount.deliver(syncFrame(echo, SYNC.Update, MSG.Sync, DOC));
+    await settle();
+    expect(remount.closeReasons()).toEqual([]);
+    expect(first.closeReasons()).toEqual([]);
+    // Hocuspocus answered SyncStatus(true): the Update was applied (a no-op), not refused
+    const statuses = remount.sent.slice(sentBefore).filter((m) => readServerFrame(m).type === MSG.SyncStatus);
+    expect(statuses.map((m) => m[m.length - 1])).toEqual([1]);
+    expect(isDuplicateWriteKey(live, 'api-key')).toBe(true);
+    await expect(n.handlers.flushPageContent(DOC)).resolves.toMatchObject({ flushed: true });
+    const rowAfter = await row();
+    expect(Buffer.from(rowAfter.ydoc).equals(Buffer.from(rowBefore.ydoc))).toBe(true);
+    expect(rowAfter.content).toEqual(rowBefore.content);
+    // and the remounted editor's next edit stores
+    remount.deliver(syncFrame(new RemoteClient(live).edit(live, (f) => textOf(f.get(0) as Y.XmlElement).insert(9, ' and more')), SYNC.Update, MSG.Sync, DOC));
+    await settle();
+    await expect(n.handlers.flushPageContent(DOC, { withDigest: true })).resolves.toMatchObject({ flushed: true });
+    expect(remount.closeReasons()).toEqual([]);
+    expect(storeFailures).toEqual([]);
+    expect(JSON.stringify((await row()).content)).toContain('"text":"seed text and more"');
+  });
+
   it('residual (ADR 0036): a browser holding a ledger entry the crashed node never stored is refused on reconnect', async () => {
     const first = node(true);
     const browserSock = await first.connect('editor');

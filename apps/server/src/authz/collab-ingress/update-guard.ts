@@ -11,7 +11,10 @@
  * inspected inside that transaction, before Yjs's cleanup garbage-collects or merges anything: every struct from the
  * transaction's `beforeState` to the store's end, plus `tr.deleteSet`. So Yjs itself resolves parents, origins, splits
  * and pending structs. A refused frame leaves the shadow ahead of live, so the next frame rebuilds it from live plus the
- * frames accepted but not yet applied (`inflight`), keeping it an exact image of live's future.
+ * frames accepted but not yet applied (`inflight`), keeping it an exact image of live's future. Both the stateless
+ * pre-pass and the shadow judge only what Yjs will integrate: a struct live already holds in full (a y-indexeddb
+ * remount resends the whole local copy, the server's own `/v1` ledger entries and pre-#781 content included) is a
+ * no-op in Yjs and is not refused for its content (see `heldByLive`).
  *
  * Ordering (Hocuspocus 4.7.1, `Connection.processMessages` and `MessageReceiver.apply`): each document connection
  * queues its frames and handles one at a time: it awaits the `beforeHandleMessage` hooks (one promise chain), then the
@@ -462,7 +465,7 @@ export class CollabUpdateGuard {
     let applyMs = 0;
     try {
       // 1. Stateless pre-pass: a refusal here touches no shadow, so a refuse/reconnect loop costs no rebuild.
-      const pre = prePass(payload);
+      const pre = prePass(payload, frame.document);
       let violation = pre.violation;
       if (violation && this.mode === 'enforce') return this.refuse(frame, header, violation);
       // 1b. #816: client ids live has never seen, charged before anything integrates them.
@@ -846,11 +849,13 @@ const tryRead = (read: () => Uint8Array): Uint8Array | null => {
 };
 
 /**
- * The stateless rules, on the decoded frame (no document state, so already-known structs are checked too), and the
- * client ids of its structs (Skips excepted: they integrate nothing). `Y.decodeUpdate` keeps the wire order of the
- * delete set (`readDeleteSet` appends, it never sorts).
+ * The stateless rules, on the decoded frame, for every struct live does not already hold (`heldByLive`), and the client
+ * ids of those structs (Skips excepted: they integrate nothing). A held struct is a no-op in Yjs, so neither its content
+ * nor its client id is judged; a struct that is only partly held is judged whole (the shadow then sees the tail Yjs
+ * integrates). The decode and the delete-order rule still cover the WHOLE frame, held structs or not: a delete set is
+ * judged by its wire order alone. `Y.decodeUpdate` keeps that order (`readDeleteSet` appends, it never sorts).
  */
-function prePass(payload: Uint8Array): { violation: Violation | null; clients: Set<number> } {
+function prePass(payload: Uint8Array, live: Y.Doc): { violation: Violation | null; clients: Set<number> } {
   const clients = new Set<number>();
   let decoded: { structs: Array<Y.Item | Y.GC | Y.Skip>; ds: { clients: Map<number, Array<{ clock: number; len: number }>> } };
   try {
@@ -859,12 +864,40 @@ function prePass(payload: Uint8Array): { violation: Violation | null; clients: S
     return { violation: { rule: 'undecodable' }, clients }; // e.g. a lib0 `readAny` value deep enough to overflow the decoder
   }
   let violation: Violation | null = null;
+  const states = new Map<number, number>();
   for (const struct of decoded.structs) {
     if (struct instanceof Y.Skip) continue;
+    if (heldByLive(struct, live, states)) continue; // a remount's resend: Yjs integrates none of it
     clients.add(struct.id.client);
     if (struct instanceof Y.Item) violation ??= structRule(struct);
   }
   return { violation: violation ?? deleteOrder(decoded.ds.clients), clients };
+}
+
+/**
+ * Does live already hold all of `struct`, so that Yjs never integrates it? Yjs's `integrateStructs` integrates a struct
+ * only when `offset === 0 || offset < length` (offset = live's state for its client minus its clock); this is the exact
+ * negation, so a zero-length struct at the state's clock is NOT held (Yjs integrates it, and it is judged). A y-indexeddb
+ * remount honestly resends such structs: the server's own `__ccc_write_idem` ledger entries (pruned ones too, as
+ * ContentDeleted), other users' content, and stored pre-#781 content a stateless rule refuses (the shadow treats that as
+ * legacy).
+ *
+ * Sound because a Y.Doc's state only grows during its lifetime: held when checked means never integrated by any later
+ * apply of this frame. A shadow ahead of live changes nothing here (live is what is read): a struct live lacks is simply
+ * not held, and is judged as before. Two side effects of a held struct remain, both the shadow's as for any struct:
+ * - The decode itself: Yjs's `readClientsStructRefs` calls `doc.get(<root name>)` for a struct whose parent is a root
+ *   name, before the clock check, creating that root. So a struct naming a root live does not hold is never held (it
+ *   is judged `root`), or a frame of held structs could grow live's `share` without bound.
+ * - `getMissing` (splits, a pending park, a throw on a forged parent id): the shadow's `internal` and `unresolved`.
+ * Not counted: structs in live's pending store (`getState` excludes them). Those are judged as before.
+ */
+function heldByLive(struct: Y.Item | Y.GC, live: Y.Doc, states: Map<number, number>): boolean {
+  const { client, clock } = struct.id;
+  let state = states.get(client);
+  if (state === undefined) states.set(client, (state = Y.getState(live.store, client)));
+  if (!(state > clock && clock + struct.length <= state)) return false;
+  const parent = struct instanceof Y.Item ? (struct.parent as unknown) : null;
+  return typeof parent !== 'string' || live.share.has(parent);
 }
 
 function structRule(struct: Y.Item): Violation | null {
