@@ -13,7 +13,9 @@ import { AWARENESS_BINDS_PER_USER, AWARENESS_NEW_IDS_REFILL_MS, COLLAB_REFUSAL_C
  * the server's relay to that peer made them part of its Step2 or IndexedDB echo. Binding them to that peer refused the
  * real author `foreign-client` for the rest of the lifetime. And the mirror ordering (the author's awareness lands first,
  * then the peer's relay) is answered `unresolved`, never applied: the peer reconnects once and by then the author's own
- * Step2 has made those clocks known.
+ * Step2 has made those clocks known. That holds for a ONE-SIDED relay, and only when the author's Step2 lands before the
+ * peer's retry; both limits are pinned as residuals below (and the crash corpus in honest-concurrency.spec.ts measures
+ * them).
  *
  * Driven like update-guard.spec.ts: `deliver` stands in for Hocuspocus (the guard first, then the apply), and `meta` for
  * the awareness clocks Hocuspocus's Document keeps. One describe runs the orderings through a real Hocuspocus 4.7.1.
@@ -228,6 +230,159 @@ describe('residuals pinned (ADR 0036 §4): equal to the rule before this evidenc
     expect(s.announce(aConn, { clientID: A_ID, state: null })).toBe('applied');
     expect(s.send(aConn, s.step2(a.doc), SYNC.Step2)).toBe('applied');
     expect(s.announce(s.conn('B'), { clientID: B_ID })).toBe(REFUSED('foreign-client'));
+  });
+});
+
+/**
+ * Lifetime 1 where BOTH co-editors typed inside the store debounce and each was relayed the other's edit before the
+ * crash: A's Step2 carries A's lost tail and B's, B's carries B's and A's.
+ */
+function bothLostLifetime(opts: { storedPrefix: boolean }) {
+  const life1 = new Y.Doc();
+  Y.applyUpdate(life1, Y.encodeStateAsUpdate(prosemirrorJSONToYDoc(serverSchema(), SEED, 'default')));
+  const b = new RemoteClient(life1, B_ID);
+  const a = new RemoteClient(life1, A_ID);
+  if (opts.storedPrefix) {
+    Y.applyUpdate(life1, typeAt0(b, life1, 'B-stored '));
+    a.sync(life1);
+    Y.applyUpdate(life1, typeAt0(a, life1, 'A-stored '));
+    b.sync(life1);
+  }
+  const stored = Y.encodeStateAsUpdate(life1);
+  Y.applyUpdate(life1, typeAt0(b, life1, 'B-lost '));
+  a.sync(life1);
+  Y.applyUpdate(life1, typeAt0(a, life1, 'A-lost '));
+  b.sync(life1);
+  return { stored, a, b };
+}
+
+describe('pinned residuals of the mirror-race answer (ADR 0036 §4): one-sided relays only, and a timing assumption', () => {
+  it.each([
+    ['a stored id', true],
+    ['a never-seen id', false],
+  ])('%s, BOTH co-editors lost a tail: each Step2 hits the other\'s unproven id, both are unresolved twice (final), live never changes', (_name, storedPrefix) => {
+    // Not a regression (the rule before this change refused both foreign-client at once), and not fixed: neither frame
+    // can land, so neither id is ever proven, and a reload within the lifetime replays the same ids. The deadlock ends
+    // with the lifetime (the document unloads once no editor holds it; a new lifetime binds nothing).
+    const { stored, a, b } = bothLostLifetime({ storedPrefix });
+    const s = lifetime(stored);
+    expect(Y.getState(s.live.store, B_ID) > 0).toBe(storedPrefix);
+    expect(clientsOf(s.step2(a.doc))).toEqual(new Set([A_ID, B_ID])); // precondition: each carries both lost tails
+    expect(clientsOf(s.step2(b.doc))).toEqual(new Set([A_ID, B_ID]));
+    const before = Y.encodeStateAsUpdate(s.live);
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      // a reconnect: new connections, each announcing its own id again (an echo of its own bound id), then its Step2
+      const bConn = s.conn('B');
+      const aConn = s.conn('A');
+      expect(s.announce(bConn, { clientID: B_ID, clock: attempt })).toBe('applied');
+      expect(s.announce(aConn, { clientID: A_ID, clock: attempt })).toBe('applied');
+      expect(s.send(aConn, s.step2(a.doc), SYNC.Step2)).toBe(UNRESOLVED_REASON);
+      expect(s.send(bConn, s.step2(b.doc), SYNC.Step2)).toBe(UNRESOLVED_REASON);
+    }
+    // the client's second `unresolved` before sync-acked is final (collab-access.ts): both editors are refused
+    expect(Buffer.from(Y.encodeStateAsUpdate(s.live)).equals(Buffer.from(before))).toBe(true);
+    const stages = s.logs.filter((l) => l.startsWith('COLLAB_UPDATE_REFUSED')).map((l) => JSON.parse(l.slice(l.indexOf('{'))));
+    expect(stages).toHaveLength(4);
+    for (const line of stages) expect(line).toMatchObject({ rule: 'foreign-client', stage: 'unproven-owner' });
+  });
+
+  it('timing: A\'s one retry lands before B\'s Step2 (B\'s round trip over twice A\'s): A is unresolved again, which is final', () => {
+    // The one-sided recovery assumes the author's Step2 reaches the server before the relayer has reconnected (its
+    // close, a new Auth and Step1, then its Step2: about two of its round trips after the refusal).
+    const { stored, a, b } = lostLifetime({ storedPrefix: true });
+    const s = lifetime(stored);
+    const bConn = s.conn('B');
+    expect(s.announce(bConn, { clientID: B_ID })).toBe('applied');
+    expect(s.announce(s.conn('A'), { clientID: A_ID })).toBe('applied');
+    expect(s.send(s.conn('A'), s.step2(a.doc), SYNC.Step2)).toBe(UNRESOLVED_REASON);
+    const aRetry = s.conn('A');
+    expect(s.announce(aRetry, { clientID: A_ID, clock: 2 })).toBe('applied');
+    expect(s.send(aRetry, s.step2(a.doc), SYNC.Step2)).toBe(UNRESOLVED_REASON); // the client stops here
+    expect(s.send(bConn, s.step2(b.doc), SYNC.Step2)).toBe('applied'); // B's own edits are not lost
+    expect(renderLikeABrowser(s.live).text).toBe('B-after B-lost B-stored base');
+  });
+});
+
+describe('an owner is proven only by a frame that is ACCEPTED', () => {
+  it.each([
+    [
+      'a missing dependency (answered unresolved)',
+      (s: ReturnType<typeof lifetime>, b: RemoteClient) => {
+        const other = new RemoteClient(s.live, 5555);
+        typeAt0(other, s.live, 'x');
+        const sv = Y.encodeStateVector(other.doc);
+        typeAt0(other, s.live, 'y');
+        return Y.mergeUpdates([s.step2(b.doc), Y.encodeStateAsUpdate(other.doc, sv)]); // 5555's clock 1 without clock 0
+      },
+      UNRESOLVED_REASON,
+    ],
+    [
+      'a content violation at the owner\'s own id that only the shadow sees (refused)',
+      (s: ReturnType<typeof lifetime>, b: RemoteClient) => {
+        // a listItem whose first child is a list: every struct is valid alone (the stateless pre-pass passes it), the
+        // element is not, so the refusal comes after the owner's structs were inspected
+        b.doc.transact(() => {
+          const el = (name: string, ...children: Array<Y.XmlElement | Y.XmlText>) => {
+            const e = new Y.XmlElement(name);
+            e.insert(0, children);
+            return e;
+          };
+          b.fragment.insert(b.fragment.length, [el('bulletList', el('listItem', el('bulletList', el('listItem', el('paragraph', new Y.XmlText('x'))))))]);
+        });
+        return s.step2(b.doc);
+      },
+      REFUSED('schema'),
+    ],
+  ])('B\'s frame with new clocks at its awareness-only id is refused for %s: A\'s relay is still unresolved', (_name, frameOf, answer) => {
+    const { stored, a, b } = lostLifetime({ storedPrefix: true });
+    const s = lifetime(stored);
+    const bConn = s.conn('B');
+    expect(s.announce(bConn, { clientID: B_ID })).toBe('applied');
+    const bad = frameOf(s, b);
+    expect(clientsOf(bad).has(B_ID)).toBe(true); // precondition: B writes new clocks at its own id
+    expect(s.send(bConn, bad, SYNC.Step2)).toBe(answer);
+    const aConn = s.conn('A');
+    expect(s.announce(aConn, { clientID: A_ID })).toBe('applied');
+    expect(s.send(aConn, s.step2(a.doc), SYNC.Step2)).toBe(UNRESOLVED_REASON); // B is still unproven: not foreign-client
+  });
+});
+
+describe('the per-connection announcement evidence is bounded', () => {
+  it('an id announced past the per-connection cap is not the connection\'s own: its struct at a never-seen id stays unbound', () => {
+    let t = 1_000_000;
+    const s = lifetime(Y.encodeStateAsUpdate(prosemirrorJSONToYDoc(serverSchema(), SEED, 'default')), { now: () => t });
+    const hog = s.conn('hog');
+    expect(s.announce(hog, ...Array.from({ length: 32 }, (_, i) => ({ clientID: 10_000 + i })))).toBe('applied');
+    t += 32 * AWARENESS_NEW_IDS_REFILL_MS;
+    // control: an id inside the cap is the connection's (here bound by its awareness), and a forgery there is refused
+    expect(s.send(hog, typeAt0(new RemoteClient(s.live, 10_031), s.live, 'own '))).toBe('applied'); // (builds the shadow)
+    expect(s.send(s.conn('M'), typeAt0(new RemoteClient(s.live, 10_031), s.live, 'FORGED '))).toBe(REFUSED('foreign-client'));
+    const bound = s.guard.bindingCount(s.live);
+    expect(s.announce(hog, { clientID: 77_777 })).toBe('applied'); // the 33rd: neither recorded nor bound by awareness
+    expect(s.send(hog, typeAt0(new RemoteClient(s.live, 77_777), s.live, 'hog '))).toBe('applied');
+    expect(s.guard.bindingCount(s.live)).toBe(bound); // never bound: the evidence set stopped at its cap
+    expect(s.send(s.conn('M'), typeAt0(new RemoteClient(s.live, 77_777), s.live, 'X '))).toBe('applied');
+  });
+});
+
+describe('pinned residual (ADR 0036 §4): a regenerated client id is no longer bound by its first struct', () => {
+  it('a connection that announced its old id writes at a never-seen regenerated id: applied, unbound, and forgeable', () => {
+    // Yjs gives a doc a new clientID when a remote transaction touches its current one; y-protocols' Awareness keeps
+    // announcing the id it was built with. So the connection's evidence names only the old id, and the new id joins the
+    // stored-id class (#793). Honest regeneration needs a remote write at the doc's current id, which the guard refuses
+    // (or answers unresolved) for every bound id, so on an honest page it follows only an id collision. A connection
+    // whose awareness is null, or absent, keeps the old rule and binds it (update-guard.spec.ts B4).
+    const s = lifetime(Y.encodeStateAsUpdate(prosemirrorJSONToYDoc(serverSchema(), SEED, 'default')));
+    const victim = s.conn('V');
+    expect(s.announce(victim, { clientID: B_ID })).toBe('applied');
+    expect(s.send(victim, typeAt0(new RemoteClient(s.live, B_ID), s.live, 'old '))).toBe('applied'); // (builds the shadow)
+    const regenerated = new RemoteClient(s.live, 4004);
+    const bound = s.guard.bindingCount(s.live);
+    expect(s.send(victim, typeAt0(regenerated, s.live, 'mine '))).toBe('applied');
+    expect(s.guard.bindingCount(s.live)).toBe(bound);
+    expect(s.send(s.conn('M'), typeAt0(new RemoteClient(s.live, 4004), s.live, 'FORGED '))).toBe('applied');
+    expect(s.send(victim, typeAt0(regenerated, s.live, 'next '))).toBe('applied'); // its clocks are already taken
+    expect(renderLikeABrowser(s.live).text).toBe('FORGED mine old base'); // the victim's next edit was silently dropped
   });
 });
 

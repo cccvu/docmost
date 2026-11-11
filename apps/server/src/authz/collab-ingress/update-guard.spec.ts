@@ -519,7 +519,8 @@ describe('#781 B4: a client id is bound to its user (forged clocks)', () => {
     expectRefused(s, s.conn('attacker'), forge(s, 1001, 'FORGED '), REFUSED('foreign-client'));
   });
 
-  it('bound by the first new struct (a pagehide-nulled awareness, or a regenerated client id)', () => {
+  // A regenerated client id is NOT bound this way once its connection announced its old id: relay-binding.spec.ts pins it.
+  it('bound by the first new struct when the connection announced nothing (a pagehide-nulled awareness)', () => {
     const { s, victim, vc } = victimSetup();
     expect(s.deliver(vc, awarenessFrame([{ clientID: 1001, state: null }]))).toBe('applied'); // null never binds
     expect(s.send(vc, victim.edit(s.live, () => textOf(find(victim.doc, 'paragraph')).insert(0, 'first ')))).toBe('applied');

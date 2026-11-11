@@ -82,7 +82,10 @@ export const COLLAB_REFUSAL_CODE = 4422;
 export const REFUSED_REASON_PREFIX = 'ccc:collab-update-refused:';
 export const UNRESOLVED_REASON = 'ccc:collab-update-unresolved';
 export const SOCKET_REFUSAL_BUDGET = 3;
-/** An honest connection announces one client id (two after Yjs regenerates one); this only bounds memory. */
+/**
+ * An honest connection announces one client id (y-protocols' Awareness keeps the id it was built with, even after Yjs
+ * regenerates the doc's); this only bounds memory.
+ */
 const AWARENESS_BINDS_PER_CONNECTION = 32;
 /** The ids one connection's own awareness announced that are remembered as its ownership evidence (memory bound only). */
 const ANNOUNCED_PER_CONNECTION = AWARENESS_BINDS_PER_CONNECTION;
@@ -608,7 +611,9 @@ export class CollabUpdateGuard {
           } else if (owner !== userId) {
             // The owner has only announced the id so far: its own Step2 may still be on the way while a peer relays its
             // lost structs (the mirror race after a lost lifetime). Never applied either way; `unresolved` makes the
-            // sender reconnect once, and by then the owner's Step2 has made these clocks known.
+            // sender reconnect once. That recovers a ONE-SIDED relay, and only when the owner's Step2 lands before the
+            // retry (an owner round trip under about twice the relayer's). Residual (ADR 0036 §4): when co-editors' frames
+            // each carry another's unproven id, none lands and none proves, so each is unresolved twice, which is final.
             if (doc.awarenessOnly.has(client)) return result({ rule: 'foreign-client' }, { stage: 'unproven-owner' });
             return result({ rule: 'foreign-client' });
           } else if (doc.awarenessOnly.has(client)) {
@@ -863,8 +868,11 @@ export class CollabUpdateGuard {
 /**
  * May a struct at a never-seen id bind it to this connection's user? Yes when its own awareness announced that id, or
  * announced none (the rule before this evidence: a sender that sends no awareness still gets it, ADR 0036 §4). An honest
- * 4.7.1 provider sends its own awareness right after Auth and Step1, before its Step2 or any queued Update, so a sender
- * that announced ids and writes another never-seen one is relaying a peer's structs.
+ * 4.7.1 provider sends its own awareness right after Auth and Step1, before its Step2 or any queued Update (with Docmost's
+ * static token; pinned by the client's collab-provider-order.test.ts), so a sender that announced ids and writes another
+ * never-seen one is relaying a peer's structs. Residual: a doc whose id Yjs regenerated (a remote write at its current
+ * id) keeps announcing the old one, so its new id stays unbound (relay-binding.spec.ts); the guard refuses that remote
+ * write at every bound id, so on an honest page it follows only an id collision.
  */
 const ownedBy =
   (announced: Set<number> | undefined) =>
