@@ -59,18 +59,15 @@ import {
 } from "@/features/editor/components/common/editor-paste-handler.tsx";
 import ExcalidrawMenu from "./components/excalidraw/excalidraw-menu-lazy";
 import {
-  CollabAccessEvent,
   CollabAccessState,
   collabAllowsEditing,
-  currentCollabToken,
   initialCollabAccess,
-  isCollabTokenExpired,
-  nextCollabAccess,
 } from "@/features/editor-ux/collab-access";
 import {
-  refetchCollabTokenAndReopen,
-  reopenCollabSocket,
-} from "@/features/editor-ux/collab-reconnect";
+  CollabAccessController,
+  createCollabAccessController,
+} from "@/features/editor-ux/collab-access-controller";
+import { reopensOnVisible } from "@/features/editor-ux/collab-reconnect";
 import { CollabRefusalNotice } from "@/features/editor-ux/collab-refusal-notice";
 import { clearLocalCollabCopy } from "@/features/editor-ux/collab-local-copy";
 import DrawioMenu from "./components/drawio/drawio-menu";
@@ -147,13 +144,12 @@ export default function PageEditor({
     socket: HocuspocusProviderWebsocket;
   } | null>(null);
   const [providersReady, setProvidersReady] = useState(false);
-  // CCC (#501): the server can narrow this connection mid-session (see features/editor-ux/collab-access).
+  // CCC (#501, #810): the server can narrow this connection mid-session (features/editor-ux/collab-access-controller).
   const [collabAccess, setCollabAccess] =
     useState<CollabAccessState>(initialCollabAccess);
-  const collabAccessRef = useRef<CollabAccessState>(initialCollabAccess);
+  const collabAccessRef = useRef<CollabAccessController | null>(null);
 
   useEffect(() => {
-    let lostRetry: ReturnType<typeof setTimeout> | undefined; // CCC (#790): a lost editor's next try
     if (!providersRef.current) {
       const documentName = `page.${pageId}`;
       const ydoc = new Y.Doc();
@@ -188,79 +184,29 @@ export default function PageEditor({
           // ignore unrelated stateless messages
         }
       };
-      // False once this editor unmounted or moved to another page: a late callback then changes nothing. CCC (#790):
-      // false once refused too, so a token refetch already in flight never reopens the closed socket.
-      const isCurrent = () =>
-        providersRef.current?.socket === socket &&
-        !collabAccessRef.current.refused;
-      const onCollabAccess = (event: CollabAccessEvent) => {
-        const step = nextCollabAccess(collabAccessRef.current, event);
-        collabAccessRef.current = step.state;
-        setCollabAccess(step.state);
-        if (step.markDisconnected) {
-          setYjsConnectionStatus(WebSocketStatus.Disconnected);
-        }
-        // CCC (#501, #537): reopen on the socket's own `disconnect`, never on a timer (collab-reconnect.ts).
-        if (step.reconnect) reopenCollabSocket(socket, isCurrent);
-        if (step.detach) remote.detach(); // CCC (#781): a refused provider stops sending (see attach() below)
-        if (step.disconnectSocket) socket.disconnect(); // CCC (#790): a refused or lost editor's socket closes
-        if (step.retryAfterMs) {
-          // CCC (#790): a lost editor tries again later, not at the provider's pace (collab-access.ts)
-          clearTimeout(lostRetry);
-          lostRetry = setTimeout(() => {
-            if (isCurrent() && collabAccessRef.current.lost) socket.connect();
-          }, step.retryAfterMs);
-        }
-        if (step.refreshToken) {
-          void refetchCollabTokenAndReopen({
-            refetch: refetchCollabToken,
-            setToken: (token) => {
-              remote.configuration.token = token;
-            },
-            reopen: () => reopenCollabSocket(socket, isCurrent),
-            onFailed: () => onCollabAccess({ kind: "refresh-failed" }),
-            isCurrent,
-          });
-        }
-      };
-      const onAuthenticationFailedHandler = () => {
-        // CCC (#501): judge the token the provider actually sent — a refresh updates remote.configuration.token,
-        // and the mount-time collabQuery token would read every later refusal as an expiry (a refetch loop).
-        const isTokenExpired = isCollabTokenExpired(
-          currentCollabToken(remote.configuration.token, collabQuery?.token),
-          Date.now(),
-        );
-        // CCC (#537): an expiry, or the first other refusal, refetches the token once; a failed refetch is final.
-        onCollabAccess({ kind: "auth-failed", tokenExpired: isTokenExpired });
-      };
+      // CCC (#501, #537, #781, #790, #810): the controller carries out every collab-access rule for this provider.
+      const access = createCollabAccessController({
+        socket,
+        initialToken: collabQuery?.token,
+        refetchToken: refetchCollabToken,
+        onState: setCollabAccess,
+        markDisconnected: () =>
+          setYjsConnectionStatus(WebSocketStatus.Disconnected),
+      });
       const remote = new HocuspocusProvider({
         websocketProvider: socket,
         name: documentName,
         document: ydoc,
         token: collabQuery?.token,
-        onAuthenticationFailed: onAuthenticationFailedHandler,
-        onAuthenticated: ({ scope }) =>
-          onCollabAccess({ kind: "authenticated", scope }),
-        // A server CLOSE for this document arrives while the socket stays open; a raw socket close has
-        // already set the status to disconnected (and the provider reconnects on its own).
-        onClose: ({ event }) =>
-          onCollabAccess({
-            kind: "server-close",
-            socketConnected: socket.status === WebSocketStatus.Connected,
-            reason: event?.reason, // CCC (#781): a document CLOSE always says code 1000; the reason is the signal
-            code: event?.code, // CCC (#790): a raw socket close carries its own code (1009: a frame over maxPayload)
-          }),
-        onUnsyncedChanges: ({ number }) => {
-          if (number === 0) onCollabAccess({ kind: "sync-acked" }); // CCC (#781)
-        },
         onStatus: onStatusHandler,
         onSynced: onSyncedHandler,
         onStateless: onStatelessHandler,
       });
+      access.bind(remote);
 
       local.on("synced", onLocalSyncedHandler);
-      collabAccessRef.current = initialCollabAccess;
-      setCollabAccess(initialCollabAccess);
+      collabAccessRef.current = access;
+      setCollabAccess(access.state);
       providersRef.current = { socket, local, remote };
       setProvidersReady(true);
     } else {
@@ -268,7 +214,8 @@ export default function PageEditor({
     }
     // Only destroy on final unmount
     return () => {
-      clearTimeout(lostRetry); // CCC (#790)
+      collabAccessRef.current?.destroy(); // CCC (#810): stops its retry timer; late results change nothing
+      collabAccessRef.current = null;
       providersRef.current?.socket.destroy();
       providersRef.current?.remote.destroy();
       providersRef.current?.local.destroy();
@@ -279,7 +226,7 @@ export default function PageEditor({
   // Only connect/disconnect on tab/idle, not destroy
   useEffect(() => {
     if (!providersReady || !providersRef.current) return;
-    if (collabAccessRef.current.refused) return; // CCC (#790): a refused editor's socket stays closed
+    if (collabAccessRef.current?.state.refused) return; // CCC (#790): a refused editor's socket stays closed
     const socket = providersRef.current.socket;
 
     if (
@@ -290,17 +237,15 @@ export default function PageEditor({
       socket.disconnect();
       return;
     }
-    if (
-      documentState === "visible" &&
-      yjsConnectionStatus === WebSocketStatus.Disconnected
-    ) {
+    // CCC (#810): reopen only a socket nothing is retrying, never restarting the provider's backoff at zero
+    if (reopensOnVisible(documentState, yjsConnectionStatus, socket)) {
       resetIdle();
       socket.connect();
     }
   }, [isIdle, documentState, providersReady, resetIdle]);
 
   // Attach here, to make sure the connection gets properly established
-  if (!collabAccessRef.current.refused) providersRef.current?.remote.attach(); // CCC (#781): never re-attach
+  if (!collabAccessRef.current?.state.refused) providersRef.current?.remote.attach(); // CCC (#781): never re-attach
 
   const extensions = useMemo(() => {
     if (!providersReady || !providersRef.current || !currentUser?.user) {
@@ -496,6 +441,7 @@ export default function PageEditor({
     <TransclusionLookupProvider>
       {collabAccess.refused && (
         <CollabRefusalNotice
+          tooBig={collabAccess.refusedTooBig} // CCC (#810): after a 1009 only Discard helps
           clearLocalCopy={() =>
             clearLocalCollabCopy(providersRef.current?.local)
           }
