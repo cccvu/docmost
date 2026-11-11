@@ -24,6 +24,7 @@ const PARTS = [
   'CollabAuthRate',
   'CollabUserConnectionsExtension',
   'BoundedCollabSocket',
+  'CollabClientTrust', // #810: one trust fetch per process, shared with the public-surface throttler
 ];
 const WIRING_CALLS = ['keepCollabSocketAlive', 'admitCollabFrame'];
 
@@ -202,11 +203,14 @@ describe('#810 fitness: one CollabSocketBounds per process', () => {
     const adapter = code(read('collaboration/adapter/collab-ws.adapter.ts'));
     expect(adapter).toMatch(/constructor\(private readonly collabSocketBounds: CollabSocketBounds\)/);
     expect(adapter).toMatch(/verifyClient: collabSocketBounds\.verifyUpgrade/);
-    expect(adapter).toMatch(/this\.collabSocketBounds\.holdUpgraded\(ws, socket\);/);
+    expect(adapter).toMatch(/this\.collabSocketBounds\.holdUpgraded\(ws, socket, request\);/); // #810: the request verifyClient keyed
 
     const module = code(read('collaboration/collaboration.module.ts'));
     expect(module).toMatch(/^\s*collabSocketBoundsProvider,\s*$/m);
     expect(module).toMatch(/private readonly collabSocketBounds: CollabSocketBounds/);
     expect(module).toMatch(/new CollabWsAdapter\(this\.collabSocketBounds\)/);
+    // #810: the bounds' own client trust is what the module exports (never a second CollabClientTrust)
+    expect(module).toMatch(/^\s*collabClientTrustProvider,\s*$/m);
+    expect(module).toMatch(/exports: \[CollaborationGateway, collabClientTrustProvider\]/);
   });
 });

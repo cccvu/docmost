@@ -8,7 +8,10 @@
  *   gateway's `connected` / `onDisconnect` extension (seam §3);
  * - the socket documents (socket-documents.ts): written by that same extension, read by the keepalive's empty-socket
  *   reaper (socket-keepalive.ts) the gateway starts for every socket;
- * - the per-session and per-user auth rates (auth-rate.ts), charged in `onAuthenticate`.
+ * - the per-session and per-user auth rates (auth-rate.ts), charged in `onAuthenticate`;
+ * - the client trust (client-trust.ts): the platform's trusted-proxy list, which keys the pre-auth slots per client
+ *   address at the upgrade (client-address.ts) and the public-surface throttler (seam #4's APP_GUARD). It starts
+ *   fetching in `onModuleInit` (Nest calls it on this factory-built instance) and stops in `onModuleDestroy`.
  * A part split across two instances fails silently (a slot never released, ending in 503s; a cap the early check never
  * sees; a reaper reading an empty registry), so the parts live only here and nothing else builds one
  * (socket-bounds.fitness.spec.ts).
@@ -23,7 +26,7 @@
  * bounds (an invalid token, a 4xx access refusal: auth-refusal.ts) log through this object's sink too.
  */
 import type { IncomingMessage } from 'http';
-import type { FactoryProvider } from '@nestjs/common';
+import type { FactoryProvider, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import type { WebSocketLike } from '@hocuspocus/server';
 import { chargeCollabAuth, chargeCollabSessionAuth, CollabAuthRate } from './auth-rate';
 import {
@@ -34,12 +37,14 @@ import {
   type CollabAuthRefusal,
 } from './auth-refusal';
 import { BoundedCollabSocket, type RawCollabSocket } from './bounded-socket';
+import { CollabClientTrust, platformEdgeTrustFetch, type EdgeTrustFetch } from './client-trust';
 import { admitCollabFrame, type AddressedSocket } from './frame-admission';
 import { answerCollabUpgrade, CollabPreAuthSlots, type PreAuthSocket, type PreAuthTransport, type VerifyCallback } from './preauth-slots';
 import { CollabSocketDocuments } from './socket-documents';
 import { COLLAB_PING_INTERVAL_MS, keepCollabSocketAlive, type PingableSocket } from './socket-keepalive';
 import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
 import { admitCollabUserConnection, CollabUserConnections, CollabUserConnectionsExtension } from './user-connections';
+import { AUTHZ_MODE, type AuthzMode } from '../mode/authz-mode';
 
 /** The ws client socket `open` wires: what the bounded socket, the frame check and the keepalive read. */
 export type CollabClientSocket = RawCollabSocket &
@@ -59,11 +64,16 @@ export interface CollabSocketBoundsOptions {
   documents?: CollabSocketDocuments;
   authRate?: CollabAuthRate;
   sessionAuthRate?: CollabAuthRate;
+  clientTrust?: CollabClientTrust;
+  /** The platform's edge-trust endpoint (client-trust.ts); absent or null: the trust stays unknown, the share off. */
+  fetchEdgeTrust?: EdgeTrustFetch | null;
   pingIntervalMs?: number;
 }
 
-export class CollabSocketBounds {
+export class CollabSocketBounds implements OnModuleInit, OnModuleDestroy {
   readonly limitLog: SocketLimitLog;
+  /** The platform's trusted-proxy list: keys the pre-auth slots per client address once it is known. */
+  readonly clientTrust: CollabClientTrust;
   readonly preAuth: CollabPreAuthSlots;
   readonly connections: CollabUserConnections;
   readonly documents: CollabSocketDocuments;
@@ -77,7 +87,8 @@ export class CollabSocketBounds {
 
   constructor(opts: CollabSocketBoundsOptions = {}) {
     this.limitLog = opts.limitLog ?? collabSocketLimitLog;
-    this.preAuth = opts.preAuth ?? new CollabPreAuthSlots({ limitLog: this.limitLog });
+    this.clientTrust = opts.clientTrust ?? new CollabClientTrust({ fetchTrust: opts.fetchEdgeTrust ?? null, limitLog: this.limitLog });
+    this.preAuth = opts.preAuth ?? new CollabPreAuthSlots({ limitLog: this.limitLog, clientKey: (req) => this.clientTrust.keyFor(req) });
     this.connections = opts.connections ?? new CollabUserConnections({ limitLog: this.limitLog });
     this.documents = opts.documents ?? new CollabSocketDocuments();
     this.authRate = opts.authRate ?? new CollabAuthRate({ limitLog: this.limitLog });
@@ -91,13 +102,26 @@ export class CollabSocketBounds {
    * two-argument form with a callback (and answers 401 for the one-argument form), and this answers it synchronously,
    * so ws completes the upgrade and calls the adapter's callback (`holdUpgraded`) in the same call.
    */
-  readonly verifyUpgrade = (_info: { req: IncomingMessage }, done: VerifyCallback): void => {
-    answerCollabUpgrade(this.preAuth, done);
+  readonly verifyUpgrade = (info: { req: IncomingMessage }, done: VerifyCallback): void => {
+    answerCollabUpgrade(this.preAuth, info.req, done);
   };
 
-  /** The ws adapter's upgrade callback (seam §226): the new ws socket takes its slot, counting the TCP socket's bytes. */
-  holdUpgraded(ws: PreAuthSocket, transport: PreAuthTransport): void {
-    this.preAuth.hold(ws, transport);
+  /**
+   * The ws adapter's upgrade callback (seam §226): the new ws socket takes its slot, counting the TCP socket's bytes and
+   * against the client address `verifyUpgrade` keyed `request` by.
+   */
+  holdUpgraded(ws: PreAuthSocket, transport: PreAuthTransport, request: IncomingMessage): void {
+    this.preAuth.hold(ws, transport, request);
+  }
+
+  /** Nest, once the module is built: start fetching the platform's trust list (never blocks the boot). */
+  onModuleInit(): void {
+    this.clientTrust.start();
+  }
+
+  /** Nest, at shutdown: stop the trust fetch's timers. */
+  onModuleDestroy(): void {
+    this.clientTrust.stop();
   }
 
   /**
@@ -157,8 +181,24 @@ export class CollabSocketBounds {
   }
 }
 
-/** The one instance per process (the `trashCleanupProvider` pattern): registered in CollaborationModule, seam §227. */
+/**
+ * The one instance per process (the `trashCleanupProvider` pattern): registered in CollaborationModule, seam §227. In
+ * remote mode with PLATFORM_AUTHZ_URL set it fetches the platform's trust list; otherwise (native mode, the standalone
+ * smokes) the trust stays unknown and the share off. AUTHZ_MODE is @Global (AuthzModeModule); optional only so a spec
+ * can build the provider without it, which is native's answer.
+ */
 export const collabSocketBoundsProvider: FactoryProvider<CollabSocketBounds> = {
   provide: CollabSocketBounds,
-  useFactory: (): CollabSocketBounds => new CollabSocketBounds(),
+  inject: [{ token: AUTHZ_MODE, optional: true }],
+  useFactory: (mode?: AuthzMode): CollabSocketBounds => new CollabSocketBounds({ fetchEdgeTrust: platformEdgeTrustFetch(mode) }),
+};
+
+/**
+ * The bounds' client trust for consumers outside the collab module (the public-surface throttler, seam #4's APP_GUARD):
+ * the same instance, never a second fetch loop. Exported by CollaborationModule (seam §227).
+ */
+export const collabClientTrustProvider: FactoryProvider<CollabClientTrust> = {
+  provide: CollabClientTrust,
+  inject: [CollabSocketBounds],
+  useFactory: (bounds: CollabSocketBounds): CollabClientTrust => bounds.clientTrust,
 };

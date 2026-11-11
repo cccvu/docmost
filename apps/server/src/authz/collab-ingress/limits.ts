@@ -64,6 +64,22 @@ export const COLLAB_PREAUTH_TOTAL_BYTES = 128 * 1024 * 1024;
  */
 export const COLLAB_PREAUTH_SOCKETS = 512;
 /**
+ * Unauthenticated collab sockets ONE client address may hold (preauth-slots.ts, #810): past it that address's upgrade is
+ * refused 429 with `Retry-After`, while other addresses still get the rest of the pool. The address is the platform's
+ * trusted-proxy walk (client-address.ts), active once the platform has served its trust list (client-trust.ts); until
+ * then there is no share, as before #810.
+ *
+ * 128 = COLLAB_PREAUTH_SOCKETS / 4, so emptying the pool takes at least four addresses (a spec pins 512 / S >= 4). The
+ * honest need is the collab sockets one NAT has in pre-auth at once, which is about one in steady state (a socket is
+ * pre-auth for one token verify and its reads) and peaks in a deploy's reconnect wave: #312's 3x rule bounds a campus or
+ * VPN egress at 85 (busiest measured peak 11), and 300 tabs behind one NAT are all admitted within about 3 s (128 at
+ * once, the rest on the provider's 1 s-and-up retries). Re-size from `288-front-door.sh limit-conn-report`: the smallest
+ * of 64 or 128 that is at least twice the legitimate per-address peak, never above 128 (past that one address could hold
+ * a quarter of the pool and the share stops protecting it). The share defends against one source; many addresses
+ * remain a residual (ADR 0036).
+ */
+export const COLLAB_PREAUTH_SOCKETS_PER_ADDRESS = 128;
+/**
  * A socket that has not sent a complete Auth frame this long after it opened is terminated (preauth-slots.ts,
  * `preauth_first_auth`). An honest provider sends its Auth at once: HocuspocusProvider.onOpen awaits `sendToken()` on a
  * token page-editor.tsx already holds as a string, and a token refetch finishes before the socket is reopened, so the

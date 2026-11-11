@@ -165,10 +165,10 @@ describe('#790 CollabPreAuthSlots', () => {
   it('answers the upgrade 503 with Retry-After at the cap, synchronously', () => {
     const slots = new CollabPreAuthSlots({ cap: 1, deadlineMs: 60_000, limitLog: quietLog() });
     const done = jest.fn();
-    answerCollabUpgrade(slots, done);
+    answerCollabUpgrade(slots, { headers: {} }, done);
     expect(done).toHaveBeenLastCalledWith(true);
     slots.hold(new Sock());
-    answerCollabUpgrade(slots, done);
+    answerCollabUpgrade(slots, { headers: {} }, done);
     expect(done).toHaveBeenLastCalledWith(false, 503, 'Service Unavailable', { 'Retry-After': '5' });
   });
 

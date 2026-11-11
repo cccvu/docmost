@@ -31,8 +31,17 @@
  *   COLLAB_PREAUTH_CLOSE_GRACE_MS, once; it keeps its slot and its byte count until it has closed, so a socket on its way
  *   out cannot hold memory the bound does not count, and a complete but malformed Auth buys no more than the grace.
  *
+ * - **Per address** (#810): once the platform's trust list is known (client-trust.ts), each upgrade is keyed by its
+ *   client address (client-address.ts) and one key holds at most COLLAB_PREAUTH_SOCKETS_PER_ADDRESS slots; past it the
+ *   upgrade is refused `429` with `Retry-After` (a 4xx, so one address stays out of the ALB 5xx alarm; `503` stays the
+ *   signal that the whole pool is full). An upgrade with two X-Forwarded-For lines, or whose address is not an IP, is
+ *   refused `400`: keying it would hand its sender a second share. While the trust is unknown none of this applies, and
+ *   the upgrade is decided exactly as before #810 (two X-Forwarded-For lines included), so a missing platform answer
+ *   never collapses proxied users into one key. The key is stashed per request at the decision and taken by `hold`,
+ *   so the count cannot drift from the decision; every exit (`release`) gives it back.
+ *
  * ws's check runs synchronously and the adapter's upgrade callback follows in the same call (no `await` between the
- * 503 decision and the slot being taken), so concurrent upgrades cannot all pass one free slot.
+ * 503 decision and the slot being taken), so concurrent upgrades cannot all pass one free slot (nor one address's).
  *
  * One instance per process, owned by `CollabSocketBounds` (socket-bounds.ts), which the adapter takes the slot from and
  * every `BoundedCollabSocket` releases it to: an adapter and a gateway on different instances would leak every slot.
@@ -43,8 +52,10 @@ import {
   COLLAB_PREAUTH_DEADLINE_MS,
   COLLAB_PREAUTH_SOCKET_BYTES,
   COLLAB_PREAUTH_SOCKETS,
+  COLLAB_PREAUTH_SOCKETS_PER_ADDRESS,
   COLLAB_PREAUTH_TOTAL_BYTES,
 } from './limits';
+import type { ClientAddressRequest, ClientKey } from './client-address';
 import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
 
 /** The ws socket surface used here. */
@@ -68,7 +79,12 @@ type Held = {
   bytes: number;
   openedAt: number;
   phase: Phase;
+  /** The client address key it counts against, when the share was active at its upgrade. */
+  key?: string;
 };
+
+/** An upgrade's answer: admitted, the pool full (503), its address at its share (429), or not keyable (400). */
+export type UpgradeDecision = 'ok' | 'pool' | 'address' | 'refused';
 
 /** Every bound defaults to its limits.ts constant; specs override them by name. */
 export interface CollabPreAuthSlotsOptions {
@@ -84,11 +100,19 @@ export interface CollabPreAuthSlotsOptions {
   socketBytes?: number;
   /** Bytes all of them together may deliver: COLLAB_PREAUTH_TOTAL_BYTES. */
   totalBytes?: number;
+  /** Slots one client address may hold: COLLAB_PREAUTH_SOCKETS_PER_ADDRESS. */
+  perAddress?: number;
+  /** An upgrade's client key, or null while the share is off (CollabClientTrust.keyFor). Absent: always off. */
+  clientKey?: (req: ClientAddressRequest) => ClientKey | null;
   limitLog?: SocketLimitLog;
 }
 
 export class CollabPreAuthSlots {
   private readonly held = new Map<object, Held>();
+  /** Slots held per client key; a key at 0 is deleted, so it holds at most `cap` entries. */
+  private readonly perKey = new Map<string, number>();
+  /** Each admitted upgrade's key, from the decision to `hold` (the same synchronous ws call). */
+  private readonly admitted = new WeakMap<object, string>();
   private totalBytes = 0;
   private readonly cap: number;
   private readonly deadlineMs: number;
@@ -96,6 +120,8 @@ export class CollabPreAuthSlots {
   private readonly closeGraceMs: number;
   private readonly socketBytesCap: number;
   private readonly totalBytesCap: number;
+  private readonly perAddressCap: number;
+  private readonly clientKey: (req: ClientAddressRequest) => ClientKey | null;
   private readonly limitLog: SocketLimitLog;
 
   constructor({
@@ -105,6 +131,8 @@ export class CollabPreAuthSlots {
     closeGraceMs = COLLAB_PREAUTH_CLOSE_GRACE_MS,
     socketBytes = COLLAB_PREAUTH_SOCKET_BYTES,
     totalBytes = COLLAB_PREAUTH_TOTAL_BYTES,
+    perAddress = COLLAB_PREAUTH_SOCKETS_PER_ADDRESS,
+    clientKey = () => null,
     limitLog = collabSocketLimitLog,
   }: CollabPreAuthSlotsOptions = {}) {
     this.cap = cap;
@@ -113,7 +141,31 @@ export class CollabPreAuthSlots {
     this.closeGraceMs = closeGraceMs;
     this.socketBytesCap = socketBytes;
     this.totalBytesCap = totalBytes;
+    this.perAddressCap = perAddress;
+    this.clientKey = clientKey;
     this.limitLog = limitLog;
+  }
+
+  /**
+   * At the upgrade (synchronous, from ws's `verifyClient`): the answer for `req`. Takes nothing; an admitted request's
+   * key is stashed for `hold`. While the share is off this is exactly `admit()`.
+   */
+  admitUpgrade(req: ClientAddressRequest): UpgradeDecision {
+    const client = this.clientKey(req);
+    if (client?.status === 'refused') {
+      this.limitLog.log('client_address_refused', { why: client.why });
+      return 'refused';
+    }
+    if (client?.status === 'keyed') {
+      const held = this.perKey.get(client.key) ?? 0;
+      if (held >= this.perAddressCap) {
+        this.limitLog.log('client_address', { held, cap: this.perAddressCap, hop: client.hop, kind: client.kind });
+        return 'address';
+      }
+    }
+    if (!this.admit()) return 'pool';
+    if (client?.status === 'keyed') this.admitted.set(req, client.key);
+    return 'ok';
   }
 
   /** At the upgrade: false (logged) when the process already holds the cap. Takes nothing. */
@@ -127,8 +179,10 @@ export class CollabPreAuthSlots {
    * After the upgrade: hold a slot until the socket authenticates or closes, count what its TCP socket delivers (when
    * one is given), and terminate it past the byte cap, or at the first-Auth deadline unless `authArrived` moves it.
    */
-  hold(socket: PreAuthSocket, transport?: PreAuthTransport): void {
+  hold(socket: PreAuthSocket, transport?: PreAuthTransport, req?: object): void {
     if (this.held.has(socket)) return;
+    const key = req ? this.admitted.get(req) : undefined;
+    if (req) this.admitted.delete(req);
     const onData = (chunk: Buffer) => {
       const entry = this.held.get(socket);
       if (!entry) return;
@@ -153,8 +207,10 @@ export class CollabPreAuthSlots {
       bytes: 0,
       openedAt: Date.now(),
       phase: 'awaiting_auth',
+      key,
     };
     this.held.set(socket, entry);
+    if (key !== undefined) this.perKey.set(key, (this.perKey.get(key) ?? 0) + 1);
     socket.once?.('close', () => this.release(socket));
   }
 
@@ -166,6 +222,20 @@ export class CollabPreAuthSlots {
     entry.detach();
     this.totalBytes -= entry.bytes;
     this.held.delete(socket);
+    if (entry.key !== undefined) {
+      const left = (this.perKey.get(entry.key) ?? 1) - 1;
+      if (left > 0) this.perKey.set(entry.key, left);
+      else this.perKey.delete(entry.key);
+    }
+  }
+
+  /** Slots `key` holds, and how many keys hold any (specs and diagnostics; never logged with the key). */
+  heldBy(key: string): number {
+    return this.perKey.get(key) ?? 0;
+  }
+
+  get addresses(): number {
+    return this.perKey.size;
   }
 
   /** Bytes all unauthenticated sockets hold (specs and diagnostics). */
@@ -253,8 +323,20 @@ export class CollabPreAuthSlots {
 
 export type VerifyCallback = (verified: boolean, code?: number, message?: string, headers?: Record<string, string>) => void;
 
-/** Answer an upgrade from `slots`, synchronously: admitted, or a 503 with `Retry-After`. */
-export function answerCollabUpgrade(slots: CollabPreAuthSlots, done: VerifyCallback): void {
-  if (slots.admit()) done(true);
-  else done(false, 503, 'Service Unavailable', { 'Retry-After': '5' });
+/**
+ * Answer an upgrade from `slots`, synchronously: admitted; the pool full, 503; its address at its share, 429 (a 4xx, so
+ * one address stays out of the ALB 5xx alarm); both with `Retry-After` 5 (no later than the first-Auth deadline frees a
+ * silent socket's slot); or not keyable (two X-Forwarded-For lines, an address that is not an IP), 400.
+ */
+export function answerCollabUpgrade(slots: CollabPreAuthSlots, req: ClientAddressRequest, done: VerifyCallback): void {
+  switch (slots.admitUpgrade(req)) {
+    case 'ok':
+      return done(true);
+    case 'address':
+      return done(false, 429, 'Too Many Requests', { 'Retry-After': '5' });
+    case 'refused':
+      return done(false, 400, 'Bad Request');
+    case 'pool':
+      return done(false, 503, 'Service Unavailable', { 'Retry-After': '5' });
+  }
 }
