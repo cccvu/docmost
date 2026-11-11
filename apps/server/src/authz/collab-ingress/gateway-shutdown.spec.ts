@@ -1,6 +1,6 @@
 // The gateway's Redis clients are FakeRedisClients on one in-memory bus (redis-bus.testkit.ts); RedisSync, Hocuspocus
 // 4.7.1, the gateway and the CCC extensions are real.
-import { FakeRedisBus } from './redis-bus.testkit';
+import { FakeRedisBus, turn } from './redis-bus.testkit';
 
 const mockBus: { current: FakeRedisBus | null } = { current: null };
 jest.mock('ioredis', () => ({
@@ -43,10 +43,13 @@ const deferred = (): Deferred => {
   const promise = new Promise<void>((r) => (resolve = r));
   return { promise, resolve };
 };
-/** Run timers due by `ms` from now, and the promise chains between them. */
+/** Run timers due by `ms` from now, and the promise chains and bus deliveries between them. */
 const advance = async (ms = 0) => {
   await jest.advanceTimersByTimeAsync(ms);
-  for (let i = 0; i < 20; i++) await jest.advanceTimersByTimeAsync(0);
+  for (let i = 0; i < 20; i++) {
+    await turn();
+    await jest.advanceTimersByTimeAsync(0);
+  }
 };
 
 const text = (state: Uint8Array): string => {

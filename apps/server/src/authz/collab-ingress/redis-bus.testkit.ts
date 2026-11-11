@@ -6,8 +6,9 @@
  * `duplicate()`s) shares its pub/sub and its keys. It implements only the commands RedisSync uses
  * (redis-sync.extension.ts): `duplicate`, `subscribe`, `on('messageBuffer' | 'error')`, `publish`, `set` (with
  * `PX`, `NX`, `GET`), `get`, `del` and `disconnect`, with Redis's semantics:
- * - `publish` resolves the number of subscribers it reached, and delivers to each one later (a `setImmediate`, as a
- *   network round trip would; on jest's fake clock, `advanceTimersByTimeAsync` runs it), as `(channel, message)` Buffers;
+ * - `publish` resolves the number of subscribers it reached, and delivers to each one later, as `(channel, message)`
+ *   Buffers: on the REAL `setImmediate` (captured when this module loads, before a spec fakes the clock), as network I/O
+ *   would arrive, so a delivery never waits for the fake clock to move (`turn()` lets every pending one land);
  * - `set k v PX ms NX GET` answers the previous value (null when it set the key), and sets only when the key is absent;
  * - a key's `PX` expiry is read on the bus's clock (`now`, `Date.now` by default, so jest's fake clock moves it);
  * - after `disconnect`, a client receives nothing, and its commands reach no server: they resolve to null and are kept
@@ -17,6 +18,12 @@
 import { EventEmitter } from 'node:events';
 
 type Entry = { value: string; expiresAt: number | null };
+
+/** The real setImmediate, whatever a spec does to the clock after this module loaded. */
+const realSetImmediate: typeof setImmediate = globalThis.setImmediate;
+
+/** One real event-loop turn: every delivery already published, and every promise chain pending, has run. */
+export const turn = (): Promise<void> => new Promise((resolve) => realSetImmediate(resolve));
 
 export class FakeRedisBus {
   private readonly keys = new Map<string, Entry>();
@@ -65,7 +72,7 @@ export class FakeRedisBus {
     this.published.push({ channel, message });
     if (!this.deliver) return 0;
     const to = [...this.clients].filter((c) => c.isSubscribedTo(channel));
-    for (const c of to) setImmediate(() => c.receive(channel, message));
+    for (const c of to) realSetImmediate(() => c.receive(channel, message));
     return to.length;
   }
 }
