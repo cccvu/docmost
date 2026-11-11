@@ -9,10 +9,12 @@ import { Logger } from '@nestjs/common';
 import { AuthenticationExtension } from '../../collaboration/extensions/authentication.extension';
 import { authFrame, FakeSocket, MSG, readServerFrame } from './collab-ingress.testkit';
 import { COLLAB_CONNECTIONS_PER_USER } from './limits';
+import { CollabSocketBounds } from './socket-bounds';
+import { CollabSocketDocuments } from './socket-documents';
 import { SocketLimitLog } from './socket-limit-log';
+import { COLLAB_USER_CONNECTIONS_REASON } from './auth-refusal';
 import {
   admitCollabUserConnection,
-  COLLAB_USER_CONNECTIONS_REASON,
   CollabUserConnections,
   CollabUserConnectionsExtension,
 } from './user-connections';
@@ -27,7 +29,7 @@ const settle = (ms = 5) => new Promise((r) => setTimeout(r, ms));
 describe('#790 CollabUserConnections', () => {
   const make = (cap = 3) => {
     const warn = jest.fn();
-    return { warn, c: new CollabUserConnections(cap, new SocketLimitLog({ warn })) };
+    return { warn, c: new CollabUserConnections({ cap, limitLog: new SocketLimitLog({ warn }) }) };
   };
 
   it('holds up to the cap per user, refuses past it, frees on release; keys are idempotent; users are separate', () => {
@@ -77,8 +79,8 @@ describe('#790 the extension hooks', () => {
   });
 
   it('holds at connected, releases at onDisconnect; closes (and never holds) a connection past the cap, and its socket', async () => {
-    const c = new CollabUserConnections(2, new SocketLimitLog({ warn: () => undefined }));
-    const ext = new CollabUserConnectionsExtension(c);
+    const c = new CollabUserConnections({ cap: 2, limitLog: new SocketLimitLog({ warn: () => undefined }) });
+    const ext = new CollabUserConnectionsExtension(c, new CollabSocketDocuments());
     const closes = [jest.fn(), jest.fn(), jest.fn()];
     const socketCloses = [jest.fn(), jest.fn(), jest.fn()];
     await ext.connected(payload('u1', 's1', closes[0], socketCloses[0]));
@@ -98,8 +100,8 @@ describe('#790 the extension hooks', () => {
   });
 
   it('ignores a payload with no user (a server DirectConnection) and never throws', async () => {
-    const c = new CollabUserConnections(1, new SocketLimitLog({ warn: () => undefined }));
-    const ext = new CollabUserConnectionsExtension(c);
+    const c = new CollabUserConnections({ cap: 1, limitLog: new SocketLimitLog({ warn: () => undefined }) });
+    const ext = new CollabUserConnectionsExtension(c, new CollabSocketDocuments());
     await expect(ext.connected(payload(undefined, 's1'))).resolves.toBeUndefined();
     await expect(ext.onDisconnect({ socketId: 'server', documentName: 'page.p', context: {} })).resolves.toBeUndefined();
     const boom = { socketId: 's', documentName: 'page.p', context: { user: { id: 'u' } }, connection: { close: () => { throw new Error('x'); } } };
@@ -116,6 +118,7 @@ describe('#790 the collab connect refuses a user at the cap before any read', ()
     jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     const user = `cap-${Math.random()}`;
     const userRepo = { findById: jest.fn(async () => undefined) };
+    const bounds = new CollabSocketBounds();
     const ext = new AuthenticationExtension(
       { verifyJwt: async (t: string) => ({ sub: t, workspaceId: 'w1', sessionId: 's1' }) } as any,
       userRepo as any,
@@ -123,8 +126,9 @@ describe('#790 the collab connect refuses a user at the cap before any read', ()
       {} as any,
       {} as any,
       {} as any,
+      bounds,
     );
-    const hooks = new CollabUserConnectionsExtension(); // the process-wide registry the extension's check reads
+    const hooks = bounds.userConnectionsExtension; // the registry the extension's check reads, as the gateway registers it
     for (let i = 0; i < COLLAB_CONNECTIONS_PER_USER; i++) {
       await hooks.connected({ socketId: `s${i}`, documentName: 'page.p', context: { user: { id: user } }, connection: { close: jest.fn() } });
     }
@@ -158,7 +162,7 @@ describe('#790 through a real Hocuspocus 4.7.1: one user, many sockets', () => {
     const hp = new Hocuspocus({
       quiet: true,
       extensions: [
-        new CollabUserConnectionsExtension(connections),
+        new CollabUserConnectionsExtension(connections, new CollabSocketDocuments()),
         {
           async onAuthenticate(d: { token: string }) {
             admitCollabUserConnection(d.token, connections); // as authentication.extension.ts does, before its reads
@@ -181,7 +185,7 @@ describe('#790 through a real Hocuspocus 4.7.1: one user, many sockets', () => {
   const authenticated = (sock: FakeSocket) => sock.sent.some((f) => readServerFrame(f).type === MSG.Auth) && sock.closeReasons().length === 0;
 
   it(`the ${CAP + 1}th socket is refused; another user is not; closing a socket frees its slot`, async () => {
-    const connections = new CollabUserConnections(CAP, new SocketLimitLog({ warn: () => undefined }));
+    const connections = new CollabUserConnections({ cap: CAP, limitLog: new SocketLimitLog({ warn: () => undefined }) });
     const hp = server(connections);
     const socks: FakeSocket[] = [];
     for (let i = 0; i < CAP; i++) {
@@ -207,7 +211,7 @@ describe('#790 through a real Hocuspocus 4.7.1: one user, many sockets', () => {
   });
 
   it('concurrent connects that all pass the early check are cut back to the cap at connected', async () => {
-    const connections = new CollabUserConnections(CAP, new SocketLimitLog({ warn: () => undefined }));
+    const connections = new CollabUserConnections({ cap: CAP, limitLog: new SocketLimitLog({ warn: () => undefined }) });
     const hp = server(connections, 20);
     const socks = Array.from({ length: CAP + 4 }, () => connect(hp, 'u1')); // all authenticate at once
     await settle(80);
@@ -221,7 +225,7 @@ describe('#790 through a real Hocuspocus 4.7.1: one user, many sockets', () => {
   });
 
   it('a revalidator-style close of a document connection frees the slot (onDisconnect, not only socket close)', async () => {
-    const connections = new CollabUserConnections(CAP, new SocketLimitLog({ warn: () => undefined }));
+    const connections = new CollabUserConnections({ cap: CAP, limitLog: new SocketLimitLog({ warn: () => undefined }) });
     const hp = server(connections);
     connect(hp, 'u1');
     await settle();

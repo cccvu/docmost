@@ -7,6 +7,8 @@ jest.mock('../../collaboration/collaboration.util', () => ({
 
 import { UnauthorizedException } from '@nestjs/common';
 import { AuthenticationExtension } from '../../collaboration/extensions/authentication.extension';
+import { COLLAB_INVALID_TOKEN_REASON } from '../collab-ingress/auth-refusal';
+import { CollabSocketBounds } from '../collab-ingress/socket-bounds';
 import { PdpPagePermissionRepo } from '../pdp-page-permission.repo';
 import { PdpSpaceMemberRepo } from '../pdp-space-member.repo';
 import { spyKysely } from '../../service-bridge/kysely-spy.testkit';
@@ -69,6 +71,7 @@ describe('#524 — the collab connect refuses a page the PDP has not placed in a
         unplaced as any,
       ),
       liveSessions,
+      new CollabSocketBounds(),
     );
   const payload = () =>
     ({
@@ -118,6 +121,7 @@ describe('#542 — the collab connect takes the strict PDP space role', () => {
       new PdpSpaceMemberRepo({} as any, {} as any, {} as any, {} as any, authz),
       new PdpPagePermissionRepo(openLineage(), {} as any, {} as any, authz),
       liveSessions,
+      new CollabSocketBounds(),
     );
   };
   const payload = () => ({ documentName: `page.${PAGE}`, token: 't', connectionConfig: { readOnly: false } }) as any;
@@ -179,6 +183,7 @@ describe('#537 — the collab connect refuses a token whose session is not live'
       { getUserSpaceRoles: async () => [{ userId: 'u1', role: 'writer' }] } as any,
       { canUserEditPage: async () => ({ hasAnyRestriction: false, canAccess: true, canEdit: true }) } as any,
       { findActiveById } as any,
+      new CollabSocketBounds(),
     );
     return { ext, findActiveById, pageFindById };
   };
@@ -192,9 +197,9 @@ describe('#537 — the collab connect refuses a token whose session is not live'
     expect(findActiveById).toHaveBeenCalledWith(SID);
   });
 
-  it('refuses a token with no sessionId (a pre-#537 token)', async () => {
+  it('refuses a token with no sessionId (a pre-#537 token), as an invalid token, before any read (#810)', async () => {
     const { ext, findActiveById } = build({ claims: { sessionId: undefined } });
-    await expect(ext.onAuthenticate(payload())).rejects.toBeInstanceOf(UnauthorizedException);
+    await expect(ext.onAuthenticate(payload())).rejects.toEqual({ reason: COLLAB_INVALID_TOKEN_REASON });
     expect(findActiveById).not.toHaveBeenCalled();
   });
 

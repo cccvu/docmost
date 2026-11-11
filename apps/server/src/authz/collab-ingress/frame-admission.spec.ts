@@ -1,12 +1,19 @@
 import * as encoding from 'lib0/encoding';
 import * as decoding from 'lib0/decoding';
-import { admitCollabFrame, isCollabFrameAddress } from './frame-address';
+import { admitCollabFrame, isCollabFrameAddress } from './frame-admission';
+import { MessageType } from '@hocuspocus/server';
+import { AuthMessageType, WsReadyStates } from '@hocuspocus/common';
+import { MSG } from './collab-ingress.testkit';
 import {
   COLLAB_AUTH_FRAMES_PER_SOCKET,
   COLLAB_AWARENESS_BURST,
+  COLLAB_AWARENESS_BURST_BYTES,
+  COLLAB_AWARENESS_MIN_CHARGE_BYTES,
+  COLLAB_AWARENESS_REFILL_BYTES_PER_SECOND,
   COLLAB_AWARENESS_REFILL_PER_SECOND,
   COLLAB_DOCUMENTS_PER_SOCKET,
   COLLAB_HOCUSPOCUS_OPTIONS,
+  COLLAB_SOCKET_LIMIT_LOGS_PER_MINUTE,
 } from './limits';
 import { logCollabSocketError, SocketLimitLog } from './socket-limit-log';
 
@@ -117,13 +124,15 @@ describe('#790 admitCollabFrame (the gateway check)', () => {
 describe('#790 logCollabSocketError (the collab module\'s ws client error listener)', () => {
   afterEach(() => jest.restoreAllMocks());
 
-  it('logs ws\'s error code only, rate-limited: a client sending 1000 oversized frames writes 30 lines', () => {
-    jest.spyOn(Date, 'now').mockImplementation(() => 7_000_000);
+  afterEach(() => jest.useRealTimers());
+
+  it(`logs ws\'s error code only, rate-limited: a client sending 1000 oversized frames writes ${COLLAB_SOCKET_LIMIT_LOGS_PER_MINUTE} lines`, () => {
+    jest.useFakeTimers({ now: 7_000_000 });
     const warn = jest.fn();
     const limitLog = new SocketLimitLog({ warn });
     const err = Object.assign(new RangeError('Max payload size exceeded secret-bytes'), { code: 'WS_ERR_UNSUPPORTED_MESSAGE_LENGTH' });
     for (let i = 0; i < 1000; i++) logCollabSocketError(err, limitLog);
-    expect(warn).toHaveBeenCalledTimes(30);
+    expect(warn).toHaveBeenCalledTimes(COLLAB_SOCKET_LIMIT_LOGS_PER_MINUTE);
     expect(warn.mock.calls[0][0]).toBe('COLLAB_SOCKET_LIMIT {"limit":"ws_error","code":"WS_ERR_UNSUPPORTED_MESSAGE_LENGTH"}');
     expect(warn.mock.calls.join('')).not.toContain('secret');
   });
@@ -141,17 +150,17 @@ describe('#790 logCollabSocketError (the collab module\'s ws client error listen
 describe('#790 SocketLimitLog', () => {
   afterEach(() => jest.restoreAllMocks());
 
-  it('logs at most 30 lines a minute, then one line with the suppressed count', () => {
+  it(`logs at most ${COLLAB_SOCKET_LIMIT_LOGS_PER_MINUTE} lines of a limit a minute, then one line with that limit's suppressed count`, () => {
     let now = 1_000_000;
-    jest.spyOn(Date, 'now').mockImplementation(() => now);
     const warn = jest.fn();
-    const limitLog = new SocketLimitLog({ warn });
-    for (let i = 0; i < 45; i++) limitLog.log('auth_rate', { userId: 'u1' });
-    expect(warn).toHaveBeenCalledTimes(30);
+    const limitLog = new SocketLimitLog({ warn }, () => now);
+    const quota = COLLAB_SOCKET_LIMIT_LOGS_PER_MINUTE;
+    for (let i = 0; i < quota + 15; i++) limitLog.log('auth_rate', { userId: 'u1' });
+    expect(warn).toHaveBeenCalledTimes(quota);
     now += 60_000;
     limitLog.log('auth_rate', { userId: 'u1' });
-    expect(warn.mock.calls.slice(30).map((c) => c[0])).toEqual([
-      'COLLAB_SOCKET_LIMIT {"limit":"log_suppressed","count":15}',
+    expect(warn.mock.calls.slice(quota).map((c) => c[0])).toEqual([
+      'COLLAB_SOCKET_LIMIT {"limit":"log_suppressed","of":"auth_rate","count":15}',
       'COLLAB_SOCKET_LIMIT {"limit":"auth_rate","userId":"u1"}',
     ]);
   });
@@ -314,5 +323,146 @@ describe('#790 admitCollabFrame: the awareness rate (over-rate awareness is drop
     expect(ws.terminate).not.toHaveBeenCalled(); // and the session never ends
     advance(1000);
     expect(admit(AWARENESS)).toBe(true); // the frame after the drag gets through
+  });
+});
+
+describe('#810 admitCollabFrame: the awareness bucket charges bytes, at least COLLAB_AWARENESS_MIN_CHARGE_BYTES a frame', () => {
+  // Mutation arm (recorded in the #810 notes): charging COLLAB_AWARENESS_MIN_CHARGE_BYTES (one frame) whatever the
+  // frame's length turns the large-frame tests red, while the small-frame tests above stay green.
+  const AWARENESS = 1;
+  const KiB = 1024;
+  /** An Awareness frame of exactly `total` bytes on `name` (the gate reads only the name and the type). */
+  const sized = (total: number, name = pageN(1)): Uint8Array => {
+    const frame = new Uint8Array(total);
+    frame.set(typed(name, AWARENESS).subarray(0, 1 + 41 + 1));
+    return frame;
+  };
+  const clocked = () => {
+    let t = 9_000_000;
+    const ws = { readyState: 1, terminate: jest.fn(() => (ws.readyState = 2)) };
+    const warn = jest.fn();
+    const limitLog = new SocketLimitLog({ warn });
+    const admit = (frame: Uint8Array) => admitCollabFrame(ws, frame, limitLog, () => t);
+    return { ws, warn, admit, advance: (ms: number) => (t += ms) };
+  };
+
+  it('the byte bucket is the frame bucket at the minimum charge: 200 frames (100 KiB), then 40 frames (20 KiB) a second', () => {
+    expect(COLLAB_AWARENESS_MIN_CHARGE_BYTES).toBe(512);
+    expect(COLLAB_AWARENESS_BURST_BYTES).toBe(COLLAB_AWARENESS_BURST * COLLAB_AWARENESS_MIN_CHARGE_BYTES);
+    expect(COLLAB_AWARENESS_BURST_BYTES).toBe(100 * KiB);
+    expect(COLLAB_AWARENESS_REFILL_BYTES_PER_SECOND).toBe(COLLAB_AWARENESS_REFILL_PER_SECOND * COLLAB_AWARENESS_MIN_CHARGE_BYTES);
+    expect(COLLAB_AWARENESS_REFILL_BYTES_PER_SECOND).toBe(20 * KiB);
+  });
+
+  it('a 512 KiB frame (64 ids × 8 KiB states) is never admitted, from a full bucket or after an hour; the socket stays, nothing logged', () => {
+    const { ws, warn, admit, advance } = clocked();
+    let admitted = 0;
+    for (let i = 0; i < 50; i++) {
+      if (admit(sized(512 * KiB))) admitted++;
+      advance(3_600_000);
+    }
+    expect(admitted).toBe(0); // larger than the whole bucket: at most once per burst is never
+    expect(ws.terminate).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+    expect(admit(sized(300))).toBe(true); // the socket's honest awareness still flows
+  });
+
+  it('a burst-sized frame is admitted once per burst: dropped until the whole burst refilled (5 s), and it empties the bucket for small frames too', () => {
+    const { ws, warn, admit, advance } = clocked();
+    const refillMs = (1000 * COLLAB_AWARENESS_BURST_BYTES) / COLLAB_AWARENESS_REFILL_BYTES_PER_SECOND;
+    expect(refillMs).toBe(5_000);
+    expect(admit(sized(COLLAB_AWARENESS_BURST_BYTES))).toBe(true);
+    expect(admit(sized(COLLAB_AWARENESS_BURST_BYTES))).toBe(false);
+    expect(admit(sized(100))).toBe(false); // one bucket: the bytes are spent
+    advance(refillMs - 1);
+    expect(admit(sized(COLLAB_AWARENESS_BURST_BYTES))).toBe(false);
+    advance(1);
+    expect(admit(sized(COLLAB_AWARENESS_BURST_BYTES))).toBe(true);
+    expect(ws.terminate).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  it('a sustained flood of 7 KiB frames is held to the burst plus the byte refill (the bytes every peer is owed)', () => {
+    const { ws, admit, advance } = clocked();
+    const FRAME = 7 * KiB;
+    let bytes = 0;
+    for (let ms = 0; ms < 10_000; ms += 5) {
+      if (admit(sized(FRAME))) bytes += FRAME;
+      advance(5);
+    }
+    expect(bytes).toBeLessThanOrEqual(COLLAB_AWARENESS_BURST_BYTES + 10 * COLLAB_AWARENESS_REFILL_BYTES_PER_SECOND);
+    expect(bytes).toBeGreaterThan(COLLAB_AWARENESS_BURST_BYTES + 10 * COLLAB_AWARENESS_REFILL_BYTES_PER_SECOND - 2 * FRAME);
+    expect(ws.terminate).not.toHaveBeenCalled();
+  });
+
+  it('an honest 300 B state at 40/s for 60 s is never dropped; frames up to the minimum charge all cost the same', () => {
+    const { ws, admit, advance } = clocked();
+    for (let i = 0; i < 40 * 60; i++) {
+      expect(admit(sized(300))).toBe(true);
+      advance(1000 / 40);
+    }
+    expect(ws.terminate).not.toHaveBeenCalled();
+    const b = clocked();
+    let admitted = 0;
+    for (let i = 0; i < COLLAB_AWARENESS_BURST * 2; i++) if (b.admit(sized(COLLAB_AWARENESS_MIN_CHARGE_BYTES))) admitted++;
+    expect(admitted).toBe(COLLAB_AWARENESS_BURST);
+  });
+});
+
+describe('#810 (A5): the wire constants come from Hocuspocus 4.7.1, and are the values the wire uses', () => {
+  it('MessageType, AuthMessageType and WsReadyStates match the literal wire values (testkit MSG is the independent oracle)', () => {
+    expect({
+      Sync: MessageType.Sync,
+      Awareness: MessageType.Awareness,
+      Auth: MessageType.Auth,
+      QueryAwareness: MessageType.QueryAwareness,
+      SyncReply: MessageType.SyncReply,
+      Stateless: MessageType.Stateless,
+      BroadcastStateless: MessageType.BroadcastStateless,
+      Close: MessageType.CLOSE,
+      SyncStatus: MessageType.SyncStatus,
+    }).toEqual(MSG);
+    expect([MessageType.Ping, MessageType.Pong]).toEqual([9, 10]);
+    expect([AuthMessageType.Token, AuthMessageType.PermissionDenied, AuthMessageType.Authenticated]).toEqual([0, 1, 2]);
+    expect(WsReadyStates.Open).toBe(1);
+  });
+
+  it('trap, documented: a bare 4.7.1 provider Pong ([10], no document name) is refused frame_address', () => {
+    // The 4.7.1 server sends no app-level Ping (the keepalive uses ws protocol pings), so no honest provider sends this.
+    // If a future Hocuspocus server starts app-level pings, its providers' Pongs would terminate every socket here.
+    const ws = { readyState: 1, terminate: jest.fn() };
+    expect(admitCollabFrame(ws, new Uint8Array([MessageType.Pong]), new SocketLimitLog({ warn: () => undefined }))).toBe(false);
+    expect(ws.terminate).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('#810 (N1) admitCollabFrame: the first complete Auth frame tells the pre-auth slots', () => {
+  const quiet = () => new SocketLimitLog({ warn: () => undefined });
+  const socket = () => {
+    const ws = { readyState: 1, terminate: jest.fn(() => (ws.readyState = 2)) };
+    return ws;
+  };
+
+  it('only the first Auth frame, once; Sync, Awareness and QueryAwareness never do', () => {
+    const ws = socket();
+    const preAuth = { authArrived: jest.fn() };
+    const page = pageN(1);
+    for (const type of [MessageType.Sync, MessageType.Awareness, MessageType.QueryAwareness]) {
+      expect(admitCollabFrame(ws, typed(page, type), quiet(), Date.now, preAuth)).toBe(true);
+    }
+    expect(preAuth.authArrived).not.toHaveBeenCalled();
+    expect(admitCollabFrame(ws, typed(page, MessageType.Auth), quiet(), Date.now, preAuth)).toBe(true);
+    expect(preAuth.authArrived.mock.calls).toEqual([[ws]]);
+    for (let i = 1; i < COLLAB_AUTH_FRAMES_PER_SOCKET; i++) admitCollabFrame(ws, typed(page, MessageType.Auth), quiet(), Date.now, preAuth);
+    expect(preAuth.authArrived).toHaveBeenCalledTimes(1);
+  });
+
+  it('a refused frame never reports: a junk-named Auth, and an Auth on a socket no longer open', () => {
+    const preAuth = { authArrived: jest.fn() };
+    const junk = socket();
+    expect(admitCollabFrame(junk, typed('collabLock:x', MessageType.Auth), quiet(), Date.now, preAuth)).toBe(false);
+    const closing = { readyState: 2, terminate: jest.fn() };
+    expect(admitCollabFrame(closing, typed(pageN(1), MessageType.Auth), quiet(), Date.now, preAuth)).toBe(false);
+    expect(preAuth.authArrived).not.toHaveBeenCalled();
   });
 });

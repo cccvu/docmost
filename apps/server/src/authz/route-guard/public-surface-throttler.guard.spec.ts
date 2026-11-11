@@ -1,4 +1,4 @@
-import { Controller, ExecutionContext, HttpStatus, Post } from '@nestjs/common';
+import { Controller, ExecutionContext, HttpStatus, Post, type Provider } from '@nestjs/common';
 import { APP_GUARD, Reflector } from '@nestjs/core';
 import {
   FastifyAdapter,
@@ -10,13 +10,16 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { Public, IS_PUBLIC_KEY } from '../../common/decorators/public.decorator';
 import { PLATFORM_PUBLIC_KEY } from './platform-authz.decorator';
+import { CollabClientTrust } from '../collab-ingress/client-trust';
+import { SocketLimitLog } from '../collab-ingress/socket-limit-log';
 
 /**
  * Regression suite for the @Public-surface per-IP throttler (GitHub #29) — NOT upstream Docmost code.
  *
  * Proves the properties that matter: a @Public HTTP route is rate-limited (429 + the stock un-suffixed
- * Retry-After) once the per-IP limit is exceeded; the guard keys on the unspoofable X-Real-IP (a second
- * X-Real-IP gets its own bucket) not on req.ip; a non-@Public route is NEVER throttled; and the guard FAILS
+ * Retry-After) once the per-IP limit is exceeded; until the platform's trusted-proxy list is known the guard keys
+ * on X-Real-IP (a second X-Real-IP gets its own bucket) not on req.ip, and once it is known on the trusted-proxy walk,
+ * which a direct caller cannot forge (#810); a non-@Public route is NEVER throttled; and the guard FAILS
  * OPEN when the throttle storage errors or hangs (a Redis outage must not 500/hang the anonymous surface).
  * A unit block pins the @Public/@PlatformPublic scoping predicate, and a source pin guards the APP_GUARD
  * registration. Same Fastify-adapter harness shape as authz/mode/native-auth-http.spec.ts.
@@ -52,8 +55,12 @@ class ProbeController {
   }
 }
 
+/** A trust that never fetches: `unknown`, so the guard keys as before #810 (X-Real-IP). */
+const unknownTrust = () => new CollabClientTrust({ fetchTrust: null, limitLog: new SocketLimitLog({ warn: () => undefined }) });
+
 async function boot(
   storageOverride?: Partial<ThrottlerStorage>,
+  extraProviders: Provider[] = [],
 ): Promise<NestFastifyApplication> {
   // small, deterministic limit — read by the guard's constructor during module init below
   process.env.PUBLIC_RATE_LIMIT_MAX = '2';
@@ -70,6 +77,8 @@ async function boot(
     providers: [
       Reflector,
       { provide: APP_GUARD, useClass: PublicSurfaceThrottlerGuard },
+      // the guard requires the collab bounds' trust (#810); unknown unless a block provides its own
+      ...(extraProviders.length ? extraProviders : [{ provide: CollabClientTrust, useValue: unknownTrust() }]),
     ],
   });
   if (storageOverride) {
@@ -128,6 +137,65 @@ describe('PublicSurfaceThrottlerGuard — HTTP boundary (#29)', () => {
         headers: { 'x-real-ip': '203.0.113.99' },
       });
       expect(res.statusCode).toBe(HttpStatus.CREATED);
+    }
+  });
+});
+
+describe('PublicSurfaceThrottlerGuard — keyed on the trusted-proxy walk once the platform serves its list (#810)', () => {
+  const PROXY = '107.22.62.237';
+  const ALB = '172.31.20.10';
+  let app: NestFastifyApplication;
+  let trust: CollabClientTrust;
+  beforeAll(async () => {
+    trust = new CollabClientTrust({
+      fetchTrust: async () => ({ body: { trustedProxies: [PROXY], xffTrusted: true } }),
+      limitLog: new SocketLimitLog({ warn: () => undefined }),
+    });
+    await trust.attempt();
+    trust.stop();
+    app = await boot(undefined, [{ provide: CollabClientTrust, useValue: trust }]);
+  });
+  afterAll(async () => {
+    await app?.close();
+  });
+
+  /** A request as the ALB delivers it: the ALB is the peer, and it appended the address it saw to `sentXff`. */
+  const viaAlb = (xff: string, headers: Record<string, string> = {}) =>
+    app.inject({ method: 'POST', url: '/probe/open', payload: {}, remoteAddress: ALB, headers: { ...headers, 'x-forwarded-for': xff } });
+
+  it('a direct caller rotating a forged X-Real-IP (and XFF prefix) stays in its own bucket', async () => {
+    expect((await viaAlb('203.0.113.50', { 'x-real-ip': '6.6.6.1' })).statusCode).toBe(HttpStatus.CREATED);
+    expect((await viaAlb('9.9.9.9, 203.0.113.50', { 'x-real-ip': '6.6.6.2' })).statusCode).toBe(HttpStatus.CREATED);
+    expect((await viaAlb(`${PROXY}, 203.0.113.50`, { 'x-real-ip': '6.6.6.3' })).statusCode).toBe(HttpStatus.TOO_MANY_REQUESTS);
+  });
+
+  it("a direct caller naming a proxied victim in X-Real-IP never spends the victim's bucket", async () => {
+    const victim = '198.51.100.60';
+    for (let i = 0; i < 3; i++) await viaAlb('203.0.113.51', { 'x-real-ip': victim });
+    // the victim, through the front door (nginx overwrites X-Real-IP with the truth)
+    expect((await viaAlb(`${victim}, ${PROXY}`, { 'x-real-ip': victim })).statusCode).toBe(HttpStatus.CREATED);
+    expect((await viaAlb(`${victim}, ${PROXY}`, { 'x-real-ip': victim })).statusCode).toBe(HttpStatus.CREATED);
+  });
+
+  it('control: the share of one proxied client is per client, not per proxy', async () => {
+    expect((await viaAlb(`198.51.100.61, ${PROXY}`)).statusCode).toBe(HttpStatus.CREATED);
+    expect((await viaAlb(`198.51.100.61, ${PROXY}`)).statusCode).toBe(HttpStatus.CREATED);
+    expect((await viaAlb(`198.51.100.61, ${PROXY}`)).statusCode).toBe(HttpStatus.TOO_MANY_REQUESTS);
+    expect((await viaAlb(`198.51.100.62, ${PROXY}`)).statusCode).toBe(HttpStatus.CREATED);
+  });
+
+  it('while the trust is unknown it keys as before (X-Real-IP): no guessed key', async () => {
+    const unknown = new CollabClientTrust({ fetchTrust: null, limitLog: new SocketLimitLog({ warn: () => undefined }) });
+    const other = await boot(undefined, [{ provide: CollabClientTrust, useValue: unknown }]);
+    try {
+      const at = (realIp: string) =>
+        other.inject({ method: 'POST', url: '/probe/open', payload: {}, remoteAddress: ALB, headers: { 'x-forwarded-for': '203.0.113.70', 'x-real-ip': realIp } });
+      expect((await at('6.6.6.10')).statusCode).toBe(HttpStatus.CREATED);
+      expect((await at('6.6.6.10')).statusCode).toBe(HttpStatus.CREATED);
+      expect((await at('6.6.6.10')).statusCode).toBe(HttpStatus.TOO_MANY_REQUESTS);
+      expect((await at('6.6.6.11')).statusCode).toBe(HttpStatus.CREATED); // today's key: X-Real-IP
+    } finally {
+      await other.close();
     }
   });
 });

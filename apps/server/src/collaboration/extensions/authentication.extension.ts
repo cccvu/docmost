@@ -17,8 +17,7 @@ import { getPageId } from '../collaboration.util';
 import { JwtCollabPayload, JwtType } from '../../core/auth/dto/jwt-payload';
 import { UserSessionRepo } from '@docmost/db/repos/session/user-session.repo';
 import { isWsConnectionLive } from '../../authz/ws-connection/ws-connection-live';
-import { chargeCollabAuth, invalidCollabTokenRefusal } from '../../authz/collab-ingress/auth-rate';
-import { admitCollabUserConnection } from '../../authz/collab-ingress/user-connections';
+import { CollabSocketBounds } from '../../authz/collab-ingress/socket-bounds';
 
 @Injectable()
 export class AuthenticationExtension implements Extension {
@@ -31,6 +30,7 @@ export class AuthenticationExtension implements Extension {
     private readonly spaceMemberRepo: SpaceMemberRepo,
     private readonly pagePermissionRepo: PagePermissionRepo,
     private readonly userSessionRepo: UserSessionRepo,
+    private readonly collabSocketBounds: CollabSocketBounds, // CCC (wiki-v2 #810): the process's collab socket bounds
   ) {}
 
   async onAuthenticate(data: onAuthenticatePayload) {
@@ -42,17 +42,19 @@ export class AuthenticationExtension implements Extension {
     try {
       jwtPayload = await this.tokenService.verifyJwt(token, JwtType.COLLAB);
     } catch (error) {
-      // CCC (wiki-v2 #790, UPSTREAM_MODIFICATIONS #213): no `message`, so Hocuspocus logs nothing per bad token.
-      throw invalidCollabTokenRefusal();
+      // CCC (wiki-v2 #790, #810, UPSTREAM_MODIFICATIONS #213): no `message`, so Hocuspocus logs nothing per bad token;
+      // logged rate-limited as `invalid_token` with its kind only.
+      throw this.collabSocketBounds.invalidToken(error);
     }
 
     const userId = jwtPayload.sub;
     const workspaceId = jwtPayload.workspaceId;
 
-    // CCC (wiki-v2 #790, UPSTREAM_MODIFICATIONS #213): a per-user rate on authentication and a per-user connection
-    // cap, before any read.
-    chargeCollabAuth(userId);
-    admitCollabUserConnection(userId);
+    // CCC (wiki-v2 #790, #810, UPSTREAM_MODIFICATIONS #213): before any read, a token naming no session is refused, the
+    // token's session is charged its auth rate (a revoked session's leaked token drains only its own), and the per-user
+    // connection cap is checked.
+    this.collabSocketBounds.chargeSession(userId, jwtPayload.sessionId);
+    this.collabSocketBounds.admitUser(userId);
 
     const user = await this.userRepo.findById(userId, workspaceId);
 
@@ -75,6 +77,9 @@ export class AuthenticationExtension implements Extension {
     ) {
       throw new UnauthorizedException();
     }
+
+    // CCC (wiki-v2 #810, UPSTREAM_MODIFICATIONS #213): the per-user auth rate, charged only once the session is live.
+    this.collabSocketBounds.chargeUser(userId);
 
     const page = await this.pageRepo.findById(pageId);
     if (!page) {

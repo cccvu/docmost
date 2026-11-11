@@ -9,8 +9,11 @@ import {
   ParseIntPipe,
   Post,
   Query,
+  Res,
+  ServiceUnavailableException,
   UseGuards,
 } from '@nestjs/common';
+import type { FastifyReply } from 'fastify';
 import { SkipTransform } from '../common/decorators/skip-transform.decorator';
 import { RemoteOnlyGuard } from '../authz/mode/remote-only.guard';
 import { RequireServiceScope, ServiceAuthGuard } from './service-auth.guard';
@@ -18,6 +21,7 @@ import { ServiceScope } from './service-scope';
 import {
   AuthzChangeFeedService,
   ChangesResult,
+  FeedClosingError,
   StaleCursorError,
 } from './authz-change-feed.service';
 import { AuthzSnapshotService, SnapshotResult } from './authz-snapshot.service';
@@ -35,6 +39,10 @@ import { PageAuthzStateDto } from './dto/page-authz-state.dto';
  * `changes` long-polls (blocks up to `wait` ms for a NOTIFY, then returns immediately); the durable outbox is
  * the source of truth, so a missed wake is only latency. A stale cursor (events GC'd past the consumer) is a
  * 409 with the current head, signalling the platform to rebaseline rather than skip.
+ *
+ * Shutdown (#810): once the feed is closing, a new poll is a 503 and every answer carries `Connection: close`. The
+ * platform re-polls at once on its keep-alive connection, so without this a poll arriving after the destroy kept the
+ * connection busy and the HTTP server's close (and the process) waited for the SIGKILL.
  */
 @Controller('service/authz')
 @UseGuards(RemoteOnlyGuard, ServiceAuthGuard)
@@ -53,6 +61,7 @@ export class AuthzChangeController {
     @Query('after') after: string | undefined,
     @Query('wait', new DefaultValuePipe(0), ParseIntPipe) wait: number,
     @Query('limit', new DefaultValuePipe(500), ParseIntPipe) limit: number,
+    @Res({ passthrough: true }) res: FastifyReply,
   ): Promise<ChangesResult> {
     try {
       return await this.feed.getChanges(after, wait, limit);
@@ -60,7 +69,12 @@ export class AuthzChangeController {
       if (e instanceof StaleCursorError) {
         throw new ConflictException({ stale: true, head: e.head, message: e.message });
       }
+      if (e instanceof FeedClosingError) {
+        throw new ServiceUnavailableException({ code: 'shutting_down', message: e.message });
+      }
       throw e;
+    } finally {
+      if (this.feed.closing) res.header('connection', 'close'); // #810: the caller's next poll opens a new connection
     }
   }
 

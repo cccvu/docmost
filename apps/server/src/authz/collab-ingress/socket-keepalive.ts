@@ -27,8 +27,9 @@
  * Each tick also terminates (logged `COLLAB_SOCKET_LIMIT {"limit":"socket_empty"}`) a socket that has held a document
  * connection and held none for COLLAB_EMPTY_INTERVALS consecutive ticks (socket-documents.ts says why such a socket
  * would otherwise stay open for good, and why an honest editor never keeps one).
+ *
+ * Started for every socket by `CollabSocketBounds.open` (socket-bounds.ts), on both gateway paths.
  */
-import { collabSocketDocuments } from './socket-documents';
 import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
 
 export const COLLAB_PING_INTERVAL_MS = 30_000;
@@ -47,12 +48,22 @@ export interface PingableSocket {
 
 const OPEN = 1;
 
+export interface KeepCollabSocketAliveOptions {
+  /**
+   * True when the socket has held a document connection and holds none now: the reaper's registry (socket-documents.ts),
+   * the same instance the `connected` hook writes (socket-bounds.ts). Required: a default would silently read another.
+   */
+  holdsNoDocument: (ws: PingableSocket) => boolean;
+  /** Each tick, re-sample the socket's queued bytes for the process byte budget (socket-bytes.ts, #810). */
+  sample?: (ws: PingableSocket) => void;
+  intervalMs?: number;
+  limitLog?: SocketLimitLog;
+}
+
 export function keepCollabSocketAlive(
   ws: PingableSocket,
   touch: () => void,
-  intervalMs: number = COLLAB_PING_INTERVAL_MS,
-  limitLog: SocketLimitLog = collabSocketLimitLog,
-  holdsNoDocument: (ws: PingableSocket) => boolean = (s) => collabSocketDocuments.holdsNoDocument(s),
+  { holdsNoDocument, sample, intervalMs = COLLAB_PING_INTERVAL_MS, limitLog = collabSocketLimitLog }: KeepCollabSocketAliveOptions,
 ): void {
   ws.on('pong', () => touch());
   let previous = 0;
@@ -67,6 +78,7 @@ export function keepCollabSocketAlive(
       ws.terminate();
       return;
     }
+    sample?.(ws);
     const buffered = ws.bufferedAmount;
     stalled = buffered > 0 && previous > 0 && buffered >= previous ? stalled + 1 : 0;
     previous = buffered;

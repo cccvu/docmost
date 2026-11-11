@@ -2,8 +2,8 @@ import * as decoding from 'lib0/decoding';
 import { Hocuspocus } from '@hocuspocus/server';
 import { UnauthorizedException } from '@nestjs/common';
 import { authFrame, FakeSocket, MSG } from './collab-ingress.testkit';
-import { COLLAB_INVALID_TOKEN_REASON, invalidCollabTokenRefusal } from './auth-rate';
-import { admitCollabFrame } from './frame-address';
+import { COLLAB_INVALID_TOKEN_REASON, invalidCollabTokenRefusal } from './auth-refusal';
+import { admitCollabFrame } from './frame-admission';
 import { COLLAB_AUTH_FRAMES_PER_SOCKET } from './limits';
 import { SocketLimitLog } from './socket-limit-log';
 
@@ -74,7 +74,7 @@ describe('#790 a token that does not verify, retried on one socket', () => {
   });
 
   it(`with it: ${COLLAB_AUTH_FRAMES_PER_SOCKET} attempts, then the socket is terminated; nothing is logged per attempt`, async () => {
-    const { sock, calls } = setup(invalidCollabTokenRefusal, true);
+    const { sock, calls } = setup(() => invalidCollabTokenRefusal(new Error('bad'), new SocketLimitLog({ warn: () => undefined })), true);
     for (let i = 0; i < 3 * COLLAB_AUTH_FRAMES_PER_SOCKET; i++) {
       sock.deliver(authFrame('expired'));
       await settle();

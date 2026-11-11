@@ -5,11 +5,9 @@ import { NotFoundException, ServiceUnavailableException, UnauthorizedException }
 jest.mock('../../collaboration/collaboration.util', () => ({
   getPageId: (name: string) => name.split('.')[1],
 }));
-// #790: the per-user auth rate (burst 64) would refuse this matrix's later cases for its one user; this spec is about the
-// access decision, and collab-ingress/auth-rate.spec.ts pins the rate on the same extension.
-jest.mock('../collab-ingress/auth-rate', () => ({ chargeCollabAuth: () => undefined }));
 
 import { AuthenticationExtension } from '../../collaboration/extensions/authentication.extension';
+import { CollabSocketBounds } from '../collab-ingress/socket-bounds';
 import { PdpSpaceMemberRepo } from '../pdp-space-member.repo';
 import { PdpPagePermissionRepo } from '../pdp-page-permission.repo';
 import { spyKysely } from '../../service-bridge/kysely-spy.testkit';
@@ -103,6 +101,18 @@ function authzFor(c: Case) {
   };
 }
 
+/**
+ * #790/#810: the extension's socket bounds with the auth rates switched off: their burst (64) would refuse this matrix's
+ * later cases for its one user and session. This spec is about the access decision; collab-ingress/auth-rate.spec.ts
+ * pins the rates on the same extension.
+ */
+function unrated(): CollabSocketBounds {
+  const bounds = new CollabSocketBounds();
+  jest.spyOn(bounds, 'chargeSession').mockImplementation(() => undefined);
+  jest.spyOn(bounds, 'chargeUser').mockImplementation(() => undefined);
+  return bounds;
+}
+
 const liveUser = {
   id: USER,
   workspaceId: WS,
@@ -120,6 +130,7 @@ async function connectDecision(c: Case): Promise<CollabAccess> {
     new PdpSpaceMemberRepo({} as any, {} as any, {} as any, {} as any, authz),
     new PdpPagePermissionRepo(dbFor(c), {} as any, {} as any, authz),
     sessionsFor(c),
+    unrated(),
   );
   const data = {
     documentName: `page.${PAGE}`,
@@ -302,6 +313,7 @@ describe('collab access parity: decideCollabAccess ⇔ AuthenticationExtension.o
       new PdpSpaceMemberRepo({} as any, {} as any, {} as any, {} as any, authz),
       new PdpPagePermissionRepo(dbFor(c), {} as any, {} as any, authz),
       sessionsFor(c),
+      unrated(),
     );
     const data = { documentName: `page.${PAGE}`, token: 't', connectionConfig: { readOnly: false } } as any;
     await expect(ext.onAuthenticate(data)).rejects.toBeInstanceOf(ServiceUnavailableException);
