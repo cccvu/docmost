@@ -140,6 +140,11 @@ export const serverFrames = {
     frame(documentName, MessageType.Sync, (e) =>
       syncProtocol.writeSyncStep2(e, doc),
     ),
+  /** A per-document CLOSE (the socket stays open; the provider reports it as code 1000 with this reason). */
+  close: (documentName: string, reason: string) =>
+    frame(documentName, MessageType.CLOSE, (e) =>
+      encoding.writeVarString(e, reason),
+    ),
 };
 
 /** One frame the client sent: its document name, message type and the decoder positioned after them. */

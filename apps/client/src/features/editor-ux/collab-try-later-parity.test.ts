@@ -16,6 +16,10 @@ import {
   TRY_LATER_CLOSE_REASONS,
   WS_CLOSE_MESSAGE_TOO_BIG,
 } from "./collab-access";
+import {
+  COLLAB_REFUSAL_RULES,
+  collabRefusalCause,
+} from "./collab-refusal-cause";
 
 const INGRESS = join(__dirname, "../../../../server/src/authz/collab-ingress");
 const FILES = [
@@ -109,5 +113,71 @@ describe("server ↔ client collab reasons (#810)", () => {
       TRY_LATER_AUTH_REASONS.includes(r) ||
       TRY_LATER_CLOSE_REASONS.includes(r);
     expect(serverReasons.filter((r) => !known(r))).toEqual([]);
+  });
+});
+
+// The ledger-echo incident (#781 lineage) — the refusal notice's copy follows the rule the server refused on
+// (collab-refusal-cause.ts). Every rule in the server's `CollabRule` union must be a decision on the client: exactly one
+// cause. A new or renamed server rule goes red here until it joins one.
+//
+// FORWARD_RULES: rules this client already classifies that a server it ships with may not have yet (the client must
+// know a rule before the server can send it, never after). They may be absent from the server union, and are the only
+// client entries that may be. Each sits in `other` (generic copy). Drop an entry once every server it ships with has it.
+//   - `cross-list` (the splice-bypass shadow rule): lands in the same fork change as this client copy.
+const FORWARD_RULES: ReadonlySet<string> = new Set(["cross-list"]);
+
+describe("server CollabRule ↔ client refusal causes", () => {
+  const rulesSource = readFileSync(join(INGRESS, "content-rules.ts"), "utf8");
+  const union = rulesSource.match(
+    /export type CollabRule\s*=\s*((?:\s*\|\s*'[a-z-]+')+)\s*;/,
+  );
+  const serverRules = union
+    ? [...union[1].matchAll(/'([a-z-]+)'/g)].map((m) => m[1])
+    : [];
+  const causes = Object.entries(COLLAB_REFUSAL_RULES) as [
+    string,
+    ReadonlySet<string>,
+  ][];
+
+  it("is not vacuous: the server union was read in full", () => {
+    expect(union).not.toBeNull();
+    expect(serverRules.length).toBeGreaterThanOrEqual(28);
+    for (const rule of ["root", "schema", "internal", "unresolved"]) {
+      expect(serverRules).toContain(rule);
+    }
+    expect(new Set(serverRules).size).toBe(serverRules.length);
+  });
+
+  it("every server rule is in exactly one cause", () => {
+    const misplaced = serverRules
+      .map((rule) => [rule, causes.filter(([, set]) => set.has(rule)).map(([c]) => c)] as const)
+      .filter(([, inCauses]) => inCauses.length !== 1);
+    expect(misplaced).toEqual([]);
+    for (const rule of serverRules) {
+      expect([rule, collabRefusalCause(rule)]).toEqual([
+        rule,
+        causes.find(([, set]) => set.has(rule))?.[0],
+      ]);
+    }
+  });
+
+  it("every client entry is a server rule, or a forward rule kept in `other`", () => {
+    const server = new Set(serverRules);
+    const extra = causes.flatMap(([cause, set]) =>
+      [...set]
+        .filter((rule) => !server.has(rule))
+        .filter((rule) => !(FORWARD_RULES.has(rule) && cause === "other"))
+        .map((rule) => `${cause}:${rule}`),
+    );
+    expect(extra).toEqual([]);
+    for (const rule of FORWARD_RULES) {
+      expect(collabRefusalCause(rule)).toBe("other");
+    }
+  });
+
+  it("the cause sets are disjoint", () => {
+    const all = causes.flatMap(([, set]) => [...set]);
+    expect(new Set(all).size).toBe(all.length);
+    for (const [, set] of causes) expect(set).toBeInstanceOf(Set);
   });
 });
