@@ -34,7 +34,10 @@ beforeAll(() => {
   } as unknown as typeof ResizeObserver;
 });
 
-function setup(clearLocalCopy: () => Promise<void> = async () => {}) {
+function setup(
+  clearLocalCopy: () => Promise<void> = async () => {},
+  tooBig?: boolean,
+) {
   const calls: string[] = [];
   const clear = vi.fn(async () => {
     calls.push("clear");
@@ -43,7 +46,11 @@ function setup(clearLocalCopy: () => Promise<void> = async () => {}) {
   const reload = vi.fn(() => calls.push("reload"));
   render(
     <MantineProvider>
-      <CollabRefusalNotice clearLocalCopy={clear} reload={reload} />
+      <CollabRefusalNotice
+        clearLocalCopy={clear}
+        reload={reload}
+        tooBig={tooBig}
+      />
     </MantineProvider>,
   );
   return { calls, clear, reload };
@@ -117,5 +124,58 @@ describe("CollabRefusalNotice", () => {
       "This browser's copy could not be cleared. Close the page's other tabs and try again.",
     );
     expect(calls).toEqual(["clear"]);
+  });
+});
+
+// cccvu/wiki-v2#810 (review F1) — after a 1009 the oversized change is in this browser's copy, which a reload replays
+// (and the server closes 1009 again), so only Discard recovers: the notice leads with it and offers no Reload.
+describe("CollabRefusalNotice after a 1009 (tooBig)", () => {
+  it("says the change is too large, offers no Reload, and makes Discard the primary (filled) button", () => {
+    setup(undefined, true);
+    expect(screen.getByRole("alert").textContent).toContain(
+      "too large to send",
+    );
+    expect(screen.queryByRole("button", { name: "Reload" })).toBeNull();
+    const discard = discardButton();
+    expect(discard.getAttribute("data-variant")).toBe("filled");
+  });
+
+  it("Discard still asks first, then clears this browser's copy and reloads", async () => {
+    const { calls } = setup(undefined, true);
+    fireEvent.click(discardButton());
+    await screen.findByRole("dialog");
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Discard and reload" }),
+      );
+    });
+    await waitFor(() => expect(calls).toEqual(["clear", "reload"]));
+  });
+
+  it("a failed clear still does not reload", async () => {
+    const { calls } = setup(async () => {
+      throw new Error("blocked");
+    }, true);
+    fireEvent.click(discardButton());
+    await screen.findByRole("dialog");
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Discard and reload" }),
+      );
+    });
+    await screen.findByText(
+      "This browser's copy could not be cleared. Close the page's other tabs and try again.",
+    );
+    expect(calls).toEqual(["clear"]);
+  });
+
+  // Anti-vacuity: every other refusal keeps Reload first and Discard secondary.
+  it("without tooBig, Reload is offered and Discard is not the primary button", () => {
+    setup();
+    expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
+    expect(discardButton().getAttribute("data-variant")).toBe("default");
+    expect(screen.getByRole("alert").textContent).not.toContain(
+      "too large to send",
+    );
   });
 });

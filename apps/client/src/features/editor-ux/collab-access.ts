@@ -32,8 +32,18 @@ import { jwtDecode } from "jwt-decode";
  *   - #790: a SOCKET close with code 1009 (the server's ws "message too big": this browser sent a frame over the
  *     server's maxPayload) is refused too. The provider would reconnect and resend the same frame (its Step2 answer
  *     to the server's Step1) every second, forever. Only a raw socket close carries a code other than 1000.
+ *     #810: the notice then leads with Discard (`refusedTooBig`): a reload replays the same oversized copy;
+ *   - #810: "try later" (the server's per-user auth rate, its per-user connection cap, its per-(user, document)
+ *     budgets, and a draining node all say so, see TRY_LATER_*) → close the socket, show the disconnected status, and
+ *     open it again after a jittered, growing wait (5 s doubling to COLLAB_LOST_RETRY_MS, `collabRetryDelay`). Never
+ *     the #537 token refetch (a rate-limited refusal says nothing about the token) and never lost: the editor stays
+ *     editable, as offline, and its edits wait in the Y doc. The provider's own reconnect after any received frame
+ *     is a FIXED 1 s with no backoff, so leaving these to the provider re-sent each refused attempt every second.
+ *   - #810: every token refetch also closes the socket first. The server closes a refused socket (4401) right after
+ *     its refusal, and the provider would reconnect it in 1 s with the OLD token, racing the refetch.
  *
- * Pure and dependency-free so it is unit-tested without a provider; page-editor.tsx wires it (seam 169).
+ * Pure and dependency-free so it is unit-tested without a provider; `collab-access-controller.ts` carries out its
+ * steps and page-editor.tsx wires the controller (seam 169).
  */
 
 export interface CollabAccessState {
@@ -47,6 +57,10 @@ export interface CollabAccessState {
   refused: boolean;
   /** #781: an `unresolved` close already reconnected; the next one is refused (reset only by `sync-acked`). */
   unresolvedRetried: boolean;
+  /** #810: the refusal was a 1009 (a frame over the server's maxPayload): only discarding this browser's copy helps. */
+  refusedTooBig: boolean;
+  /** #810: "try later" answers since the last successful authentication (the retry wait grows with it). */
+  tryLaterAttempts: number;
 }
 
 export const initialCollabAccess: CollabAccessState = {
@@ -55,6 +69,8 @@ export const initialCollabAccess: CollabAccessState = {
   refreshed: false,
   refused: false,
   unresolvedRetried: false,
+  refusedTooBig: false,
+  tryLaterAttempts: 0,
 };
 
 /** #781: the server's close reasons (`apps/server/src/authz/collab-ingress`). */
@@ -64,14 +80,37 @@ export const COLLAB_UPDATE_UNRESOLVED = "ccc:collab-update-unresolved";
 /** #790: the ws close code for a message over the server's `maxPayload` (RFC 6455 "Message Too Big"). */
 export const WS_CLOSE_MESSAGE_TOO_BIG = 1009;
 
+/**
+ * #810: the server's "try later" signals, copied from `apps/server/src/authz/collab-ingress` (the parity test
+ * `collab-try-later-parity.test.ts` reads the server source and holds these equal). A reason is only a pace hint: it
+ * grants nothing, and the next attempt meets the server's full access check.
+ *   - authentication refused for the per-user auth rate, or the per-user connection cap;
+ *   - a socket closed 1013 (RFC 6455 Try Again Later: a per-(user, document) budget, or a draining node) or 4429 (the
+ *     per-user connection cap), and a document CLOSE that names one of those reasons.
+ */
+export const TRY_LATER_AUTH_REASONS: readonly string[] = [
+  "ccc:collab-auth-rate-limited",
+  "ccc:collab-user-connections",
+];
+export const TRY_LATER_CLOSE_REASONS: readonly string[] = [
+  "ccc:collab-try-later",
+  "ccc:collab-user-connections",
+];
+export const TRY_LATER_CLOSE_CODES: readonly number[] = [1013, 4429];
+
 export function classifyCollabCloseReason(
   reason: string | undefined,
   code?: number,
-): "refused" | "unresolved" | "other" {
+): "refused" | "unresolved" | "try-later" | "other" {
   if (code === WS_CLOSE_MESSAGE_TOO_BIG) return "refused";
-  if (typeof reason !== "string") return "other";
-  if (reason.startsWith(COLLAB_UPDATE_REFUSED_PREFIX)) return "refused";
-  if (reason === COLLAB_UPDATE_UNRESOLVED) return "unresolved";
+  if (typeof reason === "string") {
+    if (reason.startsWith(COLLAB_UPDATE_REFUSED_PREFIX)) return "refused";
+    if (reason === COLLAB_UPDATE_UNRESOLVED) return "unresolved";
+    if (TRY_LATER_CLOSE_REASONS.includes(reason)) return "try-later";
+  }
+  if (typeof code === "number" && TRY_LATER_CLOSE_CODES.includes(code)) {
+    return "try-later";
+  }
   return "other";
 }
 
@@ -83,7 +122,12 @@ export type CollabAccessEvent =
       /** #790: the close code (a document CLOSE is always 1000; a raw socket close carries the socket's own). */
       code?: number;
     }
-  | { kind: "auth-failed"; tokenExpired: boolean }
+  | {
+      kind: "auth-failed";
+      tokenExpired: boolean;
+      /** #810: the server's refusal reason (the provider's `onAuthenticationFailed({ reason })`). */
+      reason?: string;
+    }
   | { kind: "refresh-failed" }
   | { kind: "authenticated"; scope: string | undefined }
   /** #781: the provider's unsynced-changes count reached 0 — the server applied every frame it was sent. */
@@ -101,7 +145,7 @@ export interface CollabAccessStep {
   detach: boolean;
   /** #790: close the editor's socket (after a refusal, for good; after a loss, until `retryAfterMs`). */
   disconnectSocket: boolean;
-  /** #790: lost: try the socket again after this many ms (0: no timer). */
+  /** #790: lost, #810: try later: open the socket again after about this many ms (0: no timer; jittered by the caller). */
   retryAfterMs: number;
 }
 
@@ -112,6 +156,29 @@ export interface CollabAccessStep {
  * second) would hold a slot of that pool for as long as the tab stayed open.
  */
 export const COLLAB_LOST_RETRY_MS = 60_000;
+
+/** #810: the first "try later" wait; it doubles with each further one, up to COLLAB_LOST_RETRY_MS. */
+export const COLLAB_TRY_LATER_BASE_MS = 5_000;
+
+/** #810: no jittered retry waits less than this. */
+export const COLLAB_RETRY_MIN_MS = 1_000;
+
+/**
+ * #810: the wait the caller actually uses for a step's `retryAfterMs`: between half of it and all of it, so the
+ * editors a deploy or an outage disconnected together do not come back together.
+ */
+export function collabRetryDelay(
+  ms: number,
+  random: () => number = Math.random,
+): number {
+  const r = Math.min(1, Math.max(0, random()));
+  return Math.max(COLLAB_RETRY_MIN_MS, Math.round(ms * (0.5 + 0.5 * r)));
+}
+
+/** #810: a retry timer still has work: the editor is lost, or waiting after a "try later". */
+export function collabAwaitsRetry(state: CollabAccessState): boolean {
+  return !state.refused && (state.lost || state.tryLaterAttempts > 0);
+}
 
 const NO_ACTION = {
   reconnect: false,
@@ -131,9 +198,12 @@ export function nextCollabAccess(
   switch (event.kind) {
     case "server-close": {
       const reason = classifyCollabCloseReason(event.reason, event.code);
-      if (reason === "refused") return refusedStep(prev);
+      if (reason === "refused") {
+        return refusedStep(prev, event.code === WS_CLOSE_MESSAGE_TOO_BIG);
+      }
+      if (reason === "try-later") return tryLaterStep(prev);
       if (reason === "unresolved") {
-        if (prev.unresolvedRetried) return refusedStep(prev);
+        if (prev.unresolvedRetried) return refusedStep(prev, false);
         // Reconnect once (a closing socket is reconnected by the provider itself).
         return {
           ...NO_ACTION,
@@ -149,14 +219,29 @@ export function nextCollabAccess(
       if (!prev.unresolvedRetried) return { state: prev, ...NO_ACTION };
       return { state: { ...prev, unresolvedRetried: false }, ...NO_ACTION };
     case "auth-failed":
+      // #810: checked first: a rate-limited refusal implies the token verified, so a refetch would not help.
+      if (
+        typeof event.reason === "string" &&
+        TRY_LATER_AUTH_REASONS.includes(event.reason)
+      ) {
+        return tryLaterStep(prev);
+      }
+      // #810 (review R4-F3): every refetch closes the socket first. The server closes a refused socket (4401), and
+      // the provider would reconnect it in 1 s with the OLD token; the refetch reopens it with the new one.
       if (event.tokenExpired) {
-        return { ...NO_ACTION, state: prev, refreshToken: true };
+        return {
+          ...NO_ACTION,
+          state: prev,
+          refreshToken: true,
+          disconnectSocket: true,
+        };
       }
       if (!prev.refreshed) {
         return {
           ...NO_ACTION,
           state: { ...prev, refreshed: true },
           refreshToken: true,
+          disconnectSocket: true,
         };
       }
       return lostStep(prev);
@@ -170,6 +255,7 @@ export function nextCollabAccess(
           lost: false,
           readOnly: event.scope === "readonly",
           refreshed: false,
+          tryLaterAttempts: 0, // #810: a server that authenticates is no longer asking this editor to wait
         },
       };
   }
@@ -187,13 +273,36 @@ function lostStep(prev: CollabAccessState): CollabAccessStep {
 }
 
 /**
- * #781: stop sending and stop editing. No `markDisconnected`: the header's "connection lost. Retrying..." would be
- * untrue (nothing retries); the refusal notice says what happened and offers the recovery.
+ * #810: the server asked this editor to try later. Close the socket and open it again after a wait that doubles with
+ * each answer like it (5 s, 10 s, ... COLLAB_LOST_RETRY_MS), until an authentication resets it. Not lost, not
+ * refused, no token refetch, still editable (edits wait in the Y doc, as offline); `refreshed` is untouched.
  */
-function refusedStep(prev: CollabAccessState): CollabAccessStep {
+function tryLaterStep(prev: CollabAccessState): CollabAccessStep {
+  const retryAfterMs = Math.min(
+    COLLAB_LOST_RETRY_MS,
+    COLLAB_TRY_LATER_BASE_MS * 2 ** Math.min(prev.tryLaterAttempts, 16),
+  );
   return {
     ...NO_ACTION,
-    state: { ...prev, refused: true },
+    state: { ...prev, tryLaterAttempts: prev.tryLaterAttempts + 1 },
+    markDisconnected: true,
+    disconnectSocket: true,
+    retryAfterMs,
+  };
+}
+
+/**
+ * #781: stop sending and stop editing. No `markDisconnected`: the header's "connection lost. Retrying..." would be
+ * untrue (nothing retries); the refusal notice says what happened and offers the recovery. #810: `tooBig` (a 1009)
+ * tells the notice that only discarding this browser's copy recovers.
+ */
+function refusedStep(
+  prev: CollabAccessState,
+  tooBig: boolean,
+): CollabAccessStep {
+  return {
+    ...NO_ACTION,
+    state: { ...prev, refused: true, refusedTooBig: tooBig },
     detach: true,
     disconnectSocket: true,
   };
