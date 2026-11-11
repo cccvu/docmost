@@ -40,6 +40,8 @@ export const SOCKET_LIMITS = [
   'client_address_trust',
   'user_sync_budget',
   'user_awareness_ids',
+  'user_client_ids',
+  'user_collab_cpu',
   'user_connections',
   'auth_rate',
   'auth_session_rate',

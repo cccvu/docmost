@@ -25,6 +25,19 @@ import {
   syncFrame,
   typedFrame,
 } from './collab-ingress.testkit';
+import { CONFLICT_SCAN_STEPS_PER_FRAME } from './conflict-scan';
+import {
+  basePage,
+  distinctRightShape,
+  keyedHistoryShape,
+  rawUpdate,
+  rightLeftOfOriginShape,
+  siblingsFrame,
+  siblingsShape,
+  twoClientsShape,
+  unguardedSteps,
+  type Shape,
+} from './conflict-scan.testkit';
 import { INT_ATTRS, STRING_ATTRS } from './content-rules';
 import { COLLAB_CONNECTIONS_PER_USER } from './limits';
 import { SocketLimitLog } from './socket-limit-log';
@@ -36,6 +49,7 @@ import {
   AWARENESS_STATE_MAX_BYTES,
   COLLAB_REFUSAL_CODE,
   CollabUpdateGuard,
+  NEW_CLIENT_IDS_PER_FRAME,
   SOCKET_REFUSAL_BUDGET,
   SYNC_BURST,
   SYNC_REFILL_MS,
@@ -43,6 +57,8 @@ import {
   USER_DOC_BUDGETS_MAX,
   USER_SYNC_BURST,
   USER_SYNC_REFILL_MS,
+  USER_COLLAB_CPU_BURST_MS,
+  USER_COLLAB_CPU_REFILL_MS_PER_SECOND,
   UNRESOLVED_REASON,
   type CollabGuardMode,
 } from './update-guard';
@@ -63,7 +79,9 @@ const TRY_LATER = 'try-later';
 
 type Conn = { readOnly: boolean; webSocket: { close: jest.Mock }; context: { user: { id: string } } };
 
-function setup(opts: { mode?: CollabGuardMode; seed?: unknown | Y.Doc; seedY?: (f: Y.XmlFragment, d: Y.Doc) => void; legacy?: Uint8Array; now?: () => number } = {}) {
+function setup(
+  opts: { mode?: CollabGuardMode; seed?: unknown | Y.Doc; seedY?: (f: Y.XmlFragment, d: Y.Doc) => void; legacy?: Uint8Array; now?: () => number; cpuNow?: () => number } = {},
+) {
   const live = new Y.Doc() as Y.Doc & { name: string };
   live.name = DOC_NAME;
   if (opts.seed) {
@@ -83,6 +101,7 @@ function setup(opts: { mode?: CollabGuardMode; seed?: unknown | Y.Doc; seedY?: (
     logger: { warn: (m: string) => logs.push(m) },
     limitLog: new SocketLimitLog({ warn: (m: string) => limitLogs.push(m) }),
     now: opts.now,
+    cpuNow: opts.cpuNow,
   });
   // The peer receives every update the live document broadcasts.
   const peer = new Y.Doc();
@@ -1352,5 +1371,365 @@ describe('#810 (L1) the guard logs through the shared per-key window: per token,
       'COLLAB_GUARD_LOG_SUPPRESSED {"of":"COLLAB_LEGACY_PENDING_INVALID","count":12}',
     ]);
     expect(jest.getTimerCount()).toBe(0);
+  });
+});
+
+describe('#816 conflict scan: a frame whose integrate walks would stall the process is refused before Yjs walks them', () => {
+  /** The steps of the same frame over twice the size: ~4x is quadratic (a count, never a wall-clock stall). */
+  const growth = (build: (n: number) => Shape, n: number) => {
+    const small = build(n);
+    const large = build(2 * n);
+    return unguardedSteps(large.base, large.frame) / unguardedSteps(small.base, small.frame);
+  };
+  const honestAfter = (s: ReturnType<typeof setup>) =>
+    s.send(s.conn('honest'), new RemoteClient(s.live).edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'still editing ')));
+
+  it.each([
+    ['(b) two client ids: n·m', (n: number) => twoClientsShape(n), 1100],
+    ['(c) one client id, distinct rightOrigins in one frame: m²', (n: number) => distinctRightShape(n), 1500],
+    ['(d) a rightOrigin left of its origin: tail·m', (n: number) => rightLeftOfOriginShape(n), 1100],
+    ['(e) a keyed history: history·m', (n: number) => keyedHistoryShape(n, n), 1100],
+  ] as const)('%s: control grows quadratically; treatment refuses conflict-scan, live unchanged, the next frame passes', (_name, build, n) => {
+    const ratio = growth(build, 200);
+    expect(ratio).toBeGreaterThan(3.5); // control: doubling the attacker's bytes quadruples the walk
+    expect(ratio).toBeLessThan(4.5);
+    const shape = build(n);
+    expect(unguardedSteps(shape.base, shape.frame)).toBeGreaterThan(CONFLICT_SCAN_STEPS_PER_FRAME); // the frame at hand
+    const s = setup({ seed: shape.base });
+    expectRefused(s, s.conn('attacker'), shape.frame, REFUSED('conflict-scan'));
+    const line = s.logs.find((l) => l.includes('"rule":"conflict-scan"'))!;
+    expect(JSON.parse(line.slice(line.indexOf('{')))).toMatchObject({ steps: CONFLICT_SCAN_STEPS_PER_FRAME + 1, mode: 'enforce' });
+    expect(honestAfter(s)).toBe('applied');
+  });
+
+  it('(a) #816: siblings with client ids rising across frames: the first frame past the cap is refused, earlier ones pass', () => {
+    // Each new id walks every sibling the page already holds, so a frame of 64 ids costs 64 x (siblings so far):
+    // linear per frame, quadratic in the ids an attacker sends. Start just under the cap (as if earlier frames left it).
+    let t = 1_000_000;
+    const prior = Math.floor(CONFLICT_SCAN_STEPS_PER_FRAME / NEW_CLIENT_IDS_PER_FRAME) - NEW_CLIENT_IDS_PER_FRAME;
+    const shape = siblingsShape(prior, 0);
+    const from = 100_000 + prior;
+    const frame = (k: number) => siblingsFrame(from + k * NEW_CLIENT_IDS_PER_FRAME, NEW_CLIENT_IDS_PER_FRAME, shape.first);
+    // control: the per-frame walk grows with the siblings accumulated (2x the siblings, 2x the steps)
+    const half = siblingsShape(prior / 2, 0);
+    const perFrame = (sh: Shape, p: number) => unguardedSteps(sh.base, siblingsFrame(100_000 + p, NEW_CLIENT_IDS_PER_FRAME, sh.first));
+    expect(perFrame(shape, prior) / perFrame(half, prior / 2)).toBeGreaterThan(1.9);
+    const s = setup({ seed: shape.base, now: () => t });
+    const attacker = s.conn('attacker');
+    expect(unguardedSteps(s.live, frame(0))).toBeLessThanOrEqual(CONFLICT_SCAN_STEPS_PER_FRAME);
+    expect(s.send(attacker, frame(0))).toBe('applied');
+    t += NEW_CLIENT_IDS_PER_FRAME * AWARENESS_NEW_IDS_REFILL_MS; // its id budget refilled: only the scan stops it
+    expect(unguardedSteps(s.live, frame(1))).toBeGreaterThan(CONFLICT_SCAN_STEPS_PER_FRAME);
+    expectRefused(s, attacker, frame(1), REFUSED('conflict-scan'));
+    expect(honestAfter(s)).toBe('applied');
+  });
+
+  it('no cap per item: a keystroke typed before it saw 60,000 cheap concurrent siblings at its spot still applies', () => {
+    // A co-editor (low client id) puts 60,000 siblings between two characters someone is typing between. Each walks
+    // nothing (one client, same origins), so the frame is cheap and accepted. The typist's keystroke, made before it
+    // saw them (a higher client id), walks every one of them: one item, ~60k steps, a few ms of Yjs.
+    const page = basePage('ab');
+    const s = setup({ seed: page.doc });
+    const typist = new Y.Doc();
+    typist.clientID = 3_000_000_000;
+    Y.applyUpdate(typist, Y.encodeStateAsUpdate(s.live));
+    let keystroke: Uint8Array | null = null;
+    typist.on('update', (u: Uint8Array) => (keystroke = u));
+    textOf(typist.getXmlFragment('default').get(0) as Y.XmlElement).insert(1, 'v');
+    const sibling = { origin: [1, page.first] as [number, number], right: [1, page.first + 1] as [number, number], content: new Y.ContentString('x') };
+    const siblings = rawUpdate([{ client: 2, clock: 0, structs: Array.from({ length: 60_000 }, () => sibling) }]);
+    expect(s.send(s.conn('co-editor'), siblings)).toBe('applied');
+    const steps = unguardedSteps(s.live, keystroke!);
+    expect(steps).toBeGreaterThan(50_000); // what a cap per item at 50,000 refused 4422
+    expect(steps).toBeLessThan(CONFLICT_SCAN_STEPS_PER_FRAME);
+    expect(s.send(s.conn('typist'), keystroke!)).toBe('applied');
+    expect(textOf(s.live.getXmlFragment('default').get(0) as Y.XmlElement).toString()).toContain('v');
+  });
+
+  it('a frame worth ~1e8 steps (n = m = 10 000) is refused at the cap, never after the walk', () => {
+    const shape = twoClientsShape(10_000);
+    const s = setup({ seed: shape.base });
+    // n·m + n - 1 steps unguarded (the meter spec pins the formula): ~100x the cap, a stall of seconds
+    expectRefused(s, s.conn('attacker'), shape.frame, REFUSED('conflict-scan'));
+    const line = s.logs.find((l) => l.includes('"rule":"conflict-scan"'))!;
+    expect(JSON.parse(line.slice(line.indexOf('{')))).toMatchObject({ steps: CONFLICT_SCAN_STEPS_PER_FRAME + 1 });
+  });
+
+  it('report mode counts and never refuses: the frame applies, logged with the whole count', () => {
+    const shape = twoClientsShape(1100);
+    const s = setup({ seed: shape.base, mode: 'report' });
+    expect(s.send(s.conn('attacker'), shape.frame)).toBe('applied');
+    const line = s.logs.find((l) => l.includes('"rule":"conflict-scan"'))!;
+    expect(JSON.parse(line.slice(line.indexOf('{')))).toMatchObject({ steps: unguardedSteps(shape.base, shape.frame), mode: 'report' });
+    expect(Y.encodeStateVector(s.live)).toEqual(Y.encodeStateVector(unguarded(shape.base, shape.frame)));
+  });
+
+  it('fails closed: a meter error (getItem throws in the replay) is refused internal, stage conflict-scan; the shadow rebuilds', () => {
+    const s = setup({ seed: SEED });
+    const conn = s.conn('editor');
+    const c = new RemoteClient(s.live, 4242);
+    expect(s.send(conn, c.edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'abc')))).toBe('applied');
+    c.doc.transact(() => textOf(c.fragment.get(0) as Y.XmlElement).insert(3, 'd'));
+    // A Step2 resending from one clock back (a reconnect's overlap): Yjs integrates it with offset 1, which reads getItem.
+    const sv = Y.decodeStateVector(Y.encodeStateVector(s.live));
+    sv.set(4242, sv.get(4242)! - 1);
+    const overlap = Y.encodeStateAsUpdate(c.doc, Y.encodeStateVector(sv));
+    const shadow = s.guard.shadowOf(s.live);
+    const getItem = jest.spyOn(Y, 'getItem').mockImplementation(() => {
+      throw new Error('injected');
+    });
+    try {
+      expectRefused(s, s.conn('editor'), overlap, REFUSED('internal'), SYNC.Step2);
+    } finally {
+      getItem.mockRestore();
+    }
+    const line = s.logs.find((l) => l.includes('"rule":"internal"'))!;
+    expect(line).toContain('"stage":"conflict-scan"');
+    expect(s.send(s.conn('editor'), overlap, SYNC.Step2)).toBe('applied'); // the same frame, honest, after the fault
+    expect(s.guard.shadowOf(s.live)).not.toBe(shadow); // rebuilt from live, unmetered
+    expect(textOf(find(s.live, 'paragraph')).toString()).toBe('abcdvictim text');
+  });
+});
+
+describe('#816 wire rules: keyed items carry no rightOrigin, delete ranges ascend', () => {
+  it('a keyed item with a rightOrigin is refused attr-kind (control: Yjs integrates it as the key\'s value history)', () => {
+    const s = setup({ seed: SEED });
+    const author = new RemoteClient(s.live, 31);
+    expect(s.send(s.conn('a'), author.edit(s.live, (f) => (f.get(0) as Y.XmlElement).setAttribute('textAlign', 'left')))).toBe('applied');
+    const p = find(s.live, 'paragraph');
+    const value = (p as any)._map.get('textAlign') as Y.Item;
+    // origin none, rightOrigin the current value: the wire carries no key at all; Yjs takes it from the rightOrigin
+    const attack = rawUpdate([{ client: 77, clock: 0, structs: [{ origin: null, right: [value.id.client, value.id.clock], content: new Y.ContentAny(['center']) }] }]);
+    expect(Y.decodeUpdate(attack).structs[0]).toMatchObject({ parentSub: null }); // why the pre-pass cannot see it
+    const control = unguarded(s.live, attack);
+    const landed = Y.getItem(control.store, Y.createID(77, 0)) as Y.Item;
+    expect(landed).toMatchObject({ parentSub: 'textAlign' });
+    expect(landed.rightOrigin).not.toBeNull();
+    expectRefused(s, s.conn('attacker'), attack, REFUSED('attr-kind'));
+  });
+
+  it('honest keyed writes never carry one: repeated and concurrent sets, undo and redo', () => {
+    const s = setup({ seed: SEED });
+    const one = new RemoteClient(s.live, 41);
+    const two = new RemoteClient(s.live, 42);
+    const undo = new Y.UndoManager(one.fragment, { captureTimeout: 0 });
+    const sent: string[] = [];
+    for (const v of ['left', 'center', 'right']) sent.push(s.send(s.conn('one'), one.edit(s.live, (f) => (f.get(0) as Y.XmlElement).setAttribute('textAlign', v))));
+    const u1 = one.edit(s.live, (f) => (f.get(0) as Y.XmlElement).setAttribute('textAlign', 'left'));
+    const u2 = two.edit(s.live, (f) => (f.get(0) as Y.XmlElement).setAttribute('textAlign', 'center'));
+    sent.push(s.send(s.conn('one'), u1), s.send(s.conn('two'), u2));
+    one.sync(s.live);
+    const align = () => find(s.live, 'paragraph').getAttribute('textAlign');
+    const seen = [align()];
+    for (const op of [() => undo.undo(), () => undo.undo(), () => undo.redo(), () => undo.redo()]) {
+      const sv = Y.encodeStateVector(s.live);
+      op();
+      sent.push(s.send(s.conn('one'), Y.encodeStateAsUpdate(one.doc, sv)));
+      seen.push(align());
+    }
+    expect(sent.every((r) => r === 'applied')).toBe(true);
+    expect(new Set(seen).size).toBeGreaterThan(1); // the undo and redo really rewrote the key
+    for (const structs of s.live.store.clients.values()) {
+      for (const st of structs) if (st instanceof Y.Item && st.parentSub !== null) expect(st.rightOrigin).toBeNull();
+    }
+  });
+
+  it('delete ranges out of order are refused delete-order before any shadow work; Yjs\'s own sets pass', () => {
+    const s = setup({ seed: SEED });
+    const t = textOf(find(s.live, 'paragraph'));
+    const at = ((t as any)._start as Y.Item).id;
+    const ranges = (r: Array<[number, number]>) => rawUpdate([], [{ client: at.client, ranges: r.map(([o, l]) => [at.clock + o, l]) }]);
+    // control: Yjs applies a falling set as given (it never sorts what it reads)
+    expect(Y.decodeUpdate(ranges([[8, 1], [5, 1], [2, 1]])).ds.clients.get(at.client)!.map((d) => d.clock - at.clock)).toEqual([8, 5, 2]);
+    expect(textOf(find(unguarded(s.live, ranges([[8, 1], [5, 1], [2, 1]])), 'paragraph')).toString()).toBe('viti txt');
+    for (const bad of [[[8, 1], [5, 1], [2, 1]], [[2, 3], [4, 1]], [[2, 1], [2, 1]]] as Array<Array<[number, number]>>) {
+      expectRefused(s, s.conn('attacker'), ranges(bad), REFUSED('delete-order'));
+    }
+    expect(s.guard.shadowOf(s.live)).toBeNull(); // refused by the pre-pass: no shadow built for it
+    // honest: one transaction deleting in falling order, and a merge of such updates in reverse order
+    const c = new RemoteClient(s.live);
+    const edits: Uint8Array[] = [];
+    c.doc.on('update', (u: Uint8Array) => edits.push(u));
+    c.doc.transact(() => {
+      const ct = textOf(c.fragment.get(0) as Y.XmlElement);
+      ct.delete(8, 1);
+      ct.delete(5, 1);
+      ct.delete(2, 1);
+    });
+    c.doc.transact(() => textOf(c.fragment.get(0) as Y.XmlElement).delete(0, 1));
+    expect(s.send(s.conn('honest'), Y.mergeUpdates(edits.slice().reverse()))).toBe('applied');
+    expect(s.send(s.conn('honest'), ranges([[2, 1], [3, 1], [6, 2]]))).toBe('applied'); // adjacent ranges are ascending
+  });
+});
+
+describe('#816 client ids new to the page: a ceiling per frame and the (user, document) id budget', () => {
+  const ids = (s: ReturnType<typeof setup>, from: number, n: number) => {
+    const at = ((textOf(find(s.live, 'paragraph')) as any)._start as Y.Item).id;
+    return siblingsFrame(from, n, at.clock, at.client); // n ids, one character each, at the same place
+  };
+
+  it(`more than ${NEW_CLIENT_IDS_PER_FRAME} in one frame is refused client-ids before any shadow work; ${NEW_CLIENT_IDS_PER_FRAME} pass`, () => {
+    expect(NEW_CLIENT_IDS_PER_FRAME).toBeLessThanOrEqual(AWARENESS_NEW_IDS_BURST); // so a frame under it never loops on 1013
+    const s = setup({ seed: SEED });
+    expectRefused(s, s.conn('attacker'), ids(s, 5000, NEW_CLIENT_IDS_PER_FRAME + 1), REFUSED('client-ids'));
+    expect(s.guard.shadowOf(s.live)).toBeNull();
+    expect(s.send(s.conn('editor'), ids(s, 6000, NEW_CLIENT_IDS_PER_FRAME))).toBe('applied');
+  });
+
+  it('they are charged to the per-(user, document) id budget: exhausted, the socket closes 1013; refilled, they pass', () => {
+    let t = 1_000_000;
+    const s = setup({ seed: SEED, now: () => t });
+    expect(s.send(s.conn('a'), ids(s, 5000, 40))).toBe('applied');
+    expect(s.send(s.conn('a'), ids(s, 6000, 40))).toBe(TRY_LATER);
+    expect(s.limitLogs.some((l) => l.includes('"limit":"user_client_ids"'))).toBe(true);
+    expect(s.send(s.conn('b'), ids(s, 7000, 40))).toBe('applied'); // per user
+    expect(s.send(s.conn('a'), ids(s, 5000, 40), SYNC.Step2)).toBe('applied'); // ids live already holds are free
+    t += 40 * AWARENESS_NEW_IDS_REFILL_MS;
+    expect(s.send(s.conn('a'), ids(s, 6000, 40))).toBe('applied');
+  });
+
+  it('an id is paid for once, whichever announces it first: awareness, then structs, and structs, then awareness', () => {
+    const s = setup({ seed: SEED, now: () => 1 });
+    const meta = new Map<number, { clock: number }>();
+    (s.live as unknown as { awareness: unknown }).awareness = { meta };
+    const c = s.conn('a');
+    const announce = (from: number) => awarenessFrame(Array.from({ length: AWARENESS_NEW_IDS_BURST / 2 }, (_, i) => ({ clientID: from + i, state: {} })));
+    // awareness first (the whole burst's first half), then the structs of those ids on the same connection
+    expect(s.deliver(c, announce(5000))).toBe('applied');
+    expect(s.send(c, ids(s, 5000, AWARENESS_NEW_IDS_BURST / 2))).toBe('applied');
+    // structs first (the second half), then awareness for those ids on the same connection
+    expect(s.send(c, ids(s, 6000, AWARENESS_NEW_IDS_BURST / 2))).toBe('applied');
+    expect(s.deliver(c, announce(6000))).toBe('applied');
+    // an id the document's awareness holds (another connection announced it) is not charged either
+    for (let i = 0; i < AWARENESS_NEW_IDS_BURST / 2; i++) meta.set(7000 + i, { clock: 1 });
+    expect(s.send(s.conn('a'), ids(s, 7000, AWARENESS_NEW_IDS_BURST / 2))).toBe('applied');
+    // the burst is spent now: one more new id waits
+    expect(s.send(s.conn('a'), ids(s, 8000, 1))).toBe(TRY_LATER);
+  });
+});
+
+describe('#816 the per-user collab CPU budget (a debt)', () => {
+  /**
+   * A fake CPU clock: the shadow's applies advance it by `apply` per frame and `rebuild` per rebuild, the pre-pass's
+   * decode by `decode`. With `shared` it is the wall clock too, as in production: a synchronous apply blocks the event
+   * loop, so wall time passes with it.
+   */
+  function cpuSetup(opts: { mode?: CollabGuardMode; shared?: boolean } = {}) {
+    let t = 1_000_000;
+    const cpu = { now: 0, apply: 0, rebuild: 0, decode: 0 };
+    const spend = (ms: number) => {
+      cpu.now += ms;
+      if (opts.shared) t += ms;
+    };
+    const s = setup({ seed: SEED, now: () => t, cpuNow: () => cpu.now, mode: opts.mode });
+    const real = Y.applyUpdate;
+    const spy = jest.spyOn(Y, 'applyUpdate').mockImplementation((doc: Y.Doc, update: Uint8Array, origin?: unknown) => {
+      const what = typeof origin === 'symbol' ? origin.description : undefined;
+      if (what === 'ccc-collab-inspect') spend(cpu.apply);
+      else if (what === 'ccc-collab-mirror' && doc !== s.guard.shadowOf(s.live)) spend(cpu.rebuild); // a new shadow
+      return real(doc, update, origin);
+    });
+    const realDecode = Y.decodeUpdate;
+    jest.spyOn(Y, 'decodeUpdate').mockImplementation((update: Uint8Array) => {
+      spend(cpu.decode);
+      return realDecode(update);
+    });
+    const edit = () => new RemoteClient(s.live).edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'x'));
+    return { s, cpu, spy, edit, advance: (ms: number) => (t += ms), wall: () => t };
+  }
+  /** A frame the shadow step refuses (an object image src), which leaves the shadow dirty. */
+  const badImage = (s: ReturnType<typeof setup>, n: number) =>
+    new RemoteClient(s.live).edit(s.live, (f) => {
+      const img = new Y.XmlElement('image');
+      img.setAttribute('src', { evil: n } as never);
+      f.insert(1, [img]);
+    });
+  afterEach(() => jest.restoreAllMocks());
+
+  it('one large frame passes; a frame that arrives while the balance is negative waits (1013); the refill restores it', () => {
+    const { s, cpu, edit, advance } = cpuSetup();
+    cpu.apply = 1_500; // charged in full, 2 x 1500, from a burst of 2000: balance -1000
+    expect(s.send(s.conn('a'), edit())).toBe('applied');
+    expect(s.guard.cpuBalance('a')).toBe(USER_COLLAB_CPU_BURST_MS - 3_000);
+    cpu.apply = 1;
+    expect(s.send(s.conn('a'), edit())).toBe(TRY_LATER);
+    expect(s.limitLogs.some((l) => l.includes('"limit":"user_collab_cpu"'))).toBe(true);
+    expect(s.send(s.conn('b'), edit())).toBe('applied'); // per user
+    const refill = (1_000 / USER_COLLAB_CPU_REFILL_MS_PER_SECOND) * 1_000; // wall ms that pay back 1000 ms of debt
+    advance(refill - 1_000);
+    expect(s.send(s.conn('a'), edit())).toBe(TRY_LATER); // still in debt
+    advance(1_000);
+    expect(s.send(s.conn('a'), edit())).toBe('applied'); // balance 0 is not negative
+  });
+
+  it.each([1_700, 10_000, 15_800])(
+    'frames of %i ms each, on one clock for wall and CPU, hold their sender near a tenth of the event loop',
+    (ms) => {
+      // A charge clamped to the burst, or a refill earned while the frame itself ran, let frames of 10 s and more run
+      // back to back: the sender held the event loop the whole hour.
+      const { s, cpu, edit, advance, wall } = cpuSetup({ shared: true });
+      expect(s.send(s.conn('warm'), edit())).toBe('applied'); // the shadow exists
+      cpu.apply = ms;
+      const start = wall();
+      let busy = 0;
+      let frame = edit();
+      while (wall() - start < 3_600_000) {
+        const before = s.guard.cpuBalance('a');
+        if (s.send(s.conn('a'), frame) === TRY_LATER) {
+          advance(1_000); // the provider's reconnect
+          continue;
+        }
+        expect(s.guard.cpuBalance('a')).toBeCloseTo(before - 2 * ms, 6); // all of it, and no refill while it ran
+        advance(ms); // live applies it again
+        busy += 2 * ms;
+        frame = edit();
+      }
+      const share = busy / (wall() - start);
+      expect(share).toBeGreaterThan(0.05); // frames ran
+      expect(share).toBeLessThan(0.12);
+    },
+  );
+
+  it('a frame refused in the pre-pass is charged too: refused decodes alone end in 1013', () => {
+    const { s, cpu } = cpuSetup();
+    cpu.decode = 600;
+    const unordered = rawUpdate([], [{ client: 7, ranges: [[5, 1], [2, 1]] }]); // delete ranges descending
+    const results = Array.from({ length: 5 }, () => s.send(s.conn('a'), unordered));
+    expect(results).toEqual([...Array(4).fill(REFUSED('delete-order')), TRY_LATER]); // 4 x 600 > the 2000 burst
+  });
+
+  it('a user alone whose frames are refused in the shadow pays for each one and for the rebuild it leaves', () => {
+    const { s, cpu } = cpuSetup();
+    cpu.apply = 300;
+    cpu.rebuild = 400;
+    // each frame: a rebuild (the first build, then the one its own last refusal left) once, the apply twice = 1000
+    const results = Array.from({ length: 4 }, (_, n) => s.send(s.conn('a'), badImage(s, n)));
+    expect(results.slice(0, 3).every((r) => r !== 'applied' && r !== TRY_LATER)).toBe(true);
+    expect(results[3]).toBe(TRY_LATER); // 2000 - 1000 - 1000 = 0 still runs; -1000 waits
+  });
+
+  it('a rebuild a refusal made necessary is charged to the refused user, never to the co-editor who triggers it', () => {
+    const { s, cpu, edit } = cpuSetup();
+    cpu.apply = 1;
+    cpu.rebuild = 200; // small enough that several rounds rebuild before the refused user is in debt
+    const results: string[] = [];
+    const attacker: string[] = [];
+    const rounds = 10;
+    for (let round = 0; round < rounds; round++) {
+      attacker.push(s.send(s.conn('attacker'), badImage(s, round)));
+      results.push(s.send(s.conn('co-editor'), edit())); // after each refusal, rebuilds the shadow
+    }
+    expect(results.every((r) => r === 'applied')).toBe(true);
+    const refusedInShadow = attacker.filter((r) => r !== TRY_LATER && r !== 'applied').length;
+    expect(refusedInShadow).toBeGreaterThanOrEqual(3); // the co-editor rebuilt after each of these
+    expect(attacker[rounds - 1]).toBe(TRY_LATER); // the rebuilds were the attacker's
+    expect(s.guard.cpuBalance('co-editor')).toBe(USER_COLLAB_CPU_BURST_MS - rounds * 2 * cpu.apply); // its own applies only
+  });
+
+  it('report mode only logs', () => {
+    const { s, cpu, edit } = cpuSetup({ mode: 'report' });
+    cpu.apply = 1_500;
+    for (let i = 0; i < 4; i++) expect(s.send(s.conn('a'), edit())).toBe('applied');
+    expect(s.limitLogs.some((l) => l.includes('"limit":"user_collab_cpu"'))).toBe(true);
   });
 });
