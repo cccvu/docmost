@@ -9,13 +9,13 @@ import {
   setCompactionClockForTests,
   writeLineage,
 } from '../page-write/compaction-registry';
-import { awarenessFrame, DOC_NAME, MSG, RemoteClient, SYNC, syncFrame, typedFrame, step1Frame } from './collab-ingress.testkit';
+import { awarenessFrame, DOC_NAME, MSG, processCpuMs, RemoteClient, SYNC, syncFrame, typedFrame, step1Frame } from './collab-ingress.testkit';
 import { buildCompacted, snapshotTree } from '../page-write/compaction';
 import { liveContentDigest } from '../page-write/doc-version';
 import { COLLAB_PAGE_COMPACTING_REASON, epochStaleReason } from './collab-reasons';
 import { ConflictScan, CONFLICT_SCAN_STEPS_PER_FRAME, installConflictScanMeter } from './conflict-scan';
 import { basePage, rawUpdate, type RawStruct } from './conflict-scan.testkit';
-import { deadlineExceeded, type DeadlineRunner } from './deadline';
+import { deadlineExceeded, isDeadlineExceeded, runWithDeadline, type DeadlineRunner } from './deadline';
 import { COMPACTION_ARM_DELAY_MS, PROBE_DEBOUNCE_MS, PROBE_MIN_INTERVAL_MS, readerStep2ChargeMs, softCap } from './doc-bounds';
 import { SocketLimitLog } from './socket-limit-log';
 import {
@@ -32,12 +32,14 @@ import {
  * #827 (ADR 0036): every Yjs stall path the issue lists, through a real CollabUpdateGuard. Each vector has a CONTROL arm
  * (the same bytes with no guard: the work really stalls, or the page really grows a cost) and a TREATMENT arm (refused,
  * closed 1013, or the page drained to compact, within the bound). Timed vectors run the real vm deadline at a small
- * T, sized so the unguarded control takes several times T on any runner.
+ * T, sized so the unguarded control takes several times T on any runner. Costs are measured in the worker's CPU time
+ * (`processCpuMs`), never wall time: on a shared CI runner (#567) a wait for a core is not Yjs work, and a ratio of two
+ * wall times measured minutes apart is the runner's load, not the vector's.
  */
 const REFUSED = (rule: string) => `ccc:collab-update-refused:${rule}`;
 const TRY_LATER = 'try-later';
 const COMPACTING = 'compacting';
-const ms = () => performance.now();
+const ms = processCpuMs;
 
 type Conn = { readOnly: boolean; webSocket: { close: jest.Mock }; context: { user: { id: string } }; params: URLSearchParams };
 
@@ -54,6 +56,7 @@ function setup(seed: Y.Doc | null, opts: CollabGuardOptions = {}) {
     mode: 'enforce',
     logger: { warn: (m: string) => logs.push(m) },
     limitLog: new SocketLimitLog({ warn: (m: string) => limitLogs.push(m) }),
+    cpuNow: processCpuMs, // the budget charged in CPU time: a busy runner's waits are no user's debt
     ...opts,
   });
   const conn = (id: string, readOnly = false, query = ''): Conn => {
@@ -80,7 +83,7 @@ function setup(seed: Y.Doc | null, opts: CollabGuardOptions = {}) {
   return { live, guard, logs, limitLogs, conn, deliver, send, state };
 }
 
-/** A copy of `doc` with `update` applied, no guard: the control arm. Returns the apply's wall time. */
+/** A copy of `doc` with `update` applied, no guard: the control arm. Returns the apply's CPU time, ms. */
 function unguarded(doc: Y.Doc, update: Uint8Array): number {
   const copy = new Y.Doc();
   Y.applyUpdate(copy, Y.encodeStateAsUpdate(doc));
@@ -179,15 +182,27 @@ describe('#827 (a) formatting cleanup after a remote delete: an 8-byte frame, se
 
   it('treatment: cut at T, the first time 1013 frame_deadline, the repeat 4422 apply-deadline; live never applies it', () => {
     const { doc, frame } = build();
-    const s = setup(doc, { deadlines: { frame: FRAME_MS } });
+    // The real vm deadline, recorded: which bound each run had and whether the vm cut it
+    const runs: Array<{ ms: number; cut: boolean }> = [];
+    const recorded: DeadlineRunner = (fn, bound) => {
+      try {
+        const out = runWithDeadline(fn, bound);
+        runs.push({ ms: bound, cut: false });
+        return out;
+      } catch (err) {
+        runs.push({ ms: bound, cut: isDeadlineExceeded(err) });
+        throw err;
+      }
+    };
+    const s = setup(doc, { deadlines: { frame: FRAME_MS }, runWithDeadline: recorded });
     const before = s.state();
-    let t0 = ms();
     expect(s.send(s.conn('vandal'), frame)).toBe(TRY_LATER);
-    expect(ms() - t0).toBeLessThan(unguarded(doc, frame)); // cut, never paid in full
+    // cut, never paid in full: the frame's apply ran under T and the vm stopped it (the control runs it to the end)
+    expect(runs.filter((r) => r.cut)).toEqual([{ ms: FRAME_MS, cut: true }]);
     expect(s.limitLogs.some((l) => l.includes('"limit":"frame_deadline"'))).toBe(true);
     // the provider reconnects and resends the same Step2: deterministic, so now a refusal
-    t0 = ms();
     expect(s.send(s.conn('vandal'), frame)).toBe(REFUSED('apply-deadline'));
+    expect(runs.filter((r) => r.cut)).toEqual([{ ms: FRAME_MS, cut: true }, { ms: FRAME_MS, cut: true }]);
     expect(s.state().equals(before)).toBe(true);
     // another user's honest edit still passes (the discarded shadow is rebuilt)
     expect(s.send(s.conn('peer'), editAs(s.live, 77, (d) => textOf(d).insert(0, 'k')))).toBe('applied');
@@ -419,8 +434,10 @@ describe('#827 the struct and children caps (an honest select-all over a huge pa
       return unguarded(doc, frame);
     };
     cost(1000); // warm
-    const small = Math.max(0.5, cost(2_000));
-    expect(cost(16_000)).toBeGreaterThan(8 * small); // 8x the children, more than 8x the time
+    // CPU time, the least of three runs each: a GC pause or a burst on the runner only ever adds to one run
+    const least = (n: number) => Math.min(cost(n), cost(n), cost(n));
+    const small = Math.max(0.5, least(2_000));
+    expect(least(16_000)).toBeGreaterThan(8 * small); // 8x the children, more than 8x the time
   });
 
   it('a frame adding a child past the children cap is page-full and drains nothing (compaction keeps every live child); a delete over the cap passes', () => {

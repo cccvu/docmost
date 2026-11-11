@@ -48,12 +48,14 @@ import { isDeadlineExceeded, runWithDeadline } from '../collab-ingress/deadline'
 import {
   COMPACTION_DEADLINE_MS,
   C_MAX,
+  E_MAX,
   LOAD_DEADLINE_MS,
   S_MAX,
   W_MAX,
   softCap,
 } from '../collab-ingress/doc-bounds';
 import { COLLAB_PAGE_COMPACTING_REASON, pageCompactingRefusal } from '../collab-ingress/collab-reasons';
+import { compactionWouldHelp, liveStructure, type LiveStructure } from '../collab-ingress/live-structure';
 import {
   canStartCompaction,
   clearCompacting,
@@ -198,8 +200,16 @@ export interface LoadBounds {
   steps: number;
   /** The vm backstop, ms. */
   deadlineMs: number;
+  /** The page structure caps the loaded page is held to (LOAD_CAPS unless a spec passes smaller ones). */
+  caps?: LoadCaps;
 }
-export const LOAD_BOUNDS: LoadBounds = Object.freeze({ steps: W_MAX, deadlineMs: LOAD_DEADLINE_MS });
+export interface LoadCaps {
+  structs: number;
+  clientIds: number;
+  children: number;
+}
+const LOAD_CAPS: LoadCaps = Object.freeze({ structs: S_MAX, clientIds: C_MAX, children: E_MAX });
+export const LOAD_BOUNDS: LoadBounds = Object.freeze({ steps: W_MAX, deadlineMs: LOAD_DEADLINE_MS, caps: LOAD_CAPS });
 
 /**
  * Seam #122: apply a page's stored ydoc into the loading Hocuspocus `document`, bounded. Replaces upstream's
@@ -248,24 +258,49 @@ export function loadStoredYdoc(
   markRowCovered(document, bytes); // #731: the next store's reconcile of these bytes is a no-op
   const stats: LoadStats = { ...countStructs(document), steps: scan.steps, ms, generation: storeGenerationOf(document) };
   loadStats.set(document, stats);
-  requestIfOverSoftCaps(document, pageId, stats, bounds.steps);
+  requestIfOverSoftCaps(document, pageId, stats, bounds.steps, bounds.caps ?? LOAD_CAPS);
 }
 
-/** A loaded page past a soft cap is compacted at its next unload; past a hard cap it drains now. */
-function requestIfOverSoftCaps(document: Y.Doc, pageId: string, stats: LoadStats, stepCap: number): void {
+/**
+ * A loaded page past a soft cap is compacted at its next unload; past a hard cap it drains now. The update guard's rule
+ * (`checkCaps`, `measured`): the step caps always (compaction rewrites the struct order, which is what the walk costs);
+ * the structs and client-id caps only when compaction would bring the page under the soft caps (`compactionWouldHelp`
+ * on its live structure, measured only then): a page whose visible content is too big is never drained, or queued, for
+ * a compaction that keeps it over.
+ */
+function requestIfOverSoftCaps(
+  document: Y.Doc,
+  pageId: string,
+  stats: LoadStats,
+  stepCap: number,
+  caps: LoadCaps,
+): void {
   const measured: Array<[CompactionReason, number, number]> = [
-    ['structs', stats.structs, S_MAX],
-    ['client_ids', stats.clients, C_MAX],
+    ['structs', stats.structs, caps.structs],
+    ['client_ids', stats.clients, caps.clientIds],
     ['load_steps', stats.steps, stepCap],
   ];
-  const over = measured.filter(([, n, cap]) => n >= softCap(cap));
+  let over = measured.filter(([, n, cap]) => n >= softCap(cap));
   if (over.length === 0) return;
+  let live: LiveStructure | undefined;
+  if (over.some(([reason]) => reason !== 'load_steps')) {
+    live = liveStructure(document); // O(structs), as the load just was; only for a page past a soft cap
+    if (!compactionWouldHelp(live, caps)) over = over.filter(([reason]) => reason === 'load_steps');
+    if (over.length === 0) return;
+  }
   const request: CompactionRequest = {
     reason: over[0][0],
     userId: null,
     drain: over.some(([, n, cap]) => n >= cap),
   };
-  if (requestCompaction(document, request)) logCompactionRequested(pageId, request, { structs: stats.structs, clientIds: stats.clients, steps: stats.steps });
+  if (requestCompaction(document, request)) {
+    logCompactionRequested(pageId, request, {
+      structs: stats.structs,
+      clientIds: stats.clients,
+      steps: stats.steps,
+      ...(live ? { liveStructs: live.structs, liveChildren: live.children } : {}),
+    });
+  }
 }
 
 // --- the unload (seam #122)
@@ -615,8 +650,14 @@ export function buildCompacted(
   }
 }
 
-/** The digest of `json` as the server schema reads it (defaults filled in, unknown attributes dropped). */
-const schemaDigest = (json: unknown): string => stableHash(serverSchema().nodeFromJSON(json).toJSON());
+/**
+ * The digest of `json` as the server schema reads it (defaults filled in, unknown attributes dropped). ProseMirror's
+ * `toJSON` hands out a node type's ONE defaultAttrs object for every node built without attrs, and stableStringify
+ * writes an object it has already seen as null; so the JSON is copied first (a tree again), or two attrs-less
+ * paragraphs in a row's content would never match the rebuilt page and the page could never compact.
+ */
+const schemaDigest = (json: unknown): string =>
+  stableHash(JSON.parse(JSON.stringify(serverSchema().nodeFromJSON(json).toJSON())));
 
 // --- the store
 

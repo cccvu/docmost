@@ -99,10 +99,11 @@ export const C_MAX = 20_000;
  */
 export const E_MAX = 14_000;
 /**
- * Walk steps (the #816 meter's count) of a full load: ~0.6 s of Yjs at 88–95 ns per step (about 1.1 s with the meter
- * counting, before it trips). An honest page at the caps walks 40k; the inversion attack grows as M·N.
+ * Walk steps (the #816 meter's count) of a full load: ~0.3 s of Yjs at 88–95 ns per step (6M measured 1.2 s live with
+ * the meter counting before it tripped, so 3M keeps a refused load near 0.6 s). An honest page at the caps walks 40k
+ * (75× headroom); the inversion attack grows as M·N.
  */
-export const W_MAX = 6_000_000;
+export const W_MAX = 3_000_000;
 /**
  * Past this fraction of a cap, compaction is requested for the next unload; at the hard cap, the page drains and
  * compacts. Either only when compaction would bring the page back under this fraction of every cap (its live structs

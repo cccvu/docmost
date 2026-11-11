@@ -13,8 +13,36 @@ import { initProseMirrorDoc } from '@tiptap/y-tiptap';
 import { TiptapTransformer } from '@hocuspocus/transformer';
 import type { Hocuspocus } from '@hocuspocus/server';
 import { serverSchema } from '../page-write/prelim-content';
+import { deadlineExceeded, runWithDeadline, type DeadlineRunner } from './deadline';
 
 export const DOC_NAME = 'page.00000000-0000-4000-8000-000000000781';
+
+/**
+ * #827: the CPU this jest worker ran, in ms (user + system, every thread of the process). The guard charges its CPU
+ * budget and decides its deadlines on wall time, which on a production task (one process, its own vCPUs) is the
+ * work's cost. On a shared CI runner (`--maxWorkers=2` on mixed tiers, #567) wall time also counts the time the worker
+ * waited for a core, so a spec that asserts an honest frame fits a bound measures the frame in CPU time instead: a
+ * slower CPU still costs more and still fails, a busy neighbour no longer does.
+ */
+export const processCpuMs = (): number => {
+  const u = process.cpuUsage();
+  return (u.user + u.system) / 1000;
+};
+
+/**
+ * #827: the guard's deadline runner for specs asserting honest work fits the PRODUCTION deadlines: the real vm deadline
+ * still runs (at `wallSlack` × the bound, so runaway work is still cut), and work that finished is the guard's timeout
+ * when it used more than the bound in CPU time (`processCpuMs`). Same verdict as production's for an honest frame on a
+ * host with a free core; never a looser bound on the work itself.
+ */
+export function cpuTimeDeadline(wallSlack = 10): DeadlineRunner {
+  return <T>(fn: () => T, ms: number): T => {
+    const started = processCpuMs();
+    const result = runWithDeadline(fn, ms * wallSlack);
+    if (processCpuMs() - started > ms) throw deadlineExceeded(ms);
+    return result;
+  };
+}
 
 /** Hocuspocus 4.7.1 message types (`types.ts` MessageType) and y-protocols sync subtypes. */
 export const MSG = { Sync: 0, Awareness: 1, Auth: 2, QueryAwareness: 3, SyncReply: 4, Stateless: 5, BroadcastStateless: 6, Close: 7, SyncStatus: 8 } as const;

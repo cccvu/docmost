@@ -44,7 +44,7 @@ export function logPageCompaction(
 export function logCompactionRequested(
   pageId: string | null,
   request: CompactionRequest,
-  counts: { structs?: number; clientIds?: number; steps?: number } | null,
+  counts: { structs?: number; clientIds?: number; steps?: number; liveStructs?: number; liveChildren?: number } | null,
   sink: CompactionLogSink = defaultSink,
 ): void {
   logPageCompaction(

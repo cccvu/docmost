@@ -96,10 +96,12 @@ describe('#827 sizing: the bounds keep their margins over the measured honest wo
     expect(MIRROR_DEADLINE_MS).toBeGreaterThanOrEqual(T_FRAME_MS);
   });
 
-  it('W_MAX is about 0.6 s of load steps, far above an honest page and below the inversion that stalls', () => {
-    expect(W_MAX).toBe(6_000_000);
-    expect((W_MAX * NODE22.loadNsPerStep) / 1e6).toBeLessThan(700);
-    expect(W_MAX).toBeGreaterThanOrEqual(100 * NODE22.honestLoadSteps);
+  it('W_MAX is about 0.3 s of load steps (a refused load ~0.6 s metered), far above an honest page and below the inversion that stalls', () => {
+    expect(W_MAX).toBe(3_000_000);
+    expect((W_MAX * NODE22.loadNsPerStep) / 1e6).toBeLessThan(350);
+    // a refused load runs metered, about 2× the unmetered step cost (6M measured 1.2 s live): keep it under ~0.7 s
+    expect((W_MAX * 2 * NODE22.loadNsPerStep) / 1e6).toBeLessThan(700);
+    expect(W_MAX).toBeGreaterThanOrEqual(70 * NODE22.honestLoadSteps); // ~75× an honest page at the caps
     expect(W_MAX).toBeLessThan(NODE22.attackC4000Steps);
     expect(W_MAX).toBeGreaterThanOrEqual(CONFLICT_SCAN_STEPS_PER_FRAME); // a page that took one accepted frame loads
     expect((W_MAX * 2 * NODE22.loadNsPerStep) / 1e6).toBeLessThan(LOAD_DEADLINE_MS); // the meter trips first, metered

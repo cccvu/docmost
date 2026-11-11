@@ -2,7 +2,17 @@ import * as Y from 'yjs';
 import { initProseMirrorDoc, updateYFragment } from '@tiptap/y-tiptap';
 import { Node as PMNode } from '@tiptap/pm/model';
 import { serverSchema } from '../page-write/prelim-content';
-import { awarenessFrame, contentOf, DOC_NAME, renderLikeABrowser, step1Frame, SYNC, syncFrame } from './collab-ingress.testkit';
+import {
+  awarenessFrame,
+  contentOf,
+  cpuTimeDeadline,
+  DOC_NAME,
+  processCpuMs,
+  renderLikeABrowser,
+  step1Frame,
+  SYNC,
+  syncFrame,
+} from './collab-ingress.testkit';
 import { basePage, rawUpdate, unguardedSteps, type RawStruct } from './conflict-scan.testkit';
 import { compactionRequest } from '../page-write/compaction-registry';
 import { PAGE_MAX_YDOC_BYTES } from '../page-write/page-size';
@@ -17,9 +27,11 @@ import { COLLAB_REFUSAL_CODE, COLLAB_TRY_LATER_CODE, CollabUpdateGuard, USER_COL
  * session's unsent edits (a page's local copy) under a new client id, and latency both ways. Every frame goes through a
  * real CollabUpdateGuard in enforce mode before it applies: zero refusals, zero 1013s, and every peer converges.
  *
- * The CPU budget is charged on the real CPU clock (`performance.now`) while the wall clock is simulated (200 ms per op,
- * slower than people type in bursts, faster than they type on average), so the corpus also shows how far an honest
- * session stays from the debt: the lowest balance any user reached is asserted with a wide margin (ADR 0036 §6).
+ * The CPU budget is charged on the real CPU clock (the worker's own CPU time, `processCpuMs`, and the deadlines decided
+ * on it: `cpuTimeDeadline`; a shared CI runner's waits for a core are not the work's cost, #567) while the wall clock
+ * is simulated (200 ms per op, slower than people type in bursts, faster than they type on average), so the corpus
+ * also shows how far an honest session stays from the debt: the lowest balance any user reached is asserted with a
+ * wide margin (ADR 0036 §6).
  */
 const schema = serverSchema();
 const SEEDS = 8;
@@ -58,7 +70,8 @@ function harness(seed: number) {
     logger: { warn: (m: string) => refusals.push(m) },
     limitLog: new SocketLimitLog({ warn: (m: string) => refusals.push(m) }),
     now: () => now,
-    cpuNow: () => performance.now(),
+    cpuNow: processCpuMs,
+    runWithDeadline: cpuTimeDeadline(),
   });
   const peers: Peer[] = [];
   const results = { frames: 0, refused: [] as string[], lowestBalance: Infinity };
@@ -335,10 +348,13 @@ describe('#827 honest work at the caps is never refused', () => {
     live.getConnections = () => [];
     if (seed) Y.applyUpdate(live, Y.encodeStateAsUpdate(seed));
     const lines: string[] = [];
+    // The production bounds, held in CPU time (the worker's own: a busy CI runner's waits are not the frame's cost)
     const guard = new CollabUpdateGuard({
       mode: 'enforce',
       logger: { warn: (m: string) => lines.push(m) },
       limitLog: new SocketLimitLog({ warn: (m: string) => lines.push(m) }),
+      cpuNow: processCpuMs,
+      runWithDeadline: cpuTimeDeadline(),
     });
     const conn = (id: string): Conn => ({ readOnly: false, webSocket: { close: () => undefined }, context: { user: { id } } });
     const send = (c: Conn, update: Uint8Array, subtype: number = SYNC.Update): string => {

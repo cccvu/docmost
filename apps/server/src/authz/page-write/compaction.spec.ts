@@ -9,6 +9,7 @@ import { COLLAB_PAGE_COMPACTING_REASON } from '../collab-ingress/collab-reasons'
 import { ConflictScan, installConflictScanMeter } from '../collab-ingress/conflict-scan';
 import { deadlineExceeded, overrideDeadlineForTests } from '../collab-ingress/deadline';
 import { rawUpdate } from '../collab-ingress/conflict-scan.testkit';
+import { liveStructure } from '../collab-ingress/live-structure';
 import {
   assertDocWritable,
   buildCompacted,
@@ -55,6 +56,7 @@ import { coveredRowDigest, markRowCovered } from './reconcile-store';
 import { stableHash } from './stable-hash';
 import { hasStoreFailure, markStoredAt, storeGenerationOf } from './store-failure-registry';
 import { storeSafeJson } from './store-safe-json';
+import { serverSchema } from './prelim-content';
 import { recordWriteKey, WRITE_IDEM_MAP } from './write-idem';
 import { PageTooLargeException } from './page-size';
 
@@ -420,6 +422,82 @@ describe('loadStoredYdoc (#827): the bounded load', () => {
     loadStoredYdoc(exact, nextPageId(), bytes, memoryStore(null), { steps, deadlineMs: 60_000 });
     expect(compactionRequest(exact)).toEqual({ reason: 'load_steps', userId: null, drain: true });
   });
+
+  describe('the structure caps follow the update guard: only when compaction would bring the page under the soft caps', () => {
+    const STEPS = 1e9; // never the reason here
+    const load = (bytes: Uint8Array, caps: { structs: number; clientIds: number; children: number }) => {
+      const doc = new Y.Doc();
+      loadStoredYdoc(doc, nextPageId(), bytes, memoryStore(null), { steps: STEPS, deadlineMs: 60_000, caps });
+      return doc;
+    };
+    // A page whose history is most of it: every round deleted the whole page and wrote it again (and added a client id).
+    const churned = churnedPage(10);
+    const churnedBytes = Y.encodeStateAsUpdate(churned);
+    const total = countStructs(churned);
+    const live = liveStructure(churned);
+    // A page with no history at all: every struct is visible, so compaction would keep every one.
+    const fresh = toYdoc({ type: 'doc', content: Array.from({ length: 40 }, (_, i) => para(text(`p${i}`, [{ type: 'bold' }]), text(' x'))) });
+    const freshBytes = Y.encodeStateAsUpdate(fresh);
+    const freshTotal = countStructs(fresh);
+    const roomy = 1e9;
+
+    it('the fixtures are what the cases need (anti-vacuity)', () => {
+      expect(live.structs).toBeLessThan(Math.floor(total.structs * 0.8)); // under a soft cap set at the total
+      expect(total.clients).toBeGreaterThanOrEqual(10);
+      expect(liveStructure(fresh).structs).toBe(freshTotal.structs);
+      expect(liveStructure(fresh).children).toBe(40);
+    });
+
+    it('history past the structs cap: requested (and drained at the hard cap), with the live counts logged', () => {
+      const lines: string[] = [];
+      const spy = jest.spyOn(Logger.prototype, 'warn').mockImplementation((m: unknown) => void lines.push(String(m)));
+      try {
+        const hard = load(churnedBytes, { structs: total.structs, clientIds: roomy, children: roomy });
+        expect(compactionRequest(hard)).toEqual({ reason: 'structs', userId: null, drain: true });
+        const soft = load(churnedBytes, { structs: Math.ceil(total.structs / 0.9), clientIds: roomy, children: roomy });
+        expect(compactionRequest(soft)).toEqual({ reason: 'structs', userId: null, drain: false });
+      } finally {
+        spy.mockRestore();
+      }
+      expect(lines.some((l) => l.includes('"event":"requested"') && l.includes(`"liveStructs":${live.structs}`))).toBe(true);
+    });
+
+    it('history past the client-ids cap: requested (compaction leaves one id)', () => {
+      const doc = load(churnedBytes, { structs: roomy, clientIds: total.clients, children: roomy });
+      expect(compactionRequest(doc)).toEqual({ reason: 'client_ids', userId: null, drain: true });
+    });
+
+    it('visible content past the structs cap: neither requested nor drained (compaction would keep every struct)', () => {
+      expect(compactionRequest(load(freshBytes, { structs: freshTotal.structs, clientIds: roomy, children: roomy }))).toBeNull();
+      expect(compactionRequest(load(freshBytes, { structs: Math.ceil(freshTotal.structs / 0.9), clientIds: roomy, children: roomy }))).toBeNull();
+    });
+
+    it('history past a cap but live children past the soft children cap: not requested (compaction keeps every child)', () => {
+      const children = live.children;
+      expect(children).toBeGreaterThan(1);
+      const caps = { structs: total.structs, clientIds: total.clients, children: Math.ceil(children / 0.8) };
+      expect(compactionRequest(load(churnedBytes, caps))).toBeNull();
+      // One child of headroom more and it helps again: the children bound is what decided.
+      expect(compactionRequest(load(churnedBytes, { ...caps, children: Math.ceil(children / 0.8) + 2 }))).toEqual({
+        reason: 'structs',
+        userId: null,
+        drain: true,
+      });
+    });
+
+    it('the step caps still request whatever the live structure (compaction rewrites the struct order)', () => {
+      const bytes = inverted(); // every struct visible: past a structs cap compaction would not help
+      const structs = countStructs((() => { const d = new Y.Doc(); Y.applyUpdate(d, bytes); return d; })()).structs;
+      const doc = new Y.Doc();
+      loadStoredYdoc(doc, nextPageId(), bytes, memoryStore(null), {
+        steps: Math.ceil(loadSteps(bytes) / 0.9),
+        deadlineMs: 60_000,
+        caps: { structs, clientIds: roomy, children: roomy },
+      });
+      expect(liveStructure(doc).structs).toBe(structs);
+      expect(compactionRequest(doc)).toEqual({ reason: 'load_steps', userId: null, drain: false });
+    });
+  });
 });
 
 describe('compactOnUnload (#827)', () => {
@@ -627,6 +705,22 @@ describe('compactFromRow (#827): the row content is the source', () => {
     const loaded = new Y.Doc();
     Y.applyUpdate(loaded, store.row!.ydoc!);
     expect(TiptapTransformer.fromYdoc(loaded, 'default')).toMatchObject({ content: [{ type: 'paragraph', content: [{ text: 'x' }] }] });
+  });
+
+  it('content with several nodes of a type and no attrs (API content, stored verbatim) compacts: shared defaults are no cycle', async () => {
+    // ProseMirror gives every node built without attrs its type's ONE defaultAttrs object, and toJSON hands that object
+    // out as is; stableStringify collapses an object it has seen before to null. Found live (yjs-adversarial inversion
+    // --pairs 4): the page tripped its load, its row compaction failed digest_mismatch, and it stayed try-later for good.
+    const para = (text: string) => ({ type: 'paragraph', content: [{ type: 'text', text }] });
+    const raw = { type: 'doc', content: [para('a'), para('b'), para('c')] };
+    const pm = serverSchema().nodeFromJSON(raw).toJSON() as { content: Array<{ attrs: unknown }> };
+    expect(pm.content[0].attrs).toBe(pm.content[1].attrs); // anti-vacuity: the defaults object is shared
+    const bytes = Y.encodeStateAsUpdate(toYdoc(raw));
+    const store = memoryStore({ content: raw, ydoc: bytes, contentHash: md5(raw) });
+    await expect(compactFromRow(store, nextPageId(), 'load_trip')).resolves.toBe('done');
+    const loaded = new Y.Doc();
+    Y.applyUpdate(loaded, store.row!.ydoc!);
+    expect(TiptapTransformer.fromYdoc(loaded, 'default')).toMatchObject({ content: [para('a'), para('b'), para('c')] });
   });
 
   it('content the schema cannot read aborts: nothing written', async () => {

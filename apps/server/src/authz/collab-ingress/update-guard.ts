@@ -92,6 +92,7 @@ import { ConflictScan, installConflictScanMeter, type ConflictScanMeter } from '
 import { COLLAB_PAGE_COMPACTING_REASON, epochStaleReason } from './collab-reasons';
 import { COLLAB_PAGE_COMPACTION_TOKEN, logCompactionRequested, type CompactionLogSink } from './compaction-log';
 import { isDeadlineExceeded, runWithDeadline, type DeadlineRunner } from './deadline';
+import { compactionWouldHelp, liveStructure } from './live-structure';
 import {
   C_MAX,
   COMPACTION_MIN_INTERVAL_MS,
@@ -871,9 +872,8 @@ export class CollabUpdateGuard {
    * again). O(1).
    */
   private compactionHelps(doc: DocGuard, frameStructs = 0, frameChildren = 0): boolean {
-    const liveStructs = doc.liveStructs + Math.max(0, doc.structs - doc.structsAtMeasure) + frameStructs;
-    const liveChildren = Math.max(doc.liveChildren, frameChildren);
-    return liveStructs < softCap(this.caps.structs) && liveChildren < softCap(this.caps.children);
+    const structs = doc.liveStructs + Math.max(0, doc.structs - doc.structsAtMeasure) + frameStructs;
+    return compactionWouldHelp({ structs, children: Math.max(doc.liveChildren, frameChildren) }, this.caps);
   }
 
   /** #827: measure what a compaction of `shadow` (the page, exactly) would keep. O(structs); never on the frame path. */
@@ -1629,26 +1629,6 @@ function structCount(store: Y.Doc['store']): number {
   return n;
 }
 const lengthOf = (store: Y.Doc['store'], client: number): number => store.clients.get(client)?.length ?? 0;
-
-/**
- * #827: what a compaction of `doc` keeps: its live (non-deleted) structs, and the most live children of one element
- * (the `default` root included; the children cap's count). Pure reads, O(structs): an explicit stack, never recursion.
- */
-export function liveStructure(doc: Y.Doc): { structs: number; children: number } {
-  let structs = 0;
-  for (const array of doc.store.clients.values()) for (const struct of array) if (!struct.deleted) structs++;
-  let children = 0;
-  const root = doc.share.get('default');
-  const stack: Y.AbstractType<any>[] = root ? [root] : [];
-  while (stack.length) {
-    const type = stack.pop()!;
-    children = Math.max(children, type._length);
-    for (let item = type._start; item !== null; item = item.right) {
-      if (!item.deleted && item.content instanceof Y.ContentType && kindOf(item.content.type) === 'element') stack.push(item.content.type);
-    }
-  }
-  return { structs, children };
-}
 
 /** #827: the lineage epoch a connection's client claims for its copy (`?cccEpoch`); absent = 0, malformed = NaN. */
 function clientEpoch(params: GuardFrame['requestParameters']): number {
