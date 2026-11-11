@@ -10,15 +10,12 @@
  * COLLAB_AUTH_BURST, refill COLLAB_AUTH_REFILL_PER_SECOND. One process-wide Map; a bucket that has refilled to full
  * carries no state, so a sweep (at most once a minute) drops those.
  *
- * An empty bucket throws `{ reason }` with no `message`: Hocuspocus logs `error.message` of a failed hook (4.7.1
- * `Hocuspocus.hooks`), and this is logged once, rate-limited, as `COLLAB_SOCKET_LIMIT` instead. Hocuspocus answers
- * the client with permission-denied carrying the reason, which the editor treats as any other refusal (collab-access.ts:
- * refetch the token once, then the connection-lost state).
+ * An empty bucket is refused with COLLAB_AUTH_RATE_REASON (auth-refusal.ts: no `message`, so Hocuspocus logs
+ * nothing), logged once, rate-limited, as `COLLAB_SOCKET_LIMIT {"limit":"auth_rate"}`.
  */
+import { COLLAB_AUTH_RATE_REASON, collabAuthRefusal } from './auth-refusal';
 import { COLLAB_AUTH_BURST, COLLAB_AUTH_REFILL_PER_SECOND } from './limits';
 import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
-
-export const COLLAB_AUTH_RATE_REASON = 'ccc:collab-auth-rate-limited';
 
 interface Bucket {
   tokens: number;
@@ -65,18 +62,5 @@ const processRate = new CollabAuthRate();
 
 /** Charge one collab authentication to `userId`; throws `{ reason }` (no `message`) when the user is over the rate. */
 export function chargeCollabAuth(userId: string): void {
-  if (!processRate.charge(String(userId))) throw { reason: COLLAB_AUTH_RATE_REASON };
-}
-
-/**
- * The refusal for a collab token that does not verify (authentication.extension.ts, seam #213): `{ reason }` with no
- * `message`, so Hocuspocus logs nothing (it logs `error.message` of a failed hook, once per attempt, and a token that
- * does not verify never reaches the per-user rate). The reason is the one Hocuspocus sends for a refusal that names
- * none (4.7.1 `ClientConnection`: `error.reason ?? "permission-denied"`), so the client sees what it saw before; the
- * editor decides "expired?" from the token it sent, never from the reason (page-editor.tsx, collab-access.ts). How
- * many times one socket may try is bounded by its Auth frames (frame-address.ts).
- */
-export const COLLAB_INVALID_TOKEN_REASON = 'permission-denied';
-export function invalidCollabTokenRefusal(): { reason: string } {
-  return { reason: COLLAB_INVALID_TOKEN_REASON };
+  if (!processRate.charge(String(userId))) throw collabAuthRefusal(COLLAB_AUTH_RATE_REASON);
 }

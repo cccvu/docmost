@@ -2,7 +2,7 @@ import * as decoding from 'lib0/decoding';
 import { Hocuspocus } from '@hocuspocus/server';
 import { UnauthorizedException } from '@nestjs/common';
 import { authFrame, FakeSocket, MSG } from './collab-ingress.testkit';
-import { COLLAB_INVALID_TOKEN_REASON, invalidCollabTokenRefusal } from './auth-rate';
+import { COLLAB_INVALID_TOKEN_REASON, invalidCollabTokenRefusal } from './auth-refusal';
 import { admitCollabFrame } from './frame-admission';
 import { COLLAB_AUTH_FRAMES_PER_SOCKET } from './limits';
 import { SocketLimitLog } from './socket-limit-log';

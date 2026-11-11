@@ -10,9 +10,9 @@ import { AuthenticationExtension } from '../../collaboration/extensions/authenti
 import { authFrame, FakeSocket, MSG, readServerFrame } from './collab-ingress.testkit';
 import { COLLAB_CONNECTIONS_PER_USER } from './limits';
 import { SocketLimitLog } from './socket-limit-log';
+import { COLLAB_USER_CONNECTIONS_REASON } from './auth-refusal';
 import {
   admitCollabUserConnection,
-  COLLAB_USER_CONNECTIONS_REASON,
   CollabUserConnections,
   CollabUserConnectionsExtension,
 } from './user-connections';

@@ -17,7 +17,8 @@ import { getPageId } from '../collaboration.util';
 import { JwtCollabPayload, JwtType } from '../../core/auth/dto/jwt-payload';
 import { UserSessionRepo } from '@docmost/db/repos/session/user-session.repo';
 import { isWsConnectionLive } from '../../authz/ws-connection/ws-connection-live';
-import { chargeCollabAuth, invalidCollabTokenRefusal } from '../../authz/collab-ingress/auth-rate';
+import { chargeCollabAuth } from '../../authz/collab-ingress/auth-rate';
+import { invalidCollabTokenRefusal } from '../../authz/collab-ingress/auth-refusal';
 import { admitCollabUserConnection } from '../../authz/collab-ingress/user-connections';
 
 @Injectable()

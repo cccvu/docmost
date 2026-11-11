@@ -6,7 +6,8 @@ jest.mock('../../collaboration/collaboration.util', () => ({
 
 import { Logger, UnauthorizedException } from '@nestjs/common';
 import { AuthenticationExtension } from '../../collaboration/extensions/authentication.extension';
-import { COLLAB_AUTH_RATE_REASON, COLLAB_INVALID_TOKEN_REASON, CollabAuthRate } from './auth-rate';
+import { CollabAuthRate } from './auth-rate';
+import { COLLAB_AUTH_RATE_REASON, COLLAB_INVALID_TOKEN_REASON } from './auth-refusal';
 import { COLLAB_AUTH_BURST } from './limits';
 import { SocketLimitLog } from './socket-limit-log';
 

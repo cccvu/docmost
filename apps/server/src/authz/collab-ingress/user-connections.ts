@@ -16,18 +16,17 @@
  * - the `connected` hook: authentications run concurrently, so several can pass that check together; one that would
  *   take the user past the cap is closed there (`connection.close`, then its socket, which would otherwise stay open
  *   holding no document), and the editor sees a close it reconnects from, to be refused at the first check.
- * A refusal throws `{ reason }` with no `message` (Hocuspocus logs `error.message`), logged once, rate-limited, as
- * `COLLAB_SOCKET_LIMIT {"limit":"user_connections"}`. The editor treats it as any refusal (collab-access.ts: refetch the
+ * A refusal throws COLLAB_USER_CONNECTIONS_REASON (auth-refusal.ts: no `message`, so Hocuspocus logs nothing), logged
+ * once, rate-limited, as `COLLAB_SOCKET_LIMIT {"limit":"user_connections"}`. The editor treats it as any refusal (collab-access.ts: refetch the
  * token once, then the connection-lost state).
  *
  * The extension defines only `connected` and `onDisconnect`, never throws from either (a throw would skip every later
  * extension's hook), and ranks just below the update guard so its `connected` runs before any extension's that awaits.
  */
+import { COLLAB_USER_CONNECTIONS_REASON, collabAuthRefusal } from './auth-refusal';
 import { COLLAB_CONNECTIONS_PER_USER } from './limits';
 import { collabSocketDocuments, type CollabSocketDocuments, type CountedConnection } from './socket-documents';
 import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
-
-export const COLLAB_USER_CONNECTIONS_REASON = 'ccc:collab-user-connections';
 
 export class CollabUserConnections {
   private readonly held = new Map<string, Set<string>>();
@@ -74,7 +73,7 @@ const processConnections = new CollabUserConnections();
 
 /** In `onAuthenticate`: throws `{ reason }` (no `message`) when `userId` already holds the cap. */
 export function admitCollabUserConnection(userId: string, connections: CollabUserConnections = processConnections): void {
-  if (!connections.admit(String(userId))) throw { reason: COLLAB_USER_CONNECTIONS_REASON };
+  if (!connections.admit(String(userId))) throw collabAuthRefusal(COLLAB_USER_CONNECTIONS_REASON);
 }
 
 /** The subset of Hocuspocus 4.7.1's `connected` / `onDisconnect` payloads read here. */
