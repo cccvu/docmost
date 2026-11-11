@@ -170,6 +170,43 @@ describe('#716 content writes against a real Y.Doc', () => {
     Y.applyUpdate(copy, oldState);
     Y.applyUpdate(copy, updates[0]);
     expect(readFragment(copy).content).toEqual(paras('old one', 'old two', 'appended'));
-    expect(copy.getMap(WRITE_IDEM_MAP).has(scopedWriteKey('user-1', 'K'))).toBe(true);
+    expect(copy.getMap(WRITE_IDEM_MAP).has(scopedWriteKey('user-1', 'K').entry)).toBe(true);
+  });
+
+  // #781 lineage (ledger-userid-exposure), end to end through the real handler and a real Y.Doc: the bytes that
+  // every viewer syncs, persist and reload (tombstones included once the entry is pruned) never hold the acting
+  // user's id or the caller's key. Control: a pre-fix raw entry in the same doc DOES show up in the same bytes.
+  it('the persisted state carries neither the user id nor the caller key, and the h1 entry is present', async () => {
+    const KEY = 'attachment-embed:0193b000-0000-7000-8000-0000000000aa';
+    const { doc, handlers } = setup();
+    await expect(
+      handlers.conditionalUpdatePageContent(DOC, {
+        prosemirrorJson: { type: 'doc', content: paras('appended') },
+        operation: 'append',
+        user: USER,
+        idempotencyKey: KEY,
+      }),
+    ).resolves.toEqual({ applied: true });
+    const copy = new Y.Doc(); // what pages.ydoc / a browser's IndexedDB holds
+    Y.applyUpdate(copy, Y.encodeStateAsUpdate(doc));
+    expect(copy.getMap(WRITE_IDEM_MAP).has(scopedWriteKey('user-1', KEY).entry)).toBe(true); // mandatory: not vacuous
+    // Age the entry so the next keyed write prunes it, leaving only its tombstone.
+    doc.getMap<number>(WRITE_IDEM_MAP).set(scopedWriteKey('user-1', KEY).entry, 0);
+    await handlers.conditionalUpdatePageContent(DOC, {
+      prosemirrorJson: { type: 'doc', content: paras('again') },
+      operation: 'append',
+      user: USER,
+      idempotencyKey: 'v2:next',
+    });
+    expect(doc.getMap(WRITE_IDEM_MAP).has(scopedWriteKey('user-1', KEY).entry)).toBe(false); // pruned
+    const state = Buffer.from(Y.encodeStateAsUpdate(doc));
+    expect(state.includes('user-1')).toBe(false);
+    expect(state.includes('attachment-embed')).toBe(false);
+    expect(state.includes('v2:next')).toBe(false);
+    // Control: the same doc with a pre-fix raw entry leaks both, so the assertions above can fail.
+    doc.getMap<number>(WRITE_IDEM_MAP).set(`user-1\u0000${KEY}`, Date.now());
+    const leaked = Buffer.from(Y.encodeStateAsUpdate(doc));
+    expect(leaked.includes('user-1')).toBe(true);
+    expect(leaked.includes('attachment-embed')).toBe(true);
   });
 });
