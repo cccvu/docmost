@@ -68,6 +68,7 @@ function shared(opts: { cap?: number; perAddress?: number; totalBytes?: number; 
     perAddress: opts.perAddress,
     totalBytes: opts.totalBytes,
     socketBytes: opts.socketBytes,
+    readOverhead: 0, // byte arithmetic only; the per-read charge has its own spec (preauth-slots.spec.ts)
     clientKey: (req) => collabClientKey(req, TRUST),
     limitLog: new SocketLimitLog({ warn: opts.warn ?? (() => undefined) }),
   });

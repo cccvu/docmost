@@ -10,7 +10,9 @@ import { authFrame, DOC_NAME, FakeSocket, MSG } from './collab-ingress.testkit';
 import { admitCollabFrame } from './frame-admission';
 import {
   COLLAB_HOCUSPOCUS_OPTIONS,
+  COLLAB_INBOUND_CHUNK_OVERHEAD_BYTES,
   COLLAB_MAX_PAYLOAD_BYTES,
+  COLLAB_WS_SERVER_OPTIONS,
   COLLAB_PREAUTH_AUTH_FRAME_MS,
   COLLAB_PREAUTH_HEADROOM_BYTES,
   COLLAB_PREAUTH_SOCKET_BYTES,
@@ -217,8 +219,8 @@ describe('#790 CollabPreAuthSlots', () => {
 
   it('past the total budget the socket holding the most is cut, not the small honest ones, until the total is under', () => {
     const warn = jest.fn();
-    // per socket 10,000 bytes, all of them together 10,000
-    const slots = new CollabPreAuthSlots({ cap: 8, deadlineMs: 60_000, limitLog: new SocketLimitLog({ warn }), socketBytes: 10_000, closeGraceMs: 2000, totalBytes: 10_000 });
+    // per socket 10,000 bytes, all of them together 10,000; the payload arithmetic only (the per-read charge: below)
+    const slots = new CollabPreAuthSlots({ cap: 8, deadlineMs: 60_000, limitLog: new SocketLimitLog({ warn }), socketBytes: 10_000, closeGraceMs: 2000, totalBytes: 10_000, readOverhead: 0 });
     const honest = [new Sock(), new Sock(), new Sock()];
     const [big1, big2] = [new Sock(), new Sock()];
     const t = new Map<Sock, EventEmitter>();
@@ -242,6 +244,60 @@ describe('#790 CollabPreAuthSlots', () => {
       { limit: 'preauth_total_bytes', bytes: 5000, totalBytes: 10_400 },
       { limit: 'preauth_total_bytes', bytes: 9200, totalBytes: 10_100 },
     ]);
+  });
+
+  describe('#810 the per-read heap: the total charges every TCP read COLLAB_INBOUND_CHUNK_OVERHEAD_BYTES', () => {
+    const OVH = COLLAB_INBOUND_CHUNK_OVERHEAD_BYTES;
+
+    it('is the same constant the post-auth budget charges, and covers a socket at maxBufferedChunks', () => {
+      expect(OVH).toBe(256);
+      // a partial frame in 1-byte reads: ws holds up to maxBufferedChunks reads of about 232 B of heap each (about 15 MB,
+      // socket-bytes.sizing.spec.ts), now charged as more than that, so no slot holds read heap the total does not see
+      expect(COLLAB_WS_SERVER_OPTIONS.maxBufferedChunks * (1 + OVH)).toBeGreaterThan(COLLAB_WS_SERVER_OPTIONS.maxBufferedChunks * 232);
+    });
+
+    it('an honest Auth split into tiny reads is never cut by its own cap: the per-socket count stays bytes only', () => {
+      const warn = jest.fn();
+      const slots = new CollabPreAuthSlots({ cap: 4, deadlineMs: 60_000, limitLog: new SocketLimitLog({ warn }), socketBytes: 1000 });
+      const sock = new Sock();
+      const tr = new EventEmitter();
+      slots.hold(sock, tr as never);
+      for (let i = 0; i < 1000; i++) tr.emit('data', Buffer.alloc(1)); // exactly the per-socket cap, in 1000 reads
+      expect(sock.terminated).toBe(0);
+      expect(slots.bytes).toBe(1000 * (1 + OVH)); // the total sees the reads' heap
+      expect(warn).not.toHaveBeenCalled();
+      slots.release(sock);
+      expect(slots.bytes).toBe(0); // all of it, charge included, leaves with the socket
+    });
+
+    it('a socket trickling a partial frame in 1-byte reads fills the total and is the one cut, not the honest ones', () => {
+      const warn = jest.fn();
+      const slots = new CollabPreAuthSlots({ cap: 8, deadlineMs: 60_000, limitLog: new SocketLimitLog({ warn }), socketBytes: 10_000, totalBytes: 100_000 });
+      const honest = [new Sock(), new Sock(), new Sock()];
+      const trickler = new Sock();
+      const t = new Map<Sock, EventEmitter>();
+      for (const s of [...honest, trickler]) {
+        t.set(s, new EventEmitter());
+        slots.hold(s, t.get(s) as never);
+      }
+      // an Auth, a SyncStep1 and an awareness state, in one read each: more BYTES than the trickler will have sent
+      for (const s of honest) t.get(s)!.emit('data', Buffer.alloc(2000));
+      let reads = 0;
+      while (!trickler.terminated && reads < 10_000) {
+        t.get(trickler)!.emit('data', Buffer.alloc(1));
+        reads += 1;
+      }
+      // 3 x (2000 + 256) + n x 257 > 100,000 first at n = 363: cut after 363 bytes, far under its own 10,000-byte cap
+      // and under each honest socket's 2000 bytes, so the one cut is the one charged the most, not the one with most bytes
+      expect(trickler.terminated).toBe(1);
+      expect(reads).toBe(Math.floor((100_000 - 3 * (2000 + OVH)) / (1 + OVH)) + 1);
+      expect(reads).toBeLessThan(2000);
+      expect(honest.map((s) => s.terminated)).toEqual([0, 0, 0]);
+      expect(slots.bytes).toBe(3 * (2000 + OVH));
+      expect(warn.mock.calls.map((c) => JSON.parse(c[0].replace('COLLAB_SOCKET_LIMIT ', '')))).toEqual([
+        { limit: 'preauth_total_bytes', bytes: reads * (1 + OVH), totalBytes: 3 * (2000 + OVH) + reads * (1 + OVH) },
+      ]);
+    });
   });
 
   it('a page whose SyncStep1 is 1 MiB (about 150,000 client ids) still opens before auth', () => {

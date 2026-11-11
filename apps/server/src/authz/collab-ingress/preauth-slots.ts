@@ -17,6 +17,13 @@
  *   those bytes. One socket past COLLAB_PREAUTH_SOCKET_BYTES is terminated (`preauth_bytes`); and when all of them
  *   together pass COLLAB_PREAUTH_TOTAL_BYTES, the one holding the most is terminated (`preauth_total_bytes`) until the
  *   total is back under, so a client that fills the budget loses its own largest sockets, not the honest small ones.
+ *   The total also charges each read COLLAB_INBOUND_CHUNK_OVERHEAD_BYTES (#810), the heap ws holds per read while it
+ *   assembles a frame, the same constant the post-auth byte budget charges (socket-bytes.ts): without it a socket that
+ *   delivers a partial frame in tiny TCP reads holds up to `maxBufferedChunks` (65,536) reads of about 230 B of heap
+ *   each, about 15 MB, counted as the 64 KiB of bytes it carried. The charge never leaves the socket before it is
+ *   released (a frame ws completed no longer holds its reads, so it over-counts, the safe direction), and it is NOT
+ *   added to the per-socket count: one socket's cap stays bytes only, so an honest Auth, however its reads are split,
+ *   is never cut by it; only the process total, where the socket charged the most is the one cut, sees it.
  * - **Two deadlines** (#810 N1): a socket that has not sent a complete Auth frame COLLAB_PREAUTH_AUTH_FRAME_MS after
  *   it opened is terminated (`preauth_first_auth`). Its FIRST Auth frame (`authArrived`, called by the gateway's frame
  *   check on both paths, before RedisSync or Hocuspocus reads it) moves that deadline, once, to
@@ -47,6 +54,7 @@
  * every `BoundedCollabSocket` releases it to: an adapter and a gateway on different instances would leak every slot.
  */
 import {
+  COLLAB_INBOUND_CHUNK_OVERHEAD_BYTES,
   COLLAB_PREAUTH_AUTH_FRAME_MS,
   COLLAB_PREAUTH_CLOSE_GRACE_MS,
   COLLAB_PREAUTH_DEADLINE_MS,
@@ -76,7 +84,10 @@ type Held = {
   socket: PreAuthSocket;
   timer: ReturnType<typeof setTimeout>;
   detach: () => void;
+  /** Bytes its TCP socket delivered (the per-socket cap). */
   bytes: number;
+  /** What it adds to the process total: `bytes` plus the per-read overhead for every read. */
+  charged: number;
   openedAt: number;
   phase: Phase;
   /** The client address key it counts against, when the share was active at its upgrade. */
@@ -98,8 +109,10 @@ export interface CollabPreAuthSlotsOptions {
   closeGraceMs?: number;
   /** Bytes one unauthenticated socket may deliver: COLLAB_PREAUTH_SOCKET_BYTES. */
   socketBytes?: number;
-  /** Bytes all of them together may deliver: COLLAB_PREAUTH_TOTAL_BYTES. */
+  /** Bytes (and per-read overhead) all of them together may hold: COLLAB_PREAUTH_TOTAL_BYTES. */
   totalBytes?: number;
+  /** Charged to the total for every TCP read, on top of its bytes: COLLAB_INBOUND_CHUNK_OVERHEAD_BYTES. */
+  readOverhead?: number;
   /** Slots one client address may hold: COLLAB_PREAUTH_SOCKETS_PER_ADDRESS. */
   perAddress?: number;
   /** An upgrade's client key, or null while the share is off (CollabClientTrust.keyFor). Absent: always off. */
@@ -120,6 +133,7 @@ export class CollabPreAuthSlots {
   private readonly closeGraceMs: number;
   private readonly socketBytesCap: number;
   private readonly totalBytesCap: number;
+  private readonly readOverhead: number;
   private readonly perAddressCap: number;
   private readonly clientKey: (req: ClientAddressRequest) => ClientKey | null;
   private readonly limitLog: SocketLimitLog;
@@ -131,6 +145,7 @@ export class CollabPreAuthSlots {
     closeGraceMs = COLLAB_PREAUTH_CLOSE_GRACE_MS,
     socketBytes = COLLAB_PREAUTH_SOCKET_BYTES,
     totalBytes = COLLAB_PREAUTH_TOTAL_BYTES,
+    readOverhead = COLLAB_INBOUND_CHUNK_OVERHEAD_BYTES,
     perAddress = COLLAB_PREAUTH_SOCKETS_PER_ADDRESS,
     clientKey = () => null,
     limitLog = collabSocketLimitLog,
@@ -141,6 +156,7 @@ export class CollabPreAuthSlots {
     this.closeGraceMs = closeGraceMs;
     this.socketBytesCap = socketBytes;
     this.totalBytesCap = totalBytes;
+    this.readOverhead = readOverhead;
     this.perAddressCap = perAddress;
     this.clientKey = clientKey;
     this.limitLog = limitLog;
@@ -187,7 +203,9 @@ export class CollabPreAuthSlots {
       const entry = this.held.get(socket);
       if (!entry) return;
       entry.bytes += chunk.length;
-      this.totalBytes += chunk.length;
+      const charge = chunk.length + this.readOverhead;
+      entry.charged += charge;
+      this.totalBytes += charge;
       if (entry.bytes > this.socketBytesCap) {
         this.limitLog.log('preauth_bytes', { bytes: entry.bytes });
         this.cut(entry);
@@ -195,7 +213,7 @@ export class CollabPreAuthSlots {
       while (this.totalBytes > this.totalBytesCap) {
         const largest = this.largest();
         if (!largest) break;
-        this.limitLog.log('preauth_total_bytes', { bytes: largest.bytes, totalBytes: this.totalBytes });
+        this.limitLog.log('preauth_total_bytes', { bytes: largest.charged, totalBytes: this.totalBytes });
         this.cut(largest);
       }
     };
@@ -205,6 +223,7 @@ export class CollabPreAuthSlots {
       timer: this.firstAuthDeadline(socket),
       detach: () => transport?.off('data', onData),
       bytes: 0,
+      charged: 0,
       openedAt: Date.now(),
       phase: 'awaiting_auth',
       key,
@@ -220,7 +239,7 @@ export class CollabPreAuthSlots {
     if (!entry) return;
     clearTimeout(entry.timer);
     entry.detach();
-    this.totalBytes -= entry.bytes;
+    this.totalBytes -= entry.charged;
     this.held.delete(socket);
     if (entry.key !== undefined) {
       const left = (this.perKey.get(entry.key) ?? 1) - 1;
@@ -238,7 +257,7 @@ export class CollabPreAuthSlots {
     return this.perKey.size;
   }
 
-  /** Bytes all unauthenticated sockets hold (specs and diagnostics). */
+  /** What all unauthenticated sockets are charged: their bytes plus the per-read overhead (specs and diagnostics). */
   get bytes(): number {
     return this.totalBytes;
   }
@@ -248,10 +267,10 @@ export class CollabPreAuthSlots {
     entry.socket.terminate();
   }
 
-  /** The unauthenticated socket holding the most bytes (O(slots), only once the total is over its budget). */
+  /** The unauthenticated socket charged the most (O(slots), only once the total is over its budget). */
   private largest(): Held | null {
     let top: Held | null = null;
-    for (const entry of this.held.values()) if (!top || entry.bytes > top.bytes) top = entry;
+    for (const entry of this.held.values()) if (!top || entry.charged > top.charged) top = entry;
     return top;
   }
 

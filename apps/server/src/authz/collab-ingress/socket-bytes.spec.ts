@@ -303,7 +303,7 @@ describe('#810 the inbound partial frame, once authenticated', () => {
     bounds.open(ws as never, { readyState: 1, send: jest.fn(), close: jest.fn() }, (s) => ((bounded = s), { touch: () => undefined }), () => undefined);
     transport.read(300 * KiB); // part of a large frame, before it authenticated
     expect(bytes.total).toBe(0);
-    expect(bounds.preAuth.bytes).toBe(300 * KiB);
+    expect(bounds.preAuth.bytes).toBe(300 * KiB + CHUNK); // the pre-auth total charges the same per-read overhead
     const reply = authenticated();
     bounded.send(reply); // the first Authenticated reply: the slot is freed, the partial frame moves here
     expect(bounds.preAuth.holds(ws)).toBe(false);

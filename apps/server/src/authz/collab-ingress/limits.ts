@@ -46,18 +46,23 @@ export const COLLAB_WS_SERVER_OPTIONS: ServerOptions & { maxFragments: number; m
 export const COLLAB_PREAUTH_HEADROOM_BYTES = 1024 * 1024;
 export const COLLAB_PREAUTH_SOCKET_BYTES = COLLAB_MAX_PAYLOAD_BYTES + COLLAB_PREAUTH_HEADROOM_BYTES;
 /**
- * Bytes ALL unauthenticated sockets together may hold (preauth-slots.ts). Past it, the socket holding the most is
- * terminated, until the total is back under: an honest unauthenticated socket holds a few KiB to a few hundred, so a
- * client that fills the budget loses its own largest sockets first.
+ * Bytes ALL unauthenticated sockets together may hold (preauth-slots.ts), each TCP read charged
+ * COLLAB_INBOUND_CHUNK_OVERHEAD_BYTES on top of its bytes (#810: the heap ws holds per read of a frame it is still
+ * assembling, which a partial frame sent in tiny reads would otherwise hold uncounted). Past it, the socket charged the
+ * most is terminated, until the total is back under: an honest unauthenticated socket holds a few KiB to a few hundred,
+ * so a client that fills the budget loses its own largest sockets first. The per-read charge is not in the per-socket
+ * cap, which stays bytes only, so an honest Auth is never cut by its own count however its reads are split.
  */
 export const COLLAB_PREAUTH_TOTAL_BYTES = 128 * 1024 * 1024;
 /**
  * Unauthenticated collab sockets per process (preauth-slots.ts): past it the upgrade is refused 503. Together they hold
- * at most COLLAB_PREAUTH_TOTAL_BYTES of received bytes (their pre-auth queues and partial frames are both made of them)
- * plus their objects (ws, Hocuspocus, timers: budgeted at 64 KiB each), so at most 128 MiB + 512 x 64 KiB = 160 MiB of
- * native memory. The task is 4096 MiB and its V8 and Go heap caps sum to 3072 MiB (docmost 1024, its conversion worker
- * 1024, platform 512, SpiceDB 512; ecs.tf, check-infra-config §27), so everything outside a heap (Buffers, ws, stacks,
- * code) shares the remaining 1024 MiB; this bound takes under a sixth of it.
+ * at most COLLAB_PREAUTH_TOTAL_BYTES of received bytes and per-read heap (their pre-auth queues and partial frames are
+ * made of those bytes, and ws holds about 232 B of heap per read of a partial frame, charged 256; #810) plus their
+ * objects (ws, Hocuspocus, timers: budgeted at 64 KiB each), so at most 128 MiB + 512 x 64 KiB = 160 MiB, part native
+ * (the bytes) and part V8 heap (the reads, the objects). The task is 4096 MiB and its V8 and Go heap caps sum to
+ * 3072 MiB (docmost 1024, its conversion worker 1024, platform 512, SpiceDB 512; ecs.tf, check-infra-config §27), so
+ * everything outside a heap (Buffers, ws, stacks, code) shares the remaining 1024 MiB: all native, this bound takes
+ * under a sixth of it; all heap, under a sixth of docmost's 1 GiB.
  *
  * Holding the pool: the edge allows each client address 2000 requests per 5 minutes (the WAF's rate rules, on both the
  * proxied and the direct path). The count is per 5-minute window, so one address CAN burst 512 upgrades at once. A socket
@@ -152,6 +157,9 @@ export const COLLAB_OUTBOUND_FRAME_OVERHEAD_BYTES = 512;
  * Heap a TCP read costs on top of its bytes while ws holds it as part of a frame it is still assembling (#810): the
  * Buffer object and ws's chunk list entry. Measured the same way (128-byte reads): 230-232 B on node:22-slim, 238-246 B
  * on Node 24.21. Without it, 65,536 reads of 128 B (`maxBufferedChunks`) hold about 15 MB of heap counted as 8 MiB.
+ * Both byte budgets charge it: COLLAB_SOCKET_TOTAL_BYTES once a socket is authenticated (socket-bytes.ts), and
+ * COLLAB_PREAUTH_TOTAL_BYTES before (preauth-slots.ts), so an unauthenticated socket sending a partial frame in 1-byte
+ * reads is charged 257 B a read, not 1.
  */
 export const COLLAB_INBOUND_CHUNK_OVERHEAD_BYTES = 256;
 /**
