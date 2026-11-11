@@ -6,7 +6,13 @@ import * as Y from 'yjs';
 import { Hocuspocus } from '@hocuspocus/server';
 import { CollabWsAdapter } from '../../collaboration/adapter/collab-ws.adapter';
 import { PAGE_MAX_YDOC_BYTES, PAGE_MAX_YDOC_BYTES_CEILING } from '../page-write/page-size';
-import { COLLAB_HOCUSPOCUS_OPTIONS, COLLAB_MAX_PAYLOAD_BYTES, COLLAB_PREAUTH_SOCKET_BYTES, COLLAB_WS_SERVER_OPTIONS } from './limits';
+import {
+  COLLAB_HOCUSPOCUS_OPTIONS,
+  COLLAB_MAX_PAYLOAD_BYTES,
+  COLLAB_PREAUTH_HEADROOM_BYTES,
+  COLLAB_PREAUTH_SOCKET_BYTES,
+  COLLAB_WS_SERVER_OPTIONS,
+} from './limits';
 import { CollabSocketBounds } from './socket-bounds';
 
 /**
@@ -145,14 +151,17 @@ describe('#790 Hocuspocus options (a real Hocuspocus 4.7.1 with the gateway cons
 
   it('pins the values', () => {
     expect(COLLAB_HOCUSPOCUS_OPTIONS).toEqual({ maxPendingDocuments: 1, maxUnauthenticatedQueueSize: COLLAB_PREAUTH_SOCKET_BYTES });
-    expect(COLLAB_PREAUTH_SOCKET_BYTES).toBe(COLLAB_MAX_PAYLOAD_BYTES);
+    expect(COLLAB_PREAUTH_SOCKET_BYTES).toBe(COLLAB_MAX_PAYLOAD_BYTES + COLLAB_PREAUTH_HEADROOM_BYTES); // #810 N5
+    expect(COLLAB_PREAUTH_HEADROOM_BYTES).toBe(MiB);
   });
 
-  it('one maximum honest frame (a busy page\'s SyncStep1, a cached page) fits in the pre-auth queue; a byte more terminates', () => {
+  it('a busy page\'s 512 KiB SyncStep1 and a maximal cached-page update fit in the pre-auth queue (#810 N5); past the cap terminates', () => {
     const hp = new Hocuspocus({ ...COLLAB_HOCUSPOCUS_OPTIONS });
     const c = connect(hp);
-    c.deliver(frameOf(COLLAB_MAX_PAYLOAD_BYTES - 64));
-    c.deliver(frameOf(64));
+    c.deliver(frameOf(512 * 1024)); // a SyncStep1 (the state vector of a page about 75,000 sessions wrote to)
+    c.deliver(frameOf(COLLAB_MAX_PAYLOAD_BYTES)); // a cached copy near maxPayload
+    expect(c.socket.closed).toBeNull();
+    c.deliver(frameOf(COLLAB_PREAUTH_SOCKET_BYTES - 512 * 1024 - COLLAB_MAX_PAYLOAD_BYTES)); // exactly at the cap
     expect(c.socket.closed).toBeNull();
     c.deliver(frameOf(64));
     expect(c.socket.closed).toBe(RESET_CONNECTION);

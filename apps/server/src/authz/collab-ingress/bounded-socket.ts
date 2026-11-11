@@ -22,7 +22,10 @@
  * slot only until it has closed. This is the one place that sees the replies of documents this node owns and of
  * documents RedisSync proxies to another node, so the close stays here rather than in a second wrapper on the send path.
  * Without the close, Hocuspocus 4.7.1 leaves a refused socket open and the provider reconnecting it keeps a slot for as
- * long as the editor stays open. Built only by `CollabSocketBounds.open` (socket-bounds.ts).
+ * long as the editor stays open. Every other close the server starts while the socket holds a slot (`close`: Hocuspocus
+ * closing a socket whose Auth frame it cannot decode, here or relayed from the node that owns the document) shortens the
+ * slot the same way (#810): a closing handshake can take ws 30 s, and a complete but malformed Auth frame must not buy
+ * the socket the overall pre-auth deadline. Built only by `CollabSocketBounds.open` (socket-bounds.ts).
  */
 import * as decoding from 'lib0/decoding';
 import { MessageType, type WebSocketLike } from '@hocuspocus/server';
@@ -104,6 +107,7 @@ export class BoundedCollabSocket implements WebSocketLike {
   }
 
   close(code?: number, reason?: string): void {
+    if (this.preAuth.holds(this.raw)) this.preAuth.closing(this.raw);
     this.inner.close(code, reason);
   }
 }

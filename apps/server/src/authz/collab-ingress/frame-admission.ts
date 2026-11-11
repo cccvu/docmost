@@ -27,6 +27,12 @@
  *   refuses its Auth, so the next Auth re-runs `onAuthenticate`; a token that does not verify never reaches the per-user
  *   auth rate (auth-rate.ts), which needs the verified user id.
  *
+ * ## The first Auth frame (#810 N1)
+ * The socket's first complete Auth frame tells the pre-auth slots (`authArrived`, preauth-slots.ts) that the socket is
+ * authenticating, which moves its deadline from the short first-Auth one to the overall one. Here, on the origin node,
+ * it holds on both paths, also for an Auth RedisSync relays to the node that owns the document. A partial frame never
+ * reaches this check, so a socket trickling one is still cut at the first-Auth deadline.
+ *
  * ## The awareness rate (a drop, not a refusal)
  * Awareness and QueryAwareness frames past a burst of COLLAB_AWARENESS_BURST, then COLLAB_AWARENESS_REFILL_PER_SECOND,
  * are DROPPED and the socket stays up (limits.ts says why a drop, not a refusal). Here, before RedisSync and
@@ -85,6 +91,11 @@ interface SocketFrames {
 }
 const perSocket = new WeakMap<object, SocketFrames>();
 
+/** The pre-auth slots' hook for a socket's first Auth frame (CollabPreAuthSlots.authArrived). */
+export interface FirstAuthListener {
+  authArrived(socket: object): void;
+}
+
 /** The `ws` WebSocket surface used here. */
 export interface AddressedSocket {
   readonly readyState: number;
@@ -95,13 +106,15 @@ export interface AddressedSocket {
  * The gateway's check on every inbound frame, on both paths: false (drop it) when the socket is no longer open; false
  * after terminating the socket when the frame does not name `page.<uuid>`, names one document more than
  * COLLAB_DOCUMENTS_PER_SOCKET, or is one Auth frame more than COLLAB_AUTH_FRAMES_PER_SOCKET; and false, with the socket
- * left up, for an awareness frame over the socket's awareness rate.
+ * left up, for an awareness frame over the socket's awareness rate. The first admitted Auth frame is reported to
+ * `preAuth` (`CollabSocketBounds.open` passes the process's pre-auth slots).
  */
 export function admitCollabFrame(
   ws: AddressedSocket,
   data: Uint8Array | ArrayBuffer,
   limitLog: SocketLimitLog = collabSocketLimitLog,
   now: () => number = Date.now,
+  preAuth?: FirstAuthListener,
 ): boolean {
   if (ws.readyState !== WsReadyStates.Open) return false;
   const frame = asBytes(data);
@@ -114,8 +127,9 @@ export function admitCollabFrame(
     seen.names.add(name);
   }
   const type = messageType(frame);
-  if (type === MessageType.Auth && ++seen.auths > COLLAB_AUTH_FRAMES_PER_SOCKET) {
-    return refuse(ws, limitLog, 'socket_auth_frames', { authFrames: seen.auths });
+  if (type === MessageType.Auth) {
+    if (++seen.auths > COLLAB_AUTH_FRAMES_PER_SOCKET) return refuse(ws, limitLog, 'socket_auth_frames', { authFrames: seen.auths });
+    if (seen.auths === 1) preAuth?.authArrived(ws);
   }
   if (type === MessageType.Awareness || type === MessageType.QueryAwareness) return chargeAwareness(seen, now());
   return true;

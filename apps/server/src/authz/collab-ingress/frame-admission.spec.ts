@@ -346,3 +346,34 @@ describe('#810 (A5): the wire constants come from Hocuspocus 4.7.1, and are the 
     expect(ws.terminate).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('#810 (N1) admitCollabFrame: the first complete Auth frame tells the pre-auth slots', () => {
+  const quiet = () => new SocketLimitLog({ warn: () => undefined });
+  const socket = () => {
+    const ws = { readyState: 1, terminate: jest.fn(() => (ws.readyState = 2)) };
+    return ws;
+  };
+
+  it('only the first Auth frame, once; Sync, Awareness and QueryAwareness never do', () => {
+    const ws = socket();
+    const preAuth = { authArrived: jest.fn() };
+    const page = pageN(1);
+    for (const type of [MessageType.Sync, MessageType.Awareness, MessageType.QueryAwareness]) {
+      expect(admitCollabFrame(ws, typed(page, type), quiet(), Date.now, preAuth)).toBe(true);
+    }
+    expect(preAuth.authArrived).not.toHaveBeenCalled();
+    expect(admitCollabFrame(ws, typed(page, MessageType.Auth), quiet(), Date.now, preAuth)).toBe(true);
+    expect(preAuth.authArrived.mock.calls).toEqual([[ws]]);
+    for (let i = 1; i < COLLAB_AUTH_FRAMES_PER_SOCKET; i++) admitCollabFrame(ws, typed(page, MessageType.Auth), quiet(), Date.now, preAuth);
+    expect(preAuth.authArrived).toHaveBeenCalledTimes(1);
+  });
+
+  it('a refused frame never reports: a junk-named Auth, and an Auth on a socket no longer open', () => {
+    const preAuth = { authArrived: jest.fn() };
+    const junk = socket();
+    expect(admitCollabFrame(junk, typed('collabLock:x', MessageType.Auth), quiet(), Date.now, preAuth)).toBe(false);
+    const closing = { readyState: 2, terminate: jest.fn() };
+    expect(admitCollabFrame(closing, typed(pageN(1), MessageType.Auth), quiet(), Date.now, preAuth)).toBe(false);
+    expect(preAuth.authArrived).not.toHaveBeenCalled();
+  });
+});

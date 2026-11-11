@@ -416,3 +416,23 @@ describe('#810 as assembled: the ws adapter takes the slot the gateway-built soc
     expect(new CollabSocketBounds().verifyUpgrade.length).toBe(2);
   });
 });
+
+describe('#810 (N1) the first Auth frame moves the slot deadline, on both gateway paths', () => {
+  it.each([
+    ['RedisSync', true],
+    ['standalone', false],
+  ] as const)('%s: the first Auth reaches preAuth.authArrived with the client socket, before it is forwarded', (_path, withRedis) => {
+    const bounds = new CollabSocketBounds();
+    const arrived = jest.spyOn(bounds.preAuth, 'authArrived');
+    const forwarded = withRedis ? redis.onSocketMessage : null;
+    const ws = new FakeWs();
+    gateway(withRedis, bounds).handleConnection(ws as never, request());
+    ws.emit('message', pageN(1)); // a Sync frame on the same document: not an Auth
+    expect(arrived).not.toHaveBeenCalled();
+    const forwardedBefore = withRedis ? forwarded!.mock.calls.length : hpConnections[0].handleMessage.mock.calls.length;
+    ws.emit('message', authN(1));
+    expect(arrived.mock.calls).toEqual([[ws]]);
+    const forwardedAfter = withRedis ? forwarded!.mock.calls.length : hpConnections[0].handleMessage.mock.calls.length;
+    expect(forwardedAfter).toBe(forwardedBefore + 1);
+  });
+});

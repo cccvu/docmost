@@ -26,15 +26,18 @@ export const COLLAB_WS_SERVER_OPTIONS: ServerOptions & { maxFragments: number; m
 
 /**
  * Bytes ONE socket may send before it is authenticated (preauth-slots.ts, counted on its TCP socket, so a partial frame
- * ws is still assembling counts too): the largest frame the server accepts at all (`maxPayload`). Before it is
- * authenticated an honest provider sends its Auth frame, its SyncStep1 and its awareness state, and what it holds that
- * the socket has not sent: keystrokes made while the token verifies, edits queued while it was offline, and a page's
- * cached copy that its local store (y-indexeddb) loaded after the socket opened. A SyncStep1 is the page's whole state
- * vector, about 7 bytes for every client id that ever wrote to the page, which is never pruned, so on a page written to
- * by many sessions (every API write and every editing session adds one) it can be hundreds of KiB. A per-socket cap
- * below a maximal frame would cut such a page off for every editor, so the bound on the total is the next constant.
+ * ws is still assembling counts too): the largest frame the server accepts at all (`maxPayload`) plus
+ * COLLAB_PREAUTH_HEADROOM_BYTES. Before it is authenticated an honest provider sends its Auth frame, its SyncStep1 and
+ * its awareness state, and what it holds that the socket has not sent: keystrokes made while the token verifies, edits
+ * queued while it was offline, and a page's cached copy that its local store (y-indexeddb) loaded after the socket
+ * opened. A SyncStep1 is the page's whole state vector, about 7 bytes for every client id that ever wrote to the page,
+ * which is never pruned, so on a page written to by many sessions (every API write and every editing session adds one)
+ * it can be hundreds of KiB. These are wire bytes (frame headers, the Auth frame's token, that SyncStep1), so a cap of
+ * exactly one maximal frame would cut a provider whose cached copy is near `maxPayload` before it authenticated, and it
+ * would resend the same bytes on every reconnect (#810 N5). The bound on the total is the next constant.
  */
-export const COLLAB_PREAUTH_SOCKET_BYTES = COLLAB_MAX_PAYLOAD_BYTES;
+export const COLLAB_PREAUTH_HEADROOM_BYTES = 1024 * 1024;
+export const COLLAB_PREAUTH_SOCKET_BYTES = COLLAB_MAX_PAYLOAD_BYTES + COLLAB_PREAUTH_HEADROOM_BYTES;
 /**
  * Bytes ALL unauthenticated sockets together may hold (preauth-slots.ts). Past it, the socket holding the most is
  * terminated, until the total is back under: an honest unauthenticated socket holds a few KiB to a few hundred, so a
@@ -50,17 +53,34 @@ export const COLLAB_PREAUTH_TOTAL_BYTES = 128 * 1024 * 1024;
  * code) shares the remaining 1024 MiB; this bound takes under a sixth of it.
  *
  * Holding the pool: the edge allows each client address 2000 requests per 5 minutes (the WAF's rate rules, on both the
- * proxied and the direct path). The count is per 5-minute window, so one address CAN burst 512 upgrades at once and hold
- * the whole pool for COLLAB_PREAUTH_DEADLINE_MS, about three more times before its window blocks it (roughly 40 s of
- * refused collab opens per 5 minutes). Held continuously, at its average rate, one address holds about
- * 2000 / 300 s x 10 s = 67 sockets, under a seventh of the pool, so a sustained hold takes about eight addresses. A
- * socket whose authentication is refused is closed at once (bounded-socket.ts), so it holds its slot for one round
- * trip, and an honest socket for one token verify and its reads.
+ * proxied and the direct path). The count is per 5-minute window, so one address CAN burst 512 upgrades at once. A socket
+ * that sends no Auth frame holds its slot for COLLAB_PREAUTH_AUTH_FRAME_MS, so that address holds the whole pool about
+ * four times before its window blocks it (roughly 20 s of refused collab opens per 5 minutes). A complete Auth frame the
+ * server refuses, malformed or not verifying, ends in a server close, after which the socket keeps its slot at most
+ * COLLAB_PREAUTH_CLOSE_GRACE_MS (bounded-socket.ts); only an authentication still running (its reads, or a relay to a
+ * node that does not answer) holds a slot until COLLAB_PREAUTH_DEADLINE_MS. Held continuously, at its average rate, one
+ * address holds about 2000 / 300 s x 5 s = 34 silent sockets, under a fifteenth of the pool, so a sustained hold takes
+ * about sixteen addresses. An honest socket holds its slot for one token verify and its reads.
  */
 export const COLLAB_PREAUTH_SOCKETS = 512;
-/** A socket not authenticated this long after it opened is terminated (preauth-slots.ts). 4.7.1's own is 60–120 s. */
+/**
+ * A socket that has not sent a complete Auth frame this long after it opened is terminated (preauth-slots.ts,
+ * `preauth_first_auth`). An honest provider sends its Auth at once: HocuspocusProvider.onOpen awaits `sendToken()` on a
+ * token page-editor.tsx already holds as a string, and a token refetch finishes before the socket is reopened, so the
+ * frame arrives about one round trip after the upgrade. Five seconds covers two TCP retransmits (1 s, then 2 s) and a
+ * main thread busy through a deploy's reconnect wave; a tab frozen past it is cut and reconnects once it thaws (#810 N1).
+ */
+export const COLLAB_PREAUTH_AUTH_FRAME_MS = 5_000;
+/**
+ * A socket not authenticated this long after it opened is terminated (preauth-slots.ts, `preauth_deadline`): absolute
+ * from the upgrade, never extended by an Auth frame. It bounds the authentication itself (the token verify, the reads,
+ * a RedisSync relay to the node that owns the document). 4.7.1's own deadline is 60–120 s.
+ */
 export const COLLAB_PREAUTH_DEADLINE_MS = 10_000;
-/** After an authentication is refused the socket is closed; one that has not finished closing by then is terminated. */
+/**
+ * After the server closes an unauthenticated socket (a refused authentication, or any other close Hocuspocus or a bound
+ * starts, such as a malformed Auth frame), one that has not finished closing by then is terminated.
+ */
 export const COLLAB_PREAUTH_CLOSE_GRACE_MS = 2_000;
 
 /** Hocuspocus 4.7.1 options; the rest stay at upstream defaults (1000 queued messages, 60 s `timeout`). */

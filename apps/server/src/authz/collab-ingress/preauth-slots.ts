@@ -17,12 +17,19 @@
  *   those bytes. One socket past COLLAB_PREAUTH_SOCKET_BYTES is terminated (`preauth_bytes`); and when all of them
  *   together pass COLLAB_PREAUTH_TOTAL_BYTES, the one holding the most is terminated (`preauth_total_bytes`) until the
  *   total is back under, so a client that fills the budget loses its own largest sockets, not the honest small ones.
- * - **A deadline**: a socket still unauthenticated COLLAB_PREAUTH_DEADLINE_MS after it opened is terminated
- *   (`preauth_deadline`). Hocuspocus 4.7.1's own deadline is its `timeout` (60 s, checked every 60 s, so up to 120 s),
- *   which is also its idle timeout, so it cannot be shortened alone.
- * - **A refused authentication** closes the socket (`BoundedCollabSocket.send` sees the `PermissionDenied` reply) and
- *   `closing` shortens its deadline to COLLAB_PREAUTH_CLOSE_GRACE_MS; it keeps its slot and its byte count until it has
- *   closed, so a socket on its way out cannot hold memory the bound does not count.
+ * - **Two deadlines** (#810 N1): a socket that has not sent a complete Auth frame COLLAB_PREAUTH_AUTH_FRAME_MS after
+ *   it opened is terminated (`preauth_first_auth`). Its FIRST Auth frame (`authArrived`, called by the gateway's frame
+ *   check on both paths, before RedisSync or Hocuspocus reads it) moves that deadline, once, to
+ *   COLLAB_PREAUTH_DEADLINE_MS after the upgrade (`preauth_deadline`): absolute, so no later frame extends it. A silent
+ *   socket, the cheapest way to hold a slot, holds it half as long. The first-Auth timer re-checks one `setImmediate`
+ *   later, so an Auth frame already read in the same turn of the event loop is not cut. Hocuspocus 4.7.1's own deadline
+ *   is its `timeout` (60 s, checked every 60 s, so up to 120 s), which is also its idle timeout, so it cannot be
+ *   shortened alone.
+ * - **A server close**: a refused authentication (`BoundedCollabSocket.send` sees the `PermissionDenied` reply) or any
+ *   other close the server starts while the socket is unauthenticated (`BoundedCollabSocket.close`: Hocuspocus closes a
+ *   socket whose Auth frame it cannot decode) calls `closing`, which shortens its deadline to
+ *   COLLAB_PREAUTH_CLOSE_GRACE_MS, once; it keeps its slot and its byte count until it has closed, so a socket on its way
+ *   out cannot hold memory the bound does not count, and a complete but malformed Auth buys no more than the grace.
  *
  * ws's check runs synchronously and the adapter's upgrade callback follows in the same call (no `await` between the
  * 503 decision and the slot being taken), so concurrent upgrades cannot all pass one free slot.
@@ -31,6 +38,7 @@
  * every `BoundedCollabSocket` releases it to: an adapter and a gateway on different instances would leak every slot.
  */
 import {
+  COLLAB_PREAUTH_AUTH_FRAME_MS,
   COLLAB_PREAUTH_CLOSE_GRACE_MS,
   COLLAB_PREAUTH_DEADLINE_MS,
   COLLAB_PREAUTH_SOCKET_BYTES,
@@ -51,7 +59,16 @@ export interface PreAuthTransport {
   off(event: 'data', listener: (chunk: Buffer) => void): unknown;
 }
 
-type Held = { socket: PreAuthSocket; timer: ReturnType<typeof setTimeout>; detach: () => void; bytes: number };
+/** Where a held socket is: no Auth frame yet, its first Auth arrived (authenticating), or the server is closing it. */
+type Phase = 'awaiting_auth' | 'authenticating' | 'closing';
+type Held = {
+  socket: PreAuthSocket;
+  timer: ReturnType<typeof setTimeout>;
+  detach: () => void;
+  bytes: number;
+  openedAt: number;
+  phase: Phase;
+};
 
 /** Every bound defaults to its limits.ts constant; specs override them by name. */
 export interface CollabPreAuthSlotsOptions {
@@ -59,6 +76,8 @@ export interface CollabPreAuthSlotsOptions {
   cap?: number;
   /** From the upgrade to the first Authenticated reply: COLLAB_PREAUTH_DEADLINE_MS. */
   deadlineMs?: number;
+  /** From the upgrade to the first complete Auth frame: COLLAB_PREAUTH_AUTH_FRAME_MS (never more than `deadlineMs`). */
+  firstAuthMs?: number;
   /** A refused socket's slot while it closes: COLLAB_PREAUTH_CLOSE_GRACE_MS. */
   closeGraceMs?: number;
   /** Bytes one unauthenticated socket may deliver: COLLAB_PREAUTH_SOCKET_BYTES. */
@@ -73,6 +92,7 @@ export class CollabPreAuthSlots {
   private totalBytes = 0;
   private readonly cap: number;
   private readonly deadlineMs: number;
+  private readonly firstAuthMs: number;
   private readonly closeGraceMs: number;
   private readonly socketBytesCap: number;
   private readonly totalBytesCap: number;
@@ -81,6 +101,7 @@ export class CollabPreAuthSlots {
   constructor({
     cap = COLLAB_PREAUTH_SOCKETS,
     deadlineMs = COLLAB_PREAUTH_DEADLINE_MS,
+    firstAuthMs = COLLAB_PREAUTH_AUTH_FRAME_MS,
     closeGraceMs = COLLAB_PREAUTH_CLOSE_GRACE_MS,
     socketBytes = COLLAB_PREAUTH_SOCKET_BYTES,
     totalBytes = COLLAB_PREAUTH_TOTAL_BYTES,
@@ -88,6 +109,7 @@ export class CollabPreAuthSlots {
   }: CollabPreAuthSlotsOptions = {}) {
     this.cap = cap;
     this.deadlineMs = deadlineMs;
+    this.firstAuthMs = Math.min(firstAuthMs, deadlineMs);
     this.closeGraceMs = closeGraceMs;
     this.socketBytesCap = socketBytes;
     this.totalBytesCap = totalBytes;
@@ -103,7 +125,7 @@ export class CollabPreAuthSlots {
 
   /**
    * After the upgrade: hold a slot until the socket authenticates or closes, count what its TCP socket delivers (when
-   * one is given), and terminate it at the deadline or past the byte cap.
+   * one is given), and terminate it past the byte cap, or at the first-Auth deadline unless `authArrived` moves it.
    */
   hold(socket: PreAuthSocket, transport?: PreAuthTransport): void {
     if (this.held.has(socket)) return;
@@ -126,9 +148,11 @@ export class CollabPreAuthSlots {
     transport?.on('data', onData);
     const entry: Held = {
       socket,
-      timer: this.deadline(socket, this.deadlineMs, 'preauth_deadline'),
+      timer: this.firstAuthDeadline(socket),
       detach: () => transport?.off('data', onData),
       bytes: 0,
+      openedAt: Date.now(),
+      phase: 'awaiting_auth',
     };
     this.held.set(socket, entry);
     socket.once?.('close', () => this.release(socket));
@@ -161,10 +185,27 @@ export class CollabPreAuthSlots {
     return top;
   }
 
-  /** Its authentication was refused and it is being closed: it keeps its slot, now for COLLAB_PREAUTH_CLOSE_GRACE_MS. */
+  /**
+   * The socket's first complete Auth frame was admitted (frame-admission.ts): its deadline moves, once, from the first-Auth
+   * deadline to COLLAB_PREAUTH_DEADLINE_MS after the upgrade. A later Auth, or one after a close began, changes nothing.
+   */
+  authArrived(socket: object): void {
+    const entry = this.held.get(socket);
+    if (!entry || entry.phase !== 'awaiting_auth') return;
+    entry.phase = 'authenticating';
+    clearTimeout(entry.timer);
+    entry.timer = this.deadline(entry.socket, Math.max(0, this.deadlineMs - (Date.now() - entry.openedAt)), 'preauth_deadline', this.deadlineMs);
+  }
+
+  /**
+   * The server is closing it (a refused authentication, or any close the server started before it authenticated): it
+   * keeps its slot, now for at most COLLAB_PREAUTH_CLOSE_GRACE_MS. Only the first call shortens; a later one changes
+   * nothing, so repeated closes never extend the grace.
+   */
   closing(socket: PreAuthSocket): void {
     const entry = this.held.get(socket);
-    if (!entry) return;
+    if (!entry || entry.phase === 'closing') return;
+    entry.phase = 'closing';
     clearTimeout(entry.timer);
     entry.timer = this.deadline(socket, this.closeGraceMs, 'preauth_close_grace');
   }
@@ -179,15 +220,34 @@ export class CollabPreAuthSlots {
     return this.held.size;
   }
 
-  private deadline(socket: PreAuthSocket, ms: number, limit: string): ReturnType<typeof setTimeout> {
-    const timer = setTimeout(() => {
-      if (!this.held.has(socket)) return;
-      this.release(socket);
-      this.limitLog.log(limit, { deadlineMs: ms });
-      socket.terminate();
-    }, ms);
+  /** Terminate `socket` (logged as `limit` with `loggedMs`) `ms` from now unless it has left its slot by then. */
+  private deadline(socket: PreAuthSocket, ms: number, limit: string, loggedMs: number = ms): ReturnType<typeof setTimeout> {
+    const timer = setTimeout(() => this.expire(socket, limit, loggedMs), ms);
     timer.unref?.();
     return timer;
+  }
+
+  /**
+   * The first-Auth deadline. Node runs expired timers before it reads sockets, so an Auth frame already waiting in the
+   * kernel would be read only after this fires: the check waits one `setImmediate` (after that read) and cuts the socket
+   * only if no Auth arrived and nothing else moved its deadline.
+   */
+  private firstAuthDeadline(socket: PreAuthSocket): ReturnType<typeof setTimeout> {
+    const timer = setTimeout(() => {
+      setImmediate(() => {
+        if (this.held.get(socket)?.phase !== 'awaiting_auth') return;
+        this.expire(socket, 'preauth_first_auth', this.firstAuthMs);
+      });
+    }, this.firstAuthMs);
+    timer.unref?.();
+    return timer;
+  }
+
+  private expire(socket: PreAuthSocket, limit: string, deadlineMs: number): void {
+    if (!this.held.has(socket)) return;
+    this.release(socket);
+    this.limitLog.log(limit, { deadlineMs });
+    socket.terminate();
   }
 }
 

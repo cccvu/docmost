@@ -100,7 +100,7 @@ export class CollabSocketBounds {
   /**
    * Open one collab ws socket on either gateway path (seam §3): `connect` gets the outbound-bounded socket (which ends
    * the pre-auth slot on the first Authenticated reply), every inbound frame passes the frame check before `forward`
-   * sees it, and the keepalive pings it, touches the connection on each pong and reaps it once it holds no document.
+   * sees it (its first Auth frame moves the slot's deadline: preauth-slots.ts), and the keepalive pings it, touches the connection on each pong and reaps it once it holds no document.
    * The 'message' listener is registered here, synchronously, inside ws's 'connection' emit, so no frame is missed.
    */
   open<C extends { touch(): void }>(
@@ -111,7 +111,7 @@ export class CollabSocketBounds {
   ): C {
     const connection = connect(new BoundedCollabSocket(client, inner, { preAuth: this.preAuth, limitLog: this.limitLog }));
     client.on('message', (data: Buffer) => {
-      if (admitCollabFrame(client, data, this.limitLog)) forward(connection, data as CollabFrameData);
+      if (admitCollabFrame(client, data, this.limitLog, Date.now, this.preAuth)) forward(connection, data as CollabFrameData);
     });
     keepCollabSocketAlive(client, () => connection.touch(), {
       holdsNoDocument: (ws) => this.documents.holdsNoDocument(ws),
