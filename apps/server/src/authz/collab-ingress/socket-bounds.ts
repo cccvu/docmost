@@ -23,12 +23,18 @@
  * extension (§213). CollaborationModule is a static module, so this is exactly as process-wide as the module-level
  * singletons it replaced, and a spec builds its own. The class is undecorated, so Nest never resolves its options.
  *
+ * It also holds the drain flag (#810): the gateway's `destroy` sets it first (`beginDrain`, seam §3), and from then on the
+ * `connected` hook closes every new connection 1013 (user-connections.ts), so the drain never waits for the SIGKILL behind
+ * a late Auth. `beginDrain` writes `COLLAB_DRAIN {"phase":"start","documents"}` and its returned callback
+ * `COLLAB_DRAIN {"phase":"done","documents","ms"}` (`documents`: resident when the drain began), one line each per
+ * shutdown, so a deploy's drain and its length show in the logs.
+ *
  * Only the rate-limited log sink stays module-level (socket-limit-log.ts): sharing it is its purpose (one quota of lines
  * a minute per limit, for every bound, the module's ws_error line and the update guard). The connect's refusals that are not
  * bounds (an invalid token, a 4xx access refusal: auth-refusal.ts) log through this object's sink too.
  */
 import type { IncomingMessage } from 'http';
-import type { FactoryProvider, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
+import { Logger, type FactoryProvider, type OnModuleDestroy, type OnModuleInit } from '@nestjs/common';
 import type { WebSocketLike } from '@hocuspocus/server';
 import { chargeCollabAuth, chargeCollabSessionAuth, CollabAuthRate } from './auth-rate';
 import {
@@ -73,7 +79,13 @@ export interface CollabSocketBoundsOptions {
   /** The platform's edge-trust endpoint (client-trust.ts); absent or null: the trust stays unknown, the share off. */
   fetchEdgeTrust?: EdgeTrustFetch | null;
   pingIntervalMs?: number;
+  /** Where the two COLLAB_DRAIN lines go (a Nest logger by default). */
+  drainLog?: { log(message: string): void };
+  now?: () => number;
 }
+
+/** The token of the drain's start and done lines (#810). */
+export const COLLAB_DRAIN_TOKEN = 'COLLAB_DRAIN';
 
 export class CollabSocketBounds implements OnModuleInit, OnModuleDestroy {
   readonly limitLog: SocketLimitLog;
@@ -91,6 +103,9 @@ export class CollabSocketBounds implements OnModuleInit, OnModuleDestroy {
   /** The gateway's `connected` / `onDisconnect` extension (seam §3), on this object's connections and documents. */
   readonly userConnectionsExtension: CollabUserConnectionsExtension;
   private readonly pingIntervalMs: number;
+  private readonly drainLog: { log(message: string): void };
+  private readonly now: () => number;
+  private drainingSince: number | null = null;
 
   constructor(opts: CollabSocketBoundsOptions = {}) {
     this.limitLog = opts.limitLog ?? collabSocketLimitLog;
@@ -102,7 +117,30 @@ export class CollabSocketBounds implements OnModuleInit, OnModuleDestroy {
     this.authRate = opts.authRate ?? new CollabAuthRate({ limitLog: this.limitLog });
     this.sessionAuthRate = opts.sessionAuthRate ?? new CollabAuthRate({ limitLog: this.limitLog, limit: 'auth_session_rate' });
     this.pingIntervalMs = opts.pingIntervalMs ?? COLLAB_PING_INTERVAL_MS;
-    this.userConnectionsExtension = new CollabUserConnectionsExtension(this.connections, this.documents);
+    this.drainLog = opts.drainLog ?? new Logger('CollaborationGateway');
+    this.now = opts.now ?? Date.now;
+    this.userConnectionsExtension = new CollabUserConnectionsExtension(this.connections, this.documents, () => this.draining);
+  }
+
+  /** True from the start of the gateway's `destroy`: every connection established from then on is closed 1013. */
+  get draining(): boolean {
+    return this.drainingSince !== null;
+  }
+
+  /**
+   * First in the gateway's `destroy` (seam §3), with its resident documents: sets `draining` and logs the start. The
+   * returned callback logs the done line once the documents have unloaded. A second call logs nothing new.
+   */
+  beginDrain(documents: number): () => void {
+    if (this.drainingSince !== null) return () => undefined;
+    const since = (this.drainingSince = this.now());
+    this.drainLog.log(`${COLLAB_DRAIN_TOKEN} ${JSON.stringify({ phase: 'start', documents })}`);
+    let done = false;
+    return () => {
+      if (done) return;
+      done = true;
+      this.drainLog.log(`${COLLAB_DRAIN_TOKEN} ${JSON.stringify({ phase: 'done', documents, ms: this.now() - since })}`);
+    };
   }
 
   /**

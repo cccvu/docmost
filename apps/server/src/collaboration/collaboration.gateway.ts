@@ -270,6 +270,7 @@ export class CollaborationGateway {
   }
 
   async destroy(collabWsAdapter: CollabWsAdapter): Promise<void> {
+    const drained = this.collabSocketBounds.beginDrain(this.hocuspocus.getDocumentsCount()); // CCC #810: first; new connections closed 1013 (authz/collab-ingress/socket-bounds)
     // eslint-disable-next-line no-async-promise-executor
     await new Promise(async (resolve) => {
       try {
@@ -289,6 +290,7 @@ export class CollaborationGateway {
         console.error(error);
       }
     });
+    drained(); // CCC #810: COLLAB_DRAIN done
 
     await this.hocuspocus.hooks('onDestroy', { instance: this.hocuspocus });
   }

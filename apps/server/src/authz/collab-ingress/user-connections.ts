@@ -23,6 +23,15 @@
  *
  * The extension defines only `connected` and `onDisconnect`, never throws from either (a throw would skip every later
  * extension's hook), and ranks just below the update guard so its `connected` runs before any extension's that awaits.
+ *
+ * It is also the drain's late-connection rule (#810). Once the gateway's `destroy` has begun (the bounds' `draining`,
+ * socket-bounds.ts), every connection established after that is closed here at once: an Auth already inside
+ * `onAuthenticate` when `closeConnections` ran, or one RedisSync proxied from another node that still sees this node's
+ * lock. Kept open, its document would never unload, and `destroy` would wait for the SIGKILL with the lock held. It
+ * closes the SOCKET first, 1013 (try again later): the socket then reads as closing, so the document close after it
+ * sends no CLOSE frame. The editor answers a document CLOSE by reopening at once (collab-access.ts), and the raw 1013
+ * with the provider's backoff, by when the next node holds the document. A proxied connection's 1013 is relayed to the
+ * node holding the real socket (CollabProxySocket); only 4408 is not.
  */
 import { COLLAB_USER_CONNECTIONS_REASON, collabAuthRefusal } from './auth-refusal';
 import { COLLAB_CONNECTIONS_PER_USER } from './limits';
@@ -109,19 +118,32 @@ const userOf = (p: ConnectionHookPayload): string | null => {
 /** Hocuspocus close code for the over-cap close (the update guard's refusals use 4422). */
 export const COLLAB_USER_CONNECTIONS_CLOSE_CODE = 4429;
 
+/** The close of a connection established while the process drains (#810): RFC 6455 1013, retried with backoff. */
+export const COLLAB_DRAINING_CLOSE = { code: 1013, reason: 'Try Again Later' } as const;
+
 export class CollabUserConnectionsExtension {
   /** Below the update guard (10 000), above RedisSync (1000) and every default-priority extension (100). */
   readonly priority = 9_000;
   readonly extensionName = 'CollabUserConnections';
 
-  /** Both registries are the process's own, from `CollabSocketBounds` (socket-bounds.ts), which builds this once. */
+  /**
+   * Both registries are the process's own, from `CollabSocketBounds` (socket-bounds.ts), which builds this once; so is
+   * `draining`, true from the start of the gateway's `destroy` (#810).
+   */
   constructor(
     readonly connections: CollabUserConnections,
     readonly socketDocuments: CollabSocketDocuments,
+    private readonly draining: () => boolean = () => false,
   ) {}
 
   async connected(payload: ConnectedPayload): Promise<void> {
     try {
+      if (this.draining()) {
+        // #810: the socket first, so the document close sends no CLOSE frame (see the header); nothing is held
+        payload.connection?.webSocket?.close?.(COLLAB_DRAINING_CLOSE.code, COLLAB_DRAINING_CLOSE.reason);
+        payload.connection?.close(COLLAB_DRAINING_CLOSE);
+        return;
+      }
       this.socketDocuments.track(payload.connection); // every connection, a user's or not (socket-documents.ts)
       const user = userOf(payload);
       const key = keyOf(payload);
