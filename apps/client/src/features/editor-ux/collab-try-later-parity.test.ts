@@ -118,13 +118,8 @@ describe("server ↔ client collab reasons (#810)", () => {
 
 // The ledger-echo incident (#781 lineage) — the refusal notice's copy follows the rule the server refused on
 // (collab-refusal-cause.ts). Every rule in the server's `CollabRule` union must be a decision on the client: exactly one
-// cause. A new or renamed server rule goes red here until it joins one.
-//
-// FORWARD_RULES: rules this client already classifies that a server it ships with may not have yet (the client must
-// know a rule before the server can send it, never after). They may be absent from the server union, and are the only
-// client entries that may be. Each sits in `other` (generic copy). Drop an entry once every server it ships with has it.
-//   - `cross-list` (the splice-bypass shadow rule): lands in the same fork change as this client copy.
-const FORWARD_RULES: ReadonlySet<string> = new Set(["cross-list"]);
+// cause. A new or renamed server rule goes red here until it joins one. The client and server ship in one image, so the
+// two lists are equal; an older cached bundle that meets a newer rule falls back to `other` (collabRefusalCause).
 
 describe("server CollabRule ↔ client refusal causes", () => {
   const rulesSource = readFileSync(join(INGRESS, "content-rules.ts"), "utf8");
@@ -161,18 +156,13 @@ describe("server CollabRule ↔ client refusal causes", () => {
     }
   });
 
-  it("every client entry is a server rule, or a forward rule kept in `other`", () => {
+  it("every client entry is a server rule", () => {
     const server = new Set(serverRules);
     const extra = causes.flatMap(([cause, set]) =>
-      [...set]
-        .filter((rule) => !server.has(rule))
-        .filter((rule) => !(FORWARD_RULES.has(rule) && cause === "other"))
-        .map((rule) => `${cause}:${rule}`),
+      [...set].filter((rule) => !server.has(rule)).map((rule) => `${cause}:${rule}`),
     );
     expect(extra).toEqual([]);
-    for (const rule of FORWARD_RULES) {
-      expect(collabRefusalCause(rule)).toBe("other");
-    }
+    expect(collabRefusalCause("not-a-rule-yet")).toBe("other");
   });
 
   it("the cause sets are disjoint", () => {
