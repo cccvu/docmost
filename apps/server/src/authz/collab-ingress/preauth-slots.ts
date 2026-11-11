@@ -56,7 +56,7 @@ import {
   COLLAB_PREAUTH_TOTAL_BYTES,
 } from './limits';
 import type { ClientAddressRequest, ClientKey } from './client-address';
-import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
+import { collabSocketLimitLog, type SocketLimit, type SocketLimitLog } from './socket-limit-log';
 
 /** The ws socket surface used here. */
 export interface PreAuthSocket {
@@ -291,7 +291,7 @@ export class CollabPreAuthSlots {
   }
 
   /** Terminate `socket` (logged as `limit` with `loggedMs`) `ms` from now unless it has left its slot by then. */
-  private deadline(socket: PreAuthSocket, ms: number, limit: string, loggedMs: number = ms): ReturnType<typeof setTimeout> {
+  private deadline(socket: PreAuthSocket, ms: number, limit: SocketLimit, loggedMs: number = ms): ReturnType<typeof setTimeout> {
     const timer = setTimeout(() => this.expire(socket, limit, loggedMs), ms);
     timer.unref?.();
     return timer;
@@ -313,7 +313,7 @@ export class CollabPreAuthSlots {
     return timer;
   }
 
-  private expire(socket: PreAuthSocket, limit: string, deadlineMs: number): void {
+  private expire(socket: PreAuthSocket, limit: SocketLimit, deadlineMs: number): void {
     if (!this.held.has(socket)) return;
     this.release(socket);
     this.limitLog.log(limit, { deadlineMs });

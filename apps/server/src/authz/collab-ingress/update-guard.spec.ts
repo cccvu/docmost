@@ -1326,3 +1326,31 @@ describe('#810 (C2): a 3.4.4 tab\'s queued "remove every peer" awareness frame, 
     expect(s.limitLogs).toEqual([]);
   });
 });
+
+describe('#810 (L1) the guard logs through the shared per-key window: per token, and the final count by timer', () => {
+  afterEach(() => jest.useRealTimers());
+  /** The guard's private `log` (only COLLAB_LEGACY_PENDING_INVALID and COLLAB_UPDATE_REFUSED reach it). */
+  const logOf = (guard: CollabUpdateGuard) =>
+    (guard as unknown as { log(token: string, live: Y.Doc, fields: Record<string, unknown>): void }).log.bind(guard);
+
+  it('a flood of one token (legacy content on every page load) cannot suppress a refusal line', () => {
+    jest.useFakeTimers({ now: 3_000_000 });
+    const s = setup({ seed: SEED });
+    for (let i = 0; i < 100; i++) logOf(s.guard)('COLLAB_LEGACY_PENDING_INVALID', s.live, { rule: 'legacy' });
+    expect(s.logs.filter((l) => l.startsWith('COLLAB_LEGACY_PENDING_INVALID '))).toHaveLength(30);
+    expect(s.deliver(s.conn('a'), statelessFrame('{"type":"page.updated"}', MSG.Stateless))).toBe(REFUSED('stateless'));
+    expect(s.logs.filter((l) => l.startsWith('COLLAB_UPDATE_REFUSED '))).toHaveLength(1);
+  });
+
+  it('the suppressed count is written at the end of the window with no further line, as COLLAB_GUARD_LOG_SUPPRESSED with `of`', () => {
+    jest.useFakeTimers({ now: 3_000_000 });
+    const s = setup({ seed: SEED });
+    for (let i = 0; i < 42; i++) logOf(s.guard)('COLLAB_LEGACY_PENDING_INVALID', s.live, { rule: 'legacy' });
+    expect(s.logs.filter((l) => l.startsWith('COLLAB_GUARD_LOG_SUPPRESSED'))).toEqual([]);
+    jest.advanceTimersByTime(60_000);
+    expect(s.logs.filter((l) => l.startsWith('COLLAB_GUARD_LOG_SUPPRESSED'))).toEqual([
+      'COLLAB_GUARD_LOG_SUPPRESSED {"of":"COLLAB_LEGACY_PENDING_INVALID","count":12}',
+    ]);
+    expect(jest.getTimerCount()).toBe(0);
+  });
+});

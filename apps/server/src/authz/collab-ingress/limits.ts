@@ -201,5 +201,10 @@ export const COLLAB_AWARENESS_REFILL_PER_SECOND = 40;
 export const COLLAB_AUTH_BURST = 64;
 export const COLLAB_AUTH_REFILL_PER_SECOND = 1;
 
-/** Violation log lines (`COLLAB_SOCKET_LIMIT`) per minute, process-wide; the rest are counted. */
-export const COLLAB_SOCKET_LIMIT_LOGS_PER_MINUTE = 30;
+/**
+ * Violation log lines (`COLLAB_SOCKET_LIMIT`) per limit per minute (socket-limit-log.ts, #810); the rest are counted and
+ * written as one `log_suppressed` line per limit when the window ends. Per limit, so a stranger's junk on one limit
+ * (frame_address, preauth_sockets) never crowds out another's lines (auth_rate, user_sync_budget). About 25 limits, so
+ * at most about 250 lines a minute plus the summaries.
+ */
+export const COLLAB_SOCKET_LIMIT_LOGS_PER_MINUTE = 10;

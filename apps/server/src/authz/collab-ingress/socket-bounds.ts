@@ -23,8 +23,8 @@
  * extension (§213). CollaborationModule is a static module, so this is exactly as process-wide as the module-level
  * singletons it replaced, and a spec builds its own. The class is undecorated, so Nest never resolves its options.
  *
- * Only the rate-limited log sink stays module-level (socket-limit-log.ts): sharing it is its purpose (one budget of
- * lines a minute for every bound, the module's ws_error line and the update guard). The connect's refusals that are not
+ * Only the rate-limited log sink stays module-level (socket-limit-log.ts): sharing it is its purpose (one quota of lines
+ * a minute per limit, for every bound, the module's ws_error line and the update guard). The connect's refusals that are not
  * bounds (an invalid token, a 4xx access refusal: auth-refusal.ts) log through this object's sink too.
  */
 import type { IncomingMessage } from 'http';

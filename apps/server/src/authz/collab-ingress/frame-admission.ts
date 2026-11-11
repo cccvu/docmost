@@ -50,7 +50,7 @@ import {
   COLLAB_AWARENESS_REFILL_PER_SECOND,
   COLLAB_DOCUMENTS_PER_SOCKET,
 } from './limits';
-import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
+import { collabSocketLimitLog, type SocketLimit, type SocketLimitLog } from './socket-limit-log';
 
 const NAME = /^page\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** `page.` + a 36-character UUID; below 128, so its varint is the single byte 41. */
@@ -147,7 +147,7 @@ function chargeAwareness(seen: SocketFrames, at: number): boolean {
   return true;
 }
 
-function refuse(ws: AddressedSocket, limitLog: SocketLimitLog, limit: string, fields: Record<string, number>): false {
+function refuse(ws: AddressedSocket, limitLog: SocketLimitLog, limit: SocketLimit, fields: Record<string, number>): false {
   limitLog.log(limit, fields);
   ws.terminate();
   return false;

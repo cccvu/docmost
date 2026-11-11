@@ -25,7 +25,7 @@
  */
 import { COLLAB_AUTH_RATE_REASON, collabAuthRefusal } from './auth-refusal';
 import { COLLAB_AUTH_BURST, COLLAB_AUTH_REFILL_PER_SECOND } from './limits';
-import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
+import { collabSocketLimitLog, type SocketLimit, type SocketLimitLog } from './socket-limit-log';
 
 interface Bucket {
   tokens: number;
@@ -35,14 +35,14 @@ interface Bucket {
 export interface CollabAuthRateOptions {
   limitLog?: SocketLimitLog;
   /** The `COLLAB_SOCKET_LIMIT` limit an empty bucket is logged as: `auth_rate` (per user) or `auth_session_rate`. */
-  limit?: string;
+  limit?: Extract<SocketLimit, 'auth_rate' | 'auth_session_rate'>;
 }
 
 export class CollabAuthRate {
   private readonly buckets = new Map<string, Bucket>();
   private lastSweep = 0;
   private readonly limitLog: SocketLimitLog;
-  private readonly limit: string;
+  private readonly limit: SocketLimit;
 
   constructor({ limitLog = collabSocketLimitLog, limit = 'auth_rate' }: CollabAuthRateOptions = {}) {
     this.limitLog = limitLog;

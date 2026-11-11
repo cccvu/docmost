@@ -47,7 +47,7 @@ import { decodeUtf8 } from 'lib0/string';
 import * as Y from 'yjs';
 import { MessageType } from '@hocuspocus/server';
 import { COLLAB_CONNECTIONS_PER_USER } from './limits';
-import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
+import { collabSocketLimitLog, RateLimitedWarn, type SocketLimit, type SocketLimitLog } from './socket-limit-log';
 import {
   checkAttribute,
   checkElement,
@@ -187,7 +187,12 @@ export class CollabUpdateGuard {
   private readonly logger: GuardLogger;
   private readonly limitLog: SocketLimitLog;
   private readonly now: () => number;
-  private logWindow = { start: 0, count: 0, suppressed: 0 };
+  /** Guard lines, LOGS_PER_MINUTE per token a minute; the rest are counted (socket-limit-log.ts, #810). */
+  private readonly logLines = new RateLimitedWarn<string>({
+    logger: { warn: (message) => this.logger.warn(message) },
+    perKey: LOGS_PER_MINUTE,
+    summary: (token, count) => `COLLAB_GUARD_LOG_SUPPRESSED ${JSON.stringify({ of: token, count })}`,
+  });
 
   constructor(opts: { mode?: CollabGuardMode; logger?: GuardLogger; limitLog?: SocketLimitLog; now?: () => number } = {}) {
     this.mode = opts.mode ?? COLLAB_UPDATE_GUARD_MODE;
@@ -297,7 +302,7 @@ export class CollabUpdateGuard {
    * is dropped by the closing socket and the editor sees only a retryable socket close), then throw so this frame and
    * the ones queued behind it are not applied. Logged `COLLAB_SOCKET_LIMIT`, rate-limited. Report mode only logs.
    */
-  private tryLater(frame: GuardFrame, limit: string): void {
+  private tryLater(frame: GuardFrame, limit: SocketLimit): void {
     this.limitLog.log(limit, { userId: String(frame.context?.user?.id ?? '') });
     if (this.mode === 'report') return;
     try {
@@ -657,16 +662,9 @@ export class CollabUpdateGuard {
     throw { code: COLLAB_REFUSAL_CODE, reason };
   }
 
-  /** Rate-limited structured warn lines. Schema ids, user and page ids only: never a value or any content. */
+  /** Rate-limited structured warn lines, per token. Schema ids, user and page ids only: never a value or any content. */
   private log(token: string, live: Y.Doc & { name?: string }, fields: Record<string, unknown>): void {
-    const now = Date.now();
-    const w = this.logWindow;
-    if (now - w.start >= 60_000) {
-      if (w.suppressed) this.logger.warn(`COLLAB_GUARD_LOG_SUPPRESSED ${JSON.stringify({ count: w.suppressed })}`);
-      this.logWindow = { start: now, count: 0, suppressed: 0 };
-    }
-    if (this.logWindow.count++ < LOGS_PER_MINUTE) this.logger.warn(`${token} ${JSON.stringify({ ...fields, pageId: pageIdOf(live) })}`);
-    else this.logWindow.suppressed++;
+    this.logLines.warn(token, () => `${token} ${JSON.stringify({ ...fields, pageId: pageIdOf(live) })}`);
   }
 }
 

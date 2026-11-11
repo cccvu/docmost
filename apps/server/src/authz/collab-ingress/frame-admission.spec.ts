@@ -10,6 +10,7 @@ import {
   COLLAB_AWARENESS_REFILL_PER_SECOND,
   COLLAB_DOCUMENTS_PER_SOCKET,
   COLLAB_HOCUSPOCUS_OPTIONS,
+  COLLAB_SOCKET_LIMIT_LOGS_PER_MINUTE,
 } from './limits';
 import { logCollabSocketError, SocketLimitLog } from './socket-limit-log';
 
@@ -120,13 +121,15 @@ describe('#790 admitCollabFrame (the gateway check)', () => {
 describe('#790 logCollabSocketError (the collab module\'s ws client error listener)', () => {
   afterEach(() => jest.restoreAllMocks());
 
-  it('logs ws\'s error code only, rate-limited: a client sending 1000 oversized frames writes 30 lines', () => {
-    jest.spyOn(Date, 'now').mockImplementation(() => 7_000_000);
+  afterEach(() => jest.useRealTimers());
+
+  it(`logs ws\'s error code only, rate-limited: a client sending 1000 oversized frames writes ${COLLAB_SOCKET_LIMIT_LOGS_PER_MINUTE} lines`, () => {
+    jest.useFakeTimers({ now: 7_000_000 });
     const warn = jest.fn();
     const limitLog = new SocketLimitLog({ warn });
     const err = Object.assign(new RangeError('Max payload size exceeded secret-bytes'), { code: 'WS_ERR_UNSUPPORTED_MESSAGE_LENGTH' });
     for (let i = 0; i < 1000; i++) logCollabSocketError(err, limitLog);
-    expect(warn).toHaveBeenCalledTimes(30);
+    expect(warn).toHaveBeenCalledTimes(COLLAB_SOCKET_LIMIT_LOGS_PER_MINUTE);
     expect(warn.mock.calls[0][0]).toBe('COLLAB_SOCKET_LIMIT {"limit":"ws_error","code":"WS_ERR_UNSUPPORTED_MESSAGE_LENGTH"}');
     expect(warn.mock.calls.join('')).not.toContain('secret');
   });
@@ -144,17 +147,17 @@ describe('#790 logCollabSocketError (the collab module\'s ws client error listen
 describe('#790 SocketLimitLog', () => {
   afterEach(() => jest.restoreAllMocks());
 
-  it('logs at most 30 lines a minute, then one line with the suppressed count', () => {
+  it(`logs at most ${COLLAB_SOCKET_LIMIT_LOGS_PER_MINUTE} lines of a limit a minute, then one line with that limit's suppressed count`, () => {
     let now = 1_000_000;
-    jest.spyOn(Date, 'now').mockImplementation(() => now);
     const warn = jest.fn();
-    const limitLog = new SocketLimitLog({ warn });
-    for (let i = 0; i < 45; i++) limitLog.log('auth_rate', { userId: 'u1' });
-    expect(warn).toHaveBeenCalledTimes(30);
+    const limitLog = new SocketLimitLog({ warn }, () => now);
+    const quota = COLLAB_SOCKET_LIMIT_LOGS_PER_MINUTE;
+    for (let i = 0; i < quota + 15; i++) limitLog.log('auth_rate', { userId: 'u1' });
+    expect(warn).toHaveBeenCalledTimes(quota);
     now += 60_000;
     limitLog.log('auth_rate', { userId: 'u1' });
-    expect(warn.mock.calls.slice(30).map((c) => c[0])).toEqual([
-      'COLLAB_SOCKET_LIMIT {"limit":"log_suppressed","count":15}',
+    expect(warn.mock.calls.slice(quota).map((c) => c[0])).toEqual([
+      'COLLAB_SOCKET_LIMIT {"limit":"log_suppressed","of":"auth_rate","count":15}',
       'COLLAB_SOCKET_LIMIT {"limit":"auth_rate","userId":"u1"}',
     ]);
   });
