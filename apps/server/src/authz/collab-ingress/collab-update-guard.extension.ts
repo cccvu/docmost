@@ -13,7 +13,8 @@
  * Its one other hook, `afterLoadDocument`, is not on any frame's path: it runs the load repair of legacy values
  * (legacy-repair.ts) once per document lifetime. Hocuspocus 4.7.1 awaits it inside `loadDocument` (after attaching
  * `onUpdate`, before `createDocument` resolves), and a connection, and so every frame, exists only after that; so the
- * guard's shadow and its first-build audit (built on the first frame) see the repaired document.
+ * guard's shadow and its first-build audit (built on the first frame) see the repaired document. It runs one macrotask
+ * turn after the load's `applyUpdate`, never in the same event-loop block.
  */
 import { Logger } from '@nestjs/common';
 import type { afterLoadDocumentPayload, beforeHandleMessagePayload } from '@hocuspocus/server';
@@ -55,12 +56,19 @@ export class CollabUpdateGuardExtension {
   }
 
   /**
-   * The load repair (legacy-repair.ts). NEVER throws: a throw here fails the document's load (every connection to the
-   * page). On any failure it logs and leaves the document as loaded; the guard still enforces on every frame.
+   * The load repair (legacy-repair.ts). NEVER rejects: a rejection here fails the document's load (every connection to
+   * the page). On any failure it logs and leaves the document as loaded; the guard still enforces on every frame.
    * Logged with counts and rule names only, never a value.
+   *
+   * It first yields one macrotask turn. Hocuspocus chains `onLoadDocument` (the page-sized `applyUpdate`) and this hook
+   * with `.then`, so without the yield the repair's page-sized walk would extend that same event-loop block, on every
+   * load, readers' and direct connections' included (#731 keeps page-sized work in separate turns). The yield cannot
+   * let a frame in first: 4.7.1 awaits this hook inside `loadDocument`, the document is in `documents` only after that
+   * resolves (a concurrent open awaits the same loading promise), and a connection is created only after that.
    */
-  afterLoadDocument({ document, documentName }: afterLoadDocumentPayload): Promise<void> {
+  async afterLoadDocument({ document, documentName }: afterLoadDocumentPayload): Promise<void> {
     const pageId = String(documentName ?? '').replace(/^page\./, '');
+    await new Promise<void>((resolve) => setImmediate(resolve));
     try {
       const r = this.repair(document);
       if (r.attrs || r.marks || r.skipped) {
@@ -71,6 +79,5 @@ export class CollabUpdateGuardExtension {
     } catch {
       this.repairLog.warn('COLLAB_LEGACY_REPAIR_FAILED', () => `COLLAB_LEGACY_REPAIR_FAILED ${JSON.stringify({ pageId })}`);
     }
-    return undefined as unknown as Promise<void>;
   }
 }

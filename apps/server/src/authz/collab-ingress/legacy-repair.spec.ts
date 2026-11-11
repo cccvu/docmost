@@ -1,4 +1,5 @@
 import * as Y from 'yjs';
+import * as decoding from 'lib0/decoding';
 import { Hocuspocus } from '@hocuspocus/server';
 import { Node as PMNode } from '@tiptap/pm/model';
 import { EditorState } from '@tiptap/pm/state';
@@ -13,6 +14,7 @@ import {
   deepJson,
   DOC_NAME,
   FakeSocket,
+  MSG,
   RemoteClient,
   renderLikeABrowser,
   spliceVarString,
@@ -185,7 +187,10 @@ describe('#781 legacy repair: every value the guard\'s value rules refuse is rem
     const [type, attr] = entry.slice('node '.length).split('.');
     const def = (schema.nodes[type].spec.attrs as Record<string, { default?: unknown }>)[attr].default;
     const range = INT_ATTRS.get(entry);
-    const base = range ? ['100%', '', 0, -1, 1.5, range[1] + 1, '2', true, {}, deep17] : [0, 1.5, true, {}, [1], deep17];
+    // Every value rule: kind (a BigInt, a typed array, nested or as the item itself: lib0's readAny decodes both),
+    // size (more than COLLAB_LIMITS.valueEntries entries) and depth, then string-ness and range.
+    const anyRule = [10n, new Uint8Array(1), [new Uint8Array(1)], Array(10_001).fill(0), deep17];
+    const base = range ? ['100%', '', 0, -1, 1.5, range[1] + 1, '2', true, {}, ...anyRule] : [0, 1.5, true, {}, [1], ...anyRule];
     return def === null || def === undefined ? base : [...base, null];
   };
   const swept = [...INT_ATTRS.keys(), ...nodeStringAttrs];
@@ -209,6 +214,26 @@ describe('#781 legacy repair: every value the guard\'s value rules refuse is rem
     expect(renderLikeABrowser(doc)).toMatchObject({ deleted: false, threw: false });
   });
 
+  // The forms a value takes in a stored row: the row encoded and decoded (lib0's readAny for an attribute's ContentAny,
+  // which assigns keys, so a JSON `__proto__` key re-prototypes the object). Each is removed under its own rule; a rule
+  // dropped from REPAIRABLE_RULES leaves its case unrepaired here.
+  it.each([
+    ['a BigInt', () => 10n, 'value-kind'],
+    ['a typed array inside the value', () => [new Uint8Array(1)], 'value-kind'],
+    ["an object with a JSON '__proto__' key", () => JSON.parse('{"__proto__":{"href":"x"}}'), 'value-kind'],
+    ['an array of 10_001 entries', () => Array(10_001).fill(0), 'value-size'],
+    ['a value 17 deep', () => deep17, 'value-depth'],
+    ['a typed array as the item (ContentBinary)', () => new Uint8Array(1), 'attr-kind'],
+  ])('a stored attribute value, %s, is removed under %s', (_n, value, rule) => {
+    const row = stored((f) => f.insert(0, [el('paragraph', { textAlign: value() }, runs(['x']))]));
+    const doc = lifetime(row, false);
+    const p = find(doc, 'paragraph');
+    expect(checkElement(p)).toMatchObject({ ok: false, violation: { rule } }); // non-vacuity: refused under that rule
+    expect(repairLegacyValues(doc)).toEqual({ attrs: 1, marks: 0, spills: 0, skipped: 0, rules: { [rule]: 1 } });
+    expect(checkElement(p)).toEqual({ ok: true });
+    expect(p.getAttributes()).not.toHaveProperty('textAlign');
+  });
+
   it('an attribute item that is not a JSON value (a nested map) is removed too (attr-kind)', () => {
     const doc = prosemirrorJSONToYDoc(schema, ALL_NODES_DOC, 'default') as Doc;
     const p = find(doc, 'paragraph');
@@ -219,17 +244,42 @@ describe('#781 legacy repair: every value the guard\'s value rules refuse is rem
   });
 
   it.each([
-    ['link href a number', { link: { href: 123 } }, 'string-attr'],
-    ['highlight colorName an object', { highlight: { color: '#fff', colorName: {} } }, 'string-attr'],
-    ['textStyle with a 17-deep undeclared key', { textStyle: { color: '#1971c2', x: deep17 } }, 'value-depth'],
-  ])('a mark: %s is deleted; the text, other marks and comment marks are unchanged', (_n, bad, rule) => {
-    const row = stored((f) =>
-      f.insert(0, [para(runs(['plain '], ['bad', { ...bad, bold: {} }], [' kept', { comment: { commentId: 'c1', resolved: false } }]))]),
-    );
-    const doc = lifetime(row, false);
+    ['link href a number', { link: { href: 123 } }, 'string-attr', 'v1'],
+    ['highlight colorName an object', { highlight: { color: '#fff', colorName: {} } }, 'string-attr', 'v1'],
+    ['textStyle with a 17-deep undeclared key', { textStyle: { color: '#1971c2', x: deep17 } }, 'value-depth', 'v1'],
+    ['textStyle with an undeclared array of 10_001 entries', { textStyle: { color: '#1971c2', x: Array(10_001).fill(0) } }, 'value-size', 'v1'],
+    // A V2 row: Yjs encodes a format value with lib0's writeAny there, and readAny decodes a BigInt and a typed array,
+    // and assigns keys (a JSON `__proto__` key re-prototypes the value). A V1 row's JSON.parse keeps it an own key.
+    ["link with a JSON '__proto__' key (V2 row)", { link: JSON.parse('{"__proto__":{"href":"x"}}') }, 'value-kind', 'v2'],
+    ['link with a BigInt (V2 row)', { link: { href: 'x', n: 10n } }, 'value-kind', 'v2'],
+    ['highlight with a typed array (V2 row)', { highlight: { color: '#fff', b: new Uint8Array(1) } }, 'value-kind', 'v2'],
+  ] as Array<[string, Record<string, unknown>, string, 'v1' | 'v2']>)('a mark: %s is deleted; the text, other marks and comment marks are unchanged', (_n, bad, rule, enc) => {
+    const build = (f: Y.XmlFragment) =>
+      f.insert(0, [para(runs(['plain '], ['bad', { ...bad, bold: {} }], [' kept', { comment: { commentId: 'c1', resolved: false } }]))]);
+    let doc: Doc;
+    if (enc === 'v2') {
+      const src = new Y.Doc();
+      src.transact(() => build(src.getXmlFragment('default')));
+      doc = new Y.Doc() as Doc;
+      doc.name = DOC_NAME;
+      doc.getXmlFragment('default');
+      Y.applyUpdateV2(doc, Y.encodeStateAsUpdateV2(src));
+    } else {
+      doc = lifetime(stored(build), false);
+    }
     const p = find(doc, 'paragraph');
-    expect(checkElement(p).ok).toBe(false); // non-vacuity
-    const updates = updatesOf(doc, () => expect(repairLegacyValues(doc)).toMatchObject({ attrs: 0, marks: 1, spills: 0, rules: { [rule]: 1 } }));
+    // non-vacuity: the stored format item is refused under that rule
+    const formatsOf = () => {
+      const out: Array<string | undefined> = [];
+      for (let i = textOf(p)._start; i; i = i.right) {
+        if (!i.deleted && i.content instanceof Y.ContentFormat) out.push(checkFormat(i.content.key, i.content.value)?.rule);
+      }
+      return out;
+    };
+    expect(formatsOf()).toContain(rule);
+    expect(checkElement(p).ok).toBe(false);
+    const updates = updatesOf(doc, () => expect(repairLegacyValues(doc)).toEqual({ attrs: 0, marks: 1, spills: 0, skipped: 0, rules: { [rule]: 1 } }));
+    expect(formatsOf()).not.toContain(rule);
     expect(checkElement(p)).toEqual({ ok: true });
     expect(textOf(p).toDelta()).toEqual([
       { insert: 'plain ' },
@@ -538,11 +588,11 @@ describe('#781 legacy repair wired as the guard extension\'s afterLoadDocument',
   const PAGE = DOC_NAME.replace(/^page\./, '');
   const legacyRow = () => stored((f) => f.insert(0, [table([['100%', 1]]), para(runs(['x', { link: { href: 123 } }]))]));
 
-  it('repairs the loaded document and logs counts and rule names only (never a value)', () => {
+  it('repairs the loaded document and logs counts and rule names only (never a value)', async () => {
     const lines: string[] = [];
     const ext = new CollabUpdateGuardExtension(undefined, { logger: { warn: (m) => lines.push(m) } });
     const doc = lifetime(legacyRow(), false);
-    expect(ext.afterLoadDocument({ document: doc, documentName: DOC_NAME } as never)).toBeUndefined();
+    await expect(ext.afterLoadDocument({ document: doc, documentName: DOC_NAME } as never)).resolves.toBeUndefined();
     expect(planLegacyRepair(doc).report).toMatchObject({ attrs: 0, marks: 0 });
     expect(lines).toHaveLength(1);
     expect(lines[0].startsWith('COLLAB_LEGACY_REPAIRED ')).toBe(true);
@@ -558,14 +608,14 @@ describe('#781 legacy repair wired as the guard extension\'s afterLoadDocument',
     expect(lines[0]).not.toContain('123');
   });
 
-  it('a clean document logs nothing', () => {
+  it('a clean document logs nothing', async () => {
     const lines: string[] = [];
     const ext = new CollabUpdateGuardExtension(undefined, { logger: { warn: (m) => lines.push(m) } });
-    ext.afterLoadDocument({ document: prosemirrorJSONToYDoc(schema, ALL_NODES_DOC, 'default'), documentName: DOC_NAME } as never);
+    await ext.afterLoadDocument({ document: prosemirrorJSONToYDoc(schema, ALL_NODES_DOC, 'default'), documentName: DOC_NAME } as never);
     expect(lines).toEqual([]);
   });
 
-  it('never throws: a failing repair resolves, leaves the document as loaded, and logs COLLAB_LEGACY_REPAIR_FAILED', () => {
+  it('never rejects: a failing repair resolves, leaves the document as loaded, and logs COLLAB_LEGACY_REPAIR_FAILED', async () => {
     const lines: string[] = [];
     const ext = new CollabUpdateGuardExtension(undefined, {
       logger: { warn: (m) => lines.push(m) },
@@ -574,15 +624,29 @@ describe('#781 legacy repair wired as the guard extension\'s afterLoadDocument',
       },
     });
     const doc = lifetime(legacyRow(), false);
-    expect(() => ext.afterLoadDocument({ document: doc, documentName: DOC_NAME } as never)).not.toThrow();
+    await expect(ext.afterLoadDocument({ document: doc, documentName: DOC_NAME } as never)).resolves.toBeUndefined();
+    expect(planLegacyRepair(doc).report).toMatchObject({ attrs: 1, marks: 1 }); // as loaded
     expect(lines).toEqual([`COLLAB_LEGACY_REPAIR_FAILED ${JSON.stringify({ pageId: PAGE })}`]);
   });
 
-  it('is rate-limited: a read-only page reloaded 100 times in a minute writes 30 lines', () => {
+  it('is rate-limited: a read-only page reloaded 100 times in a minute writes 30 lines', async () => {
     const lines: string[] = [];
     const ext = new CollabUpdateGuardExtension(undefined, { logger: { warn: (m) => lines.push(m) }, now: () => 1_000 });
-    for (let i = 0; i < 100; i++) ext.afterLoadDocument({ document: lifetime(legacyRow(), false), documentName: DOC_NAME } as never);
+    for (let i = 0; i < 100; i++) await ext.afterLoadDocument({ document: lifetime(legacyRow(), false), documentName: DOC_NAME } as never);
     expect(lines.filter((l) => l.startsWith('COLLAB_LEGACY_REPAIRED '))).toHaveLength(30);
+  });
+
+  it('runs the repair in a later macrotask turn than the load (never in the load apply\'s event-loop block)', async () => {
+    const ext = new CollabUpdateGuardExtension(undefined, { logger: { warn: () => undefined } });
+    const doc = lifetime(legacyRow(), false);
+    const order: string[] = [];
+    const done = ext.afterLoadDocument({ document: doc, documentName: DOC_NAME } as never).then(() => order.push('repaired'));
+    // Every microtask the hook chain could run drains before a macrotask; the repair has not run yet.
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    expect(planLegacyRepair(doc).report).toMatchObject({ attrs: 1, marks: 1 });
+    expect(order).toEqual([]);
+    await done;
+    expect(planLegacyRepair(doc).report).toMatchObject({ attrs: 0, marks: 0 });
   });
 });
 
@@ -599,7 +663,7 @@ describe('#781 legacy repair through a REAL Hocuspocus 4.7.1: before any client 
     jest.restoreAllMocks();
   });
 
-  async function server(row: Uint8Array, opts: { repair?: boolean } = {}) {
+  async function server(row: Uint8Array, opts: { repair?: boolean; step1?: boolean } = {}) {
     const logs: string[] = [];
     const stores: unknown[] = [];
     const guard = new CollabUpdateGuard({ logger: { warn: (m) => logs.push(m) } });
@@ -624,7 +688,9 @@ describe('#781 legacy repair through a REAL Hocuspocus 4.7.1: before any client 
     const sock = new FakeSocket();
     sockets.push(sock);
     sock.connect(hp);
-    sock.deliver(authFrame('t'));
+    // With `step1`, the client's Sync Step1 arrives in the same chunk as its auth, while the document is still loading.
+    if (opts.step1) sock.deliver(authFrame('t'), syncFrame(Y.encodeStateVector(new Y.Doc()), SYNC.Step1));
+    else sock.deliver(authFrame('t'));
     const deadline = Date.now() + 5_000;
     while (!hp.documents.get(DOC_NAME)?.getConnections().length) {
       if (Date.now() > deadline) throw new Error('not connected');
@@ -650,6 +716,31 @@ describe('#781 legacy repair through a REAL Hocuspocus 4.7.1: before any client 
     await new Promise((r) => setTimeout(r, 40)); // past the debounce
     expect(s.stores).toEqual(['writer']); // the writer's edit stored, the repair with it; nothing stored without a user
   });
+
+  /** The document the client receives: every Sync Step2/Update payload the server sent, applied to an empty replica. */
+  function received(sock: FakeSocket): Y.Doc {
+    const d = new Y.Doc();
+    d.getXmlFragment('default');
+    for (const data of sock.sent) {
+      const dec = decoding.createDecoder(data);
+      decoding.readVarString(dec);
+      if (decoding.readVarUint(dec) !== MSG.Sync) continue;
+      const subtype = decoding.readVarUint(dec);
+      if (subtype === SYNC.Step2 || subtype === SYNC.Update) Y.applyUpdate(d, decoding.readVarUint8Array(dec));
+    }
+    return d;
+  }
+
+  it.each([true, false])(
+    "the client's Step1, sent with its auth in one chunk, is answered with the repaired document (repair %p)",
+    async (repair) => {
+      const s = await server(row(), { repair, step1: true });
+      const got = received(s.sock);
+      expect(got.getXmlFragment('default').length).toBeGreaterThan(0); // non-vacuity: the Step2 arrived
+      if (repair) expect(planLegacyRepair(got).report).toEqual({ attrs: 0, marks: 0, spills: 0, skipped: 0, rules: {} });
+      else expect(planLegacyRepair(got).report).toMatchObject({ attrs: 2, marks: 1 }); // control: the stored values
+    },
+  );
 
   it('with no edit, nothing is stored (the repair is persisted only by a real store)', async () => {
     const s = await server(row());
