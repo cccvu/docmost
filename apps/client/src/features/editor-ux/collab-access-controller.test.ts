@@ -143,7 +143,7 @@ describe("reconnect pace (#810, final live check L2-2)", () => {
     });
   }
 
-  it("a refused upgrade is retried only on the provider's backoff: 1, 2, 4, 8 s (5 attempts in 15 s, not ~42)", async () => {
+  it("a refused upgrade is retried only on the provider's backoff, 1, 2, 4, 8 s apart (4 attempts in 15 s; the per-render reconnect made ~300 here, 42 live)", async () => {
     vi.spyOn(Math, "random").mockReturnValue(0.9999); // the longest jittered waits
     ScriptedSocket.onConstruct = (s) =>
       setTimeout(() => s.failBeforeOpen(), 50);
