@@ -10,7 +10,7 @@ import { PersistenceExtension } from '../../collaboration/extensions/persistence
 import { PG_URL, uuid, mkReadModelPg, bootstrapSchema, mkReadModelDb } from '../../service-bridge/read-model-pg.testkit';
 import * as driftLog from '../page-write/collab-drift-log';
 import { hasStoreFailure } from '../page-write/store-failure-registry';
-import { isDuplicateWriteKey, recordWriteKey, WRITE_IDEM_MAP } from '../page-write/write-idem';
+import { isDuplicateWriteKey, recordWriteKey, scopedWriteKey, WRITE_IDEM_MAP } from '../page-write/write-idem';
 import { authFrame, FakeSocket, MSG, readServerFrame, RemoteClient, SYNC, syncFrame } from './collab-ingress.testkit';
 import { CollabUpdateGuardExtension } from './collab-update-guard.extension';
 import { CollabUpdateGuard } from './update-guard';
@@ -193,23 +193,24 @@ d('the collab store behind the ingress guard (#781)', () => {
   });
 
   it('the /v1 idempotency ledger: control erases another writer\'s key; treatment refuses and the key stays', async () => {
+    const VICTIM = scopedWriteKey('victim', 'victim-key'); // entries are digests (write-idem.ts)
     for (const withGuard of [false, true]) {
       const n = node(withGuard);
       const sock = await n.connect('attacker');
       const live = n.live();
-      live.transact(() => recordWriteKey(live, 'victim-key', Date.now()), V1_WRITE);
-      const del = new RemoteClient(live).edit(live, (_f, doc) => doc.getMap(WRITE_IDEM_MAP).delete('victim-key'));
+      live.transact(() => recordWriteKey(live, VICTIM, Date.now()), V1_WRITE);
+      const del = new RemoteClient(live).edit(live, (_f, doc) => doc.getMap(WRITE_IDEM_MAP).delete(VICTIM.entry));
       sock.deliver(syncFrame(del, SYNC.Update, MSG.Sync, DOC));
       await settle();
       await expect(n.handlers.flushPageContent(DOC)).resolves.toMatchObject({ flushed: true });
       if (!withGuard) {
-        expect(isDuplicateWriteKey(live, 'victim-key')).toBe(false); // control: a client erased another's write key
+        expect(isDuplicateWriteKey(live, VICTIM)).toBe(false); // control: a client erased another's write key
         for (const s of sockets.splice(0)) s.close(1000, 'next arm');
         await settle();
         continue;
       }
       expect(sock.closeReasons()).toEqual([REFUSED('root')]);
-      expect(isDuplicateWriteKey(live, 'victim-key')).toBe(true);
+      expect(isDuplicateWriteKey(live, VICTIM)).toBe(true);
     }
   });
 
@@ -252,23 +253,24 @@ d('the collab store behind the ingress guard (#781)', () => {
   });
 
   it('residual (ADR 0036): a browser holding a ledger entry the crashed node never stored is refused on reconnect', async () => {
+    const API_KEY = scopedWriteKey('editor', 'api-key');
     const first = node(true);
     const browserSock = await first.connect('editor');
     const live = first.live();
-    live.transact(() => recordWriteKey(live, 'api-key', Date.now()), V1_WRITE); // broadcast before the debounced store
+    live.transact(() => recordWriteKey(live, API_KEY, Date.now()), V1_WRITE); // broadcast before the debounced store
     const browser = new RemoteClient(live);
-    expect(isDuplicateWriteKey(browser.doc, 'api-key')).toBe(true);
+    expect(isDuplicateWriteKey(browser.doc, API_KEY)).toBe(true);
     expect(browserSock.closeReasons()).toEqual([]);
     // The node crashes inside the store debounce: no store ran, the row lacks the entry. A fresh node loads the row.
     const stored = new Y.Doc();
     Y.applyUpdate(stored, new Uint8Array((await row()).ydoc));
-    expect(isDuplicateWriteKey(stored, 'api-key')).toBe(false);
+    expect(isDuplicateWriteKey(stored, API_KEY)).toBe(false);
     const second = node(true);
     const sock = await second.connect('editor');
     const live2 = second.live();
     sock.deliver(syncFrame(Y.encodeStateAsUpdate(browser.doc, Y.encodeStateVector(second.live())), SYNC.Step2, MSG.Sync, DOC));
     await settle();
     expect(sock.closeReasons()).toEqual([REFUSED('root')]);
-    expect(isDuplicateWriteKey(live2, 'api-key')).toBe(false);
+    expect(isDuplicateWriteKey(live2, API_KEY)).toBe(false);
   });
 });

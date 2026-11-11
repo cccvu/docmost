@@ -7,7 +7,7 @@ import { MessageType } from '@hocuspocus/server';
 import * as encoding from 'lib0/encoding';
 import { htmlToJson, jsonToHtml } from '../../collaboration/collaboration.util';
 import { serverSchema } from '../page-write/prelim-content';
-import { isDuplicateWriteKey, recordWriteKey, WRITE_IDEM_MAP } from '../page-write/write-idem';
+import { isDuplicateWriteKey, recordWriteKey, scopedWriteKey, WRITE_IDEM_MAP } from '../page-write/write-idem';
 import {
   ALL_NODES_DOC,
   authFrame,
@@ -694,28 +694,31 @@ describe('#781 deep values and deep trees (stack safety)', () => {
 });
 
 describe('#781 the idempotency ledger, other roots and Stateless frames are not client-writable', () => {
+  // Ledger entries are digests (write-idem.ts): a forger writes the digest of a key it wants to suppress.
+  const VICTIM = scopedWriteKey('victim', 'victim-key');
+  const FORGED = scopedWriteKey('victim', 'forged-key');
   const ledgerSetup = () => {
     const s = setup({ seed: SEED });
-    s.live.transact(() => recordWriteKey(s.live, 'victim-key', Date.now()));
+    s.live.transact(() => recordWriteKey(s.live, VICTIM, Date.now()));
     return s;
   };
   it('forging a ledger entry: control flips isDuplicateWriteKey; treatment refuses root', () => {
     const s = ledgerSetup();
-    const u = new RemoteClient(s.live).edit(s.live, (_f, d) => d.getMap(WRITE_IDEM_MAP).set('forged-key', 1));
-    expect(isDuplicateWriteKey(unguarded(s.live, u), 'forged-key')).toBe(true);
+    const u = new RemoteClient(s.live).edit(s.live, (_f, d) => d.getMap(WRITE_IDEM_MAP).set(FORGED.entry, 1));
+    expect(isDuplicateWriteKey(unguarded(s.live, u), FORGED)).toBe(true);
     expectRefused(s, s.conn('attacker'), u, REFUSED('root'));
   });
   it('overwriting and deleting the victim\'s entry: control drops it; treatment refuses root', () => {
     const changes: Array<[boolean, (m: Y.Map<unknown>) => void]> = [
-      [false, (m) => m.set('victim-key', 'x')],
-      [true, (m) => m.delete('victim-key')],
+      [false, (m) => m.set(VICTIM.entry, 'x')],
+      [true, (m) => m.delete(VICTIM.entry)],
     ];
     for (const [drops, change] of changes) {
       const s = ledgerSetup();
       const u = new RemoteClient(s.live).edit(s.live, (_f, d) => change(d.getMap(WRITE_IDEM_MAP)));
-      if (drops) expect(isDuplicateWriteKey(unguarded(s.live, u), 'victim-key')).toBe(false); // control
+      if (drops) expect(isDuplicateWriteKey(unguarded(s.live, u), VICTIM)).toBe(false); // control
       expectRefused(s, s.conn('attacker'), u, REFUSED('root'));
-      expect(isDuplicateWriteKey(s.live, 'victim-key')).toBe(true);
+      expect(isDuplicateWriteKey(s.live, VICTIM)).toBe(true);
     }
   });
   it('a new root is refused', () => {
