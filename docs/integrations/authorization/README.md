@@ -17,7 +17,7 @@ matter only for `AUTHZ_MODE=remote`.
 
 ## The outbound contract (implement this to run remote)
 
-`authorization-service.openapi.json` describes six `POST` endpoints your service must expose:
+`authorization-service.openapi.json` describes six required `POST` endpoints your service must expose:
 
 - `/authz/check` -> `{ allowed }`
 - `/authz/check-bulk` (<= 256 checks) -> `{ results }` (one boolean per check, in order)
@@ -26,15 +26,22 @@ matter only for `AUTHZ_MODE=remote`.
 - `/authz/filter-subjects` (<= 1000 candidates) -> `{ subjects }` (passing subjects, echoed verbatim)
 - `/audit/ingest` (<= 500 events) -> `202 { accepted, persisted }` (fire-and-forget on the fork side)
 
-And one OPTIONAL endpoint (1.1.0, #501):
+And two OPTIONAL endpoints. A `404` from either is safe and is the reference stub's answer:
 
-- `/sync/settle` `{ position, timeoutMs }` -> `{ status: "confirmed" | "pending", reason? }`. After a request that
+- `POST /sync/settle` `{ position, timeoutMs }` -> `{ status: "confirmed" | "pending", reason? }`. After a request that
   takes access away succeeds, the fork asks whether every access change up to its outbox position `position` is
   already reflected in your decisions, and reports the answer to its caller as the `Authz-Propagation` response
   header. Answer `confirmed` only when that is true. Positions (like change-feed cursors) order as a pair of
   64-bit integers `(xact_id, id)`, never as strings: `"9.9"` is before `"10.1"`. Without this route (404), every
   such response says `pending`: safe, never a failure. `AUTHZ_NARROWING_SETTLE_TIMEOUT_MS` (default 3000, max 5000, `0` = off) is
-  how long the fork lets you wait.
+  how long the fork lets you wait. (1.1.0, #501)
+- `GET /authz/edge-trust` (no body) -> `{ trustedProxies: string[], xffTrusted: boolean }`. Config, not a decision:
+  which X-Forwarded-For hops your edge adds. The fork's collab server walks `[socket peer, ...X-Forwarded-For right
+  to left]`, trusting the socket peer and then only these exact IP literals (at most 64; `xffTrusted: false` walks
+  nothing), and shares its pool of unauthenticated collab sockets per resulting client address (128 of 512 each,
+  then `429`). It fetches at boot without blocking it, retries from 1 s up to every 30 s, then refreshes every 5
+  minutes. Without this route (`404`), or on any other failure or a malformed body, the per-address share stays off:
+  the pool and its deadlines still apply, and no address is ever guessed. (1.3.0, wiki-v2 #810)
 
 Point the fork at your service with two environment variables:
 
@@ -91,7 +98,7 @@ and always requires `edit`. A fork before 1.12.0 never asks for `share`. The ref
 
 A zero-dependency Node reference implementation lives at
 [`../../../examples/integrations/authorization-stub/`](../../../examples/integrations/authorization-stub/).
-It implements all six endpoints faithfully (secret check, caps, status codes, subject shape) with a
+It implements all six required endpoints faithfully (secret check, caps, status codes, subject shape) with a
 deterministic, **deny-by-default** demo policy. Use it to see the wire shapes and to smoke-test the fork in
 remote mode without building a real PDP. It is a skeleton, not a production authorization service.
 

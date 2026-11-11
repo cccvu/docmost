@@ -1,13 +1,14 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import * as ts from 'typescript';
 import { Hocuspocus } from '@hocuspocus/server';
 import { authFrame, FakeSocket } from './collab-ingress.testkit';
 import { BoundedCollabSocket } from './bounded-socket';
+import { CollabPreAuthSlots } from './preauth-slots';
 import { CollabSocketDocuments } from './socket-documents';
 import { COLLAB_EMPTY_INTERVALS, COLLAB_PING_INTERVAL_MS, COLLAB_STALL_INTERVALS, keepCollabSocketAlive } from './socket-keepalive';
 import { SocketLimitLog } from './socket-limit-log';
 import { CollabUserConnections, CollabUserConnectionsExtension } from './user-connections';
+import { CollabSocketBytes } from './socket-bytes';
 
 /**
  * #790: Hocuspocus 4.x sends no pings and reaps a connection that received nothing for `timeout`. The gateway pings
@@ -16,8 +17,9 @@ import { CollabUserConnections, CollabUserConnectionsExtension } from './user-co
  * refresh the idle clock through `touch()` only, never the private pre-auth reference upstream rewrites.
  */
 const SRC = join(__dirname, '..', '..');
-const settle = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const CONNECTION_TIMEOUT = 4408; // @hocuspocus/common ConnectionTimeout.code
+/** A socket the reaper never sees as empty (the cases below that are not about it). */
+const NEVER_EMPTY = { holdsNoDocument: () => false };
 
 class PongingSocket extends FakeSocket {
   pings = 0;
@@ -36,7 +38,7 @@ describe('keepCollabSocketAlive (#790)', () => {
     const sock = new PongingSocket();
     sock.answer = false;
     const touch = jest.fn();
-    keepCollabSocketAlive(sock, touch, 1_000);
+    keepCollabSocketAlive(sock, touch, { ...NEVER_EMPTY, intervalMs: 1_000 });
     jest.advanceTimersByTime(3_000);
     expect(sock.pings).toBe(3);
     sock.emit('pong');
@@ -58,7 +60,7 @@ describe('keepCollabSocketAlive (#790)', () => {
     sock.ping = () => {
       throw new Error('not open');
     };
-    keepCollabSocketAlive(sock, () => undefined, 1_000);
+    keepCollabSocketAlive(sock, () => undefined, { ...NEVER_EMPTY, intervalMs: 1_000 });
     expect(() => jest.advanceTimersByTime(1_000)).not.toThrow();
     sock.close(1000, 'bye');
   });
@@ -75,7 +77,7 @@ describe('#790 the stall check: a socket that stops reading is closed, a slow on
     jest.useFakeTimers();
     const sock = new PongingSocket(); // answers every ping: a pong proves nothing about reading
     const warn = jest.fn();
-    keepCollabSocketAlive(sock, () => undefined, 1_000, new SocketLimitLog({ warn }));
+    keepCollabSocketAlive(sock, () => undefined, { ...NEVER_EMPTY, intervalMs: 1_000, limitLog: new SocketLimitLog({ warn }) });
     return { sock, warn };
   };
 
@@ -155,7 +157,7 @@ describe('#790 CollabSocketDocuments', () => {
   it('keys by the raw ws socket under the gateway\'s BoundedCollabSocket; a connection already closed counts as held then closed', () => {
     const docs = new CollabSocketDocuments();
     const raw = new FakeSocket();
-    const bounded = new BoundedCollabSocket(raw, raw as never);
+    const bounded = new BoundedCollabSocket(raw, raw as never, { preAuth: new CollabPreAuthSlots(), bytes: new CollabSocketBytes() });
     docs.track(conn(bounded, false).c);
     expect(docs.holdsNoDocument(raw)).toBe(true);
     expect(docs.holdsNoDocument(bounded)).toBe(false);
@@ -172,7 +174,7 @@ describe('#790 the empty-socket reaper', () => {
     const sock = new PongingSocket();
     const warn = jest.fn();
     let empty = false;
-    keepCollabSocketAlive(sock, () => undefined, 1_000, new SocketLimitLog({ warn }), () => empty);
+    keepCollabSocketAlive(sock, () => undefined, { intervalMs: 1_000, limitLog: new SocketLimitLog({ warn }), holdsNoDocument: () => empty });
     jest.advanceTimersByTime(10_000);
     expect(sock.terminated).toBe(false);
     empty = true;
@@ -190,15 +192,22 @@ describe('#790 the empty-socket reaper', () => {
 });
 
 // Margins: Hocuspocus checks every `timeout` and reaps past it, so a reaped socket is closed within 2 x TIMEOUT; a
-// kept-alive one is touched every 25 ms, so only an event-loop stall longer than TIMEOUT could close it.
+// kept-alive one is touched every 25 ms. #810 T5: on jest's fake clock (Hocuspocus 4.7.1's ClientConnection reads only
+// setInterval and Date.now; the pong answers through setImmediate), so no runner stall can move a margin. nextTick and
+// queueMicrotask stay real: Hocuspocus's hooks are promise chains, and `advanceTimersByTimeAsync` lets them settle
+// between timers.
 const TIMEOUT = 400;
+const fakeClock = () => jest.useFakeTimers({ doNotFake: ['nextTick', 'queueMicrotask'] });
+const advance = (ms: number) => jest.advanceTimersByTimeAsync(ms);
 describe('through a real Hocuspocus 4.7.1 (timeout shortened to 400 ms)', () => {
   const open: Hocuspocus[] = [];
   const sockets: FakeSocket[] = [];
+  beforeEach(fakeClock); // before `new Hocuspocus` and `connect`, so ClientConnection's interval and clock are fake
   afterEach(async () => {
     for (const s of sockets.splice(0)) s.close(1000, 'test over');
     for (const hp of open.splice(0)) hp.closeConnections();
-    await settle(5);
+    await advance(5);
+    jest.useRealTimers();
   });
   const server = () => {
     const hp = new Hocuspocus({
@@ -213,7 +222,7 @@ describe('through a real Hocuspocus 4.7.1 (timeout shortened to 400 ms)', () => 
     const sock = new PongingSocket();
     sockets.push(sock);
     const clientConnection = sock.connect(hp);
-    if (keepAlive) keepCollabSocketAlive(sock, () => clientConnection.touch(), 25);
+    if (keepAlive) keepCollabSocketAlive(sock, () => clientConnection.touch(), { ...NEVER_EMPTY, intervalMs: 25 });
     return sock;
   };
 
@@ -221,7 +230,7 @@ describe('through a real Hocuspocus 4.7.1 (timeout shortened to 400 ms)', () => 
     const hp = server();
     const sock = socket(hp, false);
     sock.deliver(authFrame('ok'));
-    await settle(2.5 * TIMEOUT);
+    await advance(2.5 * TIMEOUT);
     expect(sock.closed?.code).toBe(CONNECTION_TIMEOUT);
   });
 
@@ -229,7 +238,7 @@ describe('through a real Hocuspocus 4.7.1 (timeout shortened to 400 ms)', () => 
     const hp = server();
     const sock = socket(hp, true);
     sock.deliver(authFrame('ok'));
-    await settle(2.5 * TIMEOUT);
+    await advance(2.5 * TIMEOUT);
     expect(sock.closed).toBeNull();
     expect(sock.pings).toBeGreaterThan(5);
   });
@@ -237,7 +246,7 @@ describe('through a real Hocuspocus 4.7.1 (timeout shortened to 400 ms)', () => 
   it('pongs never extend an unauthenticated socket\'s deadline', async () => {
     const hp = server();
     const sock = socket(hp, true); // never authenticates
-    await settle(2.5 * TIMEOUT);
+    await advance(2.5 * TIMEOUT);
     expect(sock.pings).toBeGreaterThan(0);
     expect(sock.closed?.code).toBe(CONNECTION_TIMEOUT);
   });
@@ -246,10 +255,10 @@ describe('through a real Hocuspocus 4.7.1 (timeout shortened to 400 ms)', () => 
     const hp = server();
     const sock = socket(hp, true);
     sock.deliver(authFrame('ok'));
-    await settle(TIMEOUT / 2);
+    await advance(TIMEOUT / 2);
     expect(sock.closed).toBeNull();
     sock.answer = false;
-    await settle(2.5 * TIMEOUT);
+    await advance(2.5 * TIMEOUT);
     expect(sock.closed?.code).toBe(CONNECTION_TIMEOUT);
   });
 });
@@ -257,10 +266,12 @@ describe('through a real Hocuspocus 4.7.1 (timeout shortened to 400 ms)', () => 
 describe('#790 through a real Hocuspocus 4.7.1: a socket left holding no document is reaped', () => {
   const open: Hocuspocus[] = [];
   const sockets: FakeSocket[] = [];
+  beforeEach(fakeClock); // before `new Hocuspocus` and `connect`, so ClientConnection's interval and clock are fake
   afterEach(async () => {
     for (const s of sockets.splice(0)) s.close(1000, 'test over');
     for (const hp of open.splice(0)) hp.closeConnections();
-    await settle(5);
+    await advance(5);
+    jest.useRealTimers();
   });
   const run = (reap: boolean) => {
     const docs = new CollabSocketDocuments();
@@ -268,7 +279,7 @@ describe('#790 through a real Hocuspocus 4.7.1: a socket left holding no documen
       quiet: true,
       timeout: TIMEOUT,
       extensions: [
-        new CollabUserConnectionsExtension(new CollabUserConnections(32, new SocketLimitLog({ warn: () => undefined })), docs),
+        new CollabUserConnectionsExtension(new CollabUserConnections({ cap: 32, limitLog: new SocketLimitLog({ warn: () => undefined }) }), docs),
         { async onAuthenticate() { return { user: { id: 'u' } }; } },
       ],
     } as never);
@@ -277,7 +288,7 @@ describe('#790 through a real Hocuspocus 4.7.1: a socket left holding no documen
     sockets.push(sock);
     const clientConnection = sock.connect(hp);
     const holdsNoDocument = reap ? (ws: object) => docs.holdsNoDocument(ws) : () => false;
-    keepCollabSocketAlive(sock, () => clientConnection.touch(), 25, new SocketLimitLog({ warn: () => undefined }), holdsNoDocument);
+    keepCollabSocketAlive(sock, () => clientConnection.touch(), { intervalMs: 25, limitLog: new SocketLimitLog({ warn: () => undefined }), holdsNoDocument });
     sock.deliver(authFrame('ok'));
     const closeDocuments = () => {
       for (const doc of hp.documents.values()) for (const conn of doc.getConnections()) conn.close({ code: 4403, reason: 'access-revoked' });
@@ -287,9 +298,9 @@ describe('#790 through a real Hocuspocus 4.7.1: a socket left holding no documen
 
   it('control: after a document-level close, pongs keep the empty socket open past the idle timeout', async () => {
     const { sock, closeDocuments } = run(false);
-    await settle(50);
+    await advance(50);
     closeDocuments();
-    await settle(2.5 * TIMEOUT);
+    await advance(2.5 * TIMEOUT);
     expect(sock.closeReasons()).toEqual(['access-revoked']);
     expect(sock.closed).toBeNull();
   });
@@ -297,45 +308,18 @@ describe('#790 through a real Hocuspocus 4.7.1: a socket left holding no documen
   it('with the reaper, the same socket is terminated within two ticks; a socket still holding its document is not', async () => {
     const { sock, closeDocuments } = run(true);
     const kept = run(true);
-    await settle(50);
+    await advance(50);
     expect(sock.closed).toBeNull();
     closeDocuments(); // closes the documents of `sock`'s server only
-    await settle(150);
+    await advance(150);
     expect(sock.terminated).toBe(true);
-    await settle(2.5 * TIMEOUT);
+    await advance(2.5 * TIMEOUT);
     expect(kept.sock.closed).toBeNull();
   });
 });
 
 describe('wiring', () => {
-  const parse = (rel: string) => ts.createSourceFile(rel, readFileSync(join(SRC, rel), 'utf8'), ts.ScriptTarget.Latest, true);
-
-  it('the gateway keeps every socket alive on both paths (RedisSync and standalone)', () => {
-    const sf = parse('collaboration/collaboration.gateway.ts');
-    let branches: string[][] = [];
-    const visit = (n: ts.Node) => {
-      if (ts.isMethodDeclaration(n) && n.name.getText() === 'handleConnection') {
-        const body = n.body!.statements.find(ts.isIfStatement)!;
-        const callsIn = (s: ts.Node | undefined) => {
-          const out: string[] = [];
-          const walk = (m: ts.Node) => {
-            if (ts.isCallExpression(m) && m.expression.getText() === 'keepCollabSocketAlive') out.push(m.getText());
-            ts.forEachChild(m, walk);
-          };
-          if (s) walk(s);
-          return out;
-        };
-        branches = [callsIn(body.thenStatement), callsIn(body.elseStatement)];
-      }
-      ts.forEachChild(n, visit);
-    };
-    visit(sf);
-    expect(branches).toEqual([
-      ['keepCollabSocketAlive(client, () => clientConnection.touch())'],
-      ['keepCollabSocketAlive(client, () => clientConnection.touch())'],
-    ]);
-  });
-
+  // The gateway starts the keepalive on both paths through CollabSocketBounds.open: socket-bounds.fitness.spec.ts pins it.
   it('RedisSync refreshes a proxied socket through touch() only, never the private pre-auth reference', () => {
     const text = readFileSync(join(SRC, 'collaboration/extensions/redis-sync/redis-sync.extension.ts'), 'utf8');
     const code = text.replace(/\/\/.*$/gm, ''); // comments may name it; code may not

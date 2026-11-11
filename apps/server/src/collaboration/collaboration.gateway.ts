@@ -31,11 +31,8 @@ import {
 // (importless, so it is unit-testable outside the lib0 ESM graph); this method is a thin delegate.
 import { disconnectUserConnections } from '../authz/collab/disconnect-user-connections';
 import { CollabUpdateGuardExtension } from '../authz/collab-ingress/collab-update-guard.extension'; // CCC seam #3 (#781)
-import { keepCollabSocketAlive } from '../authz/collab-ingress/socket-keepalive'; // CCC seam #3 (#790)
 import { COLLAB_HOCUSPOCUS_OPTIONS } from '../authz/collab-ingress/limits'; // CCC seam #3 (#790)
-import { BoundedCollabSocket } from '../authz/collab-ingress/bounded-socket'; // CCC seam #3 (#790)
-import { admitCollabFrame } from '../authz/collab-ingress/frame-address'; // CCC seam #3 (#790)
-import { CollabUserConnectionsExtension } from '../authz/collab-ingress/user-connections'; // CCC seam #3 (#790)
+import { CollabSocketBounds } from '../authz/collab-ingress/socket-bounds'; // CCC seam #3 (#790, #810)
 
 @Injectable()
 export class CollaborationGateway {
@@ -52,6 +49,7 @@ export class CollaborationGateway {
     private loggerExtension: LoggerExtension,
     private environmentService: EnvironmentService,
     private collabEventsService: CollaborationHandler,
+    private readonly collabSocketBounds: CollabSocketBounds, // CCC #810: the process's collab socket bounds
   ) {
     this.redisConfig = parseRedisUrl(this.environmentService.getRedisUrl());
     this.withRedis = !this.environmentService.isCollabDisableRedis();
@@ -71,8 +69,8 @@ export class CollaborationGateway {
       ...COLLAB_HOCUSPOCUS_OPTIONS, // CCC #790: pending documents and the pre-auth queue (authz/collab-ingress/limits)
       extensions: [
         new CollabUpdateGuardExtension(), // CCC #781: refuses a malformed frame before it applies; first, synchronous
-        new CollabUserConnectionsExtension(), // CCC #790: the per-user connection cap (authz/collab-ingress/user-connections)
-        this.authenticationExtension,
+        this.collabSocketBounds.userConnectionsExtension, // CCC #790: the per-user connection cap (authz/collab-ingress/user-connections)
+        this.collabSocketBounds.quietAuthRefusals(this.authenticationExtension), // CCC #810: its 4xx refusals logged rate-limited, not per attempt
         this.persistenceExtension,
         this.loggerExtension,
       ],
@@ -123,24 +121,16 @@ export class CollaborationGateway {
       const serializedHTTPRequest = this.serializeRequest(request);
       const socketId = serializedHTTPRequest.headers['sec-websocket-key'];
 
-      // CCC #790: the outbound bound (authz/collab-ingress/bounded-socket)
-      const wrappedSocket = new BoundedCollabSocket(
+      // Route through RedisSync extension (this calls handleConnection internally). CCC #790/#810: the outbound bound,
+      // the frame check before RedisSync keys a name, and the keepalive (authz/collab-ingress/socket-bounds).
+      this.collabSocketBounds.open(
         client,
         new WsSocketWrapper(client),
+        (wrappedSocket) =>
+          this.redisSync!.onSocketOpen(wrappedSocket, serializedHTTPRequest),
+        (_clientConnection, data) =>
+          this.redisSync!.onSocketMessage(serializedHTTPRequest, data),
       );
-
-      // Route through RedisSync extension (this calls handleConnection internally)
-      const clientConnection = this.redisSync.onSocketOpen(
-        wrappedSocket,
-        serializedHTTPRequest,
-      );
-      // CCC #790: Hocuspocus 4.x sends no pings; ping here and count each pong as activity.
-      keepCollabSocketAlive(client, () => clientConnection.touch());
-
-      client.on('message', (data: ArrayBuffer) => {
-        if (!admitCollabFrame(client, data)) return; // CCC #790: `page.<uuid>` only, before RedisSync keys it
-        this.redisSync!.onSocketMessage(serializedHTTPRequest, data);
-      });
 
       client.on('close', (code: number, reason: Buffer) => {
         this.redisSync!.onSocketClose(
@@ -150,23 +140,22 @@ export class CollaborationGateway {
         );
       });
     } else {
-      // Fallback to direct Hocuspocus connection
-      const clientConnection = this.hocuspocus.handleConnection(
-        new BoundedCollabSocket(client, new WsSocketWrapper(client)), // CCC #790: the outbound bound
-        toWebRequest(this.serializeRequest(request)),
+      // Fallback to direct Hocuspocus connection. CCC #790/#810: the outbound bound, the frame check and the keepalive
+      // (authz/collab-ingress/socket-bounds).
+      const clientConnection = this.collabSocketBounds.open(
+        client,
+        new WsSocketWrapper(client),
+        (wrappedSocket) =>
+          this.hocuspocus.handleConnection(
+            wrappedSocket,
+            toWebRequest(this.serializeRequest(request)),
+          ),
+        (connection, data) => connection.handleMessage(new Uint8Array(data)),
       );
-
-      client.on('message', (data: Buffer) => {
-        if (!admitCollabFrame(client, data)) return; // CCC #790: `page.<uuid>` only
-        clientConnection.handleMessage(new Uint8Array(data));
-      });
 
       client.on('close', (code: number, reason: Buffer) => {
         clientConnection.handleClose({ code, reason: reason.toString() });
       });
-
-      // CCC #790: Hocuspocus 4.x sends no pings; ping here and count each pong as activity.
-      keepCollabSocketAlive(client, () => clientConnection.touch());
     }
   }
 
@@ -281,6 +270,7 @@ export class CollaborationGateway {
   }
 
   async destroy(collabWsAdapter: CollabWsAdapter): Promise<void> {
+    const drained = this.collabSocketBounds.beginDrain(this.hocuspocus.getDocumentsCount()); // CCC #810: first; new connections closed 1013 (authz/collab-ingress/socket-bounds)
     // eslint-disable-next-line no-async-promise-executor
     await new Promise(async (resolve) => {
       try {
@@ -300,6 +290,7 @@ export class CollaborationGateway {
         console.error(error);
       }
     });
+    drained(); // CCC #810: COLLAB_DRAIN done
 
     await this.hocuspocus.hooks('onDestroy', { instance: this.hocuspocus });
   }

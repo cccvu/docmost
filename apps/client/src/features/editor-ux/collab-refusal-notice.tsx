@@ -11,6 +11,8 @@ import { useTranslation } from "react-i18next";
  *     clientID the server bound to someone else: the copy holds the refused edit under that ID and replays it.
  *   - Discard this browser's copy: after a confirm, clear the page's IndexedDB copy, then reload. For a copy the
  *     server refuses every time it is replayed. A failed clear does not reload (it would replay the same copy).
+ *   - #810: after a 1009 (`tooBig`: this browser sent a frame over the server's size limit) the oversized change is
+ *     in this browser's copy, which a reload replays, so the notice says so, leads with Discard and offers no Reload.
  *
  * Wired by page-editor.tsx (seam 169).
  */
@@ -18,11 +20,14 @@ export interface CollabRefusalNoticeProps {
   /** Clear this page's local (IndexedDB) copy: `clearLocalCollabCopy`. */
   clearLocalCopy: () => Promise<void>;
   reload?: () => void;
+  /** #810: the refusal was a 1009 (`refusedTooBig`): only discarding this browser's copy recovers. */
+  tooBig?: boolean;
 }
 
 export function CollabRefusalNotice({
   clearLocalCopy,
   reload = () => window.location.reload(),
+  tooBig = false,
 }: CollabRefusalNoticeProps) {
   const { t } = useTranslation();
   const alertRef = useRef<HTMLDivElement>(null);
@@ -61,17 +66,23 @@ export function CollabRefusalNotice({
       >
         <Stack gap="sm">
           <Text size="sm">
-            {t(
-              "The server could not accept a change from this browser, so editing is paused. Reload the page to continue. If that does not help, discard this browser's copy of the page.",
-            )}
+            {tooBig
+              ? t(
+                  "A change in this browser is too large to send, so editing is paused. Reloading would send it again. To continue, discard this browser's copy of the page.",
+                )
+              : t(
+                  "The server could not accept a change from this browser, so editing is paused. Reload the page to continue. If that does not help, discard this browser's copy of the page.",
+                )}
           </Text>
           <Group gap="sm">
-            <Button size="xs" onClick={() => reload()}>
-              {t("Reload")}
-            </Button>
+            {!tooBig && (
+              <Button size="xs" onClick={() => reload()}>
+                {t("Reload")}
+              </Button>
+            )}
             <Button
               size="xs"
-              variant="default"
+              variant={tooBig ? "filled" : "default"}
               color="red"
               onClick={() => setConfirmOpen(true)}
             >

@@ -2,9 +2,9 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Docmost Remote Authorization Service",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "summary": "The contract a third party implements to run this Docmost fork with AUTHZ_MODE=remote.",
-    "description": "When this Docmost fork runs with AUTHZ_MODE=remote, it delegates EVERY fine-grained authorization decision, and forwards domain audit, to an external HTTP service over this contract. Implement these six endpoints (plus, optionally, /sync/settle — 1.1.0) and point the fork at your service via PLATFORM_AUTHZ_URL (base URL, no path prefix) and PLATFORM_AUTHZ_SERVICE_SECRET (the shared secret sent in the x-authz-service-secret header) to run the fork without the CCC platform.\n\nThis document is the CANONICAL source of truth for the PEP to PDP + audit boundary. It supersedes the retired contract/pep-pdp.contract.json fixture; the fork consumer contract test and the reference implementation's provider contract test both derive their canonical request/response bodies and array caps from this file.\n\nSecurity model (non-negotiable, enforced by the fork, not by your service):\n  - The mode is a server-controlled boundary fixed at fork startup, never inferred from availability, and there is NO fallback to native decisions. If your service is unreachable, slow, or returns a non-2xx or malformed body, the fork FAILS CLOSED: nothing is granted, and the fork answers its own caller a retryable 503 for a decision or a list it could not get answered (wiki-v2 #696, #716), never an empty or partial list. A platform outage must never silently grant access, so your service returning 5xx is safe by construction.\n  - The fork calls with a per-request AbortController timeout (PLATFORM_AUTHZ_TIMEOUT_MS, default 1500 ms, clamped to [250, 60000]); respond well within it or the call is treated as a denial.\n  - Subjects arrive as { provider: \"docmost\", externalId: <docmost user id> } for every user decision. Since 1.2.0 (wiki-v2 #615) the fork ALSO sends { principalId, subjectType: \"service\" } to /authz/filter-resources, only for the service-account leg of an on-behalf-of service-bridge content/search (when its caller passes serviceSubjectId). Denying that subject is safe (fail-closed) but empties every such search.\n  - The reference implementation additionally rejects unknown request keys with 400 and enforces the array caps below; a faithful implementation should do the same, but the fork itself never sends unknown keys or over-cap arrays.",
+    "description": "When this Docmost fork runs with AUTHZ_MODE=remote, it delegates EVERY fine-grained authorization decision, and forwards domain audit, to an external HTTP service over this contract. Implement these six endpoints (plus, optionally, POST /sync/settle — 1.1.0 — and GET /authz/edge-trust — 1.3.0) and point the fork at your service via PLATFORM_AUTHZ_URL (base URL, no path prefix) and PLATFORM_AUTHZ_SERVICE_SECRET (the shared secret sent in the x-authz-service-secret header) to run the fork without the CCC platform.\n\nThis document is the CANONICAL source of truth for the PEP to PDP + audit boundary. It supersedes the retired contract/pep-pdp.contract.json fixture; the fork consumer contract test and the reference implementation's provider contract test both derive their canonical request/response bodies and array caps from this file.\n\nSecurity model (non-negotiable, enforced by the fork, not by your service):\n  - The mode is a server-controlled boundary fixed at fork startup, never inferred from availability, and there is NO fallback to native decisions. If your service is unreachable, slow, or returns a non-2xx or malformed body, the fork FAILS CLOSED: nothing is granted, and the fork answers its own caller a retryable 503 for a decision or a list it could not get answered (wiki-v2 #696, #716), never an empty or partial list. A platform outage must never silently grant access, so your service returning 5xx is safe by construction.\n  - The fork calls with a per-request AbortController timeout (PLATFORM_AUTHZ_TIMEOUT_MS, default 1500 ms, clamped to [250, 60000]); respond well within it or the call is treated as a denial.\n  - Subjects arrive as { provider: \"docmost\", externalId: <docmost user id> } for every user decision. Since 1.2.0 (wiki-v2 #615) the fork ALSO sends { principalId, subjectType: \"service\" } to /authz/filter-resources, only for the service-account leg of an on-behalf-of service-bridge content/search (when its caller passes serviceSubjectId). Denying that subject is safe (fail-closed) but empties every such search.\n  - The reference implementation additionally rejects unknown request keys with 400 and enforces the array caps below; a faithful implementation should do the same, but the fork itself never sends unknown keys or over-cap arrays.",
     "license": { "name": "AGPL-3.0-only", "identifier": "AGPL-3.0-only" },
     "x-canonical": true
   },
@@ -335,6 +335,35 @@
           },
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "404": { "description": "Not implemented — the fork treats it as `pending`." }
+        }
+      }
+    },
+    "/authz/edge-trust": {
+      "get": {
+        "operationId": "getEdgeTrust",
+        "tags": ["authz"],
+        "summary": "OPTIONAL (1.3.0, wiki-v2 #810): which X-Forwarded-For hops your edge adds, so the collab server can key unauthenticated sockets by client address.",
+        "description": "Config, not a decision: no request body, no query, no subject. The fork's collab server shares its process-wide pool of unauthenticated collab sockets per client address (at most 128 of 512 each; past it the upgrade is refused `429` with `Retry-After`). To find a socket's client address it walks `[socket peer, ...X-Forwarded-For right to left]`: hop 0 (the socket peer, your load balancer) is trusted, then only the exact IP literals in `trustedProxies`, and the first untrusted hop is the client. With `xffTrusted: false` it walks nothing and the client is the socket peer. Serve the same list your own edge-facing service trusts, so the two never disagree. The fork calls this with `GET`, the `x-authz-service-secret` header and its authz timeout, at boot without blocking it, retrying from 1 s doubling to 30 s until it gets a well-formed answer, then every 5 minutes; a failed refresh keeps the last good answer. OPTIONAL: without this route (`404`), or on any non-2xx, timeout, transport error or malformed body, the trust is `unknown` and the per-address share is OFF (the pool, its deadlines and its byte bounds still apply, as before 1.3.0). Nothing is ever guessed, so a missing answer never collapses proxied users into one key. A malformed answer is logged by the fork; an extra key is ignored.",
+        "responses": {
+          "200": {
+            "description": "The edge trust. `trustedProxies` holds bare IP literals (IPv4 or IPv6, no CIDR, no port), at most 64; anything else makes the whole answer malformed (share off).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": ["trustedProxies", "xffTrusted"],
+                  "properties": {
+                    "trustedProxies": { "type": "array", "maxItems": 64, "items": { "type": "string" } },
+                    "xffTrusted": { "type": "boolean", "description": "Whether X-Forwarded-For is walked at all (false outside production, where your own service should ignore it too)." }
+                  }
+                },
+                "example": { "trustedProxies": ["198.51.100.10"], "xffTrusted": true }
+              }
+            }
+          },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "404": { "description": "Not implemented: the fork keeps the trust `unknown` and the per-address share off (the reference stub answers this)." },
+          "503": { "$ref": "#/components/responses/Unconfigured" }
         }
       }
     },

@@ -1,9 +1,11 @@
 import { WebSocketStatus } from "@hocuspocus/provider";
 
 /**
- * CCC fork addition (cccvu/wiki-v2#501, #537) — how page-editor.tsx re-opens the collab socket so every attached
- * document re-authenticates, and how it refetches the collab token first. Wired by seam 169; the decision of WHEN
- * to do either stays in `collab-access.ts`.
+ * CCC fork addition (cccvu/wiki-v2#501, #537) — how the editor re-opens the collab socket so every attached
+ * document re-authenticates, and how it refetches the collab token first. Carried out by
+ * `collab-access-controller.ts` (wired by seam 169); the decision of WHEN to do either stays in `collab-access.ts`.
+ * #810: the controller closes the socket before every refetch (the server closes a refused socket, and the
+ * provider would reconnect it in 1 s with the old token), so `reopen` usually finds it closed and connects directly.
  */
 
 /** The slice of `HocuspocusProviderWebsocket` the reconnect uses. */
@@ -37,6 +39,25 @@ export function reopenCollabSocket(
   };
   socket.on("disconnect", reopen);
   socket.disconnect();
+}
+
+/**
+ * #810: whether page-editor.tsx's visibility effect should open the socket: the tab is visible, the header reads
+ * disconnected, and nothing is retrying the socket (`shouldConnect` is false only after `disconnect()`: the effect's
+ * own idle close, or the access controller's lost / try-later close). A socket the provider is already retrying is
+ * left alone: `connect()` cancels the provider's backoff and dials at once, and an effect that ran on every status
+ * render (the unstable `resetIdle` in its deps) turned that into a reconnect per round trip (42 in 15 s).
+ */
+export function reopensOnVisible(
+  documentState: string,
+  status: WebSocketStatus | string,
+  socket: { shouldConnect: boolean },
+): boolean {
+  return (
+    documentState === "visible" &&
+    status === WebSocketStatus.Disconnected &&
+    !socket.shouldConnect
+  );
 }
 
 export interface CollabTokenRefetch {

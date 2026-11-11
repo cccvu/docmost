@@ -3,12 +3,16 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   COLLAB_LOST_RETRY_MS,
+  COLLAB_RETRY_MIN_MS,
+  COLLAB_TRY_LATER_BASE_MS,
   COLLAB_UPDATE_REFUSED_PREFIX,
   COLLAB_UPDATE_UNRESOLVED,
   CollabAccessEvent,
   CollabAccessState,
   classifyCollabCloseReason,
   collabAllowsEditing,
+  collabAwaitsRetry,
+  collabRetryDelay,
   currentCollabToken,
   initialCollabAccess,
   isCollabTokenExpired,
@@ -414,20 +418,47 @@ describe("a socket close with 1009 (a frame over the server's maxPayload) (#790)
   const rawClose = (code: number | undefined, reason = "") =>
     ({ kind: "server-close", socketConnected: false, reason, code }) as const;
 
-  it("is refused: detach, stop editing, the generic notice, never reconnect or refetch", () => {
+  it("is refused: detach, stop editing, the too-big notice (#810: Discard first), never reconnect or refetch", () => {
     expect(WS_CLOSE_MESSAGE_TOO_BIG).toBe(1009);
     expect(classifyCollabCloseReason("", 1009)).toBe("refused");
     for (const step of [
       nextCollabAccess(initialCollabAccess, rawClose(1009)),
       nextCollabAccess(initialCollabAccess, rawClose(1009, "Max payload size exceeded")),
+      // a 1009 wins over any reason, even a try-later one
+      nextCollabAccess(initialCollabAccess, rawClose(1009, "ccc:collab-try-later")),
     ]) {
       expect(step.detach).toBe(true);
       expect(step.reconnect).toBe(false);
       expect(step.refreshToken).toBe(false);
       expect(step.markDisconnected).toBe(false);
+      expect(step.retryAfterMs).toBe(0);
       expect(step.state.refused).toBe(true);
+      expect(step.state.refusedTooBig).toBe(true);
       expect(collabAllowsEditing(step.state)).toBe(false);
     }
+  });
+
+  // #810 (review F1): only a 1009 says "too big"; every other refusal keeps Reload in the notice (anti-vacuity).
+  it("no other refusal is too big, and refused stays final", () => {
+    const others = [
+      nextCollabAccess(initialCollabAccess, {
+        kind: "server-close",
+        socketConnected: true,
+        reason: `${COLLAB_UPDATE_REFUSED_PREFIX}mark`,
+        code: 1000,
+      }),
+      nextCollabAccess(
+        { ...initialCollabAccess, unresolvedRetried: true },
+        { kind: "server-close", socketConnected: true, reason: COLLAB_UPDATE_UNRESOLVED },
+      ),
+    ];
+    for (const step of others) {
+      expect(step.state.refused).toBe(true);
+      expect(step.state.refusedTooBig).toBe(false);
+    }
+    const tooBig = nextCollabAccess(initialCollabAccess, rawClose(1009)).state;
+    expect(nextCollabAccess(tooBig, { kind: "authenticated", scope: "read-write" }).state).toBe(tooBig);
+    expect(initialCollabAccess.refusedTooBig).toBe(false);
   });
 
   it.each([1000, 1001, 1006, 1011, 4408, 4422, undefined])(
@@ -447,25 +478,6 @@ describe("a socket close with 1009 (a frame over the server's maxPayload) (#790)
     },
   );
 
-  // #790 (review S2): the server's per-user budgets close the SOCKET with 1013 (Try Again Later) and the per-user
-  // connection cap closes it with 4429, both with a reason the editor must never read as a refusal: the provider
-  // reconnects with its backoff, and the editor stays editable.
-  it.each([
-    [1013, "ccc:collab-try-later"],
-    [4429, "ccc:collab-user-connections"],
-  ])("a %s socket close (%s) is retried, never refused", (code, reason) => {
-    expect(classifyCollabCloseReason(reason, code)).toBe("other");
-    const step = nextCollabAccess(initialCollabAccess, rawClose(code, reason));
-    expect(step.state.refused).toBe(false);
-    expect(step.detach).toBe(false);
-    expect(step.disconnectSocket).toBe(false); // the provider's own reconnect is left running
-    expect(collabAllowsEditing(step.state)).toBe(true);
-    // the same reason on a per-document CLOSE while the socket is still up reconnects at once
-    const doc = nextCollabAccess(initialCollabAccess, { kind: "server-close", socketConnected: true, reason, code: 1000 });
-    expect(doc.reconnect).toBe(true);
-    expect(doc.state.refused).toBe(false);
-  });
-
   it("a per-document CLOSE (code 1000) is still judged by its reason alone", () => {
     expect(
       nextCollabAccess(initialCollabAccess, {
@@ -483,13 +495,12 @@ describe("a socket close with 1009 (a frame over the server's maxPayload) (#790)
 
 // cccvu/wiki-v2#790 — only a refusal closes the socket: every other step keeps it (reconnect and token refresh need it).
 describe("disconnectSocket", () => {
-  it("is false for every event that is neither a refusal nor a loss", () => {
+  it("is false for every event that is neither a refusal, a loss, a try-later nor a token refetch", () => {
     const events: CollabAccessEvent[] = [
       { kind: "server-close", socketConnected: true },
       { kind: "server-close", socketConnected: false, code: 1006 },
+      { kind: "server-close", socketConnected: false, code: 4401 },
       { kind: "server-close", socketConnected: true, reason: COLLAB_UPDATE_UNRESOLVED },
-      { kind: "auth-failed", tokenExpired: true },
-      { kind: "auth-failed", tokenExpired: false },
       { kind: "authenticated", scope: "read-write" },
       { kind: "sync-acked" },
     ];
@@ -498,12 +509,42 @@ describe("disconnectSocket", () => {
     }
   });
 
+  // #810 (review R4-F3): the server closes a refused socket (4401) right after its PermissionDenied, and the provider
+  // would reconnect it after a fixed 1 s with the OLD token, racing the refetch (a refused retry that then reads as
+  // lost, and an extra pre-auth slot and auth-rate token). So every refetch closes the socket first.
+  it("every token refetch (an expiry, or the first other refusal) closes the socket and is not lost", () => {
+    for (const [prev, event] of [
+      [initialCollabAccess, { kind: "auth-failed", tokenExpired: true }],
+      [initialCollabAccess, { kind: "auth-failed", tokenExpired: false }],
+      [{ ...initialCollabAccess, refreshed: true }, { kind: "auth-failed", tokenExpired: true }],
+      [initialCollabAccess, { kind: "auth-failed", tokenExpired: false, reason: "permission-denied" }],
+    ] as [CollabAccessState, CollabAccessEvent][]) {
+      const step = nextCollabAccess(prev, event);
+      expect([event, step.refreshToken, step.disconnectSocket]).toEqual([event, true, true]);
+      expect(step.state.lost).toBe(false);
+      expect(step.markDisconnected).toBe(false);
+      expect(step.retryAfterMs).toBe(0);
+      expect(step.detach).toBe(false);
+    }
+    // a step that does NOT refetch never closes the socket for it (anti-vacuity for the rule above)
+    for (const event of [
+      { kind: "authenticated", scope: "read-write" },
+      { kind: "sync-acked" },
+      { kind: "server-close", socketConnected: true },
+    ] as CollabAccessEvent[]) {
+      const step = nextCollabAccess(initialCollabAccess, event);
+      expect(step.refreshToken).toBe(false);
+      expect(step.disconnectSocket).toBe(false);
+    }
+  });
+
   // #790: the server closes a socket right after refusing its authentication and counts every unauthenticated socket
   // in a process-wide pool. A lost editor that kept reconnecting at the provider's pace (about once a second) would
   // hold a slot of that pool for as long as the tab stayed open, so a loss closes the socket and retries slowly.
   it("a loss (a second refusal, or a refetch that fails) closes the socket and retries after COLLAB_LOST_RETRY_MS, never refused", () => {
     const refetched = nextCollabAccess(initialCollabAccess, { kind: "auth-failed", tokenExpired: false });
-    expect(refetched.disconnectSocket).toBe(false); // the first refusal refetches the token once (#537)
+    expect(refetched.refreshToken).toBe(true); // the first refusal refetches the token once (#537)
+    expect(refetched.retryAfterMs).toBe(0); // ... and is not a loss (its socket closes only for the refetch, #810)
     for (const step of [
       nextCollabAccess(refetched.state, { kind: "auth-failed", tokenExpired: false }),
       nextCollabAccess(initialCollabAccess, { kind: "refresh-failed" }),
@@ -544,31 +585,164 @@ describe("disconnectSocket", () => {
   });
 });
 
-// cccvu/wiki-v2#790 — the wiring in page-editor.tsx (seam 169): the step closes the socket, and nothing reopens it.
+// cccvu/wiki-v2#810 — the wiring in page-editor.tsx (seam 169) is now one controller (collab-access-controller.ts,
+// tested with the real 4.7.1 provider in collab-access-controller.test.ts); these scans pin only what stays in the seam.
 describe("page-editor wiring", () => {
   const source = readFileSync(
     join(__dirname, "..", "editor", "page-editor.tsx"),
     "utf8",
   );
-  it("a lost editor's retry timer reconnects only while it is still current and still lost, and is cleared on unmount", () => {
-    expect(source).toMatch(/if \(step\.retryAfterMs\) \{[\s\S]*?clearTimeout\(lostRetry\);[\s\S]*?lostRetry = setTimeout\(\(\) => \{\s*if \(isCurrent\(\) && collabAccessRef\.current\.lost\) socket\.connect\(\);\s*\}, step\.retryAfterMs\);/);
-    expect(source).toMatch(/return \(\) => \{\s*clearTimeout\(lostRetry\);/);
+  it("builds one controller per provider pair, binds the provider, and destroys the controller on unmount", () => {
+    expect(source).toMatch(/const access = createCollabAccessController\(\{\s*socket,/);
+    expect(source).toMatch(/access\.bind\(remote\);/);
+    expect(source).toMatch(/collabAccessRef\.current = access;/);
+    expect(source).toMatch(/return \(\) => \{\s*collabAccessRef\.current\?\.destroy\(\);/);
+    // the rules live in the controller: no second copy of them in the seam
+    expect(source).not.toMatch(/nextCollabAccess|onAuthenticationFailed|lostRetry/);
   });
 
-  it("a disconnectSocket step disconnects the editor's socket, after the detach", () => {
-    const detach = source.indexOf("if (step.detach) remote.detach();");
-    const disconnect = source.indexOf(
-      "if (step.disconnectSocket) socket.disconnect();",
+  it("a refused editor is never re-attached and the visibility effect never reconnects it", () => {
+    expect(source).toMatch(
+      /if \(!providersReady \|\| !providersRef\.current\) return;\s*if \(collabAccessRef\.current\?\.state\.refused\) return;/,
     );
-    expect(detach).toBeGreaterThan(-1);
-    expect(disconnect).toBeGreaterThan(detach);
+    expect(source).toMatch(
+      /if \(!collabAccessRef\.current\?\.state\.refused\) providersRef\.current\?\.remote\.attach\(\);/,
+    );
   });
-  it("a refused editor is not current (a token refetch in flight cannot reopen) and the visibility effect never reconnects it", () => {
+
+  // #810 (final live check L2-2, EXT-4): the visibility effect undoes only a close (its own idle close, or the
+  // controller's lost/try-later close), never a provider that is already retrying with its own backoff.
+  it("the visibility effect reconnects only a socket nothing is retrying", () => {
     expect(source).toMatch(
-      /const isCurrent = \(\) =>\s*providersRef\.current\?\.socket === socket &&\s*!collabAccessRef\.current\.refused;/,
+      /if \(reopensOnVisible\(documentState, yjsConnectionStatus, socket\)\) \{\s*resetIdle\(\);\s*socket\.connect\(\);\s*\}\s*\}, \[isIdle, documentState, providersReady, resetIdle\]\);/,
     );
-    expect(source).toMatch(
-      /if \(!providersReady \|\| !providersRef\.current\) return;\s*if \(collabAccessRef\.current\.refused\) return;/,
-    );
+  });
+
+  it("the refusal notice is told about a 1009", () => {
+    expect(source).toMatch(/<CollabRefusalNotice\s*tooBig=\{collabAccess\.refusedTooBig\}/);
+  });
+});
+
+// cccvu/wiki-v2#810 (T2, F2) — the server's "try later" answers are a bounded, slowed retry: never the #537 refetch,
+// never lost, never refused, still editable; the wait grows to COLLAB_LOST_RETRY_MS and an authentication resets it.
+describe("try later (#810)", () => {
+  const tryLaterEvents: [string, CollabAccessEvent][] = [
+    ["auth refused: auth rate", { kind: "auth-failed", tokenExpired: false, reason: "ccc:collab-auth-rate-limited" }],
+    ["auth refused: connections", { kind: "auth-failed", tokenExpired: false, reason: "ccc:collab-user-connections" }],
+    // a rate-limited refusal implies the token verified: it is try-later even when the token reads expired
+    ["auth refused: auth rate, expired", { kind: "auth-failed", tokenExpired: true, reason: "ccc:collab-auth-rate-limited" }],
+    ["socket close 4429", { kind: "server-close", socketConnected: false, code: 4429, reason: "ccc:collab-user-connections" }],
+    ["socket close 1013", { kind: "server-close", socketConnected: false, code: 1013, reason: "ccc:collab-try-later" }],
+    // the drain closes 1013 with whatever reason ws gives it
+    ["socket close 1013, other reason", { kind: "server-close", socketConnected: false, code: 1013, reason: "Try Again Later" }],
+    ["socket close 4429, no reason", { kind: "server-close", socketConnected: false, code: 4429 }],
+    ["document CLOSE: connections", { kind: "server-close", socketConnected: true, code: 1000, reason: "ccc:collab-user-connections" }],
+    ["document CLOSE: try later", { kind: "server-close", socketConnected: true, code: 1000, reason: "ccc:collab-try-later" }],
+  ];
+
+  it.each(tryLaterEvents)("%s ⇒ close the socket, show disconnected, retry later; no refetch, not lost, editable", (_, event) => {
+    const prev = { ...initialCollabAccess, refreshed: true };
+    const step = nextCollabAccess(prev, event);
+    expect(step.state.refused).toBe(false);
+    expect(step.state.lost).toBe(false);
+    expect(step.state.refreshed).toBe(true); // untouched
+    expect(step.state.tryLaterAttempts).toBe(1);
+    expect(step.detach).toBe(false);
+    expect(step.refreshToken).toBe(false);
+    expect(step.reconnect).toBe(false);
+    expect(step.disconnectSocket).toBe(true);
+    expect(step.markDisconnected).toBe(true);
+    expect(step.retryAfterMs).toBe(COLLAB_TRY_LATER_BASE_MS);
+    expect(collabAllowsEditing(step.state)).toBe(true);
+    expect(collabAwaitsRetry(step.state)).toBe(true);
+    // and from the initial state too (a try-later never spends the #537 refetch)
+    expect(nextCollabAccess(initialCollabAccess, event).state.refreshed).toBe(false);
+  });
+
+  it("repeated try-laters wait longer each time, capped at COLLAB_LOST_RETRY_MS; an authentication resets the wait", () => {
+    let state: CollabAccessState = initialCollabAccess;
+    const waits: number[] = [];
+    for (let i = 0; i < 12; i += 1) {
+      const step = nextCollabAccess(state, tryLaterEvents[i % tryLaterEvents.length][1]);
+      state = step.state;
+      waits.push(step.retryAfterMs);
+      expect(collabAllowsEditing(state)).toBe(true);
+    }
+    expect(waits.slice(0, 5)).toEqual([5_000, 10_000, 20_000, 40_000, 60_000]);
+    for (let i = 1; i < waits.length; i += 1) expect(waits[i]).toBeGreaterThanOrEqual(waits[i - 1]);
+    expect(Math.max(...waits)).toBe(COLLAB_LOST_RETRY_MS);
+    const back = nextCollabAccess(state, { kind: "authenticated", scope: "read-write" });
+    expect(back.state.tryLaterAttempts).toBe(0);
+    expect(collabAwaitsRetry(back.state)).toBe(false);
+    expect(nextCollabAccess(back.state, tryLaterEvents[0][1]).retryAfterMs).toBe(COLLAB_TRY_LATER_BASE_MS);
+    // a huge count never overflows the wait
+    expect(
+      nextCollabAccess({ ...initialCollabAccess, tryLaterAttempts: 10_000 }, tryLaterEvents[0][1]).retryAfterMs,
+    ).toBe(COLLAB_LOST_RETRY_MS);
+  });
+
+  it("a try-later while lost keeps the editor lost (only an authentication clears it)", () => {
+    const step = nextCollabAccess({ ...initialCollabAccess, lost: true, refreshed: true }, tryLaterEvents[0][1]);
+    expect(step.state.lost).toBe(true);
+    expect(collabAllowsEditing(step.state)).toBe(false);
+    expect(step.refreshToken).toBe(false);
+  });
+
+  // Anti-vacuity: the classes next door keep their own paths.
+  it.each([
+    ["permission-denied", "permission-denied"],
+    ["no reason", undefined],
+    ["a lookalike", "ccc:collab-auth-rate-limitedx"],
+    ["a prefix", "ccc:collab-user-connection"],
+    ["the close-only reason", "ccc:collab-try-later"],
+  ])("an auth refusal with %s keeps the #537 path (refetch once, then lost)", (_, reason) => {
+    const first = nextCollabAccess(initialCollabAccess, { kind: "auth-failed", tokenExpired: false, reason });
+    expect(first.refreshToken).toBe(true);
+    expect(first.state.tryLaterAttempts).toBe(0);
+    const second = nextCollabAccess(first.state, { kind: "auth-failed", tokenExpired: false, reason });
+    expect(second.state.lost).toBe(true);
+    expect(second.retryAfterMs).toBe(COLLAB_LOST_RETRY_MS);
+  });
+
+  it("classifies only the try-later codes and reasons; the close-only reasons are not auth reasons", () => {
+    expect(classifyCollabCloseReason(undefined, 1013)).toBe("try-later");
+    expect(classifyCollabCloseReason("", 4429)).toBe("try-later");
+    expect(classifyCollabCloseReason("ccc:collab-try-later", 1000)).toBe("try-later");
+    expect(classifyCollabCloseReason("ccc:collab-user-connections")).toBe("try-later");
+    for (const [reason, code] of [
+      ["ccc:collab-auth-rate-limited", 1000], // an auth refusal reason, never a close reason
+      ["ccc:collab-try-laterx", 1000],
+      ["", 4401],
+      ["", 1012],
+      ["", 4428],
+    ] as [string, number][]) {
+      expect([reason, code, classifyCollabCloseReason(reason, code)]).toEqual([reason, code, "other"]);
+    }
+    // a refusal reason wins over a try-later code
+    expect(classifyCollabCloseReason(`${COLLAB_UPDATE_REFUSED_PREFIX}mark`, 1013)).toBe("refused");
+  });
+
+  it("a refused editor ignores try-later", () => {
+    const refused = { ...initialCollabAccess, refused: true };
+    const step = nextCollabAccess(refused, tryLaterEvents[0][1]);
+    expect(step.state).toBe(refused);
+    expect(step.disconnectSocket || step.markDisconnected || step.retryAfterMs > 0).toBe(false);
+    expect(collabAwaitsRetry({ ...refused, tryLaterAttempts: 3, lost: true })).toBe(false);
+  });
+});
+
+describe("collabRetryDelay (#810)", () => {
+  it("is between half and all of the wait, never below COLLAB_RETRY_MIN_MS", () => {
+    expect(collabRetryDelay(60_000, () => 0)).toBe(30_000);
+    expect(collabRetryDelay(60_000, () => 1)).toBe(60_000);
+    expect(collabRetryDelay(5_000, () => 0.5)).toBe(3_750);
+    expect(collabRetryDelay(1_000, () => 0)).toBe(COLLAB_RETRY_MIN_MS);
+    expect(collabRetryDelay(5_000, () => 7)).toBe(5_000); // a bad random source is clamped
+    expect(collabRetryDelay(5_000, () => -1)).toBe(2_500);
+    for (let i = 0; i < 200; i += 1) {
+      const d = collabRetryDelay(5_000);
+      expect(d).toBeGreaterThanOrEqual(2_500);
+      expect(d).toBeLessThanOrEqual(5_000);
+    }
   });
 });

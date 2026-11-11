@@ -18,6 +18,9 @@
  * gateway's keepalive finds it by the ws socket it pings. A proxied connection (the RedisSync owner side) has its own
  * webSocket and is never looked up; its origin socket is never counted, so a socket whose documents another node owns
  * is never reaped here (a rolling deploy's overlap). WeakMap: an entry goes with its socket.
+ *
+ * One instance per process, owned by `CollabSocketBounds` (socket-bounds.ts): written by its user-connections extension's
+ * `connected` hook, read by the keepalive it starts for every socket.
  */
 
 /** The subset of a Hocuspocus 4.7.1 `Connection` read here. */
@@ -53,6 +56,3 @@ export class CollabSocketDocuments {
     return entry !== undefined && entry.live === 0;
   }
 }
-
-/** The process's registry: written by the `connected` hook, read by the gateway's keepalive. */
-export const collabSocketDocuments = new CollabSocketDocuments();

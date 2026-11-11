@@ -55,9 +55,10 @@ import { Logger } from '@nestjs/common';
 import * as decoding from 'lib0/decoding';
 import { decodeUtf8 } from 'lib0/string';
 import * as Y from 'yjs';
+import { MessageType } from '@hocuspocus/server';
 import { COLLAB_CONNECTIONS_PER_USER } from './limits';
 import { ConflictScan, installConflictScanMeter, type ConflictScanMeter } from './conflict-scan';
-import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
+import { collabSocketLimitLog, RateLimitedWarn, type SocketLimit, type SocketLimitLog } from './socket-limit-log';
 import {
   checkAttribute,
   checkElement,
@@ -89,8 +90,8 @@ export const AWARENESS_BINDS_PER_USER = 256;
 /**
  * #790 budgets per (user, document), kept across that user's connections and reconnects (a per-connection budget
  * refilled on every reconnect, so only the 1/s auth rate bounded it). Exhausting one closes the SOCKET with 1013 (Try
- * Again Later), which the editor treats as an ordinary close and retries with the provider's backoff: never a 4422
- * refusal, which detaches the editor for good.
+ * Again Later), which the editor waits out with its try-later backoff (5 s doubling to 60 s, jittered) before it
+ * reconnects: never a 4422 refusal, which detaches the editor for good.
  *
  * Sync: SyncStep1 (Sync or SyncReply) and a read-only connection's Step2, each of which makes 4.7.1 encode or snapshot
  * the whole document. An honest provider sends one Step1 per open (HocuspocusProvider.onOpen; Docmost sets no
@@ -119,7 +120,7 @@ export const AWARENESS_NEW_IDS_BURST = 2 * COLLAB_CONNECTIONS_PER_USER;
 export const AWARENESS_NEW_IDS_REFILL_MS = 4_000;
 /** (user, document) budgets kept in this process; past it the least recently used is dropped (a fresh budget). */
 export const USER_DOC_BUDGETS_MAX = 10_000;
-/** #790: the socket close for an exhausted budget: 1013 (RFC 6455 Try Again Later), retried by the provider. */
+/** #790: the socket close for an exhausted budget: 1013 (RFC 6455 Try Again Later), waited out by the editor's backoff. */
 export const COLLAB_TRY_LATER_CODE = 1013;
 export const TRY_LATER_REASON = 'ccc:collab-try-later';
 /**
@@ -150,14 +151,13 @@ const LOGS_PER_MINUTE = 30;
 
 export const reasonFor = (rule: CollabRule): string => (rule === 'unresolved' ? UNRESOLVED_REASON : REFUSED_REASON_PREFIX + rule);
 
-/** Hocuspocus 4.7.1 MessageType values and y-protocols sync subtypes. */
-const MESSAGE = { Sync: 0, Awareness: 1, Auth: 2, QueryAwareness: 3, SyncReply: 4, Stateless: 5, BroadcastStateless: 6, Close: 7 } as const;
 /**
  * The client message types 4.7.1's `MessageReceiver.apply` handles and an honest provider may send on an established
  * session (Stateless is refused on its own rule above, Auth on an established session on `auth`). Anything else falls
  * to its `default:` branch: one unrate-limited console.error per frame, and the session stays up.
  */
-const HANDLED = new Set<number>([MESSAGE.Sync, MESSAGE.Awareness, MESSAGE.QueryAwareness, MESSAGE.SyncReply, MESSAGE.Close]);
+const HANDLED = new Set<number>([MessageType.Sync, MessageType.Awareness, MessageType.QueryAwareness, MessageType.SyncReply, MessageType.CLOSE]);
+/** y-protocols/sync message subtypes (messageYjsSyncStep1/2/Update; y-protocols is not a declared dependency here). */
 const STEP1 = 0;
 const STEP2 = 1;
 const UPDATE = 2;
@@ -227,9 +227,14 @@ export class CollabUpdateGuard {
   private readonly logger: GuardLogger;
   private readonly limitLog: SocketLimitLog;
   private readonly now: () => number;
+  /** Guard lines, LOGS_PER_MINUTE per token a minute; the rest are counted (socket-limit-log.ts, #810). */
+  private readonly logLines = new RateLimitedWarn<string>({
+    logger: { warn: (message) => this.logger.warn(message) },
+    perKey: LOGS_PER_MINUTE,
+    summary: (token, count) => `COLLAB_GUARD_LOG_SUPPRESSED ${JSON.stringify({ of: token, count })}`,
+  });
   private readonly cpuNow: () => number;
   private readonly meter: ConflictScanMeter;
-  private logWindow = { start: 0, count: 0, suppressed: 0 };
 
   constructor(
     opts: { mode?: CollabGuardMode; logger?: GuardLogger; limitLog?: SocketLimitLog; now?: () => number; cpuNow?: () => number } = {},
@@ -249,14 +254,14 @@ export class CollabUpdateGuard {
     if (earlier) throw { code: COLLAB_REFUSAL_CODE, reason: earlier };
     const header = readHeader(frame.update);
     if (!header) return; // not decodable as a frame: Hocuspocus refuses it itself
-    if (header.type === MESSAGE.Stateless || header.type === MESSAGE.BroadcastStateless) {
+    if (header.type === MessageType.Stateless || header.type === MessageType.BroadcastStateless) {
       return this.refuse(frame, header, { rule: 'stateless' }); // nothing in Docmost sends one; a broadcast reaches every peer
     }
     // Only an established session's frames reach this hook (Hocuspocus consumes the Auth that establishes it): a second
     // Auth re-runs onTokenSync, or logs, per frame. An honest provider authenticates once per open.
-    if (header.type === MESSAGE.Auth) return this.refuse(frame, header, { rule: 'auth' });
+    if (header.type === MessageType.Auth) return this.refuse(frame, header, { rule: 'auth' });
     if (!HANDLED.has(header.type)) return this.refuse(frame, header, { rule: 'message-type' });
-    if (header.type === MESSAGE.Awareness) {
+    if (header.type === MessageType.Awareness) {
       if (!header.payload) return; // malformed: Hocuspocus refuses it itself
       const checked = this.checkAwareness(frame, header.payload);
       if (checked.violation) this.refuse(frame, header, checked.violation); // throws unless report mode
@@ -273,7 +278,7 @@ export class CollabUpdateGuard {
       if (!frame.connection.readOnly && checked.entries) this.bindFromAwareness(this.docFor(frame.document), frame, checked.entries);
       return;
     }
-    if (header.type !== MESSAGE.Sync && header.type !== MESSAGE.SyncReply) return;
+    if (header.type !== MessageType.Sync && header.type !== MessageType.SyncReply) return;
     // A Step1 makes Hocuspocus encode the whole document (its Step2 answer); a reader's Step2 makes it snapshot it.
     if (header.subtype === STEP1 || (header.subtype === STEP2 && frame.connection.readOnly)) {
       const ok = this.takeBoth(
@@ -378,7 +383,7 @@ export class CollabUpdateGuard {
    * is dropped by the closing socket and the editor sees only a retryable socket close), then throw so this frame and
    * the ones queued behind it are not applied. Logged `COLLAB_SOCKET_LIMIT`, rate-limited. Report mode only logs.
    */
-  private tryLater(frame: GuardFrame, limit: string): void {
+  private tryLater(frame: GuardFrame, limit: SocketLimit): void {
     this.limitLog.log(limit, { userId: String(frame.context?.user?.id ?? '') });
     if (this.mode === 'report') return;
     try {
@@ -805,16 +810,9 @@ export class CollabUpdateGuard {
     throw { code: COLLAB_REFUSAL_CODE, reason };
   }
 
-  /** Rate-limited structured warn lines. Schema ids, user and page ids only: never a value or any content. */
+  /** Rate-limited structured warn lines, per token. Schema ids, user and page ids only: never a value or any content. */
   private log(token: string, live: Y.Doc & { name?: string }, fields: Record<string, unknown>): void {
-    const now = Date.now();
-    const w = this.logWindow;
-    if (now - w.start >= 60_000) {
-      if (w.suppressed) this.logger.warn(`COLLAB_GUARD_LOG_SUPPRESSED ${JSON.stringify({ count: w.suppressed })}`);
-      this.logWindow = { start: now, count: 0, suppressed: 0 };
-    }
-    if (this.logWindow.count++ < LOGS_PER_MINUTE) this.logger.warn(`${token} ${JSON.stringify({ ...fields, pageId: pageIdOf(live) })}`);
-    else this.logWindow.suppressed++;
+    this.logLines.warn(token, () => `${token} ${JSON.stringify({ ...fields, pageId: pageIdOf(live) })}`);
   }
 }
 
@@ -828,12 +826,12 @@ function readHeader(update: Uint8Array): Header | null {
     const d = decoding.createDecoder(update);
     decoding.readVarString(d);
     const type = decoding.readVarUint(d);
-    if (type === MESSAGE.Sync || type === MESSAGE.SyncReply) {
+    if (type === MessageType.Sync || type === MessageType.SyncReply) {
       const subtype = decoding.readVarUint(d);
       if (subtype !== STEP2 && subtype !== UPDATE) return { type, subtype };
       return { type, subtype, payload: tryRead(() => decoding.readVarUint8Array(d)) };
     }
-    if (type === MESSAGE.Awareness) return { type, payload: tryRead(() => decoding.readVarUint8Array(d)) };
+    if (type === MessageType.Awareness) return { type, payload: tryRead(() => decoding.readVarUint8Array(d)) };
     return { type };
   } catch {
     return null;

@@ -124,6 +124,14 @@ export class StaleCursorError extends Error {
   }
 }
 
+/** A poll that arrived after the process began shutting down (#810): answered 503, nothing read. */
+export class FeedClosingError extends Error {
+  constructor() {
+    super('the change feed is shutting down; retry against the replacement');
+    this.name = 'FeedClosingError';
+  }
+}
+
 /**
  * CCC service-bridge — NOT upstream Docmost code (Group D, issue #171).
  *
@@ -158,6 +166,16 @@ export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
    *  read is in flight (a commit the read's snapshot could not see) is never lost: the call re-reads instead of
    *  parking for the full wait (#501 lost-wakeup fix). */
   private wakeSeq = 0;
+  /** Set first in onModuleDestroy (#810): the process is shutting down. A long-poll then never parks again, and a
+   *  new one is refused (FeedClosingError), because the platform re-polls at once on its keep-alive connection: a
+   *  poll parked for the full wait after the destroy kept that connection busy, so the HTTP server's close never
+   *  finished and the process waited for the SIGKILL. */
+  private closingFlag = false;
+
+  /** Whether the process is shutting down (onModuleDestroy has run). */
+  get closing(): boolean {
+    return this.closingFlag;
+  }
 
   constructor(
     @InjectKysely() private readonly db: KyselyDB,
@@ -173,6 +191,7 @@ export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.closingFlag = true; // before the wake: a woken poll must not park again (#810)
     if (this.gcTimer) clearInterval(this.gcTimer);
     this.wakeAll(); // release any blocked long-polls
     try {
@@ -238,6 +257,7 @@ export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
 
   /** Long-poll for changes after the opaque `after` cursor. */
   async getChanges(after: string | undefined, waitMs: number, limit: number): Promise<ChangesResult> {
+    if (this.closingFlag) throw new FeedClosingError();
     const cursor = parseCursor(after);
     const cappedWait = Math.max(0, Math.min(waitMs, MAX_WAIT_MS));
     const cappedLimit = Math.max(1, Math.min(limit, MAX_LIMIT));
@@ -290,12 +310,12 @@ export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
     for (;;) {
       const withheld = await this.hasRowsAfter(cursor);
       const remaining = deadline - Date.now();
-      if (remaining > 0 && this.wakeSeq === seq) {
+      if (remaining > 0 && this.wakeSeq === seq && !this.closingFlag) {
         await this.waitForWake(withheld ? Math.min(WITHHELD_POLL_MS, remaining) : remaining);
       }
       seq = this.wakeSeq;
       const raw = await this.readRawAfter(cursor, limit);
-      if (raw.length > 0 || !withheld || Date.now() >= deadline) return raw;
+      if (raw.length > 0 || !withheld || Date.now() >= deadline || this.closingFlag) return raw;
     }
   }
 

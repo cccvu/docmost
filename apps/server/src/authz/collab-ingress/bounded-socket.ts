@@ -13,6 +13,12 @@
  * when something is sent; a socket owed nothing more that stops reading is cut off by the stall check on the keepalive
  * tick (socket-keepalive.ts).
  *
+ * Each frame still queued also counts COLLAB_OUTBOUND_FRAME_OVERHEAD_BYTES (#810): the heap ws spends on it, which
+ * `bufferedAmount` does not show, so a flood of tiny frames is cut at about 15,000 of them (8 MiB / 564 B), not 161,000.
+ * Frames are queued on the raw ws socket through the process byte budget (socket-bytes.ts), which passes ws the send
+ * callback that counts them pending and charges them to the process total; `inner` (the backported WsSocketWrapper,
+ * whose own send takes no callback) is only closed.
+ *
  * `readyState` is the raw socket's once it is closing, so Hocuspocus stops sending to a socket the client closed
  * (the backported WsSocketWrapper keeps its own, which only its own `close()` moves).
  *
@@ -20,18 +26,21 @@
  * sends frees the slot, and a `PermissionDenied` reply sent while the socket holds one closes the socket (4401,
  * `permission-denied`, after the reply, so the editor still reads it and runs its token refetch), which then keeps the
  * slot only until it has closed. This is the one place that sees the replies of documents this node owns and of
- * documents RedisSync proxies to another node. Without the close, Hocuspocus 4.7.1 leaves a refused socket open and
- * the provider reconnecting it keeps a slot for as long as the editor stays open.
+ * documents RedisSync proxies to another node, so the close stays here rather than in a second wrapper on the send path.
+ * Without the close, Hocuspocus 4.7.1 leaves a refused socket open and the provider reconnecting it keeps a slot for as
+ * long as the editor stays open. Every other close the server starts while the socket holds a slot (`close`: Hocuspocus
+ * closing a socket whose Auth frame it cannot decode, here or relayed from the node that owns the document) shortens the
+ * slot the same way (#810): a closing handshake can take ws 30 s, and a complete but malformed Auth frame must not buy
+ * the socket the overall pre-auth deadline. Built only by `CollabSocketBounds.open` (socket-bounds.ts).
  */
 import * as decoding from 'lib0/decoding';
-import type { WebSocketLike } from '@hocuspocus/server';
-import { COLLAB_MAX_PAYLOAD_BYTES, COLLAB_OUTBOUND_BUFFER_FACTOR } from './limits';
-import { collabPreAuthSlots, type CollabPreAuthSlots, type PreAuthSocket } from './preauth-slots';
+import { MessageType, type WebSocketLike } from '@hocuspocus/server';
+import { AuthMessageType, WsReadyStates } from '@hocuspocus/common';
+import { COLLAB_MAX_PAYLOAD_BYTES, COLLAB_OUTBOUND_BUFFER_FACTOR, COLLAB_OUTBOUND_FRAME_OVERHEAD_BYTES } from './limits';
+import type { CollabPreAuthSlots, PreAuthSocket } from './preauth-slots';
+import type { BytesSocket, CollabSocketBytes } from './socket-bytes';
 import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
 
-const AUTH = 2; // Hocuspocus MessageType.Auth
-const PERMISSION_DENIED = 1; // @hocuspocus/common AuthMessageType.PermissionDenied
-const AUTHENTICATED = 2; // @hocuspocus/common AuthMessageType.Authenticated
 /** The socket close after a refused authentication (the 4401 Hocuspocus's own Unauthorized close uses). */
 export const COLLAB_DENIED_CLOSE_CODE = 4401;
 
@@ -40,32 +49,47 @@ export function authReplyOf(frame: Uint8Array): 'authenticated' | 'denied' | nul
   try {
     const d = decoding.createDecoder(frame);
     decoding.readVarString(d);
-    if (decoding.readVarUint(d) !== AUTH) return null;
+    if (decoding.readVarUint(d) !== MessageType.Auth) return null;
     const subtype = decoding.readVarUint(d);
-    return subtype === AUTHENTICATED ? 'authenticated' : subtype === PERMISSION_DENIED ? 'denied' : null;
+    return subtype === AuthMessageType.Authenticated ? 'authenticated' : subtype === AuthMessageType.PermissionDenied ? 'denied' : null;
   } catch {
     return null;
   }
 }
 
 /** The `ws` WebSocket surface used here. */
-export interface RawCollabSocket extends PreAuthSocket {
+export interface RawCollabSocket extends PreAuthSocket, BytesSocket {
   readonly readyState: number;
   readonly bufferedAmount: number;
   terminate(): void;
 }
 
-const OPEN = 1;
+export interface BoundedCollabSocketOptions {
+  /** The process's pre-auth slots, the same instance the ws adapter took this socket's slot from (socket-bounds.ts). */
+  preAuth: CollabPreAuthSlots;
+  /**
+   * The process's byte budget (socket-bytes.ts), the same instance the ws adapter tracked this socket on: every frame
+   * is queued through it, which counts the frames still pending. Required: a default would be a second budget.
+   */
+  bytes: CollabSocketBytes;
+  limitLog?: SocketLimitLog;
+}
 
 export class BoundedCollabSocket implements WebSocketLike {
   private largestSent = 0;
+  private readonly preAuth: CollabPreAuthSlots;
+  private readonly bytes: CollabSocketBytes;
+  private readonly limitLog: SocketLimitLog;
 
   constructor(
     private readonly raw: RawCollabSocket,
     private readonly inner: WebSocketLike,
-    private readonly limitLog: SocketLimitLog = collabSocketLimitLog,
-    private readonly preAuth: CollabPreAuthSlots = collabPreAuthSlots,
-  ) {}
+    { preAuth, bytes, limitLog = collabSocketLimitLog }: BoundedCollabSocketOptions,
+  ) {
+    this.preAuth = preAuth;
+    this.bytes = bytes;
+    this.limitLog = limitLog;
+  }
 
   /** The ws socket underneath (socket-documents.ts keys a socket's document connections by it). */
   get rawSocket(): RawCollabSocket {
@@ -77,19 +101,28 @@ export class BoundedCollabSocket implements WebSocketLike {
   }
 
   send(message: Uint8Array): void {
-    if (this.readyState !== OPEN) return;
+    if (this.readyState !== WsReadyStates.Open) return;
     const largest = Math.max(this.largestSent, message.byteLength);
     const allowance = COLLAB_OUTBOUND_BUFFER_FACTOR * COLLAB_MAX_PAYLOAD_BYTES + largest;
-    const buffered = this.raw.bufferedAmount;
-    if (buffered + message.byteLength > allowance) {
-      this.limitLog.log('outbound_buffer', { bufferedBytes: buffered, frameBytes: message.byteLength, allowanceBytes: allowance });
+    const queued = this.bytes.queued(this.raw);
+    if (queued + message.byteLength + COLLAB_OUTBOUND_FRAME_OVERHEAD_BYTES > allowance) {
+      this.limitLog.log('outbound_buffer', {
+        bufferedBytes: this.raw.bufferedAmount,
+        pendingFrames: this.bytes.pendingFrames(this.raw),
+        frameBytes: message.byteLength,
+        allowanceBytes: allowance,
+      });
+      this.bytes.release(this.raw); // its queue goes with it: no longer the process budget's
       this.raw.terminate();
       return;
     }
     this.largestSent = largest;
     const reply = this.preAuth.holds(this.raw) ? authReplyOf(message) : null;
-    if (reply === 'authenticated') this.preAuth.release(this.raw);
-    this.inner.send(message);
+    if (reply === 'authenticated') {
+      this.preAuth.release(this.raw);
+      this.bytes.authenticated(this.raw);
+    }
+    this.bytes.send(this.raw, message);
     if (reply === 'denied') {
       this.preAuth.closing(this.raw);
       this.inner.close(COLLAB_DENIED_CLOSE_CODE, 'permission-denied');
@@ -97,6 +130,7 @@ export class BoundedCollabSocket implements WebSocketLike {
   }
 
   close(code?: number, reason?: string): void {
+    if (this.preAuth.holds(this.raw)) this.preAuth.closing(this.raw);
     this.inner.close(code, reason);
   }
 }

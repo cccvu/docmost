@@ -3,6 +3,8 @@ import { initProseMirrorDoc, prosemirrorJSONToYDoc, updateYFragment } from '@tip
 import { Node as PMNode } from '@tiptap/pm/model';
 import { TableMap } from '@tiptap/pm/tables';
 import { TiptapTransformer } from '@hocuspocus/transformer';
+import { MessageType } from '@hocuspocus/server';
+import * as encoding from 'lib0/encoding';
 import { htmlToJson, jsonToHtml } from '../../collaboration/collaboration.util';
 import { serverSchema } from '../page-write/prelim-content';
 import { isDuplicateWriteKey, recordWriteKey, WRITE_IDEM_MAP } from '../page-write/write-idem';
@@ -1176,7 +1178,7 @@ describe('#790 frame bounds: Auth on an established session and unknown message 
   });
 });
 
-describe('#790 awareness: no rate refusal in the guard (the rate is a drop at the gateway, frame-address.ts)', () => {
+describe('#790 awareness: no rate refusal in the guard (the rate is a drop at the gateway, frame-admission.ts)', () => {
   it.each([['writer', false], ['reader', true]] as const)(
     'a %s sending 1000 cursor frames in one millisecond is never refused: a refusal would end an honest session',
     (_who, readOnly) => {
@@ -1234,6 +1236,141 @@ describe('#790 awareness: no state for another user\'s client id', () => {
     expect(s.deliver(s.conn('victim'), awarenessFrame([{ clientID: 1001, clock: 6, state: { user: { name: 'V' } } }]))).toBe('applied');
     // one frame can mix a peer's removal with the sender's own state (y-protocols batches changed clients)
     expect(s.deliver(s.conn('peer'), awarenessFrame([{ clientID: 1001, clock: 7, state: null }, { clientID: 3003, clock: 1, state: { user: { name: 'P' } } }]))).toBe('applied');
+  });
+});
+
+describe('#810 (A5): every Hocuspocus MessageType is classified, from the library enum', () => {
+  // The guard reads Hocuspocus's own enum (no local copy). This pins each member's outcome on an established session, so
+  // a Hocuspocus bump that adds a type goes red here until someone classifies it.
+  const EXPECTED: Record<string, 'applied' | string> = {
+    Sync: 'applied',
+    Awareness: 'applied',
+    Auth: REFUSED('auth'),
+    QueryAwareness: 'applied',
+    SyncReply: 'applied',
+    Stateless: REFUSED('stateless'),
+    BroadcastStateless: REFUSED('stateless'),
+    CLOSE: 'applied',
+    SyncStatus: REFUSED('message-type'),
+    Ping: REFUSED('message-type'),
+    Pong: REFUSED('message-type'),
+  };
+
+  it('the table covers exactly the enum members a client can put on the wire (Unknown = -1 is not a varint)', () => {
+    const members = Object.entries(MessageType).filter(([, v]) => typeof v === 'number' && v >= 0).map(([k]) => k);
+    expect(members.sort()).toEqual(Object.keys(EXPECTED).sort());
+    expect(MessageType.Unknown).toBe(-1);
+  });
+
+  it.each(Object.keys(EXPECTED))('%s', (name) => {
+    const s = setup({ seed: SEED });
+    const type = MessageType[name as keyof typeof MessageType] as number;
+    // Sync and SyncReply carry a Step1 so the frame reaches the HANDLED check (a bodiless one is left to Hocuspocus)
+    const frame =
+      type === MessageType.Sync || type === MessageType.SyncReply
+        ? typedFrame(type, (e) => {
+            encoding.writeVarUint(e, SYNC.Step1);
+            encoding.writeVarUint8Array(e, Y.encodeStateVector(s.live));
+          })
+        : typedFrame(type);
+    expect(s.deliver(s.conn('writer'), frame)).toBe(EXPECTED[name]);
+  });
+});
+
+describe('#810 (C2): a 3.4.4 tab\'s queued "remove every peer" awareness frame, replayed after the 4.7.1 deploy', () => {
+  // A 3.4.4 provider's onClose removed every peer's awareness state and queued that frame while its socket was closed;
+  // 4.7.1 providers never send one. Its removals name ids the freshly loaded document's awareness has never held, so
+  // they count against the (user, document) new-ids budget: they must stay counted (y-protocols writes `meta` for an
+  // unknown id removed at clock >= 1 and never prunes it), and past the budget the outcome must be recoverable.
+  // y-protocols as Hocuspocus 4.7.1 resolves it (the server does not declare it), so `meta` is what Hocuspocus keeps.
+  interface AwarenessLike {
+    meta: Map<number, { clock: number }>;
+    destroy(): void;
+  }
+  const yAwareness = (): {
+    Awareness: new (doc: Y.Doc) => AwarenessLike;
+    applyAwarenessUpdate: (a: AwarenessLike, update: Uint8Array, origin: unknown) => void;
+  } =>
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    require(require.resolve('y-protocols/awareness', { paths: [require('node:path').dirname(require.resolve('@hocuspocus/server'))] }));
+  /** The awareness update an Awareness frame carries (what Hocuspocus hands applyAwarenessUpdate). */
+  const updateOf = (frame: Uint8Array): Uint8Array => {
+    const d = decoding.createDecoder(frame);
+    decoding.readVarString(d);
+    decoding.readVarUint(d);
+    return decoding.readVarUint8Array(d);
+  };
+  const decoding = jest.requireActual<typeof import('lib0/decoding')>('lib0/decoding');
+  const removals = (from: number, n: number, clock = 2) => Array.from({ length: n }, (_, i) => ({ clientID: from + i, clock, state: null }));
+
+  const opened: AwarenessLike[] = [];
+  afterEach(() => opened.splice(0).forEach((a) => a.destroy())); // its renewal interval would keep jest running
+
+  /** The guard first; when it passes, the frame applied to a real y-protocols Awareness, as Hocuspocus does. */
+  const room = () => {
+    const s = setup({ seed: SEED, now: () => 1_000_000 });
+    const { Awareness, applyAwarenessUpdate } = yAwareness();
+    const awareness = new Awareness(s.live);
+    opened.push(awareness);
+    (s.live as unknown as { awareness: AwarenessLike }).awareness = awareness;
+    const send = (c: Conn, entries: Array<{ clientID: number; clock?: number; state: unknown }>) => {
+      const frame = awarenessFrame(entries);
+      const outcome = s.deliver(c, frame);
+      if (outcome === 'applied') applyAwarenessUpdate(awareness, updateOf(frame), c);
+      return outcome;
+    };
+    return { s, awareness, send };
+  };
+
+  it(`removals of ${AWARENESS_NEW_IDS_BURST + 1} unknown ids (clock >= 1): 1013 (try later), never a refusal; meta grows by at most ${AWARENESS_NEW_IDS_BURST}`, () => {
+    const { s, awareness, send } = room();
+    const before = awareness.meta.size;
+    const stale = s.conn('stale-tab');
+    expect(send(stale, removals(9_000, AWARENESS_NEW_IDS_BURST + 1))).toBe(TRY_LATER);
+    expect(awareness.meta.size).toBe(before); // refused whole: nothing applied
+    // the tab reconnects (a new connection, the same user and document), and the budget it has left is what passes
+    expect(send(s.conn('stale-tab'), removals(9_000, AWARENESS_NEW_IDS_BURST))).toBe('applied');
+    expect(awareness.meta.size - before).toBe(AWARENESS_NEW_IDS_BURST); // y-protocols kept a meta entry for each
+    expect(send(s.conn('stale-tab'), removals(9_000 + AWARENESS_NEW_IDS_BURST, 1))).toBe(TRY_LATER);
+    expect(awareness.meta.size - before).toBe(AWARENESS_NEW_IDS_BURST);
+    expect(s.limitLogs.every((l) => l.includes('"limit":"user_awareness_ids"'))).toBe(true);
+    expect(s.logs.filter((l) => l.includes('COLLAB_UPDATE_REFUSED'))).toEqual([]);
+  });
+
+  it('once those peers have re-announced (their ids are in meta), the same removal frame applies, uncounted', () => {
+    const { s, awareness, send } = room();
+    const ids = removals(9_000, AWARENESS_NEW_IDS_BURST + 1);
+    for (const { clientID } of ids) expect(send(s.conn(`peer-${clientID}`), [{ clientID, clock: 1, state: { user: { name: 'P' } } }])).toBe('applied');
+    expect(send(s.conn('stale-tab'), ids)).toBe('applied');
+    expect(s.limitLogs).toEqual([]);
+  });
+});
+
+describe('#810 (L1) the guard logs through the shared per-key window: per token, and the final count by timer', () => {
+  afterEach(() => jest.useRealTimers());
+  /** The guard's private `log` (only COLLAB_LEGACY_PENDING_INVALID and COLLAB_UPDATE_REFUSED reach it). */
+  const logOf = (guard: CollabUpdateGuard) =>
+    (guard as unknown as { log(token: string, live: Y.Doc, fields: Record<string, unknown>): void }).log.bind(guard);
+
+  it('a flood of one token (legacy content on every page load) cannot suppress a refusal line', () => {
+    jest.useFakeTimers({ now: 3_000_000 });
+    const s = setup({ seed: SEED });
+    for (let i = 0; i < 100; i++) logOf(s.guard)('COLLAB_LEGACY_PENDING_INVALID', s.live, { rule: 'legacy' });
+    expect(s.logs.filter((l) => l.startsWith('COLLAB_LEGACY_PENDING_INVALID '))).toHaveLength(30);
+    expect(s.deliver(s.conn('a'), statelessFrame('{"type":"page.updated"}', MSG.Stateless))).toBe(REFUSED('stateless'));
+    expect(s.logs.filter((l) => l.startsWith('COLLAB_UPDATE_REFUSED '))).toHaveLength(1);
+  });
+
+  it('the suppressed count is written at the end of the window with no further line, as COLLAB_GUARD_LOG_SUPPRESSED with `of`', () => {
+    jest.useFakeTimers({ now: 3_000_000 });
+    const s = setup({ seed: SEED });
+    for (let i = 0; i < 42; i++) logOf(s.guard)('COLLAB_LEGACY_PENDING_INVALID', s.live, { rule: 'legacy' });
+    expect(s.logs.filter((l) => l.startsWith('COLLAB_GUARD_LOG_SUPPRESSED'))).toEqual([]);
+    jest.advanceTimersByTime(60_000);
+    expect(s.logs.filter((l) => l.startsWith('COLLAB_GUARD_LOG_SUPPRESSED'))).toEqual([
+      'COLLAB_GUARD_LOG_SUPPRESSED {"of":"COLLAB_LEGACY_PENDING_INVALID","count":12}',
+    ]);
+    expect(jest.getTimerCount()).toBe(0);
   });
 });
 

@@ -1,4 +1,4 @@
-import { AuthzChangeFeedService, StaleCursorError } from './authz-change-feed.service';
+import { AuthzChangeFeedService, FeedClosingError, StaleCursorError } from './authz-change-feed.service';
 import { BadRequestException } from '@nestjs/common';
 import { spyKysely, SpyQuery } from './kysely-spy.testkit';
 
@@ -232,6 +232,45 @@ describe('AuthzChangeFeedService long-poll wakeups (#501)', () => {
     const res = await svc.getChanges('49.0', 300, 500);
     expect(res.events).toEqual([]);
     expect(probes).toHaveLength(1); // one probe, then one park until the deadline
+  });
+});
+
+describe('AuthzChangeFeedService shutdown (#810)', () => {
+  // The platform re-polls at once on its keep-alive connection. A poll that parked after onModuleDestroy kept that
+  // connection busy for the full wait, again and again, so the HTTP server never closed and docmost waited for the
+  // SIGKILL (live: exit 137 after the 90 s grace, the in-flight request always GET /api/service/authz/changes).
+  function withheldFeed() {
+    const spy = spyKysely((q: SpyQuery) => {
+      if (q.sql.includes('authz_outbox_gc')) return [{ stale: false }];
+      if (q.sql.includes('age_ms')) return [{ age_ms: null }];
+      if (q.sql.includes('as withheld')) return [{ withheld: true }]; // rows committed but held by the xmin gate
+      if (q.sql.includes('order by xact_id desc')) return [{ xact_id: '50', id: '6' }];
+      return [];
+    });
+    const svc = new AuthzChangeFeedService(spy.db, {} as any, 'remote' as any);
+    return { svc, spy };
+  }
+
+  it('a poll parked when the destroy runs returns at once and never parks again', async () => {
+    const { svc } = withheldFeed();
+    expect(svc.closing).toBe(false);
+    const t0 = Date.now();
+    const p = svc.getChanges('49.0', 10_000, 500);
+    await new Promise((r) => setTimeout(r, 50)); // parked on the withheld re-poll
+    await svc.onModuleDestroy();
+    expect(svc.closing).toBe(true);
+    const res = await p;
+    // Without the flag the woken poll keeps re-polling the withheld rows until its 10 s deadline.
+    expect(Date.now() - t0).toBeLessThan(1_000);
+    expect(res.events).toEqual([]);
+  });
+
+  it('a poll that arrives after the destroy is refused before any read', async () => {
+    const { svc, spy } = withheldFeed();
+    await svc.onModuleDestroy();
+    const before = spy.calls.length;
+    await expect(svc.getChanges('49.0', 300, 500)).rejects.toBeInstanceOf(FeedClosingError);
+    expect(spy.calls.length).toBe(before);
   });
 });
 

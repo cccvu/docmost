@@ -3,6 +3,7 @@
 // machinery actually runs here. This spec lives under authz/ (fork-owned) so it does not add an undocumented
 // file to the upstream-owned collaboration/ tree.
 jest.mock('@hocuspocus/server', () => ({
+  MessageType: jest.requireActual('@hocuspocus/server').MessageType, // the update guard reads the real wire constants
   Hocuspocus: jest.fn().mockImplementation(() => ({
     configuration: { extensions: [] as unknown[] },
   })),
@@ -34,6 +35,7 @@ jest.mock('../../common/helpers', () => ({
 }));
 
 import { CollaborationGateway } from '../../collaboration/collaboration.gateway';
+import { CollabSocketBounds } from '../collab-ingress/socket-bounds';
 
 /**
  * #344 — the NARROWEST fail-fast for COLLAB_DISABLE_REDIS (single-node standalone).
@@ -58,6 +60,7 @@ describe('CollaborationGateway.handleYjsEvent routing guard (#344)', () => {
       {} as never, // logger extension
       env as never,
       handler as never,
+      new CollabSocketBounds(),
     );
   };
 

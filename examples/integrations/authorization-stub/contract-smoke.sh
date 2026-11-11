@@ -79,7 +79,7 @@ wait_ready() { # $1 = human label
 psql() { "${COMPOSE[@]}" exec -T postgres psql -U docmost -d docmost -tAc "$1" | tr -d '[:space:]'; }
 
 # The stub port (4000) is internal (not published), so probe it from INSIDE the stub container. Any HTTP
-# response (the stub answers 405 to a GET) means it is listening; connection-refused/timeout means not ready.
+# response (the stub answers 404 to a GET of /) means it is listening; connection-refused/timeout means not ready.
 # Guards the race where the fork boots in remote mode and delegates a decision before the stub is up.
 wait_stub() {
   for _ in $(seq 1 60); do

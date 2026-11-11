@@ -6,8 +6,14 @@ import * as Y from 'yjs';
 import { Hocuspocus } from '@hocuspocus/server';
 import { CollabWsAdapter } from '../../collaboration/adapter/collab-ws.adapter';
 import { PAGE_MAX_YDOC_BYTES, PAGE_MAX_YDOC_BYTES_CEILING } from '../page-write/page-size';
-import { COLLAB_HOCUSPOCUS_OPTIONS, COLLAB_MAX_PAYLOAD_BYTES, COLLAB_PREAUTH_SOCKET_BYTES, COLLAB_WS_SERVER_OPTIONS } from './limits';
-import { collabPreAuthSlots } from './preauth-slots';
+import {
+  COLLAB_HOCUSPOCUS_OPTIONS,
+  COLLAB_MAX_PAYLOAD_BYTES,
+  COLLAB_PREAUTH_HEADROOM_BYTES,
+  COLLAB_PREAUTH_SOCKET_BYTES,
+  COLLAB_WS_SERVER_OPTIONS,
+} from './limits';
+import { CollabSocketBounds } from './socket-bounds';
 
 /**
  * #790: the inbound bounds are effective where they are wired. The ws limits through the REAL collab ws adapter
@@ -38,12 +44,13 @@ describe('#790 ws limits through the collab ws adapter', () => {
 
   beforeAll(async () => {
     http = createServer();
-    adapter = new CollabWsAdapter();
+    const bounds = new CollabSocketBounds();
+    adapter = new CollabWsAdapter(bounds);
     wss = adapter.handleUpgrade('/collab', http);
     wss.on('connection', (ws) => {
       // As if it had authenticated: maxPayload is the bound on an authenticated socket (before that, the pre-auth byte
       // count terminates it far sooner: preauth-slots.spec.ts).
-      collabPreAuthSlots.release(ws);
+      bounds.preAuth.release(ws);
       ws.on('message', (data: Buffer) => received.push(data.byteLength));
       ws.on('error', () => undefined); // collaboration.module.ts logs a client error; ws closes the socket itself
     });
@@ -74,9 +81,15 @@ describe('#790 ws limits through the collab ws adapter', () => {
     return outcome;
   }
 
-  it('the adapter builds its server from COLLAB_WS_SERVER_OPTIONS (8 MiB, 1024 fragments, 65536 chunks)', () => {
+  it('the adapter builds its server from COLLAB_WS_SERVER_OPTIONS (8 MiB, 1024 fragments, 65536 chunks, #810: no autoPong, no deflate)', () => {
     expect(wss.options).toMatchObject(COLLAB_WS_SERVER_OPTIONS);
-    expect(COLLAB_WS_SERVER_OPTIONS).toEqual({ maxPayload: 8 * MiB, maxFragments: 1024, maxBufferedChunks: 65_536 });
+    expect(COLLAB_WS_SERVER_OPTIONS).toEqual({
+      maxPayload: 8 * MiB,
+      maxFragments: 1024,
+      maxBufferedChunks: 65_536,
+      autoPong: false,
+      perMessageDeflate: false,
+    });
     expect(COLLAB_MAX_PAYLOAD_BYTES).toBe(PAGE_MAX_YDOC_BYTES_CEILING);
   });
 
@@ -144,14 +157,17 @@ describe('#790 Hocuspocus options (a real Hocuspocus 4.7.1 with the gateway cons
 
   it('pins the values', () => {
     expect(COLLAB_HOCUSPOCUS_OPTIONS).toEqual({ maxPendingDocuments: 1, maxUnauthenticatedQueueSize: COLLAB_PREAUTH_SOCKET_BYTES });
-    expect(COLLAB_PREAUTH_SOCKET_BYTES).toBe(COLLAB_MAX_PAYLOAD_BYTES);
+    expect(COLLAB_PREAUTH_SOCKET_BYTES).toBe(COLLAB_MAX_PAYLOAD_BYTES + COLLAB_PREAUTH_HEADROOM_BYTES); // #810 N5
+    expect(COLLAB_PREAUTH_HEADROOM_BYTES).toBe(MiB);
   });
 
-  it('one maximum honest frame (a busy page\'s SyncStep1, a cached page) fits in the pre-auth queue; a byte more terminates', () => {
+  it('a busy page\'s 512 KiB SyncStep1 and a maximal cached-page update fit in the pre-auth queue (#810 N5); past the cap terminates', () => {
     const hp = new Hocuspocus({ ...COLLAB_HOCUSPOCUS_OPTIONS });
     const c = connect(hp);
-    c.deliver(frameOf(COLLAB_MAX_PAYLOAD_BYTES - 64));
-    c.deliver(frameOf(64));
+    c.deliver(frameOf(512 * 1024)); // a SyncStep1 (the state vector of a page about 75,000 sessions wrote to)
+    c.deliver(frameOf(COLLAB_MAX_PAYLOAD_BYTES)); // a cached copy near maxPayload
+    expect(c.socket.closed).toBeNull();
+    c.deliver(frameOf(COLLAB_PREAUTH_SOCKET_BYTES - 512 * 1024 - COLLAB_MAX_PAYLOAD_BYTES)); // exactly at the cap
     expect(c.socket.closed).toBeNull();
     c.deliver(frameOf(64));
     expect(c.socket.closed).toBe(RESET_CONNECTION);

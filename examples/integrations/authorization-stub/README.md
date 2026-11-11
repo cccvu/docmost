@@ -72,10 +72,12 @@ Add a grant by appending a tuple to `stub-policy.json` and restarting.
 
 ## What it implements
 
-All six contract endpoints, with the secret guard (`x-authz-service-secret`, constant-time), the array caps
+All six required contract endpoints, with the secret guard (`x-authz-service-secret`, constant-time), the array caps
 (`check-bulk` <= 256, `filter-resources`/`filter-subjects` <= 1000, `audit/ingest` <= 500; over-cap -> `400`),
 correct status codes (`200`/`202`/`400`/`401`/`404`/`405`/`503`), and the `{ provider: "docmost", externalId }`
-subject shape. It does not attempt SpiceDB semantics, caching, or ZedToken freshness; those are the
+subject shape. The OPTIONAL `POST /sync/settle` (1.1.0) and `GET /authz/edge-trust` (1.3.0) are left out and answer
+`404`, which the fork reads as "not implemented": every narrowing response says `pending`, and the collab server's
+per-address pre-auth share stays off. It does not attempt SpiceDB semantics, caching, or ZedToken freshness; those are the
 responsibility of a real implementation.
 
 The stub grants nothing to a `{ principalId, subjectType: "service" }` subject (contract 1.2.0). The fork sends

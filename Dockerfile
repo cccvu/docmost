@@ -15,7 +15,7 @@ RUN pnpm build
 FROM base AS installer
 
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends curl bash \
+  && apt-get install -y --no-install-recommends curl bash tini \
   && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -49,6 +49,15 @@ RUN mkdir -p /app/data/storage
 
 VOLUME ["/app/data/storage"]
 
+# CCC (wiki-v2 #810, UPSTREAM_MODIFICATIONS.md): upstream a5ecd0e5's runtime lines, backported, so node is not behind
+# pnpm (which never forwards SIGTERM: node was SIGKILLed and the collab drain never ran); tini as PID 1 forwards the
+# signal and reaps, since node as PID 1 ignores the SIGTERM Nest re-raises after its shutdown hooks.
+WORKDIR /app/apps/server
+
+ENV NODE_ENV=production
+
 EXPOSE 3000
 
-CMD ["pnpm", "start"]
+ENTRYPOINT ["/usr/bin/tini", "--"]
+
+CMD ["node", "dist/main"]
