@@ -1055,7 +1055,7 @@
           "403": { "$ref": "#/components/responses/Forbidden" },
           "409": { "description": "Stale cursor: events after `after` were already GC'd by retention; the platform must rebaseline.", "content": { "application/json": { "schema": { "type": "object", "required": ["stale", "head"], "properties": { "stale": { "const": true }, "head": { "type": "string" }, "message": { "type": "string" } } } } } },
           "429": { "$ref": "#/components/responses/RateLimited" },
-          "503": { "$ref": "#/components/responses/Unconfigured" }
+          "503": { "description": "No service secret configured on the fork, OR the fork is not in AUTHZ_MODE=remote (fail-closed), OR (wiki-v2 #810) the process is shutting down: a poll that arrives after the shutdown began is refused `{ code: \"shutting_down\" }` before any read, with `Retry-After`, and a poll already parked returns at once with what it has. Every answer during the shutdown carries `Connection: close`, so the next poll opens a new connection, to the replacement. Treat it like any feed outage: back off and poll again with the same cursor; nothing was skipped.", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
         }
       }
     },

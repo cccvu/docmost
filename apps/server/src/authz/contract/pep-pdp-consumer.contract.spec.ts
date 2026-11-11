@@ -4,6 +4,7 @@ import type { AddressInfo } from 'net';
 import { join } from 'path';
 import { HttpAuthzClient } from '../http-authz.client';
 import { PlatformAuditClient } from '../audit/platform-audit.client';
+import { parseEdgeTrust, platformEdgeTrustFetch } from '../collab-ingress/client-trust';
 
 /**
  * PEP↔PDP CONSUMER contract (fork / Docmost side of the seam) — GitHub Task #16, contract #13.
@@ -47,7 +48,7 @@ const OAS_PATH = join(
   '../../../../../docs/integrations/authorization/authorization-service.openapi.json',
 );
 const OAS = JSON.parse(readFileSync(OAS_PATH, 'utf8')) as {
-  paths: Record<string, { post?: { operationId?: string; requestBody: any; responses: any } }>;
+  paths: Record<string, { post?: { operationId?: string; requestBody: any; responses: any }; get?: { operationId?: string; responses: any } }>;
 };
 
 /** Pull { path, canonical request example, canonical 2xx response example } for one operationId. */
@@ -198,6 +199,45 @@ describe('PEP↔PDP consumer contract — real clients over a loopback PDP (#13)
     it('an implementation without the route (404) reads as pending, never as an error', async () => {
       nextResponse = { status: 404, body: { error: 'not found' } };
       expect((await authz.settleProjection('1.1', 0)).status).toBe('pending');
+    });
+  });
+
+  // ---------------------------------------------------------------------------------------------
+  // the edge trust — the OPTIONAL GET /authz/edge-trust op (1.3.0, wiki-v2 #810), config the collab server reads
+  // ---------------------------------------------------------------------------------------------
+  describe('platformEdgeTrustFetch() (optional GET)', () => {
+    const entry = Object.entries(OAS.paths).find(([, item]) => item.get?.operationId === 'getEdgeTrust');
+    const path = entry?.[0];
+    const get = entry?.[1].get;
+
+    it('is published as a GET with no request body, and its example parses', () => {
+      expect(path).toBe('/authz/edge-trust');
+      expect(entry![1].post).toBeUndefined();
+      expect(get).not.toHaveProperty('requestBody');
+      const example = get!.responses['200'].content['application/json'].example;
+      expect(parseEdgeTrust(example)).toEqual(example);
+      // the published cap is the parser's: one more entry makes the whole answer malformed (share off)
+      const cap = get!.responses['200'].content['application/json'].schema.properties.trustedProxies.maxItems;
+      expect(parseEdgeTrust({ trustedProxies: Array(cap).fill('198.51.100.1'), xffTrusted: true })).not.toBeNull();
+      expect(parseEdgeTrust({ trustedProxies: Array(cap + 1).fill('198.51.100.1'), xffTrusted: true })).toBeNull();
+    });
+
+    it('GETs the published path with the service secret and no body, and returns the body as served', async () => {
+      const example = get!.responses['200'].content['application/json'].example;
+      nextResponse = { status: 200, body: example };
+      const fetchTrust = platformEdgeTrustFetch('remote', { PLATFORM_AUTHZ_URL: baseUrl, PLATFORM_AUTHZ_SERVICE_SECRET: SERVICE_SECRET });
+      expect(await fetchTrust!()).toEqual({ body: example });
+      expect(captured!.method).toBe('GET');
+      expect(captured!.path).toBe(path);
+      expect(captured!.headers['x-authz-service-secret']).toBe(SERVICE_SECRET);
+      expect(captured!.body).toBeUndefined();
+    });
+
+    it('an implementation without the route (404, the reference stub) is a reason, never a body', async () => {
+      expect(Object.keys(get!.responses)).toContain('404');
+      nextResponse = { status: 404, body: { error: 'not found' } };
+      const fetchTrust = platformEdgeTrustFetch('remote', { PLATFORM_AUTHZ_URL: baseUrl, PLATFORM_AUTHZ_SERVICE_SECRET: SERVICE_SECRET });
+      expect(await fetchTrust!()).toEqual({ reason: 'http_404' });
     });
   });
 

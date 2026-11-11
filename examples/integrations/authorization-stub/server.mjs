@@ -125,11 +125,12 @@ const HANDLERS = {
 const server = createServer((req, res) => {
   // Fail-closed: refuse to serve at all if no secret is configured.
   if (!SECRET) return send(res, 503, { error: 'service secret not configured' });
-  if (req.method !== 'POST') return send(res, 405, { error: 'method not allowed' });
-
+  // A path the stub does not serve is 404 for every method, so the OPTIONAL routes it leaves out (POST /sync/settle,
+  // GET /authz/edge-trust) answer exactly what the contract documents for "not implemented"; a served path is POST-only.
   const path = (req.url || '').split('?')[0];
   const isAudit = path === '/audit/ingest';
   if (!HANDLERS[path] && !isAudit) return send(res, 404, { error: 'not found' });
+  if (req.method !== 'POST') return send(res, 405, { error: 'method not allowed' });
 
   if (!safeSecretMatch(req.headers['x-authz-service-secret'])) {
     return send(res, 401, { error: 'invalid or missing service secret' });
