@@ -70,7 +70,7 @@ export default function PasswordlessLogin() {
     e.preventDefault();
     const trimmed = email.trim();
     if (!trimmed) return;
-    if (await requestEmail(trimmed)) {
+    if (await requestEmail(trimmed, { onRetryAfter: cooldown.start })) {
       setSent(true);
       cooldown.start();
     }
@@ -109,7 +109,10 @@ export default function PasswordlessLogin() {
         );
         setOtp("");
       }
+      // Select what is left (the kept code after a 429): a paste of a fresh code then replaces it rather than
+      // appending to it, which would make a 12-digit value that auto-submits and can never be right.
       otpRef.current?.focus();
+      otpRef.current?.select();
     }
   }
 
@@ -156,7 +159,7 @@ export default function PasswordlessLogin() {
           {!sent && !haveCode ? (
             <>
               <Text c="dimmed" ta="center" mb="lg">
-                {t("Enter your email and we'll send you a sign-in link.")}
+                {t("Enter your email and we'll send you a sign-in code.")}
               </Text>
               <form onSubmit={onRequest}>
                 <TextInput
@@ -170,7 +173,7 @@ export default function PasswordlessLogin() {
                   onChange={(e) => setEmail(e.currentTarget.value)}
                 />
                 <Button type="submit" fullWidth mt="lg" loading={isRequesting}>
-                  {t("Email me a sign-in link")}
+                  {t("Email me a sign-in code")}
                 </Button>
               </form>
               <Text ta="center" mt="md" size="sm" c="dimmed">
@@ -188,7 +191,7 @@ export default function PasswordlessLogin() {
                 {/*
                   NEVER `disabled`. Mantine's Anchor ships no `:disabled` rule — its only styling is the link
                   colour, a pointer cursor and a hover underline — so a disabled one looks completely live and
-                  swallows the click in silence. The user's next move is then "Email me a sign-in link",
+                  swallows the click in silence. The user's next move is then "Email me a sign-in code",
                   which supersedes the very code they came to redeem: the #319 failure arriving through
                   a different door. The address is collected on the next step instead, where it is visible and
                   correctable.
@@ -213,7 +216,7 @@ export default function PasswordlessLogin() {
               >
                 {sent
                   ? t(
-                      "Check your email and open the sign-in link. If the email also has a code, you can enter it below instead. It expires shortly and can be used once.",
+                      "Check your email and enter the code below. If the email has a sign-in link, opening it works too. The code expires shortly and can be used once.",
                     )
                   : t(
                       "Enter the code from your sign-in email. It expires shortly and can be used once.",
@@ -297,7 +300,11 @@ export default function PasswordlessLogin() {
                     // throwing, so an optimistic `setSent(true)` would permanently flip the copy to "Check
                     // your email" for a message that never went — and would clear the code the user is
                     // holding on the way. Mirrors onRequest, which already gets this right.
-                    if (await requestEmail(email.trim())) {
+                    if (
+                      await requestEmail(email.trim(), {
+                        onRetryAfter: cooldown.start,
+                      })
+                    ) {
                       setOtp("");
                       setOtpError(null);
                       autoSubmitted.current = null;

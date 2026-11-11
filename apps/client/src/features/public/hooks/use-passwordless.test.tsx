@@ -229,12 +229,14 @@ describe("usePasswordless().requestEmail — a 429 says to wait (#815)", () => {
     );
   });
 
-  it("429 with Retry-After → names that wait", async () => {
+  it("429 with Retry-After → names that wait, and hands it to the page (onRetryAfter)", async () => {
     (requestPasswordless as any).mockRejectedValueOnce(http(429, { "retry-after": "60" }));
     const { result } = renderHook(() => usePasswordless());
+    const onRetryAfter = vi.fn();
     await act(async () => {
-      await result.current.requestEmail("a@b.edu");
+      await result.current.requestEmail("a@b.edu", { onRetryAfter });
     });
+    expect(onRetryAfter).toHaveBeenCalledWith(60);
     // This file's `t` stub returns the key, so the seconds-variant key is what proves Retry-After was read.
     expect((notifications.show as any).mock.calls[0][0].message).toBe(
       "Too many requests. Wait {{seconds}} seconds, then try again.",

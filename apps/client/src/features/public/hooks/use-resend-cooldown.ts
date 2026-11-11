@@ -3,15 +3,19 @@ import { useCallback, useEffect, useState } from "react";
 // wiki-v2 #815 — NOT upstream Docmost code. A countdown after a code was emailed, so "Resend email" is not pressed
 // again before the first message had a chance to arrive (each resend supersedes the code already on its way).
 // Held as a deadline rather than a decrementing counter: a background tab's throttled timer cannot stretch it.
-export function useResendCooldown(seconds: number) {
+// `start(seconds)` takes a longer wait when the server asked for one (a 429's Retry-After).
+export function useResendCooldown(defaultSeconds: number) {
   const [until, setUntil] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
 
-  const start = useCallback(() => {
-    const at = Date.now();
-    setNow(at);
-    setUntil(at + seconds * 1000);
-  }, [seconds]);
+  const start = useCallback(
+    (seconds: number = defaultSeconds) => {
+      const at = Date.now();
+      setNow(at);
+      setUntil(at + seconds * 1000);
+    },
+    [defaultSeconds],
+  );
 
   const reset = useCallback(() => setUntil(null), []);
 

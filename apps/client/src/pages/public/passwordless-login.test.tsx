@@ -31,9 +31,18 @@ import { MemoryRouter } from "react-router-dom";
  * pins the reachable route. If someone deletes "I already have a code", these tests fail.
  */
 
-const requestEmail = vi.fn(async () => true);
+const requestEmail = vi.fn(
+  async (
+    _email: string,
+    _opts?: { onRetryAfter?: (seconds: number) => void },
+  ): Promise<boolean> => true,
+);
 const completeSignIn = vi.fn(async () => {});
+const showNotification = vi.fn();
 
+vi.mock("@mantine/notifications", () => ({
+  notifications: { show: (...a: unknown[]) => showNotification(...a) },
+}));
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
     // Interpolates like i18next does for a key with no translation (the key is the English text).
@@ -274,7 +283,7 @@ describe("PasswordlessLogin — the OTP is reachable without destroying it", () 
     renderLogin();
     typeEmail();
     fireEvent.click(
-      screen.getByRole("button", { name: /email me a sign-in link/i }),
+      screen.getByRole("button", { name: /email me a sign-in code/i }),
     );
     await waitFor(() =>
       expect(screen.getByLabelText(/one-time code/i)).toBeTruthy(),
@@ -299,7 +308,7 @@ describe("PasswordlessLogin — the OTP is reachable without destroying it", () 
     await waitFor(() =>
       expect(
         screen.getByRole("button", {
-          name: /email me a sign-in link/i,
+          name: /email me a sign-in code/i,
         }),
       ).toBeTruthy(),
     );
@@ -350,10 +359,12 @@ describe("PasswordlessLogin — the OTP is reachable without destroying it", () 
     renderLogin();
     typeEmail();
     fireEvent.click(
-      screen.getByRole("button", { name: /email me a sign-in link/i }),
+      screen.getByRole("button", { name: /email me a sign-in code/i }),
     );
     await waitFor(() => expect(requestEmail).toHaveBeenCalledTimes(1));
-    expect(requestEmail).toHaveBeenCalledWith("user@example.edu");
+    expect(requestEmail).toHaveBeenCalledWith("user@example.edu", {
+      onRetryAfter: expect.any(Function),
+    });
   });
 });
 
@@ -511,7 +522,7 @@ describe("PasswordlessLogin — the code field takes 6 to 12 digits (#815)", () 
     );
     typeEmail();
     fireEvent.click(
-      screen.getByRole("button", { name: /email me a sign-in link/i }),
+      screen.getByRole("button", { name: /email me a sign-in code/i }),
     );
     expect(
       await screen.findByText(
@@ -533,7 +544,7 @@ describe("PasswordlessLogin — the 60 s resend countdown (#815)", () => {
     typeEmail();
     await act(async () => {
       fireEvent.click(
-        screen.getByRole("button", { name: /email me a sign-in link/i }),
+        screen.getByRole("button", { name: /email me a sign-in code/i }),
       );
     });
     expect(requestEmail).toHaveBeenCalledTimes(1);
@@ -579,5 +590,55 @@ describe("PasswordlessLogin — the 60 s resend countdown (#815)", () => {
     const resend = screen.getByRole("button", { name: /resend email/i });
     expect(resend.textContent).toBe("Resend email");
     expect(resend.hasAttribute("disabled")).toBe(false);
+  });
+
+  it("a throttled send that names its wait (Retry-After) holds Resend for that wait", async () => {
+    renderLogin();
+    typeEmail();
+    fireEvent.click(
+      screen.getByRole("button", { name: /i already have a code/i }),
+    );
+    requestEmail.mockImplementationOnce(async (_email, opts) => {
+      opts?.onRetryAfter?.(120);
+      return false;
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /resend email/i }));
+    });
+    const resend = screen.getByRole("button", { name: /resend email/i });
+    expect(resend.textContent).toBe("Resend email (120s)");
+    expect(resend.hasAttribute("disabled")).toBe(true);
+  });
+});
+
+describe("PasswordlessLogin — verify failures (#815)", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("a bridge failure is a toast, not a code error: the field keeps the code and shows no alert", async () => {
+    // The code WAS good (the platform session was minted); only the wiki session bridge failed. Telling the
+    // person the code is invalid, and clearing it, would send them to request a new one for nothing.
+    completeSignIn.mockRejectedValueOnce(
+      Object.assign(new Error("session-bridge-failed"), { stage: "bridge" }),
+    );
+    await openCodeStep();
+    pasteOtp("1234 5678");
+    await waitFor(() => expect(showNotification).toHaveBeenCalledTimes(1));
+    expect(showNotification.mock.calls[0][0]).toMatchObject({
+      message:
+        "You're verified, but we couldn't open your workspace session. Please try again.",
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(otpField().value).toBe("1234 5678");
+  });
+
+  it("after a 429 the kept code is SELECTED, so a pasted fresh code replaces it instead of appending", async () => {
+    completeSignIn.mockRejectedValueOnce(http(429));
+    await openCodeStep();
+    pasteOtp("123456");
+    await screen.findByRole("alert");
+    const field = otpField();
+    expect(document.activeElement).toBe(field);
+    expect(field.selectionStart).toBe(0);
+    expect(field.selectionEnd).toBe(field.value.length);
   });
 });

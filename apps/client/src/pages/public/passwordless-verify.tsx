@@ -140,7 +140,7 @@ export default function PasswordlessVerify() {
                 supersedes the very code this notice is sending the user to type (#319 review).
               */}
               {t(
-                "This sign-in link is missing its token. The same email also contains a 6-digit code — open the ",
+                "This sign-in link is missing its token. The same email also contains a sign-in code — open the ",
               )}
               <Anchor component={Link} to={APP_ROUTE.AUTH.LOGIN}>
                 {t("sign-in page")}
