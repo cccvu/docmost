@@ -11,9 +11,9 @@ import { PG_URL, uuid, mkReadModelPg, bootstrapSchema, mkReadModelDb } from '../
 import * as driftLog from '../page-write/collab-drift-log';
 import { hasStoreFailure } from '../page-write/store-failure-registry';
 import { isDuplicateWriteKey, recordWriteKey, WRITE_IDEM_MAP } from '../page-write/write-idem';
-import { authFrame, FakeSocket, MSG, readServerFrame, RemoteClient, SYNC, syncFrame } from './collab-ingress.testkit';
+import { authFrame, awarenessFrame, FakeSocket, MSG, readServerFrame, RemoteClient, SYNC, syncFrame } from './collab-ingress.testkit';
 import { CollabUpdateGuardExtension } from './collab-update-guard.extension';
-import { CollabUpdateGuard } from './update-guard';
+import { CollabUpdateGuard, UNRESOLVED_REASON } from './update-guard';
 
 /**
  * #781 on real Postgres (ADR 0036): the REAL store path (Hocuspocus 4.7.1, the real PersistenceExtension and
@@ -232,5 +232,55 @@ d('the collab store behind the ingress guard (#781)', () => {
     await settle();
     expect(sock.closeReasons()).toEqual([REFUSED('root')]);
     expect(isDuplicateWriteKey(live2, 'api-key')).toBe(false);
+  });
+
+  it.each([
+    ['a stored prefix (B typed before the last store and after it: the common case)', true],
+    ['no stored prefix (every edit of B\'s was lost)', false],
+  ])('#781 lineage crash, %s: B announces first, A\'s relay is unresolved, A reconnects once, the row holds B\'s edits', async (_name, storedPrefix) => {
+    const B_ID = 1001;
+    const A_ID = 2002;
+    const first = node(true);
+    const bSock = await first.connect('editor');
+    const live = first.live();
+    const b = new RemoteClient(live, B_ID);
+    const typeB = async (text: string) => {
+      bSock.deliver(syncFrame(b.edit(live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, text)), SYNC.Update, MSG.Sync, DOC));
+      await settle();
+    };
+    if (storedPrefix) {
+      await typeB('B-stored ');
+      await expect(first.handlers.flushPageContent(DOC, { withDigest: true })).resolves.toMatchObject({ flushed: true });
+    }
+    await typeB('B-lost ');
+    expect(JSON.stringify(TiptapTransformer.fromYdoc(live, 'default'))).toContain('B-lost');
+    const a = new RemoteClient(live, A_ID); // A holds B's edit: the first node relayed it
+    // The node crashes inside the store debounce: the row lacks `B-lost`. B keeps typing while disconnected.
+    expect(JSON.stringify((await row()).content)).not.toContain('B-lost');
+    b.doc.transact(() => textOf(b.fragment.get(0) as Y.XmlElement).insert(0, 'B-after '));
+
+    const second = node(true);
+    const bSock2 = await second.connect('editor');
+    const aSock2 = await second.connect('peer');
+    const live2 = second.live();
+    expect(Y.getState(live2.store, B_ID) > 0).toBe(storedPrefix); // precondition: the row holds B's id or not
+    bSock2.deliver(awarenessFrame([{ clientID: B_ID, clock: 1, state: { user: {} } }], DOC)); // B's startSync awareness
+    await settle();
+    const relay = Y.encodeStateAsUpdate(a.doc, Y.encodeStateVector(live2));
+    aSock2.deliver(awarenessFrame([{ clientID: A_ID, clock: 1, state: { user: {} } }], DOC), syncFrame(relay, SYNC.Step2, MSG.Sync, DOC));
+    await settle();
+    expect(aSock2.closeReasons()).toEqual([UNRESOLVED_REASON]);
+    expect(JSON.stringify(TiptapTransformer.fromYdoc(live2, 'default'))).not.toContain('B-lost'); // never applied
+    bSock2.deliver(syncFrame(Y.encodeStateAsUpdate(b.doc, Y.encodeStateVector(live2)), SYNC.Step2, MSG.Sync, DOC));
+    await settle();
+    // A's provider reconnects once on the same socket: a new Auth, its awareness, the same Step2 (now all known clocks)
+    await second.connect('peer', aSock2);
+    aSock2.deliver(awarenessFrame([{ clientID: A_ID, clock: 2, state: { user: {} } }], DOC), syncFrame(relay, SYNC.Step2, MSG.Sync, DOC));
+    await settle();
+    expect(aSock2.closeReasons()).toEqual([UNRESOLVED_REASON]);
+    expect(bSock2.closeReasons()).toEqual([]);
+    await expect(second.handlers.flushPageContent(DOC, { withDigest: true })).resolves.toMatchObject({ flushed: true });
+    expect(storeFailures).toEqual([]);
+    expect(JSON.stringify((await row()).content)).toContain(`"text":"B-after B-lost ${storedPrefix ? 'B-stored ' : ''}seed text"`);
   });
 });
