@@ -17,7 +17,6 @@ import { CollabSocketBytes } from './socket-bytes';
  * refresh the idle clock through `touch()` only, never the private pre-auth reference upstream rewrites.
  */
 const SRC = join(__dirname, '..', '..');
-const settle = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const CONNECTION_TIMEOUT = 4408; // @hocuspocus/common ConnectionTimeout.code
 /** A socket the reaper never sees as empty (the cases below that are not about it). */
 const NEVER_EMPTY = { holdsNoDocument: () => false };
@@ -193,15 +192,22 @@ describe('#790 the empty-socket reaper', () => {
 });
 
 // Margins: Hocuspocus checks every `timeout` and reaps past it, so a reaped socket is closed within 2 x TIMEOUT; a
-// kept-alive one is touched every 25 ms, so only an event-loop stall longer than TIMEOUT could close it.
+// kept-alive one is touched every 25 ms. #810 T5: on jest's fake clock (Hocuspocus 4.7.1's ClientConnection reads only
+// setInterval and Date.now; the pong answers through setImmediate), so no runner stall can move a margin. nextTick and
+// queueMicrotask stay real: Hocuspocus's hooks are promise chains, and `advanceTimersByTimeAsync` lets them settle
+// between timers.
 const TIMEOUT = 400;
+const fakeClock = () => jest.useFakeTimers({ doNotFake: ['nextTick', 'queueMicrotask'] });
+const advance = (ms: number) => jest.advanceTimersByTimeAsync(ms);
 describe('through a real Hocuspocus 4.7.1 (timeout shortened to 400 ms)', () => {
   const open: Hocuspocus[] = [];
   const sockets: FakeSocket[] = [];
+  beforeEach(fakeClock); // before `new Hocuspocus` and `connect`, so ClientConnection's interval and clock are fake
   afterEach(async () => {
     for (const s of sockets.splice(0)) s.close(1000, 'test over');
     for (const hp of open.splice(0)) hp.closeConnections();
-    await settle(5);
+    await advance(5);
+    jest.useRealTimers();
   });
   const server = () => {
     const hp = new Hocuspocus({
@@ -224,7 +230,7 @@ describe('through a real Hocuspocus 4.7.1 (timeout shortened to 400 ms)', () => 
     const hp = server();
     const sock = socket(hp, false);
     sock.deliver(authFrame('ok'));
-    await settle(2.5 * TIMEOUT);
+    await advance(2.5 * TIMEOUT);
     expect(sock.closed?.code).toBe(CONNECTION_TIMEOUT);
   });
 
@@ -232,7 +238,7 @@ describe('through a real Hocuspocus 4.7.1 (timeout shortened to 400 ms)', () => 
     const hp = server();
     const sock = socket(hp, true);
     sock.deliver(authFrame('ok'));
-    await settle(2.5 * TIMEOUT);
+    await advance(2.5 * TIMEOUT);
     expect(sock.closed).toBeNull();
     expect(sock.pings).toBeGreaterThan(5);
   });
@@ -240,7 +246,7 @@ describe('through a real Hocuspocus 4.7.1 (timeout shortened to 400 ms)', () => 
   it('pongs never extend an unauthenticated socket\'s deadline', async () => {
     const hp = server();
     const sock = socket(hp, true); // never authenticates
-    await settle(2.5 * TIMEOUT);
+    await advance(2.5 * TIMEOUT);
     expect(sock.pings).toBeGreaterThan(0);
     expect(sock.closed?.code).toBe(CONNECTION_TIMEOUT);
   });
@@ -249,10 +255,10 @@ describe('through a real Hocuspocus 4.7.1 (timeout shortened to 400 ms)', () => 
     const hp = server();
     const sock = socket(hp, true);
     sock.deliver(authFrame('ok'));
-    await settle(TIMEOUT / 2);
+    await advance(TIMEOUT / 2);
     expect(sock.closed).toBeNull();
     sock.answer = false;
-    await settle(2.5 * TIMEOUT);
+    await advance(2.5 * TIMEOUT);
     expect(sock.closed?.code).toBe(CONNECTION_TIMEOUT);
   });
 });
@@ -260,10 +266,12 @@ describe('through a real Hocuspocus 4.7.1 (timeout shortened to 400 ms)', () => 
 describe('#790 through a real Hocuspocus 4.7.1: a socket left holding no document is reaped', () => {
   const open: Hocuspocus[] = [];
   const sockets: FakeSocket[] = [];
+  beforeEach(fakeClock); // before `new Hocuspocus` and `connect`, so ClientConnection's interval and clock are fake
   afterEach(async () => {
     for (const s of sockets.splice(0)) s.close(1000, 'test over');
     for (const hp of open.splice(0)) hp.closeConnections();
-    await settle(5);
+    await advance(5);
+    jest.useRealTimers();
   });
   const run = (reap: boolean) => {
     const docs = new CollabSocketDocuments();
@@ -290,9 +298,9 @@ describe('#790 through a real Hocuspocus 4.7.1: a socket left holding no documen
 
   it('control: after a document-level close, pongs keep the empty socket open past the idle timeout', async () => {
     const { sock, closeDocuments } = run(false);
-    await settle(50);
+    await advance(50);
     closeDocuments();
-    await settle(2.5 * TIMEOUT);
+    await advance(2.5 * TIMEOUT);
     expect(sock.closeReasons()).toEqual(['access-revoked']);
     expect(sock.closed).toBeNull();
   });
@@ -300,12 +308,12 @@ describe('#790 through a real Hocuspocus 4.7.1: a socket left holding no documen
   it('with the reaper, the same socket is terminated within two ticks; a socket still holding its document is not', async () => {
     const { sock, closeDocuments } = run(true);
     const kept = run(true);
-    await settle(50);
+    await advance(50);
     expect(sock.closed).toBeNull();
     closeDocuments(); // closes the documents of `sock`'s server only
-    await settle(150);
+    await advance(150);
     expect(sock.terminated).toBe(true);
-    await settle(2.5 * TIMEOUT);
+    await advance(2.5 * TIMEOUT);
     expect(kept.sock.closed).toBeNull();
   });
 });
