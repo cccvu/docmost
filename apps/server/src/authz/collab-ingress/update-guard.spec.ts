@@ -845,6 +845,21 @@ describe('#781 a remount resending structs live already holds is not refused (th
     expectRefused(s, s.conn('attacker'), u, REFUSED('root'));
     // the pre-pass refused it: judging only a struct's head (`clock < state`) would leave this to the shadow
     expect(s.guard.shadowOf(s.live)).toBeNull();
+
+    // the upper boundary: a struct new by exactly ONE clock is still judged whole (`clock + length <= state`, not `- 1`)
+    const t = setup({ seed: SEED });
+    t.live.transact(() => recordWriteKey(t.live, 'k1', Date.now()));
+    const c2 = seedClient(t);
+    const st = Y.getState(t.live.store, c2);
+    const byOne = rawUpdate([
+      { client: c2, clock: st - 1, structs: [{ origin: null, right: null, parent: WRITE_IDEM_MAP, content: new Y.ContentAny([1, 2]) }] },
+    ]);
+    const decoded = Y.decodeUpdate(byOne).structs[0];
+    // precondition: one clock held, exactly one clock new
+    expect(decoded.id.clock + decoded.length - st).toBe(1);
+    expect(t.live.share.has(WRITE_IDEM_MAP)).toBe(true);
+    expectRefused(t, t.conn('attacker'), byOne, REFUSED('root'));
+    expect(t.guard.shadowOf(t.live)).toBeNull();
   });
 
   it('a zero-length struct at the clock live is at is refused zero-length (Yjs integrates it: offset 0)', () => {
