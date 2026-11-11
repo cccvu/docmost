@@ -259,7 +259,7 @@ describe('#810 through the real ws adapter: forged X-Forwarded-For on the direct
     adapter = new CollabWsAdapter(bounds);
     const wss = adapter.handleUpgrade('/collab', server);
     wss.on('connection', (ws: WebSocket) => {
-      const bounded = new BoundedCollabSocket(ws, new WsSocketWrapper(ws as never), { preAuth: bounds.preAuth });
+      const bounded = new BoundedCollabSocket(ws, new WsSocketWrapper(ws as never), { preAuth: bounds.preAuth, bytes: bounds.bytes });
       ws.on('message', (data: Buffer) => {
         if (data.toString() === 'authenticate-me') bounded.send(new OutgoingMessage('page.x').writeAuthenticated(false).toUint8Array());
       });

@@ -13,6 +13,12 @@
  * when something is sent; a socket owed nothing more that stops reading is cut off by the stall check on the keepalive
  * tick (socket-keepalive.ts).
  *
+ * Each frame still queued also counts COLLAB_OUTBOUND_FRAME_OVERHEAD_BYTES (#810): the heap ws spends on it, which
+ * `bufferedAmount` does not show, so a flood of tiny frames is cut at about 15,000 of them (8 MiB / 564 B), not 161,000.
+ * Frames are queued on the raw ws socket through the process byte budget (socket-bytes.ts), which passes ws the send
+ * callback that counts them pending and charges them to the process total; `inner` (the backported WsSocketWrapper,
+ * whose own send takes no callback) is only closed.
+ *
  * `readyState` is the raw socket's once it is closing, so Hocuspocus stops sending to a socket the client closed
  * (the backported WsSocketWrapper keeps its own, which only its own `close()` moves).
  *
@@ -30,8 +36,9 @@
 import * as decoding from 'lib0/decoding';
 import { MessageType, type WebSocketLike } from '@hocuspocus/server';
 import { AuthMessageType, WsReadyStates } from '@hocuspocus/common';
-import { COLLAB_MAX_PAYLOAD_BYTES, COLLAB_OUTBOUND_BUFFER_FACTOR } from './limits';
+import { COLLAB_MAX_PAYLOAD_BYTES, COLLAB_OUTBOUND_BUFFER_FACTOR, COLLAB_OUTBOUND_FRAME_OVERHEAD_BYTES } from './limits';
 import type { CollabPreAuthSlots, PreAuthSocket } from './preauth-slots';
+import type { BytesSocket, CollabSocketBytes } from './socket-bytes';
 import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
 
 /** The socket close after a refused authentication (the 4401 Hocuspocus's own Unauthorized close uses). */
@@ -51,7 +58,7 @@ export function authReplyOf(frame: Uint8Array): 'authenticated' | 'denied' | nul
 }
 
 /** The `ws` WebSocket surface used here. */
-export interface RawCollabSocket extends PreAuthSocket {
+export interface RawCollabSocket extends PreAuthSocket, BytesSocket {
   readonly readyState: number;
   readonly bufferedAmount: number;
   terminate(): void;
@@ -60,20 +67,27 @@ export interface RawCollabSocket extends PreAuthSocket {
 export interface BoundedCollabSocketOptions {
   /** The process's pre-auth slots, the same instance the ws adapter took this socket's slot from (socket-bounds.ts). */
   preAuth: CollabPreAuthSlots;
+  /**
+   * The process's byte budget (socket-bytes.ts), the same instance the ws adapter tracked this socket on: every frame
+   * is queued through it, which counts the frames still pending. Required: a default would be a second budget.
+   */
+  bytes: CollabSocketBytes;
   limitLog?: SocketLimitLog;
 }
 
 export class BoundedCollabSocket implements WebSocketLike {
   private largestSent = 0;
   private readonly preAuth: CollabPreAuthSlots;
+  private readonly bytes: CollabSocketBytes;
   private readonly limitLog: SocketLimitLog;
 
   constructor(
     private readonly raw: RawCollabSocket,
     private readonly inner: WebSocketLike,
-    { preAuth, limitLog = collabSocketLimitLog }: BoundedCollabSocketOptions,
+    { preAuth, bytes, limitLog = collabSocketLimitLog }: BoundedCollabSocketOptions,
   ) {
     this.preAuth = preAuth;
+    this.bytes = bytes;
     this.limitLog = limitLog;
   }
 
@@ -90,16 +104,25 @@ export class BoundedCollabSocket implements WebSocketLike {
     if (this.readyState !== WsReadyStates.Open) return;
     const largest = Math.max(this.largestSent, message.byteLength);
     const allowance = COLLAB_OUTBOUND_BUFFER_FACTOR * COLLAB_MAX_PAYLOAD_BYTES + largest;
-    const buffered = this.raw.bufferedAmount;
-    if (buffered + message.byteLength > allowance) {
-      this.limitLog.log('outbound_buffer', { bufferedBytes: buffered, frameBytes: message.byteLength, allowanceBytes: allowance });
+    const queued = this.bytes.queued(this.raw);
+    if (queued + message.byteLength + COLLAB_OUTBOUND_FRAME_OVERHEAD_BYTES > allowance) {
+      this.limitLog.log('outbound_buffer', {
+        bufferedBytes: this.raw.bufferedAmount,
+        pendingFrames: this.bytes.pendingFrames(this.raw),
+        frameBytes: message.byteLength,
+        allowanceBytes: allowance,
+      });
+      this.bytes.release(this.raw); // its queue goes with it: no longer the process budget's
       this.raw.terminate();
       return;
     }
     this.largestSent = largest;
     const reply = this.preAuth.holds(this.raw) ? authReplyOf(message) : null;
-    if (reply === 'authenticated') this.preAuth.release(this.raw);
-    this.inner.send(message);
+    if (reply === 'authenticated') {
+      this.preAuth.release(this.raw);
+      this.bytes.authenticated(this.raw);
+    }
+    this.bytes.send(this.raw, message);
     if (reply === 'denied') {
       this.preAuth.closing(this.raw);
       this.inner.close(COLLAB_DENIED_CLOSE_CODE, 'permission-denied');

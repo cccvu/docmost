@@ -9,6 +9,8 @@
  * - the socket documents (socket-documents.ts): written by that same extension, read by the keepalive's empty-socket
  *   reaper (socket-keepalive.ts) the gateway starts for every socket;
  * - the per-session and per-user auth rates (auth-rate.ts), charged in `onAuthenticate`;
+ * - the byte budget (socket-bytes.ts): tracked by the ws adapter at the upgrade (seam §226), charged by every
+ *   `BoundedCollabSocket` send and its first Authenticated reply, re-sampled by the keepalive;
  * - the client trust (client-trust.ts): the platform's trusted-proxy list, which keys the pre-auth slots per client
  *   address at the upgrade (client-address.ts) and the public-surface throttler (seam #4's APP_GUARD). It starts
  *   fetching in `onModuleInit` (Nest calls it on this factory-built instance) and stops in `onModuleDestroy`.
@@ -42,6 +44,7 @@ import { admitCollabFrame, type AddressedSocket } from './frame-admission';
 import { answerCollabUpgrade, CollabPreAuthSlots, type PreAuthSocket, type PreAuthTransport, type VerifyCallback } from './preauth-slots';
 import { CollabSocketDocuments } from './socket-documents';
 import { COLLAB_PING_INTERVAL_MS, keepCollabSocketAlive, type PingableSocket } from './socket-keepalive';
+import { CollabSocketBytes, type BytesSocket } from './socket-bytes';
 import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
 import { answerCollabPings, type PongSocket } from './socket-pong';
 import { admitCollabUserConnection, CollabUserConnections, CollabUserConnectionsExtension } from './user-connections';
@@ -66,6 +69,7 @@ export interface CollabSocketBoundsOptions {
   authRate?: CollabAuthRate;
   sessionAuthRate?: CollabAuthRate;
   clientTrust?: CollabClientTrust;
+  bytes?: CollabSocketBytes;
   /** The platform's edge-trust endpoint (client-trust.ts); absent or null: the trust stays unknown, the share off. */
   fetchEdgeTrust?: EdgeTrustFetch | null;
   pingIntervalMs?: number;
@@ -78,6 +82,8 @@ export class CollabSocketBounds implements OnModuleInit, OnModuleDestroy {
   readonly preAuth: CollabPreAuthSlots;
   readonly connections: CollabUserConnections;
   readonly documents: CollabSocketDocuments;
+  /** The process-wide byte budget across every collab socket's queued outbound and authenticated inbound. */
+  readonly bytes: CollabSocketBytes;
   /** The per-user auth rate, charged once the session is live. */
   readonly authRate: CollabAuthRate;
   /** The per-session auth rate, charged before any read. */
@@ -92,6 +98,7 @@ export class CollabSocketBounds implements OnModuleInit, OnModuleDestroy {
     this.preAuth = opts.preAuth ?? new CollabPreAuthSlots({ limitLog: this.limitLog, clientKey: (req) => this.clientTrust.keyFor(req) });
     this.connections = opts.connections ?? new CollabUserConnections({ limitLog: this.limitLog });
     this.documents = opts.documents ?? new CollabSocketDocuments();
+    this.bytes = opts.bytes ?? new CollabSocketBytes({ limitLog: this.limitLog });
     this.authRate = opts.authRate ?? new CollabAuthRate({ limitLog: this.limitLog });
     this.sessionAuthRate = opts.sessionAuthRate ?? new CollabAuthRate({ limitLog: this.limitLog, limit: 'auth_session_rate' });
     this.pingIntervalMs = opts.pingIntervalMs ?? COLLAB_PING_INTERVAL_MS;
@@ -109,11 +116,12 @@ export class CollabSocketBounds implements OnModuleInit, OnModuleDestroy {
 
   /**
    * The ws adapter's upgrade callback (seam §226): the new ws socket takes its slot, counting the TCP socket's bytes and
-   * against the client address `verifyUpgrade` keyed `request` by; and its pings get one pong in flight (#810,
-   * socket-pong.ts), before ws reads a frame from it.
+   * against the client address `verifyUpgrade` keyed `request` by; the byte budget tracks it from now on (#810); and its
+   * pings get one pong in flight (#810, socket-pong.ts), before ws reads a frame from it.
    */
-  holdUpgraded(ws: PreAuthSocket & PongSocket, transport: PreAuthTransport, request: IncomingMessage): void {
+  holdUpgraded(ws: PreAuthSocket & BytesSocket & PongSocket, transport: PreAuthTransport, request: IncomingMessage): void {
     this.preAuth.hold(ws, transport, request);
+    this.bytes.track(ws, transport);
     answerCollabPings(ws);
   }
 
@@ -171,12 +179,13 @@ export class CollabSocketBounds implements OnModuleInit, OnModuleDestroy {
     connect: (socket: BoundedCollabSocket) => C,
     forward: (connection: C, data: CollabFrameData) => void,
   ): C {
-    const connection = connect(new BoundedCollabSocket(client, inner, { preAuth: this.preAuth, limitLog: this.limitLog }));
+    const connection = connect(new BoundedCollabSocket(client, inner, { preAuth: this.preAuth, bytes: this.bytes, limitLog: this.limitLog }));
     client.on('message', (data: Buffer) => {
       if (admitCollabFrame(client, data, this.limitLog, Date.now, this.preAuth)) forward(connection, data as CollabFrameData);
     });
     keepCollabSocketAlive(client, () => connection.touch(), {
       holdsNoDocument: (ws) => this.documents.holdsNoDocument(ws),
+      sample: (ws) => this.bytes.resample(ws),
       intervalMs: this.pingIntervalMs,
       limitLog: this.limitLog,
     });

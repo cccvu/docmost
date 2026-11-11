@@ -25,6 +25,7 @@ const PARTS = [
   'CollabUserConnectionsExtension',
   'BoundedCollabSocket',
   'CollabClientTrust', // #810: one trust fetch per process, shared with the public-surface throttler
+  'CollabSocketBytes', // #810: one byte budget per process (the adapter tracks, the bounded socket charges)
 ];
 const WIRING_CALLS = ['keepCollabSocketAlive', 'admitCollabFrame'];
 

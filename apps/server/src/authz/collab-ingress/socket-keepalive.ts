@@ -54,6 +54,8 @@ export interface KeepCollabSocketAliveOptions {
    * the same instance the `connected` hook writes (socket-bounds.ts). Required: a default would silently read another.
    */
   holdsNoDocument: (ws: PingableSocket) => boolean;
+  /** Each tick, re-sample the socket's queued bytes for the process byte budget (socket-bytes.ts, #810). */
+  sample?: (ws: PingableSocket) => void;
   intervalMs?: number;
   limitLog?: SocketLimitLog;
 }
@@ -61,7 +63,7 @@ export interface KeepCollabSocketAliveOptions {
 export function keepCollabSocketAlive(
   ws: PingableSocket,
   touch: () => void,
-  { holdsNoDocument, intervalMs = COLLAB_PING_INTERVAL_MS, limitLog = collabSocketLimitLog }: KeepCollabSocketAliveOptions,
+  { holdsNoDocument, sample, intervalMs = COLLAB_PING_INTERVAL_MS, limitLog = collabSocketLimitLog }: KeepCollabSocketAliveOptions,
 ): void {
   ws.on('pong', () => touch());
   let previous = 0;
@@ -76,6 +78,7 @@ export function keepCollabSocketAlive(
       ws.terminate();
       return;
     }
+    sample?.(ws);
     const buffered = ws.bufferedAmount;
     stalled = buffered > 0 && previous > 0 && buffered >= previous ? stalled + 1 : 0;
     previous = buffered;

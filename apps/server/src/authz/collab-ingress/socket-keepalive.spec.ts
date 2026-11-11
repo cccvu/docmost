@@ -8,6 +8,7 @@ import { CollabSocketDocuments } from './socket-documents';
 import { COLLAB_EMPTY_INTERVALS, COLLAB_PING_INTERVAL_MS, COLLAB_STALL_INTERVALS, keepCollabSocketAlive } from './socket-keepalive';
 import { SocketLimitLog } from './socket-limit-log';
 import { CollabUserConnections, CollabUserConnectionsExtension } from './user-connections';
+import { CollabSocketBytes } from './socket-bytes';
 
 /**
  * #790: Hocuspocus 4.x sends no pings and reaps a connection that received nothing for `timeout`. The gateway pings
@@ -157,7 +158,7 @@ describe('#790 CollabSocketDocuments', () => {
   it('keys by the raw ws socket under the gateway\'s BoundedCollabSocket; a connection already closed counts as held then closed', () => {
     const docs = new CollabSocketDocuments();
     const raw = new FakeSocket();
-    const bounded = new BoundedCollabSocket(raw, raw as never, { preAuth: new CollabPreAuthSlots() });
+    const bounded = new BoundedCollabSocket(raw, raw as never, { preAuth: new CollabPreAuthSlots(), bytes: new CollabSocketBytes() });
     docs.track(conn(bounded, false).c);
     expect(docs.holdsNoDocument(raw)).toBe(true);
     expect(docs.holdsNoDocument(bounded)).toBe(false);

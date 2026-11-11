@@ -130,8 +130,9 @@ export const COLLAB_DOCUMENTS_PER_SOCKET = COLLAB_HOCUSPOCUS_OPTIONS.maxPendingD
 export const COLLAB_AUTH_FRAMES_PER_SOCKET = 2 * COLLAB_DOCUMENTS_PER_SOCKET;
 
 /**
- * Outbound: terminate rather than send a frame that would take ws's `bufferedAmount` past this many maxPayloads plus
- * the largest frame sent so far (this one included). One maxPayload above the largest frame: an honest slow client holds
+ * Outbound: terminate rather than send a frame that would take ws's `bufferedAmount`, plus
+ * COLLAB_OUTBOUND_FRAME_OVERHEAD_BYTES for each frame still queued (this one included, #810), past this many maxPayloads
+ * plus the largest frame sent so far (this one included). One maxPayload above the largest frame: an honest slow client holds
  * at most the largest frame it was sent (a SyncStep2) plus what is relayed while it drains it, and the largest relayed
  * frame is one peer frame (at most maxPayload). Past that it is behind by more than the biggest thing it could be owed.
  * A socket therefore never holds more than 8 MiB plus its largest frame (16 MiB for any frame up to maxPayload).
@@ -139,11 +140,48 @@ export const COLLAB_AUTH_FRAMES_PER_SOCKET = 2 * COLLAB_DOCUMENTS_PER_SOCKET;
 export const COLLAB_OUTBOUND_BUFFER_FACTOR = 1;
 
 /**
+ * Heap a frame queued in ws's send buffer costs on top of the bytes `bufferedAmount` counts (#810): ws's two Writable
+ * entries, the header and the payload view. Measured with ws 8.21.0 on a loopback socket the client never reads, on
+ * node:22-slim (the production base image, Node 22.23.4): 397 B of heap + 8 B of ArrayBuffer for a distinct payload,
+ * 310 + 8 B for one shared with other sockets (a broadcast); Node 24.21: 421 and 326 (socket-bytes.sizing.spec.ts).
+ * 512 covers both with a quarter to spare. Without it a 50-byte frame counts as 52, so a socket fed tiny frames could
+ * queue 8 MiB / 52 = 161k of them, about 62 MB of heap, and one account's 31 paused readers past the 1 GiB heap.
+ */
+export const COLLAB_OUTBOUND_FRAME_OVERHEAD_BYTES = 512;
+/**
+ * Heap a TCP read costs on top of its bytes while ws holds it as part of a frame it is still assembling (#810): the
+ * Buffer object and ws's chunk list entry. Measured the same way (128-byte reads): 230-232 B on node:22-slim, 238-246 B
+ * on Node 24.21. Without it, 65,536 reads of 128 B (`maxBufferedChunks`) hold about 15 MB of heap counted as 8 MiB.
+ */
+export const COLLAB_INBOUND_CHUNK_OVERHEAD_BYTES = 256;
+/**
+ * Bytes ALL collab sockets together may hold once counted (socket-bytes.ts, #810): every socket's queued outbound
+ * frames (`bufferedAmount` plus COLLAB_OUTBOUND_FRAME_OVERHEAD_BYTES a frame, a payload shared by several sockets
+ * counted once) and, once it is authenticated, its inbound partial frame (the bytes since its last message plus
+ * COLLAB_INBOUND_CHUNK_OVERHEAD_BYTES a read). Past it every socket is re-sampled and, if the total is still over, the
+ * sockets holding the most (their fair share of a shared payload) are terminated until it is back to
+ * COLLAB_SOCKET_TOTAL_LOW_WATER_BYTES (`socket_total_bytes`), so the clients filling it lose their own largest sockets.
+ * The per-socket bounds alone let one account's 32 sockets hold 32 x (16 MiB out + an 8 MiB inbound frame) and their
+ * per-frame heap, past docmost's 1 GiB heap; this caps every account together. What it counts is partly native (the
+ * payloads and reads) and partly V8 heap (the per-frame and per-read overheads): all heap, it is an eighth of the 1 GiB
+ * heap; all native, it and COLLAB_PREAUTH_TOTAL_BYTES are a quarter of the 1024 MiB the task leaves outside its heap
+ * caps. An honest socket holds what one reader of its page is owed (a SyncStep2 of at most a few MiB, its share of a
+ * broadcast), so it is cut only when it holds more than the sockets of the clients filling the budget.
+ */
+export const COLLAB_SOCKET_TOTAL_BYTES = 128 * 1024 * 1024;
+/**
+ * Where a cut stops: 7/8 of the budget, so each pass (which re-samples every socket, O(sockets)) buys at least 16 MiB of
+ * growth before the next one, and a holder parked just under the line cannot force one on every send.
+ */
+export const COLLAB_SOCKET_TOTAL_LOW_WATER_BYTES = 112 * 1024 * 1024;
+
+/**
  * Authenticated collab connections (one per document per socket) one user may hold in this process
  * (user-connections.ts). Docmost opens one per page editor; an editor in a hidden tab idle for five minutes
  * disconnects (page-editor.tsx), so a user's live count is the pages they had open in the last minutes, across their
  * devices. 32 is several times that. It bounds the native memory one account can hold: 32 sockets, each at most
- * COLLAB_OUTBOUND_BUFFER_FACTOR x 8 MiB plus its largest frame, and a stalled one is cut off (socket-keepalive.ts).
+ * COLLAB_OUTBOUND_BUFFER_FACTOR x 8 MiB plus its largest frame, and a stalled one is cut off (socket-keepalive.ts);
+ * COLLAB_SOCKET_TOTAL_BYTES bounds every account together (#810).
  */
 export const COLLAB_CONNECTIONS_PER_USER = 32;
 

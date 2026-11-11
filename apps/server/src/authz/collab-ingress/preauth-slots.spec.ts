@@ -23,6 +23,7 @@ import { answerCollabUpgrade, CollabPreAuthSlots } from './preauth-slots';
 import { CollabSocketBounds } from './socket-bounds';
 import { EventEmitter } from 'node:events';
 import { SocketLimitLog } from './socket-limit-log';
+import { CollabSocketBytes } from './socket-bytes';
 
 /**
  * #790 (review S1): a process-wide bound on unauthenticated collab sockets, held from the connection until the first
@@ -305,7 +306,7 @@ describe('#790 through a real Hocuspocus 4.7.1: Authenticated frees the slot, Pe
     const sock = new FakeSocket();
     sockets.push(sock);
     slots.hold(sock); // as the ws adapter does at the upgrade
-    const bounded = new BoundedCollabSocket(sock, new WsSocketWrapper(sock as never), { preAuth: slots, limitLog: quietLog() });
+    const bounded = new BoundedCollabSocket(sock, new WsSocketWrapper(sock as never), { preAuth: slots, bytes: new CollabSocketBytes(), limitLog: quietLog() });
     const cc = hp.handleConnection(bounded, new Request('http://localhost/'));
     sock.on('message', (data: Buffer) => cc.handleMessage(new Uint8Array(data)));
     sock.on('close', (code: number, reason: Buffer) => cc.handleClose({ code, reason: reason.toString() }));
@@ -383,7 +384,7 @@ describe('#810 (red team): a complete but malformed Auth frame buys no more than
     const hp = new Hocuspocus({ quiet: true, extensions: [{ async onAuthenticate() { return { user: { id: 'u' } }; } }] } as never);
     const sock = new StubbornSocket();
     slots.hold(sock); // as the ws adapter does at the upgrade
-    const bounded = new BoundedCollabSocket(sock, new WsSocketWrapper(sock as never), { preAuth: slots, limitLog });
+    const bounded = new BoundedCollabSocket(sock, new WsSocketWrapper(sock as never), { preAuth: slots, bytes: new CollabSocketBytes(), limitLog });
     const cc = hp.handleConnection(bounded, new Request('http://localhost/'));
     // as CollabSocketBounds.open wires it: the frame check (which reports the first Auth to the slots), then Hocuspocus
     sock.on('message', (data: Buffer) => {
@@ -417,7 +418,7 @@ describe('#790 through the real ws adapter: the upgrade check, the slot and the 
     const wss = adapter.handleUpgrade('/collab', server);
     // As the gateway does on both paths: the bounded socket frees the slot on its first Authenticated reply.
     wss.on('connection', (ws: WebSocket) => {
-      const bounded = new BoundedCollabSocket(ws, new WsSocketWrapper(ws as never), { preAuth: bounds.preAuth });
+      const bounded = new BoundedCollabSocket(ws, new WsSocketWrapper(ws as never), { preAuth: bounds.preAuth, bytes: bounds.bytes });
       ws.on('message', (data: Buffer) => {
         if (data.toString() === 'authenticate-me') bounded.send(new OutgoingMessage('page.x').writeAuthenticated(false).toUint8Array());
       });
