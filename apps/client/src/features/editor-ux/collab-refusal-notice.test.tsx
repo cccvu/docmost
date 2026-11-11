@@ -222,6 +222,20 @@ describe("CollabRefusalNotice copy by cause", () => {
     expect(alertText()).toContain("A change from this browser was not saved");
     expect(alertText()).toContain("other people's edits no longer appear here");
     expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
+    expect(discardButton().getAttribute("data-variant")).toBe("default");
+  });
+
+  // Reload and Discard are the only ways out of a refused page, so every cause keeps both, in Edit and in Read mode alike;
+  // only too big drops Reload (a reload would replay the oversized change).
+  it("every cause, passive or not, offers Reload and a secondary Discard", () => {
+    for (const cause of ["change", "copy", "other"] as const) {
+      for (const passive of [false, true]) {
+        const { unmount } = setup(undefined, false, { cause, passive });
+        expect(screen.getAllByRole("button", { name: "Reload" })).toHaveLength(1);
+        expect(discardButton().getAttribute("data-variant")).toBe("default");
+        unmount();
+      }
+    }
   });
 
   it("other (the server could not decide, or a rule this bundle does not know) is generic", () => {
