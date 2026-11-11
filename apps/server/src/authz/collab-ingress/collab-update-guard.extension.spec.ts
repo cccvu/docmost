@@ -19,6 +19,7 @@ import {
 } from './collab-ingress.testkit';
 import * as encoding from 'lib0/encoding';
 import { CollabUpdateGuardExtension } from './collab-update-guard.extension';
+import { twoClientsShape } from './conflict-scan.testkit';
 import {
   AWARENESS_STATE_MAX_BYTES,
   COLLAB_REFUSAL_CODE,
@@ -62,10 +63,10 @@ const open: Hocuspocus[] = [];
 const sockets: FakeSocket[] = [];
 
 /** `guard: 'none'` is the control arm: the same server with no guard. `refuse-unknown-mark` is a naive guard with no state. */
-async function server(opts: { guard?: 'real' | 'none' | 'refuse-unknown-mark'; mode?: CollabGuardMode } = {}) {
+async function server(opts: { guard?: 'real' | 'none' | 'refuse-unknown-mark'; mode?: CollabGuardMode; seed?: Uint8Array } = {}) {
   const logs: string[] = [];
   const guard = new CollabUpdateGuard({ mode: opts.mode ?? 'enforce', logger: { warn: (m: string) => logs.push(m) } });
-  const seedUpdate = Y.encodeStateAsUpdate(prosemirrorJSONToYDoc(serverSchema(), SEED, 'default'));
+  const seedUpdate = opts.seed ?? Y.encodeStateAsUpdate(prosemirrorJSONToYDoc(serverSchema(), SEED, 'default'));
   const extensions: any[] = [];
   if ((opts.guard ?? 'real') === 'real') extensions.push(new CollabUpdateGuardExtension(guard));
   if (opts.guard === 'refuse-unknown-mark') {
@@ -427,5 +428,37 @@ describe('#790 frame bounds through a real Hocuspocus 4.7.1', () => {
       counts.push(s.guard.bindingCount(live));
     }
     expect(new Set(counts)).toEqual(new Set([counts[0]]));
+  });
+});
+
+describe('#816 the conflict-scan meter through a real Hocuspocus 4.7.1', () => {
+  it('a frame past the scan cap closes that session with conflict-scan, applies nowhere, and an honest peer keeps editing', async () => {
+    for (const arm of ['none', 'real'] as const) {
+      const shape = twoClientsShape(1100); // 1100 x 1100 steps: the meter's cap is 1e6 per frame
+      const s = await server({ guard: arm, seed: Y.encodeStateAsUpdate(shape.base) });
+      const peer = await s.connect('peer');
+      const attacker = await s.connect('attacker');
+      const live = s.live();
+      const before = Y.encodeStateAsUpdate(live);
+      const relayed = updatesReceived(peer);
+      attacker.deliver(syncFrame(shape.frame));
+      await settle();
+      if (arm === 'none') {
+        // Control: Hocuspocus applies it and relays it to every peer (who each pay the same walk again).
+        expect(updatesReceived(peer)).toBeGreaterThan(relayed);
+        expect(Buffer.from(Y.encodeStateAsUpdate(live)).equals(Buffer.from(before))).toBe(false);
+        continue;
+      }
+      expect(attacker.closeReasons()).toEqual([REFUSED('conflict-scan')]);
+      expect(Buffer.from(Y.encodeStateAsUpdate(live)).equals(Buffer.from(before))).toBe(true);
+      expect(updatesReceived(peer)).toBe(relayed); // nothing reached the peer
+      expect(s.logs.some((l) => l.includes('"rule":"conflict-scan"'))).toBe(true);
+      const honest = new RemoteClient(live).edit(live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'honest '));
+      peer.deliver(syncFrame(honest));
+      await settle();
+      expect(peer.closeReasons()).toEqual([]);
+      expect(textOf(live.getXmlFragment('default').get(0) as Y.XmlElement).toString()).toMatch(/^honest /);
+      expect(contentOf(s.guard.shadowOf(live)!)).toEqual(contentOf(live)); // rebuilt from live after the refusal
+    }
   });
 });

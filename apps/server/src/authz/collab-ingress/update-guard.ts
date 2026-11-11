@@ -35,6 +35,16 @@
  * unhandled type with one unrate-limited console.error). The awareness RATE is not here: over-rate awareness frames are
  * dropped at the gateway (frame-address.ts), since a refusal here would end an honest editor's session.
  *
+ * CPU bounds (#816), in the same check. The shadow apply runs inside the conflict-scan meter (conflict-scan.ts), which
+ * replays Yjs's integrate walks before Yjs makes them and refuses the frame `conflict-scan` past a per-item or per-frame
+ * step cap, before Yjs pays the walk; live never runs it. Two wire rules close the shapes the meter does not count: a
+ * delete set whose ranges are not ascending (`delete-order`: each out-of-order range splits a struct near the front of
+ * its client's array) and a keyed item with a rightOrigin (`attr-kind`: Yjs never writes one). Client ids live has
+ * never seen are capped per frame (`client-ids`) and charged to the (user, document) id budget the awareness ids use:
+ * every later transaction pays for every id a page holds. And a per-USER CPU budget, as a debt: each writer frame's
+ * shadow step is timed and charged twice (live applies it again), and a frame that arrives while that user's balance is
+ * negative closes the socket 1013 before any work. A rebuild a refusal made necessary is charged to the refused user.
+ *
  * Refusal = a throw of `{ code: 4422, reason }`: Hocuspocus closes that ONE document session and sends the reason (the
  * websocket stays up). Reasons the client acts on (apps/client features/editor-ux): `ccc:collab-update-refused:<rule>`
  * (stop sending, read-only, notice) and `ccc:collab-update-unresolved` (reconnect once). A socket whose sessions are
@@ -46,6 +56,7 @@ import * as decoding from 'lib0/decoding';
 import { decodeUtf8 } from 'lib0/string';
 import * as Y from 'yjs';
 import { COLLAB_CONNECTIONS_PER_USER } from './limits';
+import { ConflictScan, installConflictScanMeter, type ConflictScanMeter } from './conflict-scan';
 import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
 import {
   checkAttribute,
@@ -111,6 +122,26 @@ export const USER_DOC_BUDGETS_MAX = 10_000;
 /** #790: the socket close for an exhausted budget: 1013 (RFC 6455 Try Again Later), retried by the provider. */
 export const COLLAB_TRY_LATER_CODE = 1013;
 export const TRY_LATER_REASON = 'ccc:collab-try-later';
+/**
+ * #816: struct client ids one frame may introduce that live has never seen (nor its awareness: an id is paid for once,
+ * whichever announces it first). An honest frame introduces its own id, a Step2 from a page's local copy also those of
+ * the browser's earlier sessions it still holds unsent. Each one stays in the page's state vector for good, and every
+ * later transaction pays for every id the page holds. Past it the frame is refused `client-ids`; under it the ids are
+ * charged to the (user, document) awareness-id budget (AWARENESS_NEW_IDS_*). Not above that burst, so a frame under the
+ * ceiling always passes once the budget has refilled: it never loops on 1013.
+ */
+export const NEW_CLIENT_IDS_PER_FRAME = 64;
+/**
+ * #816: collab CPU per USER, across documents, as a debt. Each writer frame's shadow step (the rebuild it needs, the
+ * apply, the inspection) is timed and charged twice, since live applies the frame again, clamped per frame to the
+ * burst. A frame that arrives while the balance is negative closes the socket 1013 before any work. So one large honest
+ * frame always passes, and one user's sustained share is USER_COLLAB_CPU_REFILL_MS_PER_SECOND per second (a tenth of a
+ * core). It bounds, in sustained use only, what the conflict-scan meter does not count (struct splits, formatting
+ * cleanup, the element checks on a long list): never the first frame.
+ */
+export const USER_COLLAB_CPU_BURST_MS = 2_000;
+export const USER_COLLAB_CPU_REFILL_MS_PER_SECOND = 100;
+const CPU_MS_REFILL_EVERY_MS = 1_000 / USER_COLLAB_CPU_REFILL_MS_PER_SECOND;
 const LOGS_PER_MINUTE = 30;
 
 export const reasonFor = (rule: CollabRule): string => (rule === 'unresolved' ? UNRESOLVED_REASON : REFUSED_REASON_PREFIX + rule);
@@ -149,7 +180,7 @@ export interface GuardFrame {
 type Header = { type: number; subtype?: number; payload?: Uint8Array | null };
 /** One awareness entry, its state still the undecoded UTF-8 JSON. */
 type AwarenessEntry = { clientID: number; clock: number; state: Uint8Array };
-type ShadowResult = { violation: Violation | null; binds: Map<number, string>; applied: boolean };
+type ShadowResult = { violation: Violation | null; binds: Map<number, string>; applied: boolean; log?: Record<string, unknown> };
 type Ranges = Map<number, Array<[number, number]>>;
 
 /** Per live Document: its shadow, client-id bindings and audit results. Dropped with the document (`destroy`). */
@@ -170,11 +201,14 @@ class DocGuard {
   readonly awarenessBindsByUser = new Map<string, number>();
   /** The client id bound to SERVER for the current shadow: unbound again when a rebuild replaces that shadow. */
   shadowBinding: number | null = null;
+  /** #816: the user whose refused frame left the shadow dirty: the rebuild is charged to them, not the next sender. */
+  dirtiedBy: string | null = null;
   constructor(readonly live: Y.Doc & { name?: string }) {}
 }
 
 type Bucket = { tokens: number; at: number };
-type UserDocBudget = { sync: Bucket; ids: Bucket };
+/** `cpu` (milliseconds, #816) is only used on the whole-user entry. */
+type UserDocBudget = { sync: Bucket; ids: Bucket; cpu: Bucket };
 
 export class CollabUpdateGuard {
   private readonly docs = new WeakMap<Y.Doc, DocGuard>();
@@ -187,13 +221,20 @@ export class CollabUpdateGuard {
   private readonly logger: GuardLogger;
   private readonly limitLog: SocketLimitLog;
   private readonly now: () => number;
+  private readonly cpuNow: () => number;
+  private readonly meter: ConflictScanMeter;
   private logWindow = { start: 0, count: 0, suppressed: 0 };
 
-  constructor(opts: { mode?: CollabGuardMode; logger?: GuardLogger; limitLog?: SocketLimitLog; now?: () => number } = {}) {
+  constructor(
+    opts: { mode?: CollabGuardMode; logger?: GuardLogger; limitLog?: SocketLimitLog; now?: () => number; cpuNow?: () => number } = {},
+  ) {
     this.mode = opts.mode ?? COLLAB_UPDATE_GUARD_MODE;
     this.logger = opts.logger ?? new Logger('CollabUpdateGuard');
     this.limitLog = opts.limitLog ?? collabSocketLimitLog;
     this.now = opts.now ?? Date.now;
+    this.cpuNow = opts.cpuNow ?? (() => performance.now());
+    // Throws when yjs changed shape, so the server refuses to boot rather than run unbounded (#816).
+    this.meter = installConflictScanMeter(Y);
   }
 
   /** Synchronous: returns undefined (apply the frame) or throws `{ code, reason }` (refuse it). Never a promise. */
@@ -259,12 +300,23 @@ export class CollabUpdateGuard {
 
   /** The (user, document) budget of this frame's connection, made most recently used; the least recent past the cap goes. */
   private budgetFor(frame: GuardFrame, wholeUser = false): UserDocBudget {
-    const user = String(frame.context?.user?.id ?? '');
-    const key = wholeUser ? `${user}\u0001` : `${user}\u0000${frame.document.name ?? ''}`;
+    return this.budgetOf(String(frame.context?.user?.id ?? ''), wholeUser ? null : (frame.document.name ?? ''));
+  }
+
+  /** The budget of (`user`, `docName`), or the whole user's when `docName` is null. */
+  private budgetOf(user: string, docName: string | null): UserDocBudget {
+    const wholeUser = docName === null;
+    const key = wholeUser ? `${user}\u0001` : `${user}\u0000${docName}`;
     const at = this.now();
     let budget = this.userDocBudgets.get(key);
     if (budget) this.userDocBudgets.delete(key);
-    else budget = { sync: { tokens: wholeUser ? USER_SYNC_BURST : SYNC_BURST, at }, ids: { tokens: AWARENESS_NEW_IDS_BURST, at } };
+    else {
+      budget = {
+        sync: { tokens: wholeUser ? USER_SYNC_BURST : SYNC_BURST, at },
+        ids: { tokens: AWARENESS_NEW_IDS_BURST, at },
+        cpu: { tokens: USER_COLLAB_CPU_BURST_MS, at },
+      };
+    }
     this.userDocBudgets.set(key, budget);
     if (this.userDocBudgets.size > USER_DOC_BUDGETS_MAX) this.userDocBudgets.delete(this.userDocBudgets.keys().next().value!);
     return budget;
@@ -284,12 +336,23 @@ export class CollabUpdateGuard {
 
   /** Take `n` tokens from `bucket` (`burst`, refilled one per `refillMs`); false, taking none, when it holds fewer. */
   private take(bucket: Bucket, burst: number, refillMs: number, n: number): boolean {
-    const now = this.now();
-    bucket.tokens = Math.min(burst, bucket.tokens + Math.max(0, now - bucket.at) / refillMs);
-    bucket.at = now;
+    this.refill(bucket, burst, refillMs);
     if (bucket.tokens < n) return false;
     bucket.tokens -= n;
     return true;
+  }
+
+  private refill(bucket: Bucket, burst: number, refillMs: number): void {
+    const now = this.now();
+    bucket.tokens = Math.min(burst, bucket.tokens + Math.max(0, now - bucket.at) / refillMs);
+    bucket.at = now;
+  }
+
+  /** #816: charge `ms` of collab CPU to `user` (clamped to one burst), into debt if need be. */
+  private chargeCpu(user: string, ms: number): void {
+    const bucket = this.budgetOf(user, null).cpu;
+    this.refill(bucket, USER_COLLAB_CPU_BURST_MS, CPU_MS_REFILL_EVERY_MS);
+    bucket.tokens -= Math.min(USER_COLLAB_CPU_BURST_MS, Math.max(0, ms));
   }
 
   /**
@@ -364,44 +427,102 @@ export class CollabUpdateGuard {
   private inspect(frame: GuardFrame, header: Header, payload: Uint8Array): void {
     const doc = this.docFor(frame.document);
     const userId = String(frame.context?.user?.id ?? '');
-    // 1. Stateless pre-pass: a refusal here touches no shadow, so a refuse/reconnect loop costs no rebuild.
-    let violation = prePass(payload);
-    if (violation && this.mode === 'enforce') return this.refuse(frame, header, violation);
-    // 2. The shadow step.
-    if (!this.ensureShadow(doc)) return this.refuse(frame, header, violation ?? { rule: 'shadow-unavailable' });
-    const result = this.applyToShadow(doc, payload, userId);
-    violation ??= result.violation;
-    if (violation && this.mode === 'enforce') {
-      // The shadow holds the refused frame; live never will. Rebuilt lazily by the next frame that needs it (ensureShadow),
-      // so a refuse/reconnect loop pays no rebuild per refusal.
-      doc.dirty = true;
-      return this.refuse(frame, header, violation);
+    // 0. #816: a user in CPU debt waits, before any work.
+    if (!this.take(this.budgetFor(frame, true).cpu, USER_COLLAB_CPU_BURST_MS, CPU_MS_REFILL_EVERY_MS, 0)) {
+      this.tryLater(frame, 'user_collab_cpu'); // throws unless report mode
     }
-    if (violation) this.refuse(frame, header, violation); // report mode: logged, and the frame applies
-    for (const [client, user] of result.binds) if (!doc.bindings.has(client)) doc.bindings.set(client, user);
-    // A frame the shadow could not apply is not replayed into a rebuild (it would fail every rebuild from then on).
-    if (result.applied) doc.inflight.push(payload.slice());
-    this.scheduleFlush(doc);
+    // 1. Stateless pre-pass: a refusal here touches no shadow, so a refuse/reconnect loop costs no rebuild.
+    const pre = prePass(payload);
+    let violation = pre.violation;
+    if (violation && this.mode === 'enforce') return this.refuse(frame, header, violation);
+    // 1b. #816: client ids live has never seen, charged before anything integrates them.
+    violation ??= this.chargeNewClientIds(frame, pre.clients);
+    if (violation && this.mode === 'enforce') return this.refuse(frame, header, violation);
+    // 2. The shadow step, timed for the CPU budget. A rebuild someone else's refusal made necessary is theirs.
+    const started = this.cpuNow();
+    let othersMs = 0;
+    try {
+      const blame = doc.dirty && doc.dirtiedBy !== null && doc.dirtiedBy !== userId ? doc.dirtiedBy : null;
+      const rebuildStarted = blame === null ? 0 : this.cpuNow();
+      const ready = this.ensureShadow(doc);
+      if (blame !== null) {
+        othersMs = this.cpuNow() - rebuildStarted;
+        this.chargeCpu(blame, othersMs); // shadow-only work: once
+      }
+      if (!ready) return this.refuse(frame, header, violation ?? { rule: 'shadow-unavailable' });
+      const result = this.applyToShadow(doc, payload, userId);
+      violation ??= result.violation;
+      if (violation && this.mode === 'enforce') {
+        // The shadow holds the refused frame; live never will. Rebuilt lazily by the next frame that needs it
+        // (ensureShadow), so a refuse/reconnect loop pays no rebuild per refusal, and that rebuild is this user's.
+        doc.dirty = true;
+        doc.dirtiedBy = userId;
+        return this.refuse(frame, header, violation, result.log);
+      }
+      if (violation) this.refuse(frame, header, violation, result.log); // report mode: logged, and the frame applies
+      for (const [client, user] of result.binds) if (!doc.bindings.has(client)) doc.bindings.set(client, user);
+      // A frame the shadow could not apply is not replayed into a rebuild (it would fail every rebuild from then on).
+      if (result.applied) doc.inflight.push(payload.slice());
+      this.scheduleFlush(doc);
+    } finally {
+      this.chargeCpu(userId, 2 * (this.cpuNow() - started - othersMs)); // live applies the frame again
+    }
   }
 
+  /**
+   * #816: the frame's struct client ids that live has never seen, its awareness does not hold and this connection has
+   * not already paid for: past NEW_CLIENT_IDS_PER_FRAME a refusal, under it charged to the (user, document) id budget.
+   */
+  private chargeNewClientIds(frame: GuardFrame, clients: Set<number>): Violation | null {
+    const live = frame.document;
+    const meta = live.awareness?.meta;
+    const introduced = this.awarenessNewIds.get(frame.connection) ?? new Set<number>();
+    const fresh: number[] = [];
+    for (const client of clients) {
+      if (Y.getState(live.store, client) === 0 && !meta?.has(client) && !introduced.has(client)) fresh.push(client);
+    }
+    if (!fresh.length) return null;
+    if (fresh.length > NEW_CLIENT_IDS_PER_FRAME) return { rule: 'client-ids' };
+    if (!this.take(this.budgetFor(frame).ids, AWARENESS_NEW_IDS_BURST, AWARENESS_NEW_IDS_REFILL_MS, fresh.length)) {
+      this.tryLater(frame, 'user_client_ids'); // throws unless report mode
+    }
+    for (const id of fresh) introduced.add(id);
+    this.awarenessNewIds.set(frame.connection, introduced);
+    return null;
+  }
+
+  /**
+   * The frame applied to the shadow inside the conflict-scan meter (#816). A trip or a meter failure throws out of
+   * Yjs's stack, before the item it was replaying integrates; the scope says which, never the error's identity.
+   */
   private applyToShadow(doc: DocGuard, payload: Uint8Array, userId: string): ShadowResult {
     const shadow = doc.shadow!;
     const pendingBefore = pendingRanges(shadow.store);
+    const scan = new ConflictScan(shadow, this.mode === 'enforce');
     let out: ShadowResult = { violation: { rule: 'internal' }, binds: new Map(), applied: false };
     try {
-      Y.transact(
-        shadow,
-        (tr) => {
-          Y.applyUpdate(shadow, payload, INSPECT); // V1, as y-protocols reads Step2 and Update
-          out = this.inspectTransaction(doc, tr, userId, pendingBefore);
-        },
-        INSPECT,
-        false,
+      this.meter.metered(scan, () =>
+        Y.transact(
+          shadow,
+          (tr) => {
+            Y.applyUpdate(shadow, payload, INSPECT); // V1, as y-protocols reads Step2 and Update
+            out = this.inspectTransaction(doc, tr, userId, pendingBefore);
+          },
+          INSPECT,
+          false,
+        ),
       );
     } catch {
       doc.dirty = true;
-      return { violation: { rule: 'internal' }, binds: new Map(), applied: false };
+      doc.dirtiedBy = userId;
+      if (scan.trip !== null) {
+        return { violation: { rule: 'conflict-scan' }, binds: new Map(), applied: false, log: { steps: scan.trip.steps, cap: scan.trip.cap } };
+      }
+      const log = scan.failure !== null ? { stage: 'conflict-scan' } : undefined;
+      return { violation: { rule: 'internal' }, binds: new Map(), applied: false, log };
     }
+    // Report mode: the meter counted past a cap and threw nothing; the frame is logged as it would have been refused.
+    if (scan.trip !== null) return { ...out, violation: { rule: 'conflict-scan' }, log: { steps: scan.steps, cap: scan.trip.cap } };
     return out;
   }
 
@@ -519,6 +640,7 @@ export class CollabUpdateGuard {
       for (const frame of doc.inflight) Y.applyUpdate(shadow, frame, MIRROR);
       doc.shadow = shadow;
       doc.dirty = false;
+      doc.dirtiedBy = null;
       // The replaced shadow is gone, and so is any reason to reserve its client id: one binding per rebuild otherwise.
       const replaced = doc.shadowBinding;
       if (replaced !== null && replaced !== live.clientID && doc.bindings.get(replaced) === SERVER) doc.bindings.delete(replaced);
@@ -627,13 +749,14 @@ export class CollabUpdateGuard {
   }
 
   /** Logs the refusal; in enforce mode also closes the session (throws) and counts against the socket's budget. */
-  private refuse(frame: GuardFrame, header: Header, violation: Violation): void {
+  private refuse(frame: GuardFrame, header: Header, violation: Violation, extra?: Record<string, unknown>): void {
     const reason = reasonFor(violation.rule);
     this.log('COLLAB_UPDATE_REFUSED', frame.document, {
       rule: violation.rule,
       ...(violation.node ? { node: violation.node } : {}),
       ...(violation.mark ? { mark: violation.mark } : {}),
       ...(violation.key ? { key: violation.key } : {}),
+      ...extra, // #816: `steps` and `cap` for conflict-scan, `stage` for a meter failure; numbers and fixed words only
       userId: frame.context?.user?.id,
       msgType: header.type,
       ...(header.subtype !== undefined ? { syncType: header.subtype } : {}),
@@ -699,44 +822,67 @@ const tryRead = (read: () => Uint8Array): Uint8Array | null => {
   }
 };
 
-/** The stateless rules, on the decoded frame (no document state, so already-known structs are checked too). */
-function prePass(payload: Uint8Array): Violation | null {
-  let structs: Array<Y.Item | Y.GC | Y.Skip>;
+/**
+ * The stateless rules, on the decoded frame (no document state, so already-known structs are checked too), and the
+ * client ids of its structs (Skips excepted: they integrate nothing). `Y.decodeUpdate` keeps the wire order of the
+ * delete set (`readDeleteSet` appends, it never sorts).
+ */
+function prePass(payload: Uint8Array): { violation: Violation | null; clients: Set<number> } {
+  const clients = new Set<number>();
+  let decoded: { structs: Array<Y.Item | Y.GC | Y.Skip>; ds: { clients: Map<number, Array<{ clock: number; len: number }>> } };
   try {
-    structs = Y.decodeUpdate(payload).structs as Array<Y.Item | Y.GC | Y.Skip>;
+    decoded = Y.decodeUpdate(payload) as typeof decoded;
   } catch {
-    return { rule: 'undecodable' }; // e.g. a lib0 `readAny` value deep enough to overflow the decoder
+    return { violation: { rule: 'undecodable' }, clients }; // e.g. a lib0 `readAny` value deep enough to overflow the decoder
   }
-  for (const struct of structs) {
-    if (!(struct instanceof Y.Item)) continue;
-    const parent = struct.parent as unknown;
-    if (typeof parent === 'string' && parent !== 'default') return { rule: 'root' };
-    if (parent === 'default' && struct.parentSub !== null) return { rule: 'attr-kind' };
-    if (struct.parentSub === '__proto__') return { rule: 'attr-kind' };
-    const content = struct.content;
-    if (content.getLength() === 0) return { rule: 'zero-length' };
-    if (content instanceof Y.ContentString || content instanceof Y.ContentDeleted) continue;
-    if (content instanceof Y.ContentAny) {
-      for (const value of content.arr) {
-        const rule = checkValue(value);
-        if (rule) return { rule };
-      }
-      continue;
+  let violation: Violation | null = null;
+  for (const struct of decoded.structs) {
+    if (struct instanceof Y.Skip) continue;
+    clients.add(struct.id.client);
+    if (struct instanceof Y.Item) violation ??= structRule(struct);
+  }
+  return { violation: violation ?? deleteOrder(decoded.ds.clients), clients };
+}
+
+function structRule(struct: Y.Item): Violation | null {
+  const parent = struct.parent as unknown;
+  if (typeof parent === 'string' && parent !== 'default') return { rule: 'root' };
+  if (parent === 'default' && struct.parentSub !== null) return { rule: 'attr-kind' };
+  if (struct.parentSub === '__proto__') return { rule: 'attr-kind' };
+  const content = struct.content;
+  if (content.getLength() === 0) return { rule: 'zero-length' };
+  if (content instanceof Y.ContentString || content instanceof Y.ContentDeleted) return null;
+  if (content instanceof Y.ContentAny) {
+    for (const value of content.arr) {
+      const rule = checkValue(value);
+      if (rule) return { rule };
     }
-    if (content instanceof Y.ContentFormat) {
-      const v = checkFormat(content.key, content.value);
-      if (v) return v;
-      continue;
+    return null;
+  }
+  if (content instanceof Y.ContentFormat) return checkFormat(content.key, content.value);
+  if (content instanceof Y.ContentType) {
+    const type = content.type;
+    if (type.constructor === Y.XmlText) return null;
+    if (type.constructor === Y.XmlElement) {
+      return isElementName((type as Y.XmlElement).nodeName) ? null : { rule: 'schema' }; // y-tiptap deletes it on every peer
     }
-    if (content instanceof Y.ContentType) {
-      const type = content.type;
-      if (type.constructor === Y.XmlText) continue;
-      if (type.constructor === Y.XmlElement) {
-        if (!isElementName((type as Y.XmlElement).nodeName)) return { rule: 'schema' }; // y-tiptap deletes it on every peer
-        continue;
-      }
+  }
+  return { rule: 'content-kind' }; // Embed, Binary, JSON, Doc (a subdocument), or a non-Xml shared type
+}
+
+/**
+ * #816: each client's delete ranges ascending and apart, in wire order (`start >= previous end`). Every Yjs encoder
+ * writes them so (a transaction's `sortAndMergeDeleteSet`, `createDeleteSetFromStructStore`, `mergeDeleteSets` in
+ * `mergeUpdates`; `diffUpdate` passes its input's order through). Out of order, each range that splits a struct inserts
+ * near the front of the client's struct array: quadratic in the ranges.
+ */
+function deleteOrder(ds: Map<number, Array<{ clock: number; len: number }>>): Violation | null {
+  for (const ranges of ds.values()) {
+    let end = 0;
+    for (let i = 0; i < ranges.length; i++) {
+      if (i > 0 && ranges[i].clock < end) return { rule: 'delete-order' };
+      end = ranges[i].clock + ranges[i].len;
     }
-    return { rule: 'content-kind' }; // Embed, Binary, JSON, Doc (a subdocument), or a non-Xml shared type
   }
   return null;
 }
@@ -749,6 +895,10 @@ function checkStruct(item: Y.Item, root: Y.AbstractType<any> | undefined, touche
   const parent = item.parent as Y.AbstractType<any>;
   const parentKind = kindOf(parent);
   if (rootOf(parent) !== root) return { rule: 'root' };
+  // #816: Yjs never writes a keyed item with a rightOrigin (typeMapSet and redo leave it null; a split copies it), and one
+  // re-walks its key's history. Checked here, not in the pre-pass: an item with an origin or a rightOrigin takes its key
+  // from them at integrate time (Yjs's readItem reads parentSub only when both are null), so the wire never shows it.
+  if (item.parentSub !== null && item.rightOrigin !== null) return { rule: 'attr-kind' };
   if (item.deleted) return null; // ContentDeleted, or deleted on arrival: nothing of it is ever rendered or stored
   const content = item.content;
   if (item.parentSub !== null) {
