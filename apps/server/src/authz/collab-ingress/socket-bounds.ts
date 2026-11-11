@@ -8,7 +8,7 @@
  *   gateway's `connected` / `onDisconnect` extension (seam §3);
  * - the socket documents (socket-documents.ts): written by that same extension, read by the keepalive's empty-socket
  *   reaper (socket-keepalive.ts) the gateway starts for every socket;
- * - the per-user auth rate (auth-rate.ts), charged in `onAuthenticate`.
+ * - the per-session and per-user auth rates (auth-rate.ts), charged in `onAuthenticate`.
  * A part split across two instances fails silently (a slot never released, ending in 503s; a cap the early check never
  * sees; a reaper reading an empty registry), so the parts live only here and nothing else builds one
  * (socket-bounds.fitness.spec.ts).
@@ -19,12 +19,20 @@
  * singletons it replaced, and a spec builds its own. The class is undecorated, so Nest never resolves its options.
  *
  * Only the rate-limited log sink stays module-level (socket-limit-log.ts): sharing it is its purpose (one budget of
- * lines a minute for every bound, the module's ws_error line and the update guard).
+ * lines a minute for every bound, the module's ws_error line and the update guard). The connect's refusals that are not
+ * bounds (an invalid token, a 4xx access refusal: auth-refusal.ts) log through this object's sink too.
  */
 import type { IncomingMessage } from 'http';
 import type { FactoryProvider } from '@nestjs/common';
 import type { WebSocketLike } from '@hocuspocus/server';
-import { chargeCollabAuth, CollabAuthRate } from './auth-rate';
+import { chargeCollabAuth, chargeCollabSessionAuth, CollabAuthRate } from './auth-rate';
+import {
+  COLLAB_TOKEN_WITHOUT_SESSION,
+  invalidCollabTokenRefusal,
+  quietCollabAuthRefusals,
+  type CollabAuthenticator,
+  type CollabAuthRefusal,
+} from './auth-refusal';
 import { BoundedCollabSocket, type RawCollabSocket } from './bounded-socket';
 import { admitCollabFrame, type AddressedSocket } from './frame-admission';
 import { answerCollabUpgrade, CollabPreAuthSlots, type PreAuthSocket, type PreAuthTransport, type VerifyCallback } from './preauth-slots';
@@ -50,6 +58,7 @@ export interface CollabSocketBoundsOptions {
   connections?: CollabUserConnections;
   documents?: CollabSocketDocuments;
   authRate?: CollabAuthRate;
+  sessionAuthRate?: CollabAuthRate;
   pingIntervalMs?: number;
 }
 
@@ -58,7 +67,10 @@ export class CollabSocketBounds {
   readonly preAuth: CollabPreAuthSlots;
   readonly connections: CollabUserConnections;
   readonly documents: CollabSocketDocuments;
+  /** The per-user auth rate, charged once the session is live. */
   readonly authRate: CollabAuthRate;
+  /** The per-session auth rate, charged before any read. */
+  readonly sessionAuthRate: CollabAuthRate;
   /** The gateway's `connected` / `onDisconnect` extension (seam §3), on this object's connections and documents. */
   readonly userConnectionsExtension: CollabUserConnectionsExtension;
   private readonly pingIntervalMs: number;
@@ -69,6 +81,7 @@ export class CollabSocketBounds {
     this.connections = opts.connections ?? new CollabUserConnections({ limitLog: this.limitLog });
     this.documents = opts.documents ?? new CollabSocketDocuments();
     this.authRate = opts.authRate ?? new CollabAuthRate({ limitLog: this.limitLog });
+    this.sessionAuthRate = opts.sessionAuthRate ?? new CollabAuthRate({ limitLog: this.limitLog, limit: 'auth_session_rate' });
     this.pingIntervalMs = opts.pingIntervalMs ?? COLLAB_PING_INTERVAL_MS;
     this.userConnectionsExtension = new CollabUserConnectionsExtension(this.connections, this.documents);
   }
@@ -87,9 +100,31 @@ export class CollabSocketBounds {
     this.preAuth.hold(ws, transport);
   }
 
-  /** In `onAuthenticate` before any read (seam §213): the per-user auth rate; throws `{ reason }` when it is spent. */
-  chargeAuth(userId: string): void {
+  /**
+   * In `onAuthenticate` when the collab JWT does not verify (seam §213): the refusal to throw, logged `invalid_token` with
+   * its kind only (auth-refusal.ts).
+   */
+  invalidToken(cause: unknown): CollabAuthRefusal {
+    return invalidCollabTokenRefusal(cause, this.limitLog);
+  }
+
+  /**
+   * In `onAuthenticate` right after the JWT verifies, before any read (seam §213): a token naming no session is refused as
+   * an invalid token (`no_session`), then the session's auth rate is charged; throws `{ reason }` either way.
+   */
+  chargeSession(userId: string, sessionId: string | undefined): void {
+    if (!sessionId) throw this.invalidToken(COLLAB_TOKEN_WITHOUT_SESSION);
+    chargeCollabSessionAuth(userId, sessionId, this.sessionAuthRate);
+  }
+
+  /** In `onAuthenticate` once the session is live (seam §213): the per-user auth rate; throws `{ reason }` when spent. */
+  chargeUser(userId: string): void {
     chargeCollabAuth(userId, this.authRate);
+  }
+
+  /** The authentication extension as the gateway registers it (seam §3): its 4xx refusals quiet (auth-refusal.ts). */
+  quietAuthRefusals<P, R>(extension: CollabAuthenticator<P, R>): CollabAuthenticator<P, R> {
+    return quietCollabAuthRefusals(extension, this.limitLog);
   }
 
   /** In `onAuthenticate` before any read (seam §213): throws `{ reason }` when the user already holds the cap. */

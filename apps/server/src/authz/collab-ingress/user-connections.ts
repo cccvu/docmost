@@ -11,15 +11,15 @@
  * fails, or whose socket closes before the connection is set up, never reaches `connected`, so it holds nothing.
  *
  * Enforced twice:
- * - `admitCollabUserConnection` (through `CollabSocketBounds.admitUser`), in `onAuthenticate` right after the per-user
- *   auth rate and before any user, session, page or PDP read (authentication.extension.ts, seam #213): a user already at
+ * - `admitCollabUserConnection` (through `CollabSocketBounds.admitUser`), in `onAuthenticate` right after the
+ *   per-session auth rate and before any user, session, page or PDP read (authentication.extension.ts, seam #213): a user already at
  *   the cap is refused without a DB call;
  * - the `connected` hook: authentications run concurrently, so several can pass that check together; one that would
  *   take the user past the cap is closed there (`connection.close`, then its socket, which would otherwise stay open
- *   holding no document), and the editor sees a close it reconnects from, to be refused at the first check.
+ *   holding no document), and the editor reconnects after its try-later wait, to be refused at the first check.
  * A refusal throws COLLAB_USER_CONNECTIONS_REASON (auth-refusal.ts: no `message`, so Hocuspocus logs nothing), logged
- * once, rate-limited, as `COLLAB_SOCKET_LIMIT {"limit":"user_connections"}`. The editor treats it as any refusal (collab-access.ts: refetch the
- * token once, then the connection-lost state).
+ * once, rate-limited, as `COLLAB_SOCKET_LIMIT {"limit":"user_connections"}`. The editor waits out the refusal and the
+ * close alike (collab-access.ts: its try-later backoff, 5 s doubling to 60 s, jittered; never a token refetch).
  *
  * The extension defines only `connected` and `onDisconnect`, never throws from either (a throw would skip every later
  * extension's hook), and ranks just below the update guard so its `connected` runs before any extension's that awaits.
@@ -129,7 +129,7 @@ export class CollabUserConnectionsExtension {
       if (!this.connections.hold(user, key)) {
         const refusal = { code: COLLAB_USER_CONNECTIONS_CLOSE_CODE, reason: COLLAB_USER_CONNECTIONS_REASON };
         payload.connection?.close(refusal);
-        // The socket too: it holds no document now (one per socket in Docmost), and the editor reconnects on either close.
+        // The socket too: it holds no document now (one per socket in Docmost); the editor waits out either close, then reconnects.
         payload.connection?.webSocket?.close?.(refusal.code, refusal.reason);
       }
     } catch {

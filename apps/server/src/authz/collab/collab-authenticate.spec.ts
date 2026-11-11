@@ -7,6 +7,7 @@ jest.mock('../../collaboration/collaboration.util', () => ({
 
 import { UnauthorizedException } from '@nestjs/common';
 import { AuthenticationExtension } from '../../collaboration/extensions/authentication.extension';
+import { COLLAB_INVALID_TOKEN_REASON } from '../collab-ingress/auth-refusal';
 import { CollabSocketBounds } from '../collab-ingress/socket-bounds';
 import { PdpPagePermissionRepo } from '../pdp-page-permission.repo';
 import { PdpSpaceMemberRepo } from '../pdp-space-member.repo';
@@ -196,9 +197,9 @@ describe('#537 — the collab connect refuses a token whose session is not live'
     expect(findActiveById).toHaveBeenCalledWith(SID);
   });
 
-  it('refuses a token with no sessionId (a pre-#537 token)', async () => {
+  it('refuses a token with no sessionId (a pre-#537 token), as an invalid token, before any read (#810)', async () => {
     const { ext, findActiveById } = build({ claims: { sessionId: undefined } });
-    await expect(ext.onAuthenticate(payload())).rejects.toBeInstanceOf(UnauthorizedException);
+    await expect(ext.onAuthenticate(payload())).rejects.toEqual({ reason: COLLAB_INVALID_TOKEN_REASON });
     expect(findActiveById).not.toHaveBeenCalled();
   });
 

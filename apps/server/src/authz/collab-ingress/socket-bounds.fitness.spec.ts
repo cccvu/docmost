@@ -132,11 +132,13 @@ describe('#810 fitness: one CollabSocketBounds per process', () => {
     for (const f of [BOUNDS_FILE, 'collaboration/collaboration.gateway.ts', 'collaboration/adapter/collab-ws.adapter.ts']) {
       expect(files).toContain(f);
     }
-    // and socket-bounds.ts builds each part exactly once, in its constructor, and wires a socket only in open()
+    // and socket-bounds.ts builds each part exactly once (the auth rate twice: per session and per user, #810), in its
+    // constructor, and wires a socket only in open()
     const own = scan(BOUNDS_FILE, read(BOUNDS_FILE), PARTS, WIRING_CALLS).map((f) => `${f.fn}: ${f.what}`);
     expect(own.sort()).toEqual(
       [
         ...PARTS.filter((p) => p !== 'BoundedCollabSocket').map((p) => `constructor: new ${p}`),
+        'constructor: new CollabAuthRate',
         'open: new BoundedCollabSocket',
         ...WIRING_CALLS.map((c) => `open: ${c}()`),
       ].sort(),
@@ -189,7 +191,11 @@ describe('#810 fitness: one CollabSocketBounds per process', () => {
 
     const extension = code(read('collaboration/extensions/authentication.extension.ts'));
     expect(extension).toMatch(/private readonly collabSocketBounds: CollabSocketBounds/);
-    expect(extension).toMatch(/this\.collabSocketBounds\.chargeAuth\(userId\);\s*this\.collabSocketBounds\.admitUser\(userId\);/);
+    expect(extension).toMatch(/this\.collabSocketBounds\.chargeSession\(userId, jwtPayload\.sessionId\);\s*this\.collabSocketBounds\.admitUser\(userId\);/);
+    expect(extension).toMatch(/this\.collabSocketBounds\.chargeUser\(userId\);/);
+    expect(extension).toMatch(/throw this\.collabSocketBounds\.invalidToken\(error\);/);
+    expect(gateway).toMatch(/this\.collabSocketBounds\.quietAuthRefusals\(this\.authenticationExtension\),/);
+    expect(gateway).not.toMatch(/^\s*this\.authenticationExtension,\s*$/m); // never the bare extension (#810 L1)
     // a value import: `import type` would drop the constructor's design:paramtypes, and Nest could not inject it
     expect(extension).toMatch(/^import \{ CollabSocketBounds \} from '\.\.\/\.\.\/authz\/collab-ingress\/socket-bounds';$/m);
 

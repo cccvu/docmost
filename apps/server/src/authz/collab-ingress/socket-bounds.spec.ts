@@ -72,12 +72,17 @@ describe('#810 the bounds\' refusals carry only a reason (Hocuspocus logs error.
     return undefined;
   };
 
-  it('auth rate, user connections and an invalid token: exactly { reason }', () => {
+  it('auth rates, user connections and an invalid token: exactly { reason }', () => {
     const bounds = new CollabSocketBounds({ limitLog: quiet(), connections: new CollabUserConnections({ cap: 1, limitLog: quiet() }) });
-    for (let i = 0; i < COLLAB_AUTH_BURST; i++) bounds.chargeAuth('u1');
-    const rate = thrown(() => bounds.chargeAuth('u1'));
+    for (let i = 0; i < COLLAB_AUTH_BURST; i++) bounds.chargeUser('u1');
+    const rate = thrown(() => bounds.chargeUser('u1'));
     expect(rate).toEqual({ reason: COLLAB_AUTH_RATE_REASON });
     expect(Object.keys(rate as object)).toEqual(['reason']);
+    for (let i = 0; i < COLLAB_AUTH_BURST; i++) bounds.chargeSession('u1', 's1');
+    const sessionRate = thrown(() => bounds.chargeSession('u1', 's1'));
+    expect(sessionRate).toEqual({ reason: COLLAB_AUTH_RATE_REASON });
+    expect(Object.keys(sessionRate as object)).toEqual(['reason']);
+    expect(Object.keys(thrown(() => bounds.chargeSession('u1', undefined)) as object)).toEqual(['reason']);
 
     expect(thrown(() => bounds.admitUser('u1'))).toBeUndefined();
     bounds.connections.hold('u1', 'socket\u0000page');
@@ -85,6 +90,6 @@ describe('#810 the bounds\' refusals carry only a reason (Hocuspocus logs error.
     expect(cap).toEqual({ reason: COLLAB_USER_CONNECTIONS_REASON });
     expect(Object.keys(cap as object)).toEqual(['reason']);
 
-    expect(Object.keys(invalidCollabTokenRefusal())).toEqual(['reason']);
+    expect(Object.keys(invalidCollabTokenRefusal(new Error('bad'), quiet()))).toEqual(['reason']);
   });
 });

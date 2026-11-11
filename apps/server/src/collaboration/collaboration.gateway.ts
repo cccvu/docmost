@@ -70,7 +70,7 @@ export class CollaborationGateway {
       extensions: [
         new CollabUpdateGuardExtension(), // CCC #781: refuses a malformed frame before it applies; first, synchronous
         this.collabSocketBounds.userConnectionsExtension, // CCC #790: the per-user connection cap (authz/collab-ingress/user-connections)
-        this.authenticationExtension,
+        this.collabSocketBounds.quietAuthRefusals(this.authenticationExtension), // CCC #810: its 4xx refusals logged rate-limited, not per attempt
         this.persistenceExtension,
         this.loggerExtension,
       ],

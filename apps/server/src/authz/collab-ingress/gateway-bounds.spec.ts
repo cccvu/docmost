@@ -436,3 +436,30 @@ describe('#810 (N1) the first Auth frame moves the slot deadline, on both gatewa
     expect(forwardedAfter).toBe(forwardedBefore + 1);
   });
 });
+
+describe('#810 (L1) the gateway registers the authentication extension with its 4xx refusals quiet', () => {
+  it('extensions[2] wraps the injected extension: a 4xx becomes { reason }, an allow passes, an outage passes through', async () => {
+    (Hocuspocus as unknown as jest.Mock).mockClear();
+    let next: () => Promise<unknown> = async () => ({ user: { id: 'u' } });
+    const auth = { onAuthenticate: jest.fn(() => next()) };
+    new CollaborationGateway(
+      auth as never,
+      {} as never,
+      {} as never,
+      { getRedisUrl: () => 'redis://localhost:6379', isCollabDisableRedis: () => true } as never,
+      { getHandlers: jest.fn(() => ({})) } as never,
+      new CollabSocketBounds({ limitLog: new SocketLimitLog({ warn: () => undefined }) }),
+    );
+    const extensions = (Hocuspocus as unknown as jest.Mock).mock.calls[0][0].extensions as Array<{ onAuthenticate?: (p: unknown) => Promise<unknown> }>;
+    expect(extensions).not.toContain(auth); // never the bare extension
+    const registered = extensions[2];
+    expect(Object.keys(registered)).toEqual(['onAuthenticate']); // no priority: Hocuspocus keeps the listed order
+    await expect(registered.onAuthenticate!({ token: 't' })).resolves.toEqual({ user: { id: 'u' } });
+    expect(auth.onAuthenticate).toHaveBeenLastCalledWith({ token: 't' });
+    next = async () => Promise.reject(new UnauthorizedException());
+    await expect(registered.onAuthenticate!({})).rejects.toEqual({ reason: 'permission-denied' });
+    const boom = new Error('db down');
+    next = async () => Promise.reject(boom);
+    await expect(registered.onAuthenticate!({})).rejects.toBe(boom);
+  });
+});

@@ -102,13 +102,14 @@ function authzFor(c: Case) {
 }
 
 /**
- * #790/#810: the extension's socket bounds with the per-user auth rate switched off: its burst (64) would refuse this
- * matrix's later cases for its one user. This spec is about the access decision; collab-ingress/auth-rate.spec.ts pins
- * the rate on the same extension.
+ * #790/#810: the extension's socket bounds with the auth rates switched off: their burst (64) would refuse this matrix's
+ * later cases for its one user and session. This spec is about the access decision; collab-ingress/auth-rate.spec.ts
+ * pins the rates on the same extension.
  */
 function unrated(): CollabSocketBounds {
   const bounds = new CollabSocketBounds();
-  jest.spyOn(bounds, 'chargeAuth').mockImplementation(() => undefined);
+  jest.spyOn(bounds, 'chargeSession').mockImplementation(() => undefined);
+  jest.spyOn(bounds, 'chargeUser').mockImplementation(() => undefined);
   return bounds;
 }
 
