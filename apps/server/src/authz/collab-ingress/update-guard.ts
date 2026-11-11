@@ -250,7 +250,8 @@ export class CollabUpdateGuard {
   /** #790: per (user, document) budgets, least recently used first; and per connection, the ids it already paid for. */
   private readonly userDocBudgets = new Map<string, UserDocBudget>();
   private readonly awarenessNewIds = new WeakMap<object, Set<number>>();
-  private readonly mode: CollabGuardMode;
+  /** Read by the guard extension too: the load repair runs only in enforce mode (#841). */
+  readonly mode: CollabGuardMode;
   private readonly logger: GuardLogger;
   private readonly limitLog: SocketLimitLog;
   private readonly now: () => number;
@@ -488,7 +489,8 @@ export class CollabUpdateGuard {
     let othersMs = 0;
     let applyMs = 0;
     try {
-      // 1. Stateless pre-pass: a refusal here touches no shadow, so a refuse/reconnect loop costs no rebuild.
+      // 1. Pre-pass (the per-struct rules; it reads live's state, never the shadow): a refusal here touches no shadow,
+      //    so a refuse/reconnect loop costs no rebuild.
       const pre = prePass(payload, frame.document);
       let violation = pre.violation;
       if (violation && this.mode === 'enforce') return this.refuse(frame, header, violation);

@@ -608,6 +608,26 @@ describe('#781 legacy repair wired as the guard extension\'s afterLoadDocument',
     expect(lines[0]).not.toContain('123');
   });
 
+  it('the kill switch covers it: in report mode the repair never runs (control: the same guard in enforce mode repairs)', async () => {
+    const quiet = { warn: () => undefined };
+    const run = async (mode: 'enforce' | 'report') => {
+      const lines: string[] = [];
+      const repair = jest.fn(repairLegacyValues);
+      const guard = new CollabUpdateGuard({ mode, logger: quiet, limitLog: new SocketLimitLog(quiet) });
+      const ext = new CollabUpdateGuardExtension(guard, { logger: { warn: (m) => lines.push(m) }, repair });
+      const doc = lifetime(legacyRow(), false);
+      await expect(ext.afterLoadDocument({ document: doc, documentName: DOC_NAME } as never)).resolves.toBeUndefined();
+      return { calls: repair.mock.calls.length, left: planLegacyRepair(doc).report, lines };
+    };
+    const report = await run('report');
+    expect(report.calls).toBe(0);
+    expect(report.left).toMatchObject({ attrs: 1, marks: 1 }); // the stored values are untouched
+    expect(report.lines).toEqual([]);
+    const enforce = await run('enforce');
+    expect(enforce.calls).toBe(1);
+    expect(enforce.left).toMatchObject({ attrs: 0, marks: 0 });
+  });
+
   it('a clean document logs nothing', async () => {
     const lines: string[] = [];
     const ext = new CollabUpdateGuardExtension(undefined, { logger: { warn: (m) => lines.push(m) } });

@@ -14,7 +14,9 @@
  * (legacy-repair.ts) once per document lifetime. Hocuspocus 4.7.1 awaits it inside `loadDocument` (after attaching
  * `onUpdate`, before `createDocument` resolves), and a connection, and so every frame, exists only after that; so the
  * guard's shadow and its first-build audit (built on the first frame) see the repaired document. It runs one macrotask
- * turn after the load's `applyUpdate`, never in the same event-loop block.
+ * turn after the load's `applyUpdate`, never in the same event-loop block. It runs only while the guard enforces: the
+ * repair exists so stored values the guard would refuse stop blocking honest edits, and it deletes them, so
+ * `COLLAB_UPDATE_GUARD=report` (the ADR 0036 kill switch) turns it off along with the refusals.
  */
 import { Logger } from '@nestjs/common';
 import type { afterLoadDocumentPayload, beforeHandleMessagePayload } from '@hocuspocus/server';
@@ -57,8 +59,12 @@ export class CollabUpdateGuardExtension {
 
   /**
    * The load repair (legacy-repair.ts). NEVER rejects: a rejection here fails the document's load (every connection to
-   * the page). On any failure it logs and leaves the document as loaded; the guard still enforces on every frame.
-   * Logged with counts and rule names only, never a value.
+   * the page). On any failure it logs and carries on; the guard still enforces on every frame. A failure while
+   * planning (every read) leaves the document as loaded; a throw inside the one repair transaction would keep the
+   * deletes made before it (none of the calls there is known to throw). Logged with counts and rule names only, never a
+   * value.
+   *
+   * Skipped entirely (no yield, no walk, no log) unless the guard is in enforce mode.
    *
    * It first yields one macrotask turn. Hocuspocus chains `onLoadDocument` (the page-sized `applyUpdate`) and this hook
    * with `.then`, so without the yield the repair's page-sized walk would extend that same event-loop block, on every
@@ -67,6 +73,7 @@ export class CollabUpdateGuardExtension {
    * resolves (a concurrent open awaits the same loading promise), and a connection is created only after that.
    */
   async afterLoadDocument({ document, documentName }: afterLoadDocumentPayload): Promise<void> {
+    if (this.guard.mode !== 'enforce') return;
     const pageId = String(documentName ?? '').replace(/^page\./, '');
     await new Promise<void>((resolve) => setImmediate(resolve));
     try {

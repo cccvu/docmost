@@ -18,6 +18,10 @@
  * (only XmlElement/XmlText children, which the server's `fromYdoc` and y-tiptap's root conversion require),
  * STRING_ATTRS (attributes a renderer calls a string method on), and depth/size bounds that keep every recursive walker
  * (lib0's encoder, `fromYdoc`, `isDeepStrictEqual`, `stableStringify`) inside the stack.
+ *
+ * Tightening a value rule (STRING_ATTRS, INT_ATTRS, a mark's attribute check) is also a data migration: in enforce mode
+ * the load repair (legacy-repair.ts, #841) deletes every stored value the tightened rule refuses, on each page's next
+ * load, and the next store persists that. `COLLAB_UPDATE_GUARD=report` turns the repair off with the refusals.
  */
 import { BadRequestException } from '@nestjs/common';
 import { Mark, Node as PMNode, type MarkType, type NodeType } from '@tiptap/pm/model';
@@ -48,6 +52,7 @@ export const COLLAB_LIMITS = Object.freeze({
  * a non-string value crashes every viewer of the page. The render-gate spec's KNOWN_THROWS (server renderers) plus the
  * client crash sites (link/media/attachment views, getFileUrl, normalizeUrl, callout/math/mention/status views).
  * Each must be a string, null or undefined. A new attribute read as a string is added here (schema-names.spec.ts).
+ * Adding one deletes existing non-string stored values at load (the header's data-migration note).
  */
 export const STRING_ATTRS: ReadonlySet<string> = new Set([
   'mark link.href',
@@ -76,7 +81,8 @@ export const STRING_ATTRS: ReadonlySet<string> = new Set([
 /**
  * Integer attributes a renderer loops over: prosemirror-tables' `computeMap` and the table node view build one column per
  * unit of `colspan`, so `colspan: 1e9` hangs every viewer's tab. Each must be an integer in its range (HTML's own limits:
- * a browser clamps `colspan` to 1000 and `rowspan` to 65534), null or undefined.
+ * a browser clamps `colspan` to 1000 and `rowspan` to 65534), null or undefined. Narrowing a range deletes existing
+ * out-of-range stored values at load (the header's data-migration note).
  */
 export const INT_ATTRS: ReadonlyMap<string, readonly [min: number, max: number]> = new Map([
   ['node tableCell.colspan', [1, 1000]],
