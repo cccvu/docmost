@@ -1,0 +1,279 @@
+[
+  {
+    "name": "proxied: the real client through the front door",
+    "appliesTo": [
+      "platform",
+      "fork"
+    ],
+    "nodeEnv": "production",
+    "trustedProxies": [
+      "107.22.62.237"
+    ],
+    "peer": "172.31.20.10",
+    "xff": "198.51.100.7, 107.22.62.237",
+    "expect": "198.51.100.7"
+  },
+  {
+    "name": "proxied with a forged X-Forwarded-For prefix",
+    "appliesTo": [
+      "platform",
+      "fork"
+    ],
+    "nodeEnv": "production",
+    "trustedProxies": [
+      "107.22.62.237"
+    ],
+    "peer": "172.31.20.10",
+    "xff": "9.9.9.9, 198.51.100.7, 107.22.62.237",
+    "expect": "198.51.100.7"
+  },
+  {
+    "name": "proxied with a forged entry naming the proxy (trust laundering)",
+    "appliesTo": [
+      "platform",
+      "fork"
+    ],
+    "nodeEnv": "production",
+    "trustedProxies": [
+      "107.22.62.237"
+    ],
+    "peer": "172.31.20.10",
+    "xff": "107.22.62.237, 198.51.100.7, 107.22.62.237",
+    "expect": "198.51.100.7"
+  },
+  {
+    "name": "proxied, no space after the comma",
+    "appliesTo": [
+      "platform",
+      "fork"
+    ],
+    "nodeEnv": "production",
+    "trustedProxies": [
+      "107.22.62.237"
+    ],
+    "peer": "172.31.20.10",
+    "xff": "198.51.100.7,107.22.62.237",
+    "expect": "198.51.100.7"
+  },
+  {
+    "name": "direct to the ALB: the real client",
+    "appliesTo": [
+      "platform",
+      "fork"
+    ],
+    "nodeEnv": "production",
+    "trustedProxies": [
+      "107.22.62.237"
+    ],
+    "peer": "172.31.20.10",
+    "xff": "198.51.100.7",
+    "expect": "198.51.100.7"
+  },
+  {
+    "name": "direct with a forged prefix",
+    "appliesTo": [
+      "platform",
+      "fork"
+    ],
+    "nodeEnv": "production",
+    "trustedProxies": [
+      "107.22.62.237"
+    ],
+    "peer": "172.31.20.10",
+    "xff": "9.9.9.9, 198.51.100.7",
+    "expect": "198.51.100.7"
+  },
+  {
+    "name": "direct, forging the proxy name to the left of the truth",
+    "appliesTo": [
+      "platform",
+      "fork"
+    ],
+    "nodeEnv": "production",
+    "trustedProxies": [
+      "107.22.62.237"
+    ],
+    "peer": "172.31.20.10",
+    "xff": "1.2.3.4, 107.22.62.237, 203.0.113.99",
+    "expect": "203.0.113.99"
+  },
+  {
+    "name": "direct, writing only the proxy name",
+    "appliesTo": [
+      "platform",
+      "fork"
+    ],
+    "nodeEnv": "production",
+    "trustedProxies": [
+      "107.22.62.237"
+    ],
+    "peer": "172.31.20.10",
+    "xff": "107.22.62.237, 203.0.113.99",
+    "expect": "203.0.113.99"
+  },
+  {
+    "name": "port-less: the ALB never appends a port, so a forged host:port to the left is never reached",
+    "appliesTo": [
+      "platform",
+      "fork"
+    ],
+    "nodeEnv": "production",
+    "trustedProxies": [
+      "107.22.62.237"
+    ],
+    "peer": "172.31.20.10",
+    "xff": "203.0.113.5:443, 198.51.100.7, 107.22.62.237",
+    "expect": "198.51.100.7"
+  },
+  {
+    "name": "no X-Forwarded-For at all: the socket peer",
+    "appliesTo": [
+      "platform",
+      "fork"
+    ],
+    "nodeEnv": "production",
+    "trustedProxies": [
+      "107.22.62.237"
+    ],
+    "peer": "172.31.20.10",
+    "xff": null,
+    "expect": "172.31.20.10"
+  },
+  {
+    "name": "an all-trusted chain stops at the leftmost entry, never past the header",
+    "appliesTo": [
+      "platform",
+      "fork"
+    ],
+    "nodeEnv": "production",
+    "trustedProxies": [
+      "107.22.62.237"
+    ],
+    "peer": "172.31.20.10",
+    "xff": "107.22.62.237, 107.22.62.237",
+    "expect": "107.22.62.237"
+  },
+  {
+    "name": "::ffff: mapped socket peer (dual-stack listener): hop 0 is trusted whatever its spelling",
+    "appliesTo": [
+      "platform",
+      "fork"
+    ],
+    "nodeEnv": "production",
+    "trustedProxies": [
+      "107.22.62.237"
+    ],
+    "peer": "::ffff:172.31.20.10",
+    "xff": "198.51.100.7, 107.22.62.237",
+    "expect": "198.51.100.7"
+  },
+  {
+    "name": "::ffff: mapped client entry is keyed as its IPv4 address",
+    "appliesTo": [
+      "fork"
+    ],
+    "nodeEnv": "production",
+    "trustedProxies": [
+      "107.22.62.237"
+    ],
+    "peer": "172.31.20.10",
+    "xff": "::ffff:198.51.100.7, 107.22.62.237",
+    "expect": "198.51.100.7"
+  },
+  {
+    "name": "Stage B (the proxy retired, empty list): direct still resolves the real client",
+    "appliesTo": [
+      "platform",
+      "fork"
+    ],
+    "nodeEnv": "production",
+    "trustedProxies": [],
+    "peer": "172.31.20.10",
+    "xff": "198.51.100.7",
+    "expect": "198.51.100.7"
+  },
+  {
+    "name": "Stage B: the old proxy hop is no longer trusted",
+    "appliesTo": [
+      "platform",
+      "fork"
+    ],
+    "nodeEnv": "production",
+    "trustedProxies": [],
+    "peer": "172.31.20.10",
+    "xff": "198.51.100.7, 107.22.62.237",
+    "expect": "107.22.62.237"
+  },
+  {
+    "name": "Stage B: a forged prefix is never reached",
+    "appliesTo": [
+      "platform",
+      "fork"
+    ],
+    "nodeEnv": "production",
+    "trustedProxies": [],
+    "peer": "172.31.20.10",
+    "xff": "9.9.9.9, 203.0.113.99",
+    "expect": "203.0.113.99"
+  },
+  {
+    "name": "non-production (development): X-Forwarded-For is ignored, the socket peer is the client",
+    "appliesTo": [
+      "platform",
+      "fork"
+    ],
+    "nodeEnv": "development",
+    "trustedProxies": [
+      "107.22.62.237"
+    ],
+    "peer": "172.31.20.10",
+    "xff": "9.9.9.9, 198.51.100.7, 107.22.62.237",
+    "expect": "172.31.20.10"
+  },
+  {
+    "name": "non-production (test): X-Forwarded-For is ignored",
+    "appliesTo": [
+      "platform",
+      "fork"
+    ],
+    "nodeEnv": "test",
+    "trustedProxies": [
+      "107.22.62.237"
+    ],
+    "peer": "172.31.20.10",
+    "xff": "198.51.100.7, 107.22.62.237",
+    "expect": "172.31.20.10"
+  },
+  {
+    "name": "two X-Forwarded-For header lines are refused, never joined",
+    "appliesTo": [
+      "fork"
+    ],
+    "nodeEnv": "production",
+    "trustedProxies": [
+      "107.22.62.237"
+    ],
+    "peer": "172.31.20.10",
+    "xff": [
+      "9.9.9.9",
+      "198.51.100.7, 107.22.62.237"
+    ],
+    "expectRefused": true
+  },
+  {
+    "name": "two X-Forwarded-For header lines are refused even when each looks honest",
+    "appliesTo": [
+      "fork"
+    ],
+    "nodeEnv": "production",
+    "trustedProxies": [
+      "107.22.62.237"
+    ],
+    "peer": "172.31.20.10",
+    "xff": [
+      "198.51.100.7",
+      "107.22.62.237"
+    ],
+    "expectRefused": true
+  }
+]
