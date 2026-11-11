@@ -55,6 +55,9 @@ class ProbeController {
   }
 }
 
+/** A trust that never fetches: `unknown`, so the guard keys as before #810 (X-Real-IP). */
+const unknownTrust = () => new CollabClientTrust({ fetchTrust: null, limitLog: new SocketLimitLog({ warn: () => undefined }) });
+
 async function boot(
   storageOverride?: Partial<ThrottlerStorage>,
   extraProviders: Provider[] = [],
@@ -74,7 +77,8 @@ async function boot(
     providers: [
       Reflector,
       { provide: APP_GUARD, useClass: PublicSurfaceThrottlerGuard },
-      ...extraProviders,
+      // the guard requires the collab bounds' trust (#810); unknown unless a block provides its own
+      ...(extraProviders.length ? extraProviders : [{ provide: CollabClientTrust, useValue: unknownTrust() }]),
     ],
   });
   if (storageOverride) {

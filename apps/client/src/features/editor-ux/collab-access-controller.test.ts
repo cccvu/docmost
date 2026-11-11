@@ -44,6 +44,7 @@ function setup(
   options: {
     refetch?: () => Promise<RefetchResult>;
     random?: () => number;
+    network?: EventTarget;
   } = {},
 ) {
   const socket = new HocuspocusProviderWebsocket({
@@ -66,6 +67,7 @@ function setup(
     onState: () => {},
     markDisconnected,
     random: options.random ?? (() => 1),
+    network: options.network ?? null,
   });
   const remote = new HocuspocusProvider({
     websocketProvider: socket,
@@ -318,6 +320,59 @@ describe("try later (#810, F2, T2)", () => {
     expect(sockets()).toHaveLength(2);
     await advance(COLLAB_TRY_LATER_BASE_MS);
     expect(sockets()).toHaveLength(2); // the timer saw shouldConnect and stood down
+  });
+});
+
+describe("the network coming back skips the provider's backoff (#810 review: no 30 s wait after a drop)", () => {
+  const online = (network: EventTarget) =>
+    network.dispatchEvent(new Event("online"));
+
+  it("a socket the provider is retrying is dialled once at once on `online`, not after its grown backoff", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.9999);
+    ScriptedSocket.onConstruct = (s) =>
+      setTimeout(() => s.failBeforeOpen(), 10);
+    const network = new EventTarget();
+    setup({ network });
+    await advance(20_000); // offline: every try fails, the backoff grows toward 30 s
+    const before = sockets().length;
+    await advance(1_000);
+    expect(sockets()).toHaveLength(before); // waiting out a long backoff
+    online(network);
+    expect(sockets()).toHaveLength(before + 1); // dialled at once
+    online(network);
+    expect(sockets()).toHaveLength(before + 1); // a dial in flight (connecting) is left alone
+  });
+
+  it("never dials a socket the controller closed (try later keeps its pacing) or a connected one", async () => {
+    const network = new EventTarget();
+    setup({ network, random: () => 1 });
+    const first = await openLatest();
+    first.receive(serverFrames.authenticated(DOC));
+    await flush();
+    online(network);
+    expect(sockets()).toHaveLength(1); // connected: nothing to do
+    first.receive(
+      serverFrames.permissionDenied(DOC, "ccc:collab-auth-rate-limited"),
+    );
+    first.serverClose(4401);
+    await flush();
+    online(network);
+    expect(sockets()).toHaveLength(1); // shouldConnect false: the try-later timer owns the redial
+    await advance(COLLAB_TRY_LATER_BASE_MS);
+    expect(sockets()).toHaveLength(2);
+  });
+
+  it("a destroyed controller dials nothing on `online`", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.9999);
+    ScriptedSocket.onConstruct = (s) =>
+      setTimeout(() => s.failBeforeOpen(), 10);
+    const network = new EventTarget();
+    const { access } = setup({ network });
+    await advance(5_000);
+    access.destroy();
+    const before = sockets().length;
+    online(network);
+    expect(sockets()).toHaveLength(before);
   });
 });
 

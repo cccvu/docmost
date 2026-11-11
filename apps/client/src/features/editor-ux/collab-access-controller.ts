@@ -30,6 +30,11 @@ import {
  * retry and the socket is still closed by us (`shouldConnect` false). A socket something else already reopened (the
  * tab becoming visible again) is retrying on its own, with the provider's backoff, and `connect()` would restart that
  * backoff at zero.
+ *
+ * The one exception is the browser's `online` event: the network just came back, so a socket the provider is still
+ * retrying (`shouldConnect` true, disconnected) is dialled once at once instead of waiting out a backoff that may
+ * have grown to 30 s while offline. It never touches a socket this controller closed (a refusal, lost, try later:
+ * their pacing stands) or one the tab closed while idle, and it fires once per network change, not per close.
  */
 
 /** The slice of `HocuspocusProviderWebsocket` the controller drives. */
@@ -59,6 +64,14 @@ export interface CollabAccessControllerOptions {
   /** For tests: the jitter source (default Math.random) and the clock (default Date.now). */
   random?: () => number;
   now?: () => number;
+  /** Where the browser's `online` event fires (default `window`; none outside a browser). */
+  network?: CollabNetworkEvents | null;
+}
+
+/** The slice of `window` the controller listens to. */
+export interface CollabNetworkEvents {
+  addEventListener(type: "online", fn: () => void): void;
+  removeEventListener(type: "online", fn: () => void): void;
 }
 
 export interface CollabAccessController {
@@ -78,6 +91,12 @@ export function createCollabAccessController(
   const { socket } = options;
   const random = options.random ?? Math.random;
   const now = options.now ?? Date.now;
+  const network =
+    options.network !== undefined
+      ? options.network
+      : typeof window !== "undefined"
+        ? window
+        : null;
   let state: CollabAccessState = initialCollabAccess;
   let provider: CollabControllerProvider | null = null;
   let destroyed = false;
@@ -155,6 +174,16 @@ export function createCollabAccessController(
   const onUnsyncedChanges = ({ number }: { number?: number } = {}) => {
     if (number === 0) handle({ kind: "sync-acked" });
   };
+  // The network is back: skip the provider's remaining backoff, only for a socket the provider itself is retrying.
+  const onOnline = () => {
+    if (
+      isCurrent() &&
+      socket.shouldConnect &&
+      socket.status === WebSocketStatus.Disconnected
+    ) {
+      socket.connect();
+    }
+  };
 
   return {
     get state() {
@@ -168,12 +197,14 @@ export function createCollabAccessController(
       next.on("authenticated", onAuthenticated);
       next.on("close", onClose);
       next.on("unsyncedChanges", onUnsyncedChanges);
+      network?.addEventListener("online", onOnline);
     },
     handle,
     destroy() {
       destroyed = true;
       clearTimeout(retryTimer);
       retryTimer = undefined;
+      network?.removeEventListener("online", onOnline);
       if (provider) {
         provider.off("authenticationFailed", onAuthenticationFailed);
         provider.off("authenticated", onAuthenticated);

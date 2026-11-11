@@ -1,4 +1,4 @@
-import { ExecutionContext, Inject, Injectable, Logger, Optional } from '@nestjs/common';
+import { ExecutionContext, Inject, Injectable, Logger } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
 import {
   InjectThrottlerStorage,
@@ -85,8 +85,9 @@ export class PublicSurfaceThrottlerGuard extends ThrottlerGuard {
     // full dependency array here makes resolution unambiguous.
     @InjectThrottlerStorage() storage: ThrottlerStorage,
     @Inject(Reflector) reflector: Reflector,
-    // #810: the collab bounds' client trust (exported by CollaborationModule); absent in a graph without it.
-    @Optional() @Inject(CollabClientTrust) private readonly clientTrust?: CollabClientTrust,
+    // #810: the collab bounds' client trust (exported by CollaborationModule). Required: a graph without it fails to
+    // boot instead of silently keying on the forgeable X-Real-IP (socket-bounds.module.spec.ts).
+    @Inject(CollabClientTrust) private readonly clientTrust: CollabClientTrust,
   ) {
     // Read at construction (once, at boot for the APP_GUARD singleton) so ops can tune without a code
     // change and tests can pin a small limit before the app boots.
@@ -120,7 +121,7 @@ export class PublicSurfaceThrottlerGuard extends ThrottlerGuard {
    * key. Until then, today's key: X-Real-IP, else `req.ip`.
    */
   protected async getTracker(req: Record<string, any>): Promise<string> {
-    const client = this.clientTrust?.keyFor(req?.raw ?? req);
+    const client = this.clientTrust.keyFor(req?.raw ?? req);
     if (client) return client.status === 'keyed' ? client.key : UNKEYABLE_TRACKER;
     const raw = req?.headers?.['x-real-ip'];
     const header = Array.isArray(raw) ? raw[0] : raw;
