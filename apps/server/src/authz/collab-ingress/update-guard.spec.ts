@@ -1257,3 +1257,72 @@ describe('#810 (A5): every Hocuspocus MessageType is classified, from the librar
     expect(s.deliver(s.conn('writer'), frame)).toBe(EXPECTED[name]);
   });
 });
+
+describe('#810 (C2): a 3.4.4 tab\'s queued "remove every peer" awareness frame, replayed after the 4.7.1 deploy', () => {
+  // A 3.4.4 provider's onClose removed every peer's awareness state and queued that frame while its socket was closed;
+  // 4.7.1 providers never send one. Its removals name ids the freshly loaded document's awareness has never held, so
+  // they count against the (user, document) new-ids budget: they must stay counted (y-protocols writes `meta` for an
+  // unknown id removed at clock >= 1 and never prunes it), and past the budget the outcome must be recoverable.
+  // y-protocols as Hocuspocus 4.7.1 resolves it (the server does not declare it), so `meta` is what Hocuspocus keeps.
+  interface AwarenessLike {
+    meta: Map<number, { clock: number }>;
+    destroy(): void;
+  }
+  const yAwareness = (): {
+    Awareness: new (doc: Y.Doc) => AwarenessLike;
+    applyAwarenessUpdate: (a: AwarenessLike, update: Uint8Array, origin: unknown) => void;
+  } =>
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    require(require.resolve('y-protocols/awareness', { paths: [require('node:path').dirname(require.resolve('@hocuspocus/server'))] }));
+  /** The awareness update an Awareness frame carries (what Hocuspocus hands applyAwarenessUpdate). */
+  const updateOf = (frame: Uint8Array): Uint8Array => {
+    const d = decoding.createDecoder(frame);
+    decoding.readVarString(d);
+    decoding.readVarUint(d);
+    return decoding.readVarUint8Array(d);
+  };
+  const decoding = jest.requireActual<typeof import('lib0/decoding')>('lib0/decoding');
+  const removals = (from: number, n: number, clock = 2) => Array.from({ length: n }, (_, i) => ({ clientID: from + i, clock, state: null }));
+
+  const opened: AwarenessLike[] = [];
+  afterEach(() => opened.splice(0).forEach((a) => a.destroy())); // its renewal interval would keep jest running
+
+  /** The guard first; when it passes, the frame applied to a real y-protocols Awareness, as Hocuspocus does. */
+  const room = () => {
+    const s = setup({ seed: SEED, now: () => 1_000_000 });
+    const { Awareness, applyAwarenessUpdate } = yAwareness();
+    const awareness = new Awareness(s.live);
+    opened.push(awareness);
+    (s.live as unknown as { awareness: AwarenessLike }).awareness = awareness;
+    const send = (c: Conn, entries: Array<{ clientID: number; clock?: number; state: unknown }>) => {
+      const frame = awarenessFrame(entries);
+      const outcome = s.deliver(c, frame);
+      if (outcome === 'applied') applyAwarenessUpdate(awareness, updateOf(frame), c);
+      return outcome;
+    };
+    return { s, awareness, send };
+  };
+
+  it(`removals of ${AWARENESS_NEW_IDS_BURST + 1} unknown ids (clock >= 1): 1013 (try later), never a refusal; meta grows by at most ${AWARENESS_NEW_IDS_BURST}`, () => {
+    const { s, awareness, send } = room();
+    const before = awareness.meta.size;
+    const stale = s.conn('stale-tab');
+    expect(send(stale, removals(9_000, AWARENESS_NEW_IDS_BURST + 1))).toBe(TRY_LATER);
+    expect(awareness.meta.size).toBe(before); // refused whole: nothing applied
+    // the tab reconnects (a new connection, the same user and document), and the budget it has left is what passes
+    expect(send(s.conn('stale-tab'), removals(9_000, AWARENESS_NEW_IDS_BURST))).toBe('applied');
+    expect(awareness.meta.size - before).toBe(AWARENESS_NEW_IDS_BURST); // y-protocols kept a meta entry for each
+    expect(send(s.conn('stale-tab'), removals(9_000 + AWARENESS_NEW_IDS_BURST, 1))).toBe(TRY_LATER);
+    expect(awareness.meta.size - before).toBe(AWARENESS_NEW_IDS_BURST);
+    expect(s.limitLogs.every((l) => l.includes('"limit":"user_awareness_ids"'))).toBe(true);
+    expect(s.logs.filter((l) => l.includes('COLLAB_UPDATE_REFUSED'))).toEqual([]);
+  });
+
+  it('once those peers have re-announced (their ids are in meta), the same removal frame applies, uncounted', () => {
+    const { s, awareness, send } = room();
+    const ids = removals(9_000, AWARENESS_NEW_IDS_BURST + 1);
+    for (const { clientID } of ids) expect(send(s.conn(`peer-${clientID}`), [{ clientID, clock: 1, state: { user: { name: 'P' } } }])).toBe('applied');
+    expect(send(s.conn('stale-tab'), ids)).toBe('applied');
+    expect(s.limitLogs).toEqual([]);
+  });
+});

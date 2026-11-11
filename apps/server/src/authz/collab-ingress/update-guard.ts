@@ -79,8 +79,8 @@ export const AWARENESS_BINDS_PER_USER = 256;
 /**
  * #790 budgets per (user, document), kept across that user's connections and reconnects (a per-connection budget
  * refilled on every reconnect, so only the 1/s auth rate bounded it). Exhausting one closes the SOCKET with 1013 (Try
- * Again Later), which the editor treats as an ordinary close and retries with the provider's backoff: never a 4422
- * refusal, which detaches the editor for good.
+ * Again Later), which the editor waits out with its try-later backoff (5 s doubling to 60 s, jittered) before it
+ * reconnects: never a 4422 refusal, which detaches the editor for good.
  *
  * Sync: SyncStep1 (Sync or SyncReply) and a read-only connection's Step2, each of which makes 4.7.1 encode or snapshot
  * the whole document. An honest provider sends one Step1 per open (HocuspocusProvider.onOpen; Docmost sets no
@@ -109,7 +109,7 @@ export const AWARENESS_NEW_IDS_BURST = 2 * COLLAB_CONNECTIONS_PER_USER;
 export const AWARENESS_NEW_IDS_REFILL_MS = 4_000;
 /** (user, document) budgets kept in this process; past it the least recently used is dropped (a fresh budget). */
 export const USER_DOC_BUDGETS_MAX = 10_000;
-/** #790: the socket close for an exhausted budget: 1013 (RFC 6455 Try Again Later), retried by the provider. */
+/** #790: the socket close for an exhausted budget: 1013 (RFC 6455 Try Again Later), waited out by the editor's backoff. */
 export const COLLAB_TRY_LATER_CODE = 1013;
 export const TRY_LATER_REASON = 'ccc:collab-try-later';
 const LOGS_PER_MINUTE = 30;
