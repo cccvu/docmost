@@ -69,6 +69,8 @@ import {
 } from "@/features/editor-ux/collab-access-controller";
 import { reopensOnVisible } from "@/features/editor-ux/collab-reconnect";
 import { CollabRefusalNotice } from "@/features/editor-ux/collab-refusal-notice";
+import { collabRefusalCause } from "@/features/editor-ux/collab-refusal-cause";
+import { collabHeaderStatus } from "@/features/editor-ux/collab-header-status";
 import { clearLocalCollabCopy } from "@/features/editor-ux/collab-local-copy";
 import DrawioMenu from "./components/drawio/drawio-menu";
 import { useCollabToken } from "@/features/auth/queries/auth-query.tsx";
@@ -408,12 +410,17 @@ export default function PageEditor({
   useEffect(() => {
     const timeout = setTimeout(() => {
       if (yjsConnectionStatus === WebSocketStatus.Connecting || !isSynced) {
-        setYjsConnectionStatus(WebSocketStatus.Disconnected);
+        setYjsConnectionStatus(collabHeaderStatus(WebSocketStatus.Disconnected, collabAccess.refused)); // CCC (#781)
       }
     }, 7500);
 
     return () => clearTimeout(timeout);
-  }, [yjsConnectionStatus, isSynced]);
+  }, [yjsConnectionStatus, isSynced, collabAccess.refused]);
+  // CCC (#781): after a refusal nothing retries, so the header never says "Retrying..." (collab-header-status.ts)
+  useEffect(() => {
+    const next = collabHeaderStatus(yjsConnectionStatus, collabAccess.refused);
+    if (next !== yjsConnectionStatus) setYjsConnectionStatus(next);
+  }, [yjsConnectionStatus, collabAccess.refused]);
   useEffect(() => {
     if (!editor) return;
     editor.setEditable(
@@ -442,6 +449,9 @@ export default function PageEditor({
       {collabAccess.refused && (
         <CollabRefusalNotice
           tooBig={collabAccess.refusedTooBig} // CCC (#810): after a 1009 only Discard helps
+          cause={collabRefusalCause(collabAccess.refusedRule)}
+          passive={!(editable && currentPageEditMode === PageEditMode.Edit)}
+          showsLocalCopy={!showStatic}
           clearLocalCopy={() =>
             clearLocalCollabCopy(providersRef.current?.local)
           }
