@@ -43,6 +43,7 @@ import { answerCollabUpgrade, CollabPreAuthSlots, type PreAuthSocket, type PreAu
 import { CollabSocketDocuments } from './socket-documents';
 import { COLLAB_PING_INTERVAL_MS, keepCollabSocketAlive, type PingableSocket } from './socket-keepalive';
 import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
+import { answerCollabPings, type PongSocket } from './socket-pong';
 import { admitCollabUserConnection, CollabUserConnections, CollabUserConnectionsExtension } from './user-connections';
 import { AUTHZ_MODE, type AuthzMode } from '../mode/authz-mode';
 
@@ -108,10 +109,12 @@ export class CollabSocketBounds implements OnModuleInit, OnModuleDestroy {
 
   /**
    * The ws adapter's upgrade callback (seam §226): the new ws socket takes its slot, counting the TCP socket's bytes and
-   * against the client address `verifyUpgrade` keyed `request` by.
+   * against the client address `verifyUpgrade` keyed `request` by; and its pings get one pong in flight (#810,
+   * socket-pong.ts), before ws reads a frame from it.
    */
-  holdUpgraded(ws: PreAuthSocket, transport: PreAuthTransport, request: IncomingMessage): void {
+  holdUpgraded(ws: PreAuthSocket & PongSocket, transport: PreAuthTransport, request: IncomingMessage): void {
     this.preAuth.hold(ws, transport, request);
+    answerCollabPings(ws);
   }
 
   /** Nest, once the module is built: start fetching the platform's trust list (never blocks the boot). */

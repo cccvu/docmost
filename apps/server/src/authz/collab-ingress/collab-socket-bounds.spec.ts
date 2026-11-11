@@ -81,9 +81,15 @@ describe('#790 ws limits through the collab ws adapter', () => {
     return outcome;
   }
 
-  it('the adapter builds its server from COLLAB_WS_SERVER_OPTIONS (8 MiB, 1024 fragments, 65536 chunks)', () => {
+  it('the adapter builds its server from COLLAB_WS_SERVER_OPTIONS (8 MiB, 1024 fragments, 65536 chunks, #810: no autoPong, no deflate)', () => {
     expect(wss.options).toMatchObject(COLLAB_WS_SERVER_OPTIONS);
-    expect(COLLAB_WS_SERVER_OPTIONS).toEqual({ maxPayload: 8 * MiB, maxFragments: 1024, maxBufferedChunks: 65_536 });
+    expect(COLLAB_WS_SERVER_OPTIONS).toEqual({
+      maxPayload: 8 * MiB,
+      maxFragments: 1024,
+      maxBufferedChunks: 65_536,
+      autoPong: false,
+      perMessageDeflate: false,
+    });
     expect(COLLAB_MAX_PAYLOAD_BYTES).toBe(PAGE_MAX_YDOC_BYTES_CEILING);
   });
 

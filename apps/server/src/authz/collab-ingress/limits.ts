@@ -22,6 +22,13 @@ export const COLLAB_WS_SERVER_OPTIONS: ServerOptions & { maxFragments: number; m
   maxPayload: COLLAB_MAX_PAYLOAD_BYTES,
   maxFragments: 1024, // a browser sends each message as one frame
   maxBufferedChunks: 65_536, // one maxPayload message in 128-byte TCP reads
+  // #810: ws's own pong answers every ping, and a client that pings without reading queues a pong per 6-byte ping
+  // (about 210 B of heap each, invisible to every bound). The bounds answer pings themselves, one pong in flight
+  // (socket-pong.ts).
+  autoPong: false,
+  // #810: ws's default, pinned: deflate would queue frames in ws's sender (`_bufferedBytes`) behind an async zlib stage
+  // with per-socket zlib memory, which the byte accounting (socket-bytes.ts) does not model.
+  perMessageDeflate: false,
 };
 
 /**
