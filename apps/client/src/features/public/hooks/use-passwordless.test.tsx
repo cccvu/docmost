@@ -26,7 +26,7 @@ vi.mock("@mantine/notifications", () => ({ notifications: { show: vi.fn() } }));
 vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (s: string) => s }) }));
 
 import { logout, openDocmostSession } from "@/features/auth/services/auth-service";
-import { verifyPasswordless } from "@/features/public/services/public-service.ts";
+import { requestPasswordless, verifyPasswordless } from "@/features/public/services/public-service.ts";
 import { usePasswordless } from "@/features/public/hooks/use-passwordless.ts";
 import { notifications } from "@mantine/notifications";
 
@@ -205,5 +205,50 @@ describe("usePasswordless().completeSignIn — first self-service sign-in notice
       await expect(result.current.completeSignIn({ token: "raw-link-token" })).rejects.toThrow();
     });
     expect(notifications.show).not.toHaveBeenCalled();
+  });
+});
+
+// #815 — a throttled request is not an outage. The 429 says so and names the wait the response gives (Retry-After);
+// anything else keeps the "couldn't send" text. Either way requestEmail resolves false (it never claims a send).
+describe("usePasswordless().requestEmail — a 429 says to wait (#815)", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const http = (status: number, headers: Record<string, string> = {}) =>
+    Object.assign(new Error(`HTTP ${status}`), { isAxiosError: true, response: { status, headers, data: {} } });
+
+  it("429 without Retry-After → the honest 'wait a few minutes' text, and false", async () => {
+    (requestPasswordless as any).mockRejectedValueOnce(http(429));
+    const { result } = renderHook(() => usePasswordless());
+    let sent: boolean | undefined;
+    await act(async () => {
+      sent = await result.current.requestEmail("a@b.edu");
+    });
+    expect(sent).toBe(false);
+    expect((notifications.show as any).mock.calls[0][0].message).toBe(
+      "Too many requests. Wait a few minutes, then try again.",
+    );
+  });
+
+  it("429 with Retry-After → names that wait, and hands it to the page (onRetryAfter)", async () => {
+    (requestPasswordless as any).mockRejectedValueOnce(http(429, { "retry-after": "60" }));
+    const { result } = renderHook(() => usePasswordless());
+    const onRetryAfter = vi.fn();
+    await act(async () => {
+      await result.current.requestEmail("a@b.edu", { onRetryAfter });
+    });
+    expect(onRetryAfter).toHaveBeenCalledWith(60);
+    // This file's `t` stub returns the key, so the seconds-variant key is what proves Retry-After was read.
+    expect((notifications.show as any).mock.calls[0][0].message).toBe(
+      "Too many requests. Wait {{seconds}} seconds, then try again.",
+    );
+  });
+
+  it("a non-429 failure keeps the outage text (positive control)", async () => {
+    (requestPasswordless as any).mockRejectedValueOnce(http(503));
+    const { result } = renderHook(() => usePasswordless());
+    await act(async () => {
+      await result.current.requestEmail("a@b.edu");
+    });
+    expect((notifications.show as any).mock.calls[0][0].message).toMatch(/couldn't send a sign-in email/);
   });
 });

@@ -11,6 +11,8 @@ import {
   verifyPasswordless,
 } from "@/features/public/services/public-service.ts";
 import APP_ROUTE, { getPostLoginRedirect } from "@/lib/app-route.ts";
+import { isRateLimited, tooManyRequestsMessage } from "@/features/public/otp-code.ts";
+import { retryAfterMs } from "@/features/request-errors/request-error.ts";
 
 /**
  * Passwordless sign-in orchestration (magic link + OTP). Reuses the SAME two-step the password login
@@ -25,15 +27,25 @@ export function usePasswordless() {
   const [isVerifying, setIsVerifying] = useState(false);
 
   // Returns true once the request is accepted (the response is always generic — no account disclosure).
-  async function requestEmail(email: string): Promise<boolean> {
+  // `onRetryAfter` hears a 429's Retry-After in seconds, so the page can hold "Resend email" that long (#815).
+  async function requestEmail(
+    email: string,
+    opts?: { onRetryAfter?: (seconds: number) => void },
+  ): Promise<boolean> {
     setIsRequesting(true);
     try {
       await requestPasswordless({ email });
       return true;
-    } catch {
+    } catch (err) {
+      // #815: a throttle is not an outage. Say so, and say how long (Retry-After when the response carries one);
+      // "try again in a moment" would send the person straight back into the same limit.
+      const waitMs = isRateLimited(err) ? retryAfterMs(err) : null;
+      if (waitMs !== null) opts?.onRetryAfter?.(Math.ceil(waitMs / 1000));
       notifications.show({
         color: "red",
-        message: t("We couldn't send a sign-in email right now. Please try again in a moment."),
+        message: isRateLimited(err)
+          ? tooManyRequestsMessage(err, t)
+          : t("We couldn't send a sign-in email right now. Please try again in a moment."),
       });
       return false;
     } finally {
