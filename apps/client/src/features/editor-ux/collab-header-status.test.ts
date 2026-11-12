@@ -227,6 +227,27 @@ describe("the header after a refusal, through the real 4.7.1 provider", () => {
     expect(h.retrying).toBe(false);
   });
 
+  // #842: an `unresolved` close is retried up to 6 times. While it retries, "Retrying..." is true; once the budget is
+  // spent it is a refusal, and the header goes quiet like any other.
+  it("unresolved: once its retries run out the header reads quiet and never says Retrying again", async () => {
+    const { h, access } = pageHeader("full");
+    let s = await connect(true);
+    for (let i = 0; i < 6; i += 1) {
+      s.receive(serverFrames.close(DOC, "ccc:collab-update-unresolved"));
+      await vi.advanceTimersByTimeAsync(8_000); // the longest wait (random 1)
+      expect(access.state.refused).toBe(false);
+      s = await connect(false);
+    }
+    expect(ScriptedSocket.instances).toHaveLength(7);
+    s.receive(serverFrames.close(DOC, "ccc:collab-update-unresolved"));
+    await flush();
+    expect(access.state.refused).toBe(true);
+    await vi.advanceTimersByTimeAsync(13_000);
+    expect(h.retrying).toBe(false);
+    expect(h.status).toBe(COLLAB_HEADER_QUIET);
+    expect(ScriptedSocket.instances).toHaveLength(7); // nothing retries, as the header now says
+  });
+
   // Control: the fix changes nothing before a refusal. A connection that never syncs still reads disconnected.
   it("without a refusal, the 7.5 s check still marks an unsynced editor disconnected (and Retrying)", async () => {
     const { h, access } = pageHeader("full");
