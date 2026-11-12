@@ -18,10 +18,16 @@
  */
 import * as Y from 'yjs';
 
-/** The first newly integrated item with a neighbour of another parent or key, or null. */
-export function parentConsistencyViolation(tr: Y.Transaction): { client: number; clock: number } | null {
+/**
+ * The first newly integrated item with a neighbour of another parent or key, or null. `clients`: the ids whose structs
+ * the transaction can have added (the guard passes the frame's and the pending ones, so a frame costs O(its clients),
+ * never O(every id the page holds)); every id in the store by default.
+ */
+export function parentConsistencyViolation(tr: Y.Transaction, clients: Iterable<number> = tr.doc.store.clients.keys()): { client: number; clock: number } | null {
   const store = tr.doc.store;
-  for (const [client, structs] of store.clients) {
+  for (const client of clients) {
+    const structs = store.clients.get(client);
+    if (!structs) continue;
     const before = tr.beforeState.get(client) ?? 0;
     if (Y.getState(store, client) <= before) continue;
     for (let i = Y.findIndexSS(structs, before); i < structs.length; i++) {

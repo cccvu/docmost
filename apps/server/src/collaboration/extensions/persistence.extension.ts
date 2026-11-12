@@ -68,9 +68,19 @@ import { yieldToEventLoop } from '../../authz/page-write/yield-to-event-loop';
 // unload, and no store for a document a compaction superseded. The policy lives in authz/page-write/compaction.
 import {
   compactOnUnload,
-  loadStoredYdoc,
   skipStoreOfSuperseded,
 } from '../../authz/page-write/compaction';
+// CCC #840: serve and store only reload-stable states (an unstable store carries a verified heal image, the load heals
+// from it), hand the guard's replica log the exact bytes each load applied, and install the heal table at boot.
+import {
+  afterOrderStore,
+  checkStoreOrder,
+  loadStableYdoc,
+  noteLoadedBytes,
+  persistOrderState,
+  type OrderStoreOutcome,
+} from '../../authz/page-write/heal-image';
+import { installHealImageTableAtBoot } from '../../authz/page-write/heal-image.installer';
 
 @Injectable()
 export class PersistenceExtension implements Extension {
@@ -86,6 +96,12 @@ export class PersistenceExtension implements Extension {
     private readonly collabHistory: CollabHistoryService,
     private readonly transclusionService: TransclusionService,
   ) {}
+
+  // CCC #840 (UPSTREAM_MODIFICATIONS.md #122): the heal-image table, in every process that runs this extension (the app
+  // and collab-main) and every mode; a boot that cannot install it fails.
+  async onApplicationBootstrap() {
+    await installHealImageTableAtBoot(this.db);
+  }
 
   async onLoadDocument(data: onLoadDocumentPayload) {
     const { documentName, document } = data;
@@ -108,6 +124,7 @@ export class PersistenceExtension implements Extension {
 
     if (!page) {
       this.logger.warn('page not found');
+      noteLoadedBytes(document, Y.encodeStateAsUpdate(document)); // CCC #840
       return;
     }
 
@@ -121,8 +138,9 @@ export class PersistenceExtension implements Extension {
 
       // CCC #827 (UPSTREAM_MODIFICATIONS.md #122): the apply, bounded (a walk-step budget and a deadline). A trip throws
       // the compacting refusal (Hocuspocus then destroys this document) and compacts the page from its row. Also
-      // records the bytes as covered (#731).
-      loadStoredYdoc(document, pageId, dbState, this.db);
+      // records the bytes as covered (#731). #840: only a reload-stable state is served (a heal image adopted, or
+      // try-later); the exact bytes applied go to the guard's replica log.
+      await loadStableYdoc(document, pageId, dbState, this.db);
       return;
     }
 
@@ -136,11 +154,14 @@ export class PersistenceExtension implements Extension {
         tiptapExtensions,
       );
 
-      Y.applyUpdate(document, Y.encodeStateAsUpdate(ydoc));
+      const update = Y.encodeStateAsUpdate(ydoc);
+      Y.applyUpdate(document, update);
+      noteLoadedBytes(document, update); // CCC #840
       return;
     }
 
     this.logger.debug(`creating fresh ydoc: ${pageId}`);
+    noteLoadedBytes(document, Y.encodeStateAsUpdate(document)); // CCC #840
   }
 
   async onStoreDocument(data: onStoreDocumentPayload) {
@@ -165,6 +186,7 @@ export class PersistenceExtension implements Extension {
     // #731: the document generation this store's serialization covers, and what the store did with it.
     let coveredGeneration: number | undefined;
     let stored: 'written' | 'unchanged' | undefined;
+    let orderStored: OrderStoreOutcome | undefined; // CCC #840
 
     let page: Page = null;
     const editingUserIds = this.consumeContributors(documentName);
@@ -204,6 +226,8 @@ export class PersistenceExtension implements Extension {
         // Serialize AFTER the reconcile, under the lock (see #390 TOCTOU note above). #731: the generation, `fromYdoc`
         // and the encode are ONE synchronous run (an edit in a later yield bumps the generation: the next store runs).
         const snapshot = snapshotForStore(document);
+        // CCC #840: in the same synchronous run, whether exactly these bytes reload into live's order.
+        const order = checkStoreOrder(document, snapshot);
         coveredGeneration = snapshot.generation;
         tiptapJson = snapshot.json;
         ydocState = snapshot.state;
@@ -229,7 +253,11 @@ export class PersistenceExtension implements Extension {
           return;
         }
 
-        if (isDeepStrictEqual(tiptapJson, page.content)) {
+        // CCC #840: stable drops any heal row; unstable writes the verified heal image beside the raw bytes (also when the
+        // content is unchanged), in this transaction.
+        const unchanged = isDeepStrictEqual(tiptapJson, page.content);
+        orderStored = await persistOrderState(this.db, trx, pageId, snapshot, order, unchanged);
+        if (unchanged) {
           page = null;
           stored = 'unchanged';
           return;
@@ -269,7 +297,8 @@ export class PersistenceExtension implements Extension {
       // #731: committed — the next store may skip while the generation is unchanged (not after a not-found or a
       // refused blank clobber); a written row is bytes this document covers.
       markStoredAt(document, stored ? coveredGeneration : undefined);
-      if (stored === 'written') markRowCovered(document, ydocState);
+      if (stored === 'written' || orderStored?.ydocWritten) markRowCovered(document, ydocState);
+      afterOrderStore(document, pageId, orderStored); // CCC #840: compaction requested for an unstable store; never throws
     } catch (err) {
       // #390: do NOT re-throw (an unhandled rejection on the setTimeout debounce path could crash the
       // process). Record the failure so the settle (flushPageContent) reports {reason:'error'} → the platform

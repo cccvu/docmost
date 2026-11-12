@@ -29,6 +29,7 @@ import { tiptapExtensions } from '../../collaboration/collaboration.util';
 import { CollaborationHandler } from '../../collaboration/collaboration.handler';
 import { PersistenceExtension } from '../../collaboration/extensions/persistence.extension';
 import { stableHash } from './stable-hash';
+import { memoryHealStore } from './heal-image.testkit';
 
 const PAGE_ID = '99999999-9999-4999-8999-999999999999';
 const DOC = `page.${PAGE_ID}`;
@@ -83,7 +84,7 @@ function stack(initial: Json) {
   const queue = { add: jest.fn(async () => undefined) } as never;
   const persistence = new PersistenceExtension(
     { findById: db.findById, updatePage: db.updatePage } as never,
-    {} as never,
+    memoryHealStore(db.row) as never, // #840: the heal rows (none: every page here is order-stable)
     queue,
     queue,
     queue,
@@ -163,14 +164,16 @@ describe('#731 whole-page passes per content write (real Hocuspocus 4.7.1)', () 
     expect(s.storeHook).toHaveBeenCalledTimes(2); // the store after the transaction (direct-store.ts) + disconnect()
     expect(lockedReads(s.db)).toBe(1); // …of which ONE ran
     expect(s.db.updatePage).toHaveBeenCalledTimes(1);
-    expect(passes.counts).toEqual({ encode: 1, apply: 1, diff: 0, fromYdoc: 1, toYdoc: 0 });
+    // #840: + the load's order check (an encode of the loaded page and its reload) and the store's (a reload of the
+    // bytes it encodes): a reload-unstable page is never served or stored unhealed (heal-image.ts).
+    expect(passes.counts).toEqual({ encode: 2, apply: 3, diff: 0, fromYdoc: 1, toYdoc: 0 });
     // (before #731: encode 4, apply 3, diff 2, fromYdoc 2, toYdoc 1, two stores ran)
     expect(rowHas(s.db, 'B paragraph 1499')).toBe(true);
     expect(rowHas(s.db, 'A paragraph')).toBe(false);
     expect(s.hocuspocus.documents.has(DOC)).toBe(false); // unloaded as before
   });
 
-  it('RESIDENT CAS replace (settle, then write — twice): no apply, no diff, one store run per write', async () => {
+  it('RESIDENT CAS replace (settle, then write — twice): no apply but the store\'s order check, no diff, one store run per write', async () => {
     const s = stack(page('A'));
     const keeper = await s.hocuspocus.openDirectConnection(DOC, { user: USER }); // an open editor keeps the page resident
     const doc = s.hocuspocus.documents.get(DOC)!;
@@ -195,7 +198,8 @@ describe('#731 whole-page passes per content write (real Hocuspocus 4.7.1)', () 
       expect(s.db.updatePage).toHaveBeenCalledTimes(1);
       // fromYdoc: the settle's digest (reused by the pre-check and the CAS) + the one store's serialization.
       // The reconcile reads the bytes this document last loaded or wrote: a memo hit, no diff.
-      expect(passes.counts).toEqual({ encode: 1, apply: 0, diff: 0, fromYdoc: 2, toYdoc: 0 });
+      // #840: apply 1 is the store's order check (a reload of the bytes it encodes, heal-image.ts).
+      expect(passes.counts).toEqual({ encode: 1, apply: 1, diff: 0, fromYdoc: 2, toYdoc: 0 });
       // (before #731: encode 3, apply 1, diff 2, fromYdoc 3, toYdoc 1, two stores ran)
       // Each replace's structs sit under ONE new client id (insertAsOwnClient), never the document's own, whose struct
       // array would otherwise collect every replace and tombstone and make each later transaction slower (3–4×).

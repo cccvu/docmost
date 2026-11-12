@@ -118,7 +118,11 @@ export type CollabRule =
   // of a page still over a structure cap after compaction
   | 'frame-too-large'
   | 'apply-deadline'
-  | 'page-full';
+  | 'page-full'
+  // #840 (collab-reasons.ts): a new item beside a neighbour of another parent or key; a live keyed item that is not one
+  // standalone value (#847)
+  | 'parent-split'
+  | 'keyed-split';
 
 /** A refusal. `node`/`mark`/`key` are set only to names the schema declares: a log or a response never echoes input. */
 export interface Violation {

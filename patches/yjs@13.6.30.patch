@@ -1,5 +1,5 @@
 diff --git a/dist/yjs.cjs b/dist/yjs.cjs
-index d50f7262ce53030e935954a20ee7104fba9c8ea0..32cbc0de56da8126184200b9879276da99ceb094 100644
+index d50f7262ce53030e935954a20ee7104fba9c8ea0..4bd7649b02a96730224c332c9a069ce6aa347c03 100644
 --- a/dist/yjs.cjs
 +++ b/dist/yjs.cjs
 @@ -9729,6 +9729,20 @@ const redoItem = (transaction, item, redoitems, itemsToDelete, ignoreRemoteMapCh
@@ -23,8 +23,23 @@ index d50f7262ce53030e935954a20ee7104fba9c8ea0..32cbc0de56da8126184200b9879276da
    } else {
      right = null;
      if (item.right && !ignoreRemoteMapChanges) {
+@@ -9748,6 +9762,14 @@ const redoItem = (transaction, item, redoitems, itemsToDelete, ignoreRemoteMapCh
+     } else {
+       left = parentType._map.get(item.parentSub) || null;
+     }
++    // [ccc #840] yjs #757 (upstream fix d9aaff72, released in 13.6.31): when this redo
++    // recreated the parent, the key chain walked above is the old, deleted parent's.
++    // Linking the value there shows it to the undoing user only: its origin is in the
++    // old parent, so every other replica and every reload drop it. Start from the
++    // recreated parent's current value instead.
++    if (left !== null && /** @type {AbstractType<any>} */ (left.parent)._item !== parentItem) {
++      left = parentType._map.get(item.parentSub) || null;
++    }
+   }
+   const nextClock = getState(store, ownClientID);
+   const nextId = createID(ownClientID, nextClock);
 diff --git a/dist/yjs.mjs b/dist/yjs.mjs
-index 192cbd07886886b31a9ff797d806cddcf01b578a..7755dca7fa8441b0cafe22f1bcaab93d3d1c8809 100644
+index 192cbd07886886b31a9ff797d806cddcf01b578a..74836e4cd7c40972dd48a8a944287810a766ea55 100644
 --- a/dist/yjs.mjs
 +++ b/dist/yjs.mjs
 @@ -9692,6 +9692,20 @@ const redoItem = (transaction, item, redoitems, itemsToDelete, ignoreRemoteMapCh
@@ -48,8 +63,23 @@ index 192cbd07886886b31a9ff797d806cddcf01b578a..7755dca7fa8441b0cafe22f1bcaab93d
    } else {
      right = null;
      if (item.right && !ignoreRemoteMapChanges) {
+@@ -9711,6 +9725,14 @@ const redoItem = (transaction, item, redoitems, itemsToDelete, ignoreRemoteMapCh
+     } else {
+       left = parentType._map.get(item.parentSub) || null;
+     }
++    // [ccc #840] yjs #757 (upstream fix d9aaff72, released in 13.6.31): when this redo
++    // recreated the parent, the key chain walked above is the old, deleted parent's.
++    // Linking the value there shows it to the undoing user only: its origin is in the
++    // old parent, so every other replica and every reload drop it. Start from the
++    // recreated parent's current value instead.
++    if (left !== null && /** @type {AbstractType<any>} */ (left.parent)._item !== parentItem) {
++      left = parentType._map.get(item.parentSub) || null;
++    }
+   }
+   const nextClock = getState(store, ownClientID);
+   const nextId = createID(ownClientID, nextClock);
 diff --git a/src/structs/Item.js b/src/structs/Item.js
-index 2d2b1bb927be55e2ed64170ff1b48f97f0bf2ede..1413fa1a813847d69bcc813caf6ed1caaacf6095 100644
+index 2d2b1bb927be55e2ed64170ff1b48f97f0bf2ede..9b2b84692c3a1d52c0a7b033670b4b0da2378a48 100644
 --- a/src/structs/Item.js
 +++ b/src/structs/Item.js
 @@ -204,6 +204,20 @@ export const redoItem = (transaction, item, redoitems, itemsToDelete, ignoreRemo
@@ -73,3 +103,18 @@ index 2d2b1bb927be55e2ed64170ff1b48f97f0bf2ede..1413fa1a813847d69bcc813caf6ed1ca
    } else {
      right = null
      if (item.right && !ignoreRemoteMapChanges) {
+@@ -223,6 +237,14 @@ export const redoItem = (transaction, item, redoitems, itemsToDelete, ignoreRemo
+     } else {
+       left = parentType._map.get(item.parentSub) || null
+     }
++    // [ccc #840] yjs #757 (upstream fix d9aaff72, released in 13.6.31): when this redo
++    // recreated the parent, the key chain walked above is the old, deleted parent's.
++    // Linking the value there shows it to the undoing user only: its origin is in the
++    // old parent, so every other replica and every reload drop it. Start from the
++    // recreated parent's current value instead.
++    if (left !== null && /** @type {AbstractType<any>} */ (left.parent)._item !== parentItem) {
++      left = parentType._map.get(item.parentSub) || null
++    }
+   }
+   const nextClock = getState(store, ownClientID)
+   const nextId = createID(ownClientID, nextClock)

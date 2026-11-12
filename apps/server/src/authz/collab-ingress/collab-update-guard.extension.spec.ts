@@ -20,6 +20,8 @@ import {
 } from './collab-ingress.testkit';
 import * as encoding from 'lib0/encoding';
 import { CollabUpdateGuardExtension } from './collab-update-guard.extension';
+import { attachReplicaLog, replicaLogDistrust, replicaLogOf } from './exact-replica-registry';
+import { strictOrderDiff } from './order-parity';
 import { basePage, rawUpdate, twoClientsShape } from './conflict-scan.testkit';
 import { markCompacting } from '../page-write/compaction-registry';
 import { COLLAB_LOAD_TRY_LATER_REASON, COLLAB_PAGE_COMPACTING_REASON } from './collab-reasons';
@@ -96,6 +98,7 @@ async function server(opts: { guard?: 'real' | 'none' | 'refuse-unknown-mark'; m
     {
       async onLoadDocument({ document }: { document: Y.Doc }) {
         Y.applyUpdate(document, seedUpdate);
+        attachReplicaLog(document, seedUpdate); // #840: what the persistence load does
       },
     },
   );
@@ -678,5 +681,82 @@ describe('#827 joins and loads through a real Hocuspocus 4.7.1', () => {
       throw new Error('boom');
     });
     expect(ext.afterLoadDocument({ document: doc } as never)).toBeUndefined();
+  });
+});
+
+describe('#840 the exact shadow through a real Hocuspocus 4.7.1', () => {
+  /** A paragraph "abcdef" (one struct) and S1 on it: 'X' with origin 'f' and rightOrigin 'd' (live "abcXdef"). */
+  const abcdef = () => {
+    const doc = prosemirrorJSONToYDoc(serverSchema(), { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'abcdef' }] }] }, 'default');
+    const t = (doc.getXmlFragment('default').get(0) as Y.XmlElement).get(0) as Y.XmlText;
+    const o = (t as any)._start.id as Y.ID;
+    const s1 = rawUpdate([{ client: 2, clock: 0, structs: [{ origin: [o.client, o.clock + 5], right: [o.client, o.clock + 3], content: new Y.ContentString('X') }] }]);
+    return { seed: Y.encodeStateAsUpdate(doc), s1 };
+  };
+  const textIn = (doc: Y.Doc) => textOf(doc.getXmlFragment('default').get(0) as Y.XmlElement).toString();
+
+  it('a server-local write between a frame\'s accept and its apply: the log keeps live\'s order and the shadow is rebuilt in it', async () => {
+    const { seed, s1 } = abcdef();
+    const s = await server({ seed });
+    const attacker = await s.connect('attacker');
+    const peer = await s.connect('peer');
+    const live = s.live();
+    const check = s.guard.check.bind(s.guard);
+    let gap = true;
+    s.guard.check = (frame) => {
+      check(frame);
+      if (!gap) return;
+      gap = false;
+      // an API write landing in the microtask gap: after the hook, before Hocuspocus applies the frame
+      queueMicrotask(() => live.transact(() => textOf(live.getXmlFragment('default').get(0) as Y.XmlElement).insert(3, 'Q'), { source: 'local' }));
+    };
+    attacker.deliver(syncFrame(s1));
+    await settle();
+    expect(attacker.closeReasons()).toEqual([]);
+    expect(textIn(live)).toBe('abcQdefX'); // live applied the write first: accepted in one order, applied in the other
+    expect(replicaLogDistrust(live)).toBeNull();
+    expect(strictOrderDiff(replicaLogOf(live)!.rebuild({ gc: live.gc }), live)).toBeNull();
+    // the shadow (which held the frame when the write came) is rebuilt in live's order by the next frame
+    peer.deliver(syncFrame(new RemoteClient(live).edit(live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'p'))));
+    await settle();
+    expect(peer.closeReasons()).toEqual([]);
+    expect(strictOrderDiff(s.guard.shadowOf(live)!, live)).toBeNull();
+    expect(textIn(s.guard.shadowOf(live)!)).toBe('pabcQdefX');
+  });
+
+  it('a joiner\'s Step1 in the turn an unstable frame was accepted (not yet applied) waits 1013: the shadow is checked, not live', async () => {
+    const { seed, s1 } = abcdef();
+    const s = await server({ seed });
+    const attacker = await s.connect('attacker');
+    const reader = await s.connect('reader');
+    const live = s.live();
+    attacker.deliver(syncFrame(s1));
+    reader.deliver(step1Frame(new Y.Doc()));
+    await settle();
+    expect(attacker.closeReasons()).toEqual([]);
+    expect(reader.closed).toEqual({ code: COLLAB_TRY_LATER_CODE, reason: TRY_LATER_REASON });
+    expect(textIn(live)).toBe('abcXdef');
+    expect(s.logs.some((l) => l.startsWith('COLLAB_ORDER_DIVERGENCE ') && l.includes('"where":"join"') && l.includes('"suspects":["attacker"]'))).toBe(true);
+  });
+
+  it('honest traffic keeps the log trusted (4.7.1 opens no transaction inside another), and a stable joiner is answered', async () => {
+    const s = await server();
+    const editor = await s.connect('victim');
+    const peer = await s.connect('peer');
+    const live = s.live();
+    for (let i = 0; i < 5; i++) {
+      editor.deliver(syncFrame(new RemoteClient(live).edit(live, (f) => textOf(f.get(0) as Y.XmlElement).format(0, 3 + i, { bold: i % 2 ? null : {} }))));
+      peer.deliver(syncFrame(new RemoteClient(live).edit(live, (f) => textOf(f.get(1) as Y.XmlElement).insert(0, `${i} `))));
+      await settle();
+    }
+    const direct = await s.hp.openDirectConnection(DOC_NAME, { user: { id: 'api' } });
+    await direct.transact((doc) => textOf(doc.getXmlFragment('default').get(1) as Y.XmlElement).insert(0, 'api '));
+    await direct.disconnect();
+    const reader = await s.connect('reader');
+    reader.deliver(step1Frame(new Y.Doc()));
+    await settle();
+    expect([editor.closeReasons(), peer.closeReasons(), reader.closed]).toEqual([[], [], null]);
+    expect(replicaLogDistrust(live)).toBeNull();
+    expect(strictOrderDiff(replicaLogOf(live)!.rebuild({ gc: live.gc }), live)).toBeNull();
   });
 });

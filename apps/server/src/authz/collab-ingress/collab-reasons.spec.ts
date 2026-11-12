@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   COLLAB_827_RULES,
+  COLLAB_840_RULES,
   COLLAB_EPOCH_STALE_REASON_PREFIX,
   COLLAB_LOAD_TRY_LATER_REASON,
   COLLAB_PAGE_COMPACTING_REASON,
@@ -9,6 +10,7 @@ import {
   pageCompactingRefusal,
   parseEpochStaleReason,
 } from './collab-reasons';
+import type { CollabRule } from './content-rules';
 import { REFUSED_REASON_PREFIX, TRY_LATER_REASON, UNRESOLVED_REASON } from './update-guard';
 
 /**
@@ -49,6 +51,14 @@ describe('#827 collab reasons', () => {
   it('the new rules are fixed words a refusal reason can carry', () => {
     expect([...COLLAB_827_RULES]).toEqual(['frame-too-large', 'apply-deadline', 'page-full']);
     for (const r of COLLAB_827_RULES) expect(REFUSED_REASON_PREFIX + r).toMatch(/^ccc:collab-update-refused:[a-z-]+$/);
+  });
+
+  it('#840\'s rules are fixed words a refusal reason can carry, and rule names the guard can return', () => {
+    expect([...COLLAB_840_RULES]).toEqual(['parent-split', 'keyed-split']);
+    const rule: CollabRule[] = [...COLLAB_840_RULES]; // a compile-time check: both are CollabRule members
+    for (const r of rule) expect(REFUSED_REASON_PREFIX + r).toMatch(/^ccc:collab-update-refused:[a-z-]+$/);
+    const guard = readFileSync(join(__dirname, 'update-guard.ts'), 'utf8');
+    for (const r of COLLAB_840_RULES) expect(guard).toContain(`rule: '${r}'`);
   });
 
   it('every reason is an `export const NAME = \'…\';` line, the form the client parity test reads', () => {

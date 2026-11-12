@@ -51,9 +51,12 @@ export class ExactReplicaLog {
     this.append(update, structs);
   }
 
-  /** A fresh replica of live: the checkpoint, then every entry in order, each in its own transaction. */
-  rebuild(opts: { gc?: boolean; gcFilter?: (item: Y.Item) => boolean } = {}): Y.Doc {
-    const doc = new Y.Doc(opts);
+  /**
+   * A fresh replica of live: the checkpoint, then every entry in order, each in its own transaction. `into` (an empty
+   * document made with live's gc options) lets a caller meter the replay on a document it holds (the guard's rebuild).
+   */
+  rebuild(opts: { gc?: boolean; gcFilter?: (item: Y.Item) => boolean } = {}, into?: Y.Doc): Y.Doc {
+    const doc = into ?? new Y.Doc(opts);
     Y.applyUpdate(doc, this.checkpoint);
     for (let i = 0, start = 0; i < this.count; start = this.ends[i++]) Y.applyUpdate(doc, this.buf.subarray(start, this.ends[i]));
     return doc;

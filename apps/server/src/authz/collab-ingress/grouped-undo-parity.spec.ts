@@ -9,10 +9,11 @@ import type * as OrderParity from './order-parity';
  * #840 (ADR 0036): the honest grouped-undo corpus. 2–4 peers edit tiptap-shaped pages (paragraphs, headings, nested
  * bullet lists, marks) under Y.UndoManager, with y-tiptap's `captureTimeout` 500 on a simulated clock (typing groups
  * into one stack item, pauses split) and with 0. Frames reach the server replica (live) and the other peers late and
- * interleaved. Sessions also play the recreated-parent shape (yjs #823 with a co-editor). On the patched yjs, live
- * equals its reload strictly, every peer equals its own reload, and every peer converges with live. The same corpus on
- * the unpatched `redoItem` diverges. Both arms compile the installed dist (yjs-redo-patch.spec pins that every
- * consumer loads it); the unpatched arm is that file with patch B cut out, never written to disk.
+ * interleaved. Sessions also play the recreated-parent shape (yjs #823 with a co-editor, and yjs #757: one stack item
+ * restyles and deletes the block, so undo restores an attribute into a recreated block). On the patched yjs, live
+ * equals its reload strictly, every peer equals its own reload, and every peer converges with live. The same corpus
+ * without either hunk of patch B diverges. Every arm compiles the installed dist (yjs-redo-patch.spec pins that every
+ * consumer loads it); the other arms are that file with a hunk cut out, never written to disk.
  */
 
 const SESSIONS = 1500;
@@ -21,14 +22,18 @@ const OPS = 120;
 const CHECK_EVERY = 40;
 const MARKER = '[ccc #840]';
 const WORDS = ['lorem ', 'ipsum ', 'x', 'é', 'dolor sit '];
+const ALIGN = ['left', 'center', 'right'];
 const YJS_CJS = createRequire(join(__dirname, '../../../package.json')).resolve('yjs');
 
-/** The installed dist without patch B: the marker comment through the end of its `if` block (as yjs-redo-patch.spec). */
-function unpatched(src: string): string {
-  const at = src.indexOf(`    // ${MARKER}`);
-  const block = src.indexOf('    if (left !== null && right !== null) {\n', at);
+/** Patch B's hunks, by the text that follows the marker (as yjs-redo-patch.spec). */
+const HUNKS = { list: 'yjs #794/#823', keyed: 'yjs #757' } as const;
+
+/** The installed dist without one hunk of patch B: its marker comment through the end of its `if` block. */
+function cut(src: string, hunk: keyof typeof HUNKS): string {
+  const at = src.indexOf(`    // ${MARKER} ${HUNKS[hunk]}`);
+  const block = src.indexOf('\n    if (', at);
   const end = src.indexOf('\n    }\n', block);
-  if (at < 0 || block < at || end < block) throw new Error('patch B block not found in the installed yjs');
+  if (at < 0 || block < at || end < block) throw new Error(`patch B ${hunk} hunk not found in the installed yjs`);
   return src.slice(0, at) + src.slice(end + '\n    }\n'.length);
 }
 
@@ -90,6 +95,7 @@ type Tally = {
   stackItems: number;
   shapes: number;
   foreignShapes: number;
+  keyedShapes: number;
   first: string | null;
 };
 
@@ -189,7 +195,7 @@ function session({ Y, op, clock }: Arm, seed: number, captureTimeout: number, t:
       const c = pick(containers);
       if (c.length > (c === f ? 1 : 0)) c.delete(Math.floor(r() * c.length), 1);
     } else if (x < 0.72 && blocks.length) {
-      pick(blocks).setAttribute('textAlign', pick(['left', 'center', 'right']));
+      pick(blocks).setAttribute('textAlign', pick(ALIGN));
     } else if (x < 0.86) {
       t.undo++;
       p.undo.undo();
@@ -211,7 +217,9 @@ function session({ Y, op, clock }: Arm, seed: number, captureTimeout: number, t:
   /**
    * The recreated-parent shape (yjs #823 with a co-editor): A deletes part of a block's text and undoes it (a restored
    * copy), B types into the copy, A deletes the block and undoes it (a recreated parent), B types into the recreated
-   * block, then A undoes and redoes. B is another peer, or A itself (#823 as reported).
+   * block, then A undoes and redoes. B is another peer, or A itself (#823 as reported). In half the shapes the block
+   * has an alignment and A changes it in the same stack item as the delete (yjs #757): in one transaction (one editor
+   * step), or in two grouped by `captureTimeout`. B may restyle the recreated block.
    */
   const recreatedParent = () => {
     const a = pick(peers);
@@ -234,15 +242,30 @@ function session({ Y, op, clock }: Arm, seed: number, captureTimeout: number, t:
     receive(a);
     if (target._item!.deleted) return;
     const parent = target.parent as Y.XmlElement | Y.XmlFragment;
+    const keyed = r() < 0.5;
+    if (keyed) target.setAttribute('textAlign', pick(ALIGN));
     a.undo.stopCapturing();
-    parent.delete(parent.toArray().indexOf(target), 1);
+    const restyle = () => keyed && target.setAttribute('textAlign', pick(ALIGN));
+    const drop = () => parent.delete(parent.toArray().indexOf(target), 1);
+    if (captureTimeout && r() < 0.5) {
+      restyle();
+      drop();
+    } else {
+      a.doc.transact(() => {
+        restyle();
+        drop();
+      });
+    }
     a.undo.stopCapturing();
     a.undo.undo();
     ship(a);
     receive(b);
-    if (typeInto(blockOn(b, target._item!.redone))) {
+    const recreated = blockOn(b, target._item!.redone);
+    if (typeInto(recreated)) {
       t.shapes++;
       if (b !== a) t.foreignShapes++;
+      if (keyed) t.keyedShapes++;
+      if (keyed && r() < 0.3) recreated!.setAttribute('textAlign', pick(ALIGN));
     }
     if (r() < 0.7) {
       ship(b);
@@ -317,35 +340,42 @@ function session({ Y, op, clock }: Arm, seed: number, captureTimeout: number, t:
   t.first ??= first;
 }
 
-function corpus(arm: Arm, captureTimeout: number, base: number): Tally {
-  const t: Tally = { sessions: 0, liveUnstable: 0, peerUnstable: 0, unconverged: 0, peerSplits: 0, diverged: 0, checks: 0, undo: 0, redo: 0, grouped: 0, stackItems: 0, shapes: 0, foreignShapes: 0, first: null };
-  for (let s = 1; s <= SESSIONS; s++) session(arm, base + s * 7919, captureTimeout, t);
+function corpus(arm: Arm, captureTimeout: number, base: number, sessions = SESSIONS): Tally {
+  const t: Tally = { sessions: 0, liveUnstable: 0, peerUnstable: 0, unconverged: 0, peerSplits: 0, diverged: 0, checks: 0, undo: 0, redo: 0, grouped: 0, stackItems: 0, shapes: 0, foreignShapes: 0, keyedShapes: 0, first: null };
+  for (let s = 1; s <= sessions; s++) session(arm, base + s * 7919, captureTimeout, t);
   return t;
 }
 
 describe('#840 honest grouped-undo corpus', () => {
   const src = readFileSync(YJS_CJS, 'utf8');
   const patched = loadArm(src);
-  const upstream = loadArm(unpatched(src));
+  const noList = loadArm(cut(src, 'list'));
+  const noKeyed = loadArm(cut(src, 'keyed'));
 
-  it.each([500, 0])(`captureTimeout %i, ${SESSIONS} sessions × ${OPS} ops: live and every peer equal their reloads and converge; the unpatched redoItem diverges`, (captureTimeout) => {
+  it.each([500, 0])(`captureTimeout %i, ${SESSIONS} sessions × ${OPS} ops: live and every peer equal their reloads and converge; redoItem without either hunk diverges`, (captureTimeout) => {
     const base = captureTimeout ? 0 : 50_000_000;
     const ok = corpus(patched, captureTimeout, base);
-    const bad = corpus(upstream, captureTimeout, base);
-    console.log(`#840 grouped-undo corpus, captureTimeout ${captureTimeout}: ${JSON.stringify({ patched: ok, unpatched: { ...bad, first: bad.first?.slice(0, 200) } })}`);
+    const bad = corpus(noList, captureTimeout, base);
+    const badKeyed = corpus(noKeyed, captureTimeout, base, SESSIONS / 3);
+    const brief = (x: Tally) => ({ ...x, first: x.first?.slice(0, 200) });
+    console.log(`#840 grouped-undo corpus, captureTimeout ${captureTimeout}: ${JSON.stringify({ patched: ok, noList: brief(bad), noKeyed: brief(badKeyed) })}`);
     // Anti-vacuity: the corpus undid, redid, grouped typing into stack items (500; pauses still split them) or not (0),
     // and played the recreated-parent shape with a co-editor.
     expect(ok.undo).toBeGreaterThan(SESSIONS * 5);
     expect(ok.redo).toBeGreaterThan(SESSIONS * 5);
     expect(ok.foreignShapes).toBeGreaterThan(SESSIONS / 2);
+    expect(ok.keyedShapes).toBeGreaterThan(SESSIONS / 2);
     expect(ok.stackItems).toBeGreaterThan(SESSIONS * 40);
     if (captureTimeout) expect(ok.grouped).toBeGreaterThan(ok.stackItems / 10);
     else expect(ok.grouped).toBe(0);
     expect(ok.first).toBeNull();
     expect(ok).toMatchObject({ sessions: SESSIONS, diverged: 0, liveUnstable: 0, peerUnstable: 0, unconverged: 0 });
-    // The unpatched redoItem trips every detector on the same corpus.
+    // Without the list hunk the same corpus trips every detector; without the keyed hunk, the undoing peer keeps an
+    // attribute that live and the other peers never get.
     expect(bad.sessions).toBe(SESSIONS);
     expect(bad.diverged).toBeGreaterThan(SESSIONS / 100);
     for (const k of ['liveUnstable', 'peerUnstable', 'unconverged'] as const) expect({ [k]: bad[k] > 0 }).toEqual({ [k]: true });
+    expect(badKeyed.sessions).toBe(SESSIONS / 3);
+    expect(badKeyed.unconverged).toBeGreaterThan(SESSIONS / 300);
   });
 });

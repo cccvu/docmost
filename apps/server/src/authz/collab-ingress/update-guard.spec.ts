@@ -132,7 +132,7 @@ function setup(
       expect(err).toEqual({ code: COLLAB_REFUSAL_CODE, reason: expect.any(String) });
       return err.reason;
     }
-    if (apply) Y.applyUpdate(live, apply, c);
+    if (apply) Y.applyUpdate(live, apply, { source: 'connection', connection: c }); // #840: 4.7.1's origin for a client frame
     return 'applied';
   };
   const send = (c: Conn, update: Uint8Array, subtype: number = SYNC.Update, type: number = MSG.Sync) =>
@@ -1624,7 +1624,7 @@ describe('#816 the per-user collab CPU budget (a debt)', () => {
    */
   function cpuSetup(opts: { mode?: CollabGuardMode; shared?: boolean } = {}) {
     let t = 1_000_000;
-    const cpu = { now: 0, apply: 0, rebuild: 0, decode: 0 };
+    const cpu: { now: number; apply: number; rebuild: number; decode: number; live?: number } = { now: 0, apply: 0, rebuild: 0, decode: 0 };
     const spend = (ms: number) => {
       cpu.now += ms;
       if (opts.shared) t += ms;
@@ -1634,6 +1634,13 @@ describe('#816 the per-user collab CPU budget (a debt)', () => {
     const spy = jest.spyOn(Y, 'applyUpdate').mockImplementation((doc: Y.Doc, update: Uint8Array, origin?: unknown) => {
       const what = typeof origin === 'symbol' ? origin.description : undefined;
       if (what === 'ccc-collab-inspect') spend(cpu.apply);
+      else if (doc === s.live && (origin as { source?: unknown } | undefined)?.source === 'connection') {
+        // #840: live's own apply, timed on live (inside its transaction, as the registry times it)
+        return Y.transact(doc, () => {
+          spend(cpu.live ?? cpu.apply);
+          real(doc, update, origin);
+        }, origin, false);
+      }
       else if (what === 'ccc-collab-mirror' && doc !== s.guard.shadowOf(s.live)) spend(cpu.rebuild); // a new shadow
       return real(doc, update, origin);
     });

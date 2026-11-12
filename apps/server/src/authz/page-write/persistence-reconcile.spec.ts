@@ -75,6 +75,15 @@ jest.mock('./collab-drift-log', () => ({
   logStoreFailure: (...a: unknown[]) => logStoreFailure(...(a as [])),
   logPostStoreFailure: (...a: unknown[]) => logPostStoreFailure(...(a as [])),
 }));
+// #840: the order check and the heal row (heal-image.spec.ts, heal-image.pg.spec.ts) need real yjs; here every store
+// is order-stable and drops no heal row.
+jest.mock('./heal-image', () => ({
+  checkStoreOrder: () => ({ stable: true, why: null, structs: 0, ms: 0, source: null }),
+  persistOrderState: async () => ({ unstable: false, imaged: false, ydocWritten: false, structs: 0, ms: 0 }),
+  afterOrderStore: () => undefined,
+  loadStableYdoc: async () => undefined,
+  noteLoadedBytes: () => undefined,
+}));
 // blank-clobber-guard is left REAL (pure JSON, no heavy imports) so the null-ydoc tests exercise its
 // actual structural classifier.
 

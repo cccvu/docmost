@@ -24,6 +24,15 @@ import * as reconcile from './reconcile-store';
 import { findPageRowForLoad } from './persistence-steps';
 import { markSuperseded, registerInflight } from './compaction-registry';
 import { hasStoreFailure } from './store-failure-registry';
+import { memoryHealStore } from './heal-image.testkit';
+import { replicaLogOf } from '../collab-ingress/exact-replica-registry';
+import { strictOrderDiff } from '../collab-ingress/order-parity';
+
+/** #840: the guard's replica log of `doc` is trusted and rebuilds it exactly (each load branch attached its bytes). */
+const replicaLogRebuilds = (doc: Y.Doc) => {
+  const log = replicaLogOf(doc);
+  return log !== null && strictOrderDiff(log.rebuild(), doc) === null;
+};
 
 const PAGE_ID = '99999999-9999-4999-8999-999999999999';
 const DOC = `page.${PAGE_ID}`;
@@ -69,7 +78,7 @@ function stack(initial: Json) {
   const queue = { add: jest.fn(async () => undefined) } as never;
   const persistence = new PersistenceExtension(
     { findById, updatePage } as never,
-    {} as never,
+    memoryHealStore(row) as never, // #840: the heal rows (none: every page here is order-stable)
     queue,
     queue,
     queue,
@@ -182,6 +191,7 @@ describe('PersistenceExtension.onLoadDocument (#731 F2, seam #122)', () => {
     const expected = new Y.Doc();
     Y.applyUpdate(expected, new Uint8Array(s.row.ydoc!));
     expect(Buffer.from(Y.encodeStateAsUpdate(doc)).equals(Buffer.from(Y.encodeStateAsUpdate(expected)))).toBe(true);
+    expect(replicaLogRebuilds(doc)).toBe(true); // #840: the row's bytes
     await conn.disconnect();
   });
 
@@ -195,6 +205,7 @@ describe('PersistenceExtension.onLoadDocument (#731 F2, seam #122)', () => {
       [PAGE_ID, { includeContent: true, includeYdoc: true }],
     ]);
     expect(TiptapTransformer.fromYdoc(s.hocuspocus.documents.get(DOC)!, 'default')).toEqual(s.row.content);
+    expect(replicaLogRebuilds(s.hocuspocus.documents.get(DOC)!)).toBe(true); // #840: the exact update it applied
     await conn.disconnect();
   });
 
@@ -204,6 +215,7 @@ describe('PersistenceExtension.onLoadDocument (#731 F2, seam #122)', () => {
     s.row.content = null;
     const conn = await s.hocuspocus.openDirectConnection(DOC, {});
     expect(s.hocuspocus.documents.get(DOC)!.isEmpty('default')).toBe(true);
+    expect(replicaLogRebuilds(s.hocuspocus.documents.get(DOC)!)).toBe(true); // #840: the empty document's own encoding
     await conn.disconnect();
     await settleTimers();
     const t = stack(page('M', 1));
@@ -211,6 +223,7 @@ describe('PersistenceExtension.onLoadDocument (#731 F2, seam #122)', () => {
     const c2 = await t.hocuspocus.openDirectConnection(DOC, {});
     expect(t.findById).toHaveBeenCalledTimes(1);
     expect(t.hocuspocus.documents.get(DOC)!.isEmpty('default')).toBe(true);
+    expect(replicaLogRebuilds(t.hocuspocus.documents.get(DOC)!)).toBe(true);
     await c2.disconnect();
   });
 });

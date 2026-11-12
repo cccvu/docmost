@@ -4,6 +4,7 @@ import { Node as PMNode } from '@tiptap/pm/model';
 import { serverSchema } from '../page-write/prelim-content';
 import { copyOf, rawUpdate, type RawId } from './conflict-scan.testkit';
 import { parentConsistencyViolation } from './parent-consistency';
+import { isKeyedSplit } from './update-guard';
 
 /**
  * #840 (ADR 0036): every item a frame integrates sits beside neighbours of its own parent and key. A crafted frame that
@@ -13,6 +14,22 @@ import { parentConsistencyViolation } from './parent-consistency';
  */
 type Hit = ReturnType<typeof parentConsistencyViolation>;
 
+/** #847: the guard's keyed-split rule over what `tr` integrated (the corpus checks it with the parent rule). */
+function keyedSplitIn(tr: Y.Transaction): Hit {
+  const store = tr.doc.store;
+  for (const [client, structs] of store.clients) {
+    const before = tr.beforeState.get(client) ?? 0;
+    if (Y.getState(store, client) <= before) continue;
+    for (let i = Y.findIndexSS(structs, before); i < structs.length; i++) {
+      const item = structs[i];
+      if (!(item instanceof Y.Item) || item.parentSub === null) continue;
+      seen.keyed++;
+      if (isKeyedSplit(item)) return { client, clock: item.id.clock };
+    }
+  }
+  return null;
+}
+
 /** `update` applied as the guard applies a frame: the rule read inside the transaction, before Yjs's cleanup. */
 function applyChecked(doc: Y.Doc, update: Uint8Array, origin: unknown = 'remote'): Hit {
   let hit: Hit = null;
@@ -20,7 +37,7 @@ function applyChecked(doc: Y.Doc, update: Uint8Array, origin: unknown = 'remote'
     doc,
     (tr) => {
       Y.applyUpdate(doc, update, origin);
-      hit = parentConsistencyViolation(tr);
+      hit = parentConsistencyViolation(tr) ?? (watchingKeyed ? keyedSplitIn(tr) : null);
     },
     origin,
     false,
@@ -133,10 +150,10 @@ describe('#840 parent consistency: an integrated item\'s neighbours share its pa
     expect(applyChecked(corrupted(), frame)).toEqual({ client: 888, clock: 0 });
   });
 
-  it('scope: an author\'s own grouped undo can split its OWN replica (keyed redo under a redone parent); the frame it sends never does', () => {
-    // Yjs redoItem's keyed branch starts `left` at the old item, in the deleted parent, and never re-parents it: the
-    // redone value is linked into the old paragraph's key while the new paragraph's map points at it. A local
-    // transaction, never a frame: every other replica derives the parent from that origin (the old, deleted paragraph).
+  it('an author\'s own grouped undo (keyed redo under a redone parent) keeps its replica, the server and a reload consistent', () => {
+    // yjs 13.6.30's redoItem keyed branch started `left` at the old item, in the deleted parent: the redone value was
+    // linked into the old paragraph's key on the author's replica only, and every other replica derived the parent from
+    // that origin (the old, deleted paragraph). Patch B's keyed hunk (yjs #757) starts it in the recreated paragraph.
     const author = new Y.Doc();
     author.clientID = 5;
     const f = author.getXmlFragment('default');
@@ -153,23 +170,19 @@ describe('#840 parent consistency: an integrated item\'s neighbours share its pa
     Y.applyUpdate(server, Y.encodeStateAsUpdate(author));
     local.length = 0;
     undo.undo();
-    expect(local).toEqual([{ client: 5, clock: 4 }]);
+    expect(local).toEqual([null]);
     expect(f.toString()).toBe('<paragraph indent="left"></paragraph>');
     expect(applyChecked(server, Y.encodeStateAsUpdate(author, Y.encodeStateVector(server)))).toBeNull(); // the frame
-    expect(server.getXmlFragment('default').toString()).toBe('<paragraph></paragraph>'); // the attribute is lost there
-    expect(copyOf(author).getXmlFragment('default').toString()).toBe('<paragraph></paragraph>'); // and on reload
-    // a co-editor's honest attribute frame: consistent on the server, beside the split item on the author's replica (why
-    // the corpus stops checking a replica its own redo split)
+    expect(server.getXmlFragment('default').toString()).toBe('<paragraph indent="left"></paragraph>');
+    expect(copyOf(author).getXmlFragment('default').toString()).toBe('<paragraph indent="left"></paragraph>'); // a reload
+    // a co-editor's honest attribute frame lands consistently on both replicas
     const coEditor = copyOf(server);
-    coEditor.clientID = 2; // a lower id than the author's: Yjs places it first in the key's chain, the OLD paragraph's
+    coEditor.clientID = 2;
     (coEditor.getXmlFragment('default').get(0) as Y.XmlElement).setAttribute('indent', 'center');
     const honest = Y.encodeStateAsUpdate(coEditor, Y.encodeStateVector(server));
     expect(applyChecked(server, honest)).toBeNull();
-    expect(applyChecked(author, honest)).toEqual({ client: 2, clock: 0 });
-    expect([server, author].map((d) => d.getXmlFragment('default').toString())).toEqual([
-      '<paragraph indent="center"></paragraph>',
-      '<paragraph></paragraph>', // the author's replica shows neither value
-    ]);
+    expect(applyChecked(author, honest)).toBeNull();
+    expect([server, author].map((d) => d.getXmlFragment('default').toString())).toEqual(['<paragraph indent="center"></paragraph>', '<paragraph indent="center"></paragraph>']);
   });
 
   it('map and attribute items: overwrites, deletes and undo/redo across keys of one parent never trip', () => {
@@ -271,7 +284,7 @@ const SEEDS = 30;
 const OPS = 2500;
 const WORDS = ['lorem ', 'ipsum ', 'x', 'é', 'dolor sit ', 'the quick brown fox '];
 
-type Peer = { doc: Y.Doc; undo: Y.UndoManager; out: Uint8Array[]; inbox: Uint8Array[]; offline: number; split: boolean; grouped: boolean; last: number };
+type Peer = { doc: Y.Doc; undo: Y.UndoManager; out: Uint8Array[]; inbox: Uint8Array[]; offline: number; grouped: boolean; last: number };
 
 const elementsOf = (f: Y.XmlFragment): Y.XmlElement[] => {
   const out: Y.XmlElement[] = [];
@@ -309,7 +322,8 @@ const listItem = (r: () => number, depth: number): Y.XmlElement => {
   return li;
 };
 
-const seen = { frames: 0, step2: 0, peerIntegrations: 0, undo: 0, redo: 0, ytiptap: 0, parentDeletes: 0, nested: 0, remounts: 0, items: 0, withLeft: 0, withRight: 0, deletedNeighbour: 0, localSplits: 0, splitReplicaHits: 0, grouped: 0, pauses: 0 };
+let watchingKeyed = false;
+const seen = { keyed: 0, frames: 0, step2: 0, peerIntegrations: 0, undo: 0, redo: 0, ytiptap: 0, parentDeletes: 0, nested: 0, remounts: 0, items: 0, withLeft: 0, withRight: 0, deletedNeighbour: 0, grouped: 0, pauses: 0 };
 
 function edit(r: () => number, peer: Peer): void {
   const d = peer.doc;
@@ -402,31 +416,18 @@ function runSeed(seed: number): Hit[] {
   live.clientID = 1;
   live.getXmlFragment('default').insert(0, Array.from({ length: 20 }, () => paragraph(r)));
   const peers: Peer[] = [];
-  /**
-   * Every remote integration on a peer is checked too, except on a replica its own keyed redo split (the scope spec
-   * above): there a later honest frame can land beside the split item. The server never makes a local redo.
-   */
+  /** Every transaction on a peer is checked too, its own undo and redo included (patch B's keyed hunk, yjs #757). */
   const watch = (peer: Peer) =>
     peer.doc.on('afterTransaction', (tr: Y.Transaction) => {
-      const hit = parentConsistencyViolation(tr);
-      if (tr.local) {
-        if (hit) {
-          seen.localSplits++;
-          peer.split = true;
-        }
-        return;
-      }
-      if (peer.split) {
-        if (hit) seen.splitReplicaHits++;
-        return;
-      }
+      const hit = parentConsistencyViolation(tr) ?? keyedSplitIn(tr);
+      if (hit) hits.push(hit);
+      if (tr.local) return;
       seen.peerIntegrations++;
       const t = tally(tr);
       seen.items += t.items;
       seen.withLeft += t.withLeft;
       seen.withRight += t.withRight;
       seen.deletedNeighbour += t.deletedNeighbour;
-      if (hit) hits.push(hit);
     });
   /** A frame to the server, applied as the guard applies it, then broadcast (delivered late). */
   const send = (from: Peer, update: Uint8Array, step2 = false) => {
@@ -451,7 +452,7 @@ function runSeed(seed: number): Hit[] {
     const kind = r(); // captureTimeout 500 on the simulated clock, grouped until stopCapturing only, or 0
     const grouped = kind < 0.3;
     const undo = new Y.UndoManager(doc.getXmlFragment('default'), { captureTimeout: kind < 0.5 ? Infinity : 0 });
-    const peer: Peer = { doc, undo, out: [], inbox: [], offline: 0, split: false, grouped, last: 0 };
+    const peer: Peer = { doc, undo, out: [], inbox: [], offline: 0, grouped, last: 0 };
     undo.on('stack-item-added', () => !undo.undoing && !undo.redoing && (peer.last = now));
     undo.on('stack-item-updated', () => {
       if (grouped) seen.grouped++; // merged into the open group by the 500 arm
@@ -503,12 +504,13 @@ function runSeed(seed: number): Hit[] {
 }
 
 describe('#840 parent consistency: honest editing never trips it', () => {
-  it(`${SEEDS} seeded sessions: grouped undo/redo, parent deletes, nested lists, Step2 merges: 0 hits`, () => {
+  it(`${SEEDS} seeded sessions: grouped undo/redo, parent deletes, nested lists, Step2 merges: 0 hits (and 0 keyed-split, #847)`, () => {
+    watchingKeyed = true;
     for (let seed = 1; seed <= SEEDS; seed++) expect({ seed, hits: runSeed(840_000 + seed) }).toEqual({ seed, hits: [] });
     console.log(`#840 honest corpus: ${JSON.stringify(seen)}`);
     expect(seen.frames).toBeGreaterThan(SEEDS * 1000);
     expect(seen.withRight).toBeGreaterThan(seen.frames); // anti-vacuity: items really land between neighbours
-    for (const [k, v] of Object.entries(seen)) if (k !== 'splitReplicaHits') expect([k, v > 0]).toEqual([k, true]); // informational
+    for (const [k, v] of Object.entries(seen)) expect([k, v > 0]).toEqual([k, true]); // informational
   });
 });
 

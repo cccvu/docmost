@@ -41,6 +41,8 @@ export const COMPACTION_REASONS = [
   'probe',
   'mirror_deadline',
   'rebuild_deadline',
+  // #840: the live order and its reload differ (order-parity.ts); compaction from live makes the page reload-stable.
+  'order_divergence',
 ] as const;
 export type CompactionReason = (typeof COMPACTION_REASONS)[number];
 

@@ -7,18 +7,21 @@ import * as Y from 'yjs';
 
 /**
  * #840 (ADR 0036): yjs 13.6.30's `redoItem` can give a redone item contradictory origins (upstream yjs #794/#823), so
- * honest grouped undo leaves live and a reload of it in different orders. The fork carries patch B
- * (`patches/yjs@13.6.30.patch`, upstream PR #795's fallback). These specs pin that every Yjs consumer, server and SPA,
- * loads that one patched copy, that its `redoItem` is the reviewed text, and that it closes the divergence that the
- * unpatched `redoItem` (rebuilt here from the same file) still shows.
+ * honest grouped undo leaves live and a reload of it in different orders. And when one undo recreates a block and
+ * restores one of its attributes (yjs #757), the attribute is linked into the deleted block's key chain: the undoing
+ * user sees it, every other replica and every reload drop it. The fork carries patch B (`patches/yjs@13.6.30.patch`):
+ * a `list` hunk (upstream PR #795's fallback) and a `keyed` hunk (upstream's #757 fix, released in 13.6.31). These
+ * specs pin that every Yjs consumer, server and SPA, loads that one patched copy, that its `redoItem` is the reviewed
+ * text, and that each hunk closes the divergence that the `redoItem` without it (rebuilt here from the same file)
+ * still shows.
  */
 
 const PINNED_YJS_VERSION = '13.6.30';
 const MARKER = '[ccc #840]';
 /** sha256 of `redoItem` in dist/yjs.cjs and dist/yjs.mjs, patched (the two are byte-identical) and upstream. */
-const PINNED_REDO_SHA256 = '1d264a2b6a20084c0ed1f559f78074f634154b2a528c102774117bbb3684d478';
+const PINNED_REDO_SHA256 = '21c6c856f3109488e868d319640df765a1e50152caff1d4e4c963af663f80be6';
 const UPSTREAM_REDO_SHA256 = 'a97a69c271b02ffad94e600145305ed51989fce30f801cd7b05249ed4edb6382';
-const RE_VALIDATE = 'yjs redoItem changed: re-validate #840 patch B against upstream (yjs #794/#823, PR #795/#810) before updating this pin';
+const RE_VALIDATE = 'yjs redoItem changed: re-validate #840 patch B against upstream (yjs #794/#823 and #757, PR #795/#810) before updating this pin';
 
 const SERVER_DIR = resolve(__dirname, '../../..');
 const CLIENT_DIR = resolve(SERVER_DIR, '../client');
@@ -65,16 +68,22 @@ function redoItemOf(src: string): string {
 
 const sha256 = (text: string) => createHash('sha256').update(text).digest('hex');
 
-/** The dist without patch B: the marker comment through the end of its `if` block (4-space indented). */
-function unpatched(src: string): string {
-  const at = src.indexOf(`    // ${MARKER}`);
+/** Patch B's hunks, by the text that follows the marker. */
+const HUNKS = { list: 'yjs #794/#823', keyed: 'yjs #757' } as const;
+
+/** The dist without one hunk of patch B: its marker comment through the end of its `if` block (4-space indented). */
+function cut(src: string, hunk: keyof typeof HUNKS): string {
+  const at = src.indexOf(`    // ${MARKER} ${HUNKS[hunk]}`);
   expect(at).toBeGreaterThanOrEqual(0);
-  const block = src.indexOf('    if (left !== null && right !== null) {\n', at);
+  const block = src.indexOf('\n    if (', at);
   expect(block).toBeGreaterThan(at);
   const end = src.indexOf('\n    }\n', block);
   expect(end).toBeGreaterThan(block);
   return src.slice(0, at) + src.slice(end + '\n    }\n'.length);
 }
+
+/** The dist without patch B. */
+const unpatched = (src: string) => cut(cut(src, 'list'), 'keyed');
 
 /** A scratch yjs compiled from `src` in a vm, reading `clock.now` as its time (never written to disk). */
 function loadYjs(src: string, clock: { now: number }): typeof Y {
@@ -125,6 +134,26 @@ function repro823(YY: typeof Y): [string, string] {
   return liveAndReload(YY, doc);
 }
 
+/**
+ * yjs #757 in a page: one stack item changes a paragraph's alignment and deletes the paragraph; undo recreates it and
+ * restores "left". Returns live, a reload of it, and a replica that received live's updates as they happened.
+ */
+function repro757(YY: typeof Y): [string, string, string] {
+  const doc = new YY.Doc();
+  doc.clientID = 1;
+  const peer = new YY.Doc();
+  doc.on('update', (u: Uint8Array) => YY.applyUpdate(peer, u));
+  const f = doc.getXmlFragment('default');
+  const p = paragraph(YY, 'hello');
+  f.insert(0, [p]);
+  p.setAttribute('textAlign', 'left');
+  const um = new YY.UndoManager(f, { captureTimeout: 500 });
+  p.setAttribute('textAlign', 'center');
+  f.delete(0, 1);
+  um.undo();
+  return [...liveAndReload(YY, doc), peer.getXmlFragment('default').toString()];
+}
+
 /** Deterministic PRNG (mulberry32). */
 function rng(seed: number): () => number {
   let a = seed >>> 0;
@@ -140,9 +169,10 @@ function rng(seed: number): () => number {
 const SESSIONS = 3000;
 const OPS = 100;
 const WORDS = ['a', 'bc', '++', 'word ', 'x'];
+const ALIGN = ['left', 'center', 'right'];
 
 /**
- * One client editing paragraphs under an UndoManager with the editor's `captureTimeout` (500 ms) on a simulated clock,
+ * One client editing paragraphs (text and the `textAlign` attribute) under an UndoManager with the editor's `captureTimeout` (500 ms) on a simulated clock,
  * so edits group into multi-change stack items as typing does. Returns the sessions whose live text differs from a reload.
  */
 function groupedUndoFuzz(src: string) {
@@ -174,10 +204,12 @@ function groupedUndoFuzz(src: string) {
         }
       } else if (op < 0.55) {
         f.insert(pick(f.length + 1), [paragraph(YY, WORDS[pick(WORDS.length)])]);
-      } else if (op < 0.65 && f.length > 1) {
+      } else if (op < 0.6) {
+        if (f.length) (f.get(pick(f.length)) as Y.XmlElement).setAttribute('textAlign', ALIGN[pick(ALIGN.length)]);
+      } else if (op < 0.68 && f.length > 1) {
         const at = pick(f.length);
         f.delete(at, 1 + pick(Math.min(2, f.length - at - 1)));
-      } else if (op < 0.85) {
+      } else if (op < 0.86) {
         um.undo();
         seen.undo++;
       } else {
@@ -213,7 +245,7 @@ describe('#840 yjs redo patch B', () => {
 
     expect(JSON.parse(readFileSync(join(YJS_DIR, 'package.json'), 'utf8')).version).toBe(PINNED_YJS_VERSION);
     for (const name of ['yjs.cjs', 'yjs.mjs'] as const) {
-      expect({ [name]: dist(name).split(MARKER).length - 1 }).toEqual({ [name]: 1 });
+      expect({ [name]: dist(name).split(MARKER).length - 1 }).toEqual({ [name]: Object.keys(HUNKS).length });
     }
   });
 
@@ -225,26 +257,36 @@ describe('#840 yjs redo patch B', () => {
     }
   });
 
-  it('yjs #823: live and a reload agree on the patched yjs, and diverge on the unpatched redoItem', () => {
+  it('yjs #823: live and a reload agree on the patched yjs, and diverge without the list hunk', () => {
     const [live, reload] = repro823(Y);
     expect(live).toBe('<paragraph>awo++rd</paragraph>');
     expect(reload).toBe(live);
-    // Anti-vacuity: the same file without patch B reproduces upstream's divergence.
-    const [uLive, uReload] = repro823(loadYjs(unpatched(dist('yjs.cjs')), { now: 0 }));
+    // Anti-vacuity: the same file without the list hunk reproduces upstream's divergence.
+    const [uLive, uReload] = repro823(loadYjs(cut(dist('yjs.cjs'), 'list'), { now: 0 }));
     expect(uLive).toBe('<paragraph>awo++rd</paragraph>');
     expect(uReload).toBe('<paragraph>ardwo++</paragraph>');
   });
 
+  it('yjs #757: an attribute restored with its block reaches the reload and a peer on the patched yjs, and only the undoing user without the keyed hunk', () => {
+    const want = '<paragraph textAlign="left">hello</paragraph>';
+    expect(repro757(Y)).toEqual([want, want, want]);
+    // Anti-vacuity: without the keyed hunk the undoing user sees "left"; a reload and a peer drop it.
+    // (A frozen, nonzero clock: both changes land in one stack item.)
+    expect(repro757(loadYjs(cut(dist('yjs.cjs'), 'keyed'), { now: 1_000_000 }))).toEqual([want, '<paragraph>hello</paragraph>', '<paragraph>hello</paragraph>']);
+  });
+
   it(`seeded grouped-undo fuzz (${SESSIONS} sessions x ${OPS} ops): 0 sessions where live != reload`, () => {
     const patched = groupedUndoFuzz(dist('yjs.cjs'));
-    const upstream = groupedUndoFuzz(unpatched(dist('yjs.cjs')));
-    if (process.env.CONFLICT_SCAN_TALLY) console.log(JSON.stringify({ patched, upstream }));
+    const noList = groupedUndoFuzz(cut(dist('yjs.cjs'), 'list'));
+    const noKeyed = groupedUndoFuzz(cut(dist('yjs.cjs'), 'keyed'));
+    if (process.env.CONFLICT_SCAN_TALLY) console.log(JSON.stringify({ patched, noList, noKeyed }));
     expect(patched.sessions).toBe(SESSIONS);
     expect(patched.diverged).toBe(0);
-    // Anti-vacuity: the corpus grouped edits, undid and redid, and upstream's redoItem diverges on it.
+    // Anti-vacuity: the corpus grouped edits, undid and redid, and each hunk's divergence shows without it.
     expect(patched.grouped).toBeGreaterThan(patched.stackItems / 10);
     expect(patched.undo).toBeGreaterThan(SESSIONS * 10);
     expect(patched.redo).toBeGreaterThan(SESSIONS * 5);
-    expect(upstream.diverged).toBeGreaterThan(10);
+    expect(noList.diverged).toBeGreaterThan(10);
+    expect(noKeyed.diverged).toBeGreaterThan(10);
   });
 });

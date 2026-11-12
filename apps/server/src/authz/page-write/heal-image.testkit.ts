@@ -1,0 +1,52 @@
+/**
+ * CCC collab integration — NOT upstream Docmost code (#840). NOT a jest suite and not built (`.testkit.ts`).
+ *
+ * An in-memory heal store (heal-image.ts) and compaction store over one fake `pages` row, for the persistence unit
+ * specs: pass it as the extension's `db`. heal-image.pg.spec.ts runs the Postgres stores.
+ */
+import { createHash } from 'node:crypto';
+import type { CompactionStore } from './compaction';
+import type { HealImageStore } from './heal-image';
+
+const sha = (b: Uint8Array): string => createHash('sha256').update(b).digest('base64');
+
+export type MemoryHeal = { image: Uint8Array | null; rowSha: string; epoch: number };
+export type MemoryHealStore = HealImageStore & CompactionStore & { heals: Map<string, MemoryHeal> };
+
+/** `row` is the spec's fake row (read and written in place); `heals` the heal rows by page id. */
+export function memoryHealStore(row: { ydoc: Uint8Array | null; content?: unknown } = { ydoc: null }): MemoryHealStore {
+  const heals = new Map<string, MemoryHeal>();
+  const current = () => (row.ydoc ? sha(row.ydoc) : null);
+  return {
+    heals,
+    async read(pageId) {
+      const h = heals.get(pageId);
+      return h ? { ...h, currentSha: current() } : null;
+    },
+    async readYdoc() {
+      return row.ydoc ? new Uint8Array(row.ydoc) : null;
+    },
+    async dropStale(pageId, rowSha) {
+      if (heals.get(pageId)?.rowSha === rowSha && current() !== rowSha) heals.delete(pageId);
+    },
+    async clear(_trx, pageId, ydoc) {
+      const had = heals.delete(pageId);
+      if (had && ydoc) row.ydoc = Buffer.from(ydoc);
+      return had && !!ydoc;
+    },
+    async put(_trx, pageId, heal, ydoc) {
+      if (ydoc) row.ydoc = Buffer.from(ydoc);
+      heals.set(pageId, { ...heal });
+    },
+    async readRow() {
+      return { content: row.content ?? null, ydoc: row.ydoc ? new Uint8Array(row.ydoc) : null, contentHash: null };
+    },
+    async swapYdoc(pageId, next, { covered }) {
+      if (current() !== covered) return { swapped: false, why: 'cas_miss' };
+      const before = row.ydoc?.length ?? null;
+      row.ydoc = Buffer.from(next);
+      heals.delete(pageId);
+      return { swapped: true, beforeBytes: before };
+    },
+  };
+}
