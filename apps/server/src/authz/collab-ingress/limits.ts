@@ -199,6 +199,18 @@ export const COLLAB_SOCKET_TOTAL_LOW_WATER_BYTES = 112 * 1024 * 1024;
 export const COLLAB_REPLICA_LOG_TOTAL_BYTES = 128 * 1024 * 1024;
 
 /**
+ * #842 owner claims (relay-claims.ts): the bytes of a writer's own structs from a frame refused `unproven-owner`, kept so
+ * a peer's relay of them can be compared clock for clock. One claim per (user, document), the latest replacing the
+ * earlier; budgeted BEFORE it is stored, and when either bound is full it is not recorded (logged `claim: 'full'`, the
+ * frame keeps today's `unresolved`): nothing is ever evicted, so no user can push out another's claim. Per user: one
+ * largest frame (PAGE_MAX_YDOC_BYTES_CEILING). Per process: 64 MiB of native memory (#679), on top of the three
+ * totals above. A claim lives CLAIM_TTL_MS: longer than the editor's bounded `unresolved` retries (about 15.5 s).
+ */
+export const CLAIM_BYTES_PER_USER = PAGE_MAX_YDOC_BYTES_CEILING;
+export const CLAIM_BYTES_TOTAL = 64 * 1024 * 1024;
+export const CLAIM_TTL_MS = 30_000;
+
+/**
  * Authenticated collab connections (one per document per socket) one user may hold in this process
  * (user-connections.ts). Docmost opens one per page editor; an editor in a hidden tab idle for five minutes
  * disconnects (page-editor.tsx), so a user's live count is the pages they had open in the last minutes, across their

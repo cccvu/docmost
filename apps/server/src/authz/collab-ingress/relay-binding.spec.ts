@@ -13,9 +13,10 @@ import { AWARENESS_BINDS_PER_USER, AWARENESS_NEW_IDS_REFILL_MS, COLLAB_REFUSAL_C
  * the server's relay to that peer made them part of its Step2 or IndexedDB echo. Binding them to that peer refused the
  * real author `foreign-client` for the rest of the lifetime. And the mirror ordering (the author's awareness lands first,
  * then the peer's relay) is answered `unresolved`, never applied: the peer reconnects once and by then the author's own
- * Step2 has made those clocks known. That holds for a ONE-SIDED relay, and only when the author's Step2 lands before the
- * peer's retry; both limits are pinned as residuals below (and the crash corpus in honest-concurrency.spec.ts measures
- * them).
+ * Step2 has made those clocks known. That alone recovers a ONE-SIDED relay. Since #842 a relay there also lands when it
+ * equals what the author itself sent in a frame refused that way (an owner claim, relay-claims.ts), so co-editors who
+ * both lost a tail no longer block each other (relay-claims.spec.ts pins the forgeries). The timing limit is pinned as a
+ * residual below (and the crash corpus in honest-concurrency.spec.ts measures it).
  *
  * Driven like update-guard.spec.ts: `deliver` stands in for Hocuspocus (the guard first, then the apply), and `meta` for
  * the awareness clocks Hocuspocus's Document keeps. One describe runs the orderings through a real Hocuspocus 4.7.1.
@@ -256,36 +257,58 @@ function bothLostLifetime(opts: { storedPrefix: boolean }) {
   return { stored, a, b };
 }
 
-describe('pinned residuals of the mirror-race answer (ADR 0036 §4): one-sided relays only, and a timing assumption', () => {
+describe('#842: co-editors who BOTH lost a tail no longer block each other (owner claims, relay-claims.ts)', () => {
   it.each([
     ['a stored id', true],
     ['a never-seen id', false],
-  ])('%s, BOTH co-editors lost a tail: each Step2 hits the other\'s unproven id, both are unresolved twice (final), live never changes', (_name, storedPrefix) => {
-    // Not a regression (the rule before this change refused both foreign-client at once), and not fixed: neither frame
-    // can land, so neither id is ever proven, and a reload within the lifetime replays the same ids. The deadlock ends
-    // with the lifetime (the document unloads once no editor holds it; a new lifetime binds nothing).
+  ])('%s: the first Step2 is unresolved once (its claim recorded), the second lands on that claim, the retry lands', (_name, storedPrefix) => {
     const { stored, a, b } = bothLostLifetime({ storedPrefix });
     const s = lifetime(stored);
     expect(Y.getState(s.live.store, B_ID) > 0).toBe(storedPrefix);
     expect(clientsOf(s.step2(a.doc))).toEqual(new Set([A_ID, B_ID])); // precondition: each carries both lost tails
     expect(clientsOf(s.step2(b.doc))).toEqual(new Set([A_ID, B_ID]));
+    const bConn = s.conn('B');
+    const aConn = s.conn('A');
+    expect(s.announce(bConn, { clientID: B_ID })).toBe('applied');
+    expect(s.announce(aConn, { clientID: A_ID })).toBe('applied');
     const before = Y.encodeStateAsUpdate(s.live);
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      // a reconnect: new connections, each announcing its own id again (an echo of its own bound id), then its Step2
-      const bConn = s.conn('B');
-      const aConn = s.conn('A');
-      expect(s.announce(bConn, { clientID: B_ID, clock: attempt })).toBe('applied');
-      expect(s.announce(aConn, { clientID: A_ID, clock: attempt })).toBe('applied');
-      expect(s.send(aConn, s.step2(a.doc), SYNC.Step2)).toBe(UNRESOLVED_REASON);
-      expect(s.send(bConn, s.step2(b.doc), SYNC.Step2)).toBe(UNRESOLVED_REASON);
-    }
-    // the client's second `unresolved` before sync-acked is final (collab-access.ts): both editors are refused
+    expect(s.send(aConn, s.step2(a.doc), SYNC.Step2)).toBe(UNRESOLVED_REASON); // B sent nothing yet: no claim of B's
     expect(Buffer.from(Y.encodeStateAsUpdate(s.live)).equals(Buffer.from(before))).toBe(true);
-    const stages = s.logs.filter((l) => l.startsWith('COLLAB_UPDATE_REFUSED')).map((l) => JSON.parse(l.slice(l.indexOf('{'))));
-    expect(stages).toHaveLength(4);
-    for (const line of stages) expect(line).toMatchObject({ rule: 'foreign-client', stage: 'unproven-owner' });
+    expect(s.send(bConn, s.step2(b.doc), SYNC.Step2)).toBe('applied'); // A's tail in it equals A's claim
+    const aRetry = s.conn('A');
+    expect(s.announce(aRetry, { clientID: A_ID, clock: 2 })).toBe('applied');
+    expect(s.send(aRetry, s.step2(a.doc), SYNC.Step2)).toBe('applied');
+    expect(renderLikeABrowser(s.live).text).toBe(`A-lost B-lost ${storedPrefix ? 'A-stored B-stored ' : ''}base`);
+    const lines = s.logs.filter((l) => /^COLLAB_(UPDATE_REFUSED|RELAY_ATTESTED)/.test(l)).map((l) => [l.slice(0, l.indexOf(' ')), JSON.parse(l.slice(l.indexOf('{')))]);
+    expect(lines).toEqual([
+      ['COLLAB_UPDATE_REFUSED', expect.objectContaining({ rule: 'foreign-client', stage: 'unproven-owner', claim: 'none', userId: 'A' })],
+      ['COLLAB_RELAY_ATTESTED', expect.objectContaining({ userId: 'B', ids: 1, clocks: 'A-lost '.length })],
+    ]);
+    // B wrote new clocks at its id: proven, a forgery there is final. A's tail landed through B's relay, which proves
+    // nothing: A's id stays awareness-only, so a forgery there is still never applied (unresolved) until A writes.
+    expect(s.send(s.conn('M'), forgeAtB(s.live))).toBe(REFUSED('foreign-client'));
+    const atA = typeAt0(new RemoteClient(s.live, A_ID), s.live, 'FORGED ');
+    expect(s.send(s.conn('M'), atA)).toBe(UNRESOLVED_REASON);
+    expect(renderLikeABrowser(s.live).text).not.toContain('FORGED');
   });
 
+  it('a forgery at an unproven id with no claim to compare with stays unapplied on every retry, mutual or not', () => {
+    const { stored, a, b } = bothLostLifetime({ storedPrefix: true });
+    const s = lifetime(stored);
+    expect(s.announce(s.conn('B'), { clientID: B_ID })).toBe('applied');
+    expect(s.announce(s.conn('A'), { clientID: A_ID })).toBe('applied');
+    const before = Y.encodeStateAsUpdate(s.live);
+    // M was relayed both lost tails and relays them before either owner sent anything: no claim to compare with
+    const m = new RemoteClient(a.doc, 7007);
+    Y.applyUpdate(m.doc, Y.encodeStateAsUpdate(b.doc));
+    const mConn = s.conn('M');
+    expect(s.announce(mConn, { clientID: 7007 })).toBe('applied');
+    for (let i = 0; i < 3; i++) expect(s.send(mConn, s.step2(m.doc), SYNC.Step2)).toBe(UNRESOLVED_REASON);
+    expect(Buffer.from(Y.encodeStateAsUpdate(s.live)).equals(Buffer.from(before))).toBe(true);
+  });
+});
+
+describe('pinned residual of the mirror-race answer (ADR 0036 §4): a timing assumption', () => {
   it('timing: A\'s one retry lands before B\'s Step2 (B\'s round trip over twice A\'s): A is unresolved again, which is final', () => {
     // The one-sided recovery assumes the author's Step2 reaches the server before the relayer has reconnected (its
     // close, a new Auth and Step1, then its Step2: about two of its round trips after the refusal).
@@ -475,5 +498,34 @@ describe('the orderings through a real Hocuspocus 4.7.1 (its awareness meta, que
     expect(aSock2.closeReasons()).toEqual([]);
     expect(bSock.closeReasons()).toEqual([]);
     expect((contentOf(s.live()) as any).content[0].content[0].text).toBe('B-after B-lost B-stored base');
+  });
+
+  it('#842 both lost a tail: A\'s Step2 is unresolved (its session gone), B\'s lands on A\'s claim, A\'s retry lands', async () => {
+    const { stored, a, b } = bothLostLifetime({ storedPrefix: true });
+    const s = await server(stored);
+    const aSock = await s.connect('A');
+    const bSock = await s.connect('B');
+    aSock.deliver(awarenessFrame([{ clientID: A_ID, clock: 1, state: { user: {} } }]));
+    bSock.deliver(awarenessFrame([{ clientID: B_ID, clock: 1, state: { user: {} } }]));
+    await settle();
+    const bStep2 = Y.encodeStateAsUpdate(b.doc, Y.encodeStateVector(s.live()));
+    aSock.deliver(syncFrame(Y.encodeStateAsUpdate(a.doc, Y.encodeStateVector(s.live())), SYNC.Step2));
+    await settle();
+    expect(aSock.closeReasons()).toEqual([UNRESOLVED_REASON]);
+    // Hocuspocus removed A's refused session: A has no connection until its retry, and its claim is still used
+    expect(s.live().getConnections().some((c: any) => c.context?.user?.id === 'A')).toBe(false);
+    bSock.deliver(syncFrame(bStep2, SYNC.Step2));
+    await settle();
+    expect(bSock.closeReasons()).toEqual([]);
+    expect(renderLikeABrowser(s.live()).text).toBe('A-lost B-lost A-stored B-stored base');
+    const aSock2 = await s.connect('A');
+    aSock2.deliver(
+      awarenessFrame([{ clientID: A_ID, clock: 2, state: { user: {} } }]),
+      syncFrame(Y.encodeStateAsUpdate(a.doc, Y.encodeStateVector(s.live())), SYNC.Step2),
+    );
+    await settle();
+    expect(aSock2.closeReasons()).toEqual([]);
+    expect(bSock.closeReasons()).toEqual([]);
+    expect(renderLikeABrowser(s.live())).toMatchObject({ deleted: false, threw: false, text: 'A-lost B-lost A-stored B-stored base' });
   });
 });

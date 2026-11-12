@@ -29,7 +29,9 @@ import { COLLAB_PAGE_COMPACTING_REASON } from './collab-reasons';
 import { CONFLICT_SCAN_STEPS_PER_FRAME } from './conflict-scan';
 import {
   basePage,
+  blocksOf,
   distinctRightShape,
+  encodeStructs,
   keyedHistoryShape,
   rawUpdate,
   rightLeftOfOriginShape,
@@ -38,6 +40,7 @@ import {
   twoClientsShape,
   unguardedSteps,
   type Shape,
+  type StructBlock,
 } from './conflict-scan.testkit';
 import { INT_ATTRS, STRING_ATTRS } from './content-rules';
 import { COLLAB_CONNECTIONS_PER_USER } from './limits';
@@ -1729,6 +1732,129 @@ describe('#816 conflict scan: a frame whose integrate walks would stall the proc
     expect(s.send(s.conn('editor'), overlap, SYNC.Step2)).toBe('applied'); // the same frame, honest, after the fault
     expect(s.guard.shadowOf(s.live)).not.toBe(shadow); // rebuilt from live, unmetered
     expect(textOf(find(s.live, 'paragraph')).toString()).toBe('abcdvictim text');
+  });
+});
+
+describe('#842 pre-pass shape rules: no zero-length struct of any kind, one block per client', () => {
+  const X = 4242;
+  /** One character at X's next clock, after the page's first character: an honest frame. */
+  const oneChar = (s: ReturnType<typeof setup>, clock = Y.getState(s.live.store, X)) => {
+    const first = ((textOf(find(s.live, 'paragraph')) as any)._start as Y.Item).id;
+    return rawUpdate([{ client: X, clock, structs: [{ origin: clock ? [X, clock - 1] : [first.client, first.clock], right: null, content: new Y.ContentString('x') }] }]);
+  };
+
+  it('a zero-length GC: control, the page can no longer be encoded (stored, answered or rebuilt); refused zero-length', () => {
+    const s = setup({ seed: SEED });
+    expect(s.send(s.conn('writer'), oneChar(s))).toBe('applied');
+    const gc = encodeStructs([{ client: X, clock: 1, structs: [new Y.GC(Y.createID(X, 1), 0)] }]);
+    expect(Y.decodeUpdate(gc).structs[0]).toMatchObject({ length: 0 }); // precondition
+    const control = unguarded(s.live, gc);
+    expect(() => Y.encodeStateAsUpdate(control)).toThrow(); // the brick: findIndexSS divides by a zero-length span
+    expectRefused(s, s.conn('attacker'), gc, REFUSED('zero-length'));
+    expect(() => Y.encodeStateAsUpdate(s.live)).not.toThrow();
+    expect(s.send(s.conn('writer'), oneChar(s))).toBe('applied'); // the page still takes edits
+  });
+
+  it('a flood of zero-length GCs (every one a struct in live, a few bytes each) is refused before any shadow work', () => {
+    const s = setup({ seed: SEED });
+    const n = 50_000;
+    const flood = encodeStructs([{ client: X, clock: 0, structs: Array.from({ length: n }, () => new Y.GC(Y.createID(X, 0), 0)) }]);
+    expect(flood.length).toBeLessThan(4 * n);
+    const control = unguarded(s.live, flood);
+    expect(control.store.clients.get(X)!.length).toBe(n); // Yjs integrates every one
+    expectRefused(s, s.conn('attacker'), flood, REFUSED('zero-length'));
+    expect(s.guard.shadowOf(s.live)).toBeNull();
+  });
+
+  it.each<[string, (s: ReturnType<typeof setup>) => Uint8Array]>([
+    ['a zero-length Skip (between two honest characters)', (s) => withSkip(s)],
+    [
+      'a zero-length Item live already holds the clock of (held, and still refused)',
+      (s) => {
+        const at = ((textOf(find(s.live, 'paragraph')) as any)._start as Y.Item).id;
+        return rawUpdate([{ client: at.client, clock: at.clock, structs: [{ origin: null, right: null, parent: 'default', content: new Y.ContentString('') }] }]);
+      },
+    ],
+  ])('%s is refused zero-length', (_n, frame) => {
+    const s = setup({ seed: SEED });
+    expectRefused(s, s.conn('attacker'), frame(s), REFUSED('zero-length'));
+  });
+  /** An honest character at X, a zero-length Skip, then another character past the gap. */
+  function withSkip(s: ReturnType<typeof setup>): Uint8Array {
+    const first = ((textOf(find(s.live, 'paragraph')) as any)._start as Y.Item).id;
+    const blocks = [
+      {
+        client: X,
+        clock: 0,
+        structs: [
+          new Y.Item(Y.createID(X, 0), null, Y.createID(first.client, first.clock), null, null, null, null, new Y.ContentString('x')),
+          new Y.Skip(Y.createID(X, 1), 0),
+          new Y.Item(Y.createID(X, 1), null, Y.createID(X, 0), null, null, null, null, new Y.ContentString('y')),
+        ],
+      },
+    ];
+    return encodeStructs(blocks);
+  }
+
+  it('a repeated client block: control, Yjs applies only the last while its decode returns both; refused client-blocks', () => {
+    const s = setup({ seed: SEED });
+    const first = ((textOf(find(s.live, 'paragraph')) as any)._start as Y.Item).id;
+    const at = (str: string) => new Y.Item(Y.createID(X, 0), null, Y.createID(first.client, first.clock), null, null, null, null, new Y.ContentString(str));
+    const twice = encodeStructs([
+      { client: X, clock: 0, structs: [at('GOOD')] },
+      { client: X, clock: 0, structs: [at('BAD!')] },
+    ]);
+    expect(Y.decodeUpdate(twice).structs.map((st) => ((st as Y.Item).content as Y.ContentString).str)).toEqual(['GOOD', 'BAD!']);
+    expect(renderLikeABrowser(unguarded(s.live, twice)).text).toBe('vBAD!ictim text');
+    expectRefused(s, s.conn('attacker'), twice, REFUSED('client-blocks'));
+    // so is a block with no structs (a count that names a client the section never writes)
+    const empty = encodeStructs([{ client: X, clock: 0, structs: [at('ok')] }, { client: X + 1, clock: 0, structs: [] }]);
+    expectRefused(s, s.conn('attacker'), empty, REFUSED('client-blocks'));
+    // control: one block per client, several clients, is applied
+    const two = encodeStructs([
+      { client: X + 1, clock: 0, structs: [new Y.Item(Y.createID(X + 1, 0), null, Y.createID(first.client, first.clock), null, null, null, null, new Y.ContentString('b'))] },
+      { client: X, clock: 0, structs: [at('a')] },
+    ]);
+    expect(s.send(s.conn('honest'), two)).toBe('applied');
+  });
+
+  it('report mode (the kill switch) still refuses both shapes, and a report-only rule elsewhere in the frame never masks them', () => {
+    const s = setup({ seed: SEED, mode: 'report' });
+    const first = ((textOf(find(s.live, 'paragraph')) as any)._start as Y.Item).id;
+    const at = (str: string) => new Y.Item(Y.createID(X, 0), null, Y.createID(first.client, first.clock), null, null, null, null, new Y.ContentString(str));
+    const gc: StructBlock = { client: X, clock: 0, structs: [new Y.GC(Y.createID(X, 0), 0)] };
+    // alone: refused, and live stays encodable
+    expectRefused(s, s.conn('a1'), encodeStructs([gc]), REFUSED('zero-length'));
+    expectRefused(s, s.conn('a2'), encodeStructs([{ client: X, clock: 0, structs: [at('GOOD')] }, { client: X, clock: 0, structs: [at('BAD!')] }]), REFUSED('client-blocks'));
+    expect(() => Y.encodeStateAsUpdate(s.live)).not.toThrow();
+    // with a report-only content violation (an unknown mark) in the same frame, before or after it
+    const bad = blocksOf(new RemoteClient(s.live, X + 7).edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).format(0, 2, { evil: {} })));
+    const repeated: StructBlock[] = [
+      { client: X, clock: 0, structs: [at('GOOD')] },
+      { client: X, clock: 0, structs: [at('BAD!')] },
+    ];
+    let n = 0;
+    for (const [blocks, rule] of [
+      [[...bad.blocks, gc], 'zero-length'],
+      [[gc, ...bad.blocks], 'zero-length'],
+      [[...bad.blocks, ...repeated], 'client-blocks'],
+      [[...repeated, ...bad.blocks], 'client-blocks'],
+    ] as Array<[StructBlock[], string]>) {
+      expectRefused(s, s.conn(`m${n++}`), encodeStructs(blocks, bad.ds), REFUSED(rule));
+    }
+    const lines = s.logs.filter((l) => l.startsWith('COLLAB_UPDATE_REFUSED ')).map((l) => JSON.parse(l.slice(l.indexOf('{'))));
+    expect(lines.map((l) => [l.rule, l.mode])).toEqual([
+      ['zero-length', 'report'],
+      ['client-blocks', 'report'],
+      ['zero-length', 'report'],
+      ['zero-length', 'report'],
+      ['client-blocks', 'report'],
+      ['client-blocks', 'report'],
+    ]);
+    // the other way: a content rule still only logs in report mode (the frame applies), and so does an honest frame
+    expect(s.send(s.conn('w'), encodeStructs(bad.blocks, bad.ds))).toBe('applied');
+    expect(s.logs.some((l) => l.includes('"rule":"unknown-mark"') && l.includes('"mode":"report"'))).toBe(true);
+    expect(s.send(s.conn('honest'), encodeStructs([{ client: X, clock: 0, structs: [at('ok')] }]))).toBe('applied');
   });
 });
 

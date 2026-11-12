@@ -93,12 +93,25 @@
  * and in total (exact-replica-registry.ts); a log dropped for either, or for frames live applied out of the guard's
  * order, makes the next frame or join rebuild and re-verify the page.
  *
+ * Owner claims (#842, relay-claims.ts). New clocks at an id whose owner has only announced it (`awarenessOnly`) from
+ * another user are a relay of the owner's lost structs or a forgery, and only content identity tells them apart. So
+ * an owner's frame refused that way (`unproven-owner`) leaves a claim: its own structs and delete set, bounded per user
+ * and per process, for CLAIM_TTL_MS. A peer's relay there is compared with the claim before the shadow step (R0–R6:
+ * every struct, position and content, piece by piece); attested clocks bind nothing, prove nothing, and pass through
+ * every rule below, and the apply must leave them as compared (deleted, or GC with evidence). A failed comparison
+ * spends that relayer's one guess on that claim. So co-editors whose frames each carry another's unproven id (a crash
+ * that lost both their tails) no longer block each other; a forgery is still never applied. Two pre-pass shape rules
+ * keep the decoded frame equal to what Yjs integrates: no zero-length struct of any kind, one block per client
+ * (`client-blocks`).
+ *
  * Refusal = a throw of `{ code: 4422, reason }`: Hocuspocus closes that ONE document session and sends the reason (the
  * websocket stays up). Reasons the client acts on (apps/client features/editor-ux): `ccc:collab-update-refused:<rule>`
- * (stop sending, read-only, notice) and `ccc:collab-update-unresolved` (reconnect once: a missing dependency, or new
- * clocks at an id whose owner has only announced it so far, logged `foreign-client` at stage `unproven-owner`). A
+ * (stop sending, read-only, notice) and `ccc:collab-update-unresolved` (retry: a missing dependency, or new clocks at
+ * an id whose owner has only announced it so far that no owner claim attests, logged `foreign-client` at stage
+ * `unproven-owner` with the claim word). A
  * socket whose sessions are refused SOCKET_REFUSAL_BUDGET times is closed outright. An exhausted (user, document) budget is NOT a refusal: the
- * socket is closed 1013 (`tryLater`), which the editor retries. `COLLAB_UPDATE_GUARD=report` logs instead of either.
+ * socket is closed 1013 (`tryLater`), which the editor retries. `COLLAB_UPDATE_GUARD=report` logs instead of either,
+ * except for the rules no honest client ever trips and whose apply would outlive the kill switch (`ALWAYS_ENFORCED`).
  */
 import { Logger } from '@nestjs/common';
 import * as decoding from 'lib0/decoding';
@@ -120,6 +133,7 @@ import {
   type CompactionReason,
 } from '../page-write/compaction-registry';
 import { COLLAB_CONNECTIONS_PER_USER } from './limits';
+import { ClaimLedger, RelayClaims, verifyAttested, type Attested, type AttestResult, type ClaimOutcome, type DecodedFrame, type RecordOutcome } from './relay-claims';
 import { ConflictScan, installConflictScanMeter, type ConflictScanMeter } from './conflict-scan';
 import { COLLAB_PAGE_COMPACTING_REASON, epochStaleReason } from './collab-reasons';
 import { COLLAB_PAGE_COMPACTION_TOKEN, logCompactionRequested, type CompactionLogSink } from './compaction-log';
@@ -176,6 +190,14 @@ import {
 export type CollabGuardMode = 'enforce' | 'report';
 /** Kill switch, read once at load (like write-idem.ts): anything but `report` enforces. */
 export const COLLAB_UPDATE_GUARD_MODE: CollabGuardMode = process.env.COLLAB_UPDATE_GUARD?.trim() === 'report' ? 'report' : 'enforce';
+/**
+ * Rules that refuse in report mode too: no honest client trips them, and an applied frame would outlive the kill switch.
+ * - `root` (#827): a client write to a server-only root (the lineage epoch, the write ledger), which keep lineages apart
+ *   (a forged epoch fails every later connection and compaction).
+ * - `zero-length` and `client-blocks` (#842, the pre-pass shape rules): a zero-length GC makes the page unencodable
+ *   (never stored or answered again), and a repeated block shows the rules structs Yjs never integrates.
+ */
+export const ALWAYS_ENFORCED: ReadonlySet<string> = new Set(['root', 'zero-length', 'client-blocks']);
 export const COLLAB_REFUSAL_CODE = 4422;
 export const REFUSED_REASON_PREFIX = 'ccc:collab-update-refused:';
 export const UNRESOLVED_REASON = 'ccc:collab-update-unresolved';
@@ -306,7 +328,7 @@ export interface GuardConnection {
 export type GuardDocument = Y.Doc & {
   name?: string;
   awareness?: { meta: Map<number, { clock: number }> };
-  getConnections?(): Array<{ webSocket?: { close(code?: number, reason?: string): void } }>;
+  getConnections?(): Array<{ webSocket?: { close(code?: number, reason?: string): void }; readOnly?: boolean; context?: { user?: { id?: unknown } } }>;
 };
 /** The subset of Hocuspocus's `beforeHandleMessagePayload` the guard reads. */
 export interface GuardFrame {
@@ -358,15 +380,19 @@ export interface CollabGuardOptions {
   deadlines?: Partial<GuardDeadlines>;
   /** #827: the probe's timer (unref'd setTimeout). */
   schedule?: ScheduleTimer;
+  /** #842: the process's owner-claim bytes (relay-claims.ts); specs pass smaller bounds. */
+  claimLedger?: ClaimLedger;
 }
 type Header = { type: number; subtype?: number; payload?: Uint8Array | null };
 /** One awareness entry, its state still the undecoded UTF-8 JSON. */
 type AwarenessEntry = { clientID: number; clock: number; state: Uint8Array };
 /**
  * #816: what a refusal line may add: numbers and fixed words only, never a value from the frame. `unproven-owner`: a
- * `foreign-client` at an id whose owner has only announced it, answered `unresolved` (inspectTransaction).
+ * `foreign-client` at an id whose owner has only announced it, answered `unresolved` (inspectTransaction). #842 `claim`,
+ * with it: why no owner claim attested the relay (`none`, `uncovered`: R1/R2, `mismatch`: a failed comparison, now
+ * burned, `burned`: compared and failed before), or `full`: the sender's own claim found no room (relay-claims.ts).
  */
-type RefusalLog = { steps?: number; stage?: 'conflict-scan' | 'unproven-owner' };
+type RefusalLog = { steps?: number; stage?: 'conflict-scan' | 'unproven-owner'; claim?: ClaimOutcome | 'full' };
 type ShadowResult = {
   violation: Violation | null;
   binds: Map<number, string>;
@@ -392,6 +418,10 @@ type ShadowResult = {
   unclear: boolean;
   /** #840: the shadow's encoding may have changed (`encodingChanged`): what the join check's cache key counts. */
   changes: boolean;
+  /** #842: attested ids the frame wrote new clocks at (accepted: COLLAB_RELAY_ATTESTED), and those whose apply failed
+   *  their R4/R6 checks (`verifyAttested`: refused `unproven-owner`, the relayer burned when `failed`). */
+  relayed?: Set<number>;
+  relayFailed?: Map<number, 'pending' | 'failed'>;
 };
 /** What `inspectTransaction` finds inside the transaction. `extra`: struct-array lengths, mid-transaction, of clients a
  *  delete reached that the pre-pass did not name (a keyed overwrite deletes the key's previous item). */
@@ -407,6 +437,9 @@ type Inspection = {
   /** #840: an item contradicts its own origins (blame, never a refusal); or no walk could tell (`unclear`). */
   suspect: boolean;
   unclear: boolean;
+  /** #842: see ShadowResult. */
+  relayed: Set<number>;
+  relayFailed: Map<number, 'pending' | 'failed'>;
 };
 type Ranges = Map<number, Array<[number, number]>>;
 type PrePass = {
@@ -418,6 +451,10 @@ type PrePass = {
   reaches: Set<number>;
   /** #827: per client, the clock its structs end at: what live must hold once it applied the frame. */
   ends: Map<number, number>;
+  /** #842: the decoded frame (the relay comparison reads it; null when undecodable), and every client it has structs
+   *  at, held ones included (an owner claim keeps only the claimed ids' structs). */
+  decoded: DecodedFrame | null;
+  structClients: Set<number>;
 };
 /** #840 `diverged`: no exact shadow can be built (no trusted log, the tripwire, the replay's bounds) until the page heals. */
 type ShadowState = 'ready' | 'unavailable' | 'compacting' | 'diverged';
@@ -496,7 +533,11 @@ class DocGuard {
    * SUSPECTS_PER_PAGE per verdict), however many joins or probes find the page unstable while it cannot heal yet.
    */
   episode: { epoch: number | null; struck: Set<string> } | null = null;
-  constructor(readonly live: GuardDocument) {}
+  constructor(
+    readonly live: GuardDocument,
+    /** #842: owner claims (relay-claims.ts): what an owner sent in a frame refused `unproven-owner`. */
+    readonly claims: RelayClaims,
+  ) {}
 }
 
 type Bucket = { tokens: number; at: number };
@@ -546,6 +587,8 @@ export class CollabUpdateGuard {
   /** #827: probes due, run one per macrotask (each is synchronous work of up to PROBE_DEADLINE_MS). */
   private readonly probeQueue: DocGuard[] = [];
   private probeDraining = false;
+  /** #842: the owner-claim bytes of every document in this process (relay-claims.ts). */
+  private readonly claimLedger: ClaimLedger;
 
   constructor(opts: CollabGuardOptions = {}) {
     this.mode = opts.mode ?? COLLAB_UPDATE_GUARD_MODE;
@@ -559,6 +602,7 @@ export class CollabUpdateGuard {
     this.caps = { structs: S_MAX, clientIds: C_MAX, children: E_MAX, steps: W_MAX, compactLive: COMPACT_MAX_LIVE_STRUCTS, ...opts.caps };
     this.deadlines = { frame: T_FRAME_MS, load: LOAD_DEADLINE_MS, probe: PROBE_DEADLINE_MS, mirror: MIRROR_DEADLINE_MS, ...opts.deadlines };
     this.schedule = opts.schedule ?? timerSchedule;
+    this.claimLedger = opts.claimLedger ?? new ClaimLedger();
     // Throws when yjs changed shape, so the server refuses to boot rather than run unbounded (#816).
     this.meter = installConflictScanMeter(Y);
   }
@@ -915,6 +959,10 @@ export class CollabUpdateGuard {
       // 1b. #816: client ids live has never seen, charged before anything integrates them.
       violation ??= this.chargeNewClientIds(frame, pre.clients);
       if (violation && this.enforces(violation.rule)) return this.refuse(frame, header, violation);
+      // 1c. #842: new clocks at another user's awareness-only id, compared with that owner's claim (relay-claims.ts),
+      //     against live's state (the shadow's new clocks never start below it). The shadow step then lets exactly the
+      //     attested clocks through to every content rule, and checks the deletes and GCs they promised.
+      const relay = this.attestRelays(doc, frame, userId, pre);
       // 2. The shadow step. #840: the replay log only grows between checkpoints and recording never drops an entry, so
       // an entry past its caps, or past the process total, makes it stop being trusted (exact-replica-registry.ts)
       // whoever wrote it (a server write is logged too). This frame then rebuilds first (charged to this user): a reload
@@ -930,7 +978,7 @@ export class CollabUpdateGuard {
       if (ready === 'diverged') return this.tryLater(frame, 'order_divergence');
       if (ready !== 'ready') return this.refuse(frame, header, violation ?? { rule: 'shadow-unavailable' });
       const applyStarted = this.cpuNow();
-      const result = this.applyToShadow(doc, payload, userId, pre, ownedBy(doc.announced.get(frame.connection)));
+      const result = this.applyToShadow(doc, payload, userId, pre, ownedBy(doc.announced.get(frame.connection)), relay.attested);
       const applyMs = this.cpuNow() - applyStarted;
       if (result.timedOut) return this.deadlineStrike(frame, header);
       // A write outside `default` wins over a report-only pre-pass violation: it is refused in every mode
@@ -941,7 +989,7 @@ export class CollabUpdateGuard {
         // (ensureShadow), so a refuse/reconnect loop pays no rebuild per refusal, and that rebuild is this user's.
         doc.dirty = true;
         doc.dirtiedBy = userId;
-        return this.refuse(frame, header, violation, result.log);
+        return this.refuse(frame, header, violation, this.unprovenOwner(doc, frame, userId, payload, pre, relay, result));
       }
       if (violation) this.refuse(frame, header, violation, result.log); // report mode: logged, and the frame applies
       // 3. #827: the per-page structure caps, on what the frame changed.
@@ -955,6 +1003,13 @@ export class CollabUpdateGuard {
       this.budgetFor(frame).deadline = 0; // an accepted frame clears the strike
       for (const [client, user] of result.binds) if (!doc.bindings.has(client)) doc.bindings.set(client, user);
       for (const client of result.proven ?? []) doc.awarenessOnly.delete(client);
+      if (result.proven?.size) doc.claims.drop(userId); // #842: its ids are proven, its claim is moot
+      if (result.relayed?.size) {
+        // #842: a relay an owner claim attested (counts only)
+        let clocks = 0;
+        for (const client of result.relayed) clocks += relay.attested.get(client)!.to - relay.attested.get(client)!.from;
+        this.log('COLLAB_RELAY_ATTESTED', doc.live, { userId, ids: result.relayed.size, clocks });
+      }
       const raw = payload.slice();
       // A frame the shadow could not apply is not replayed into a rebuild (it would fail every rebuild from then on).
       if (result.applied) {
@@ -980,6 +1035,68 @@ export class CollabUpdateGuard {
     } finally {
       this.chargeCpu(userId, this.cpuNow() - started - othersMs, workStarted);
     }
+  }
+
+  /**
+   * #842: the frame's new clocks at ids that are awareness-only and bound to another user, compared with each owner's
+   * claim (relay-claims.ts). Enforce mode only (report mode records no claims). An owner's claim is used while its owner
+   * has no read-only connection on the document (narrowed: dropped from use). Not "while the owner has a writer
+   * connection": Hocuspocus removes a refused session's connection, so an owner whose frame was just refused has none
+   * until its retry reconnects, which is exactly when its peers' relays must be judged; CLAIM_TTL_MS bounds an owner
+   * that never returns.
+   */
+  private attestRelays(doc: DocGuard, frame: GuardFrame, userId: string, pre: PrePass): AttestResult {
+    const candidates: number[] = [];
+    for (const client of pre.clients) {
+      const owner = doc.bindings.get(client);
+      if (owner !== undefined && owner !== userId && doc.awarenessOnly.has(client)) candidates.push(client);
+    }
+    if (!candidates.length || this.mode !== 'enforce' || pre.decoded === null) return { attested: new Map(), failed: new Map() };
+    const live = frame.document;
+    return doc.claims.attest({
+      relayer: userId,
+      frame: pre.decoded,
+      candidates,
+      stateOf: (client) => Y.getState(live.store, client),
+      ownerOf: (client) => doc.bindings.get(client),
+      isAwarenessOnly: (client) => doc.awarenessOnly.has(client),
+      ownerMayWrite: (owner) => !(live.getConnections?.() ?? []).some((c) => c.readOnly === true && String(c.context?.user?.id ?? '') === owner),
+      now: this.now(),
+    });
+  }
+
+  /**
+   * #842: a frame refused for new clocks at an unproven owner's id (stage `unproven-owner`; any other refusal's log is
+   * passed through). A relay that failed its post-apply checks burns its relayer for that claim. The sender's OWN
+   * claim is recorded (enforce mode): its new clocks at ids bound to it, still awareness-only, and announced by this
+   * connection. The log line says why no claim attested the relay (fixed words only).
+   */
+  private unprovenOwner(doc: DocGuard, frame: GuardFrame, userId: string, payload: Uint8Array, pre: PrePass, relay: AttestResult, result: ShadowResult): RefusalLog | undefined {
+    if (result.log?.stage !== 'unproven-owner') return result.log;
+    const outcomes = new Set<ClaimOutcome>(relay.failed.values());
+    for (const [client, why] of result.relayFailed ?? []) {
+      if (why === 'failed') doc.claims.burn(relay.attested.get(client)!.owner, userId);
+      outcomes.add(why === 'failed' ? 'mismatch' : 'uncovered');
+    }
+    let recorded: RecordOutcome = 'none';
+    if (this.mode === 'enforce') {
+      const announced = doc.announced.get(frame.connection);
+      const ids = new Set<number>();
+      for (const client of pre.clients) {
+        if (doc.bindings.get(client) === userId && doc.awarenessOnly.has(client) && announced?.has(client)) ids.add(client);
+      }
+      recorded = doc.claims.record(userId, ids, payload, pre.structClients, this.now());
+    }
+    const claim: ClaimOutcome | 'full' = outcomes.has('mismatch')
+      ? 'mismatch'
+      : outcomes.has('burned')
+        ? 'burned'
+        : recorded === 'full'
+          ? 'full'
+          : outcomes.has('uncovered')
+            ? 'uncovered'
+            : 'none';
+    return { ...result.log, claim };
   }
 
   /**
@@ -1188,7 +1305,14 @@ export class CollabUpdateGuard {
    * item it was replaying integrates; the scope says which, never the error's identity. A timeout skipped Yjs's
    * cleanup (`shadow._transaction` stays set): that shadow is thrown away.
    */
-  private applyToShadow(doc: DocGuard, payload: Uint8Array, userId: string, pre: PrePass, own: (client: number) => boolean): ShadowResult {
+  private applyToShadow(
+    doc: DocGuard,
+    payload: Uint8Array,
+    userId: string,
+    pre: PrePass,
+    own: (client: number) => boolean,
+    attested: ReadonlyMap<number, Attested>,
+  ): ShadowResult {
     const shadow = doc.shadow!;
     const store = shadow.store;
     const pendingBefore = pendingRanges(store);
@@ -1225,7 +1349,7 @@ export class CollabUpdateGuard {
               (tr) => {
                 applied = tr;
                 Y.applyUpdate(shadow, payload, INSPECT); // V1, as y-protocols reads Step2 and Update
-                out = this.inspectTransaction(doc, tr, userId, own, pendingBefore, pre.clients, tracked);
+                out = this.inspectTransaction(doc, tr, userId, own, pendingBefore, pre.clients, tracked, attested);
               },
               INSPECT,
               false,
@@ -1264,6 +1388,8 @@ export class CollabUpdateGuard {
       suspect: found.suspect,
       unclear: found.unclear,
       changes: applied === null || encodingChanged(applied, pendingAtStart),
+      relayed: found.relayed,
+      relayFailed: found.relayFailed,
     };
     // Report mode: the meter counted past the cap and threw nothing; the frame is logged as it would have been refused.
     if (scan.trip !== null) return { ...result, violation: { rule: 'conflict-scan' }, log: { steps: scan.steps } };
@@ -1282,6 +1408,7 @@ export class CollabUpdateGuard {
     pendingBefore: Ranges,
     frameClients: Set<number>,
     tracked: Map<number, number>,
+    attested: ReadonlyMap<number, Attested>,
   ): Inspection {
     const shadow = tr.doc;
     const store = shadow.store;
@@ -1292,6 +1419,8 @@ export class CollabUpdateGuard {
     const binds = new Map<number, string>();
     const proven = new Set<number>();
     const reportOnly: Violation[] = [];
+    const relayed = new Set<number>();
+    const relayFailed = new Map<number, 'pending' | 'failed'>();
     let added = 0;
     let suspect = false;
     let unclear = false;
@@ -1301,7 +1430,7 @@ export class CollabUpdateGuard {
       for (const type of grew) children = Math.max(children, (type as Y.XmlFragment).length); // the root or an element
       const extra = new Map<number, number>();
       for (const client of tr.deleteSet.clients.keys()) if (!tracked.has(client)) extra.set(client, lengthOf(store, client));
-      return { violation, ...(log ? { log } : {}), binds, proven, reportOnly, added, children, extra, suspect, unclear };
+      return { violation, ...(log ? { log } : {}), binds, proven, reportOnly, added, children, extra, suspect, unclear, relayed, relayFailed };
     };
 
     // #827: a delete outside `default` (the lineage epoch, the write ledger) first, before any other rule can return:
@@ -1334,13 +1463,18 @@ export class CollabUpdateGuard {
             // structs relayed from a lifetime that lost them: it stays unbound, so its author's awareness claims it.
             if (!tr.beforeState.has(client) && own(client)) binds.set(client, userId);
           } else if (owner !== userId) {
+            if (!doc.awarenessOnly.has(client)) return result({ rule: 'foreign-client' });
             // The owner has only announced the id so far: its own Step2 may still be on the way while a peer relays its
-            // lost structs (the mirror race after a lost lifetime). Never applied either way; `unresolved` makes the
-            // sender reconnect once. That recovers a ONE-SIDED relay, and only when the owner's Step2 lands before the
-            // retry (an owner round trip under about twice the relayer's). Residual (ADR 0036 §4): when co-editors' frames
-            // each carry another's unproven id, none lands and none proves, so each is unresolved twice, which is final.
-            if (doc.awarenessOnly.has(client)) return result({ rule: 'foreign-client' }, { stage: 'unproven-owner' });
-            return result({ rule: 'foreign-client' });
+            // lost structs (the mirror race after a lost lifetime). #842: such a relay lands only where it equals what
+            // the owner itself sent in a frame refused here (its claim, compared before this step: `attested`), so
+            // co-editors whose frames each carry another's unproven id no longer block each other. An attested clock
+            // binds nothing and proves nothing, and falls through to every rule below (never `continue`). Any other
+            // new clock here is never applied: `unresolved` makes the sender retry.
+            const att = attested.get(client);
+            if (att === undefined || struct.id.clock < att.from || struct.id.clock + struct.length > att.to) {
+              return result({ rule: 'foreign-client' }, { stage: 'unproven-owner' });
+            }
+            relayed.add(client);
           } else if (doc.awarenessOnly.has(client)) {
             proven.add(client);
           }
@@ -1355,6 +1489,14 @@ export class CollabUpdateGuard {
           if (blame === true) suspect = true;
           else if (blame === null) unclear = true;
         }
+      }
+    }
+    // #842: an attested relay must have integrated as compared: its R4 pieces deleted, its R6 GCs with their evidence.
+    for (const client of relayed) {
+      const verdict = verifyAttested(store, client, attested.get(client)!);
+      if (verdict !== 'ok') {
+        relayFailed.set(client, verdict);
+        return result({ rule: 'foreign-client' }, { stage: 'unproven-owner' });
       }
     }
     // #840: a new item beside a neighbour of another parent or key: the item is checked against one parent while it
@@ -1396,7 +1538,7 @@ export class CollabUpdateGuard {
   private docFor(live: GuardDocument): DocGuard {
     const known = this.docs.get(live);
     if (known) return known;
-    const created = new DocGuard(live);
+    const created = new DocGuard(live, new RelayClaims(this.claimLedger));
     created.bindings.set(live.clientID, SERVER);
     ensureReplicaLog(live); // #840: attached at load (persistence); otherwise untrusted until a rebuild verifies it
     // The mirror NEVER throws: a throw in a Yjs 'update' listener stops every later listener and wedges the document's
@@ -1447,6 +1589,7 @@ export class CollabUpdateGuard {
       created.probeTimer?.cancel();
       created.probeTimer = null;
       created.shadow = null;
+      created.claims.clear(); // #842: its bytes go back to the process budget
       this.docs.delete(live);
     });
     this.docs.set(live, created);
@@ -1895,12 +2038,11 @@ export class CollabUpdateGuard {
 
   /** Logs the refusal; in enforce mode also closes the session (throws) and counts against the socket's budget. */
   /**
-   * #827: whether `rule` refuses (enforce mode), or only logs (report mode). A write outside the `default` root is
-   * refused in every mode: the server-only roots (the lineage epoch, the write ledger) are what keep lineages apart, and
-   * a client write there would outlive the kill switch (a forged epoch fails every later connection and compaction).
+   * #827: whether `rule` refuses (enforce mode), or only logs (report mode). ALWAYS_ENFORCED rules refuse in every
+   * mode.
    */
   private enforces(rule: string): boolean {
-    return this.mode === 'enforce' || rule === 'root';
+    return this.mode === 'enforce' || ALWAYS_ENFORCED.has(rule);
   }
 
   private refuse(frame: GuardFrame, header: Header, violation: Violation, extra?: RefusalLog): void {
@@ -1948,7 +2090,12 @@ export class CollabUpdateGuard {
  * static token; pinned by the client's collab-provider-order.test.ts), so a sender that announced ids and writes another
  * never-seen one is relaying a peer's structs. Residual: a doc whose id Yjs regenerated (a remote write at its current
  * id) keeps announcing the old one, so its new id stays unbound (relay-binding.spec.ts); the guard refuses that remote
- * write at every bound id, so on an honest page it follows only an id collision.
+ * write at every bound id, so on an honest page it follows only an id collision. An editor of the page can still force
+ * one across a reload (#845): bindings are not persisted, so while the document reloads it writes at the victim's id
+ * before the victim reconnects; the victim's Yjs then regenerates its id on the relayed write, the new id stays unbound
+ * here, and the editor can forge at it (silently dropping the victim's later edits) or claim it by awareness. Closing it
+ * needs the client to re-announce under its new id, or persisted bindings (#793) restored awareness-only-like so that
+ * owner claims cover them.
  */
 const ownedBy =
   (announced: Set<number> | undefined) =>
@@ -1992,21 +2139,40 @@ const tryRead = (read: () => Uint8Array): Uint8Array | null => {
  * judged by its wire order alone. `Y.decodeUpdate` keeps that order (`readDeleteSet` appends, it never sorts). #827:
  * also the other client ids the apply can split or merge (dependencies, delete ranges, and every struct's own client,
  * held or not: tracking only), and the clock each client's structs end at.
+ *
+ * #842: two shape rules on the WHOLE frame, held structs included, never written by an honest encoder (0 of either in
+ * a fuzz of 19,990 honest updates):
+ * - `zero-length`: a struct of any kind (GC and Skip too) that takes no clock. A zero-length GC was accepted before:
+ *   after it `Y.encodeStateAsUpdate` throws (the page can no longer be stored or answered), and a frame of them is
+ *   hundreds of MiB of heap (update-guard.spec.ts).
+ * - `client-blocks`: a struct section whose block count is not its number of distinct clients. Yjs's apply keeps only
+ *   the LAST block of a repeated client while `Y.decodeUpdate` returns them all, so a reader of the decoded frame (the
+ *   rules here, an owner-claim comparison) would see structs Yjs never integrates.
+ * Both refuse in every mode (ALWAYS_ENFORCED), ahead of any other pre-pass violation but `root`.
  */
 function prePass(payload: Uint8Array, live: Y.Doc): PrePass {
   const clients = new Set<number>();
   const reaches = new Set<number>();
   const ends = new Map<number, number>();
+  const structClients = new Set<number>();
   let decoded: { structs: Array<Y.Item | Y.GC | Y.Skip>; ds: { clients: Map<number, Array<{ clock: number; len: number }>> } };
+  let blocks: number;
   try {
     decoded = Y.decodeUpdate(payload) as typeof decoded;
+    blocks = decoding.readVarUint(decoding.createDecoder(payload)); // V1: the struct section's block count comes first
   } catch {
-    return { violation: { rule: 'undecodable' }, clients, reaches, ends }; // e.g. a lib0 `readAny` value deep enough to overflow the decoder
+    // e.g. a lib0 `readAny` value deep enough to overflow the decoder
+    return { violation: { rule: 'undecodable' }, clients, reaches, ends, decoded: null, structClients };
   }
   let violation: Violation | null = null;
   let rootWrite = false; // #827: a write outside `default` wins over any other violation (refused in every mode)
+  // #842: so do the two shape rules (ALWAYS_ENFORCED): a report-only violation earlier in the frame never masks them
+  let shape: Violation | null = null;
   const states = new Map<number, number>();
+  for (const struct of decoded.structs) structClients.add(struct.id.client);
+  if (blocks !== structClients.size) shape = { rule: 'client-blocks' };
   for (const struct of decoded.structs) {
+    if (!(struct.length > 0)) shape ??= { rule: 'zero-length' }; // before the Skip and held skips
     if (struct instanceof Y.Skip) continue;
     const client = struct.id.client;
     const end = struct.id.clock + struct.length;
@@ -2026,7 +2192,14 @@ function prePass(payload: Uint8Array, live: Y.Doc): PrePass {
     }
   }
   for (const client of decoded.ds.clients.keys()) reaches.add(client);
-  return { violation: rootWrite ? { rule: 'root' } : (violation ?? deleteOrder(decoded.ds.clients)), clients, reaches, ends };
+  return {
+    violation: rootWrite ? { rule: 'root' } : (shape ?? violation ?? deleteOrder(decoded.ds.clients)),
+    clients,
+    reaches,
+    ends,
+    decoded,
+    structClients,
+  };
 }
 
 /**
