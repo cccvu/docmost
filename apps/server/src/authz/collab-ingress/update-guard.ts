@@ -95,6 +95,7 @@ import { COLLAB_PAGE_COMPACTION_TOKEN, logCompactionRequested, type CompactionLo
 import { isDeadlineExceeded, runWithDeadline, type DeadlineRunner } from './deadline';
 import { capVerdict, compactionWouldHelp, liveStructure } from './live-structure';
 import {
+  COMPACT_MAX_LIVE_STRUCTS,
   C_MAX,
   E_MAX,
   LOAD_DEADLINE_MS,
@@ -248,6 +249,8 @@ export interface DocCaps {
   clientIds: number;
   children: number;
   steps: number;
+  /** Live structs past which compaction is never attempted (COMPACT_MAX_LIVE_STRUCTS; `compactionWouldHelp`). */
+  compactLive: number;
 }
 /** #827: the deadlines, in ms (doc-bounds.ts). */
 export interface GuardDeadlines {
@@ -410,7 +413,7 @@ export class CollabUpdateGuard {
     this.cpuNow = opts.cpuNow ?? (() => performance.now());
     this.runWithDeadline = opts.runWithDeadline ?? runWithDeadline;
     this.maxFrameBytes = opts.maxFrameBytes ?? PAGE_MAX_YDOC_BYTES;
-    this.caps = { structs: S_MAX, clientIds: C_MAX, children: E_MAX, steps: W_MAX, ...opts.caps };
+    this.caps = { structs: S_MAX, clientIds: C_MAX, children: E_MAX, steps: W_MAX, compactLive: COMPACT_MAX_LIVE_STRUCTS, ...opts.caps };
     this.deadlines = { frame: T_FRAME_MS, load: LOAD_DEADLINE_MS, probe: PROBE_DEADLINE_MS, mirror: MIRROR_DEADLINE_MS, ...opts.deadlines };
     this.schedule = opts.schedule ?? timerSchedule;
     // Throws when yjs changed shape, so the server refuses to boot rather than run unbounded (#816).

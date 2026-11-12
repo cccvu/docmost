@@ -46,6 +46,7 @@ import { ConflictScan, installConflictScanMeter, type ConflictScanMeter } from '
 import { logCompactionFailed, logCompactionRequested, logPageCompaction } from '../collab-ingress/compaction-log';
 import { isDeadlineExceeded, runWithDeadline } from '../collab-ingress/deadline';
 import {
+  COMPACT_MAX_LIVE_STRUCTS,
   COMPACTION_DEADLINE_MS,
   C_MAX,
   E_MAX,
@@ -218,8 +219,10 @@ export interface LoadCaps {
   structs: number;
   clientIds: number;
   children: number;
+  /** Live structs past which compaction is never attempted (COMPACT_MAX_LIVE_STRUCTS unless a spec passes smaller). */
+  compactLive?: number;
 }
-const LOAD_CAPS: LoadCaps = Object.freeze({ structs: S_MAX, clientIds: C_MAX, children: E_MAX });
+const LOAD_CAPS: LoadCaps = Object.freeze({ structs: S_MAX, clientIds: C_MAX, children: E_MAX, compactLive: COMPACT_MAX_LIVE_STRUCTS });
 export const LOAD_BOUNDS: LoadBounds = Object.freeze({ steps: W_MAX, deadlineMs: LOAD_DEADLINE_MS, caps: LOAD_CAPS });
 
 /**

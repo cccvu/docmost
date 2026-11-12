@@ -18,7 +18,7 @@ import { COLLAB_PAGE_COMPACTING_REASON, epochStaleReason } from './collab-reason
 import { ConflictScan, CONFLICT_SCAN_STEPS_PER_FRAME, installConflictScanMeter } from './conflict-scan';
 import { basePage, rawUpdate, type RawStruct } from './conflict-scan.testkit';
 import { deadlineExceeded, isDeadlineExceeded, runWithDeadline, type DeadlineRunner } from './deadline';
-import { COMPACTION_ARM_DELAY_MS, COMPACTION_MIN_INTERVAL_MS, PROBE_DEBOUNCE_MS, PROBE_MIN_INTERVAL_MS, readerStep2ChargeMs, softCap } from './doc-bounds';
+import { COMPACTION_ARM_DELAY_MS, COMPACTION_MIN_INTERVAL_MS, E_MAX, PROBE_DEBOUNCE_MS, PROBE_MIN_INTERVAL_MS, readerStep2ChargeMs, softCap } from './doc-bounds';
 import { SocketLimitLog } from './socket-limit-log';
 import {
   COLLAB_REFUSAL_CODE,
@@ -542,14 +542,17 @@ describe('#827 a hard cap drains only when compaction would bring the page under
     }
   };
   const NO_DEADLINE = { deadlines: { frame: 60_000, load: 60_000, probe: 60_000, mirror: 60_000 } };
-  const prose = 'Honest prose is mostly sentences of ordinary length, with a word in bold here and there, and paragraphs of a few lines. '.repeat(2).slice(0, 150);
+  const sentence = 'Honest prose is mostly sentences of ordinary length, with a word in bold here and there, and paragraphs of a few lines. ';
+  const prose = sentence.repeat(6).slice(0, 600);
 
-  it('an honest 3 MiB paste of prose (150-byte paragraphs) into an empty page is accepted at the real caps', () => {
+  it('an honest 3 MiB paste of prose (600-byte paragraphs) into an empty page is accepted at the real caps', () => {
     armed();
     const s = setup(paragraphs(1), NO_DEADLINE);
     const { update, n } = paste(s.live, 70, prose, true);
     expect(update.length).toBeGreaterThan(2.85 * 1024 * 1024);
-    expect(n).toBeGreaterThan(10_000); // past the 10k E_MAX this used to refuse
+    // E_MAX (6k, sized on Graviton2) admits a 3 MiB paste of paragraphs from about 520 bytes; this one sits under its soft cap
+    expect(n).toBeLessThan(softCap(E_MAX));
+    expect(n).toBeGreaterThan(E_MAX / 2);
     expect(s.send(s.conn('a'), update)).toBe('applied');
     expect(s.live.getXmlFragment('default').length).toBe(n + 1);
     expect(compactionRequest(s.live)).toBeNull(); // under every soft cap: nothing to compact
@@ -561,7 +564,7 @@ describe('#827 a hard cap drains only when compaction would bring the page under
     const other = s.conn('other');
     const before = s.state();
     const { update, n } = paste(s.live, 70, 'abcdefgh', false);
-    expect(n).toBeGreaterThan(14_000); // past E_MAX and S_MAX in live content: no compaction can shed it
+    expect(n).toBeGreaterThan(E_MAX); // past E_MAX (and S_MAX, COMPACT_MAX_LIVE_STRUCTS) in live content: no compaction sheds it
     expect(s.send(s.conn('a'), update)).toBe(REFUSED('page-full'));
     expect(s.state().equals(before)).toBe(true);
     expect(compactionRequest(s.live)).toBeNull();
@@ -580,6 +583,28 @@ describe('#827 a hard cap drains only when compaction would bring the page under
     }
     return doc;
   };
+
+  it('a page whose live structs pass the compaction ceiling (COMPACT_MAX_LIVE_STRUCTS) is page-full at the hard cap and never drains', () => {
+    armed();
+    const CAP = 200;
+    const grow = (live: Y.Doc, client: number) =>
+      editAs(live, client, (d) => {
+        for (let i = 0; i < 60; i++) textOf(d, i % 5).insert(1, 'q');
+      });
+    // control: the same page and crossing, with the ceiling above its live structs, drains to compact
+    const control = setup(withHistory(150), { caps: { structs: CAP, compactLive: 1_000 } });
+    expect(control.send(control.conn('a'), editAs(control.live, 70, (d) => textOf(d).insert(0, 'k')))).toBe('applied');
+    expect(control.send(control.conn('a'), grow(control.live, 70))).toBe(COMPACTING);
+    expect(isDraining(control.live)).toBe(true);
+    // treatment: its live structs (about 15) are over a ceiling of 10: no build is attempted, the growth is page-full
+    const s = setup(withHistory(150), { caps: { structs: CAP, compactLive: 10 } });
+    const other = s.conn('other');
+    expect(s.send(s.conn('a'), editAs(s.live, 70, (d) => textOf(d).insert(0, 'k')))).toBe('applied');
+    expect(s.send(s.conn('a'), grow(s.live, 70))).toBe(REFUSED('page-full'));
+    expect(isDraining(s.live)).toBe(false);
+    expect(compactionRequest(s.live)).toBeNull();
+    expect(other.webSocket.close).not.toHaveBeenCalled();
+  });
 
   it('page-full within the compaction interval lapses with it: the same crossing after the interval drains', () => {
     let now = Date.now();

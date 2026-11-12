@@ -389,9 +389,9 @@ describe('#827 honest work at the caps is never refused', () => {
     return Y.encodeStateAsUpdate(r, Y.encodeStateVector(live));
   };
 
-  it('a paste just under the frame cap (prose, 400-character paragraphs) is accepted', () => {
+  it('a paste just under the frame cap (prose, 600-character paragraphs, under E_MAX) is accepted', () => {
     const s = caps();
-    const update = paste(s.live, 4242, () => prose(6_400, 400));
+    const update = paste(s.live, 4242, () => prose(4_400, 600));
     expect(update.length).toBeGreaterThan(2.5 * 1024 * 1024);
     expect(update.length).toBeLessThanOrEqual(PAGE_MAX_YDOC_BYTES);
     expect(s.send(s.conn('a'), update)).toBe('applied');

@@ -24,6 +24,7 @@
 import * as Y from 'yjs';
 import {
   COMPACTION_ARM_DELAY_MS,
+  COMPACTION_GAP_FACTOR,
   COMPACTION_MIN_INTERVAL_MS,
   COMPACTIONS_IN_FLIGHT_MAX,
 } from '../collab-ingress/doc-bounds';
@@ -144,6 +145,12 @@ export function markPageFull(doc: object, full = true, until: number | null = nu
 const inflight = new Map<string, Promise<void>>();
 /** When each page last started a compaction (ms, the registry's clock). Pruned past the interval. */
 const lastStarted = new Map<string, number>();
+/**
+ * Process-wide: no compaction starts before this (ms, the registry's clock). Set when one settles, to its end plus
+ * COMPACTION_GAP_FACTOR × its duration, so back-to-back compactions of different pages hold at most about a third of
+ * the process.
+ */
+let nextStartAt = 0;
 
 export interface CompactionClock {
   /** Wall clock, ms. */
@@ -191,13 +198,22 @@ export function resumeCompactionsForTests(): void {
   stopped = false;
 }
 
+/** Clear the process-wide gap after the last compaction (jest only: specs run many compactions back to back). */
+export function resetCompactionGapForTests(): void {
+  if (process.env.JEST_WORKER_ID === undefined) throw new Error('resetCompactionGapForTests is for jest only (#827)');
+  nextStartAt = 0;
+}
+
 /**
  * Whether a compaction of `pageId` may start now: armed, the process not draining, none in flight for the page, fewer
- * than the per-process limit in flight, and none started for the page within COMPACTION_MIN_INTERVAL_MS.
+ * than the per-process limit in flight, the process-wide gap after the last one elapsed (COMPACTION_GAP_FACTOR), and
+ * none started for the page within COMPACTION_MIN_INTERVAL_MS. A page that may not start waits as for the in-flight
+ * limit: its request stays, and the next unload (or load) tries again.
  */
 export function canStartCompaction(pageId: string, now: number = clock.now()): boolean {
   if (!compactionArmed() || stopped) return false;
   if (inflight.has(pageId) || inflight.size >= COMPACTIONS_IN_FLIGHT_MAX) return false;
+  if (now < nextStartAt) return false;
   const last = lastStarted.get(pageId);
   return last === undefined || now - last >= COMPACTION_MIN_INTERVAL_MS;
 }
@@ -217,6 +233,8 @@ export function registerInflight(pageId: string, compaction: Promise<unknown>, n
   );
   const tracked = settled.finally(() => {
     if (inflight.get(pageId) === tracked) inflight.delete(pageId);
+    const ended = clock.now();
+    nextStartAt = Math.max(nextStartAt, ended + COMPACTION_GAP_FACTOR * Math.max(0, ended - now));
   });
   inflight.set(pageId, tracked);
   return tracked;

@@ -1,12 +1,35 @@
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { capVerdict, type CapMeasure } from './live-structure';
+import { COMPACT_MAX_LIVE_STRUCTS, softCap } from './doc-bounds';
+import { capVerdict, compactionWouldHelp, type CapMeasure } from './live-structure';
 
 /**
  * #827 (ADR 0036): `capVerdict` is THE cap rule. The update guard (a frame that grows the page, a rebuild, a probe, a
  * mirrored server write) and the load path (compaction.ts) both decide through it, so they agree on the boundaries
  * (soft: at softCap; hard: strictly past the cap), on when a structure cap is compactable, and on page-full.
  */
+describe('#827 compactionWouldHelp: under the soft caps, and within what one build may rebuild', () => {
+  const caps = { structs: 150_000, children: 6_000 };
+  it('a page whose live structs pass COMPACT_MAX_LIVE_STRUCTS is never compacted, though under every soft cap', () => {
+    expect(COMPACT_MAX_LIVE_STRUCTS).toBeLessThan(softCap(caps.structs));
+    expect(compactionWouldHelp({ structs: COMPACT_MAX_LIVE_STRUCTS, children: 100 }, caps)).toBe(true);
+    expect(compactionWouldHelp({ structs: COMPACT_MAX_LIVE_STRUCTS + 1, children: 100 }, caps)).toBe(false);
+    // the soft caps still decide below it
+    expect(compactionWouldHelp({ structs: 1_000, children: softCap(caps.children) }, caps)).toBe(false);
+    // a spec may pass a smaller ceiling; the default is the production one
+    expect(compactionWouldHelp({ structs: 11, children: 1 }, { ...caps, compactLive: 10 })).toBe(false);
+    expect(compactionWouldHelp({ structs: 10, children: 1 }, { ...caps, compactLive: 10 })).toBe(true);
+  });
+
+  it('through capVerdict: past a hard cap over the ceiling is page-full (contentFull), never a drain', () => {
+    const over = [{ reason: 'structs', n: 151, cap: 150 }] as CapMeasure[];
+    const v = capVerdict(over, () => compactionWouldHelp({ structs: 60, children: 1 }, { structs: 150, children: 100, compactLive: 50 }));
+    expect(v).toEqual({ reason: null, hard: false, full: true, contentFull: true });
+    const control = capVerdict(over, () => compactionWouldHelp({ structs: 40, children: 1 }, { structs: 150, children: 100, compactLive: 50 }));
+    expect(control).toMatchObject({ reason: 'structs', hard: true, full: false });
+  });
+});
+
 describe('#827 capVerdict, the one cap rule', () => {
   const CAP = 100; // softCap(100) = 80
   const m = (reason: CapMeasure['reason'], n: number, grew?: boolean): CapMeasure => ({ reason, n, cap: CAP, ...(grew === undefined ? {} : { grew }) });

@@ -9,7 +9,7 @@
  */
 import * as Y from 'yjs';
 import type { CompactionReason } from '../page-write/compaction-registry';
-import { softCap } from './doc-bounds';
+import { COMPACT_MAX_LIVE_STRUCTS, softCap } from './doc-bounds';
 
 /** A page's live structure: its non-deleted structs, and the most live children of one element. */
 export interface LiveStructure {
@@ -41,12 +41,15 @@ export function liveStructure(doc: Y.Doc): LiveStructure {
 }
 
 /**
- * Would a compaction bring a page of `live` structure under the soft caps? Compaction keeps the live structs (at most:
- * the rebuild merges runs), every live child and one client id, so the client-id cap always helps and the structs and
- * children caps decide.
+ * Would a compaction bring a page of `live` structure under the soft caps, within what one build may rebuild? Compaction
+ * keeps the live structs (at most: the rebuild merges runs), every live child and one client id, so the client-id cap
+ * always helps and the structs and children caps decide. A page with more live structs than `compactLive`
+ * (COMPACT_MAX_LIVE_STRUCTS: what a build fits in COMPACTION_DEADLINE_MS on production hardware) is never compacted:
+ * past a hard cap it is page-full, and it never drains.
  */
-export function compactionWouldHelp(live: LiveStructure, caps: { structs: number; children: number }): boolean {
-  return live.structs < softCap(caps.structs) && live.children < softCap(caps.children);
+export function compactionWouldHelp(live: LiveStructure, caps: { structs: number; children: number; compactLive?: number }): boolean {
+  const compactLive = caps.compactLive ?? COMPACT_MAX_LIVE_STRUCTS;
+  return live.structs <= compactLive && live.structs < softCap(caps.structs) && live.children < softCap(caps.children);
 }
 
 /** One per-page bound, measured. */

@@ -62,6 +62,7 @@ import {
   USER_COLLAB_CPU_REFILL_MS_PER_SECOND,
   UNRESOLVED_REASON,
   type CollabGuardMode,
+  type CollabGuardOptions,
 } from './update-guard';
 
 /**
@@ -83,7 +84,15 @@ const COMPACTING = 'compacting';
 type Conn = { readOnly: boolean; webSocket: { close: jest.Mock }; context: { user: { id: string } } };
 
 function setup(
-  opts: { mode?: CollabGuardMode; seed?: unknown | Y.Doc; seedY?: (f: Y.XmlFragment, d: Y.Doc) => void; legacy?: Uint8Array; now?: () => number; cpuNow?: () => number } = {},
+  opts: {
+    mode?: CollabGuardMode;
+    seed?: unknown | Y.Doc;
+    seedY?: (f: Y.XmlFragment, d: Y.Doc) => void;
+    legacy?: Uint8Array;
+    now?: () => number;
+    cpuNow?: () => number;
+    caps?: CollabGuardOptions['caps'];
+  } = {},
 ) {
   const live = new Y.Doc() as Y.Doc & { name: string };
   live.name = DOC_NAME;
@@ -105,6 +114,7 @@ function setup(
     limitLog: new SocketLimitLog({ warn: (m: string) => limitLogs.push(m) }),
     now: opts.now,
     cpuNow: opts.cpuNow,
+    caps: opts.caps,
   });
   // The peer receives every update the live document broadcasts.
   const peer = new Y.Doc();
@@ -1422,7 +1432,9 @@ describe('#816 conflict scan: a frame whose integrate walks would stall the proc
     const half = siblingsShape(prior / 2, 0);
     const perFrame = (sh: Shape, p: number) => unguardedSteps(sh.base, siblingsFrame(100_000 + p, NEW_CLIENT_IDS_PER_FRAME, sh.first));
     expect(perFrame(shape, prior) / perFrame(half, prior / 2)).toBeGreaterThan(1.9);
-    const s = setup({ seed: shape.base, now: () => t });
+    // #816's per-frame scan alone: the seed's ~15k client ids and its load walk are past the #827 page caps (C_MAX,
+    // W_MAX), which would compact it before this vector is reached
+    const s = setup({ seed: shape.base, now: () => t, caps: { clientIds: Number.MAX_SAFE_INTEGER, steps: Number.MAX_SAFE_INTEGER } });
     const attacker = s.conn('attacker');
     expect(unguardedSteps(s.live, frame(0))).toBeLessThanOrEqual(CONFLICT_SCAN_STEPS_PER_FRAME);
     expect(s.send(attacker, frame(0))).toBe('applied');
