@@ -50,8 +50,14 @@ export async function installHealImageTable(db: KyselyDB): Promise<void> {
         content_digest text
       )
     `.execute(trx);
-    // A table made by an earlier #840 build has no content_digest yet (its rows read as NULL: no rebuild from content).
-    await sql`alter table ccc_page_heal_image add column if not exists content_digest text`.execute(trx);
+    // A table made by an earlier, unreleased #840 build has no content_digest yet (its rows read as NULL: no rebuild
+    // from content). Looked up first: an ALTER, even a no-op one, takes the table's ACCESS EXCLUSIVE lock at every boot,
+    // stalling an overlapping task's stores on it.
+    const { rows } = await sql<{ present: number }>`
+      select 1 as present from information_schema.columns
+       where table_schema = current_schema() and table_name = ${HEAL_IMAGE_TABLE} and column_name = 'content_digest'
+    `.execute(trx);
+    if (rows.length === 0) await sql`alter table ccc_page_heal_image add column if not exists content_digest text`.execute(trx);
   });
 }
 

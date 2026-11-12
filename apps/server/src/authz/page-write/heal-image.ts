@@ -17,8 +17,9 @@
  *     compacted copy of live (#827's tree copy at the next epoch), verified (its ADR 0019 digest is live's once text
  *     runs Yjs left split are joined, #827's `textRunsDigest`, and it reloads strict-equal to itself), with `row_sha` =
  *     sha256 of the raw bytes, or no image when it cannot be built.
- *     After the commit, compaction is requested (`order_divergence`): unstable drains now when one can start; unknown
- *     waits for the next unload (one slow reload is no evidence; a joiner still meets the guard's join check).
+ *     After the commit, compaction is requested: unstable (`order_divergence`) drains now when one can start; unknown
+ *     (`load_steps`, so #827's build-failure memo still holds) waits for the next unload (one slow reload is no
+ *     evidence; a joiner still meets the guard's join check).
  *   - Load (`loadStableYdoc`, the only loader of `pages.ydoc`; heal-image.fitness.spec.ts pins it).
  *     (a) a heal row naming the row's bytes: once compaction is armed, one transaction compare-and-swaps the image in
  *         and deletes the heal row (compaction's own swap, which deletes it), then the image is served; before that,
@@ -28,7 +29,8 @@
  *     (c) a heal row naming other bytes (stale: only a pre-#840 task in a rolling overlap or after a rollback writes
  *         ydoc without one, and it served the reload order): the stale row is dropped and the row is (d).
  *     (d) no heal row: served as before; an unstable (legacy, pre-#840) row requests compaction from the loaded tree,
- *         which is the order users already see today, and from then on the only one.
+ *         which is the order users already see today, and from then on the only one. A reload that ran out of bounds
+ *         (`reload_failed`) is no evidence: logged as such and compacted at unload under the memo (`load_steps`).
  *   Every branch hands the exact bytes it applied to the guard's replica log (`attachReplicaLog`). The load's
  *   `COLLAB_ORDER_DIVERGENCE` lines are rate-limited per page and outcome (order-divergence-log.ts).
  *
@@ -68,7 +70,7 @@ import {
   type LoadBounds,
   type TreeNode,
 } from './compaction';
-import { canStartCompaction, compactionArmed, lineageEpoch, requestCompaction, type CompactionRequest } from './compaction-registry';
+import { canStartCompaction, compactionArmed, lineageEpoch, requestCompaction, type CompactionReason, type CompactionRequest } from './compaction-registry';
 import { ensureHealImageTable } from './heal-image.installer';
 import { loadDivergenceLog, logOrderDivergence, type OrderDivergence } from './order-divergence-log';
 import { coveredRowAtSnapshot, snapshotForStore, snapshotHoldsRow, type StoreSnapshot } from './persistence-steps';
@@ -305,8 +307,9 @@ export async function persistOrderState(
 /**
  * After the store committed: an unstable one requests compaction from live (`order_divergence`), drains the page now
  * when a compaction can start (its sockets close 1013, so it unloads and compacts; the heal row covers a crash until
- * then), and logs. An unknown order (`reload_failed`: one slow reload, a GC pause on an honest page) never drains: it
- * is compacted at its next unload, and a joiner is still checked by the guard's own join check. #827: like every drain,
+ * then), and logs. An unknown order (`reload_failed`: one slow reload, a GC pause on an honest page) never drains and
+ * is never an order heal (`load_steps`, so a failed build's memo still holds): it is compacted at its next unload, and
+ * a joiner is still checked by the guard's own join check. #827: like every drain,
  * only when the page heals after it: the unload can compact it (`unloadCanCompact`, which a failed build never stops for
  * an order heal), or the store wrote an image the next load adopts. A page with neither (bytes that leave structs
  * pending, no image) keeps its writers; its joiners wait on the guard's join check. Never throws.
@@ -314,8 +317,11 @@ export async function persistOrderState(
 export function afterOrderStore(document: Y.Doc, pageId: string, outcome: OrderStoreOutcome | null | undefined): void {
   try {
     if (!outcome?.unstable) return;
-    const heals = outcome.imaged || unloadCanCompact(document, pageId, 'order_divergence');
-    const request: CompactionRequest = { reason: 'order_divergence', userId: null, drain: !outcome.reloadFailed && canStartCompaction(pageId) && heals };
+    // An unknown order is no evidence of instability: requested as the guard requests a reload that ran out of bounds
+    // (`load_steps`), so #827's build-failure memo still holds for it. Only `order_divergence` lifts that memo.
+    const reason: CompactionReason = outcome.reloadFailed ? 'load_steps' : 'order_divergence';
+    const heals = outcome.imaged || unloadCanCompact(document, pageId, reason);
+    const request: CompactionRequest = { reason, userId: null, drain: !outcome.reloadFailed && canStartCompaction(pageId) && heals };
     if (requestCompaction(document, request)) logCompactionRequested(pageId, request, { structs: outcome.structs });
     if (request.drain) drainSockets(document);
     const word = outcome.reloadFailed ? RELOAD_FAILED : outcome.imaged ? 'heal_image' : 'image_failed';
@@ -423,7 +429,14 @@ export async function loadStableYdoc(
         // the next load drops it (it stays stale)
       }
     }
-    if (why !== null) {
+    if (why === RELOAD_FAILED) {
+      // The reload ran out of bounds: no evidence either way (a GC pause on an honest page). Compacted at its unload as
+      // any page whose reload trips is (`load_steps`, under #827's build-failure memo); a joiner is still checked by the
+      // guard's own join check.
+      const request: CompactionRequest = { reason: 'load_steps', userId: null, drain: false };
+      if (requestCompaction(document, request)) logCompactionRequested(pageId, request, { structs });
+      log(RELOAD_FAILED, false, structs);
+    } else if (why !== null) {
       // A row stored before #840: compact from the tree just loaded (the order users already see), at its unload.
       const request: CompactionRequest = { reason: 'order_divergence', userId: null, drain: false };
       if (requestCompaction(document, request)) logCompactionRequested(pageId, request, { structs });

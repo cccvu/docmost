@@ -86,7 +86,8 @@
  * answered only for a page whose shadow (live plus the frames in flight) is reload-stable, and with frames in flight
  * live too, checked once per change of what a joiner can get and charged to the joiner; an unstable page answers 1013
  * and heals. Senders whose items contradict their own origins (an origin not to the item's left, a rightOrigin not to
- * its right, or one of their own earlier items between) are suspects; an instability found strikes them, once per
+ * its right, or one of their own earlier items between) are suspects (with none, the senders whose walks reached no
+ * verdict stand in: padding past the walk cap buys no way out); an instability found strikes them, once per
  * episode (until a stable verdict or a heal), and two strikes on a page within an hour hold that user's writer frames
  * there at 1013 for an hour. Never a refusal: blame is a heuristic. The replay logs are native memory: capped per page
  * and in total (exact-replica-registry.ts); a log dropped for either, or for frames live applied out of the guard's
@@ -256,7 +257,8 @@ const CPU_MS_REFILL_EVERY_MS = 1_000 / USER_COLLAB_CPU_REFILL_MS_PER_SECOND;
 const LOGS_PER_MINUTE = 30;
 /**
  * #840 blame: each walk from a new item toward its origin or its rightOrigin stops after SUSPECT_WALK items, and a
- * frame's walks after SUSPECT_WALK_PER_FRAME in all; either way with no verdict (never a suspect).
+ * frame's walks after SUSPECT_WALK_PER_FRAME in all; either way with no verdict (`unclear`: struck only when an
+ * instability finds no suspect).
  */
 const SUSPECT_WALK = 1024;
 const SUSPECT_WALK_PER_FRAME = 16_384;
@@ -383,9 +385,11 @@ type ShadowResult = {
   structDelta: number;
   clientsBefore: number;
   clientsAfter: number;
-  /** #840: the frame's integrate walk on the shadow (the replay log's step cost), and whether its sender is a suspect. */
+  /** #840: the frame's integrate walk on the shadow (the replay log's step cost), and whether its sender is a suspect;
+   *  `unclear`: a walk that reached no verdict (its cap or the frame's budget), which counts only when nobody is a suspect. */
   steps: number;
   suspect: boolean;
+  unclear: boolean;
   /** #840: the shadow's encoding may have changed (`encodingChanged`): what the join check's cache key counts. */
   changes: boolean;
 };
@@ -400,8 +404,9 @@ type Inspection = {
   added: number;
   children: number;
   extra: Map<number, number>;
-  /** #840: an item contradicts its own origins (blame, never a refusal). */
+  /** #840: an item contradicts its own origins (blame, never a refusal); or no walk could tell (`unclear`). */
   suspect: boolean;
+  unclear: boolean;
 };
 type Ranges = Map<number, Array<[number, number]>>;
 type PrePass = {
@@ -478,8 +483,13 @@ class DocGuard {
    *  key) and the last key verified. */
   accepted = 0;
   verified: string | null = null;
+  /** #840: the last key a join found unstable: until it changes, a joiner waits (1013) without another reload. */
+  unstableAt: string | null = null;
   /** #840: user → when they last sent an item contradicting its own origins (oldest first, SUSPECTS_PER_PAGE at most). */
   readonly suspects = new Map<string, number>();
+  /** #840: likewise, the users whose walks reached no verdict (padding past SUSPECT_WALK, a spent frame budget): struck
+   *  only by an instability with no suspect, so a frame cannot buy its way out of blame with a long walk. */
+  readonly unclear = new Map<string, number>();
   /**
    * #840: the instability episode: from the first unstable verdict until a stable one or a heal (a new document, or a
    * new lineage epoch on this one). Each user is struck at most once per episode (`struck`, bounded by
@@ -953,7 +963,8 @@ export class CollabUpdateGuard {
         doc.pendingEchoes++;
         if (result.added > 0) this.scheduleProbe(doc, userId);
       }
-      if (result.suspect) this.suspect(doc, userId);
+      if (result.suspect) this.suspect(doc, doc.suspects, userId);
+      else if (result.unclear) this.suspect(doc, doc.unclear, userId);
       // #840: the join check's cache key counts only frames that can change what a joiner gets (an empty Step2 cannot)
       if (result.changes) doc.accepted++;
       // #840: live applies it next on this connection: its raw bytes go into the replay log then, and its apply is timed
@@ -1015,11 +1026,12 @@ export class CollabUpdateGuard {
     }
   }
 
-  /** #840: `user` sent an item contradicting its own origins on this document (most recent last; bounded). */
-  private suspect(doc: DocGuard, user: string): void {
-    doc.suspects.delete(user);
-    doc.suspects.set(user, this.now());
-    if (doc.suspects.size > SUSPECTS_PER_PAGE) doc.suspects.delete(doc.suspects.keys().next().value!);
+  /** #840: `user` sent an item contradicting its own origins on this document, or (`doc.unclear`) one whose walk reached
+   *  no verdict (most recent last; bounded). */
+  private suspect(doc: DocGuard, into: Map<string, number>, user: string): void {
+    into.delete(user);
+    into.set(user, this.now());
+    if (into.size > SUSPECTS_PER_PAGE) into.delete(into.keys().next().value!);
   }
 
   /**
@@ -1198,6 +1210,7 @@ export class CollabUpdateGuard {
       clientsAfter: clientsBefore,
       steps: scan.steps,
       suspect: false,
+      unclear: false,
       changes: false,
     });
     let out: Inspection | null = null;
@@ -1249,6 +1262,7 @@ export class CollabUpdateGuard {
       clientsAfter: store.clients.size,
       steps: scan.steps,
       suspect: found.suspect,
+      unclear: found.unclear,
       changes: applied === null || encodingChanged(applied, pendingAtStart),
     };
     // Report mode: the meter counted past the cap and threw nothing; the frame is logged as it would have been refused.
@@ -1280,13 +1294,14 @@ export class CollabUpdateGuard {
     const reportOnly: Violation[] = [];
     let added = 0;
     let suspect = false;
+    let unclear = false;
     const walk = { steps: SUSPECT_WALK_PER_FRAME };
     const result = (violation: Violation | null, log?: RefusalLog): Inspection => {
       let children = 0;
       for (const type of grew) children = Math.max(children, (type as Y.XmlFragment).length); // the root or an element
       const extra = new Map<number, number>();
       for (const client of tr.deleteSet.clients.keys()) if (!tracked.has(client)) extra.set(client, lengthOf(store, client));
-      return { violation, ...(log ? { log } : {}), binds, proven, reportOnly, added, children, extra, suspect };
+      return { violation, ...(log ? { log } : {}), binds, proven, reportOnly, added, children, extra, suspect, unclear };
     };
 
     // #827: a delete outside `default` (the lineage epoch, the write ledger) first, before any other rule can return:
@@ -1334,7 +1349,12 @@ export class CollabUpdateGuard {
         const v = checkStruct(struct, root, touched, newTypes, grew);
         if (v && legacy) reportOnly.push(v);
         else if (v) return result(v);
-        if (!suspect && !legacy && contradictsOrigins(struct, walk)) suspect = true; // #840 blame, never a refusal
+        if (!suspect && !legacy) {
+          // #840 blame, never a refusal: a contradiction makes the sender a suspect; a walk with no verdict, unclear
+          const blame = contradictsOrigins(struct, walk);
+          if (blame === true) suspect = true;
+          else if (blame === null) unclear = true;
+        }
       }
     }
     // #840: a new item beside a neighbour of another parent or key: the item is checked against one parent while it
@@ -1566,9 +1586,12 @@ export class CollabUpdateGuard {
    */
   private unstable(doc: DocGuard, where: OrderDivergenceWhere, outcome: string, ms: number): void {
     const now = this.now();
-    const suspects: string[] = [];
-    for (const [user, at] of doc.suspects) if (now - at <= ORDER_SUSPECT_WINDOW_MS) suspects.push(user);
+    const within = (users: Map<string, number>) => [...users].filter(([, at]) => now - at <= ORDER_SUSPECT_WINDOW_MS).map(([user]) => user);
+    // No suspect: the users no walk could clear stand in (a contradiction hidden past the walk cap is still theirs).
+    const found = within(doc.suspects);
+    const suspects = found.length > 0 ? found : within(doc.unclear);
     doc.suspects.clear();
+    doc.unclear.clear();
     const page = doc.live.name ?? '';
     const epoch = epochOrNull(doc.live);
     if (doc.episode === null || doc.episode.epoch !== epoch) doc.episode = { epoch, struck: new Set() };
@@ -1782,6 +1805,8 @@ export class CollabUpdateGuard {
    * generation, which moves only on a transaction that can change its encoding, and the accepted frames that can), under
    * the meter and the probe deadline, and charged to the joiner (who waits, 1013, while in collab CPU debt). An unstable
    * page answers 1013 (try later) and heals; so does one that cannot be verified (over the bounds, or no exact shadow).
+   * Both definite answers are kept for their key: an unstable one (`unstableAt`) answers the next joiners 1013 with no
+   * reload and asks for the heal again, until the page changes or heals.
    */
   private checkJoin(frame: GuardFrame): void {
     const doc = this.docFor(frame.document);
@@ -1792,6 +1817,13 @@ export class CollabUpdateGuard {
     const lazy = doc.shadow === null && !doc.dirty && !doc.unavailable && !doc.overBounds && !doc.diverged && !hasUnappliedFrames(doc.live);
     const key = `${mutationGeneration(doc.live)}:${doc.accepted}`;
     if (doc.verified === key && (doc.shadow !== null || lazy) && !doc.dirty) return;
+    if (doc.unstableAt === key && !doc.dirty) {
+      // Found unstable at this very key, and its heal could not start yet: what a joiner gets has not changed, so the
+      // answer has not either. No reload (a reconnect would otherwise charge the joiner a page-sized reload each time);
+      // the heal is asked for again (a drain once one can start). Never struck or logged again (the episode was).
+      this.needsCompaction(doc, 'order_divergence', null, true);
+      return this.tryLater(frame, 'order_divergence'); // throws unless report mode
+    }
     if (!this.take(this.budgetFor(frame, true).cpu, USER_COLLAB_CPU_BURST_MS, CPU_MS_REFILL_EVERY_MS, 0)) {
       this.tryLater(frame, 'user_collab_cpu'); // throws unless report mode
     }
@@ -1813,7 +1845,11 @@ export class CollabUpdateGuard {
         return;
       }
       if (checked.verdict === 'over') this.needsCompaction(doc, 'load_steps', userId, true);
-      else this.unstable(doc, 'join', 'unstable', this.cpuNow() - checkStarted);
+      else {
+        // Only a definite answer is kept: `over` depends on timing (a later reload may fit its deadline).
+        doc.unstableAt = key;
+        this.unstable(doc, 'join', 'unstable', this.cpuNow() - checkStarted);
+      }
       this.tryLater(frame, 'order_divergence'); // throws unless report mode
     } finally {
       this.chargeCpu(userId, this.cpuNow() - started - othersMs, workStarted);
@@ -2133,13 +2169,15 @@ export const isKeyedSplit = (item: Y.Item): boolean => item.parentSub !== null &
 /**
  * #840 blame (never a refusal): does `item`'s placement contradict what its sender knew when it wrote it? Yjs places an
  * item after its origin and before its rightOrigin, with only items its sender never saw (concurrent ones) between: so
- * a list end met before the origin (walking left) or the rightOrigin (walking right) contradicts, and so does one of the
- * sender's own earlier items between them (it knew those). Each walk stops after SUSPECT_WALK items with no verdict (a
- * concurrent paste of a thousand paragraphs honestly lands between an item and its rightOrigin), and `budget.steps`
- * bounds the frame's walks in all: spent, the answer is no.
+ * a list end met before the origin (walking left) or the rightOrigin (walking right) contradicts (true), and so does
+ * one of the sender's own earlier items between them (it knew those). Each walk stops after SUSPECT_WALK items, and
+ * `budget.steps` bounds the frame's walks in all: either way with no verdict (null, `unclear`: a concurrent paste of a
+ * thousand paragraphs honestly lands between an item and its rightOrigin, and so does padding meant to hide a
+ * contradiction). Own items are per client id, never per user: two tabs of one user are concurrent replicas.
  */
-function contradictsOrigins(item: Y.Item, budget: { steps: number }): boolean {
+function contradictsOrigins(item: Y.Item, budget: { steps: number }): boolean | null {
   if (item.parentSub !== null) return false;
+  let verdict: boolean | null = false;
   for (const leftward of [true, false]) {
     const target = leftward ? item.origin : item.rightOrigin;
     let s = leftward ? item.left : item.right;
@@ -2150,12 +2188,15 @@ function contradictsOrigins(item: Y.Item, budget: { steps: number }): boolean {
       }
       if (target !== null && holds(s, target)) break;
       if (s.id.client === item.id.client && s.id.clock < item.id.clock) return true;
-      if (n >= SUSPECT_WALK) break;
-      if (--budget.steps < 0) return false;
+      if (n >= SUSPECT_WALK || --budget.steps < 0) {
+        verdict = null; // the other direction may still contradict
+        break;
+      }
       s = leftward ? s.left : s.right;
     }
+    if (budget.steps < 0) return verdict;
   }
-  return false;
+  return verdict;
 }
 const holds = (s: Y.Item, id: Y.ID): boolean => s.id.client === id.client && s.id.clock <= id.clock && id.clock < s.id.clock + s.length;
 

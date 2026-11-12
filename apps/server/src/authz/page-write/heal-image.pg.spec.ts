@@ -565,7 +565,7 @@ d('heal image crash matrix on real Postgres (#840)', () => {
     const h = await heal();
     expect(h).toMatchObject({ rowSha: sha(r.ydoc), epoch: 1 }); // fail closed for a crash: the unknown order is recoverable
     expect(h!.image).not.toBeNull();
-    expect(compactionRequest(doc)).toMatchObject({ reason: 'order_divergence', drain: false }); // never a page-wide drain
+    expect(compactionRequest(doc)).toMatchObject({ reason: 'load_steps', drain: false }); // never a page-wide drain, never an order heal (#827's memo holds)
     expect(divergence()).toEqual([expect.objectContaining({ where: 'store', outcome: 'reload_failed' })]);
     expect(lines.filter((l) => l.startsWith('COLLAB_ORDER_DIVERGENCE ') && l.includes('ERROR'))).toEqual([]);
 

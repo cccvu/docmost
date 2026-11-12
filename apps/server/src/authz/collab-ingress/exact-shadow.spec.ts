@@ -18,6 +18,7 @@ import {
   COLLAB_TRY_LATER_CODE,
   CollabUpdateGuard,
   ORDER_HOLD_MS,
+  ORDER_STRIKE_WINDOW_MS,
   TRY_LATER_REASON,
   USER_COLLAB_CPU_BURST_MS,
   type DocCaps,
@@ -619,6 +620,52 @@ describe('#840 the join gate: a joiner is answered only from a reload-stable pag
     expect(s.guard.shadowOf(s.live)).not.toBeNull();
   });
 
+  it('an unstable verdict is kept for its key: joiners of a page waiting for its heal cost no reload; a change checks again', () => {
+    const { doc: base, pA } = listPage();
+    const s = harness({ base });
+    expect(s.send(s.conn('attacker'), f1(pA))).toBe('applied');
+    expect(s.join(s.conn('reader', true))).toBe(TRY_LATER); // found unstable (the heal cannot start yet: not armed)
+    expect(s.divergence()).toHaveLength(1);
+    const encodes = jest.spyOn(Y, 'encodeStateAsUpdate');
+    try {
+      for (let i = 0; i < 5; i++) expect(s.join(s.conn(`reader-${i}`, true))).toBe(TRY_LATER);
+      expect(encodes).not.toHaveBeenCalled(); // the same key: the same answer, no page-sized reload per reconnect
+      expect(s.limits().filter((l) => l === 'order_divergence')).toHaveLength(6); // each joiner still told why
+      expect(s.divergence()).toHaveLength(1); // logged (and struck) once for the episode
+      expect(compactionRequest(s.live)).toMatchObject({ reason: 'order_divergence', userId: 'attacker' }); // still asked for
+      expect(s.send(s.conn('editor'), honestEdit(s.live))).toBe('applied'); // a change: what a joiner gets may differ
+      expect(s.join(s.conn('reader', true))).toBe(TRY_LATER);
+      expect(encodes).toHaveBeenCalled(); // checked again
+      expect(s.divergence()).toHaveLength(2);
+    } finally {
+      encodes.mockRestore();
+    }
+  });
+
+  it('the join check is charged to the joiner, and a joiner in collab CPU debt waits (1013) before any reload', () => {
+    let cpu = 0;
+    const s = harness({ cpuNow: () => cpu, now: () => 4_000_000_000_000 }); // a still clock: no refill
+    const real = Y.encodeStateAsUpdate;
+    const encodes = jest.spyOn(Y, 'encodeStateAsUpdate').mockImplementation((...args) => {
+      cpu += USER_COLLAB_CPU_BURST_MS + 1; // each encode of the check "costs" more than a whole burst
+      return real(...args);
+    });
+    try {
+      expect(s.join(s.conn('reader', true))).toBe('applied'); // stable, so answered: but the check was paid for
+      expect(s.guard.cpuBalance('reader')).toBeLessThan(0);
+      expect(s.guard.cpuBalance('reader-2')).toBe(USER_COLLAB_CPU_BURST_MS); // nobody else paid
+      const root = s.live.getXmlFragment('default');
+      root.insert(root.length, [new Y.XmlElement('paragraph')]); // a change: the next join must check again
+      encodes.mockClear();
+      expect(s.join(s.conn('reader', true))).toBe(TRY_LATER); // in debt: waits
+      expect(s.limits()).toContain('user_collab_cpu');
+      expect(encodes).not.toHaveBeenCalled(); // refused before the reload
+      expect(s.join(s.conn('reader-2', true))).toBe('applied'); // control: another user's budget pays for its own check
+    } finally {
+      encodes.mockRestore();
+    }
+  });
+
   it('a join that rebuilds a dirty shadow is answered by that rebuild\'s reload (nothing in flight): no second reload', async () => {
     const s = harness();
     expect(s.send(s.conn('editor'), honestEdit(s.live))).toBe('applied');
@@ -692,6 +739,73 @@ describe('#840 strikes: once per user per instability episode', () => {
   });
 });
 
+describe('#840 strikes: padding past the walk cap does not buy a way out of blame (security review F1)', () => {
+  /** F1 with its deleted run under a second client id of the same sender, so no walk meets "its own earlier item". */
+  function f1split(pA: RawId, a = A, b = A + 1): Uint8Array {
+    return rawUpdate([
+      { client: b, clock: 0, structs: [{ origin: pA, right: null, content: new Y.ContentDeleted(6) }] as RawStruct[] },
+      {
+        client: a,
+        clock: 0,
+        structs: [
+          { origin: [b, 5], right: [b, 3], content: el('bulletList') },
+          { origin: null, right: null, parent: [a, 0], content: el('listItem') },
+          { origin: null, right: null, parent: [a, 1], content: el('paragraph') },
+          { origin: [b, 4], right: [b, 5], content: el('paragraph') },
+        ] as RawStruct[],
+      },
+    ]);
+  }
+  /** listPage with `n` paragraphs before pA in its listItem (by another client), visible or deleted (tombstones). */
+  function paddedPage(n: number, tombstones: boolean) {
+    const { doc, pA } = listPage();
+    const other = new Y.Doc();
+    other.clientID = 5000;
+    Y.applyUpdate(other, Y.encodeStateAsUpdate(doc));
+    const li = listItemOf(other);
+    // one at a time at the front: each its own struct (reverse clock order never merges, not even once deleted)
+    other.transact(() => {
+      for (let i = 0; i < n; i++) li.insert(0, [new Y.XmlElement('paragraph')]);
+    });
+    if (tombstones) other.transact(() => li.delete(0, n));
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(other));
+    return { doc, pA };
+  }
+  const caps = { children: 1_000_000, structs: 1_000_000 };
+
+  it('control: unpadded, the split frame contradicts its origins: the sender is a suspect', () => {
+    const { doc: base, pA } = paddedPage(0, false);
+    const s = harness({ base, caps });
+    expect(s.send(s.conn('attacker'), f1split(pA))).toBe('applied');
+    expect(s.guard.suspectsOf(s.live)).toEqual(['attacker']);
+  });
+
+  for (const tombstones of [false, true]) {
+    it(`padded by 1,100 ${tombstones ? 'deleted' : 'visible'} paragraphs: no verdict, so with no suspect the instability strikes that sender`, () => {
+      const { doc: base, pA } = paddedPage(1_100, tombstones);
+      const s = harness({ base, caps });
+      expect(s.join(s.conn('reader', true))).toBe('applied'); // stable before
+      expect(s.send(s.conn('honest'), honestEdit(s.live))).toBe('applied'); // a conclusive walk: never unclear
+      expect(s.send(s.conn('attacker'), f1split(pA))).toBe('applied');
+      expect(s.guard.suspectsOf(s.live)).toEqual([]); // the walk ran out before any verdict (tombstones count as items)
+      expect(s.join(s.conn('reader-2', true))).toBe(TRY_LATER);
+      expect(s.divergence()).toEqual([expect.objectContaining({ where: 'join', outcome: 'unstable', suspects: ['attacker'] })]);
+    });
+  }
+
+  it('an unclear sender stands in only when nobody is a suspect: a conclusive suspect is struck alone', () => {
+    const { doc: base, pA } = paddedPage(1_100, false);
+    const s = harness({ base, caps });
+    expect(s.send(s.conn('padder'), f1split(pA, A + 10, A + 11))).toBe('applied');
+    expect(s.guard.suspectsOf(s.live)).toEqual([]); // unclear
+    const q = s.live.getXmlFragment('default').get(1) as Y.XmlElement; // the root's second paragraph
+    expect(s.send(s.conn('attacker'), f1(idOf(q)))).toBe('applied');
+    expect(s.guard.suspectsOf(s.live)).toEqual(['attacker']);
+    expect(s.join(s.conn('reader', true))).toBe(TRY_LATER);
+    expect(s.divergence()).toEqual([expect.objectContaining({ where: 'join', suspects: ['attacker'] })]);
+  });
+});
+
 describe('#840 strikes: a stable verdict ends the episode', () => {
   it('unstable, then stable again on the same document (the crafted run deleted), then unstable: a new episode, a second strike', () => {
     const limitLogs: string[] = [];
@@ -714,6 +828,34 @@ describe('#840 strikes: a stable verdict ends the episode', () => {
     expect(s.join(s.conn('reader', true))).toBe(TRY_LATER); // episode 2: the second strike
     expect(s.send(s.conn('attacker'), new RemoteClient(s.live).edit(s.live, (f) => ((f.get(0) as Y.XmlElement).get(0) as Y.XmlText).insert(0, 'a')))).toBe(TRY_LATER);
     expect(limitLogs.some((l) => l.includes('"limit":"order_strikes"'))).toBe(true);
+  });
+});
+
+describe('#840 strikes: they expire after the strike window', () => {
+  it('two episodes more than ORDER_STRIKE_WINDOW_MS apart never hold the author (control: within the window they do)', () => {
+    for (const gap of [ORDER_STRIKE_WINDOW_MS + 1, 60_000]) {
+      let t = 5_000_000_000_000;
+      const limitLogs: string[] = [];
+      const guard = new CollabUpdateGuard({
+        mode: 'enforce',
+        logger: { warn: () => undefined },
+        limitLog: new SocketLimitLog({ warn: (m: string) => limitLogs.push(m) }),
+        now: () => t,
+        schedule: () => ({ cancel: () => undefined }),
+      });
+      const { doc: base, pA } = listPage();
+      const s = harness({ base, guard, name: `page.00000000-0000-4000-8000-0000000008${gap > 60_000 ? '43' : '44'}` });
+      expect(s.send(s.conn('attacker'), f1(pA))).toBe('applied');
+      expect(s.join(s.conn('reader', true))).toBe(TRY_LATER); // episode 1: the first strike
+      expect(s.send(s.conn('editor'), new RemoteClient(s.live).edit(s.live, (f) => f.delete(0, 1)))).toBe('applied');
+      expect(s.join(s.conn('reader', true))).toBe('applied'); // stable: the episode ends
+      t += gap;
+      const q = s.live.getXmlFragment('default').get(0) as Y.XmlElement;
+      expect(s.send(s.conn('attacker'), f1(idOf(q), A + 1))).toBe('applied');
+      expect(s.join(s.conn('reader', true))).toBe(TRY_LATER); // episode 2: a strike
+      const held = limitLogs.some((l) => l.includes('"limit":"order_strikes"')) || s.send(s.conn('attacker'), new RemoteClient(s.live).edit(s.live, (f) => ((f.get(0) as Y.XmlElement).get(0) as Y.XmlText).insert(0, 'a'))) === TRY_LATER;
+      expect(held).toBe(gap === 60_000);
+    }
   });
 });
 

@@ -11,7 +11,7 @@ import { attachReplicaLog, distrustReplicaLog, replicaLogOf } from '../collab-in
 import { isReloadStable, strictOrderDiff } from '../collab-ingress/order-parity';
 import * as compaction from './compaction';
 import { isPageCompactingRefusal, resetLoadTripsForTests } from './compaction';
-import { compactionRequest, LINEAGE_ROOT, lineageEpoch, setCompactionClockForTests } from './compaction-registry';
+import { compactionRequest, LINEAGE_ROOT, lineageEpoch, noteBuildFailed, orderHealRequested, resetBuildFailuresForTests, setCompactionClockForTests } from './compaction-registry';
 import { liveContentDigest } from './doc-version';
 import { afterOrderStore, checkStoreOrder, loadStableYdoc, persistOrderState, prepareStore, resetContentHealRefusalsForTests, storeSnapshotUnderLock, type HealImageStore } from './heal-image';
 import { memoryHealStore } from './heal-image.testkit';
@@ -19,7 +19,7 @@ import { snapshotForStore } from './persistence-steps';
 import { storeSafeJson } from './store-safe-json';
 import { isDuplicateWriteKey, recordWriteKey, scopedWriteKey } from './write-idem';
 import { repairLegacyValues } from '../collab-ingress/legacy-repair';
-import { markRowCovered } from './reconcile-store';
+import { coveredRowDigest, markRowCovered, unloadCanCompact } from './reconcile-store';
 import { resetLoadDivergenceLogForTests } from './order-divergence-log';
 
 /**
@@ -334,13 +334,54 @@ describe('a reload that throws at the store is no evidence of instability (#840 
       const closes: Array<[number, string]> = [];
       const live = Object.assign(calm, { getConnections: () => [{ webSocket: { close: (code: number, reason: string) => closes.push([code, reason]) } }] });
       afterOrderStore(live, PAGE, out);
-      expect(compactionRequest(live)).toEqual({ reason: 'order_divergence', userId: null, drain: false });
+      // requested as any reload past its bounds is (#827's memo still holds), never as an order heal
+      expect(compactionRequest(live)).toEqual({ reason: 'load_steps', userId: null, drain: false });
+      expect(orderHealRequested(live)).toBe(false);
       expect(closes).toEqual([]); // never a page-wide drain for one slow reload
       expect(outcomes(warn)).toEqual(['reload_failed']);
       expect(linesOf(error)).toEqual([]);
     } finally {
       warn.mockRestore();
       error.mockRestore();
+    }
+  });
+
+  it('reload_failed never lifts #827\'s build-failure memo: a page whose build failed for good is not compacted again at unload', () => {
+    resetBuildFailuresForTests();
+    const { stable } = unstable();
+    const calm = loaded(stable);
+    markRowCovered(calm, stable);
+    noteBuildFailed(PAGE, coveredRowDigest(calm)!, false); // a build of these very bytes failed for good
+    expect(unloadCanCompact(calm, PAGE)).toBe(false); // precondition: the memo holds
+    afterOrderStore(calm, PAGE, { unstable: true, reloadFailed: true, imaged: false, ydocWritten: false, structs: 9, ms: 1 });
+    expect(orderHealRequested(calm)).toBe(false);
+    expect(unloadCanCompact(calm, PAGE)).toBe(false); // still held: no 1013 cycle every interval for one slow reload
+    // control: real evidence of instability is an order heal, which a failed build never stops
+    afterOrderStore(calm, PAGE, { unstable: true, reloadFailed: false, imaged: false, ydocWritten: false, structs: 9, ms: 1 });
+    expect(orderHealRequested(calm)).toBe(true);
+    expect(unloadCanCompact(calm, PAGE)).toBe(true);
+    resetBuildFailuresForTests();
+  });
+
+  it('a load whose reload runs out of bounds is logged reload_failed (never legacy) and compacted under the memo, never as an order heal', async () => {
+    const { stable } = unstable();
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    let calls = 0;
+    const restore = overrideDeadlineForTests((fn, ms) => {
+      if (++calls === 2) throw deadlineExceeded(ms); // the load applies (1st); its reload check (2nd) misses the deadline
+      return fn();
+    });
+    try {
+      const doc = new Y.Doc();
+      await loadStableYdoc(doc, PAGE, stable, memoryHealStore({ ydoc: stable }));
+      expect(calls).toBe(2);
+      expect(compactionRequest(doc)).toEqual({ reason: 'load_steps', userId: null, drain: false });
+      expect(orderHealRequested(doc)).toBe(false);
+      expect(outcomes(warn)).toEqual(['reload_failed']);
+      expect(logRebuilds(doc)).toBe(true); // served as loaded
+    } finally {
+      restore();
+      warn.mockRestore();
     }
   });
 });
