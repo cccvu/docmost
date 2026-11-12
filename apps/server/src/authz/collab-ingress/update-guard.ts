@@ -966,7 +966,9 @@ export class CollabUpdateGuard {
    */
   private needsCompaction(doc: DocGuard, reason: CompactionReason, userId: string | null, hard: boolean): void {
     try {
-      const drain = hard && this.mode === 'enforce' && canStartCompaction(pageIdOf(doc.live) ?? '');
+      // Only when an unload could compact it (`rowCovered`: covered row bytes, no build of them failed for good): a
+      // probe, step or deadline drain of a page that cannot compact would close everyone again on every interval.
+      const drain = hard && this.mode === 'enforce' && canStartCompaction(pageIdOf(doc.live) ?? '') && this.rowCovered(doc.live);
       const request = { reason, userId, drain };
       if (requestCompaction(doc.live, request)) {
         logCompactionRequested(pageIdOf(doc.live), request, { structs: doc.structs, clientIds: doc.shadow?.store.clients.size, steps: doc.steps }, this.compactionLog);

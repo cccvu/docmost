@@ -420,10 +420,12 @@ async function compactResident(
     await yieldToEventLoop();
     if (storeGenerationOf(document) !== generation) return abandon(document, pageId, request.reason, 'changed');
     const at = Date.now();
-    const built = runWithDeadline(
-      () => buildCompacted({ tree }, ledger, fromEpoch + 1, at, { runs: expected }),
-      COMPACTION_DEADLINE_MS,
-    );
+    let built: CompactedBuild;
+    try {
+      built = runWithDeadline(() => buildCompacted({ tree }, ledger, fromEpoch + 1, at, { runs: expected }), COMPACTION_DEADLINE_MS);
+    } catch (err) {
+      return buildFailed(pageId, covered, err);
+    }
     await yieldToEventLoop();
     const swap = await store.swapYdoc(pageId, built.update, {
       covered,
@@ -443,7 +445,6 @@ async function compactResident(
     });
   } catch (err) {
     clearCompacting(document);
-    noteBuildFailed(pageId, covered, isDeadlineExceeded(err));
     logCompactionFailed(pageId, request.reason, isDeadlineExceeded(err) ? 'deadline' : failureWhy(err), err);
   }
 }
@@ -501,7 +502,6 @@ export async function compactFromRow(
   reason: CompactionReason,
 ): Promise<CompactionOutcome> {
   const started = performance.now();
-  let rowDigest: string | undefined;
   try {
     const row = await store.readRow(pageId);
     if (!row || !row.ydoc || row.ydoc.length === 0) {
@@ -515,14 +515,18 @@ export async function compactFromRow(
     const bytes = row.ydoc;
     const content = row.content;
     const covered = sha256(bytes);
-    rowDigest = covered;
     await yieldToEventLoop();
     const at = Date.now();
-    const built = runWithDeadline(() => {
-      const lineage = readRowLineage(bytes);
-      const json = storeSafeJson(content);
-      return { lineage, ...buildCompacted({ json }, lineage.ledger, lineage.epoch + 1, at, { content: json }) };
-    }, COMPACTION_DEADLINE_MS);
+    let built: CompactedBuild & { lineage: ReturnType<typeof readRowLineage> };
+    try {
+      built = runWithDeadline(() => {
+        const lineage = readRowLineage(bytes);
+        const json = storeSafeJson(content);
+        return { lineage, ...buildCompacted({ json }, lineage.ledger, lineage.epoch + 1, at, { content: json }) };
+      }, COMPACTION_DEADLINE_MS);
+    } catch (err) {
+      return buildFailed(pageId, covered, err);
+    }
     await yieldToEventLoop();
     const swap = await store.swapYdoc(pageId, built.update, { covered, contentHash: row.contentHash });
     if (!swap.swapped) {
@@ -541,11 +545,20 @@ export async function compactFromRow(
     });
     return 'done';
   } catch (err) {
-    const outOfTime = isDeadlineExceeded(err);
-    if (rowDigest !== undefined) noteBuildFailed(pageId, rowDigest, outOfTime);
-    logCompactionFailed(pageId, reason, outOfTime ? 'deadline' : failureWhy(err), err);
+    logCompactionFailed(pageId, reason, isDeadlineExceeded(err) ? 'deadline' : failureWhy(err), err);
     return 'failed';
   }
+}
+
+/**
+ * A compaction build (run under COMPACTION_DEADLINE_MS) threw: record it against the row bytes it was built from
+ * (`noteBuildFailed`: the digest check, a malformed lineage, the deadline) and rethrow to the caller's catch. Only the
+ * build: a store error around it (reading the row, the compare-and-swap: a lock or statement timeout, a dropped
+ * connection) is transient, logged by the caller and retried after the per-page interval, never recorded.
+ */
+function buildFailed(pageId: string, digest: string, err: unknown): never {
+  noteBuildFailed(pageId, digest, isDeadlineExceeded(err));
+  throw err;
 }
 
 // --- reading the lineage and the ledger

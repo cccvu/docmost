@@ -393,6 +393,33 @@ describe('#827 a page past the load bounds is never rebuilt in a loop', () => {
   });
 });
 
+describe('#827 an order or deadline drain needs an unload that can compact', () => {
+  it('a page whose build failed for good (or whose row is not covered) is never drained for a rebuild trip', () => {
+    armed();
+    const p = acde();
+    const seed = new Y.Doc();
+    Y.applyUpdate(seed, Y.encodeStateAsUpdate(p.doc));
+    const MN = 600;
+    Y.applyUpdate(seed, rawUpdate([{ client: 500, clock: 0, structs: Array.from({ length: MN }, () => ch(p.a, p.e, 'l')) }]));
+    Y.applyUpdate(seed, rawUpdate([{ client: 900_000, clock: 0, structs: Array.from({ length: MN }, (_, i) => ch(p.c, i ? [900_000, i - 1] : p.d, 'h')) }]));
+    const run = (canCompact: boolean) => {
+      const s = setup(seed, { caps: { steps: 100_000 }, rowCovered: () => canCompact });
+      const reader = s.conn('r', true);
+      expect(s.send(s.conn('a'), editAs(s.live, 70, (d) => textOf(d).insert(0, 'k')))).toBe(COMPACTING); // the rebuild trips
+      return { s, reader };
+    };
+    const control = run(true);
+    expect(compactionRequest(control.s.live)).toMatchObject({ reason: 'load_steps', drain: true });
+    expect(control.reader.webSocket.close).toHaveBeenCalledWith(COLLAB_TRY_LATER_CODE, COLLAB_PAGE_COMPACTING_REASON);
+    const treated = run(false);
+    expect(compactionRequest(treated.s.live)).toMatchObject({ reason: 'load_steps', drain: false });
+    expect(treated.reader.webSocket.close).not.toHaveBeenCalled();
+    // and the next writer frame does not drain it either (the re-ask honours the same predicate)
+    expect(treated.s.send(treated.s.conn('b'), editAs(treated.s.live, 71, (d) => textOf(d).insert(0, 'k')))).toBe(COMPACTING);
+    expect(isDraining(treated.s.live)).toBe(false);
+  });
+});
+
 describe('#827 (d) client ids: Yjs pays every id on every transaction, so the page caps them', () => {
   const CAP = 40;
   const withIds = (n: number) => {

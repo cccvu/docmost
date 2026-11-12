@@ -38,6 +38,7 @@ import {
 } from './compaction';
 import {
   awaitCompaction,
+  buildRefused,
   compactionRequest,
   isClosedForCompaction,
   isCompacting,
@@ -365,6 +366,43 @@ describe('loadStoredYdoc (#827): the bounded load', () => {
     expect(loadStatsOf(next)!.steps).toBe(0);
   });
 
+  it('a transient store error is never recorded as a failed build: the next load after the interval compacts, then loads', async () => {
+    const bytes = inverted();
+    const steps = loadSteps(bytes);
+    const pageId = nextPageId();
+    const content = storeSafeJson(TiptapTransformer.fromYdoc(new Y.Doc(), 'default'));
+    const store = memoryStore({ content, ydoc: bytes, contentHash: md5(content) });
+    const bounds = { steps: Math.floor(steps / 2), deadlineMs: 60_000 };
+    // the first row read and the first compare-and-swap fail as Postgres does under a lock or statement timeout
+    const read = store.readRow.bind(store);
+    const swap = store.swapYdoc.bind(store);
+    let reads = 0;
+    let swaps = 0;
+    store.readRow = async (id: string) => {
+      if (reads++ === 0) throw Object.assign(new Error('canceling statement due to lock timeout'), { code: '55P03' });
+      return read(id);
+    };
+    store.swapYdoc = async (id: string, next: Uint8Array, o: SwapOptions) => {
+      if (swaps++ === 0) throw Object.assign(new Error('Connection terminated unexpectedly'), { code: '57P01' });
+      return swap(id, next, o);
+    };
+    for (const round of [1, 2, 3]) {
+      expect(() => loadStoredYdoc(new Y.Doc(), pageId, bytes, store, bounds)).toThrow(
+        expect.objectContaining({ reason: COLLAB_PAGE_COMPACTING_REASON }) as never,
+      );
+      await awaitCompaction(pageId);
+      expect(buildRefused(pageId, sha(bytes))).toBe(false); // a store error is no build failure
+      if (round < 3) {
+        expect(store.row!.ydoc).toBe(bytes); // nothing written yet (read failed, then swap failed)
+        now += 2 * COMPACTION_MIN_INTERVAL_MS; // past the per-page interval and the process gap
+      }
+    }
+    expect(readRowLineage(store.row!.ydoc!).epoch).toBe(1); // the third try compacted the row
+    const next = new Y.Doc();
+    loadStoredYdoc(next, pageId, store.row!.ydoc!, store, bounds); // and the page loads again
+    expect(loadStatsOf(next)!.steps).toBeLessThan(bounds.steps);
+  });
+
   it('a page whose load tripped its walk budget is refused at once on the next load, without a second walk', () => {
     restoreClock();
     restoreClock = setCompactionClockForTests({ now: () => now, uptimeMs: () => 0 }); // not armed: nothing compacts
@@ -573,6 +611,28 @@ describe('compactOnUnload (#827)', () => {
     const loaded = new Y.Doc();
     Y.applyUpdate(loaded, treated.store.row!.ydoc!);
     expect(treated.cellOf(loaded).getAttribute('colspan')).toBeUndefined(); // the compacted row holds the repaired page
+  });
+
+  it('textRunsDigest joins only adjacent text of equal marks: any visible change still differs, and the build refuses it', () => {
+    const t = (text: string, marks?: unknown[]) => ({ type: 'text', text, ...(marks ? { marks } : {}) });
+    const doc = (...runs: unknown[]) => ({ type: 'doc', content: [{ type: 'paragraph', content: runs }] });
+    const bold = [{ type: 'bold' }];
+    const base = textRunsDigest(doc(t('hello world')));
+    expect(textRunsDigest(doc(t('hello'), t(' world')))).toBe(base); // a split run is the same document
+    expect(textRunsDigest(doc(t('hello'), t(' world', bold)))).not.toBe(base); // a mark gained
+    expect(textRunsDigest(doc(t('hello', bold), t(' world', bold)))).not.toBe(textRunsDigest(doc(t('hello', bold), t(' world')))); // lost
+    expect(textRunsDigest(doc(t('hello world!')))).not.toBe(base); // changed text
+    expect(textRunsDigest(doc(t(' world'), t('hello')))).not.toBe(base); // run order
+    expect(textRunsDigest(doc(t('hello'), { ...t(' world'), attrs: { x: 1 } }))).not.toBe(base); // an extra key is never joined
+    expect(textRunsDigest({ type: 'doc', content: [{ type: 'paragraph', content: [t('hello')] }, { type: 'paragraph', content: [t(' world')] }] })).not.toBe(base); // across nodes
+    // the unload's build refuses a tree whose content differs from the digest it was given
+    const live = churnedPage(2);
+    expect(() =>
+      buildCompacted({ tree: snapshotTree(live.getXmlFragment('default')) }, [], 1, 0, { runs: textRunsDigest(storeSafeJson(TiptapTransformer.fromYdoc(churnedPage(2, { type: 'doc', content: [para(text('other'))] }), 'default'))) }),
+    ).toThrow(CompactionDigestMismatchError);
+    expect(() =>
+      buildCompacted({ tree: snapshotTree(live.getXmlFragment('default')) }, [], 1, 0, { runs: textRunsDigest(storeSafeJson(TiptapTransformer.fromYdoc(live, 'default'))) }),
+    ).not.toThrow();
   });
 
   it('a page whose load repair removed a mark (a split text run) compacts: the digest check joins equal-marked runs', async () => {
