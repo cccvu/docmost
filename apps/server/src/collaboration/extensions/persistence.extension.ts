@@ -1,5 +1,6 @@
 import {
   afterUnloadDocumentPayload,
+  beforeUnloadDocumentPayload,
   Extension,
   onChangePayload,
   onLoadDocumentPayload,
@@ -63,6 +64,13 @@ import {
   snapshotForStore,
 } from '../../authz/page-write/persistence-steps';
 import { yieldToEventLoop } from '../../authz/page-write/yield-to-event-loop';
+// CCC #827: the bounded load (a page too costly to load answers try-later and is compacted from its row), compaction at
+// unload, and no store for a document a compaction superseded. The policy lives in authz/page-write/compaction.
+import {
+  compactOnUnload,
+  loadStoredYdoc,
+  skipStoreOfSuperseded,
+} from '../../authz/page-write/compaction';
 
 @Injectable()
 export class PersistenceExtension implements Extension {
@@ -111,8 +119,10 @@ export class PersistenceExtension implements Extension {
 
       const dbState = new Uint8Array(page.ydoc);
 
-      Y.applyUpdate(document, dbState);
-      markRowCovered(document, dbState); // #731: the next store's reconcile of these bytes is a no-op
+      // CCC #827 (UPSTREAM_MODIFICATIONS.md #122): the apply, bounded (a walk-step budget and a deadline). A trip throws
+      // the compacting refusal (Hocuspocus then destroys this document) and compacts the page from its row. Also
+      // records the bytes as covered (#731).
+      loadStoredYdoc(document, pageId, dbState, this.db);
       return;
     }
 
@@ -140,6 +150,8 @@ export class PersistenceExtension implements Extension {
     // store after the store that follows its transaction) — nothing to persist. Before consuming the contributors,
     // which stay for the next real store. Never throws.
     if (isStoreCurrent(document)) return;
+    // CCC #827: a document a compaction superseded never stores (its row moved to a new lineage); recorded as a failure.
+    if (skipStoreOfSuperseded(document)) return;
 
     const pageId = getPageId(documentName);
 
@@ -405,6 +417,12 @@ export class PersistenceExtension implements Extension {
     }
 
     this.contributors.get(documentName).add(userId);
+  }
+
+  // CCC #827 (UPSTREAM_MODIFICATIONS.md #122): compact a document that asked for it, now that nothing holds it (the
+  // document is still resident and RedisSync still holds its lock). Never throws: a throw would keep it resident.
+  async beforeUnloadDocument(data: beforeUnloadDocumentPayload) {
+    await compactOnUnload(data.document, this.db);
   }
 
   async afterUnloadDocument(data: afterUnloadDocumentPayload) {

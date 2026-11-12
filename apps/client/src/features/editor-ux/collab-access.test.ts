@@ -2,6 +2,12 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  COLLAB_COMPACTING_BASE_MS,
+  COLLAB_EPOCH_STALE_PREFIX,
+  COLLAB_LOAD_TRY_LATER_REASON,
+  COLLAB_PAGE_COMPACTING_REASON,
+  collabRefusalKind,
+  parseEpochStaleReason,
   COLLAB_LOST_RETRY_MS,
   COLLAB_RETRY_MIN_MS,
   COLLAB_TRY_LATER_BASE_MS,
@@ -435,7 +441,7 @@ describe("a socket close with 1009 (a frame over the server's maxPayload) (#790)
       expect(step.markDisconnected).toBe(false);
       expect(step.retryAfterMs).toBe(0);
       expect(step.state.refused).toBe(true);
-      expect(step.state.refusedTooBig).toBe(true);
+      expect(step.state.refusalKind).toBe("too-big");
       expect(collabAllowsEditing(step.state)).toBe(false);
     }
   });
@@ -456,11 +462,11 @@ describe("a socket close with 1009 (a frame over the server's maxPayload) (#790)
     ];
     for (const step of others) {
       expect(step.state.refused).toBe(true);
-      expect(step.state.refusedTooBig).toBe(false);
+      expect(step.state.refusalKind).toBe("generic");
     }
     const tooBig = nextCollabAccess(initialCollabAccess, rawClose(1009)).state;
     expect(nextCollabAccess(tooBig, { kind: "authenticated", scope: "read-write" }).state).toBe(tooBig);
-    expect(initialCollabAccess.refusedTooBig).toBe(false);
+    expect(initialCollabAccess.refusalKind).toBe("generic");
   });
 
   it.each([1000, 1001, 1006, 1011, 4408, 4422, undefined])(
@@ -609,14 +615,14 @@ describe("the refused rule (refusedRule)", () => {
         const step = nextCollabAccess(initialCollabAccess, refusedClose(rule, code));
         expect(step.state.refused).toBe(true);
         expect(step.state.refusedRule).toBe(rule);
-        expect(step.state.refusedTooBig).toBe(false);
+        expect(step.state.refusalKind).toBe("generic");
       }
     },
   );
 
   it("a 1009 records no rule (the notice's too-big copy decides), whatever its reason says", () => {
     const step = nextCollabAccess(initialCollabAccess, refusedClose("schema", 1009));
-    expect(step.state.refusedTooBig).toBe(true);
+    expect(step.state.refusalKind).toBe("too-big");
     expect(step.state.refusedRule).toBeNull();
   });
 
@@ -731,14 +737,34 @@ describe("page-editor wiring", () => {
     );
   });
 
-  it("the refusal notice is told about a 1009", () => {
-    expect(source).toMatch(/<CollabRefusalNotice\s*tooBig=\{collabAccess\.refusedTooBig\}/);
+  it("the notices are told the access state, the epoch and how to clear the local copy", () => {
+    expect(source).toMatch(
+      /<CollabPageNotices[^>]*\s+access=\{collabAccess\}\s+epoch=\{collabEpoch\}\s+passive=\{[^}]*\}\s+showsLocalCopy=\{!showStatic\}\s+clearLocalCopy=\{\(\) => clearLocalCollabCopy\(providersRef\.current\?\.local\)\}/,
+    );
+    expect(source).not.toMatch(/collabAccess\.refused &&/); // the notice decides what shows (a clean epoch switch shows none)
+  });
+
+  // #827: the copy, the socket and the controller claim the same epoch, and a new epoch rebuilds all three.
+  it("names the local copy and the socket by the epoch, hands it to the controller, and rebuilds on a switch", () => {
+    expect(source).toMatch(
+      /const collabEpoch = useCollabEpoch\(pageId, collabAccess, collabAccessRef, \(\) => setProvidersReady\(false\)\);/,
+    );
+    expect(source).toMatch(
+      /new IndexeddbPersistence\(collabLocalCopyName\(pageId, collabEpoch\.epoch\), ydoc\)/,
+    );
+    expect(source).toMatch(/url: withCollabEpoch\(collaborationURL, collabEpoch\.epoch\),/);
+    expect(source).toMatch(/epoch: collabEpoch\.epoch, \/\/ CCC \(#827\)\s*local,\s*\}\);/);
+    expect(source).toMatch(/\}, \[pageId, collabEpoch\.epoch\]\);/);
+    // the Hocuspocus document name is not the copy's: it stays page.<id> at every epoch
+    expect(source).toMatch(/const documentName = `page\.\$\{pageId\}`;/);
+    expect(source).toMatch(/name: documentName,/);
   });
 
   // The ledger-echo incident: the notice's copy, its role and its Discard wording follow the refusal and the view.
   it("the refusal notice gets the rule's cause, passive outside Edit mode, and whether this browser's copy is shown", () => {
+    // the cause comes from `refusedRule` inside CollabPageNotices (collab-refusal-notice.test.tsx pins it)
     expect(source).toMatch(
-      /<CollabRefusalNotice\s*tooBig=\{collabAccess\.refusedTooBig\}[^\n]*\n\s*cause=\{collabRefusalCause\(collabAccess\.refusedRule\)\}\s*passive=\{!\(editable && currentPageEditMode === PageEditMode\.Edit\)\}\s*showsLocalCopy=\{!showStatic\}/,
+      /<CollabPageNotices[^\n]*\n\s*access=\{collabAccess\}\s*epoch=\{collabEpoch\}\s*passive=\{!\(editable && currentPageEditMode === PageEditMode\.Edit\)\}\s*showsLocalCopy=\{!showStatic\}/,
     );
   });
 
@@ -794,7 +820,7 @@ describe("try later (#810)", () => {
     expect(nextCollabAccess(initialCollabAccess, event).state.refreshed).toBe(false);
   });
 
-  it("repeated try-laters wait longer each time, capped at COLLAB_LOST_RETRY_MS; an authentication resets the wait", () => {
+  it("repeated try-laters wait longer each time, capped at COLLAB_LOST_RETRY_MS; a completed sync resets the wait (#827)", () => {
     let state: CollabAccessState = initialCollabAccess;
     const waits: number[] = [];
     for (let i = 0; i < 12; i += 1) {
@@ -806,7 +832,11 @@ describe("try later (#810)", () => {
     expect(waits.slice(0, 5)).toEqual([5_000, 10_000, 20_000, 40_000, 60_000]);
     for (let i = 1; i < waits.length; i += 1) expect(waits[i]).toBeGreaterThanOrEqual(waits[i - 1]);
     expect(Math.max(...waits)).toBe(COLLAB_LOST_RETRY_MS);
-    const back = nextCollabAccess(state, { kind: "authenticated", scope: "read-write" });
+    // #827: an authentication does not reset it (a load that trips is refused after it); a sync does
+    const authed = nextCollabAccess(state, { kind: "authenticated", scope: "read-write" });
+    expect(authed.state.tryLaterAttempts).toBe(state.tryLaterAttempts);
+    expect(nextCollabAccess(authed.state, tryLaterEvents[0][1]).retryAfterMs).toBe(COLLAB_LOST_RETRY_MS);
+    const back = nextCollabAccess(authed.state, { kind: "synced" });
     expect(back.state.tryLaterAttempts).toBe(0);
     expect(collabAwaitsRetry(back.state)).toBe(false);
     expect(nextCollabAccess(back.state, tryLaterEvents[0][1]).retryAfterMs).toBe(COLLAB_TRY_LATER_BASE_MS);
@@ -879,5 +909,158 @@ describe("collabRetryDelay (#810)", () => {
       expect(d).toBeGreaterThanOrEqual(2_500);
       expect(d).toBeLessThanOrEqual(5_000);
     }
+  });
+});
+
+// cccvu/wiki-v2#827 — the page-level answers: a compacted lineage, a compaction in progress, a load in debt, and the
+// update guard's new Discard-first rules.
+describe("#827 epoch, compaction and the Discard-first rules", () => {
+  const close = (reason: string, code = 1000, socketConnected = true) =>
+    ({ kind: "server-close", socketConnected, reason, code }) as const;
+  const denied = (reason: string) =>
+    ({ kind: "auth-failed", tokenExpired: false, reason }) as const;
+
+  it.each([
+    ["a document CLOSE", close(`${COLLAB_EPOCH_STALE_PREFIX}3`)],
+    ["a socket close 4422", close(`${COLLAB_EPOCH_STALE_PREFIX}3`, 4422, false)],
+    ["an auth refusal", denied(`${COLLAB_EPOCH_STALE_PREFIX}3`)],
+  ] as [string, CollabAccessEvent][])(
+    "an epoch-stale refusal in %s detaches, closes for good and names the new epoch (never retried, refetched or lost)",
+    (_, event) => {
+      const step = nextCollabAccess(initialCollabAccess, event, 1);
+      expect(step.state.refused).toBe(true);
+      expect(step.state.refusalKind).toBe("compacted");
+      expect(step.state.epochChangedTo).toBe(3);
+      expect(step.detach).toBe(true);
+      expect(step.disconnectSocket).toBe(true);
+      expect(step.reconnect || step.refreshToken || step.markDisconnected).toBe(false);
+      expect(step.retryAfterMs).toBe(0);
+      expect(step.state.lost).toBe(false);
+      expect(collabAllowsEditing(step.state)).toBe(false); // the old copy stays read-only
+      // final: nothing later reopens it or changes the epoch
+      expect(nextCollabAccess(step.state, { kind: "synced" }, 1).state).toBe(step.state);
+      expect(nextCollabAccess(step.state, close(`${COLLAB_EPOCH_STALE_PREFIX}4`), 1).state).toBe(step.state);
+    },
+  );
+
+  // Switching to the epoch this copy already claims would reconnect into the same answer, forever.
+  it.each([
+    ["this copy's own epoch", `${COLLAB_EPOCH_STALE_PREFIX}2`],
+    ["a malformed epoch", `${COLLAB_EPOCH_STALE_PREFIX}02`],
+    ["no epoch", COLLAB_EPOCH_STALE_PREFIX],
+  ])("an epoch-stale refusal naming %s is an ordinary (generic) refusal, with no epoch to switch to", (_, reason) => {
+    for (const event of [close(reason), denied(reason)]) {
+      const step = nextCollabAccess(initialCollabAccess, event, 2);
+      if (event.kind === "auth-failed" && parseEpochStaleReason(reason) === null) {
+        // an unreadable reason on an auth refusal is not ours to judge: the #537 path
+        expect(step.refreshToken).toBe(true);
+        continue;
+      }
+      expect(step.state.refused).toBe(true);
+      expect(step.state.refusalKind).toBe("generic");
+      expect(step.state.epochChangedTo).toBeNull();
+      expect(step.detach).toBe(true);
+    }
+  });
+
+  it("an epoch-stale reason is classified before the refused prefix it shares; the epoch is a plain number", () => {
+    expect(COLLAB_EPOCH_STALE_PREFIX.startsWith(COLLAB_UPDATE_REFUSED_PREFIX)).toBe(true);
+    expect(classifyCollabCloseReason(`${COLLAB_EPOCH_STALE_PREFIX}7`, 1000)).toBe("epoch");
+    expect(classifyCollabCloseReason(`${COLLAB_EPOCH_STALE_PREFIX}x`, 1000)).toBe("epoch");
+    expect(classifyCollabCloseReason(`${COLLAB_UPDATE_REFUSED_PREFIX}epoch`, 1000)).toBe("refused");
+    expect(parseEpochStaleReason(`${COLLAB_EPOCH_STALE_PREFIX}7`)).toBe(7);
+    for (const bad of [undefined, "", "7", `${COLLAB_EPOCH_STALE_PREFIX}-1`, `${COLLAB_EPOCH_STALE_PREFIX}1.5`, `${COLLAB_EPOCH_STALE_PREFIX}1234567890123456`]) {
+      expect(parseEpochStaleReason(bad)).toBeNull();
+    }
+  });
+
+  it.each([
+    ["frame-too-large", "too-big"],
+    ["apply-deadline", "too-complex"],
+    ["page-full", "page-full"],
+    ["mark", "generic"],
+    ["frame-too-large-x", "generic"],
+  ])("refused rule %s ⇒ the %s notice", (rule, kind) => {
+    const step = nextCollabAccess(initialCollabAccess, close(`${COLLAB_UPDATE_REFUSED_PREFIX}${rule}`));
+    expect(step.state.refused).toBe(true);
+    expect(step.state.refusalKind).toBe(kind);
+    expect(step.detach).toBe(true);
+    expect(collabRefusalKind(`${COLLAB_UPDATE_REFUSED_PREFIX}${rule}`)).toBe(kind);
+  });
+
+  it.each([
+    ["a socket close 1013", close(COLLAB_PAGE_COMPACTING_REASON, 1013, false)],
+    ["a document CLOSE", close(COLLAB_PAGE_COMPACTING_REASON)],
+    ["a load refused (permission denied)", denied(COLLAB_PAGE_COMPACTING_REASON)],
+  ] as [string, CollabAccessEvent][])(
+    "compacting in %s: read-only, retry after 2 s, never detached, refetched or lost",
+    (_, event) => {
+      const step = nextCollabAccess({ ...initialCollabAccess, refreshed: true }, event);
+      expect(step.state.compacting).toBe(true);
+      expect(collabAllowsEditing(step.state)).toBe(false);
+      expect(collabAwaitsRetry(step.state)).toBe(true);
+      expect(step.retryAfterMs).toBe(COLLAB_COMPACTING_BASE_MS);
+      expect(step.disconnectSocket).toBe(true);
+      expect(step.markDisconnected).toBe(true);
+      expect(step.detach || step.refreshToken || step.reconnect).toBe(false);
+      expect(step.state.refused || step.state.lost).toBe(false);
+      expect(step.state.refreshed).toBe(true); // untouched
+    },
+  );
+
+  it("compacting waits 2, 4, 8 ... s up to COLLAB_LOST_RETRY_MS, survives an authentication, and a sync ends it", () => {
+    let state: CollabAccessState = initialCollabAccess;
+    const waits: number[] = [];
+    for (let i = 0; i < 8; i += 1) {
+      const step = nextCollabAccess(state, close(COLLAB_PAGE_COMPACTING_REASON, 1013, false));
+      state = step.state;
+      waits.push(step.retryAfterMs);
+      state = nextCollabAccess(state, { kind: "authenticated", scope: "read-write" }).state;
+      expect(state.compacting).toBe(true); // the load comes after the authentication
+    }
+    expect(waits).toEqual([2_000, 4_000, 8_000, 16_000, 32_000, 60_000, 60_000, 60_000]);
+    const synced = nextCollabAccess(state, { kind: "synced" }).state;
+    expect(synced.compacting).toBe(false);
+    expect(synced.tryLaterAttempts).toBe(0);
+    expect(collabAllowsEditing(synced)).toBe(true);
+    expect(collabAwaitsRetry(synced)).toBe(false);
+  });
+
+  it("a sync with nothing to clear keeps the same state object (no re-render per sync)", () => {
+    const prev = { ...initialCollabAccess, unresolvedRetried: true };
+    expect(nextCollabAccess(prev, { kind: "synced" }).state).toBe(prev);
+  });
+
+  it("a refusal after a compaction ends the banner (the refusal notice replaces it)", () => {
+    const compacting = nextCollabAccess(initialCollabAccess, close(COLLAB_PAGE_COMPACTING_REASON)).state;
+    const refused = nextCollabAccess(compacting, close(`${COLLAB_UPDATE_REFUSED_PREFIX}page-full`)).state;
+    expect(refused.compacting).toBe(false);
+    expect(refused.refusalKind).toBe("page-full");
+    const stale = nextCollabAccess(compacting, close(`${COLLAB_EPOCH_STALE_PREFIX}1`)).state;
+    expect(stale.compacting).toBe(false);
+    expect(stale.epochChangedTo).toBe(1);
+  });
+
+  it.each([
+    ["an auth refusal", denied(COLLAB_LOAD_TRY_LATER_REASON)],
+    ["a document CLOSE", close(COLLAB_LOAD_TRY_LATER_REASON)],
+  ] as [string, CollabAccessEvent][])(
+    "a load refused for CPU debt in %s is an ordinary try later: editable, 5 s, no refetch",
+    (_, event) => {
+      const step = nextCollabAccess(initialCollabAccess, event);
+      expect(step.state.tryLaterAttempts).toBe(1);
+      expect(step.state.compacting).toBe(false);
+      expect(collabAllowsEditing(step.state)).toBe(true);
+      expect(step.retryAfterMs).toBe(COLLAB_TRY_LATER_BASE_MS);
+      expect(step.refreshToken || step.detach).toBe(false);
+    },
+  );
+
+  // Anti-vacuity: the reasons next door keep their paths.
+  it("a lookalike of the compacting reason is not compacting", () => {
+    expect(classifyCollabCloseReason(`${COLLAB_PAGE_COMPACTING_REASON}x`, 1000)).toBe("other");
+    const step = nextCollabAccess(initialCollabAccess, denied(`${COLLAB_PAGE_COMPACTING_REASON}x`));
+    expect(step.state.compacting).toBe(false);
+    expect(step.refreshToken).toBe(true);
   });
 });

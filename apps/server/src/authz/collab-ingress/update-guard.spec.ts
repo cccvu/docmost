@@ -25,6 +25,7 @@ import {
   syncFrame,
   typedFrame,
 } from './collab-ingress.testkit';
+import { COLLAB_PAGE_COMPACTING_REASON } from './collab-reasons';
 import { CONFLICT_SCAN_STEPS_PER_FRAME } from './conflict-scan';
 import {
   basePage,
@@ -61,6 +62,7 @@ import {
   USER_COLLAB_CPU_REFILL_MS_PER_SECOND,
   UNRESOLVED_REASON,
   type CollabGuardMode,
+  type CollabGuardOptions,
 } from './update-guard';
 
 /**
@@ -76,11 +78,21 @@ const schema = serverSchema();
 const REFUSED = (rule: string) => `ccc:collab-update-refused:${rule}`;
 /** #790: an exhausted (user, document) budget: the socket closed 1013, never a 4422 refusal. */
 const TRY_LATER = 'try-later';
+/** #827: the socket closed 1013 with the compacting reason. */
+const COMPACTING = 'compacting';
 
 type Conn = { readOnly: boolean; webSocket: { close: jest.Mock }; context: { user: { id: string } } };
 
 function setup(
-  opts: { mode?: CollabGuardMode; seed?: unknown | Y.Doc; seedY?: (f: Y.XmlFragment, d: Y.Doc) => void; legacy?: Uint8Array; now?: () => number; cpuNow?: () => number } = {},
+  opts: {
+    mode?: CollabGuardMode;
+    seed?: unknown | Y.Doc;
+    seedY?: (f: Y.XmlFragment, d: Y.Doc) => void;
+    legacy?: Uint8Array;
+    now?: () => number;
+    cpuNow?: () => number;
+    caps?: CollabGuardOptions['caps'];
+  } = {},
 ) {
   const live = new Y.Doc() as Y.Doc & { name: string };
   live.name = DOC_NAME;
@@ -102,6 +114,7 @@ function setup(
     limitLog: new SocketLimitLog({ warn: (m: string) => limitLogs.push(m) }),
     now: opts.now,
     cpuNow: opts.cpuNow,
+    caps: opts.caps,
   });
   // The peer receives every update the live document broadcasts.
   const peer = new Y.Doc();
@@ -116,6 +129,10 @@ function setup(
       const ret = guard.check({ connection: c, document: live, update: frame, context: c.context });
       expect(ret).toBeUndefined(); // never a promise
     } catch (err: any) {
+      if (err?.code === COLLAB_TRY_LATER_CODE && err?.reason === COLLAB_PAGE_COMPACTING_REASON) {
+        expect(c.webSocket.close).toHaveBeenLastCalledWith(COLLAB_TRY_LATER_CODE, COLLAB_PAGE_COMPACTING_REASON);
+        return COMPACTING; // #827: a 1013 that names the compaction
+      }
       if (err?.code === COLLAB_TRY_LATER_CODE) {
         expect(err).toEqual({ code: COLLAB_TRY_LATER_CODE, reason: TRY_LATER_REASON });
         // the socket is closed FIRST, so Hocuspocus's document CLOSE (sent after the throw) never reaches the editor
@@ -1389,9 +1406,11 @@ describe('#790 frame bounds: Auth on an established session and unknown message 
 
   it('a type 4.7.1 does not handle is refused message-type; every type an honest provider sends passes', () => {
     const s = setup({ seed: SEED });
-    for (const type of [MSG.SyncStatus, 9, 10, 11, 127, 300]) expect(s.deliver(s.conn('a'), typedFrame(type))).toBe(REFUSED('message-type'));
+    // #827: QueryAwareness too: the 4.7.1 provider never sends it, and 4.7.1 answers it by encoding every awareness state
+    for (const type of [MSG.SyncStatus, MSG.QueryAwareness, 9, 10, 11, 127, 300]) {
+      expect(s.deliver(s.conn('a'), typedFrame(type))).toBe(REFUSED('message-type'));
+    }
     const c = s.conn('writer');
-    expect(s.deliver(c, typedFrame(MSG.QueryAwareness))).toBe('applied');
     expect(s.deliver(c, step1Frame(s.live))).toBe('applied');
     expect(s.deliver(c, awarenessFrame([{ clientID: 9, state: {} }]))).toBe('applied');
     expect(s.deliver(c, typedFrame(MSG.Close))).toBe('applied'); // a provider's detach
@@ -1408,7 +1427,6 @@ describe('#790 awareness: no rate refusal in the guard (the rate is a drop at th
         const frame = awarenessFrame([{ clientID: 4242, clock, state: { user: { name: 'W' }, cursor: { anchor: clock, head: clock } } }]);
         expect(s.deliver(c, frame)).toBe('applied');
       }
-      for (let i = 0; i < 100; i++) expect(s.deliver(c, typedFrame(MSG.QueryAwareness))).toBe('applied');
     },
   );
 });
@@ -1466,7 +1484,7 @@ describe('#810 (A5): every Hocuspocus MessageType is classified, from the librar
     Sync: 'applied',
     Awareness: 'applied',
     Auth: REFUSED('auth'),
-    QueryAwareness: 'applied',
+    QueryAwareness: REFUSED('message-type'), // #827: no 4.7.1 provider sends it; 4.7.1 encodes every state for nothing
     SyncReply: 'applied',
     Stateless: REFUSED('stateless'),
     BroadcastStateless: REFUSED('stateless'),
@@ -1634,7 +1652,9 @@ describe('#816 conflict scan: a frame whose integrate walks would stall the proc
     const half = siblingsShape(prior / 2, 0);
     const perFrame = (sh: Shape, p: number) => unguardedSteps(sh.base, siblingsFrame(100_000 + p, NEW_CLIENT_IDS_PER_FRAME, sh.first));
     expect(perFrame(shape, prior) / perFrame(half, prior / 2)).toBeGreaterThan(1.9);
-    const s = setup({ seed: shape.base, now: () => t });
+    // #816's per-frame scan alone: the seed's ~15k client ids and its load walk are past the #827 page caps (C_MAX,
+    // W_MAX), which would compact it before this vector is reached
+    const s = setup({ seed: shape.base, now: () => t, caps: { clientIds: Number.MAX_SAFE_INTEGER, steps: Number.MAX_SAFE_INTEGER } });
     const attacker = s.conn('attacker');
     expect(unguardedSteps(s.live, frame(0))).toBeLessThanOrEqual(CONFLICT_SCAN_STEPS_PER_FRAME);
     expect(s.send(attacker, frame(0))).toBe('applied');
@@ -1649,7 +1669,8 @@ describe('#816 conflict scan: a frame whose integrate walks would stall the proc
     // nothing (one client, same origins), so the frame is cheap and accepted. The typist's keystroke, made before it
     // saw them (a higher client id), walks every one of them: one item, ~60k steps, a few ms of Yjs.
     const page = basePage('ab');
-    const s = setup({ seed: page.doc });
+    // #816's per-item rule only: 60,000 live siblings are past #827's live-struct cap (COMPACT_MAX_LIVE_STRUCTS), raised here
+    const s = setup({ seed: page.doc, caps: { compactLive: 100_000 } });
     const typist = new Y.Doc();
     typist.clientID = 3_000_000_000;
     Y.applyUpdate(typist, Y.encodeStateAsUpdate(s.live));

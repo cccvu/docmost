@@ -24,6 +24,12 @@
  * null check and never throws: live, the mirror, rebuilds and server writes are never metered. A yjs whose `integrate`
  * or exports are missing or changed shape refuses to install, and the guard's constructor (so the Nest boot) with it.
  * conflict-scan.spec.ts pins the source of `integrate` and the yjs version: re-diff the replay on any bump.
+ *
+ * #827: a scan can also be ARMED on one document (`arm`/`disarm`), across awaits, so a load into a live document is
+ * counted where no synchronous `metered` callback can wrap it (the guard's load hooks). The wrapper then looks the
+ * document up only while something is armed. A scan may carry its own exit value (`ConflictScan.exit`): a load's trip
+ * throws `{ reason: 'ccc:collab-page-compacting' }`, an ordinary throw that leaves Yjs clean (its `transact` finally
+ * runs) and that Hocuspocus answers as a refused load. The guard's frame scans keep the anonymous BUDGET.
  */
 import * as Y from 'yjs';
 
@@ -44,6 +50,9 @@ export const CONFLICT_SCAN_STEPS_PER_FRAME = 1_000_000;
 type YModule = typeof Y;
 type Trip = { steps: number };
 
+/** The value thrown at a trip unless the scan names its own: a way out of Yjs's stack. Read the trip from the scope. */
+const BUDGET = Object.freeze({ cccConflictScan: 'budget' });
+
 /** One metered apply: its cap, its counts, and how it ended. */
 export class ConflictScan {
   /** Steps walked so far (report mode keeps counting past the cap). */
@@ -60,6 +69,9 @@ export class ConflictScan {
     readonly doc: Y.Doc,
     readonly enforce: boolean,
     readonly perFrame: number = CONFLICT_SCAN_STEPS_PER_FRAME,
+    /** What an enforcing scan throws at its trip (#827: a load's carries the compacting reason). Never an Error with a
+     *  message Hocuspocus would log per attempt; never recognized by identity outside the scan's owner. */
+    readonly exit: unknown = BUDGET,
   ) {}
 }
 
@@ -70,17 +82,31 @@ export class ConflictScanMeterError extends Error {
   }
 }
 
+/** `arm` refused: the document is armed already, or a `metered` scope is running (#827). Nothing was armed. */
+export class ConflictScanArmError extends Error {
+  constructor(why: string) {
+    super(`conflict-scan meter: cannot arm (${why})`);
+  }
+}
+
 export interface ConflictScanMeter {
   /** Run `fn` with `scan` active: items integrated into `scan.doc` are metered. The scope is cleared in a finally. */
   metered<T>(scan: ConflictScan, fn: () => T): T;
+  /**
+   * #827: meter every item integrated into `scan.doc` from now until `disarm(scan.doc)`, across awaits (a load). Throws
+   * ConflictScanArmError, arming nothing, when that document is armed already or a `metered` scope is running. The
+   * caller must disarm on every path (the document's `destroy` included): an armed document is held until then.
+   */
+  arm(scan: ConflictScan): void;
+  /** Stop metering `doc`; returns its scan, or null when it was not armed. Never throws. */
+  disarm(doc: Y.Doc): ConflictScan | null;
   /** The `integrate` the wrapper delegates to (the tripwire spec hashes its source). */
   readonly original: (transaction: Y.Transaction, offset: number) => void;
+  /** True while a `metered` scope runs or any document is armed. */
   isActive(): boolean;
 }
 
 const MARK = Symbol.for('ccc.collab-ingress.conflict-scan-meter');
-/** The value thrown at a trip: a way out of Yjs's stack. The guard reads the trip from the scope, not from this. */
-const BUDGET = Object.freeze({ cccConflictScan: 'budget' });
 
 /**
  * Install the meter on `y` (the guard's own `yjs`), once. Throws, so the guard and the server refuse to start, when
@@ -109,12 +135,14 @@ export function installConflictScanMeter(y: YModule = Y): ConflictScanMeter {
   }
   const original = current as unknown as (this: Y.Item, transaction: Y.Transaction, offset: number) => void;
   let active: ConflictScan | null = null;
+  /** #827: scans armed per document (a load). Consulted only while non-empty, so the unarmed path stays one check. */
+  const armed = new Map<Y.Doc, ConflictScan>();
 
   /** One step of `scan`'s walk for the current item; past the cap, record the trip and (enforce) leave Yjs's stack. */
   const over = (scan: ConflictScan, itemSteps: number): void => {
     const total = scan.steps + itemSteps;
     if (scan.trip === null && total > scan.perFrame) scan.trip = { steps: total };
-    if (scan.trip !== null && scan.enforce) throw BUDGET;
+    if (scan.trip !== null && scan.enforce) throw scan.exit;
   };
 
   /** The walks `Item.integrate` is about to make for `item`, read for read; returns their step count. */
@@ -196,11 +224,13 @@ export function installConflictScanMeter(y: YModule = Y): ConflictScanMeter {
   };
 
   const integrate = function (this: Y.Item, transaction: Y.Transaction, offset: number): void {
-    const scan = active;
-    if (scan !== null && transaction.doc === scan.doc) {
+    let scan = active;
+    if (scan !== null && transaction.doc !== scan.doc) scan = null;
+    if (scan === null && armed.size !== 0) scan = armed.get(transaction.doc) ?? null;
+    if (scan !== null) {
       // A failed or tripped scope stays failed: nothing more integrates into it unmetered.
       if (scan.failure !== null) throw new ConflictScanMeterError(scan.failure);
-      if (scan.trip !== null && scan.enforce) throw BUDGET;
+      if (scan.trip !== null && scan.enforce) throw scan.exit;
       charge(scan, this, transaction, offset);
     }
     return original.call(this, transaction, offset);
@@ -216,8 +246,18 @@ export function installConflictScanMeter(y: YModule = Y): ConflictScanMeter {
         active = previous;
       }
     },
+    arm(scan: ConflictScan): void {
+      if (active !== null) throw new ConflictScanArmError('a metered scope is running');
+      if (armed.has(scan.doc)) throw new ConflictScanArmError('the document is armed already');
+      armed.set(scan.doc, scan);
+    },
+    disarm(doc: Y.Doc): ConflictScan | null {
+      const scan = armed.get(doc) ?? null;
+      armed.delete(doc);
+      return scan;
+    },
     original,
-    isActive: () => active !== null,
+    isActive: () => active !== null || armed.size !== 0,
   };
   Object.defineProperty(integrate, MARK, { value: meter });
   proto.integrate = integrate;

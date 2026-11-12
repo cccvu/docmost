@@ -4,8 +4,10 @@ import { createRequire } from 'node:module';
 import { dirname } from 'node:path';
 import * as vm from 'node:vm';
 import * as Y from 'yjs';
+import { COLLAB_PAGE_COMPACTING_REASON, pageCompactingRefusal } from './collab-reasons';
 import {
   ConflictScan,
+  ConflictScanArmError,
   ConflictScanMeterError,
   installConflictScanMeter,
 } from './conflict-scan';
@@ -30,6 +32,48 @@ const RE_VALIDATE = [
   '4. run this spec (the exactness corpus must stay at zero mismatches) and the honest-concurrency spec;',
   '5. then update PINNED_YJS_VERSION and PINNED_INTEGRATE_SHA256.',
 ].join('\n');
+
+/**
+ * #827: the other yjs internals the #827 bounds were measured and reasoned against (doc-bounds.ts), by their source in
+ * the installed dist (most are not exported). A change to any of them can move a cost the bounds assume or open a path
+ * they do not see.
+ */
+const PINNED_827_SOURCES: Record<string, string> = {
+  integrateStructs: '78ba1f407bdd9d8810b60cd5dc7bc4fa7ac85bad9b19936f7761a545c85d232e', // the load path: client order, the getMissing stack
+  readUpdateV2: 'a10c2240bedd551917fd5ca9a071eb518e252558f4cfa1020615eed070ce597c', // every apply and load: one remote transaction
+  readAndApplyDeleteSet: 'fd69b9ebfae74fb9cbafa7228235ec2cb1cf9a2d5ce88e279248d28efcf2e3cd', // delete-range splits (#827 b)
+  tryMergeDeleteSet: 'b8b867ff5008036474cbefb6b11ff1bdbb76bac86057f6c034a1a0c5f5ba7083', // the select-all splices (E_MAX)
+  tryToMergeWithLefts: 'da459f72626dfe2b27a39f83bca232431f39a1b23ea5358f6aeda4764b563901',
+  transact: '5c41b75d2586c5ac85b4b2b97719af256c8b244119c3d83a6d4c0061bd590be3', // its finally: what a deadline's cut skips
+  cleanupTransactions: '84c3e7ed166035e93dc5b80cb51d49ce8b27819da7414f22e508f269e318a7f6', // O(client ids) per transaction (C_MAX)
+  cleanupYTextAfterTransaction: '6e3ee79c4653cbd881675c84e8827d24f21b737f3603a259e4d9a9e48aff450c', // formatting cleanup (#827 a)
+  cleanupContextlessFormattingGap: 'ebbe974183cf6c422ffeda7fd775ad30edb058b734add3b8f615329abe307afd',
+  cleanupFormattingGap: '92e8c93f8c892cc79d96b95cc26f99da4006483442efb3483d7136bd51874481',
+};
+const RE_VALIDATE_827 = [
+  'yjs changed under the #827 bounds (ADR 0036, doc-bounds.ts). Before updating PINNED_827_SOURCES:',
+  '1. diff each changed function against yjs 13.6.30 (src/utils/encoding.js integrateStructs/readUpdateV2,',
+  '   DeleteSet.js readAndApplyDeleteSet, Transaction.js transact/cleanupTransactions/tryMergeDeleteSet/',
+  '   tryToMergeWithLefts, YText.js cleanupYTextAfterTransaction and the formatting-gap helpers);',
+  '2. a change to the load order or to the getMissing stack: re-check that the meter, armed on a loading doc, still',
+  '   counts a load exactly (the arm specs below) and that W_MAX still bounds the inversion (#827 c);',
+  '3. a change to transact/cleanupTransactions: re-run deadline.spec.ts (an interrupted doc stays mid-transaction and',
+  '   is discarded; nothing outside it is touched) and the load-throw spec below (an ordinary throw leaves Yjs clean);',
+  '4. any change: re-run the sizing bench (yjs-bounds.sizing.bench.cjs) on node:22-slim and update doc-bounds.ts and',
+  '   doc-bounds.spec.ts (S_MAX, C_MAX, E_MAX, W_MAX, T_FRAME_MS keep their margins);',
+  '5. then update the pins.',
+].join('\n');
+
+/** The source of the top-level `const <name> = …` in the installed yjs dist, up to the next top-level statement. */
+function yjsSource(name: string): string {
+  const src = readFileSync(require.resolve('yjs'), 'utf8');
+  const decl = `\nconst ${name} = `;
+  const at = src.indexOf(decl);
+  if (at < 0 || src.indexOf(decl, at + 1) >= 0) return `<${name}: ${at < 0 ? 'missing' : 'declared twice'}>`;
+  const rest = src.slice(at + 1);
+  const end = rest.search(/\n(?=(?:\/\*\*|const |let |class |function |exports\.))/);
+  return (end < 0 ? rest : rest.slice(0, end)).trimEnd();
+}
 
 /**
  * A scratch copy of the installed yjs CJS dist with counters in its three integrate walks and its case-2 branch, loaded
@@ -240,6 +284,26 @@ describe('#816 tripwire: the yjs source the replay was written against', () => {
   });
 });
 
+describe('#827 tripwire: the yjs internals the #827 bounds depend on', () => {
+  it('each pinned function\'s source equals the one measured', () => {
+    const actual = Object.fromEntries(Object.keys(PINNED_827_SOURCES).map((n) => [n, createHash('sha256').update(yjsSource(n)).digest('hex')]));
+    const changed = Object.keys(PINNED_827_SOURCES).filter((n) => actual[n] !== PINNED_827_SOURCES[n]);
+    if (changed.length) throw new Error(`${RE_VALIDATE_827}\n(changed: ${changed.map((n) => `${n} ${actual[n]}`).join(', ')})`);
+  });
+
+  it('the extraction reads whole functions (anti-vacuity: a body, its end, nothing after it)', () => {
+    for (const name of Object.keys(PINNED_827_SOURCES)) {
+      const body = yjsSource(name);
+      expect(body.startsWith(`const ${name} = `)).toBe(true);
+      expect(body.length).toBeGreaterThan(200);
+      expect(body).not.toMatch(/\nconst |\nexports\./);
+    }
+    expect(yjsSource('transact')).toContain('cleanupTransactions(transactionCleanups, 0)');
+    expect(yjsSource('cleanupContextlessFormattingGap')).toContain('item.right.deleted');
+    expect(yjsSource('noSuchFunction')).toBe('<noSuchFunction: missing>');
+  });
+});
+
 describe('#816 the meter is inert outside its scope, installs once, and refuses a yjs it was not written for', () => {
   const meter = installConflictScanMeter(Y);
 
@@ -367,6 +431,133 @@ describe('#816 the meter fails closed', () => {
     }
     // and outside the scope the same frame applies
     expect(() => Y.applyUpdate(copyOf(base), frame)).not.toThrow();
+  });
+});
+
+describe('#827 arm/disarm: a scan on one document across awaits (a load), and its own exit value', () => {
+  const meter = installConflictScanMeter(Y);
+  afterEach(() => expect(meter.isActive()).toBe(false));
+
+  /** The #827 (c) inversion: cheap frames, and a state whose every load walks m·n. */
+  const inversion = (m: number, n = m): Uint8Array => {
+    const doc = new Y.Doc();
+    doc.clientID = 1;
+    doc.getText('t').insert(0, 'acde');
+    const L = Array.from({ length: m }, () => ({ origin: [1, 0] as [number, number], right: [1, 3] as [number, number], content: new Y.ContentString('l') }));
+    const H = Array.from({ length: n }, (_, i) => ({ origin: [1, 1] as [number, number], right: (i ? [900000, i - 1] : [1, 2]) as [number, number], content: new Y.ContentString('h') }));
+    Y.applyUpdate(doc, rawUpdate([{ client: 500, clock: 0, structs: L }]));
+    Y.applyUpdate(doc, rawUpdate([{ client: 900000, clock: 0, structs: H }]));
+    return Y.encodeStateAsUpdate(doc);
+  };
+
+  it('counts a load into an armed doc after an await, exactly as metered() does, and disarm returns the scan', async () => {
+    const state = inversion(300);
+    const viaMetered = new ConflictScan(new Y.Doc(), false, Infinity);
+    meter.metered(viaMetered, () => Y.applyUpdate(viaMetered.doc, state));
+    const live = new Y.Doc();
+    const scan = new ConflictScan(live, false, Infinity);
+    meter.arm(scan);
+    expect(meter.isActive()).toBe(true);
+    await Promise.resolve(); // a load's DB read sits between the arm and the apply
+    Y.applyUpdate(live, state);
+    expect(meter.disarm(live)).toBe(scan);
+    expect(scan.steps).toBe(viaMetered.steps);
+    expect(scan.steps).toBeGreaterThan(300 * 300); // m·n, the inversion
+    expect(meter.disarm(live)).toBeNull(); // disarm twice: nothing, never a throw
+  });
+
+  it('an enforcing load trips with its own exit value: an ordinary throw that leaves Yjs clean, the trip on the scan', () => {
+    const state = inversion(300);
+    const live = new Y.Doc();
+    const exit = pageCompactingRefusal();
+    const scan = new ConflictScan(live, true, 10_000, exit);
+    meter.arm(scan);
+    let thrown: unknown;
+    try {
+      Y.applyUpdate(live, state);
+    } catch (e) {
+      thrown = e;
+    } finally {
+      meter.disarm(live);
+    }
+    expect(thrown).toBe(exit);
+    expect(thrown).toEqual({ reason: COLLAB_PAGE_COMPACTING_REASON });
+    expect(thrown).not.toBeInstanceOf(Error); // no message: Hocuspocus logs nothing per attempt
+    expect(scan.trip).toEqual({ steps: 10_001 });
+    // Yjs's transact finally ran (unlike a deadline's cut): the document is consistent, merely partial
+    expect((live as unknown as { _transaction: unknown })._transaction).toBeNull();
+    // and a tripped armed scan stays tripped: nothing more integrates into it unmetered
+    const again = new ConflictScan(live, true, 10_000, exit);
+    meter.arm(again);
+    again.trip = { steps: 1 };
+    try {
+      expect(() => Y.applyUpdate(live, state)).toThrow();
+    } finally {
+      meter.disarm(live);
+    }
+  });
+
+  it('the default exit stays the anonymous budget value (the guard\'s frame scans are unchanged)', () => {
+    const { base, frame } = twoClientsShape(50);
+    const victim = copyOf(base);
+    let thrown: unknown;
+    try {
+      meter.metered(new ConflictScan(victim, true, 100), () => Y.applyUpdate(victim, frame));
+    } catch (e) {
+      thrown = e;
+    }
+    expect(thrown).toEqual({ cccConflictScan: 'budget' });
+  });
+
+  it('refuses to arm inside a metered scope, or a document armed already; nothing is armed by a refusal', () => {
+    const a = new Y.Doc();
+    meter.metered(new ConflictScan(new Y.Doc(), true), () => {
+      expect(() => meter.arm(new ConflictScan(a, true))).toThrow(ConflictScanArmError);
+    });
+    expect(meter.isActive()).toBe(false);
+    meter.arm(new ConflictScan(a, true));
+    try {
+      expect(() => meter.arm(new ConflictScan(a, true))).toThrow(/armed already/);
+    } finally {
+      meter.disarm(a);
+    }
+  });
+
+  it('only the armed document is metered; a metered scope on another document still counts its own', () => {
+    const { base, frame } = twoClientsShape(100);
+    const armedDoc = copyOf(base);
+    const armedScan = new ConflictScan(armedDoc, false, Infinity);
+    meter.arm(armedScan);
+    try {
+      const other = copyOf(base);
+      Y.applyUpdate(other, frame); // not armed, not in a scope: free
+      const shadow = copyOf(base);
+      const own = new ConflictScan(shadow, false, Infinity);
+      meter.metered(own, () => Y.applyUpdate(shadow, frame));
+      expect(own.steps).toBe(100 * 100 + 99);
+      expect(armedScan.steps).toBe(0);
+      Y.applyUpdate(armedDoc, frame);
+      expect(armedScan.steps).toBe(100 * 100 + 99);
+    } finally {
+      meter.disarm(armedDoc);
+    }
+  });
+
+  it('a replay failure in an armed scan fails closed, as in a metered one', () => {
+    const { base, frame } = twoClientsShape(5);
+    const doc = copyOf(base);
+    const scan = new ConflictScan(doc, false);
+    const spy = jest.spyOn(Y, 'compareIDs').mockImplementation(() => {
+      throw new Error('injected');
+    });
+    meter.arm(scan);
+    try {
+      expect(() => Y.applyUpdate(doc, frame)).toThrow(ConflictScanMeterError);
+    } finally {
+      spy.mockRestore();
+      meter.disarm(doc);
+    }
+    expect(scan.failure).toBeInstanceOf(Error);
   });
 });
 

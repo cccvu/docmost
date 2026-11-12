@@ -2,9 +2,23 @@ import * as Y from 'yjs';
 import { initProseMirrorDoc, updateYFragment } from '@tiptap/y-tiptap';
 import { Node as PMNode } from '@tiptap/pm/model';
 import { serverSchema } from '../page-write/prelim-content';
-import { awarenessFrame, contentOf, DOC_NAME, renderLikeABrowser, step1Frame, SYNC, syncFrame } from './collab-ingress.testkit';
-import { rawUpdate, unguardedSteps, type RawStruct } from './conflict-scan.testkit';
+import {
+  awarenessFrame,
+  contentOf,
+  cpuTimeDeadline,
+  DOC_NAME,
+  processCpuMs,
+  renderLikeABrowser,
+  step1Frame,
+  SYNC,
+  syncFrame,
+} from './collab-ingress.testkit';
+import { basePage, rawUpdate, unguardedSteps, type RawStruct } from './conflict-scan.testkit';
+import { compactionRequest } from '../page-write/compaction-registry';
+import { PAGE_MAX_YDOC_BYTES } from '../page-write/page-size';
+import { C_MAX, E_MAX } from './doc-bounds';
 import { SocketLimitLog } from './socket-limit-log';
+import { markRowCovered } from '../page-write/reconcile-store';
 import { COLLAB_REFUSAL_CODE, COLLAB_TRY_LATER_CODE, CollabUpdateGuard, UNRESOLVED_REASON, USER_COLLAB_CPU_BURST_MS } from './update-guard';
 
 /**
@@ -14,9 +28,11 @@ import { COLLAB_REFUSAL_CODE, COLLAB_TRY_LATER_CODE, CollabUpdateGuard, UNRESOLV
  * session's unsent edits (a page's local copy) under a new client id, and latency both ways. Every frame goes through a
  * real CollabUpdateGuard in enforce mode before it applies: zero refusals, zero 1013s, and every peer converges.
  *
- * The CPU budget is charged on the real CPU clock (`performance.now`) while the wall clock is simulated (200 ms per op,
- * slower than people type in bursts, faster than they type on average), so the corpus also shows how far an honest
- * session stays from the debt: the lowest balance any user reached is asserted with a wide margin (ADR 0036 §6).
+ * The CPU budget is charged on the real CPU clock (the worker's own CPU time, `processCpuMs`, and the deadlines decided
+ * on it: `cpuTimeDeadline`; a shared CI runner's waits for a core are not the work's cost, #567) while the wall clock
+ * is simulated (200 ms per op, slower than people type in bursts, faster than they type on average), so the corpus
+ * also shows how far an honest session stays from the debt: the lowest balance any user reached is asserted with a
+ * wide margin (ADR 0036 §6).
  */
 const schema = serverSchema();
 const SEEDS = 8;
@@ -55,7 +71,8 @@ function harness(seed: number) {
     logger: { warn: (m: string) => refusals.push(m) },
     limitLog: new SocketLimitLog({ warn: (m: string) => refusals.push(m) }),
     now: () => now,
-    cpuNow: () => performance.now(),
+    cpuNow: processCpuMs,
+    runWithDeadline: cpuTimeDeadline(),
   });
   const peers: Peer[] = [];
   const results = { frames: 0, refused: [] as string[], lowestBalance: Infinity };
@@ -316,6 +333,116 @@ describe('#816 honest concurrency never meets the CPU bounds', () => {
     expect(h.sendUpdate(attacker, rawUpdate([{ client: 900_001, clock: 0, structs: Array.from({ length: 1100 }, at) }]))).toBe(true);
     expect(h.sendUpdate(attacker, rawUpdate([{ client: 900_002, clock: 0, structs: Array.from({ length: 1100 }, at) }]))).toBe(false);
     expect(h.results.refused).toEqual(['4422 ccc:collab-update-refused:conflict-scan']);
+  });
+});
+
+/**
+ * #827 (ADR 0036): honest work at the per-page caps, through a guard with the PRODUCTION bounds (doc-bounds.ts: the
+ * frame deadline, the struct, client-id and children caps, the frame cap): never refused, never closed 1013, never a
+ * drain. Compaction may be requested past a soft cap (for the next unload), never forced on a session.
+ */
+describe('#827 honest work at the caps is never refused', () => {
+  type Live = Y.Doc & { name: string; getConnections: () => unknown[] };
+  function caps(seed?: Y.Doc) {
+    const live = new Y.Doc() as Live;
+    live.name = DOC_NAME;
+    live.getConnections = () => [];
+    if (seed) Y.applyUpdate(live, Y.encodeStateAsUpdate(seed));
+    markRowCovered(live, Y.encodeStateAsUpdate(live)); // a stored row the unload can compact
+    const lines: string[] = [];
+    // The production bounds, held in CPU time (the worker's own: a busy CI runner's waits are not the frame's cost)
+    const guard = new CollabUpdateGuard({
+      mode: 'enforce',
+      logger: { warn: (m: string) => lines.push(m) },
+      limitLog: new SocketLimitLog({ warn: (m: string) => lines.push(m) }),
+      cpuNow: processCpuMs,
+      runWithDeadline: cpuTimeDeadline(),
+    });
+    const conn = (id: string): Conn => ({ readOnly: false, webSocket: { close: () => undefined }, context: { user: { id } } });
+    const send = (c: Conn, update: Uint8Array, subtype: number = SYNC.Update): string => {
+      try {
+        guard.check({ connection: c, document: live, update: syncFrame(update, subtype), context: c.context });
+      } catch (err: any) {
+        // the guard's own log line names the rule or limit (a 1013 reason is shared by several limits)
+        return `${err?.code} ${err?.reason}${lines.length ? ` [${lines[lines.length - 1]}]` : ''}`;
+      }
+      Y.applyUpdate(live, update, { source: 'connection', connection: c });
+      return 'applied';
+    };
+    const drained = () => compactionRequest(live)?.drain === true;
+    return { live, guard, lines, conn, send, drained };
+  }
+  /** `n` paragraphs of `chars` characters, one bold word each: what a paste of real prose looks like. */
+  function prose(n: number, chars: number): Y.XmlElement[] {
+    return Array.from({ length: n }, (_, i) => {
+      const p = new Y.XmlElement('paragraph');
+      const t = new Y.XmlText();
+      p.insert(0, [t]);
+      t.insert(0, `${i} `.padEnd(chars, 'lorem ipsum dolor sit amet '));
+      t.format(2, 5, { bold: {} });
+      return p;
+    });
+  }
+  const paste = (live: Y.Doc, client: number, els: () => Y.XmlElement[]) => {
+    const r = new Y.Doc();
+    Y.applyUpdate(r, Y.encodeStateAsUpdate(live));
+    r.clientID = client;
+    r.transact(() => r.getXmlFragment('default').insert(0, els()));
+    return Y.encodeStateAsUpdate(r, Y.encodeStateVector(live));
+  };
+
+  it('a paste just under the frame cap (prose, 600-character paragraphs, under E_MAX) is accepted', () => {
+    const s = caps();
+    const update = paste(s.live, 4242, () => prose(4_400, 600));
+    expect(update.length).toBeGreaterThan(2.5 * 1024 * 1024);
+    expect(update.length).toBeLessThanOrEqual(PAGE_MAX_YDOC_BYTES);
+    expect(s.send(s.conn('a'), update)).toBe('applied');
+    expect(s.drained()).toBe(false);
+  });
+
+  it('a select-all delete of a page at the children cap is accepted, and so is an API replace of it (mirrored)', () => {
+    const seed = new Y.Doc();
+    seed.transact(() => seed.getXmlFragment('default').insert(0, prose(E_MAX, 40)));
+    const s = caps(seed);
+    const r = new Y.Doc();
+    Y.applyUpdate(r, Y.encodeStateAsUpdate(s.live));
+    r.clientID = 777;
+    r.transact(() => r.getXmlFragment('default').delete(0, E_MAX));
+    expect(s.send(s.conn('a'), Y.encodeStateAsUpdate(r, Y.encodeStateVector(s.live)))).toBe('applied');
+    // the API's replace: a server-local transaction, mirrored into the shadow under its own deadline
+    s.live.transact(() => {
+      const f = s.live.getXmlFragment('default');
+      f.delete(0, f.length);
+      f.insert(0, prose(E_MAX - 1, 40));
+    }, { source: 'local' });
+    expect(s.guard.shadowOf(s.live)).not.toBeNull(); // mirrored in time
+    // the shadow still serves (another editor: on a slow core the select-all alone is about a CPU burst for its sender,
+    // whose next frame then waits on the debt with a retryable 1013; nothing is lost)
+    expect(s.send(s.conn('b'), paste(s.live, 778, () => prose(1, 10)))).toBe('applied');
+    expect(s.drained()).toBe(false);
+  });
+
+  it('typing on a page holding C_MAX client ids is accepted (compaction only requested, for the next unload)', () => {
+    const b = basePage('hello');
+    const clients = Array.from({ length: C_MAX - 2 }, (_, i) => ({
+      client: 10_000 + i,
+      clock: 0,
+      structs: [{ origin: i === 0 ? ([1, b.first + 4] as [number, number]) : ([10_000 + i - 1, 0] as [number, number]), right: null, content: new Y.ContentString('c') }],
+    }));
+    Y.applyUpdate(b.doc, rawUpdate(clients));
+    const s = caps(b.doc);
+    expect(s.live.store.clients.size).toBe(C_MAX - 1);
+    const typist = new Y.Doc();
+    Y.applyUpdate(typist, Y.encodeStateAsUpdate(s.live));
+    typist.clientID = 99_999_999;
+    const t = (typist.getXmlFragment('default').get(0) as Y.XmlElement).get(0) as Y.XmlText;
+    for (let k = 0; k < 20; k++) {
+      const sv = Y.encodeStateVector(s.live);
+      t.insert(k, 'x');
+      expect(s.send(s.conn('typist'), Y.encodeStateAsUpdate(typist, sv))).toBe('applied');
+    }
+    expect(s.live.store.clients.size).toBe(C_MAX);
+    expect(compactionRequest(s.live)).toMatchObject({ reason: 'client_ids', drain: false });
   });
 });
 

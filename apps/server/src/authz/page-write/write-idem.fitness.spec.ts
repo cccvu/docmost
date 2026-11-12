@@ -19,8 +19,10 @@ const SRC_ROOT = resolve(__dirname, '..', '..');
 
 /** The only non-spec file that may reference the ledger root, and how often (paths relative to apps/server/src). */
 const ALLOWED: Record<string, number> = {
-  // The declaration, its one string literal, and the two `getMap` calls (check, record).
-  'authz/page-write/write-idem.ts': 4,
+  // The declaration, its one string literal, the two `getMap` calls (check, record), and #827 compaction's three
+  // ledger helpers (`ledgerOfDoc` 2, `ledgerOfDecoded` 1, `carryLedgerOver` 1), which read the ledger and carry only
+  // what it already held into the rebuilt lineage.
+  'authz/page-write/write-idem.ts': 8,
 };
 
 const walk = (dir: string, out: string[]): string[] => {

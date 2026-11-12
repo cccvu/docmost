@@ -68,10 +68,10 @@ import {
   createCollabAccessController,
 } from "@/features/editor-ux/collab-access-controller";
 import { reopensOnVisible } from "@/features/editor-ux/collab-reconnect";
-import { CollabRefusalNotice } from "@/features/editor-ux/collab-refusal-notice";
-import { collabRefusalCause } from "@/features/editor-ux/collab-refusal-cause";
+import { CollabPageNotices } from "@/features/editor-ux/collab-refusal-notice";
 import { collabHeaderStatus } from "@/features/editor-ux/collab-header-status";
 import { clearLocalCollabCopy } from "@/features/editor-ux/collab-local-copy";
+import { collabLocalCopyName, useCollabEpoch, withCollabEpoch } from "@/features/editor-ux/collab-epoch";
 import DrawioMenu from "./components/drawio/drawio-menu";
 import { useCollabToken } from "@/features/auth/queries/auth-query.tsx";
 import SearchAndReplaceDialog from "@/features/editor/components/search-and-replace/search-and-replace-dialog.tsx";
@@ -150,14 +150,16 @@ export default function PageEditor({
   const [collabAccess, setCollabAccess] =
     useState<CollabAccessState>(initialCollabAccess);
   const collabAccessRef = useRef<CollabAccessController | null>(null);
+  // CCC (#827): the page's lineage epoch; a switch rebuilds the providers (features/editor-ux/collab-epoch)
+  const collabEpoch = useCollabEpoch(pageId, collabAccess, collabAccessRef, () => setProvidersReady(false));
 
   useEffect(() => {
     if (!providersRef.current) {
       const documentName = `page.${pageId}`;
       const ydoc = new Y.Doc();
-      const local = new IndexeddbPersistence(documentName, ydoc);
+      const local = new IndexeddbPersistence(collabLocalCopyName(pageId, collabEpoch.epoch), ydoc); // CCC (#827)
       const socket = new HocuspocusProviderWebsocket({
-        url: collaborationURL,
+        url: withCollabEpoch(collaborationURL, collabEpoch.epoch), // CCC (#827)
       });
       const onLocalSyncedHandler = () => {
         setIsLocalSynced(true);
@@ -194,6 +196,8 @@ export default function PageEditor({
         onState: setCollabAccess,
         markDisconnected: () =>
           setYjsConnectionStatus(WebSocketStatus.Disconnected),
+        epoch: collabEpoch.epoch, // CCC (#827)
+        local,
       });
       const remote = new HocuspocusProvider({
         websocketProvider: socket,
@@ -223,7 +227,7 @@ export default function PageEditor({
       providersRef.current?.local.destroy();
       providersRef.current = null;
     };
-  }, [pageId]);
+  }, [pageId, collabEpoch.epoch]); // CCC (#827): a new epoch is a new local copy and socket
 
   // Only connect/disconnect on tab/idle, not destroy
   useEffect(() => {
@@ -446,17 +450,13 @@ export default function PageEditor({
 
   return (
     <TransclusionLookupProvider>
-      {collabAccess.refused && (
-        <CollabRefusalNotice
-          tooBig={collabAccess.refusedTooBig} // CCC (#810): after a 1009 only Discard helps
-          cause={collabRefusalCause(collabAccess.refusedRule)}
-          passive={!(editable && currentPageEditMode === PageEditMode.Edit)}
-          showsLocalCopy={!showStatic}
-          clearLocalCopy={() =>
-            clearLocalCollabCopy(providersRef.current?.local)
-          }
-        />
-      )}
+      <CollabPageNotices // CCC (#781, #810, #827): refusal notices and the compaction banner
+        access={collabAccess}
+        epoch={collabEpoch}
+        passive={!(editable && currentPageEditMode === PageEditMode.Edit)}
+        showsLocalCopy={!showStatic}
+        clearLocalCopy={() => clearLocalCollabCopy(providersRef.current?.local)}
+      />
       {showStatic ? (
         <EditorProvider
           editable={false}

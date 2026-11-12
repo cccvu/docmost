@@ -5,8 +5,9 @@
  * guard has (`CollabRule`, apps/server/src/authz/collab-ingress/content-rules.ts) to one cause:
  *
  *   - `change`: a value or shape rule a change made in this browser broke (a schema skew during a rolling deploy,
- *     legacy content, a very large paste, or an earlier visit's edit replayed from IndexedDB). Only this cause may say
- *     a change was not saved.
+ *     legacy content, a very large paste, or an earlier visit's edit replayed from IndexedDB), and #827's size and
+ *     time bounds (`frame-too-large`, `apply-deadline`, `page-full`, whose notices are Discard-first by `refusalKind`).
+ *     Only this cause may say a change was not saved.
  *   - `copy`: this browser's stored copy of the page disagrees with the server (a top-level `root` the SPA never writes
  *     is the IndexedDB echo of server-written state; a client id bound to someone else; more new client ids than a
  *     frame may carry, which a copy collects one per visit). Never "your changes": the user may have typed nothing.
@@ -46,6 +47,10 @@ export const COLLAB_REFUSAL_RULES: Readonly<
     "zero-length",
     "conflict-scan",
     "delete-order",
+    // #827: a change this browser holds that the page cannot take (the notice's Discard-first kinds say which)
+    "frame-too-large",
+    "apply-deadline",
+    "page-full",
   ]),
   copy: new Set(["root", "foreign-client", "client-ids", "unresolved"]),
   other: new Set([

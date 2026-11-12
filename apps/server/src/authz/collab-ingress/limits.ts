@@ -10,7 +10,11 @@
 import type { ServerOptions } from 'ws';
 import { PAGE_MAX_YDOC_BYTES_CEILING } from '../page-write/page-size';
 
-/** The largest inbound frame: the API page-size cap's ceiling (8 MiB), ~15x the largest real page (0.52 MB). */
+/**
+ * The largest inbound frame: the API page-size cap's ceiling (8 MiB), ~15x the largest real page (0.52 MB). A transport
+ * bound only: since #827 the update guard refuses a Step2/Update payload over PAGE_MAX_YDOC_BYTES (`frame-too-large`,
+ * before it is decoded), so the #810 memory model (and outbound initial sync) keeps this 8 MiB.
+ */
 export const COLLAB_MAX_PAYLOAD_BYTES = PAGE_MAX_YDOC_BYTES_CEILING;
 
 /**
@@ -194,7 +198,8 @@ export const COLLAB_SOCKET_TOTAL_LOW_WATER_BYTES = 112 * 1024 * 1024;
 export const COLLAB_CONNECTIONS_PER_USER = 32;
 
 /**
- * Awareness and QueryAwareness frames per socket (frame-admission.ts): a burst of COLLAB_AWARENESS_BURST, then
+ * Awareness and QueryAwareness frames per socket (frame-admission.ts; since #827 the update guard refuses every
+ * QueryAwareness `message-type`, so only awareness frames reach a document): a burst of COLLAB_AWARENESS_BURST, then
  * COLLAB_AWARENESS_REFILL_PER_SECOND. Hocuspocus relays each awareness frame to every peer. Past it the frame is DROPPED,
  * never refused: awareness is a lossy last-state channel (every frame carries each client's whole state at a higher
  * clock, so a later frame supersedes a dropped one), and an honest provider can exceed any fixed rate: it sends one
@@ -208,7 +213,8 @@ export const COLLAB_CONNECTIONS_PER_USER = 32;
  * per id, so it is charged the minimum and the frame counts above hold exactly. Charged per frame, one socket could relay
  * 64 own ids at AWARENESS_STATE_MAX_BYTES each, about 512 KiB a frame, 40 times a second, to every peer (about 20 MiB/s
  * each). A frame larger than the whole bucket is never admitted: the guard caps a state at 8 KiB, and the 4.7.1 server
- * never sends QueryAwareness, so no honest client answers one with every state it knows.
+ * never sends QueryAwareness, so no honest client answers one with every state it knows (nor does an honest provider
+ * send one: the guard refuses it, #827).
  *
  * `flushDelay` stays at Hocuspocus's 0 (#810): it already coalesces a document's broadcasts within one event-loop turn,
  * and a positive value only adds latency unless several changes land per window (Hocuspocus 4.7.1's own guidance,

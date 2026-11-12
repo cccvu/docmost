@@ -49,6 +49,7 @@
  */
 import { createHash } from 'node:crypto';
 import * as Y from 'yjs';
+import { readRootMapEntries } from './reconcile-store';
 
 /** Top-level Y.Map name for the idempotency-key ledger. Deliberately not the `'default'` fragment. */
 export const WRITE_IDEM_MAP = '__ccc_write_idem';
@@ -164,4 +165,53 @@ export function recordWriteKey(
   // The digest only, never the legacy raw form. A `ScopedWriteKey`-only signature means no caller can record a
   // raw or unscoped entry through here (write-idem.fitness.spec.ts keeps every other writer of the root out).
   ledger.set(key.entry, nowMs);
+}
+
+// --- #827 compaction: the ledger read out of a page and carried, verbatim, into its rebuilt lineage
+
+declare const storedLedgerKey: unique symbol;
+/** A key exactly as a ledger holds it (an `h1:` digest, or a legacy raw entry a replica before it recorded). Made
+ *  only by reading a ledger here, so `carryLedgerOver` can write back nothing a ledger did not already hold. */
+export type StoredLedgerKey = string & { readonly [storedLedgerKey]: true };
+/** One number-valued ledger entry (anything else is corrupt and would be pruned at the next record anyway). */
+export interface LedgerEntry {
+  readonly key: StoredLedgerKey;
+  readonly ts: number;
+}
+
+/** The live document's ledger. Pure: never creates the root. */
+export function ledgerOfDoc(doc: Y.Doc): LedgerEntry[] {
+  if (!doc.share.has(WRITE_IDEM_MAP)) return [];
+  const out: LedgerEntry[] = [];
+  for (const [key, ts] of doc.getMap<unknown>(WRITE_IDEM_MAP).entries()) {
+    if (typeof ts === 'number' && Number.isFinite(ts)) out.push({ key: key as StoredLedgerKey, ts });
+  }
+  return out;
+}
+
+/**
+ * A stored row's ledger, from its decoded structs and delete set (reconcile-store.ts `readRootMapEntries`: nothing is
+ * integrated, so it works on a row too costly to load). `unresolved`: live entries whose key the bytes could not name.
+ */
+export function ledgerOfDecoded(
+  structs: Parameters<typeof readRootMapEntries>[0],
+  ds: Parameters<typeof readRootMapEntries>[1],
+): { ledger: LedgerEntry[]; unresolved: number } {
+  const { entries, unresolved } = readRootMapEntries(structs, ds, WRITE_IDEM_MAP);
+  const ledger: LedgerEntry[] = [];
+  for (const [key, { value }] of entries) {
+    if (typeof value === 'number' && Number.isFinite(value)) ledger.push({ key: key as StoredLedgerKey, ts: value });
+  }
+  return { ledger, unresolved };
+}
+
+/**
+ * Write `entries` (read from the page by `ledgerOfDoc` / `ledgerOfDecoded`) into a document compaction built, as they
+ * were: a write applied before the compaction still dedups after it. Only entries a ledger already held can be
+ * passed (`StoredLedgerKey`), so this records no new key and no raw form that was not already there.
+ */
+export function carryLedgerOver(doc: Y.Doc, entries: readonly LedgerEntry[]): void {
+  if (entries.length === 0) return;
+  const ledger = doc.getMap<number>(WRITE_IDEM_MAP);
+  for (const { key, ts } of entries) ledger.set(key, ts);
 }

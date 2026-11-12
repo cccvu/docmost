@@ -140,6 +140,11 @@ export const serverFrames = {
     frame(documentName, MessageType.Sync, (e) =>
       syncProtocol.writeSyncStep2(e, doc),
     ),
+  /** #827: the server's acknowledgement of one sync frame it applied (the provider's unsynced count goes down). */
+  syncStatus: (documentName: string, applied = true) =>
+    frame(documentName, MessageType.SyncStatus, (e) =>
+      encoding.writeVarInt(e, applied ? 1 : 0),
+    ),
   /** A per-document CLOSE (the socket stays open; the provider reports it as code 1000 with this reason). */
   close: (documentName: string, reason: string) =>
     frame(documentName, MessageType.CLOSE, (e) =>

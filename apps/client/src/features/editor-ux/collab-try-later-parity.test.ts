@@ -4,13 +4,24 @@
 // token refetch, then "connection lost") or a refusal into a retry loop.
 //
 // Where the server keeps them moves (auth-refusal.ts holds the connect's refusal reasons since #810; auth-rate.ts and
-// user-connections.ts held them before), so the constants are found by NAME in whichever of these files exist.
+// user-connections.ts held them before; collab-reasons.ts holds #827's), so the constants are found by NAME in
+// whichever of these files exist.
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import {
+  COLLAB_EPOCH_PATTERN,
+  COLLAB_EPOCH_STALE_PREFIX,
+  COLLAB_LOAD_TRY_LATER_REASON,
+  COLLAB_PAGE_COMPACTING_REASON,
+  COLLAB_RULE_APPLY_DEADLINE,
+  COLLAB_RULE_FRAME_TOO_LARGE,
+  COLLAB_RULE_PAGE_FULL,
   COLLAB_UPDATE_REFUSED_PREFIX,
   COLLAB_UPDATE_UNRESOLVED,
+  classifyCollabCloseReason,
+  collabRefusalKind,
+  parseEpochStaleReason,
   TRY_LATER_AUTH_REASONS,
   TRY_LATER_CLOSE_CODES,
   TRY_LATER_CLOSE_REASONS,
@@ -28,6 +39,7 @@ const FILES = [
   "user-connections.ts",
   "update-guard.ts",
   "bounded-socket.ts",
+  "collab-reasons.ts", // #827
 ];
 
 const present = FILES.filter((f) => existsSync(join(INGRESS, f)));
@@ -65,17 +77,24 @@ describe("server ↔ client collab reasons (#810)", () => {
       "COLLAB_USER_CONNECTIONS_CLOSE_CODE",
       "REFUSED_REASON_PREFIX",
       "UNRESOLVED_REASON",
+      "COLLAB_PAGE_COMPACTING_REASON",
+      "COLLAB_LOAD_TRY_LATER_REASON",
+      "COLLAB_EPOCH_STALE_REASON_PREFIX",
+      "RULE_FRAME_TOO_LARGE",
+      "RULE_APPLY_DEADLINE",
+      "RULE_PAGE_FULL",
     ]) {
       expect([name, serverConst(name)]).toEqual([name, expect.any(String)]);
     }
     expect(serverReasons.length).toBeGreaterThanOrEqual(5);
   });
 
-  it("the auth refusals the editor waits out are the server's auth-rate and connection-cap reasons", () => {
+  it("the auth refusals the editor waits out are the server's auth-rate, connection-cap and load-debt reasons", () => {
     expect([...TRY_LATER_AUTH_REASONS].sort()).toEqual(
       [
         serverConst("COLLAB_AUTH_RATE_REASON"),
         serverConst("COLLAB_USER_CONNECTIONS_REASON"),
+        serverConst("COLLAB_LOAD_TRY_LATER_REASON"),
       ].sort(),
     );
   });
@@ -85,6 +104,7 @@ describe("server ↔ client collab reasons (#810)", () => {
       [
         serverConst("TRY_LATER_REASON"),
         serverConst("COLLAB_USER_CONNECTIONS_REASON"),
+        serverConst("COLLAB_LOAD_TRY_LATER_REASON"),
       ].sort(),
     );
     expect([...TRY_LATER_CLOSE_CODES].sort()).toEqual(
@@ -103,16 +123,57 @@ describe("server ↔ client collab reasons (#810)", () => {
     expect(WS_CLOSE_MESSAGE_TOO_BIG).toBe(1009);
   });
 
-  // A NEW server reason must be a decision on the client too (refused, unresolved or try later), never "other" by
-  // default: a reason the editor does not know takes the #537 path (auth) or the provider's 1 s reconnect (close).
+  // #827: the page-level reasons and the Discard-first rules.
+  it("the compaction, load-debt and epoch-stale reasons and the Discard-first rules are the client's", () => {
+    expect(serverConst("COLLAB_PAGE_COMPACTING_REASON")).toBe(
+      COLLAB_PAGE_COMPACTING_REASON,
+    );
+    expect(serverConst("COLLAB_LOAD_TRY_LATER_REASON")).toBe(
+      COLLAB_LOAD_TRY_LATER_REASON,
+    );
+    expect(serverConst("COLLAB_EPOCH_STALE_REASON_PREFIX")).toBe(
+      COLLAB_EPOCH_STALE_PREFIX,
+    );
+    expect(serverConst("RULE_FRAME_TOO_LARGE")).toBe(COLLAB_RULE_FRAME_TOO_LARGE);
+    expect(serverConst("RULE_APPLY_DEADLINE")).toBe(COLLAB_RULE_APPLY_DEADLINE);
+    expect(serverConst("RULE_PAGE_FULL")).toBe(COLLAB_RULE_PAGE_FULL);
+    for (const rule of [
+      COLLAB_RULE_FRAME_TOO_LARGE,
+      COLLAB_RULE_APPLY_DEADLINE,
+      COLLAB_RULE_PAGE_FULL,
+    ]) {
+      expect(collabRefusalKind(COLLAB_UPDATE_REFUSED_PREFIX + rule)).not.toBe("generic");
+    }
+  });
+
+  // The server's parseEpochStaleReason and the client's must read the same epochs (the server's own spec vectors).
+  it("the client reads an epoch-stale reason as the server writes it", () => {
+    const pattern = source.match(
+      /export function parseEpochStaleReason[\s\S]*?if \(!(\/.*\/)\.test\(tail\)\)/,
+    );
+    expect(pattern?.[1]).toBe(String(COLLAB_EPOCH_PATTERN));
+    for (const n of [0, 1, 42, 999_999_999_999_999]) {
+      expect(parseEpochStaleReason(COLLAB_EPOCH_STALE_PREFIX + n)).toBe(n);
+    }
+    for (const bad of ["", "-1", "01", "1e3", "1 ", "x"]) {
+      expect(parseEpochStaleReason(COLLAB_EPOCH_STALE_PREFIX + bad)).toBeNull();
+    }
+  });
+
+  // A NEW server reason must be a decision on the client too (refused, epoch, unresolved, compacting or try later),
+  // never "other" by default: a reason the editor does not know takes the #537 path (auth) or the provider's 1 s
+  // reconnect (close).
   it("every ccc:collab reason the server sends is one the client classifies", () => {
     const known = (r: string) =>
       r === COLLAB_UPDATE_REFUSED_PREFIX ||
       r.startsWith(COLLAB_UPDATE_REFUSED_PREFIX) ||
       r === COLLAB_UPDATE_UNRESOLVED ||
+      r === COLLAB_PAGE_COMPACTING_REASON ||
       TRY_LATER_AUTH_REASONS.includes(r) ||
       TRY_LATER_CLOSE_REASONS.includes(r);
     expect(serverReasons.filter((r) => !known(r))).toEqual([]);
+    expect(classifyCollabCloseReason(COLLAB_PAGE_COMPACTING_REASON, 1013)).toBe("compacting");
+    expect(classifyCollabCloseReason(`${COLLAB_EPOCH_STALE_PREFIX}2`, 1000)).toBe("epoch");
   });
 });
 

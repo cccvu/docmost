@@ -13,8 +13,90 @@ import { initProseMirrorDoc } from '@tiptap/y-tiptap';
 import { TiptapTransformer } from '@hocuspocus/transformer';
 import type { Hocuspocus } from '@hocuspocus/server';
 import { serverSchema } from '../page-write/prelim-content';
+import { deadlineExceeded, runWithDeadline, type DeadlineRunner } from './deadline';
 
 export const DOC_NAME = 'page.00000000-0000-4000-8000-000000000781';
+
+/**
+ * #827: the CPU this jest worker's MAIN thread ran, in ms (user + system). The guard charges its CPU budget and decides
+ * its deadlines on wall time, which on a production task (one process, its own vCPUs) is the work's cost on the event
+ * loop. On a shared CI runner (`--maxWorkers=2` on mixed tiers, #567) wall time also counts the time the worker waited
+ * for a core, so a spec that asserts an honest frame fits a bound measures the frame in CPU time instead: a slower CPU
+ * still costs more and still fails, a busy neighbour no longer does. Only the main thread's: the process total also
+ * counts V8's parallel and concurrent GC helper threads, which run beside the work (measured on this suite: up to twice
+ * the main thread's time for one frame), so it overstated the event loop's cost and could fail honest frames that
+ * production's wall-clock deadline admits.
+ */
+export const processCpuMs = (): number => {
+  const u = process.threadCpuUsage();
+  return (u.user + u.system) / 1000;
+};
+
+/**
+ * #827: the production deadlines (doc-bounds.ts) are sized on Graviton2, the production class. A CI runner slower than
+ * that would fail honest work the production host admits, so a spec asserting honest work fits them scales the bound
+ * by how much slower than Graviton2 this runner runs Yjs, never below 1: on a runner at least as fast as production the
+ * bound is the production value, unchanged. Measured once per jest worker on a fixed reference (the sizing bench's
+ * `sweep.SE` S=40k/E=2k select-all: a plain apply of the delete of a 2,000-paragraph, 40k-struct page), in this
+ * worker's main-thread CPU time, the median of three. Its Graviton2 cost, measured by the bench on c6g.large (Node
+ * 22.23.5), is REFERENCE_YJS_GRAVITON2_MS; the x86 dev box measures about 28 ms, so there the factor is 1.
+ */
+export const REFERENCE_YJS_GRAVITON2_MS = 128.1;
+let slowdown: number | undefined;
+export function runnerSlowdown(): number {
+  if (slowdown !== undefined) return slowdown;
+  const base = new Y.Doc();
+  base.clientID = 1;
+  base.transact(() => {
+    const ps: Y.XmlElement[] = [];
+    for (let i = 0; i < 2_000; i++) {
+      const p = new Y.XmlElement('paragraph');
+      const t = new Y.XmlText();
+      p.insert(0, [t]);
+      for (let m = 5; m >= 0; m--) t.insert(0, 'run' + m + ' ', m % 2 ? { italic: true } : { bold: true });
+      ps.push(p);
+    }
+    base.getXmlFragment('default').insert(0, ps);
+  });
+  const state = Y.encodeStateAsUpdate(base);
+  const editor = new Y.Doc();
+  Y.applyUpdate(editor, state);
+  editor.clientID = 9;
+  let del: Uint8Array | null = null;
+  editor.on('update', (u: Uint8Array) => (del = u));
+  const fragment = editor.getXmlFragment('default');
+  fragment.delete(0, fragment.length);
+  const runs: number[] = [];
+  for (let i = 0; i < 3; i++) {
+    const doc = new Y.Doc();
+    Y.applyUpdate(doc, state);
+    doc.on('update', (u: Uint8Array) => u.length);
+    const started = processCpuMs();
+    Y.applyUpdate(doc, del!);
+    runs.push(processCpuMs() - started);
+    doc.destroy();
+  }
+  runs.sort((a, b) => a - b);
+  slowdown = Math.max(1, runs[1] / REFERENCE_YJS_GRAVITON2_MS);
+  return slowdown;
+}
+
+/**
+ * #827: the guard's deadline runner for specs asserting honest work fits the PRODUCTION deadlines: the real vm deadline
+ * still runs (at `wallSlack` × the scaled bound, so runaway work is still cut), and work that finished is the guard's
+ * timeout when it used more than the bound × `scale` in CPU time (`processCpuMs`). `scale` is `runnerSlowdown()`: 1 on
+ * a runner at least as fast as Graviton2, so the verdict is production's for an honest frame on a host with a free
+ * core; on a slower runner the bound grows with it, so a slow runner never forces the production value.
+ */
+export function cpuTimeDeadline(wallSlack = 10, scale = runnerSlowdown()): DeadlineRunner {
+  return <T>(fn: () => T, ms: number): T => {
+    const bound = ms * scale;
+    const started = processCpuMs();
+    const result = runWithDeadline(fn, bound * wallSlack);
+    if (processCpuMs() - started > bound) throw deadlineExceeded(ms);
+    return result;
+  };
+}
 
 /** Hocuspocus 4.7.1 message types (`types.ts` MessageType) and y-protocols sync subtypes. */
 export const MSG = { Sync: 0, Awareness: 1, Auth: 2, QueryAwareness: 3, SyncReply: 4, Stateless: 5, BroadcastStateless: 6, Close: 7, SyncStatus: 8 } as const;

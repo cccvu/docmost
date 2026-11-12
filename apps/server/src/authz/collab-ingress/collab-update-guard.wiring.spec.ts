@@ -5,6 +5,8 @@ import * as Y from 'yjs';
 import { syncFrame, awarenessFrame, statelessFrame, MSG, RemoteClient } from './collab-ingress.testkit';
 import { CollabUpdateGuardExtension } from './collab-update-guard.extension';
 import { CollabUpdateGuard } from './update-guard';
+import { requestCompaction } from '../page-write/compaction-registry';
+import { COLLAB_LOAD_TRY_LATER_REASON, COLLAB_PAGE_COMPACTING_REASON } from './collab-reasons';
 
 /**
  * #781 wiring fitness (ADR 0036). Hocuspocus 4.7.1 handles one frame at a time per connection: it awaits the
@@ -14,7 +16,8 @@ import { CollabUpdateGuard } from './update-guard';
  * apply has the same length and no hook on it awaits anything; the guard's shadow replica is exact only under that
  * order. So: the guard is the FIRST extension, it is the ONLY `beforeHandleMessage` in the server, it never returns a
  * promise (it returns undefined or throws synchronously), and no server source defines a `beforeSync` or
- * `beforeHandleAwareness` hook (#790: either would sit on that path).
+ * `beforeHandleAwareness` hook (#790: either would sit on that path). #827 adds the join and load hooks, synchronous
+ * too: a load gate that awaited first could share its refusal with a co-loader.
  */
 const SRC = join(__dirname, '..', '..');
 const posix = (p: string) => p.split(sep).join('/');
@@ -100,17 +103,63 @@ describe('#781 the collab update guard is wired first, alone and synchronous', (
     expect(definesHook(ts.createSourceFile('x.ts', 'const beforeSyncNot = 1; call(beforeSync);', ts.ScriptTarget.Latest, true), 'beforeSync')).toBe(false);
   });
 
-  it('its hook is not async, and returns undefined (never a promise) for every kind of frame', () => {
+  it('#827: its hooks are exactly the frame hook, the post-auth join gate and the load pair; only afterLoadDocument is async', () => {
     const sf = parse(join(__dirname, 'collab-update-guard.extension.ts'));
-    let asyncHook = true;
+    const hooks = new Map<string, boolean>();
     const visit = (n: ts.Node) => {
-      if (ts.isMethodDeclaration(n) && n.name.getText() === 'beforeHandleMessage') {
-        asyncHook = !!ts.getModifiers(n)?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword);
+      if (ts.isClassDeclaration(n) && n.name?.text === 'CollabUpdateGuardExtension') {
+        for (const m of n.members) {
+          if (!ts.isMethodDeclaration(m) && !ts.isPropertyDeclaration(m)) continue;
+          if (ts.getModifiers(m)?.some((x) => x.kind === ts.SyntaxKind.PrivateKeyword)) continue;
+          const isAsync = !!ts.getModifiers(m)?.some((x) => x.kind === ts.SyntaxKind.AsyncKeyword);
+          hooks.set(m.name.getText(), isAsync);
+        }
       }
       ts.forEachChild(n, visit);
     };
     visit(sf);
-    expect(asyncHook).toBe(false);
+    // No onAuthenticate or onConnect: this extension outranks the auth extension, so a hook there would answer a client
+    // that has not authenticated (a compacting refusal would tell it the page exists and is compacting).
+    expect([...hooks.keys()].sort()).toEqual(['afterLoadDocument', 'beforeHandleMessage', 'connected', 'extensionName', 'onLoadDocument', 'priority']);
+    // afterLoadDocument alone: #841's load repair yields a macrotask after #827's load charge (which runs before it)
+    expect([...hooks].filter(([, isAsync]) => isAsync).map(([name]) => name)).toEqual(['afterLoadDocument']);
+  });
+
+  it('#827: the post-auth join gate closes the socket 1013 and never throws; the load gate throws { reason } synchronously (no co-loader shares it); afterLoadDocument never rejects', async () => {
+    const guard = new CollabUpdateGuard({ logger: { warn: () => undefined } });
+    const ext = new CollabUpdateGuardExtension(guard);
+    const live = new Y.Doc() as Y.Doc & { name: string };
+    live.name = 'page.p';
+    // an authenticated join to a resident document that drains: its socket is closed, nothing is thrown
+    requestCompaction(live, { reason: 'structs', userId: null, drain: true });
+    const socket = { readyState: 1, close: jest.fn() };
+    const joined = (document: Y.Doc) => ({ connection: { document, webSocket: socket }, documentName: 'page.p', context: {} });
+    expect(ext.connected(joined(live) as never)).toBeUndefined();
+    expect(socket.close).toHaveBeenCalledWith(1013, COLLAB_PAGE_COMPACTING_REASON);
+    socket.close.mockClear();
+    expect(ext.connected(joined(new Y.Doc()) as never)).toBeUndefined(); // a page not closed: untouched
+    expect(socket.close).not.toHaveBeenCalled();
+    socket.close.mockImplementation(() => {
+      throw new Error('gone');
+    });
+    expect(ext.connected(joined(live) as never)).toBeUndefined(); // a socket that throws on close: still nothing thrown
+    // a socket's load while its user is in debt; the same load from a DirectConnection is admitted
+    guard.chargeLoad('u', 1e9, guard.wallClock());
+    const load = (headers: Headers) => ({ document: new Y.Doc(), context: { user: { id: 'u' } }, requestHeaders: headers });
+    let thrown: unknown;
+    try {
+      ext.onLoadDocument(load(new Headers({ 'sec-websocket-key': 'k' })) as never);
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toEqual({ reason: COLLAB_LOAD_TRY_LATER_REASON });
+    const direct = load(new Headers());
+    expect(ext.onLoadDocument(direct as never)).toBeUndefined();
+    await expect(ext.afterLoadDocument(direct as never)).resolves.toBeUndefined();
+    await expect(ext.afterLoadDocument({ document: undefined } as never)).resolves.toBeUndefined();
+  });
+
+  it('its frame hook returns undefined (never a promise) for every kind of frame', () => {
 
     const ext = new CollabUpdateGuardExtension(new CollabUpdateGuard({ logger: { warn: () => undefined } }));
     const live = new Y.Doc() as Y.Doc & { name: string };

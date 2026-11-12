@@ -91,6 +91,11 @@ export const INT_ATTRS: ReadonlyMap<string, readonly [min: number, max: number]>
   ['node tableHeader.rowspan', [1, 65534]],
 ]);
 
+/**
+ * Every rule a refusal names. #827 (collab-reasons.ts): `frame-too-large` (a Step2/Update payload over
+ * PAGE_MAX_YDOC_BYTES), `apply-deadline` (a second shadow-apply deadline), `page-full` (growth of a page still over a
+ * structure cap after compaction). A plain union of literals: the client's parity test reads it.
+ */
 export type CollabRule =
   | 'root'
   | 'content-kind'
@@ -120,6 +125,9 @@ export type CollabRule =
   | 'conflict-scan'
   | 'client-ids'
   | 'delete-order'
+  | 'frame-too-large'
+  | 'apply-deadline'
+  | 'page-full'
   | 'cross-list';
 
 /** A refusal. `node`/`mark`/`key` are set only to names the schema declares: a log or a response never echoes input. */
