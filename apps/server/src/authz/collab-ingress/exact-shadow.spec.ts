@@ -1155,6 +1155,33 @@ describe('#847 keyed splits of stored items, the crash-class refusals in report 
     }
   });
 
+  it('a legacy PENDING multi-value head, released by an honest frame: applied and logged keyed-split, never refused; it cannot wedge, and a split of it is still refused', () => {
+    // A row stored before #847 whose pending structs hold a keyed item with two values (P:0..1, origin M:0, which the row
+    // lacks). The frame that supplies M:0 is an editor's honest one; refusing it (4422) would detach that editor for good.
+    const [M, P] = [7, 11];
+    for (const mode of ['enforce', 'report'] as const) {
+      const { doc } = listPage();
+      const q = qOf(doc);
+      Y.applyUpdate(doc, rawUpdate([{ client: P, clock: 0, structs: [{ origin: [M, 0], right: null, content: new Y.ContentAny(['left', 'center']) }] }]));
+      expect(doc.store.pendingStructs).not.toBeNull(); // precondition: it is pending, and the row carries it
+      const logs: string[] = [];
+      const s = harness({ bytes: Y.encodeStateAsUpdate(doc), guard: mode === 'report' ? reportGuard(logs) : undefined });
+      const lines = mode === 'report' ? logs : s.logs;
+      const release = rawUpdate([{ client: M, clock: 0, structs: [{ origin: null, right: null, parent: idOf(q), sub: 'textAlign', content: new Y.ContentAny(['right']) }] }]);
+      expect(s.send(s.conn('editor'), release)).toBe('applied');
+      const head = qOf(s.live)._map.get('textAlign')!;
+      expect([head.id.client, head.length, head.deleted, head.right]).toEqual([P, 2, false, null]); // anti-vacuity: the multi-value head is live
+      const legacy = lines.filter((l) => l.startsWith('COLLAB_LEGACY_PENDING_INVALID ')).map((l) => JSON.parse(l.slice(l.indexOf('{'))).rule);
+      expect(legacy).toEqual(['keyed-split']);
+      // a split of the released head is refused, in every mode
+      expect(s.send(s.conn('attacker'), rawUpdate([], [{ client: P, ranges: [[1, 1]] }]))).toBe(REFUSED('keyed-split'));
+      // unsplit, an honest delete of its parent removes it whole: applied, and live is not wedged
+      expect(s.send(s.conn('editor'), deleteQ(s.live))).toBe('applied');
+      expect(liveWedged(s.live)).toBe(false);
+      expect(strictOrderDiff(reloadOf(s.live), s.live)).toBeNull();
+    }
+  });
+
   it('M1 through the guard (patch C): the tail over a GC integrates as a GC, live reloads into itself; over a live item it is cross-list', () => {
     for (const deleted of [true, false]) {
       const base = new Y.Doc();

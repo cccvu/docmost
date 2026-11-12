@@ -1,7 +1,11 @@
 // cccvu/wiki-v2#847 — the browser's broken-copy detector (collab-copy-health.ts) on real Y.Docs, no IndexedDB: the
 // y-indexeddb replay is played by a stand-in with the same origin and `synced` behaviour (y-indexeddb 9.0.12
 // `fetchUpdates`: one `Y.transact(doc, …, persistence, false)`, then `synced = true` synchronously on success).
+import { existsSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { IndexeddbPersistence } from "y-indexeddb";
 import * as Y from "yjs";
 import {
   type CollabCopyBreak,
@@ -242,5 +246,140 @@ describe("unsubscribe", () => {
     const observers = (doc as unknown as { _observers: Map<string, Set<unknown>> })
       ._observers;
     expect(observers.get("beforeAllTransactions")?.size ?? 0).toBe(0);
+  });
+});
+
+/**
+ * The real y-indexeddb (not the stand-in above), over a minimal IndexedDB that answers each request as a macrotask, as
+ * the browser does. These pin the two library behaviours the `replay` arm rests on: the replay transaction's origin is
+ * the persistence object, and `synced = true` is set synchronously after it. If a y-indexeddb bump set `synced` later
+ * (after an `await`), every honest page open would be refused `client:local-copy`; the first test goes red instead.
+ */
+describe("replay: the real y-indexeddb 9.0.12 (#847 bump tripwire)", () => {
+  const RE_VALIDATE =
+    "y-indexeddb changed: re-validate collab-copy-health.ts's `replay` arm (the replay's origin, and `synced` set " +
+    "synchronously after it) against the new source, then update this pin (ADR 0036 #847 amendment, upgrade procedure).";
+
+  type Range = { lower?: number; lowerOpen?: boolean; upper?: number; upperOpen?: boolean } | null | undefined;
+  type Request = { result?: unknown; onsuccess?: (e: { target: Request }) => void; onerror?: unknown };
+
+  /** Only what y-indexeddb 9.0.12 calls through lib0/indexeddb on open: open, getAll, add, a key cursor, count. */
+  function fakeIndexedDb(stored: Uint8Array[]) {
+    const records = new Map<number, unknown>();
+    let next = 0;
+    for (const update of stored) records.set(++next, update);
+    const inRange = (key: number, range: Range) =>
+      !range ||
+      ((range.lower === undefined || (range.lowerOpen ? key > range.lower : key >= range.lower)) &&
+        (range.upper === undefined || (range.upperOpen ? key < range.upper : key <= range.upper)));
+    const keys = (range: Range) => [...records.keys()].filter((k) => inRange(k, range)).sort((a, b) => a - b);
+    const answer = (result: () => unknown): Request => {
+      const request: Request = {};
+      setTimeout(() => {
+        request.result = result();
+        request.onsuccess?.({ target: request });
+      }, 0);
+      return request;
+    };
+    const store = {
+      add: (value: unknown) => answer(() => (records.set(++next, value), next)),
+      getAll: (range: Range) => answer(() => keys(range).map((k) => records.get(k))),
+      count: (range: Range) => answer(() => keys(range).length),
+      openKeyCursor: (range: Range, direction: string) => {
+        const order = direction === "prev" ? keys(range).reverse() : keys(range);
+        const request: Request = {};
+        let i = 0;
+        const step = () =>
+          setTimeout(() => {
+            const key = order[i++];
+            request.result = key === undefined ? null : { key, continue: step };
+            request.onsuccess?.({ target: request });
+          }, 0);
+        step();
+        return request;
+      },
+    };
+    const db = { transaction: () => ({ objectStore: () => store }), createObjectStore: () => store, close: () => {} };
+    return {
+      indexedDB: {
+        open: () => {
+          const request: Request & { onupgradeneeded?: (e: { target: { result: unknown } }) => void } = {};
+          setTimeout(() => {
+            request.onupgradeneeded?.({ target: { result: db } });
+            request.result = db;
+            request.onsuccess?.({ target: request });
+          }, 0);
+          return request;
+        },
+      },
+      IDBKeyRange: {
+        lowerBound: (lower: number, lowerOpen = false) => ({ lower, lowerOpen }),
+        upperBound: (upper: number, upperOpen = false) => ({ upper, upperOpen }),
+      },
+    };
+  }
+
+  function open(stored: Uint8Array[]) {
+    const fake = fakeIndexedDb(stored);
+    vi.stubGlobal("indexedDB", fake.indexedDB);
+    vi.stubGlobal("IDBKeyRange", fake.IDBKeyRange);
+    const doc = new Y.Doc();
+    const local = new IndexeddbPersistence(`ccc-847-${Math.random()}`, doc);
+    const { reports } = watched(local); // bound right after construction, as the controller does
+    return { doc, local, reports };
+  }
+
+  /** Until `done()` or 2 s (real macrotasks: the fake answers each request with a timer). */
+  async function until(done: () => boolean) {
+    for (let i = 0; i < 400 && !done(); i++) await new Promise((r) => setTimeout(r, 5));
+  }
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("is the version these behaviours were read from", () => {
+    const require = createRequire(import.meta.url);
+    let dir = dirname(require.resolve("y-indexeddb"));
+    while (!existsSync(join(dir, "package.json"))) dir = dirname(dir);
+    const { version } = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as { version: string };
+    if (version !== "9.0.12") throw new Error(`${RE_VALIDATE}\n(installed y-indexeddb ${version})`);
+  });
+
+  it("an honest stored copy replays and reports nothing (synced is set synchronously after the replay)", async () => {
+    const stored = new Y.Doc();
+    stored.getText("t").insert(0, "stored");
+    const { doc, local, reports } = open([Y.encodeStateAsUpdate(stored)]);
+    let replays = 0;
+    doc.on("beforeTransaction", (tr: Y.Transaction) => {
+      if (tr.origin === local) replays++;
+    });
+    await local.whenSynced;
+    await drain();
+    expect(replays).toBe(1); // anti-vacuity: the replay really ran, under the persistence object's origin
+    expect(doc.getText("t").toString()).toBe("stored");
+    expect(local.synced).toBe(true);
+    expect(reports).toEqual([]);
+    local.destroy();
+  });
+
+  it("a stored copy whose replay throws is reported as a broken replay", async () => {
+    // y-indexeddb never catches the replay's throw, so the open rejects unhandled (in the browser too). Take it here,
+    // so the runner does not fail the file on an error this test expects.
+    const rejections: unknown[] = [];
+    const runner = process.listeners("unhandledRejection");
+    process.removeAllListeners("unhandledRejection");
+    process.on("unhandledRejection", (reason) => rejections.push(reason));
+    try {
+      const { local, reports } = open([MALFORMED]);
+      await until(() => reports.length > 0 && rejections.length > 0);
+      expect(rejections).toHaveLength(1);
+      expect(local.synced).toBe(false);
+      expect(reports).toEqual(["replay"]);
+      local.destroy();
+    } finally {
+      process.removeAllListeners("unhandledRejection");
+      for (const listener of runner) process.on("unhandledRejection", listener);
+    }
   });
 });
