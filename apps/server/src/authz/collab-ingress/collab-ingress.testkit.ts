@@ -18,14 +18,17 @@ import { deadlineExceeded, runWithDeadline, type DeadlineRunner } from './deadli
 export const DOC_NAME = 'page.00000000-0000-4000-8000-000000000781';
 
 /**
- * #827: the CPU this jest worker ran, in ms (user + system, every thread of the process). The guard charges its CPU
- * budget and decides its deadlines on wall time, which on a production task (one process, its own vCPUs) is the
- * work's cost. On a shared CI runner (`--maxWorkers=2` on mixed tiers, #567) wall time also counts the time the worker
- * waited for a core, so a spec that asserts an honest frame fits a bound measures the frame in CPU time instead: a
- * slower CPU still costs more and still fails, a busy neighbour no longer does.
+ * #827: the CPU this jest worker's MAIN thread ran, in ms (user + system). The guard charges its CPU budget and decides
+ * its deadlines on wall time, which on a production task (one process, its own vCPUs) is the work's cost on the event
+ * loop. On a shared CI runner (`--maxWorkers=2` on mixed tiers, #567) wall time also counts the time the worker waited
+ * for a core, so a spec that asserts an honest frame fits a bound measures the frame in CPU time instead: a slower CPU
+ * still costs more and still fails, a busy neighbour no longer does. Only the main thread's: the process total also
+ * counts V8's parallel and concurrent GC helper threads, which run beside the work (measured on this suite: up to twice
+ * the main thread's time for one frame), so it overstated the event loop's cost and could fail honest frames that
+ * production's wall-clock deadline admits.
  */
 export const processCpuMs = (): number => {
-  const u = process.cpuUsage();
+  const u = process.threadCpuUsage();
   return (u.user + u.system) / 1000;
 };
 
