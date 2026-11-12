@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import * as Y from 'yjs';
 // #827: the lineage root and the superseded mark (the registry imports only yjs and constants).
-import { buildRefused, LINEAGE_ROOT, liveWedged, markSuperseded, orderHealRequested, type CompactionReason } from './compaction-registry';
+import { buildRefused, LINEAGE_ROOT, markSuperseded, orderHealRequested, type CompactionReason } from './compaction-registry';
 
 /**
  * #390 — the SYMMETRIC guard for ADR 0019.
@@ -69,9 +69,11 @@ export function reconcileRowIntoDoc(
     throw new ForeignLineageError(foreign.why, foreign.rowEpoch);
   }
 
-  // #847: never into a wedged document (compaction-registry.ts `liveWedged`): the merge would integrate and never be
-  // cleaned up, broadcast or counted. The store fails (recorded, so a settle fails closed); the row keeps what it holds.
-  if (liveWedged(document)) throw new WedgedDocumentError();
+  // #847: a wedged document (compaction-registry.ts `liveWedged`) is merged into too. Its integration stays correct
+  // (wedge-integrity.spec.ts: the visible tree equals a gc:false oracle and a reload equals it); the merge emits no
+  // update, so it is never broadcast or counted, but the store serializes `document` next, under the row lock, so the
+  // row gets the union and the heal compacts from a live the row covers. Refusing failed that store: the heal skipped
+  // `not_stored` and live's acknowledged unstored edits were lost at unload.
 
   // #790: under Hocuspocus 4.x every change to a live document schedules a store unless its origin opts out. This
   // merge runs INSIDE a store that serializes it next, so it opts out: as under 3.4.4 it schedules nothing, and it
@@ -145,13 +147,6 @@ export class ForeignLineageError extends Error {
         ? 'the stored page was compacted to another lineage since this copy loaded; refused to merge it (#827)'
         : 'the stored page holds an older lineage than this compacted copy; refused to merge it (#827)',
     );
-  }
-}
-
-/** #847: the resident document is wedged (its Yjs cleanup threw); the store refused to fold the row into it. */
-export class WedgedDocumentError extends Error {
-  constructor() {
-    super('the resident page is wedged (a Yjs transaction cleanup failed); refused to fold the row into it (#847)');
   }
 }
 

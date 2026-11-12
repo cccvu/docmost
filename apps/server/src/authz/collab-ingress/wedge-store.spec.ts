@@ -7,7 +7,7 @@ import { serverSchema } from '../page-write/prelim-content';
 import { compactOnUnload, loadStoredYdoc, type CompactableDocument, type CompactionStore } from '../page-write/compaction';
 import { lineageEpoch, liveWedged, resetCompactionGapForTests, setCompactionClockForTests } from '../page-write/compaction-registry';
 import { clearStoreFailure, markStoredAt, recordStoreFailure, storeGenerationOf } from '../page-write/store-failure-registry';
-import { markRowCovered } from '../page-write/reconcile-store';
+import { markRowCovered, reconcileRowIntoDoc } from '../page-write/reconcile-store';
 import { COMPACTION_ARM_DELAY_MS } from './doc-bounds';
 import { authFrame, DOC_NAME, FakeSocket, MSG, readServerFrame, RemoteClient, syncFrame } from './collab-ingress.testkit';
 import { CollabUpdateGuardExtension } from './collab-update-guard.extension';
@@ -58,6 +58,12 @@ function wedgeLive(live: Y.Doc): void {
   }
 }
 
+function paragraphOf(text: string): Y.XmlElement {
+  const el = new Y.XmlElement('paragraph');
+  el.insert(0, [new Y.XmlText(text)]);
+  return el;
+}
+
 const visibleText = (bytes: Uint8Array) => {
   const d = new Y.Doc();
   Y.applyUpdate(d, bytes);
@@ -90,7 +96,9 @@ describe('#847 a wedged live document: the acknowledged frames are stored, and t
     for (const hp of open.splice(0)) hp.closeConnections();
   });
 
-  async function server(opts: { failStores?: boolean } = {}) {
+  type Reconcile = typeof reconcileRowIntoDoc;
+  async function server(opts: { failStores?: boolean; splitBrainOnWedgedStore?: boolean; reconcile?: Reconcile } = {}) {
+    const reconcile = opts.reconcile ?? reconcileRowIntoDoc;
     offset += 86_400_000;
     const row = { ydoc: storedPage() as Uint8Array };
     const stores: Uint8Array[] = [];
@@ -133,6 +141,20 @@ describe('#847 a wedged live document: the acknowledged frames are stored, and t
           },
           async onStoreDocument({ document }: { document: Y.Doc }) {
             if (opts.failStores) return recordStoreFailure(document); // what its catch does after logging
+            if (opts.splitBrainOnWedgedStore && liveWedged(document)) {
+              // another resident copy (Redis split-brain) stored first: the row holds structs live lacks
+              opts.splitBrainOnWedgedStore = false;
+              const other = new Y.Doc();
+              other.clientID = 77;
+              Y.applyUpdate(other, row.ydoc);
+              other.getXmlFragment('default').insert(0, [paragraphOf('out of band')]);
+              row.ydoc = Y.encodeStateAsUpdate(other);
+            }
+            try {
+              reconcile(document, row.ydoc); // seam #390, under the row lock, before the snapshot
+            } catch {
+              return recordStoreFailure(document); // the store's catch
+            }
             const generation = storeGenerationOf(document);
             const bytes = Y.encodeStateAsUpdate(document);
             row.ydoc = bytes;
@@ -211,6 +233,50 @@ describe('#847 a wedged live document: the acknowledged frames are stored, and t
     expect(logs.some((l) => l.includes('"event":"done"'))).toBe(true);
     expect(visibleText(s.row.ydoc)).not.toContain('two');
     expect(visibleText(s.row.ydoc)).toContain('typed one');
+  });
+
+  it('a split-brain row at the forced store is merged: the row holds both sides and the heal keeps them (control: refusing the merge loses the acked frame)', async () => {
+    // the pre-fix refusal (WedgedDocumentError), as a control: a row with structs a wedged live lacks fails the store
+    const refusing: Reconcile = (doc, bytes) => {
+      if (liveWedged(doc) && bytes && Y.decodeUpdate(Y.diffUpdate(bytes, Y.encodeStateVector(doc))).structs.length > 0) {
+        throw new Error('refused to fold the row into a wedged document');
+      }
+      return reconcileRowIntoDoc(doc, bytes);
+    };
+    for (const refuse of [false, true]) {
+      logs = [];
+      resetCompactionGapForTests();
+      const s = await server({ splitBrainOnWedgedStore: true, reconcile: refuse ? refusing : undefined });
+      s.sock.deliver(syncFrame(s.edit('before ')));
+      await waitFor(() => s.syncStatuses() === 1);
+      strand(s.live);
+      await waitFor(() => s.stores.length === 1);
+      await new Promise((r) => setTimeout(r, 120));
+      s.armWedge();
+      s.sock.deliver(syncFrame(s.edit('acked ')));
+      await waitFor(() => s.syncStatuses() === 2); // acknowledged, never stored before the wedge
+      expect(liveWedged(s.live)).toBe(true);
+      await waitFor(() => s.hp.getDocumentsCount() === 0);
+      expect(s.sock.closed).toMatchObject({ code: 1013 });
+      const final = visibleText(s.row.ydoc);
+      expect(final).toContain('out of band'); // the other copy's write is never reverted
+      if (!refuse) {
+        expect(s.stores.length).toBe(2);
+        expect(visibleText(s.stores[1])).toContain('out of band'); // the forced store wrote the union
+        expect(visibleText(s.stores[1])).toContain('acked before one');
+        expect(logs.some((l) => l.includes('"event":"skipped"'))).toBe(false);
+        const healed = new Y.Doc();
+        Y.applyUpdate(healed, s.row.ydoc);
+        expect(lineageEpoch(healed)).toBe(1); // compacted from live, which the stored row covers
+        expect(final).toContain('acked before one');
+        expect(final).not.toContain('two'); // the wedging delete is kept too
+      } else {
+        // control: the refused store is recorded, the heal skips not_stored, and the acked frame is lost at unload
+        expect(s.stores.length).toBe(1);
+        expect(logs.some((l) => l.includes('"event":"skipped"') && l.includes('"why":"not_stored"'))).toBe(true);
+        expect(final).not.toContain('acked');
+      }
+    }
   });
 
   it('a forced store that fails is recorded: the heal skips not_stored, as for any failed store', async () => {
