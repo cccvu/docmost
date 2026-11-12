@@ -28,9 +28,9 @@ import { watchCollabCopyHealth } from "./collab-copy-health";
  * and keeps only the render-side reads (`state`, for editability, the refusal notice and the attach guard).
  *
  * What it does with a step, in order: mark the header disconnected; reopen the socket (on its own `disconnect`
- * event, collab-reconnect.ts); detach the provider (refused); close the socket (refused, lost, try later, and before
- * every token refetch); start the one retry timer (lost or try later, jittered by `collabRetryDelay`); refetch the
- * token and reopen with it.
+ * event, collab-reconnect.ts); detach the provider (refused); close the socket (refused, lost, try later, an
+ * `unresolved` retry after the first (#842), and before every token refetch); start the one retry timer (lost, try
+ * later or an unresolved retry, jittered by `collabRetryDelay`); refetch the token and reopen with it.
  *
  * The retry timer only undoes this controller's own close: it opens the socket only while the editor still awaits a
  * retry and the socket is still closed by us (`shouldConnect` false). A socket something else already reopened (the
@@ -39,8 +39,9 @@ import { watchCollabCopyHealth } from "./collab-copy-health";
  *
  * The one exception is the browser's `online` event: the network just came back, so a socket the provider is still
  * retrying (`shouldConnect` true, disconnected) is dialled once at once instead of waiting out a backoff that may
- * have grown to 30 s while offline. It never touches a socket this controller closed (a refusal, lost, try later:
- * their pacing stands) or one the tab closed while idle, and it fires once per network change, not per close.
+ * have grown to 30 s while offline. It never touches a socket this controller closed (a refusal, lost, try later, an
+ * unresolved retry: their pacing stands) or one the tab closed while idle, and it fires once per network change, not
+ * per close.
  *
  * #827: it judges refusals against the epoch its copy claims (`epoch`), feeds the provider's `synced` (which resets
  * the try-later wait), and keeps the local copy's dirty marker (`local`, collab-epoch.ts) for `isCopyDirty`.
@@ -150,7 +151,7 @@ export function createCollabAccessController(
             socket.connect();
           }
         },
-        collabRetryDelay(step.retryAfterMs, random),
+        collabRetryDelay(step.retryAfterMs, random, step.retryMinMs),
       );
     }
     if (step.refreshToken) {

@@ -28,9 +28,14 @@ import { COLLAB_LOCAL_COPY_RULE } from "./collab-refusal-cause";
  *         provider's message timeout), for as long as the tab stays open. Reload and Discard reload the page, so
  *         they need no socket. The `<rule>` is kept (`refusedRule`) and picks the notice's copy
  *         (`collab-refusal-cause.ts`): a stored copy the server disagrees with is not "your changes were not saved";
- *       - `ccc:collab-update-unresolved` → the server could not decide; reconnect ONCE. The retry is spent until
- *         `sync-acked` (every frame this provider sent was applied), NOT until the next authentication, which
- *         happens before the replay is judged; a second one before that is treated as refused.
+ *       - `ccc:collab-update-unresolved` → the server could not decide yet (ADR 0036 §5): most often this copy relays a
+ *         co-editor's structs at an id that co-editor has only announced, which lands once the owner's own frame has
+ *         reached the server (its Step2 lands, or its refused frame is kept as the owner's claim). So retry, at most
+ *         COLLAB_UNRESOLVED_RETRY_MS.length times (#842): the first at once, as before #842, then after a growing
+ *         jittered wait through the same retry timer as a try later, which gives a slower owner its round trip. The
+ *         budget is spent until `sync-acked` (every frame this provider sent was applied), NOT until the next
+ *         authentication, which happens before the replay is judged; one more `unresolved` after the last retry is
+ *         treated as refused. Retries cannot help when no owner ever sends its own copy, so the budget stays bounded;
  *   - #790: a SOCKET close with code 1009 (the server's ws "message too big": this browser sent a frame over the
  *     server's maxPayload) is refused too. The provider would reconnect and resend the same frame (its Step2 answer
  *     to the server's Step1) every second, forever. Only a raw socket close carries a code other than 1000.
@@ -75,13 +80,16 @@ export interface CollabAccessState {
   refreshed: boolean;
   /** #781: the server refused a frame from this editor; the provider is detached. Final until a reload. */
   refused: boolean;
-  /** #781: an `unresolved` close already reconnected; the next one is refused (reset only by `sync-acked`). */
-  unresolvedRetried: boolean;
+  /**
+   * #781, #842: `unresolved` closes since the last `sync-acked` (which alone resets it). Each one is retried while it
+   * is below COLLAB_UNRESOLVED_RETRY_MS.length; the one after that is refused.
+   */
+  unresolvedAttempts: number;
   /** #810, #827: which refusal notice: the Discard-first kinds say a reload would replay the same copy. */
   refusalKind: CollabRefusalKind;
   /**
-   * The rule the server refused on (`ccc:collab-update-refused:<rule>`), or `"unresolved"` for a second unresolved;
-   * null otherwise (not refused, a 1009, or a reason without the prefix). Picks a generic notice's copy
+   * The rule the server refused on (`ccc:collab-update-refused:<rule>`), or `"unresolved"` once the unresolved retries
+   * ran out (#842); null otherwise (not refused, a 1009, or a reason without the prefix). Picks a generic notice's copy
    * (`collab-refusal-cause.ts`): it is a server-sent string, so it is only ever looked up, never rendered.
    */
   refusedRule: string | null;
@@ -112,7 +120,7 @@ export const initialCollabAccess: CollabAccessState = {
   readOnly: false,
   refreshed: false,
   refused: false,
-  unresolvedRetried: false,
+  unresolvedAttempts: 0,
   refusalKind: "generic",
   refusedRule: null,
   tryLaterAttempts: 0,
@@ -256,8 +264,13 @@ export interface CollabAccessStep {
   detach: boolean;
   /** #790: close the editor's socket (after a refusal, for good; after a loss, until `retryAfterMs`). */
   disconnectSocket: boolean;
-  /** #790: lost, #810: try later: open the socket again after about this many ms (0: no timer; jittered by the caller). */
+  /**
+   * #790: lost, #810: try later, #842: an unresolved retry after the first: open the socket again after about this many
+   * ms (0: no timer; jittered by the caller, `collabRetryDelay`).
+   */
   retryAfterMs: number;
+  /** #842: the floor of that jittered wait: COLLAB_RETRY_MIN_MS, or half the wait for an unresolved retry. */
+  retryMinMs: number;
 }
 
 /**
@@ -271,8 +284,18 @@ export const COLLAB_LOST_RETRY_MS = 60_000;
 /** #810: the first "try later" wait; it doubles with each further one, up to COLLAB_LOST_RETRY_MS. */
 export const COLLAB_TRY_LATER_BASE_MS = 5_000;
 
-/** #810: no jittered retry waits less than this. */
+/** #810: no jittered retry waits less than this, except #842's unresolved retries (half their wait, `retryMinMs`). */
 export const COLLAB_RETRY_MIN_MS = 1_000;
+
+/**
+ * #842: the wait before each `unresolved` retry since the last `sync-acked`, and so the budget (its length, 6 retries):
+ * the first at once (the controller reconnects the socket directly, as before #842), then 0.5, 1, 2, 4 and 8 s, each
+ * jittered by `collabRetryDelay` to half to all of it (so the sub-second waits keep their jitter under the 1 s floor):
+ * about 8 to 16 s in all. Each retry opens a new socket, so the server's per-socket refusal budget is not spent by it.
+ */
+export const COLLAB_UNRESOLVED_RETRY_MS: readonly number[] = [
+  0, 500, 1_000, 2_000, 4_000, 8_000,
+];
 
 /** #827: the first wait after a "compacting" answer (a compaction takes seconds); it doubles like a try later. */
 export const COLLAB_COMPACTING_BASE_MS = 2_000;
@@ -284,14 +307,21 @@ export const COLLAB_COMPACTING_BASE_MS = 2_000;
 export function collabRetryDelay(
   ms: number,
   random: () => number = Math.random,
+  minMs: number = COLLAB_RETRY_MIN_MS, // #842: the step's `retryMinMs`
 ): number {
   const r = Math.min(1, Math.max(0, random()));
-  return Math.max(COLLAB_RETRY_MIN_MS, Math.round(ms * (0.5 + 0.5 * r)));
+  return Math.max(minMs, Math.round(ms * (0.5 + 0.5 * r)));
 }
 
-/** #810: a retry timer still has work: the editor is lost, or waiting after a "try later". */
+/**
+ * #810: a retry timer still has work: the editor is lost, waiting after a "try later", or (#842) retrying an
+ * `unresolved` close (the controller's timer redials only while this holds).
+ */
 export function collabAwaitsRetry(state: CollabAccessState): boolean {
-  return !state.refused && (state.lost || state.tryLaterAttempts > 0);
+  return (
+    !state.refused &&
+    (state.lost || state.tryLaterAttempts > 0 || state.unresolvedAttempts > 0)
+  );
 }
 
 const NO_ACTION = {
@@ -301,6 +331,7 @@ const NO_ACTION = {
   detach: false,
   disconnectSocket: false,
   retryAfterMs: 0,
+  retryMinMs: COLLAB_RETRY_MIN_MS,
 } as const;
 
 /**
@@ -323,22 +354,14 @@ export function nextCollabAccess(
       }
       if (reason === "compacting") return compactingStep(prev);
       if (reason === "try-later") return tryLaterStep(prev);
-      if (reason === "unresolved") {
-        if (prev.unresolvedRetried) return refusedStep(prev, "generic", "unresolved");
-        // Reconnect once (a closing socket is reconnected by the provider itself).
-        return {
-          ...NO_ACTION,
-          state: { ...prev, unresolvedRetried: true },
-          reconnect: event.socketConnected,
-        };
-      }
+      if (reason === "unresolved") return unresolvedStep(prev, event.socketConnected);
       // A raw socket close is already handled by the provider (it reconnects and re-authenticates). Only a
       // per-document CLOSE on a live socket leaves the document unauthenticated with nothing to recover it.
       return { ...NO_ACTION, state: prev, reconnect: event.socketConnected };
     }
     case "sync-acked":
-      if (!prev.unresolvedRetried) return { state: prev, ...NO_ACTION };
-      return { state: { ...prev, unresolvedRetried: false }, ...NO_ACTION };
+      if (prev.unresolvedAttempts === 0) return { state: prev, ...NO_ACTION };
+      return { state: { ...prev, unresolvedAttempts: 0 }, ...NO_ACTION };
     case "synced":
       // #827: the server loaded the page and answered: the wait (and a compaction) is over. Same object when there
       // is nothing to clear, so a sync does not re-render.
@@ -392,7 +415,7 @@ export function nextCollabAccess(
       return {
         ...NO_ACTION,
         state: {
-          ...prev, // #781: `unresolvedRetried` survives: authenticating says nothing about the replay
+          ...prev, // #781, #842: `unresolvedAttempts` survives: authenticating says nothing about the replay
           lost: false,
           readOnly: event.scope === "readonly",
           refreshed: false,
@@ -429,6 +452,34 @@ function tryLaterStep(prev: CollabAccessState): CollabAccessStep {
     markDisconnected: true,
     disconnectSocket: true,
     retryAfterMs,
+  };
+}
+
+/**
+ * #781, #842: the server could not decide a frame (see the header). While the budget lasts, retry: the first at once
+ * (reconnect a live socket; a closing one the provider reconnects itself, about 1 s later), each later one after its
+ * jittered COLLAB_UNRESOLVED_RETRY_MS wait. A timed retry closes the socket so the retry timer owns the redial (the
+ * provider's own reconnect would be a fixed 1 s, and a live socket would wait for nothing). No `markDisconnected`:
+ * the socket's own status says disconnected while it is closed, and that is true (it is retrying). The budget spent,
+ * it is a refusal (`"unresolved"`, the notice's copy cause), final until a reload, as before #842.
+ */
+function unresolvedStep(
+  prev: CollabAccessState,
+  socketConnected: boolean,
+): CollabAccessStep {
+  const attempt = prev.unresolvedAttempts;
+  if (attempt >= COLLAB_UNRESOLVED_RETRY_MS.length) {
+    return refusedStep(prev, "generic", "unresolved");
+  }
+  const state = { ...prev, unresolvedAttempts: attempt + 1 };
+  const wait = COLLAB_UNRESOLVED_RETRY_MS[attempt];
+  if (wait === 0) return { ...NO_ACTION, state, reconnect: socketConnected };
+  return {
+    ...NO_ACTION,
+    state,
+    disconnectSocket: true,
+    retryAfterMs: wait,
+    retryMinMs: Math.round(wait / 2),
   };
 }
 

@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import {
   COLLAB_827_RULES,
   COLLAB_840_RULES,
+  COLLAB_842_RULES,
   COLLAB_EPOCH_STALE_REASON_PREFIX,
   COLLAB_LOAD_TRY_LATER_REASON,
   COLLAB_PAGE_COMPACTING_REASON,
@@ -59,6 +60,14 @@ describe('#827 collab reasons', () => {
     for (const r of rule) expect(REFUSED_REASON_PREFIX + r).toMatch(/^ccc:collab-update-refused:[a-z-]+$/);
     const guard = readFileSync(join(__dirname, 'update-guard.ts'), 'utf8');
     for (const r of COLLAB_840_RULES) expect(guard).toContain(`rule: '${r}'`);
+  });
+
+  it('#842\'s rule is a fixed word a refusal reason can carry, and a rule name the guard can return', () => {
+    expect([...COLLAB_842_RULES]).toEqual(['client-blocks']);
+    const rule: CollabRule[] = [...COLLAB_842_RULES]; // a compile-time check: a CollabRule member
+    for (const r of rule) expect(REFUSED_REASON_PREFIX + r).toMatch(/^ccc:collab-update-refused:[a-z-]+$/);
+    const guard = readFileSync(join(__dirname, 'update-guard.ts'), 'utf8');
+    for (const r of COLLAB_842_RULES) expect(guard).toContain(`rule: '${r}'`);
   });
 
   it('every reason is an `export const NAME = \'…\';` line, the form the client parity test reads', () => {

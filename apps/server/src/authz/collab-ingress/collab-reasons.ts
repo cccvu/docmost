@@ -83,3 +83,12 @@ export type Collab827Rule = (typeof COLLAB_827_RULES)[number];
 export const RULE_PARENT_SPLIT = 'parent-split';
 export const RULE_KEYED_SPLIT = 'keyed-split';
 export const COLLAB_840_RULES = [RULE_PARENT_SPLIT, RULE_KEYED_SPLIT] as const;
+
+/**
+ * #842's update-guard rule (`ccc:collab-update-refused:<rule>`, 4422, detaching): a struct section whose block count is
+ * not its number of distinct clients (Yjs's apply keeps only the last block of a repeated client, its decode returns
+ * every one). Never written by an honest encoder. The client shows it as any other crafted shape (`other`). #842's other
+ * pre-pass rule, a zero-length struct of any kind, keeps the existing `zero-length` name.
+ */
+export const RULE_CLIENT_BLOCKS = 'client-blocks';
+export const COLLAB_842_RULES = [RULE_CLIENT_BLOCKS] as const;

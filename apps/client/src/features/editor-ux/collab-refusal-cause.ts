@@ -12,9 +12,9 @@
  *     is the IndexedDB echo of server-written state; a client id bound to someone else; more new client ids than a
  *     frame may carry, which a copy collects one per visit). Never "your changes": the user may have typed nothing.
  *       - `unresolved` never arrives with the refused prefix: the server answers it with its own reason
- *         (`ccc:collab-update-unresolved`), and `collab-access.ts` records `"unresolved"` itself when a second one
- *         arrives before every sent frame was applied. It is listed so the client value has a cause; the parity test
- *         holds it because the server union names it too.
+ *         (`ccc:collab-update-unresolved`), and `collab-access.ts` records `"unresolved"` itself when one arrives
+ *         after its bounded retries (#842) ran out before every sent frame was applied. It is listed so the client
+ *         value has a cause; the parity test holds it because the server union names it too.
  *   - `other`: the server could not decide (`internal`, `shadow-unavailable`; either can repeat for the same copy, so
  *     Discard stays on offer), protocol rules this SPA never trips (stateless, auth, message-type, awareness,
  *     undecodable), crafted frames no honest editor sends (`cross-list`, and #840's
@@ -75,6 +75,8 @@ export const COLLAB_REFUSAL_RULES: Readonly<
     // keyed item that is not one standalone value)
     "parent-split",
     "keyed-split",
+    // #842: a struct section repeating a client's block (Yjs applies only the last one)
+    "client-blocks",
   ]),
 };
 
