@@ -679,6 +679,8 @@ describe("collabRefusalCause", () => {
     ["auth", "other"],
     ["awareness", "other"],
     ["cross-list", "other"],
+    ["parent-split", "other"],
+    ["keyed-split", "other"],
   ])("%s → %s", (rule, cause) => {
     expect(collabRefusalCause(rule)).toBe(cause);
   });

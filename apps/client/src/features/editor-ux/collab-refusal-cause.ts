@@ -17,8 +17,9 @@
  *         holds it because the server union names it too.
  *   - `other`: the server could not decide (`internal`, `shadow-unavailable`; either can repeat for the same copy, so
  *     Discard stays on offer), protocol rules this SPA never trips (stateless, auth, message-type, awareness,
- *     undecodable), a crafted frame no honest editor sends (`cross-list`), and anything this bundle does not know: a
- *     rule a newer server adds, a missing rule, or a hostile string. Generic copy that claims nothing.
+ *     undecodable), crafted frames no honest editor sends (`cross-list`, and #840's
+ *     `parent-split` and `keyed-split`), and anything this bundle does not know: a rule a newer server adds, a missing
+ *     rule, or a hostile string. Generic copy that claims nothing.
  *
  * Lookups go through `ReadonlySet.has`, so a rule such as `__proto__` or `constructor` can never reach a prototype.
  * `collab-try-later-parity.test.ts` reads the server union and holds the partition to it: a new server rule goes red
@@ -62,6 +63,10 @@ export const COLLAB_REFUSAL_RULES: Readonly<
     "awareness",
     "undecodable",
     "cross-list",
+    // #840: crafted shapes no honest editor writes (a new item beside a neighbour of another parent or key; a live
+    // keyed item that is not one standalone value)
+    "parent-split",
+    "keyed-split",
   ]),
 };
 

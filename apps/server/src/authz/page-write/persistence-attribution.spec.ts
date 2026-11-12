@@ -28,6 +28,7 @@ import { CollaborationHandler } from '../../collaboration/collaboration.handler'
 import { PersistenceExtension } from '../../collaboration/extensions/persistence.extension';
 import { authFrame, FakeSocket, RemoteClient, syncFrame } from '../collab-ingress/collab-ingress.testkit';
 import { hasStoreFailure } from './store-failure-registry';
+import { memoryHealStore } from './heal-image.testkit';
 
 const PAGE_ID = '00000000-0000-4000-8000-000000000781'; // the testkit's DOC_NAME page
 const DOC = `page.${PAGE_ID}`;
@@ -62,7 +63,7 @@ function stack() {
   const queue = { add: jest.fn(async () => undefined) } as never;
   const persistence = new PersistenceExtension(
     { findById, updatePage } as never,
-    {} as never,
+    memoryHealStore(row) as never, // #840: the heal rows (none: every page here is order-stable)
     queue,
     queue,
     queue,

@@ -19,7 +19,8 @@
  *     bytes are decoded again and must reproduce the source (the live document's ADR 0019 digest, or `content` as the
  *     server schema reads it), or it aborts.
  *   - The write is a compare-and-swap on the row's ydoc (`sha256`) and touches nothing else: no `updated_at`, no
- *     `content`, no event (the page ETag reads `updated_at`, `last_updated_by_id` and `content` only).
+ *     `content`, no event (the page ETag reads `updated_at`, `last_updated_by_id` and `content` only). #840: the same
+ *     transaction deletes the page's heal image (heal-image.ts), which named the bytes the swap replaced.
  *
  * When it may run: only with no connection (the unload, or a load nobody got), once the process has been up
  * COMPACTION_ARM_DELAY_MS (a pre-#827 task overlapping a deploy has no epoch rule and would merge a stale copy into a
@@ -72,6 +73,7 @@ import {
   markPageFull,
   markSuperseded,
   noteBuildFailed,
+  orderHealRequested,
   pageFullUntil,
   MalformedLineageError,
   registerInflight,
@@ -91,6 +93,7 @@ import { hasStoreFailure, isStoreCurrent, recordStoreFailure, storeGenerationOf 
 import { storeSafeJson } from './store-safe-json';
 import { carryLedgerOver, ledgerOfDecoded, ledgerOfDoc, type LedgerEntry } from './write-idem';
 import { yieldToEventLoop } from './yield-to-event-loop';
+import { ensureHealImageTable } from './heal-image.installer';
 
 /**
  * The non-detaching try-later close code: update-guard.ts's COLLAB_TRY_LATER_CODE (1013), restated rather than imported
@@ -372,7 +375,9 @@ export async function compactOnUnload(document: CompactableDocument, db: KyselyD
     if (!holdsItsRow(document)) return skipUnload(pageId, request, 'not_stored');
     const covered = coveredRowDigest(document);
     if (covered === null) return skipUnload(pageId, request, 'uncovered');
-    if (buildRefused(pageId, covered)) return skipUnload(pageId, request, 'failed_before');
+    // #840: an order heal is retried after a failed build (`orderHealRequested`): its page is closed to joiners until
+    // it heals, so the per-page interval and the process gap bound its retries instead of the memo
+    if (buildRefused(pageId, covered) && !orderHealRequested(document)) return skipUnload(pageId, request, 'failed_before');
     if (!canStartCompaction(pageId)) return;
     markCompacting(document); // synchronously: from here joins and writes answer try-later
     marked = true;
@@ -797,6 +802,7 @@ export function kyselyCompactionStore(db: KyselyDB): CompactionStore {
       return { content: row.content, ydoc: row.ydoc ? new Uint8Array(row.ydoc) : null, contentHash: row.contenthash };
     },
     async swapYdoc(pageId, next, { covered, contentHash, stillCurrent }) {
+      await ensureHealImageTable(db); // #840: the heal row goes with the CAS
       try {
         return await db.transaction().execute(async (trx): Promise<SwapResult> => {
           await sql`set local lock_timeout = '2s'`.execute(trx);
@@ -810,6 +816,9 @@ export function kyselyCompactionStore(db: KyselyDB): CompactionStore {
               ${contentHash === undefined ? sql`` : sql`and md5(p.content::text) is not distinct from ${contentHash}`}
             returning o.before`.execute(trx);
           if (rows.length !== 1) return { swapped: false, why: 'cas_miss' };
+          // #840 (I4): the row now holds a fresh, reload-stable lineage; a heal image of the bytes it replaced goes in the
+          // same transaction (heal-image.ts).
+          await sql`delete from ccc_page_heal_image where page_id = ${pageId}`.execute(trx);
           if (stillCurrent && !stillCurrent()) throw new StillCurrentRollback();
           const before = rows[0].before === null ? null : Number(rows[0].before);
           return { swapped: true, beforeBytes: before };
@@ -823,6 +832,10 @@ export function kyselyCompactionStore(db: KyselyDB): CompactionStore {
 }
 
 const stores = new WeakMap<object, CompactionStore>();
+/** The Postgres store for a Kysely handle (one per handle), or `db` itself when it is a store (the unit specs'). */
+export function compactionStoreOf(db: KyselyDB | CompactionStore): CompactionStore {
+  return storeOf(db);
+}
 function storeOf(db: KyselyDB | CompactionStore): CompactionStore {
   if (typeof (db as CompactionStore).swapYdoc === 'function') return db as CompactionStore;
   let store = stores.get(db);

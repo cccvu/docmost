@@ -188,6 +188,17 @@ export const COLLAB_SOCKET_TOTAL_BYTES = 128 * 1024 * 1024;
 export const COLLAB_SOCKET_TOTAL_LOW_WATER_BYTES = 112 * 1024 * 1024;
 
 /**
+ * Bytes ALL of the process's exact-shadow replay logs may retain together (exact-replica-registry.ts, #840), by the
+ * capacity of their buffers. Each log is capped at EXACT_REPLICA_CAPS (8 MiB), and a log normally spans one store
+ * debounce, but every resident page a writer touched keeps one, so without a total they could exhaust the task's
+ * native memory (#679). Before a log grows past it, the largest logs stop being trusted and their bytes go
+ * (`LOG_OVER_TOTAL`); each such page re-verifies at its next frame (a reload equal to live re-arms it, otherwise it
+ * heals). Native memory: with COLLAB_SOCKET_TOTAL_BYTES and COLLAB_PREAUTH_TOTAL_BYTES, three eighths of the 1024 MiB
+ * the task leaves outside its heap caps.
+ */
+export const COLLAB_REPLICA_LOG_TOTAL_BYTES = 128 * 1024 * 1024;
+
+/**
  * Authenticated collab connections (one per document per socket) one user may hold in this process
  * (user-connections.ts). Docmost opens one per page editor; an editor in a hidden tab idle for five minutes
  * disconnects (page-editor.tsx), so a user's live count is the pages they had open in the last minutes, across their

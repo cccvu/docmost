@@ -45,6 +45,8 @@ export const SOCKET_LIMITS = [
   'frame_deadline',
   'page_compacting',
   'load_debt',
+  'order_divergence',
+  'order_strikes',
   'user_connections',
   'auth_rate',
   'auth_session_rate',

@@ -70,3 +70,15 @@ export const RULE_APPLY_DEADLINE = 'apply-deadline';
 export const RULE_PAGE_FULL = 'page-full';
 export const COLLAB_827_RULES = [RULE_FRAME_TOO_LARGE, RULE_APPLY_DEADLINE, RULE_PAGE_FULL] as const;
 export type Collab827Rule = (typeof COLLAB_827_RULES)[number];
+
+/**
+ * #840's update-guard rules (`ccc:collab-update-refused:<rule>`, 4422, detaching). Both are shapes no honest Yjs client
+ * writes (0 hits in the #840 honest corpora), refused because no replay or reload rebuilds what they leave:
+ *   - parent-split: a new item beside a neighbour of another parent or key (parent-consistency.ts);
+ *   - keyed-split: a live keyed item that is not one standalone value (#847: split by a later delete, it wedges live's
+ *     transaction cleanup).
+ * The client shows them as any other refusal (the prefix).
+ */
+export const RULE_PARENT_SPLIT = 'parent-split';
+export const RULE_KEYED_SPLIT = 'keyed-split';
+export const COLLAB_840_RULES = [RULE_PARENT_SPLIT, RULE_KEYED_SPLIT] as const;

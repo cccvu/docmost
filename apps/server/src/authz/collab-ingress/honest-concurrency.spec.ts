@@ -18,6 +18,8 @@ import { compactionRequest } from '../page-write/compaction-registry';
 import { PAGE_MAX_YDOC_BYTES } from '../page-write/page-size';
 import { C_MAX, E_MAX } from './doc-bounds';
 import { SocketLimitLog } from './socket-limit-log';
+import { replicaLogDistrust, replicaLogOf } from './exact-replica-registry';
+import { strictOrderDiff } from './order-parity';
 import { markRowCovered } from '../page-write/reconcile-store';
 import { COLLAB_REFUSAL_CODE, COLLAB_TRY_LATER_CODE, CollabUpdateGuard, UNRESOLVED_REASON, USER_COLLAB_CPU_BURST_MS } from './update-guard';
 
@@ -92,11 +94,13 @@ function harness(seed: number) {
   };
   const sendUpdate = (peer: Peer, update: Uint8Array, subtype: number = SYNC.Update) => {
     if (subtype === SYNC.Step2) seen.step2++;
-    return deliver(peer, syncFrame(update, subtype), () => Y.applyUpdate(live, update, peer.conn));
+    // #840: 4.7.1's origin for a client frame (the replay log reads it)
+    return deliver(peer, syncFrame(update, subtype), () => Y.applyUpdate(live, update, { source: 'connection', connection: peer.conn }));
   };
 
   live.on('update', (u: Uint8Array, origin: unknown) => {
-    for (const p of peers) if (p.conn !== origin && r() < 0.9) p.inbox.push(u); // broadcast, delivered late
+    const from = (origin as { connection?: unknown } | null)?.connection;
+    for (const p of peers) if (p.conn !== from && r() < 0.9) p.inbox.push(u); // broadcast, delivered late
   });
 
   /** A provider (re)connecting: its awareness, a Step1, then a Step2 with everything the server lacks. */
@@ -266,6 +270,9 @@ describe('#816 honest concurrency never meets the CPU bounds', () => {
       const expected = contentOf(h.live);
       for (const p of h.peers) expect(contentOf(p.doc)).toEqual(expected);
       expect(renderLikeABrowser(h.live)).toMatchObject({ deleted: false, threw: false });
+      // #840: the replay log stayed exact and trusted through the session, and no honest editor became a suspect
+      expect({ seed, distrust: replicaLogDistrust(h.live), suspects: h.guard.suspectsOf(h.live) }).toEqual({ seed, distrust: null, suspects: [] });
+      expect(strictOrderDiff(replicaLogOf(h.live)!.rebuild({ gc: h.live.gc }), h.live)).toBeNull();
     }
     // anti-vacuity: the corpus really sent frames of every kind it claims
     if (process.env.CONFLICT_SCAN_TALLY) console.log(JSON.stringify({ ...seen, lowest }));

@@ -2,7 +2,7 @@
 // between its page-sized steps, never inside the snapshot. The REAL stack (Hocuspocus 4.7.1, PersistenceExtension,
 // CollaborationHandler, yjs, the tiptap transformer); only the `pages` row and the queues are fakes, as in
 // content-write-passes.spec.ts.
-const mockTx = { inside: false };
+const mockTx = { inside: false, preparing: false };
 jest.mock('@docmost/db/utils', () => ({
   executeTx: async (_db: unknown, cb: (trx: unknown) => Promise<unknown>) => {
     mockTx.inside = true;
@@ -21,9 +21,21 @@ import * as util from '../../collaboration/collaboration.util';
 import { CollaborationHandler } from '../../collaboration/collaboration.handler';
 import { PersistenceExtension } from '../../collaboration/extensions/persistence.extension';
 import * as reconcile from './reconcile-store';
+import * as healImage from './heal-image';
 import { findPageRowForLoad } from './persistence-steps';
 import { markSuperseded, registerInflight } from './compaction-registry';
 import { hasStoreFailure } from './store-failure-registry';
+import { memoryHealStore } from './heal-image.testkit';
+import { replicaLogOf } from '../collab-ingress/exact-replica-registry';
+import { isReloadStable, strictOrderDiff } from '../collab-ingress/order-parity';
+import { rawUpdate } from '../collab-ingress/conflict-scan.testkit';
+import * as compaction from './compaction';
+
+/** #840: the guard's replica log of `doc` is trusted and rebuilds it exactly (each load branch attached its bytes). */
+const replicaLogRebuilds = (doc: Y.Doc) => {
+  const log = replicaLogOf(doc);
+  return log !== null && strictOrderDiff(log.rebuild(), doc) === null;
+};
 
 const PAGE_ID = '99999999-9999-4999-8999-999999999999';
 const DOC = `page.${PAGE_ID}`;
@@ -69,7 +81,7 @@ function stack(initial: Json) {
   const queue = { add: jest.fn(async () => undefined) } as never;
   const persistence = new PersistenceExtension(
     { findById, updatePage } as never,
-    {} as never,
+    memoryHealStore(row) as never, // #840: the heal rows (none: every page here is order-stable)
     queue,
     queue,
     queue,
@@ -182,6 +194,7 @@ describe('PersistenceExtension.onLoadDocument (#731 F2, seam #122)', () => {
     const expected = new Y.Doc();
     Y.applyUpdate(expected, new Uint8Array(s.row.ydoc!));
     expect(Buffer.from(Y.encodeStateAsUpdate(doc)).equals(Buffer.from(Y.encodeStateAsUpdate(expected)))).toBe(true);
+    expect(replicaLogRebuilds(doc)).toBe(true); // #840: the row's bytes
     await conn.disconnect();
   });
 
@@ -195,6 +208,7 @@ describe('PersistenceExtension.onLoadDocument (#731 F2, seam #122)', () => {
       [PAGE_ID, { includeContent: true, includeYdoc: true }],
     ]);
     expect(TiptapTransformer.fromYdoc(s.hocuspocus.documents.get(DOC)!, 'default')).toEqual(s.row.content);
+    expect(replicaLogRebuilds(s.hocuspocus.documents.get(DOC)!)).toBe(true); // #840: the exact update it applied
     await conn.disconnect();
   });
 
@@ -204,6 +218,7 @@ describe('PersistenceExtension.onLoadDocument (#731 F2, seam #122)', () => {
     s.row.content = null;
     const conn = await s.hocuspocus.openDirectConnection(DOC, {});
     expect(s.hocuspocus.documents.get(DOC)!.isEmpty('default')).toBe(true);
+    expect(replicaLogRebuilds(s.hocuspocus.documents.get(DOC)!)).toBe(true); // #840: the empty document's own encoding
     await conn.disconnect();
     await settleTimers();
     const t = stack(page('M', 1));
@@ -211,6 +226,7 @@ describe('PersistenceExtension.onLoadDocument (#731 F2, seam #122)', () => {
     const c2 = await t.hocuspocus.openDirectConnection(DOC, {});
     expect(t.findById).toHaveBeenCalledTimes(1);
     expect(t.hocuspocus.documents.get(DOC)!.isEmpty('default')).toBe(true);
+    expect(replicaLogRebuilds(t.hocuspocus.documents.get(DOC)!)).toBe(true);
     await c2.disconnect();
   });
 });
@@ -222,8 +238,18 @@ describe('PersistenceExtension.onStoreDocument yields (#731 F3)', () => {
    */
   function recordSteps(s: ReturnType<typeof stack>, hooks: Partial<Record<string, () => void>> = {}) {
     const order: string[] = [];
+    // #840: the snapshot (and its order check) runs before the row lock, in heal-image's prepareStore.
+    const prepare = healImage.prepareStore;
+    jest.spyOn(healImage, 'prepareStore').mockImplementation(async (...a) => {
+      mockTx.preparing = true;
+      try {
+        return await prepare(...a);
+      } finally {
+        mockTx.preparing = false;
+      }
+    });
     const step = (name: string) => {
-      if (!mockTx.inside) return;
+      if (!mockTx.inside && !mockTx.preparing) return;
       order.push(name);
       hooks[name]?.();
       setImmediate(() => order[order.length - 1] !== '~' && order.push('~'));
@@ -262,15 +288,16 @@ describe('PersistenceExtension.onStoreDocument yields (#731 F3)', () => {
   const typeInto = (doc: Y.Doc, text: string) =>
     doc.transact(() => doc.getXmlFragment('default').insert(0, [new Y.XmlText(text)]));
 
-  it('order: locked read → yield → reconcile + ONE synchronous snapshot (generation, fromYdoc, encode) → yield → jsonToText → yield → write', async () => {
+  it('order: ONE synchronous snapshot (generation, fromYdoc, encode) before the lock (#840) → locked read → yield → reconcile → yield → jsonToText → yield → write', async () => {
     const s = stack(page('A'));
     const keeper = await s.hocuspocus.openDirectConnection(DOC, { user: USER });
     const order = recordSteps(s);
     await expect(
       s.handlers.conditionalUpdatePageContent(DOC, { prosemirrorJson: page('B', 3), operation: 'append', user: USER }),
     ).resolves.toEqual({ applied: true });
-    // ONE store ran (disconnect()'s was skipped): exactly these steps, the markers exactly at the three yields.
-    expect(order).toEqual(['lockedRead', '~', 'reconcile', 'fromYdoc', 'encode', '~', 'jsonToText', '~', 'updatePage']);
+    // ONE store ran (disconnect()'s was skipped): exactly these steps, the markers exactly at the three yields. #840:
+    // the snapshot is taken before the row lock and written, because the locked row is the bytes the document covered.
+    expect(order).toEqual(['fromYdoc', 'encode', 'lockedRead', '~', 'reconcile', '~', 'jsonToText', '~', 'updatePage']);
     expect(rowAgrees(s)).toBe(true);
     await keeper.disconnect();
   });
@@ -304,7 +331,8 @@ describe('PersistenceExtension.onStoreDocument yields (#731 F3)', () => {
   });
 
   it.each([
-    ['the yield after the locked read (before the reconcile)', 'lockedRead', 1],
+    // #840: the snapshot is taken before the lock, so an edit in any of the store's yields is newer than it.
+    ['the yield after the locked read (before the reconcile)', 'lockedRead', 2],
     ['the yield after the snapshot', 'encode', 2],
     ['the yield after jsonToText', 'jsonToText', 2],
   ])('an edit landing in %s is persisted, and a store after the snapshot is never skipped over it', async (_l, at, stores) => {
@@ -316,8 +344,8 @@ describe('PersistenceExtension.onStoreDocument yields (#731 F3)', () => {
     await expect(
       s.handlers.conditionalUpdatePageContent(DOC, { prosemirrorJson: page('B', 3), operation: 'append', user: USER }),
     ).resolves.toEqual({ applied: true });
-    // Before the snapshot, the edit is IN the first store (the second is then rightly skipped); after it, the
-    // generation recorded is the snapshot's, older than the edit, so disconnect()'s store runs and persists it.
+    // After the snapshot (#840: every yield is), the generation recorded is the snapshot's, older than the edit, so
+    // disconnect()'s store runs and persists it.
     expect(lockedReads(s)).toBe(stores);
     expect(rowHas(s, `typed at ${at}`)).toBe(true);
     expect(rowHas(s, 'B paragraph 2')).toBe(true);
@@ -327,6 +355,76 @@ describe('PersistenceExtension.onStoreDocument yields (#731 F3)', () => {
     await keeper.transact(() => undefined); // a store hook with no transaction since the last store
     expect(lockedReads(s)).toBe(0);
     expect(s.updatePage).toHaveBeenCalledTimes(stores);
+    await keeper.disconnect();
+  });
+});
+
+describe('PersistenceExtension.onStoreDocument keeps the order check out of the row lock (#840 review item 4)', () => {
+  /** Records, around the locked read, the store's reloads (`Y.applyUpdate` on a document it made) and image builds. */
+  function recordAroundLock(s: ReturnType<typeof stack>) {
+    const order: string[] = [];
+    const find = s.findById.getMockImplementation()!;
+    s.findById.mockImplementation(async (id, opts) => {
+      if (opts?.withLock) order.push('lockedRead');
+      return find(id, opts);
+    });
+    let storing = false;
+    const store = s.updatePage.getMockImplementation()!;
+    s.updatePage.mockImplementation(async (v) => {
+      order.push('write');
+      return store(v);
+    });
+    const apply = Y.applyUpdate;
+    jest.spyOn(Y, 'applyUpdate').mockImplementation((...a: Parameters<typeof apply>) => {
+      if (storing) order.push('apply');
+      return apply(...a);
+    });
+    const build = compaction.buildCompacted;
+    jest.spyOn(compaction, 'buildCompacted').mockImplementation((...a: Parameters<typeof build>) => {
+      if (storing) order.push('buildImage');
+      return build(...a);
+    });
+    const onStore = PersistenceExtension.prototype.onStoreDocument;
+    jest.spyOn(PersistenceExtension.prototype, 'onStoreDocument').mockImplementation(async function (this: PersistenceExtension, ...a) {
+      storing = true;
+      try {
+        return await onStore.apply(this, a);
+      } finally {
+        storing = false;
+      }
+    });
+    return order;
+  }
+
+  it('a stable store: its reload runs before the lock; nothing page-sized runs under it', async () => {
+    const s = stack(page('A'));
+    const keeper = await s.hocuspocus.openDirectConnection(DOC, { user: USER });
+    const order = recordAroundLock(s);
+    await keeper.transact((d) => d.getXmlFragment('default').insert(0, [new Y.XmlText('more')]));
+    await expect(s.handlers.flushPageContent(DOC)).resolves.toEqual({ flushed: true });
+    expect(order).toEqual(['apply', 'lockedRead', 'write']);
+    expect(rowAgrees(s)).toBe(true);
+    await keeper.disconnect();
+  });
+
+  it('an unstable store: its reload and its heal image are built before the lock; the write and the heal row go in one transaction', async () => {
+    const s = stack(page('A', 1));
+    const keeper = await s.hocuspocus.openDirectConnection(DOC, { user: USER });
+    const doc = s.hocuspocus.documents.get(DOC)!;
+    const text = (doc.getXmlFragment('default').get(0) as Y.XmlElement).get(0) as Y.XmlText;
+    const start = (text as unknown as { _start: Y.Item })._start.id;
+    const order = recordAroundLock(s);
+    await keeper.transact((d) =>
+      Y.applyUpdate(d, rawUpdate([{ client: start.client + 1, clock: 0, structs: [{ origin: [start.client, start.clock + 5], right: [start.client, start.clock + 3], content: new Y.ContentString('XYZ') }] }])),
+    );
+    expect(isReloadStable(doc).stable).toBe(false); // precondition
+    order.length = 0; // the frame's own apply above is not the store's
+    await expect(s.handlers.flushPageContent(DOC)).resolves.toEqual({ flushed: true });
+    // reload (1), the image build and its decode check (buildCompacted + its own check applies), its reload-stability check
+    const lock = order.indexOf('lockedRead');
+    expect(lock).toBeGreaterThan(0);
+    expect(order.slice(0, lock)).toContain('buildImage');
+    expect(order.slice(lock)).toEqual(['lockedRead', 'write']);
     await keeper.disconnect();
   });
 });

@@ -4,9 +4,12 @@
  * Steps of the persistence extension's load and store that the seam (`collaboration/extensions/persistence.extension.ts`)
  * calls out to, so the upstream file keeps one call per step.
  */
+import { createHash } from 'node:crypto';
 import * as Y from 'yjs';
 import { TiptapTransformer } from '@hocuspocus/transformer';
 import { storeGenerationOf } from './store-failure-registry';
+// #840: the reconcile memo decides whether a snapshot taken before the row lock still holds the locked row.
+import { coveredRowDigest } from './reconcile-store';
 // CCC #773: the stored projection is made storable (no lone surrogate or NUL) before anything reads or writes it.
 import { storeSafeJson } from './store-safe-json';
 // #827: a load waits for the page's compaction in flight, so it reads the compacted row, never the one being replaced.
@@ -52,7 +55,9 @@ export interface StoreSnapshot {
 
 /**
  * The store's snapshot of `document` (#390, #731): its generation, `fromYdoc` and `encodeStateAsUpdate`, in ONE
- * synchronous run, called after the reconcile under the row lock.
+ * synchronous run. #840: taken before the row lock (heal-image.ts `prepareStore`, so its order check and heal image stay
+ * out of the lock) and written only while it holds the locked row (`snapshotHoldsRow`); else taken again under the lock,
+ * after the reconcile.
  *
  * Never split it, and never make it async. A transaction between `fromYdoc` and the encode (an edit landing in a
  * yield) would persist a `content` and a `ydoc` that disagree in the same row; one between the generation read and
@@ -66,6 +71,26 @@ export function snapshotForStore(document: Y.Doc): StoreSnapshot {
   const json = storedProjection(document);
   const state = Buffer.from(Y.encodeStateAsUpdate(document));
   return { generation, json, state };
+}
+
+/**
+ * #840: the row bytes `document` was known to cover (reconcile-store.ts's memo), read in the same synchronous run as a
+ * snapshot taken BEFORE the store's row lock. Coverage only grows, so the snapshot holds every struct in those bytes.
+ */
+export function coveredRowAtSnapshot(document: Y.Doc): string | null {
+  return coveredRowDigest(document);
+}
+
+/**
+ * #840: whether a snapshot taken before the row lock may be written over the locked row and still keep #390's rule
+ * (the write is a superset of the locked row): the row has no Yjs state, or its bytes are exactly the ones the document
+ * covered when the snapshot was taken (`coveredRowAtSnapshot`). Anything else (another node's write, an out-of-band
+ * write the reconcile folded in, a memo the document never had) is false: the store snapshots again under the lock.
+ * Compared by digest, the reconcile's own rule, so it adds no page-sized pass but a hash.
+ */
+export function snapshotHoldsRow(coveredRow: string | null, rowYdoc: Uint8Array | null | undefined): boolean {
+  if (!rowYdoc || rowYdoc.length === 0) return true;
+  return coveredRow !== null && createHash('sha256').update(rowYdoc).digest('base64') === coveredRow;
 }
 
 /**

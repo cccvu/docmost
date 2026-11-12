@@ -94,7 +94,10 @@ export const INT_ATTRS: ReadonlyMap<string, readonly [min: number, max: number]>
 /**
  * Every rule a refusal names. #827 (collab-reasons.ts): `frame-too-large` (a Step2/Update payload over
  * PAGE_MAX_YDOC_BYTES), `apply-deadline` (a second shadow-apply deadline), `page-full` (growth of a page still over a
- * structure cap after compaction). A plain union of literals: the client's parity test reads it.
+ * structure cap after compaction). Crafted shapes no honest client writes: `cross-list` (an item linked after a left
+ * neighbour of another list, wiki-v2 #781 lineage), and #840's `parent-split` (a new item beside a neighbour, left or
+ * right, of another parent or key) and `keyed-split` (a live keyed item that is not one standalone value, #847). A plain
+ * union of literals, no comments inside: the client's parity test reads it.
  */
 export type CollabRule =
   | 'root'
@@ -128,7 +131,9 @@ export type CollabRule =
   | 'frame-too-large'
   | 'apply-deadline'
   | 'page-full'
-  | 'cross-list';
+  | 'cross-list'
+  | 'parent-split'
+  | 'keyed-split';
 
 /** A refusal. `node`/`mark`/`key` are set only to names the schema declares: a log or a response never echoes input. */
 export interface Violation {

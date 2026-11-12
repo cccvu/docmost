@@ -1,0 +1,48 @@
+/**
+ * CCC collab integration — NOT upstream Docmost code (#840, ADR 0036).
+ *
+ * The parent-consistency rule: every item a frame integrates sits beside neighbours of its own parent and key. Yjs sets
+ * an item's `parent` (and key) from what the wire names, or from its declared origin, but links it where its integrate
+ * lands: the tail of a partly known struct goes next to the same client's previous clock, which a crafted frame can
+ * place in another list. The item is then checked against one parent while it lives in another, the named parent's
+ * `_length` counts content its list lacks, and a reload re-derives the parent from the neighbours, so live and every
+ * reload disagree for good. The guard's `cross-list` reads `left`; this reads both neighbours, so a frame placed beside a
+ * foreign item a stored document already holds is caught too. A remote integrate never does it honestly: `right` is
+ * `left.right` or the head of the item's own list or key (0 hits in the #840 experiments' 338,673 honest frames, and
+ * in parent-consistency.spec.ts's seeded corpus).
+ *
+ * For frames only: a LOCAL keyed redo under a redone parent can split the author's own replica (Yjs redoItem), but the
+ * frame it sends is consistent wherever it applies. Called inside the frame's transaction, after it integrated and before
+ * Yjs's cleanup, whose struct merge ignores parents and can join a split tail to its left. It reads Yjs internals
+ * (`beforeState`, `findIndexSS`, item neighbours): order-parity.spec.ts's tripwire pins the yjs version for both.
+ */
+import * as Y from 'yjs';
+
+/**
+ * The first newly integrated item with a neighbour of another parent or key, or null. `clients`: the ids whose structs
+ * the transaction can have added (the guard passes the frame's and the pending ones, so a frame costs O(its clients),
+ * never O(every id the page holds)); every id in the store by default. `side`: the neighbour that differs, `left`
+ * first. A foreign `left` is the shape the guard's per-struct `cross-list` rule names (a legacy pending item is only
+ * report-only there, so it reaches this walk); only a foreign `right` with a consistent `left` is `parent-split`, so one
+ * shape always gets one rule (update-guard.ts).
+ */
+export function parentConsistencyViolation(
+  tr: Y.Transaction,
+  clients: Iterable<number> = tr.doc.store.clients.keys(),
+): { client: number; clock: number; side: 'left' | 'right' } | null {
+  const store = tr.doc.store;
+  for (const client of clients) {
+    const structs = store.clients.get(client);
+    if (!structs) continue;
+    const before = tr.beforeState.get(client) ?? 0;
+    if (Y.getState(store, client) <= before) continue;
+    for (let i = Y.findIndexSS(structs, before); i < structs.length; i++) {
+      const item = structs[i];
+      if (!(item instanceof Y.Item)) continue; // GC: no parent, no neighbours
+      const foreign = (n: Y.Item | null): boolean => n !== null && (n.parent !== item.parent || n.parentSub !== item.parentSub);
+      if (foreign(item.left)) return { client, clock: item.id.clock, side: 'left' };
+      if (foreign(item.right)) return { client, clock: item.id.clock, side: 'right' };
+    }
+  }
+  return null;
+}
