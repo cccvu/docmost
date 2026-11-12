@@ -780,7 +780,8 @@ export class CollabUpdateGuard {
         applyMs = 0; // live never applies it: its time is charged once
         return this.deadlineStrike(frame, header);
       }
-      violation ??= result.violation;
+      // A write outside `default` wins over a report-only pre-pass violation: it is refused in every mode
+      violation = result.violation?.rule === 'root' ? result.violation : (violation ?? result.violation);
       if (!violation) for (const v of result.reportOnly) this.log('COLLAB_LEGACY_PENDING_INVALID', doc.live, { rule: v.rule });
       if (violation && this.enforces(violation.rule)) {
         // The shadow holds the refused frame; live never will. Rebuilt lazily by the next frame that needs it
@@ -1047,6 +1048,14 @@ export class CollabUpdateGuard {
       return { violation, binds, reportOnly, added, children, extra };
     };
 
+    // #827: a delete outside `default` (the lineage epoch, the write ledger) first, before any other rule can return:
+    // it is refused in every mode, so a report-only violation earlier in the frame must not mask it.
+    let rootDelete = false;
+    Y.iterateDeletedStructs(tr, tr.deleteSet, (struct) => {
+      if (!rootDelete && struct instanceof Y.Item && rootOf(struct.parent as Y.AbstractType<any>) !== root) rootDelete = true;
+    });
+    if (rootDelete) return result({ rule: 'root' });
+
     // #827: new clocks come only from the frame's structs and the pending structs it releases (never O(ids)).
     const clients = new Set(frameClients);
     for (const client of pendingBefore.keys()) clients.add(client);
@@ -1077,16 +1086,9 @@ export class CollabUpdateGuard {
     }
     for (const type of newTypes) if (depthOf(type) > COLLAB_LIMITS.elementDepth) return result({ rule: 'element-depth' });
 
-    let deletion: Violation | null = null;
     Y.iterateDeletedStructs(tr, tr.deleteSet, (struct) => {
-      if (deletion || !(struct instanceof Y.Item)) return;
-      if (rootOf(struct.parent as Y.AbstractType<any>) !== root) {
-        deletion = { rule: 'root' };
-        return;
-      }
-      touch(struct, touched);
+      if (struct instanceof Y.Item) touch(struct, touched); // every one is under `default` (checked above)
     });
-    if (deletion) return result(deletion);
 
     for (const type of touched) {
       if (type !== root && kindOf(type) !== 'element') continue;
@@ -1492,6 +1494,7 @@ function prePass(payload: Uint8Array): PrePass {
     return { violation: { rule: 'undecodable' }, clients, reaches, ends }; // e.g. a lib0 `readAny` value deep enough to overflow the decoder
   }
   let violation: Violation | null = null;
+  let rootWrite = false; // #827: a write outside `default` wins over any other violation (refused in every mode)
   for (const struct of decoded.structs) {
     if (struct instanceof Y.Skip) continue;
     const client = struct.id.client;
@@ -1500,6 +1503,7 @@ function prePass(payload: Uint8Array): PrePass {
     if (end > (ends.get(client) ?? 0)) ends.set(client, end);
     if (struct instanceof Y.Item) {
       violation ??= structRule(struct);
+      if (typeof struct.parent === 'string' && struct.parent !== 'default') rootWrite = true;
       if (struct.origin) reaches.add(struct.origin.client);
       if (struct.rightOrigin) reaches.add(struct.rightOrigin.client);
       const parent = struct.parent as unknown;
@@ -1507,7 +1511,7 @@ function prePass(payload: Uint8Array): PrePass {
     }
   }
   for (const client of decoded.ds.clients.keys()) reaches.add(client);
-  return { violation: violation ?? deleteOrder(decoded.ds.clients), clients, reaches, ends };
+  return { violation: rootWrite ? { rule: 'root' } : (violation ?? deleteOrder(decoded.ds.clients)), clients, reaches, ends };
 }
 
 function structRule(struct: Y.Item): Violation | null {

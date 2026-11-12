@@ -298,6 +298,7 @@ describe("the dirty marker (ccc-unsynced)", () => {
     const src = readFileSync(join(dir, "src", "y-indexeddb.js"), "utf8");
     expect(src).toMatch(/Y\.transact\(idbPersistence\.doc, \(\) => \{[\s\S]*?\}, idbPersistence, false\)/);
     expect(src).toMatch(/\['custom'\]/);
+    expect(src).toMatch(/this\.whenSynced\s*=/); // isDirty waits on it before trusting a missing marker
   });
 });
 

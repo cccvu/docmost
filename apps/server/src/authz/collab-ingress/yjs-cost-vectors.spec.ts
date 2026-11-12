@@ -879,6 +879,16 @@ describe('#827 the lineage epoch, on each connection\'s first frame', () => {
     expect(s.send(c, editAs(s.live, 70, (d) => d.getMap(LINEAGE_ROOT).set('epoch', 'x')))).toBe(REFUSED('root'));
     expect(s.send(s.conn('w2', false, 'cccEpoch=1'), editAs(s.live, 71, (d) => d.getMap('__ccc_write_idem').set('k', 1)))).toBe(REFUSED('root'));
     expect(s.state().equals(before)).toBe(true);
+    // a report-only content violation in the same frame never masks it, in either order, for a write or a delete
+    const bad = (d: Y.Doc) => d.getXmlFragment('default').insert(0, [new Y.XmlElement('noSuchNode')]);
+    const forge = (d: Y.Doc) => d.getMap(LINEAGE_ROOT).set('epoch', 'x');
+    const drop = (d: Y.Doc) => d.getMap(LINEAGE_ROOT).delete('epoch');
+    let id = 80;
+    for (const edits of [[bad, forge], [forge, bad], [bad, drop], [drop, bad]]) {
+      const frame = editAs(s.live, id++, (d) => edits.forEach((e) => e(d)));
+      expect(s.send(s.conn(`m${id}`, false, 'cccEpoch=1'), frame)).toBe(REFUSED('root'));
+      expect(s.state().equals(before)).toBe(true);
+    }
     // a content rule still only logs in report mode (the kill switch): an invalid node applies
     expect(s.send(s.conn('w3', false, 'cccEpoch=1'), editAs(s.live, 72, (d) => {
       const bad = new Y.XmlElement('noSuchNode');

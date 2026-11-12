@@ -140,12 +140,21 @@ export function assertDocWritable(doc: object | null | undefined): void {
 }
 
 /**
- * Seam #2, inside a content write's transaction: an append/prepend to a page still over a structure cap after
- * compaction (`page-full`, its visible content is too big) is refused as the API cap's `page_too_large`. A replace
- * passes: it is how such a page gets smaller. Comment marks pass (they add formatting, not nodes).
+ * Seam #2, inside a content write's transaction: an append/prepend is refused as the API cap's `page_too_large` when
+ * the page is page-full (the cap rule's mark: an exact measure found it past a structure cap compaction cannot fix),
+ * or when its root already holds E_MAX children (O(1); an append/prepend only grows the root, and a page only the API
+ * writes has no shadow to measure it, nor a load that counts children). A replace passes: it is how such a page gets
+ * smaller. Comment marks pass (they add formatting, not nodes).
  */
-export function refusesGrowth(doc: object, operation: string | undefined): boolean {
-  return accumulates(operation) && isPageFull(doc);
+export function refusesGrowth(doc: object, operation: string | undefined, rootChildrenCap: number = E_MAX): boolean {
+  return accumulates(operation) && (isPageFull(doc) || rootChildren(doc) >= rootChildrenCap);
+}
+
+/** Live children of the page's `default` root, without creating it (0 for a non-Yjs or empty document). */
+function rootChildren(doc: object): number {
+  const share = (doc as { share?: unknown }).share;
+  const root = share instanceof Map ? (share.get('default') as { _length?: unknown } | undefined) : undefined;
+  return typeof root?._length === 'number' ? root._length : 0;
 }
 
 /** Seam #2: a direct connection's open failed. A load refused as compacting becomes the retryable 503; anything else as is. */

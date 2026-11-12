@@ -811,6 +811,16 @@ describe('the write gate (#827, seam #2)', () => {
     expect(new PageTooLargeException().getResponse()).toMatchObject({ code: 'page_too_large' });
   });
 
+  it('an append/prepend to a root already at the children cap is refused, with no shadow or load having measured it', () => {
+    // a page only the API writes: freshly loaded, never measured past a cap, so never marked page-full
+    const d = toYdoc({ type: 'doc', content: Array.from({ length: 5 }, (_, i) => para(text(`p${i}`))) });
+    expect(isPageFull(d)).toBe(false);
+    expect(['append', 'prepend', 'replace'].map((op) => refusesGrowth(d, op, 6))).toEqual([false, false, false]);
+    expect(['append', 'prepend', 'replace'].map((op) => refusesGrowth(d, op, 5))).toEqual([true, true, false]);
+    expect(refusesGrowth(new Y.Doc(), 'append')).toBe(false); // no root yet: 0 children
+    expect(refusesGrowth(d, 'append')).toBe(false); // the real cap, E_MAX
+  });
+
   it('a direct connection whose load was refused as compacting is the 503; anything else is rethrown as is', () => {
     expect(() => rethrowDirectOpenRefusal({ reason: COLLAB_PAGE_COMPACTING_REASON })).toThrow(PageCompactingException);
     const other = new Error('boom');
