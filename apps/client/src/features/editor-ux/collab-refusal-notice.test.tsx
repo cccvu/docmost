@@ -21,7 +21,8 @@ import {
   CollabPageNotices,
   CollabRefusalNotice,
 } from "./collab-refusal-notice";
-import { initialCollabAccess } from "./collab-access";
+import { initialCollabAccess, nextCollabAccess } from "./collab-access";
+import { COLLAB_LOCAL_COPY_RULE } from "./collab-refusal-cause";
 import type { CollabAccessState, CollabRefusalKind } from "./collab-access";
 
 beforeAll(() => {
@@ -312,6 +313,24 @@ describe("CollabPageNotices (#827)", () => {
     show({ refused: true, refusalKind: "generic", refusedRule: "schema" }, null, { passive: true });
     expect(screen.queryByRole("alert")).toBeNull();
     expect(screen.getByRole("status").textContent).toContain("A change from this browser was not saved");
+  });
+
+  // #847: this browser's own copy broke (collab-copy-health.ts): the stored-copy notice, with both recoveries
+  it("a broken local copy shows the stored-copy notice with Reload and a Discard that asks first", async () => {
+    const access = nextCollabAccess(initialCollabAccess, { kind: "local-copy-broken" }).state;
+    expect(access.refusedRule).toBe(COLLAB_LOCAL_COPY_RULE);
+    const { clearLocalCopy } = show(access, null, { showsLocalCopy: false });
+    const text = screen.getByRole("alert").textContent ?? "";
+    expect(text).toContain(
+      "This browser's stored copy of the page does not match the server",
+    );
+    expect(text).not.toContain("not saved");
+    expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
+    fireEvent.click(discardButton());
+    const dialog = await screen.findByRole("dialog");
+    expect(dialog.textContent).toContain("cannot be recovered"); // the server's version is on screen
+    expect(screen.getByRole("button", { name: "Discard and reload" })).toBeTruthy();
+    expect(clearLocalCopy).not.toHaveBeenCalled(); // never discarded without the confirm
   });
 
   it("a refusal shows its kind's notice", () => {

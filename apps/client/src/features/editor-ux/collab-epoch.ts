@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import type * as Y from "yjs";
 import { notifications } from "@mantine/notifications";
 import { useTranslation } from "react-i18next";
 import { COLLAB_EPOCH_PATTERN, CollabAccessState } from "./collab-access";
@@ -129,16 +130,16 @@ export async function deleteStaleCollabCopies(
   }
 }
 
-/** The slice of `IndexeddbPersistence` the dirty marker uses. */
+/** The slice of `IndexeddbPersistence` the dirty marker (and #847's broken-copy detector) uses. */
 export interface CollabLocalCopy {
-  doc: {
-    on(event: "update", fn: (update: Uint8Array, origin: unknown) => void): void;
-    off(event: "update", fn: (update: Uint8Array, origin: unknown) => void): void;
-  };
+  /** The page's Y.Doc: its `update` (the marker) and its transaction events (`collab-copy-health.ts`, #847). */
+  doc: Pick<Y.Doc, "on" | "off">;
   get(key: string): Promise<unknown>;
   set(key: string, value: number): Promise<unknown>;
   /** Resolves once the stored copy has been replayed into `doc` (y-indexeddb's `whenSynced`). */
   whenSynced?: Promise<unknown>;
+  /** #847: y-indexeddb's flag, set synchronously after a successful replay of the stored copy. */
+  synced?: boolean;
 }
 
 /** The slice of `HocuspocusProvider` the dirty marker listens to. */

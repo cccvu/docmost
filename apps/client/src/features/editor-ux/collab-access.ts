@@ -1,4 +1,5 @@
 import { jwtDecode } from "jwt-decode";
+import { COLLAB_LOCAL_COPY_RULE } from "./collab-refusal-cause";
 
 /**
  * CCC fork addition (cccvu/wiki-v2#501) — how an open editor reacts when the server narrows its collab access.
@@ -60,6 +61,11 @@ import { jwtDecode } from "jwt-decode";
  *     trips is refused AFTER the authentication, so resetting there kept the wait at 5 s forever;
  *   - #827: the update guard's new rules are Discard-first (`refusalKind`): `frame-too-large` (as a 1009), the
  *     `apply-deadline` strike ("too complex") and `page-full`. A reload would replay the same copy.
+ *   - #847: this browser's own Yjs copy broke (`local-copy-broken`, from `collab-copy-health.ts`: a wedged document
+ *     that will never send or persist again, or a stored copy whose replay threw) → refused, like a server refusal:
+ *     detach, close the socket, read-only, so the broken copy stops sending and persisting. The rule is the client's
+ *     own `COLLAB_LOCAL_COPY_RULE`, whose notice says the stored copy does not match and offers Reload and Discard.
+ *     Never discarded automatically: the dirty marker cannot vouch for a broken copy.
  *
  * Pure and dependency-free so it is unit-tested without a provider; `collab-access-controller.ts` carries out its
  * steps and page-editor.tsx wires the controller (seam 169).
@@ -242,7 +248,9 @@ export type CollabAccessEvent =
   /** #781: the provider's unsynced-changes count reached 0 — the server applied every frame it was sent. */
   | { kind: "sync-acked" }
   /** #827: the provider synced (the server's Step2 applied): the page loaded, so stop waiting. */
-  | { kind: "synced" };
+  | { kind: "synced" }
+  /** #847: this browser's Yjs copy broke (`collab-copy-health.ts`): it can no longer be trusted to send or persist. */
+  | { kind: "local-copy-broken" };
 
 export interface CollabAccessStep {
   state: CollabAccessState;
@@ -400,6 +408,9 @@ export function nextCollabAccess(
       return lostStep(prev);
     case "refresh-failed":
       return lostStep(prev);
+    case "local-copy-broken":
+      // #847: as a refusal (the `refused` guard above keeps it to one): stop sending, stop editing, never reconnect
+      return refusedStep(prev, "generic", COLLAB_LOCAL_COPY_RULE);
     case "authenticated":
       return {
         ...NO_ACTION,

@@ -20,15 +20,20 @@ import { copyOf, rawUpdate, siblingsShape, twoClientsShape, unguardedSteps, type
  * inert outside its scope, it installs once, it refuses to install on a yjs it was not written for, and it fails closed.
  */
 
-/** Pinned: yjs's `Item.prototype.integrate` source and version the replay in conflict-scan.ts was written against. */
+/**
+ * Pinned: yjs's `Item.prototype.integrate` source and version the replay in conflict-scan.ts was written against: stock
+ * 13.6.30 with the fork's patch C (`[ccc #847]`, patches/yjs@13.6.30.patch: the offset branch's origin and its GC rule;
+ * stock was e1840302…, re-pinned by yjs-redo-patch.spec.ts).
+ */
 const PINNED_YJS_VERSION = '13.6.30';
-const PINNED_INTEGRATE_SHA256 = 'e1840302775981b0ed0c7b62f05695c53dc03dc3ab196fd70c44865a9638d267';
+const PINNED_INTEGRATE_SHA256 = '031193b8ffb9b780e46ac1b5d308276e05bd33b15ffd67e69216bb25a632471e';
 const RE_VALIDATE = [
   'yjs changed under the conflict-scan meter (#816, ADR 0036). Before updating the pins:',
-  '1. diff the new Item.prototype.integrate (src/structs/Item.js) against 13.6.30 Item.js:415-496;',
-  '2. mirror every change to its walks (the offset > 0 left, the entry condition, the keyed pre-walk, the loop, the',
-  '   keyed reconnect walk) and to the reads it makes in conflict-scan.ts `replay`, read for read;',
-  '3. re-check the exports it uses (compareIDs, getItem, createID) and the instrumentation anchors in this spec;',
+  '1. diff the new Item.prototype.integrate (src/structs/Item.js) against 13.6.30 Item.js:415-496 as patch C',
+  '   ([ccc #847], patches/yjs@13.6.30.patch) changes it;',
+  '2. mirror every change to its walks (the offset > 0 left and its GC rule, the entry condition, the keyed pre-walk, the',
+  '   loop, the keyed reconnect walk) and to the reads it makes in conflict-scan.ts `replay`, read for read;',
+  '3. re-check the exports it uses (compareIDs, getItem, createID, GC) and the instrumentation anchors in this spec;',
   '4. run this spec (the exactness corpus must stay at zero mismatches) and the honest-concurrency spec;',
   '5. then update PINNED_YJS_VERSION and PINNED_INTEGRATE_SHA256.',
 ].join('\n');
@@ -49,12 +54,16 @@ const PINNED_827_SOURCES: Record<string, string> = {
   cleanupYTextAfterTransaction: '6e3ee79c4653cbd881675c84e8827d24f21b737f3603a259e4d9a9e48aff450c', // formatting cleanup (#827 a)
   cleanupContextlessFormattingGap: 'ebbe974183cf6c422ffeda7fd775ad30edb058b734add3b8f615329abe307afd',
   cleanupFormattingGap: '92e8c93f8c892cc79d96b95cc26f99da4006483442efb3483d7136bd51874481',
+  // #847: every split pushes its right half to transaction._mergeStructs; the guard's keyed-split product rule reads it.
+  splitItem: '8e2510f30e4d2bf0e1bdfd28ba47651799e818d1f2e0410c68c2a9617fc58b75',
 };
 const RE_VALIDATE_827 = [
   'yjs changed under the #827 bounds (ADR 0036, doc-bounds.ts). Before updating PINNED_827_SOURCES:',
   '1. diff each changed function against yjs 13.6.30 (src/utils/encoding.js integrateStructs/readUpdateV2,',
   '   DeleteSet.js readAndApplyDeleteSet, Transaction.js transact/cleanupTransactions/tryMergeDeleteSet/',
-  '   tryToMergeWithLefts, YText.js cleanupYTextAfterTransaction and the formatting-gap helpers);',
+  '   tryToMergeWithLefts, YText.js cleanupYTextAfterTransaction and the formatting-gap helpers, Item.js splitItem);',
+  '   a change to splitItem: re-check that every split still pushes its right half to transaction._mergeStructs',
+  '   (#847: the keyed-split rule finds split products there);',
   '2. a change to the load order or to the getMissing stack: re-check that the meter, armed on a loading doc, still',
   '   counts a load exactly (the arm specs below) and that W_MAX still bounds the inversion (#827 c);',
   '3. a change to transact/cleanupTransactions: re-run deadline.spec.ts (an interrupted doc stays mid-transaction and',
@@ -122,10 +131,14 @@ describe('#816 the replay counts exactly what Yjs walks', () => {
     const meter = installConflictScanMeter(IY);
     const proto = IY.Item.prototype as any;
     const metered = proto.integrate;
-    const tally = { checked: 0, nonzero: 0, maxSeen: 0, mismatches: [] as unknown[], offsets: 0, meterThrew: 0, yjsAgreed: 0, steps: 0 };
+    const tally = { checked: 0, nonzero: 0, maxSeen: 0, mismatches: [] as unknown[], offsets: 0, gcOffsets: 0, meterThrew: 0, yjsAgreed: 0, steps: 0 };
     let scan: ConflictScan | null = null;
     proto.integrate = function (tr: Y.Transaction, offset: number) {
-      if (offset > 0) tally.offsets++;
+      if (offset > 0) {
+        tally.offsets++;
+        // #847: the tail of a partly known struct whose previous clock is a GC here (patch C integrates it as a GC)
+        if (IY.getItem(tr.doc.store, IY.createID(this.id.client, this.id.clock + offset - 1)) instanceof IY.GC) tally.gcOffsets++;
+      }
       const before = counts.pre + counts.loop + counts.rec;
       const items = scan?.items ?? 0;
       try {
@@ -249,9 +262,56 @@ describe('#816 the replay counts exactly what Yjs walks', () => {
       }
     };
 
+    /**
+     * #847: GC'd blocks. Nested texts in a root array take frames from several clients, and some texts are deleted, so
+     * their children become GC structs; frames that overlap a client's last clock (offset > 0) then land on a GC (patch
+     * C: the tail integrates as a GC) or on a live Item (in its own list or another one).
+     */
+    const gcBlocks = (seed: number) => {
+      const r = rng(seed);
+      const doc = new IY.Doc();
+      doc.clientID = 1;
+      const arr = doc.getArray<Y.Text>('a');
+      arr.insert(0, Array.from({ length: 4 }, () => new IY.Text('t')));
+      const pool = [2, 3, 5, 8];
+      const pickId = (): [number, number] | null => {
+        const ids: Array<[number, number]> = [];
+        for (const [client, structs] of doc.store.clients) {
+          for (const s of structs) if (s instanceof IY.Item && s.parent instanceof IY.Text) ids.push([client, s.id.clock + Math.floor(r() * s.length)]);
+        }
+        return ids.length ? ids[Math.floor(r() * ids.length)] : null;
+      };
+      for (let u = 0; u < 60; u++) {
+        if (r() < 0.2 && arr.length > 1) {
+          arr.delete(Math.floor(r() * arr.length), 1); // its children are GC'd at this transaction's cleanup
+          arr.insert(Math.floor(r() * (arr.length + 1)), [new IY.Text('n')]);
+          continue;
+        }
+        const client = pool[Math.floor(r() * pool.length)];
+        let clock = IY.getState(doc.store, client);
+        if (clock > 0 && r() < 0.5) clock -= 1 + Math.floor(r() * Math.min(clock, 2)); // an overlap: offset > 0
+        const structs: RawClient['structs'] = [];
+        for (let k = 1 + Math.floor(r() * 3); k > 0; k--) {
+          const origin = pickId();
+          if (!origin) break;
+          structs.push({ origin, right: r() < 0.3 ? pickId() : null, content: new IY.ContentString('xyz'.slice(0, 1 + Math.floor(r() * 3))) });
+        }
+        if (!structs.length) continue;
+        let update: Uint8Array;
+        try {
+          update = rawUpdate([{ client, clock, structs }], [], IY);
+        } catch {
+          continue;
+        }
+        apply(doc, update);
+      }
+      apply(new IY.Doc(), IY.encodeStateAsUpdate(doc));
+    };
+
     for (let seed = 1; seed <= 60; seed++) {
       honest(seed);
       hostile(seed * 7919);
+      gcBlocks(seed * 104729);
     }
     // The crafted shapes too (small), so long walks and both caps' paths are in the corpus.
     for (const shape of [siblingsShape(300, 40), twoClientsShape(200)]) {
@@ -268,6 +328,7 @@ describe('#816 the replay counts exactly what Yjs walks', () => {
     expect(tally.maxSeen).toBeGreaterThan(300);
     for (const c of Object.values(counts)) expect(c).toBeGreaterThan(0);
     expect(tally.offsets).toBeGreaterThan(0);
+    expect(tally.gcOffsets).toBeGreaterThan(20); // #847: tails over a GC were compared, not merely possible
     expect(tally.yjsAgreed).toBe(tally.meterThrew);
   });
 });
@@ -358,12 +419,13 @@ describe('#816 the meter is inert outside its scope, installs once, and refuses 
     expect(meter.original.toString()).toContain('conflictingItems'); // yjs's own, not a wrapper of a wrapper
   });
 
-  it('refuses to install when integrate, compareIDs, getItem or createID is missing or changed shape', () => {
+  it('refuses to install when integrate, compareIDs, getItem, createID or GC is missing or changed shape', () => {
     const fake = (patch: Record<string, unknown> = {}) => {
       class Item {
         integrate(_transaction: unknown, _offset: unknown) {}
       }
-      return { Item, compareIDs: (_a: unknown, _b: unknown) => true, getItem: (_s: unknown, _i: unknown) => null, createID: (_c: unknown, _k: unknown) => null, ...patch } as unknown as typeof Y;
+      class GC {}
+      return { Item, GC, compareIDs: (_a: unknown, _b: unknown) => true, getItem: (_s: unknown, _i: unknown) => null, createID: (_c: unknown, _k: unknown) => null, ...patch } as unknown as typeof Y;
     };
     expect(() => installConflictScanMeter(fake())).not.toThrow(); // the shapes the replay was written against
     expect(() => installConflictScanMeter(fake({ Item: undefined }))).toThrow(/Item.prototype.integrate.*refusing to start/);
@@ -372,6 +434,7 @@ describe('#816 the meter is inert outside its scope, installs once, and refuses 
     expect(() => installConflictScanMeter(fake({ getItem: undefined }))).toThrow(/getItem/);
     expect(() => installConflictScanMeter(fake({ compareIDs: (_a: unknown) => true }))).toThrow(/compareIDs/);
     expect(() => installConflictScanMeter(fake({ createID: 'createID' }))).toThrow(/createID/);
+    expect(() => installConflictScanMeter(fake({ GC: undefined }))).toThrow(/yjs GC is missing/); // #847: the offset branch's GC test
   });
 
   it('so the guard (and with it the server boot) refuses to construct on such a yjs', () => {
@@ -392,6 +455,45 @@ describe('#816 the meter is inert outside its scope, installs once, and refuses 
     });
     jest.dontMock('yjs');
     (globalThis as Record<string, unknown>)[flag] = had;
+  });
+});
+
+describe('#847 the meter mirrors patch C: the tail of a partly known struct over a GC', () => {
+  const meter = installConflictScanMeter(Y);
+
+  /** M1 (yjs-redo-patch.spec.ts): client 7's clocks 0..2 are a GC here (their text was deleted); the frame resends 0..5. */
+  const m1 = () => {
+    const base = new Y.Doc();
+    base.clientID = 1;
+    base.getArray('arr').insert(0, [new Y.Text('P'), new Y.Text('Q')]);
+    const b0 = Y.encodeStateAsUpdate(base);
+    const write = (index: number, text: string): Uint8Array => {
+      const d = new Y.Doc();
+      d.clientID = 7;
+      Y.applyUpdate(d, b0);
+      let u: Uint8Array | null = null;
+      d.on('update', (x: Uint8Array) => (u = x));
+      (d.getArray('arr').get(index) as Y.Text).insert(1, text);
+      return u!;
+    };
+    const doc = new Y.Doc();
+    doc.clientID = 2;
+    Y.applyUpdate(doc, b0);
+    Y.applyUpdate(doc, write(0, 'abc'));
+    doc.getArray('arr').delete(0, 1);
+    expect(doc.store.clients.get(7)!.every((s) => s instanceof Y.GC)).toBe(true);
+    return { doc, frame: write(1, 'abcdef') };
+  };
+
+  it('meters the M1 frame without a meter error: 0 steps, and Yjs integrates the tail as a GC', () => {
+    for (const enforce of [true, false]) {
+      const { doc, frame } = m1();
+      const scan = new ConflictScan(doc, enforce);
+      expect(() => meter.metered(scan, () => Y.applyUpdate(doc, frame))).not.toThrow();
+      expect(scan).toMatchObject({ failure: null, trip: null, items: 1, steps: 0, lastItem: 0 });
+      expect(doc.store.clients.get(7)!.map((s) => [s instanceof Y.GC, s.id.clock, s.length])).toEqual([[true, 0, 6]]);
+      expect((doc.getArray('arr').get(0) as Y.Text).toString()).toBe('Q');
+    }
   });
 });
 

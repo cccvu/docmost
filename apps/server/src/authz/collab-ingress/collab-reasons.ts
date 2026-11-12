@@ -76,7 +76,8 @@ export type Collab827Rule = (typeof COLLAB_827_RULES)[number];
  * writes (0 hits in the #840 honest corpora), refused because no replay or reload rebuilds what they leave:
  *   - parent-split: a new item beside a neighbour of another parent or key (parent-consistency.ts);
  *   - keyed-split: a live keyed item that is not one standalone value (#847: split by a later delete, it wedges live's
- *     transaction cleanup).
+ *     transaction cleanup), or a split of a keyed item the page already holds (a delete of its tail, or an origin
+ *     inside it) that leaves a live piece which is not its key's head. Refused in every mode, report mode too.
  * The client shows them as any other refusal (the prefix).
  */
 export const RULE_PARENT_SPLIT = 'parent-split';

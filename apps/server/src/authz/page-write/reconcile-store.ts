@@ -69,6 +69,12 @@ export function reconcileRowIntoDoc(
     throw new ForeignLineageError(foreign.why, foreign.rowEpoch);
   }
 
+  // #847: a wedged document (compaction-registry.ts `liveWedged`) is merged into too. Its integration stays correct
+  // (wedge-integrity.spec.ts: the visible tree equals a gc:false oracle and a reload equals it); the merge emits no
+  // update, so it is never broadcast or counted, but the store serializes `document` next, under the row lock, so the
+  // row gets the union and the heal compacts from a live the row covers. Refusing failed that store: the heal skipped
+  // `not_stored` and live's acknowledged unstored edits were lost at unload.
+
   // #790: under Hocuspocus 4.x every change to a live document schedules a store unless its origin opts out. This
   // merge runs INSIDE a store that serializes it next, so it opts out: as under 3.4.4 it schedules nothing, and it
   // cannot replace a pending human store's payload with one that has no user.

@@ -2,7 +2,8 @@
  * CCC collab integration — NOT upstream Docmost code (#816, ADR 0036).
  *
  * The conflict-scan meter. To integrate an item, Yjs walks the structs between the item's `left` (origin) and its
- * `right` (rightOrigin) until a break (yjs 13.6.30 `Item.integrate`, Item.js:415-496). Honest edits send adjacent
+ * `right` (rightOrigin) until a break (yjs 13.6.30 `Item.integrate`, Item.js:415-496; every Item.js line here is stock
+ * 13.6.30's, before the fork's patches/yjs@13.6.30.patch). Honest edits send adjacent
  * origins, so the walk only crosses concurrent structs they had not seen; a crafted frame can make it cross the whole
  * document once per item (siblings at one origin with rising client ids, two clients, one client with distinct
  * rightOrigins, a rightOrigin left of the origin, a keyed history), which costs seconds to minutes in one synchronous
@@ -10,9 +11,10 @@
  *
  * How: `installConflictScanMeter` wraps `Y.Item.prototype.integrate` once (idempotent, marked by a symbol). Inside a
  * `metered` scope for one document (the guard's shadow apply), the wrapper first REPLAYS the walks Yjs is about to make
- * for that item, read for read, using the exported `compareIDs`, `getItem` and `createID` and the `_start`/`_map` fields
- * Yjs's own loop reads (never a splitting read):
- * the `offset > 0` left resolution (:416-422), the entry condition (:425), the keyed pre-walk (:440-442), the loop's
+ * for that item, read for read, using the exported `compareIDs`, `getItem`, `createID` and `GC` and the `_start`/`_map`
+ * fields Yjs's own loop reads (never a splitting read):
+ * the `offset > 0` left resolution (:416-422, as patch C `[ccc #847]` rewrites :419: the origin is the client's previous
+ * clock, and a GC there integrates the item as a GC), the entry condition (:425), the keyed pre-walk (:440-442), the loop's
  * case 1, case 2 and break (:459-482), and the keyed reconnect walk (:489-494). It counts one step per iteration and
  * throws past CONFLICT_SCAN_STEPS_PER_FRAME steps for the scope, BEFORE delegating, so Yjs never pays the walk. The
  * trip is recorded on the scope (`trip`); the thrown value is only a way out of Yjs's stack and is never recognized by
@@ -111,20 +113,24 @@ const MARK = Symbol.for('ccc.collab-ingress.conflict-scan-meter');
 /**
  * Install the meter on `y` (the guard's own `yjs`), once. Throws, so the guard and the server refuse to start, when
  * `Item.prototype.integrate`, `compareIDs`, `getItem` or `createID` is missing or not the 2-argument function the replay
- * was written against.
+ * was written against, or `GC` (#847) is not a class.
  */
 export function installConflictScanMeter(y: YModule = Y): ConflictScanMeter {
   const proto = (y as unknown as { Item?: { prototype?: Record<string | symbol, unknown> } }).Item?.prototype;
   const current = proto?.integrate as (((...a: unknown[]) => unknown) & { [MARK]?: ConflictScanMeter }) | undefined;
   if (typeof current === 'function' && current[MARK]) return current[MARK];
   const shapeOk = (f: unknown) => typeof f === 'function' && (f as (...a: unknown[]) => unknown).length === 2;
-  const missing = [
-    ['Item.prototype.integrate', current],
-    ['compareIDs', y.compareIDs],
-    ['getItem', y.getItem],
-    ['createID', y.createID],
-  ]
-    .filter(([, f]) => !shapeOk(f))
+  const isClass = (f: unknown) => typeof f === 'function';
+  const missing = (
+    [
+      ['Item.prototype.integrate', current, shapeOk],
+      ['compareIDs', y.compareIDs, shapeOk],
+      ['getItem', y.getItem, shapeOk],
+      ['createID', y.createID, shapeOk],
+      ['GC', y.GC, isClass], // #847: the offset branch's GC test
+    ] as Array<[string, unknown, (f: unknown) => boolean]>
+  )
+    .filter(([, f, ok]) => !ok(f))
     .map(([name]) => name);
   if (!proto || missing.length) {
     throw new Error(
@@ -153,8 +159,12 @@ export function installConflictScanMeter(y: YModule = Y): ConflictScanMeter {
     if (offset > 0) {
       // Item.js:416-419. clock + offset - 1 is the client's last integrated clock (integrateStructs' `offset`), so it is
       // the end of a struct: Yjs's getItemCleanEnd splits nothing there and returns what getItem returns.
-      left = y.getItem(store, y.createID(item.id.client, item.id.clock + offset - 1)) as Y.Item;
-      origin = left.lastId;
+      const prev = y.createID(item.id.client, item.id.clock + offset - 1);
+      left = y.getItem(store, prev) as Y.Item;
+      // Patch C ([ccc #847], yjs #417's rule): a garbage-collected previous clock (a GC: no lastId, no right) makes the
+      // tail integrate as a GC, which walks nothing. Otherwise the origin is that clock, which is the Item's lastId.
+      if (left.constructor === y.GC) return 0;
+      origin = prev;
     }
     const right = item.right;
     const parent = item.parent as Y.AbstractType<any> | null;

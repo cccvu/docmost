@@ -69,6 +69,7 @@ import {
   isPageFull,
   isSuperseded,
   lineageEpoch,
+  liveWedged,
   markCompacting,
   markPageFull,
   markSuperseded,
@@ -141,11 +142,17 @@ export function isPageCompactingRefusal(err: unknown): boolean {
 
 /**
  * Seam #2, the first statement of a direct write once its connection is open (before any Yjs transaction, so a refusal
- * does not even bump the document's generation): a document compacting, draining or superseded takes no write.
+ * does not even bump the document's generation): a document compacting, draining or superseded takes no write. #847:
+ * nor does a wedged one (`liveWedged`): the write would integrate but never be stored, broadcast or counted, so
+ * answering it would acknowledge a write the row never gets. Refused until the page heals (compaction from live) or
+ * unloads; never unwedged in place.
  */
 export function assertDocWritable(doc: object | null | undefined): void {
-  if (doc && isClosedForCompaction(doc)) throw new PageCompactingException();
+  if (doc && (isClosedForCompaction(doc) || liveWedged(doc))) throw new PageCompactingException();
 }
+
+/** #847: the one wedge predicate (compaction-registry.ts), for the handler seam (#2), which imports this module. */
+export { liveWedged };
 
 /**
  * Seam #2, inside a content write's transaction: an append/prepend is refused as the API cap's `page_too_large` when

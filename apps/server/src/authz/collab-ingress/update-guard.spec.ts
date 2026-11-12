@@ -27,6 +27,7 @@ import {
 } from './collab-ingress.testkit';
 import { COLLAB_PAGE_COMPACTING_REASON } from './collab-reasons';
 import { CONFLICT_SCAN_STEPS_PER_FRAME } from './conflict-scan';
+import * as parentConsistency from './parent-consistency';
 import {
   basePage,
   blocksOf,
@@ -1007,8 +1008,20 @@ describe('#781 refusal mechanics', () => {
 
   it('report mode: a frame the shadow cannot apply is not replayed into later rebuilds (the guard stays available)', () => {
     const s = setup({ seed: SEED, mode: 'report' });
+    // #847: one Yjs itself cannot apply is refused in every mode (`internal`, stage `yjs`: live would throw the same)
+    expect(s.deliver(s.conn('crafted'), syncFrame(new Uint8Array([0xff, 0xff, 0xff, 0x01])))).toBe(REFUSED('internal'));
+    expect(s.logs.some((l) => l.includes('"rule":"internal"') && l.includes('"stage":"yjs"') && l.includes('"mode":"report"'))).toBe(true);
+    // one the guard's own inspection failed on follows the mode: logged, and it applies (live is unaffected by our bug)
     const conn = s.conn('editor');
-    expect(s.deliver(conn, syncFrame(new Uint8Array([0xff, 0xff, 0xff, 0x01])))).toBe('applied'); // not applied to live here
+    const spy = jest.spyOn(parentConsistency, 'parentConsistencyViolation').mockImplementationOnce(() => {
+      throw new Error('inspection bug');
+    });
+    try {
+      expect(s.send(conn, new RemoteClient(s.live).edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'a ')))).toBe('applied');
+    } finally {
+      spy.mockRestore();
+    }
+    expect(s.logs.filter((l) => l.includes('"rule":"internal"') && !l.includes('"stage"'))).toHaveLength(1);
     expect(s.send(conn, new RemoteClient(s.live).edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'ok ')))).toBe('applied');
     expect(s.guard.shadowOf(s.live)).not.toBeNull();
     expect(s.logs.some((l) => l.startsWith('COLLAB_SHADOW_UNAVAILABLE'))).toBe(false);

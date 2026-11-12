@@ -96,9 +96,9 @@ export const INT_ATTRS: ReadonlyMap<string, readonly [min: number, max: number]>
  * PAGE_MAX_YDOC_BYTES), `apply-deadline` (a second shadow-apply deadline), `page-full` (growth of a page still over a
  * structure cap after compaction). Crafted shapes no honest client writes: `cross-list` (an item linked after a left
  * neighbour of another list, wiki-v2 #781 lineage), and #840's `parent-split` (a new item beside a neighbour, left or
- * right, of another parent or key), `keyed-split` (a live keyed item that is not one standalone value, #847), and
- * #842's `client-blocks` (a struct section repeating a client's block). A plain union of literals, no comments
- * inside: the client's parity test reads it.
+ * right, of another parent or key), `keyed-split` (a live keyed item that is not one standalone value, or a split of
+ * a stored keyed item that leaves a live piece which is not its key's head, #847), and #842's `client-blocks` (a struct
+ * section repeating a client's block). A plain union of literals, no comments inside: the client's parity test reads it.
  */
 export type CollabRule =
   | 'root'

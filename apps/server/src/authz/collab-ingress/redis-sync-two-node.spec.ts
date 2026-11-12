@@ -25,6 +25,9 @@ import { authFrame, DOC_NAME, FakeSocket, MSG, readServerFrame, RemoteClient, st
 import { authReplyOf } from './bounded-socket';
 import { COLLAB_PREAUTH_DEADLINE_MS } from './limits';
 import { CollabSocketBounds } from './socket-bounds';
+import { CollabUpdateGuardExtension } from './collab-update-guard.extension';
+import { CollabProxySocket } from '../../collaboration/extensions/redis-sync/collab-proxy-socket';
+import * as registry from '../page-write/compaction-registry';
 import { SocketLimitLog } from './socket-limit-log';
 
 /**
@@ -180,6 +183,40 @@ describe('#810 T1 RedisSync between two collab nodes', () => {
     editorA.deliver(syncFrame(new RemoteClient(a.hp.documents.get(DOC_NAME)!).edit(a.hp.documents.get(DOC_NAME)!, paragraph('from A'))));
     await advance();
     expect(sockB.sent.slice(before).map(readServerFrame).some((f) => f.type === MSG.Sync)).toBe(true); // relayed to B's client
+  });
+
+  it('#847: a frame proxied from B reaches A\'s live only through A\'s update guard, so a wedged live refuses it there (1013, never integrated)', async () => {
+    const { a, b } = await owned();
+    jest.spyOn(console, 'error').mockImplementation(() => undefined); // Hocuspocus logs the refusal it closes on
+    const sockB = b.connect('b');
+    await advance();
+    const live = a.hp.documents.get(DOC_NAME)!;
+    const ext = (a.hp as unknown as { configuration: { extensions: unknown[] } }).configuration.extensions.find(
+      (e): e is CollabUpdateGuardExtension => e instanceof CollabUpdateGuardExtension,
+    )!;
+    const seen: Array<{ document: unknown; proxied: boolean; integrated: boolean }> = [];
+    const check = ext.guard.check.bind(ext.guard);
+    jest.spyOn(ext.guard, 'check').mockImplementation((frame) => {
+      const proxied = (frame.connection as { webSocket?: unknown }).webSocket instanceof CollabProxySocket;
+      seen.push({ document: frame.document, proxied, integrated: live.getXmlFragment('default').toString().includes('from B') });
+      return check(frame);
+    });
+    // control: not wedged, the proxied edit is checked by A's guard first, then integrated
+    sockB.deliver(syncFrame(new RemoteClient(live).edit(live, paragraph('from B'))));
+    await advance();
+    expect(live.getXmlFragment('default').toString()).toContain('from B');
+    expect(seen.filter((x) => x.proxied)).toEqual([expect.objectContaining({ document: live, integrated: false })]);
+    // wedged (the predicate the guard reads, as a wedge reads to it): A's guard refuses the proxied frame 1013
+    const wedged = jest.spyOn(registry, 'liveWedged').mockImplementation((d) => d === live);
+    try {
+      sockB.deliver(syncFrame(new RemoteClient(live).edit(live, paragraph('after wedge'))));
+      await advance();
+    } finally {
+      wedged.mockRestore();
+    }
+    expect(seen.filter((x) => x.proxied)).toHaveLength(2);
+    expect(live.getXmlFragment('default').toString()).not.toContain('after wedge');
+    expect(sockB.closed).toMatchObject({ code: 1013 }); // A's refusal (a try-later close) relayed to B's socket
   });
 
   it('anti-vacuity: with the bus delivering nothing, B\'s socket never gets an Authenticated reply', async () => {

@@ -47,6 +47,7 @@ import {
 // structure cap after compaction (the API cap's `page_too_large`), and a load refused as too costly is that 503 too.
 import {
   assertDocWritable,
+  liveWedged,
   refusesGrowth,
   rethrowDirectOpenRefusal,
 } from '../authz/page-write/compaction';
@@ -95,7 +96,8 @@ export class CollaborationHandler {
           // #390: if the LAST store we forced (or drained) FAILED to persist, the row does not hold what this
           // document contains — reporting success here would let a guarded /v1 write trust a version the row
           // never received. `reason: 'error'` fails the guarded write closed (503), same as a thrown settle.
-          if (hasStoreFailure(doc)) {
+          // CCC #847: nor does a wedged document (no store ever covers what it integrates after the wedge).
+          if (hasStoreFailure(doc) || liveWedged(doc)) {
             return { flushed: false, reason: 'error' };
           }
           // Serializing + hashing a whole document is not free and it runs on the event loop every live
@@ -201,11 +203,15 @@ export class CollaborationHandler {
             liveDoc = doc;
             this.applyContentOperation(doc, prepared);
           },
-        );
+        ).catch((err) => {
+          // CCC #847: this write wedged live (Yjs's cleanup of its transaction threw): applied, never confirmed. Below.
+          if (!liveDoc || !liveWedged(liveDoc)) throw err;
+        });
         // #716 R4: the stores that followed the apply (the one after the transaction, then disconnect's retry) failed to persist it, and
         // `disconnect()` unloads a document nobody else holds — the write may be lost. Not a 200: the outcome is
-        // unknown (500 `write_outcome_unknown`, which the platform answers 504 "may have been applied").
-        if (liveDoc && hasStoreFailure(liveDoc)) {
+        // unknown (500 `write_outcome_unknown`, which the platform answers 504 "may have been applied"). CCC #847: so
+        // is a write that wedged live.
+        if (liveDoc && (hasStoreFailure(liveDoc) || liveWedged(liveDoc))) {
           this.logger.warn(
             `updatePageContent applied to ${documentName} but its store failed; answered write_outcome_unknown`,
           );

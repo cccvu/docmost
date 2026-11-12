@@ -21,11 +21,19 @@
  *     `parent-split` and `keyed-split`), and anything this bundle does not know: a rule a newer server adds, a missing
  *     rule, or a hostile string. Generic copy that claims nothing.
  *
+ * #847: one rule is the client's own, never the server's: `COLLAB_LOCAL_COPY_RULE` (`client:local-copy`), recorded when
+ * this browser's Yjs copy broke (`collab-copy-health.ts`: a wedged document, or a stored copy that cannot be replayed).
+ * It is the `copy` cause (Reload, and Discard for a copy that breaks again). The colon keeps it from ever equalling a
+ * server rule, and it stays out of `COLLAB_REFUSAL_RULES`, which the parity test holds equal to the server's.
+ *
  * Lookups go through `ReadonlySet.has`, so a rule such as `__proto__` or `constructor` can never reach a prototype.
  * `collab-try-later-parity.test.ts` reads the server union and holds the partition to it: a new server rule goes red
  * until it joins exactly one cause here.
  */
 export type CollabRefusalCause = "change" | "copy" | "other";
+
+/** #847: the rule a refusal records when this browser's own copy broke (never sent by a server). */
+export const COLLAB_LOCAL_COPY_RULE = "client:local-copy";
 
 export const COLLAB_REFUSAL_RULES: Readonly<
   Record<CollabRefusalCause, ReadonlySet<string>>
@@ -76,6 +84,7 @@ export function collabRefusalCause(
   rule: string | null | undefined,
 ): CollabRefusalCause {
   if (typeof rule !== "string") return "other";
+  if (rule === COLLAB_LOCAL_COPY_RULE) return "copy";
   if (COLLAB_REFUSAL_RULES.change.has(rule)) return "change";
   if (COLLAB_REFUSAL_RULES.copy.has(rule)) return "copy";
   return "other";

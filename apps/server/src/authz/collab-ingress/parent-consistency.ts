@@ -15,6 +15,9 @@
  * frame it sends is consistent wherever it applies. Called inside the frame's transaction, after it integrated and before
  * Yjs's cleanup, whose struct merge ignores parents and can join a split tail to its left. It reads Yjs internals
  * (`beforeState`, `findIndexSS`, item neighbours): order-parity.spec.ts's tripwire pins the yjs version for both.
+ *
+ * #847: the keyed-split rules live here too. `isKeyedSplit` reads each new keyed item; `keyedSplitProduct` reads the
+ * pieces a split of an EXISTING keyed item leaves (`tr._mergeStructs`, where Yjs's `splitItem` pushes every right half).
  */
 import * as Y from 'yjs';
 
@@ -43,6 +46,46 @@ export function parentConsistencyViolation(
       if (foreign(item.left)) return { client, clock: item.id.clock, side: 'left' };
       if (foreign(item.right)) return { client, clock: item.id.clock, side: 'right' };
     }
+  }
+  return null;
+}
+
+/**
+ * #847: a live keyed item must be one standalone value (Yjs's typeMapSet writes one; a later value of the key deletes
+ * it). One holding several values, split by a later delete, wedges live's transaction cleanup (Item.gc on the split);
+ * one with a right neighbour is not the key's value. Read inside the frame's transaction, on every item it created.
+ */
+export const isKeyedSplit = (item: Y.Item): boolean => item.parentSub !== null && !item.deleted && (item.length !== 1 || item.right !== null);
+
+/**
+ * #847: a live keyed piece that is not its key's head. Yjs's integrate deletes a keyed item that lands with a right
+ * neighbour, and deletes the old head when a new head lands after it, so no integrate ever leaves one: only a split of an
+ * existing keyed item does (a delete of its tail, or an origin inside it). A parent delete then deletes the head (the
+ * key's `_map` entry) and never this piece, and Yjs's cleanup of that transaction throws (#847 M2, `Unexpected case`):
+ * the document is wedged for good (no update event, broadcast or store again; compaction-registry.ts `liveWedged`). A live piece that IS the head
+ * (`right === null`) is harmless whatever its length: a delete of only its first value leaves one, and the parent
+ * delete deletes it whole, so the head is not checked for its length here (`isKeyedSplit` does, on new items).
+ */
+const isStrandedKeyed = (item: Y.Item): boolean => item.parentSub !== null && !item.deleted && item.right !== null;
+
+/**
+ * #847: the first live keyed piece a split in this transaction left that is not its key's head, or null. Yjs's
+ * `splitItem` pushes every right half it makes onto `tr._mergeStructs` (so do a parent delete's already-deleted
+ * children, which are never live); for each keyed one, the piece itself and its left half are read. The left half is
+ * found by store position (the struct at the same client's previous clock, of the same parent and key), never by
+ * `right.left`: a new item can be linked between the two halves. Covers splits of items the stored document already held,
+ * which the per-struct `isKeyedSplit` (new clocks only) never sees. O(splits). Called inside the frame's transaction,
+ * before Yjs's cleanup merges the halves back.
+ */
+export function keyedSplitProduct(tr: Y.Transaction): Y.Item | null {
+  const store = tr.doc.store;
+  for (const struct of tr._mergeStructs) {
+    if (!(struct instanceof Y.Item) || struct.parentSub === null) continue;
+    if (isStrandedKeyed(struct)) return struct;
+    const { client, clock } = struct.id;
+    if (clock === 0) continue;
+    const left = Y.getItem(store, Y.createID(client, clock - 1)) as Y.Item | Y.GC;
+    if (left instanceof Y.Item && left.parent === struct.parent && left.parentSub === struct.parentSub && isStrandedKeyed(left)) return left;
   }
   return null;
 }

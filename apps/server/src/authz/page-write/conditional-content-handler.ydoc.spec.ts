@@ -50,8 +50,13 @@ jest.mock('./prelim-content', () => ({
     }),
 }));
 
+import { InternalServerErrorException } from '@nestjs/common';
 import { CollaborationHandler } from '../../collaboration/collaboration.handler';
+import { PageCompactingException } from './compaction';
+import * as registry from './compaction-registry';
+import { liveWedged } from './compaction-registry';
 import { stableHash } from './stable-hash';
+import { storeGenerationOf } from './store-failure-registry';
 import { scopedWriteKey, WRITE_IDEM_MAP } from './write-idem';
 
 const DOC = 'page.77777777-7777-4777-8777-777777777777';
@@ -59,10 +64,11 @@ const USER = { id: 'user-1' } as never;
 const paras = (...texts: string[]): Para[] => texts.map((text) => ({ type: 'paragraph', text }));
 
 /** A resident real Y.Doc behind a DirectConnection-shaped fake (transact runs the callback, as Hocuspocus does). */
-const setup = (opts: { beforeCallback?: (doc: Y.Doc) => void } = {}) => {
+const setup = (opts: { beforeCallback?: (doc: Y.Doc) => void; gated?: boolean } = {}) => {
   const doc = new Y.Doc();
   toFragment(doc, paras('old one', 'old two'));
   const connection = {
+    ...(opts.gated ? { document: doc } : {}), // #847: what the write gate reads (#827 seam #2)
     transact: async (fn: (d: Y.Doc) => void) => {
       opts.beforeCallback?.(doc);
       fn(doc);
@@ -208,5 +214,104 @@ describe('#716 content writes against a real Y.Doc', () => {
     const leaked = Buffer.from(Y.encodeStateAsUpdate(doc));
     expect(leaked.includes('user-1')).toBe(true);
     expect(leaked.includes('attachment-embed')).toBe(true);
+  });
+});
+
+/**
+ * #847 G4: a WEDGED live document (Yjs's cleanup of a transaction threw, M2) integrates later transactions but never
+ * emits their update, so nothing schedules a store and the generation never moves. The write gate refuses every
+ * direct write to it (503 engine_busy, nothing changed), the settle fails closed, and a write that itself wedged live
+ * answers outcome-unknown, never a success.
+ */
+describe('#847 a wedged live document takes no API write, and a write that wedges it is never a success', () => {
+  /** A stranded keyed piece on paragraph 0 (client 9's two-value item, its second value deleted): K:0 live, not the head. */
+  const strand = (doc: Y.Doc) => {
+    const peer = new Y.Doc();
+    peer.clientID = 9;
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(doc));
+    const sv = Y.encodeStateVector(peer);
+    (peer.getXmlFragment('default').get(0) as Y.XmlElement).setAttribute('textAlign', 'left');
+    const item = (peer.getXmlFragment('default').get(0) as Y.XmlElement)._map.get('textAlign')!;
+    (item.content as Y.ContentAny).arr.push('center'); // what a pre-#847 frame could store
+    item.length = 2;
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(peer, sv));
+    Y.applyUpdate(doc, new Uint8Array([0, 1, 9, 1, 1, 1])); // delete 9:1 only (a delete-set-only frame)
+  };
+  const wedge = (doc: Y.Doc) => {
+    strand(doc);
+    try {
+      doc.getXmlFragment('default').delete(0, 1); // a parent delete over the stranded piece
+    } catch {
+      // Yjs's cleanup threw
+    }
+    expect(liveWedged(doc)).toBe(true);
+  };
+  /** Transactions begun on `doc` from now on, and its store generation. */
+  const watch = (doc: Y.Doc) => {
+    let transactions = 0;
+    doc.on('beforeTransaction', () => transactions++);
+    const generation = storeGenerationOf(doc);
+    return { transactions: () => transactions, generationMoved: () => storeGenerationOf(doc) !== generation };
+  };
+  const write = { prosemirrorJson: { type: 'doc', content: paras('new') }, operation: 'replace', user: USER };
+
+  it('an API write and a conditional write on a wedged document: 503 engine_busy / error, no Yjs transaction, the generation unchanged', async () => {
+    const { doc, handlers } = setup({ gated: true });
+    wedge(doc);
+    const w = watch(doc);
+    const before = readFragment(doc);
+    await expect(handlers.updatePageContent(DOC, write)).rejects.toBeInstanceOf(PageCompactingException);
+    await expect(handlers.updatePageContent(DOC, write)).rejects.toMatchObject({ response: { code: 'engine_busy' } });
+    await expect(handlers.conditionalUpdatePageContent(DOC, write)).resolves.toEqual({ applied: false, reason: 'error' });
+    await expect(handlers.setCommentMark(DOC, { yjsSelection: {} as never, commentId: 'c', resolved: false, user: USER } as never)).rejects.toBeInstanceOf(PageCompactingException);
+    expect(w.transactions()).toBe(0);
+    expect(w.generationMoved()).toBe(false);
+    expect(readFragment(doc)).toEqual(before);
+    expect(liveWedged(doc)).toBe(true); // never unwedged in place
+  });
+
+  it('the settle on a wedged document fails closed (the 503), with no Yjs transaction', async () => {
+    const { doc } = setup();
+    Object.assign(doc, { saveMutex: { runExclusive: async (f: () => Promise<unknown>) => f(), isLocked: () => false } });
+    const debouncer = { isDebounced: () => false, executeNow: async () => undefined, isCurrentlyExecuting: () => false };
+    const handlers = new CollaborationHandler().getHandlers({ documents: new Map([[DOC, doc]]), debouncer } as never);
+    await expect(handlers.flushPageContent(DOC, { withDigest: true })).resolves.toMatchObject({ flushed: true }); // control
+    wedge(doc);
+    const w = watch(doc);
+    await expect(handlers.flushPageContent(DOC, { withDigest: true })).resolves.toEqual({ flushed: false, reason: 'error' });
+    expect(w.transactions()).toBe(0);
+  });
+
+  it('a write that wedges live itself answers outcome-unknown (500 write_outcome_unknown / applied_unconfirmed), never a success', async () => {
+    const native = setup();
+    strand(native.doc);
+    expect(liveWedged(native.doc)).toBe(false);
+    let err: unknown;
+    await native.handlers.updatePageContent(DOC, write).catch((e) => (err = e));
+    expect(err).toBeInstanceOf(InternalServerErrorException);
+    expect((err as InternalServerErrorException).getResponse()).toMatchObject({ code: 'write_outcome_unknown' });
+    expect(liveWedged(native.doc)).toBe(true); // the replace's delete of the paragraph wedged it
+    const conditional = setup();
+    strand(conditional.doc);
+    await expect(
+      conditional.handlers.conditionalUpdatePageContent(DOC, { ...write, expectedContentHash: stableHash(readFragment(conditional.doc)) }),
+    ).resolves.toEqual({ applied: false, reason: 'applied_unconfirmed' });
+    expect(liveWedged(conditional.doc)).toBe(true);
+  });
+
+  it('control: without the wedge checks, a write to a wedged document answers success, and no update (so no store) ever follows', async () => {
+    const { doc, handlers } = setup();
+    wedge(doc);
+    let updates = 0;
+    doc.on('update', () => updates++);
+    // the one predicate blinded: the gate (seam #2) and the handler's post-apply check both read it
+    const blind = jest.spyOn(registry, 'liveWedged').mockReturnValue(false);
+    try {
+      await expect(handlers.updatePageContent(DOC, write)).resolves.toBeUndefined();
+    } finally {
+      blind.mockRestore();
+    }
+    expect(readFragment(doc).content).toEqual(paras('new')); // applied to live...
+    expect(updates).toBe(0); // ...and never emitted: the row would never get it
   });
 });

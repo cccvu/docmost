@@ -47,6 +47,7 @@ import {
   isSuperseded,
   LINEAGE_ROOT,
   lineageEpoch,
+  liveWedged,
   markCompacting,
   markPageFull,
   markSuperseded,
@@ -59,6 +60,7 @@ import {
 import { COMPACTION_ARM_DELAY_MS, COMPACTION_MIN_INTERVAL_MS } from '../collab-ingress/doc-bounds';
 import { coveredRowDigest, markRowCovered, unloadCanCompact } from './reconcile-store';
 import { stableHash } from './stable-hash';
+import { strictOrderDiff } from '../collab-ingress/order-parity';
 import { hasStoreFailure, markStoredAt, storeGenerationOf } from './store-failure-registry';
 import { storeSafeJson } from './store-safe-json';
 import { serverSchema } from './prelim-content';
@@ -1078,5 +1080,120 @@ describe('the write gate (#827, seam #2)', () => {
     expect(pageIdOfDocumentName('page.00000000-0000-4000-8000-000000000001')).toBe('00000000-0000-4000-8000-000000000001');
     expect(pageIdOfDocumentName('page.x')).toBeNull();
     expect(pageIdOfDocumentName('space.00000000-0000-4000-8000-000000000001')).toBeNull();
+  });
+});
+
+/**
+ * #847 G4: the heal of a WEDGED live document (Yjs's cleanup of a transaction threw, M2: a parent delete over a stranded
+ * keyed piece) is the #827/#840 compaction from live, run at the unload its drain brings. Its visible tree is the right
+ * one (wedge-integrity.spec.ts), so the compaction keeps every acknowledged edit, the wedging transaction's effect and
+ * what live integrated after it; until it runs the page stays frozen. And a stored stranded piece never loads stranded.
+ */
+describe('#847 a wedged live document heals by compaction from live; a stored split shape loads deleted', () => {
+  const K = 9;
+  const pageJson = { type: 'doc', content: [para(text('one')), para(text('two')), para(text('three'))] };
+  const textOf = (d: Y.Doc) => JSON.stringify(TiptapTransformer.fromYdoc(d, 'default'));
+  /** Client K's two-value `textAlign` item on paragraph `index` (what a pre-#847 frame could store), its second value deleted. */
+  const strand = (doc: Y.Doc, index: number) => {
+    const peer = new Y.Doc();
+    peer.clientID = K;
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(doc));
+    const sv = Y.encodeStateVector(peer);
+    const p = peer.getXmlFragment('default').get(index) as Y.XmlElement;
+    p.setAttribute('textAlign', 'left');
+    const item = p._map.get('textAlign')!;
+    (item.content as Y.ContentAny).arr.push('center');
+    item.length = 2;
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(peer, sv));
+    Y.applyUpdate(doc, rawUpdate([], [{ client: K, ranges: [[1, 1]] }]));
+    const piece = Y.getItem(doc.store, Y.createID(K, 0)) as Y.Item;
+    expect([piece.deleted, piece.right !== null]).toEqual([false, true]); // stranded: live, not the head
+  };
+  /** An edit as a peer's frame (its own client id), applied to `doc`. */
+  const peerEdit = (doc: Y.Doc, change: (f: Y.XmlFragment) => void) => {
+    const peer = new Y.Doc();
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(doc));
+    const sv = Y.encodeStateVector(doc);
+    peer.transact(() => change(peer.getXmlFragment('default')));
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(peer, sv));
+  };
+  const insertText = (index: number, s: string) => (f: Y.XmlFragment) => ((f.get(index) as Y.XmlElement).get(0) as Y.XmlText).insert(0, s);
+
+  it('a stored split shape loads with its stranded piece deleted (a reload is not live: strictOrderDiff flags it), and never wedges', () => {
+    const live = toYdoc(pageJson);
+    strand(live, 1);
+    const stored = Y.encodeStateAsUpdate(live);
+    const loaded = new Y.Doc();
+    loadStoredYdoc(loaded, nextPageId(), stored, memoryStore(null));
+    const piece = Y.getItem(loaded.store, Y.createID(K, 0)) as Y.Item;
+    expect(piece.deleted).toBe(true); // the dangling half re-integrated as deleted
+    expect(strictOrderDiff(loaded, live)).not.toBeNull(); // reload-unstable: what #840's heal image and order heal handle
+    expect(textOf(loaded)).toBe(textOf(live)); // the visible content is the same
+    loaded.getXmlFragment('default').delete(1, 1); // the parent delete that wedges live
+    expect(liveWedged(loaded)).toBe(false);
+    expect(() => live.getXmlFragment('default').delete(1, 1)).toThrow(); // control: the incrementally built live wedges
+    expect(liveWedged(live)).toBe(true);
+  });
+
+  it('compaction from a wedged live keeps every acknowledged edit, the wedging write and a later integration; the build reloads into itself', async () => {
+    const live = toYdoc(pageJson);
+    const pageId = nextPageId();
+    peerEdit(live, insertText(0, 'acked '));
+    strand(live, 1);
+    // the wedging transaction (an honest parent delete, here with an edit beside it): it applies, then cleanup throws
+    expect(() =>
+      live.transact(() => {
+        live.getXmlFragment('default').delete(1, 1);
+        ((live.getXmlFragment('default').get(1) as Y.XmlElement).get(0) as Y.XmlText).insert(0, 'wedging ');
+      }),
+    ).toThrow();
+    expect(liveWedged(live)).toBe(true);
+    // the pending store runs on the wedged document (it encodes live), then a frame in flight integrates after it
+    const content = storeSafeJson(TiptapTransformer.fromYdoc(live, 'default'));
+    const stored = Y.encodeStateAsUpdate(live);
+    const store = memoryStore({ content, ydoc: stored, contentHash: md5(content) });
+    const doc = resident(live, pageId, stored);
+    peerEdit(live, insertText(0, 'late '));
+    expect(liveWedged(live)).toBe(true);
+    const expected = textOf(live);
+    expect(expected).toContain('late acked one');
+    expect(expected).toContain('wedging three');
+    expect(expected).not.toContain('two');
+    expect(assertDocWritable.bind(null, doc)).toThrow(PageCompactingException); // frozen until it heals
+    requestCompaction(doc, { reason: 'order_divergence', userId: null, drain: true });
+    await compactOnUnload(doc, store);
+
+    expect(isSuperseded(doc)).toBe(true);
+    const healed = new Y.Doc();
+    Y.applyUpdate(healed, store.row!.ydoc!);
+    expect(textOf(healed)).toBe(expected);
+    expect(digestOf(healed)).toBe(digestOf(live)); // the build reproduces live's ADR 0019 digest
+    const reload = new Y.Doc();
+    Y.applyUpdate(reload, Y.encodeStateAsUpdate(healed));
+    expect(strictOrderDiff(reload, healed)).toBeNull(); // reload-stable
+    healed.getXmlFragment('default').delete(0, 1);
+    expect(liveWedged(healed)).toBe(false);
+  });
+
+  it('a heal that cannot run (nothing stored since the wedge) skips and leaves the page frozen: every write still refused', async () => {
+    const live = toYdoc(pageJson);
+    const pageId = nextPageId();
+    const stored = Y.encodeStateAsUpdate(live);
+    const store = memoryStore({ content: storeSafeJson(TiptapTransformer.fromYdoc(live, 'default')), ydoc: stored, contentHash: null });
+    const doc = resident(live, pageId, stored); // stored BEFORE the wedge: the row does not hold the wedged state
+    strand(live, 1);
+    try {
+      live.getXmlFragment('default').delete(1, 1);
+    } catch {
+      // wedged
+    }
+    expect(liveWedged(doc)).toBe(true);
+    requestCompaction(doc, { reason: 'order_divergence', userId: null, drain: true });
+    await compactOnUnload(doc, store);
+    expect(isSuperseded(doc)).toBe(false);
+    expect(store.calls.swap).toBe(0);
+    expect(logged.map(logLine)).toEqual([expect.objectContaining({ token: 'COLLAB_PAGE_COMPACTION', event: 'skipped', why: 'not_stored' })]);
+    expect(() => assertDocWritable(doc)).toThrow(PageCompactingException);
+    expect(liveWedged(doc)).toBe(true);
   });
 });

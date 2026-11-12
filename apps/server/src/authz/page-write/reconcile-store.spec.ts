@@ -10,7 +10,7 @@ import {
   readRootMapEntries,
   reconcileRowIntoDoc,
 } from './reconcile-store';
-import { isSuperseded, LINEAGE_ROOT, supersededBy, writeLineage } from './compaction-registry';
+import { isSuperseded, LINEAGE_ROOT, liveWedged, supersededBy, writeLineage } from './compaction-registry';
 
 function paragraph(text: string): Y.XmlElement {
   const el = new Y.XmlElement('paragraph');
@@ -266,5 +266,63 @@ describe('reconcileRowIntoDoc foreign lineage (#827)', () => {
     p.setAttribute('textAlign', 'right');
     const d2 = Y.decodeUpdate(rowBytesOf(withAttrs));
     expect(readRootMapEntries(d2.structs, d2.ds, LINEAGE_ROOT)).toEqual({ entries: new Map(), unresolved: 0 });
+  });
+});
+
+describe('reconcileRowIntoDoc into a wedged document (#847)', () => {
+  /** The state `wedgedResident` was in just before its wedging transaction (what a store before the wedge wrote). */
+  let preWedge: Uint8Array;
+  /** A resident whose Yjs cleanup threw (M2: a parent delete over a stranded keyed piece): wedged for good. */
+  function wedgedResident(): Y.Doc {
+    const doc = docWith(['one', 'two']);
+    const peer = new Y.Doc();
+    peer.clientID = 9;
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(doc));
+    const sv = Y.encodeStateVector(peer);
+    const p = peer.getXmlFragment('default').get(0) as Y.XmlElement;
+    p.setAttribute('textAlign', 'left');
+    const item = p._map.get('textAlign')!;
+    (item.content as Y.ContentAny).arr.push('center'); // a two-value keyed item (pre-#847 stored shape)
+    item.length = 2;
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(peer, sv));
+    Y.applyUpdate(doc, new Uint8Array([0, 1, 9, 1, 1, 1])); // its second value deleted: the first stranded
+    preWedge = Y.encodeStateAsUpdate(doc);
+    expect(() => doc.getXmlFragment('default').delete(0, 1)).toThrow();
+    expect(liveWedged(doc)).toBe(true);
+    return doc;
+  }
+
+  it('an out-of-band row is folded in losslessly: the encoding holds both sides and reloads to live', () => {
+    const resident = wedgedResident();
+    // live's acknowledged edit after the wedge (integrated, never stored: a wedged document emits no update)
+    const acked = new Y.Doc();
+    acked.clientID = 21;
+    Y.applyUpdate(acked, Y.encodeStateAsUpdate(resident));
+    const sv = Y.encodeStateVector(acked);
+    ((acked.getXmlFragment('default').get(0) as Y.XmlElement).get(0) as Y.XmlText).insert(0, 'acked ');
+    Y.applyUpdate(resident, Y.encodeStateAsUpdate(acked, sv));
+    expect(liveWedged(resident)).toBe(true);
+    // the split-brain row: another copy's write over an older state of the page, holding structs live lacks
+    const row = new Y.Doc();
+    row.clientID = 22;
+    Y.applyUpdate(row, preWedge);
+    row.getXmlFragment('default').insert(0, [paragraph('out of band')]);
+    expect(reconcileRowIntoDoc(resident, rowBytesOf(row))).toEqual({ merged: true });
+    expect(liveWedged(resident)).toBe(true); // nothing unwedged in place
+    const visible = resident.getXmlFragment('default').toString();
+    expect(visible).toContain('out of band');
+    expect(visible).toContain('acked two');
+    expect(visible).not.toContain('one'); // the wedging delete is kept
+    // what the store writes next: a reload of live's encoding is live, both sides in it
+    const reload = new Y.Doc();
+    Y.applyUpdate(reload, Y.encodeStateAsUpdate(resident));
+    expect(reload.getXmlFragment('default').toString()).toBe(visible);
+    // the memo names the row: the compaction's compare-and-swap after the store sees a covered row
+    expect(coveredRowDigest(resident)).not.toBeNull();
+  });
+
+  it('a row the wedged document already covers (its own store) needs no merge', () => {
+    const resident = wedgedResident();
+    expect(reconcileRowIntoDoc(resident, rowBytesOf(resident))).toEqual({ merged: false });
   });
 });
