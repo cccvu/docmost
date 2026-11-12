@@ -14,7 +14,7 @@ import { isReloadStable } from './order-parity';
 import { authFrame, FakeSocket, MSG, RemoteClient, renderLikeABrowser, step1Frame, SYNC, syncFrame } from './collab-ingress.testkit';
 import { rawUpdate, type RawStruct } from './conflict-scan.testkit';
 import { CollabUpdateGuardExtension } from './collab-update-guard.extension';
-import { COLLAB_PAGE_COMPACTING_REASON } from './collab-reasons';
+import { COLLAB_PAGE_COMPACTING_REASON, epochStaleReason } from './collab-reasons';
 import { COLLAB_TRY_LATER_CODE, CollabUpdateGuard, TRY_LATER_REASON } from './update-guard';
 import { awaitCompaction, lineageEpoch, setCompactionClockForTests } from '../page-write/compaction-registry';
 import { resetLoadTripsForTests } from '../page-write/compaction';
@@ -166,10 +166,11 @@ d('#840 T3 + T9: a reload-unstable page through the guard and the store, on real
     const hocuspocus = new Hocuspocus({ quiet: true, extensions: [new CollabUpdateGuardExtension(guard), auth, persistence], debounce: 60_000, maxDebounce: 60_000 } as never);
     nodes.push(hocuspocus);
     const handlers = new CollaborationHandler().getHandlers(hocuspocus);
-    const connect = async (token: string) => {
+    /** `epoch`: the lineage the client's copy claims (`?cccEpoch`, #827; absent = 0, a fresh tab's first claim). */
+    const connect = async (token: string, epoch?: number) => {
       const sock = new FakeSocket();
       sockets.push(sock);
-      sock.connect(hocuspocus);
+      sock.connect(hocuspocus, new Request(epoch === undefined ? 'http://localhost/' : `http://localhost/?cccEpoch=${epoch}`));
       sock.deliver(authFrame(token, DOC));
       const deadline = Date.now() + 5_000;
       while (!sock.closed && !hocuspocus.documents.get(DOC)?.getConnections().some((c) => c.webSocket === (sock as never))) {
@@ -180,8 +181,8 @@ d('#840 T3 + T9: a reload-unstable page through the guard and the store, on real
       return sock;
     };
     /** A joiner: connect, send SyncStep1, and wait for the answer (a Step2, or a close). */
-    const join = async (token: string) => {
-      const sock = await connect(token);
+    const join = async (token: string, epoch?: number) => {
+      const sock = await connect(token, epoch);
       sock.deliver(step1Frame(new Y.Doc(), DOC));
       await settle();
       return sock;
@@ -284,10 +285,18 @@ d('#840 T3 + T9: a reload-unstable page through the guard and the store, on real
     return { editor, attacker, live, content: json(live) };
   }
 
-  /** A joiner after the heal: served the next epoch, reload-stable, 0 deletes on render, live's pre-heal content. */
+  /**
+   * A joiner after the heal: a copy claiming the old lineage (a fresh tab claims 0) is refused `epoch-stale:1` before the
+   * server answers anything (#827: it holds nothing of the page, and the SPA switches its copy to epoch 1); claiming
+   * epoch 1 it is served the next epoch, reload-stable, 0 deletes on render, live's pre-heal content.
+   */
   async function expectHealedJoin(n: ReturnType<typeof node>, content: unknown) {
-    const joiner = await n.join('joiner');
+    const stale = await n.join('joiner');
+    expect(stale.closeReasons()).toEqual([epochStaleReason(1)]);
+    expect(received(stale).share.size).toBe(0);
+    const joiner = await n.join('joiner', 1);
     expect(joiner.closed).toBeNull();
+    expect(joiner.closeReasons()).toEqual([]);
     const served = received(joiner);
     expect(lineageEpoch(served)).toBe(1); // epoch + 1: older copies go behind #827's notice
     expect(isReloadStable(served).stable).toBe(true);

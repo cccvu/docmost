@@ -690,6 +690,44 @@ describe('compactOnUnload (#827)', () => {
     }
   });
 
+  it('#840: an order heal is retried after a failed build (once per interval), and heals when a build succeeds', async () => {
+    const live = churnedPage(6);
+    const pageId = nextPageId();
+    const stored = Y.encodeStateAsUpdate(live);
+    const content = storeSafeJson(TiptapTransformer.fromYdoc(live, 'default'));
+    const store = memoryStore({ content, ydoc: stored, contentHash: md5(content) });
+    const doc = resident(live, pageId, stored);
+    let builds = 0;
+    let fail = true;
+    const restore = overrideDeadlineForTests((fn) => {
+      builds++;
+      if (fail) throw new Error('a build that fails');
+      return fn();
+    });
+    try {
+      requestCompaction(doc, { reason: 'client_ids', userId: null, drain: true });
+      await compactOnUnload(doc, store);
+      expect(builds).toBe(1);
+      expect(unloadCanCompact(doc, pageId)).toBe(false); // the memo: no structure drain, no second structure build
+      // the page then turns out order-diverged (a join found it unstable): the same bytes, an order heal
+      requestCompaction(doc, { reason: 'order_divergence', userId: null, drain: true });
+      expect(unloadCanCompact(doc, pageId)).toBe(true);
+      await compactOnUnload(doc, store);
+      expect(builds).toBe(1); // within the per-page interval: nothing runs (the interval bounds its retries)
+      now += 2 * COMPACTION_MIN_INTERVAL_MS;
+      await compactOnUnload(doc, store);
+      expect(builds).toBe(2); // retried, not skipped failed_before
+      expect(isSuperseded(doc)).toBe(false);
+      now += 2 * COMPACTION_MIN_INTERVAL_MS;
+      fail = false; // a stall that passed, or a process that does not repeat the failure
+      await compactOnUnload(doc, store);
+      expect(builds).toBe(3);
+      expect(isSuperseded(doc)).toBe(true); // healed: a new lineage
+    } finally {
+      restore();
+    }
+  });
+
   it('a row whose bytes leave structs pending is never drained at load (its unload could not compact): requested only', () => {
     const src = churnedPage(10);
     const a = new Y.Doc();

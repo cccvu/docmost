@@ -16,6 +16,9 @@ import { liveContentDigest } from './doc-version';
 import { afterOrderStore, checkStoreOrder, loadStableYdoc, persistOrderState, prepareStore, resetContentHealRefusalsForTests, storeSnapshotUnderLock, type HealImageStore } from './heal-image';
 import { memoryHealStore } from './heal-image.testkit';
 import { snapshotForStore } from './persistence-steps';
+import { storeSafeJson } from './store-safe-json';
+import { isDuplicateWriteKey, recordWriteKey, scopedWriteKey } from './write-idem';
+import { repairLegacyValues } from '../collab-ingress/legacy-repair';
 import { markRowCovered } from './reconcile-store';
 import { resetLoadDivergenceLogForTests } from './order-divergence-log';
 
@@ -200,6 +203,26 @@ describe('afterOrderStore (#840): after the commit', () => {
       [1013, COLLAB_PAGE_COMPACTING_REASON],
       [1013, COLLAB_PAGE_COMPACTING_REASON],
     ]);
+  });
+
+  it('#827: drains only when the page heals after it: an image to adopt at the next load, or an unload that can compact', () => {
+    const closes: Array<[number, string]> = [];
+    // no image and uncovered bytes (they leave structs pending): nothing would heal, so the writers keep the page
+    const bare = doc(closes);
+    afterOrderStore(bare, PAGE, { ...unstableOutcome, imaged: false });
+    expect(compactionRequest(bare)).toEqual({ reason: 'order_divergence', userId: null, drain: false });
+    expect(closes).toEqual([]);
+    // no image, covered bytes: the unload compacts from live
+    const covered = doc(closes);
+    markRowCovered(covered, Y.encodeStateAsUpdate(basePage('abc').doc));
+    afterOrderStore(covered, PAGE, { ...unstableOutcome, imaged: false });
+    expect(compactionRequest(covered)).toMatchObject({ drain: true });
+    expect(closes).toHaveLength(2);
+    // an image (uncovered bytes): the next load adopts it
+    const imaged = doc((closes.length = 0, closes));
+    afterOrderStore(imaged, PAGE, unstableOutcome);
+    expect(compactionRequest(imaged)).toMatchObject({ drain: true });
+    expect(closes).toHaveLength(2);
   });
 
   it('before compaction is armed: requested for the next unload, no socket closed; a socket that throws never fails it', () => {
@@ -475,5 +498,115 @@ describe('loadStableYdoc (#840 review items 1 and 2)', () => {
     expect(isPageCompactingRefusal(refused)).toBe(true);
     expect(read).not.toHaveBeenCalled();
     expect(Buffer.from(row.ydoc!)).toEqual(Buffer.from(raw));
+  });
+});
+
+/**
+ * The #827 merge: compaction's digest check joins a text run Yjs left split (`textRunsDigest`): the #781 load repair
+ * deletes a refused mark's opening format item and leaves its closing one, so `fromYdoc` shows two text nodes where any
+ * rebuild (from the tree or through the schema) has one. The heal image and the rebuild from `content` must check the
+ * same way, or such a page, once unstable, gets no image at the store and none from `content` at the load: try-later
+ * for good. And both heals carry the write-idem ledger through write-idem.ts (a keyed /v1 write applied before the
+ * heal still dedups after it).
+ */
+describe('#840 heals after the #827 merge: split text runs and the write-idem ledger', () => {
+  const USER = '00000000-0000-4000-8000-0000000000aa';
+  const KEY = scopedWriteKey(USER, 'heal-key');
+  const runsOf = (doc: Y.Doc) => compaction.textRunsDigest(storeSafeJson(TiptapTransformer.fromYdoc(doc, 'default')));
+
+  /** S1 on a schema page whose first two letters lost a refused link mark to the load repair (a split run). */
+  function splitRunUnstable() {
+    const live = TiptapTransformer.toYdoc({ type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'abcdefgh' }] }] } as never, 'default', tiptapExtensions);
+    const text = (live.getXmlFragment('default').get(0) as Y.XmlElement).get(0) as Y.XmlText;
+    const start = (text as unknown as { _start: Y.Item })._start.id;
+    text.format(0, 2, { link: { href: 5 } }); // a stored legacy value the guard refuses
+    expect(repairLegacyValues(live).marks).toBeGreaterThan(0);
+    Y.applyUpdate(live, rawUpdate([{ client: start.client + 1, clock: 0, structs: [{ origin: [start.client, start.clock + 5], right: [start.client, start.clock + 3], content: new Y.ContentString('XYZ') }] }]));
+    live.transact(() => recordWriteKey(live, KEY, 1234));
+    live.getXmlFragment('default');
+    // preconditions: unstable, a split run, and an exact digest no rebuild can reproduce
+    expect(isReloadStable(live).stable).toBe(false);
+    const runs = (TiptapTransformer.fromYdoc(live, 'default') as { content: Array<{ content: unknown[] }> }).content[0].content;
+    expect(runs.length).toBeGreaterThan(1);
+    return live;
+  }
+
+  function healedFrom(update: Uint8Array) {
+    const doc = loaded(update);
+    doc.getXmlFragment('default');
+    return doc;
+  }
+
+  it('the store builds the heal image of a split-run page, and the load heals from it: same document, ledger kept', async () => {
+    const live = splitRunUnstable();
+    const row = { ydoc: null as Uint8Array | null };
+    const store = memoryHealStore(row);
+    const { snapshot, order } = await prepareStore(live, PAGE);
+    expect(order.image).not.toBeNull(); // with the exact digest: null (CompactionDigestMismatchError)
+    const out = await persistOrderState(store, {}, PAGE, snapshot, order, true);
+    expect(out).toMatchObject({ unstable: true, imaged: true });
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const doc = new Y.Doc();
+    try {
+      await loadStableYdoc(doc, PAGE, snapshot.state, store);
+      expect(outcomes(warn)).toEqual(['healed']);
+    } finally {
+      warn.mockRestore();
+    }
+    expect(isReloadStable(doc).stable).toBe(true);
+    expect(runsOf(doc)).toBe(runsOf(live)); // the same ProseMirror document live showed
+    expect(isDuplicateWriteKey(doc, KEY)).toBe(true);
+    expect(isDuplicateWriteKey(healedFrom(row.ydoc!), KEY)).toBe(true);
+  });
+
+  it('a heal row with no image over a split-run page heals from content (healed_from_content), ledger read from the raw bytes', async () => {
+    const live = splitRunUnstable();
+    const row = { ydoc: null as Uint8Array | null, content: undefined as unknown };
+    const store = memoryHealStore(row);
+    const prepared = await prepareStore(live, PAGE);
+    await persistOrderState(store, {}, PAGE, prepared.snapshot, { ...prepared.order, image: null }, true);
+    row.content = JSON.parse(JSON.stringify(prepared.snapshot.json)); // jsonb
+    expect(store.heals.get(PAGE)).toMatchObject({ image: null, epoch: 1 });
+    const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const error = jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    const doc = new Y.Doc();
+    try {
+      await loadStableYdoc(doc, PAGE, prepared.snapshot.state, store);
+      expect(outcomes(warn)).toEqual(['healed_from_content']);
+      expect(outcomes(error)).toEqual([]);
+    } finally {
+      warn.mockRestore();
+      error.mockRestore();
+    }
+    expect(isReloadStable(doc).stable).toBe(true);
+    expect(runsOf(doc)).toBe(runsOf(live));
+    expect(lineageEpoch(doc)).toBe(1);
+    expect(isDuplicateWriteKey(doc, KEY)).toBe(true);
+    expect(store.heals.has(PAGE)).toBe(false);
+  });
+
+  it('content that differs only in a split run is still refused when it is not what live showed (the exact digest gates first)', async () => {
+    const live = splitRunUnstable();
+    const row = { ydoc: null as Uint8Array | null, content: undefined as unknown };
+    const store = memoryHealStore(row);
+    const prepared = await prepareStore(live, PAGE);
+    await persistOrderState(store, {}, PAGE, prepared.snapshot, { ...prepared.order, image: null }, true);
+    // the same ProseMirror document with the run joined: textRunsDigest-equal, but not the bytes live's store wrote
+    const joined = JSON.parse(JSON.stringify(prepared.snapshot.json));
+    const para = joined.content[0];
+    para.content = [{ type: 'text', text: para.content.map((n: { text: string }) => n.text).join('') }];
+    row.content = joined;
+    jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
+    const error = jest.spyOn(Logger.prototype, 'error').mockImplementation(() => undefined);
+    let refused: unknown;
+    try {
+      await loadStableYdoc(new Y.Doc(), PAGE, prepared.snapshot.state, store);
+    } catch (err) {
+      refused = err;
+    } finally {
+      jest.restoreAllMocks();
+    }
+    expect(isPageCompactingRefusal(refused)).toBe(true);
+    expect(outcomes(error)).toEqual(['image_missing']);
   });
 });

@@ -347,9 +347,9 @@ export interface CollabGuardOptions {
   runWithDeadline?: DeadlineRunner;
   /**
    * #827: whether an unload could compact `live` (reconcile-store's `unloadCanCompact`: its row bytes are covered, and a
-   * build of them has not failed for good). Specs replace it.
+   * build of them has not failed for good, which never stops an order heal: `reason`, #840). Specs replace it.
    */
-  rowCovered?: (live: Y.Doc) => boolean;
+  rowCovered?: (live: Y.Doc, reason?: CompactionReason) => boolean;
   /** #827: the largest Step2/Update payload; PAGE_MAX_YDOC_BYTES. */
   maxFrameBytes?: number;
   caps?: Partial<DocCaps>;
@@ -526,7 +526,7 @@ export class CollabUpdateGuard {
   private readonly meter: ConflictScanMeter;
   /** #827: named so deadline.fitness.spec.ts finds every call. */
   private readonly runWithDeadline: DeadlineRunner;
-  private readonly rowCovered: (live: Y.Doc) => boolean;
+  private readonly rowCovered: (live: Y.Doc, reason?: CompactionReason) => boolean;
   private readonly maxFrameBytes: number;
   private readonly caps: DocCaps;
   private readonly deadlines: GuardDeadlines;
@@ -544,7 +544,7 @@ export class CollabUpdateGuard {
     this.now = opts.now ?? Date.now;
     this.cpuNow = opts.cpuNow ?? (() => performance.now());
     this.runWithDeadline = opts.runWithDeadline ?? runWithDeadline;
-    this.rowCovered = opts.rowCovered ?? ((live) => unloadCanCompact(live, pageIdOf(live as { name?: string }) ?? ''));
+    this.rowCovered = opts.rowCovered ?? ((live, reason) => unloadCanCompact(live, pageIdOf(live as { name?: string }) ?? '', reason));
     this.maxFrameBytes = opts.maxFrameBytes ?? PAGE_MAX_YDOC_BYTES;
     this.caps = { structs: S_MAX, clientIds: C_MAX, children: E_MAX, steps: W_MAX, compactLive: COMPACT_MAX_LIVE_STRUCTS, ...opts.caps };
     this.deadlines = { frame: T_FRAME_MS, load: LOAD_DEADLINE_MS, probe: PROBE_DEADLINE_MS, mirror: MIRROR_DEADLINE_MS, ...opts.deadlines };
@@ -1124,8 +1124,9 @@ export class CollabUpdateGuard {
   private needsCompaction(doc: DocGuard, reason: CompactionReason, userId: string | null, hard: boolean): void {
     try {
       // Only when an unload could compact it (`rowCovered`: covered row bytes, no build of them failed for good): a
-      // probe, step or deadline drain of a page that cannot compact would close everyone again on every interval.
-      const drain = hard && this.mode === 'enforce' && canStartCompaction(pageIdOf(doc.live) ?? '') && this.rowCovered(doc.live);
+      // probe, step or deadline drain of a page that cannot compact would close everyone again on every interval. #840:
+      // a failed build never stops an order heal (its page is closed to joiners until it heals; the interval bounds it).
+      const drain = hard && this.mode === 'enforce' && canStartCompaction(pageIdOf(doc.live) ?? '') && this.rowCovered(doc.live, reason);
       const request = { reason, userId, drain };
       if (requestCompaction(doc.live, request)) {
         logCompactionRequested(pageIdOf(doc.live), request, { structs: doc.structs, clientIds: doc.shadow?.store.clients.size, steps: doc.steps }, this.compactionLog);
@@ -1338,7 +1339,11 @@ export class CollabUpdateGuard {
     }
     // #840: a new item beside a neighbour of another parent or key: the item is checked against one parent while it
     // lives in another, and no replay or reload rebuilds that (parent-consistency.ts). Never written by an honest client.
-    if (parentConsistencyViolation(tr, clients)) return result({ rule: 'parent-split' });
+    // Refused in every case, a legacy pending item's too. One shape, one rule: a foreign `left` is `cross-list` (the
+    // per-struct rule above names it first; only a legacy item, report-only there, reaches here with it), and only a
+    // foreign `right` beside a consistent `left` is `parent-split`.
+    const split = parentConsistencyViolation(tr, clients);
+    if (split) return result(split.side === 'left' ? { rule: 'cross-list' } : { rule: 'parent-split' });
     for (const type of newTypes) if (depthOf(type) > COLLAB_LIMITS.elementDepth) return result({ rule: 'element-depth' });
 
     Y.iterateDeletedStructs(tr, tr.deleteSet, (struct) => {

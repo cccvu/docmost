@@ -12,7 +12,8 @@ import { isKeyedSplit } from './update-guard';
  * drift, live and a reload disagree); honest frames never do it, whatever the undo grouping, the nesting or the offline
  * merges (a seeded corpus: every frame the server applies and every remote integration on a peer, checked).
  */
-type Hit = ReturnType<typeof parentConsistencyViolation>;
+/** The parent rule's hit (with the side that differs), or the keyed-split rule's (no side). */
+type Hit = { client: number; clock: number; side?: 'left' | 'right' } | null;
 
 /** #847: the guard's keyed-split rule over what `tr` integrated (the corpus checks it with the parent rule). */
 function keyedSplitIn(tr: Y.Transaction): Hit {
@@ -84,7 +85,7 @@ describe('#840 parent consistency: an integrated item\'s neighbours share its pa
   it('the parent split: (777, 0) re-sent with an origin in the paragraph is linked in the code block; flagged at its tail', () => {
     const { live, e } = twoTexts();
     const frame = rawUpdate([{ client: ATTACKER, clock: 0, structs: [{ origin: e, right: null, content: new Y.ContentString('zb') }] }]);
-    expect(applyChecked(copyOf(live), frame)).toEqual({ client: ATTACKER, clock: 1 });
+    expect(applyChecked(copyOf(live), frame)).toEqual({ client: ATTACKER, clock: 1, side: 'left' });
 
     // control (the frame applied): the tail's parent is the paragraph's text, but it is linked after 'q' in the code
     const control = copyOf(live);
@@ -120,7 +121,7 @@ describe('#840 parent consistency: an integrated item\'s neighbours share its pa
 
     const frame = rawUpdate([{ client: ATTACKER, clock: 0, structs: [{ origin: null, right: null, parent: idOf(h), sub: 'level', content: new Y.ContentAny(['x', 3]) }] }]);
     const control = copyOf(live);
-    expect(applyChecked(control, frame)).toEqual({ client: ATTACKER, clock: 1 }); // same parent: the parentSub half
+    expect(applyChecked(control, frame)).toEqual({ client: ATTACKER, clock: 1, side: 'left' }); // same parent: the parentSub half
     const el = (d: Y.Doc) => (d.getXmlFragment('default').get(0) as Y.XmlElement).getAttributes();
     expect(el(control)).toEqual({ level: 3 }); // textAlign deleted, level rewritten
     expect(el(copyOf(control))).toEqual({ level: 1, textAlign: 3 }); // a reload reads the tail as textAlign
@@ -134,7 +135,7 @@ describe('#840 parent consistency: an integrated item\'s neighbours share its pa
     const corrupt = rawUpdate([{ client: ATTACKER, clock: 0, structs: [{ origin: n, right: e, content: new Y.ContentString('zb') }] }]);
     const corrupted = () => {
       const doc = copyOf(live);
-      expect(applyChecked(doc, corrupt)).toEqual({ client: ATTACKER, clock: 1 });
+      expect(applyChecked(doc, corrupt)).toEqual({ client: ATTACKER, clock: 1, side: 'left' });
       expect((structAt(doc, ATTACKER, 1) as Y.Item).parent).toBe(textIn(doc, 0)); // still split after cleanup
       return doc;
     };
@@ -147,7 +148,7 @@ describe('#840 parent consistency: an integrated item\'s neighbours share its pa
       const item = structAt(probe, 888, 0) as Y.Item;
       expect([item.left!.parent === item.parent, item.right!.parent === item.parent]).toEqual([true, false]);
     });
-    expect(applyChecked(corrupted(), frame)).toEqual({ client: 888, clock: 0 });
+    expect(applyChecked(corrupted(), frame)).toEqual({ client: 888, clock: 0, side: 'right' });
   });
 
   it('an author\'s own grouped undo (keyed redo under a redone parent) keeps its replica, the server and a reload consistent', () => {

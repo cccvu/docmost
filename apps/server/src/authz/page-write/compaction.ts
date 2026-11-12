@@ -73,6 +73,7 @@ import {
   markPageFull,
   markSuperseded,
   noteBuildFailed,
+  orderHealRequested,
   pageFullUntil,
   MalformedLineageError,
   registerInflight,
@@ -374,7 +375,9 @@ export async function compactOnUnload(document: CompactableDocument, db: KyselyD
     if (!holdsItsRow(document)) return skipUnload(pageId, request, 'not_stored');
     const covered = coveredRowDigest(document);
     if (covered === null) return skipUnload(pageId, request, 'uncovered');
-    if (buildRefused(pageId, covered)) return skipUnload(pageId, request, 'failed_before');
+    // #840: an order heal is retried after a failed build (`orderHealRequested`): its page is closed to joiners until
+    // it heals, so the per-page interval and the process gap bound its retries instead of the memo
+    if (buildRefused(pageId, covered) && !orderHealRequested(document)) return skipUnload(pageId, request, 'failed_before');
     if (!canStartCompaction(pageId)) return;
     markCompacting(document); // synchronously: from here joins and writes answer try-later
     marked = true;

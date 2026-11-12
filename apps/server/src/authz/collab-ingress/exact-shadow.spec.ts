@@ -1,13 +1,14 @@
 import * as Y from 'yjs';
 import { prosemirrorJSONToYDoc } from '@tiptap/y-tiptap';
 import { serverSchema } from '../page-write/prelim-content';
-import { markRowCovered } from '../page-write/reconcile-store';
-import { compactionRequest, isDraining, registerInflight, setCompactionClockForTests } from '../page-write/compaction-registry';
+import { buildRefused, compactionRequest, isDraining, noteBuildFailed, registerInflight, resetBuildFailuresForTests, resetCompactionGapForTests, setCompactionClockForTests } from '../page-write/compaction-registry';
+import { coveredRowDigest, markRowCovered, unloadCanCompact } from '../page-write/reconcile-store';
 import { COMPACTION_ARM_DELAY_MS, COMPACTION_MIN_INTERVAL_MS } from './doc-bounds';
 import { contentOf, processCpuMs, RemoteClient, renderLikeABrowser, step1Frame, syncFrame } from './collab-ingress.testkit';
 import { ConflictScan, CONFLICT_SCAN_STEPS_PER_FRAME, installConflictScanMeter } from './conflict-scan';
 import { rawUpdate, type RawId, type RawStruct } from './conflict-scan.testkit';
 import { checkElement } from './content-rules';
+import * as parentConsistency from './parent-consistency';
 import { EXACT_REPLICA_CAPS, ExactReplicaLog } from './exact-replica';
 import { attachReplicaLog, LOG_OUT_OF_ORDER, LOG_OVER_CAP, LOG_OVER_TOTAL, replicaLogDistrust, replicaLogOf, replicaLogTotal, setReplicaLogTotalForTests } from './exact-replica-registry';
 import { isReloadStable, strictOrderDiff } from './order-parity';
@@ -432,7 +433,7 @@ describe('#840 new rules: parent-split and keyed-split (#847) are refused 4422',
     expect(s.live.getXmlFragment('default').delete(1, 1)).toBeUndefined();
   });
 
-  it('an item re-sent with an origin in another text is linked beside the first (a foreign left): refused cross-list (the per-struct rule runs first)', () => {
+  it('an item re-sent with an origin in another text is linked beside the first (a foreign left): refused cross-list, the rule that shape always gets', () => {
     const base = new Y.Doc();
     base.clientID = 1;
     const [p, c, pt, ct] = [new Y.XmlElement('paragraph'), new Y.XmlElement('codeBlock'), new Y.XmlText(), new Y.XmlText()];
@@ -448,8 +449,25 @@ describe('#840 new rules: parent-split and keyed-split (#847) are refused 4422',
     expect(s.send(s.conn('attacker'), q.edit(s.live, (f) => ((f.get(1) as Y.XmlElement).get(0) as Y.XmlText).insert(3, 'q')))).toBe('applied');
     const o = (pt as any)._start.id as Y.ID; // 'one' is one struct
     const split = rawUpdate([{ client: 777, clock: 0, structs: [{ origin: [o.client, o.clock + 2], right: null, content: new Y.ContentString('zb') }] }]);
-    // the per-struct `cross-list` rule (#781 lineage) reads the item's left and refuses it before #840's walk runs
+    // #781 lineage's per-struct `cross-list` names a foreign left first; #840's walk names only a foreign right
+    // `parent-split` (parent-consistency.spec.ts has that shape), so the same frame never gets two reasons
     expect(s.send(s.conn('attacker'), split)).toBe(REFUSED('cross-list'));
+  });
+
+  it('the post-integrate walk names its hit by side: a foreign left is cross-list (a legacy item reaches only it), a foreign right parent-split', () => {
+    // A legacy pending item with a foreign left is report-only in the per-struct rules, so only the walk refuses it; it
+    // must refuse it under the rule that shape gets everywhere else. The walk's own hits are pinned in
+    // parent-consistency.spec.ts (both sides); here, what the guard answers for each.
+    for (const [side, rule] of [['left', 'cross-list'], ['right', 'parent-split']] as const) {
+      const s = harness();
+      const spy = jest.spyOn(parentConsistency, 'parentConsistencyViolation').mockReturnValue({ client: 1, clock: 0, side });
+      try {
+        expect(s.send(s.conn('editor'), honestEdit(s.live))).toBe(REFUSED(rule));
+      } finally {
+        spy.mockRestore();
+      }
+      expect(s.send(s.conn('editor'), honestEdit(s.live))).toBe('applied'); // control: the same kind of frame, no hit
+    }
   });
 });
 
@@ -794,5 +812,82 @@ describe('#840 part 4: live\'s own apply is charged, and live far slower than th
     } finally {
       spy.mockRestore();
     }
+  });
+});
+
+/**
+ * #840 with #827 (the merge): #827 drains only what an unload can compact (`unloadCanCompact`: covered row bytes, and no
+ * build of them failed for good), caps live structs at COMPACT_MAX_LIVE_STRUCTS (past it a structure cap is page-full,
+ * never a drain) and spaces compactions across the process. An order heal is a compaction too, and while it waits every
+ * joiner gets 1013: none of these may leave an unstable page with no heal at all.
+ */
+describe('#840 with #827: an order-diverged page always has a heal ahead of it', () => {
+  let t = 3_000_000_000_000;
+  let restore: () => void;
+  beforeEach(() => {
+    restore = setCompactionClockForTests({ now: () => t, uptimeMs: () => COMPACTION_ARM_DELAY_MS + 1 });
+  });
+  afterEach(() => {
+    restore();
+    resetBuildFailuresForTests();
+    resetCompactionGapForTests();
+  });
+
+  /** A legacy (pre-#840) row whose reload reorders a paragraph: nobody to strike, the join must wait for a heal. */
+  function legacyUnstableRow(): Uint8Array {
+    const doc = new Y.Doc();
+    doc.clientID = 1;
+    const p = new Y.XmlElement('paragraph');
+    const tx = new Y.XmlText();
+    doc.transact(() => {
+      doc.getXmlFragment('default').insert(0, [p]);
+      p.insert(0, [tx]);
+      tx.insert(0, 'abcdef');
+    });
+    const first = (tx as any)._start.id.clock as number;
+    Y.applyUpdate(doc, rawUpdate([{ client: 2, clock: 0, structs: [{ origin: [1, first + 5], right: [1, first + 3], content: new Y.ContentString('X') }] }]));
+    expect(isReloadStable(doc).stable).toBe(false); // precondition
+    return Y.encodeStateAsUpdate(doc);
+  }
+  const pageIdOf = (live: { name: string }) => live.name.slice('page.'.length);
+
+  it('past COMPACT_MAX_LIVE_STRUCTS: growth is page-full (no structure drain), yet the order heal drains (its goal is order, not size)', () => {
+    const s = harness({ bytes: legacyUnstableRow(), attach: true, caps: { compactLive: 3 } });
+    // non-vacuity: the page is past the live-struct cap, where compaction never helps a structure cap
+    expect(s.send(s.conn('editor'), new RemoteClient(s.live).edit(s.live, (f) => ((f.get(0) as Y.XmlElement).get(0) as Y.XmlText).insert(0, 'g')))).toBe(REFUSED('page-full'));
+    expect(isDraining(s.live)).toBe(false);
+    expect(s.join(s.conn('reader', true))).toBe(TRY_LATER);
+    expect(compactionRequest(s.live)).toMatchObject({ drain: true });
+    expect(isDraining(s.live)).toBe(true);
+  });
+
+  it('a build of the row bytes that failed for good does not stop the order heal: it drains (control: any other drain is refused)', () => {
+    const s = harness({ bytes: legacyUnstableRow(), attach: true });
+    const pageId = pageIdOf(s.live);
+    noteBuildFailed(pageId, coveredRowDigest(s.live)!, false); // a deterministic failure: refused for these bytes
+    expect(buildRefused(pageId, coveredRowDigest(s.live)!)).toBe(true);
+    expect(unloadCanCompact(s.live, pageId)).toBe(false); // control: a structure, step or deadline drain is refused
+    expect(unloadCanCompact(s.live, pageId, 'order_divergence')).toBe(true);
+    expect(s.join(s.conn('reader', true))).toBe(TRY_LATER);
+    expect(isDraining(s.live)).toBe(true);
+    // the unload then honours the same request (compaction.spec.ts runs it); a second joiner meanwhile waits (1013)
+    const c = s.conn('reader2', true);
+    expect(() => s.guard.check({ connection: c, document: s.live, update: step1Frame(new Y.Doc()), context: c.context })).toThrow(
+      expect.objectContaining({ code: COLLAB_TRY_LATER_CODE }),
+    );
+  });
+
+  it('a heal the process-wide gap holds back drains at the first join after the gap', async () => {
+    let finish: () => void = () => undefined;
+    registerInflight('00000000-0000-4000-8000-0000000c0de1', new Promise<void>((r) => (finish = r)), t); // another page's
+    t += 10_000; // it took 10 s: no compaction may start for 2 x 10 s after it ended
+    finish();
+    await new Promise((r) => setImmediate(r));
+    const s = harness({ bytes: legacyUnstableRow(), attach: true });
+    expect(s.join(s.conn('reader', true))).toBe(TRY_LATER);
+    expect(compactionRequest(s.live)).toMatchObject({ reason: 'order_divergence', drain: false }); // held back, requested
+    t += 20_001;
+    expect(s.join(s.conn('reader2', true))).toBe(TRY_LATER);
+    expect(isDraining(s.live)).toBe(true);
   });
 });

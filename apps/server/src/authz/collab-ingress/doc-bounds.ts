@@ -136,7 +136,9 @@ export const W_MAX = 1_000_000;
  * compaction (each path: a structure cap, the step budget, a probe, a refused load's row build) rebuilds at most about
  * this much. A page already past it (written before #827, or one API write over it) is never drained for a structure
  * cap (`compactionWouldHelp` says no); a row build of such a page that runs out of time is not retried for the same
- * bytes (`startRowCompaction`).
+ * bytes (`startRowCompaction`). #840's order heal is not gated by it (its goal is order, not size): an order-diverged
+ * page past it still drains and is rebuilt from live, bounded like every build by COMPACTION_DEADLINE_MS, and only a
+ * page written before #827 or by an API write can be past it (frames never grow one across it).
  */
 export const COMPACT_MAX_LIVE_STRUCTS = 50_000;
 /**

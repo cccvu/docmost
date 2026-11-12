@@ -63,13 +63,15 @@ interface DocState {
   supersededBy: number | null;
   /** Page-full (false: not), until when (ms, the registry's clock; null: until a measure clears it). */
   pageFull: false | { until: number | null };
+  /** #840: an order heal was requested (`order_divergence`, whatever reason came first): see `orderHealRequested`. */
+  orderHeal: boolean;
 }
 
 const docs = new WeakMap<object, DocState>();
 const stateOf = (doc: object): DocState => {
   let s = docs.get(doc);
   if (!s) {
-    s = { requested: null, compacting: false, superseded: false, supersededBy: null, pageFull: false };
+    s = { requested: null, compacting: false, superseded: false, supersededBy: null, pageFull: false, orderHeal: false };
     docs.set(doc, s);
   }
   return s;
@@ -78,9 +80,11 @@ const stateOf = (doc: object): DocState => {
 /**
  * Request compaction of `doc`. The first reason wins (it is what crossed first); a later `drain` upgrades a request
  * that had none. Returns true when the request is new or newly draining (log it then), false when nothing changed.
+ * An `order_divergence` request is remembered as an order heal whichever reason came first (`orderHealRequested`).
  */
 export function requestCompaction(doc: object, request: CompactionRequest): boolean {
   const s = stateOf(doc);
+  if (request.reason === 'order_divergence') s.orderHeal = true;
   if (s.requested === null) {
     s.requested = { reason: request.reason, userId: request.userId, drain: request.drain };
     return true;
@@ -94,6 +98,17 @@ export function requestCompaction(doc: object, request: CompactionRequest): bool
 
 export function compactionRequest(doc: object): CompactionRequest | null {
   return docs.get(doc)?.requested ?? null;
+}
+/**
+ * #840 with #827: an order heal was requested for `doc`. The build-failure memo (`buildRefused`) never stops one: the
+ * memo keeps a page that one compaction cannot help from being closed to everyone every interval for nothing, but an
+ * order-diverged page is already closed to every joiner (and, diverged, to every writer) until it heals, and a
+ * compaction is its only heal (or the image its store wrote). So its retries are bounded by the per-page interval, the
+ * process gap and the one-in-flight limit instead, and a build that failed once (a stall twice, or a failure a later
+ * process would not repeat) does not leave the page try-later for good.
+ */
+export function orderHealRequested(doc: object): boolean {
+  return docs.get(doc)?.orderHeal === true;
 }
 export function isDraining(doc: object): boolean {
   return docs.get(doc)?.requested?.drain === true;

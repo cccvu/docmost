@@ -14,8 +14,9 @@
  *     Unstable, or unknown (the reload threw: `reload_failed`): store the raw bytes and live-order `content` as before
  *     (no item is lost; live's lineage stays continuous for the #390 reconcile; the bytes are written even when
  *     `content` is unchanged, so `row_sha` names them), and in the SAME transaction upsert the page's heal row: a
- *     compacted copy of live (#827's tree copy at the next epoch), verified (its ADR 0019 digest is live's, and it
- *     reloads strict-equal to itself), with `row_sha` = sha256 of the raw bytes, or no image when it cannot be built.
+ *     compacted copy of live (#827's tree copy at the next epoch), verified (its ADR 0019 digest is live's once text
+ *     runs Yjs left split are joined, #827's `textRunsDigest`, and it reloads strict-equal to itself), with `row_sha` =
+ *     sha256 of the raw bytes, or no image when it cannot be built.
  *     After the commit, compaction is requested (`order_divergence`): unstable drains now when one can start; unknown
  *     waits for the next unload (one slow reload is no evidence; a joiner still meets the guard's join check).
  *   - Load (`loadStableYdoc`, the only loader of `pages.ydoc`; heal-image.fitness.spec.ts pins it).
@@ -59,12 +60,11 @@ import {
   readRowLineage,
   compactionStoreOf,
   countStructs,
-  ledgerOfDoc,
   LOAD_BOUNDS,
   loadStoredYdoc,
   snapshotTree,
+  textRunsDigest,
   type CompactionStore,
-  type LedgerEntry,
   type LoadBounds,
   type TreeNode,
 } from './compaction';
@@ -72,7 +72,10 @@ import { canStartCompaction, compactionArmed, lineageEpoch, requestCompaction, t
 import { ensureHealImageTable } from './heal-image.installer';
 import { loadDivergenceLog, logOrderDivergence, type OrderDivergence } from './order-divergence-log';
 import { coveredRowAtSnapshot, snapshotForStore, snapshotHoldsRow, type StoreSnapshot } from './persistence-steps';
+import { unloadCanCompact } from './reconcile-store';
 import { stableHash } from './stable-hash';
+// The write-idem ledger is read and carried only through write-idem.ts (write-idem.fitness.spec.ts, PR 91).
+import { ledgerOfDoc, type LedgerEntry } from './write-idem';
 import { yieldToEventLoop } from './yield-to-event-loop';
 
 const sha256 = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('base64');
@@ -106,8 +109,14 @@ export interface HealSource {
   ledger: LedgerEntry[];
   /** Live's lineage epoch (the image takes the next); null when it is malformed (no image can be built). */
   epoch: number | null;
-  /** Live's ADR 0019 digest (`stableHash` of the stored projection). */
+  /** Live's ADR 0019 digest (`stableHash` of the stored projection): the heal row's `content_digest`. */
   digest: string;
+  /**
+   * The same projection with adjacent equal-marked text joined (#827's `textRunsDigest`): what the image is checked
+   * against. A rebuild never keeps a run Yjs left split (the #781 load repair leaves one), so the exact digest would
+   * refuse every image of such a page, as it refused its compaction before #827 joined runs.
+   */
+  runs: string;
 }
 
 /** Flat, not a union: the server's tsconfig has strictNullChecks off, which defeats narrowing. */
@@ -148,7 +157,13 @@ export function checkStoreOrder(document: Y.Doc, snapshot: StoreSnapshot, bounds
       } catch {
         epoch = null; // MalformedLineageError: no image (the row still goes in, with none)
       }
-      source = { tree: snapshotTree(document.getXmlFragment('default')), ledger: ledgerOfDoc(document), epoch, digest: stableHash(snapshot.json) };
+      source = {
+        tree: snapshotTree(document.getXmlFragment('default')),
+        ledger: ledgerOfDoc(document),
+        epoch,
+        digest: stableHash(snapshot.json),
+        runs: textRunsDigest(snapshot.json),
+      };
     } catch {
       source = null;
     }
@@ -165,14 +180,15 @@ export class HealImageUnstableError extends Error {
 
 /**
  * The verified heal image of `source` (#827's build: a fresh document from live's tree, its digest checked against
- * live's), which must also reload strict-equal to itself. Pure Yjs on documents it made, under the compaction deadline.
+ * live's with split text runs joined, as compaction checks it), which must also reload strict-equal to itself. Pure Yjs
+ * on documents it made, under the compaction deadline.
  */
 export function buildHealImage(source: HealSource | null, at: number = Date.now()): HealImage {
   if (source === null || source.epoch === null) throw new Error('no heal image source (#840)');
-  const { tree, ledger, digest } = source;
+  const { tree, ledger, runs } = source;
   const epoch = source.epoch + 1;
   return runWithDeadline(() => {
-    const built = buildCompacted({ tree }, ledger, epoch, at, { digest });
+    const built = buildCompacted({ tree }, ledger, epoch, at, { runs });
     const check = new Y.Doc();
     Y.applyUpdate(check, built.update);
     if (!isReloadStable(check).stable) throw new HealImageUnstableError();
@@ -290,12 +306,16 @@ export async function persistOrderState(
  * After the store committed: an unstable one requests compaction from live (`order_divergence`), drains the page now
  * when a compaction can start (its sockets close 1013, so it unloads and compacts; the heal row covers a crash until
  * then), and logs. An unknown order (`reload_failed`: one slow reload, a GC pause on an honest page) never drains: it
- * is compacted at its next unload, and a joiner is still checked by the guard's own join check. Never throws.
+ * is compacted at its next unload, and a joiner is still checked by the guard's own join check. #827: like every drain,
+ * only when the page heals after it: the unload can compact it (`unloadCanCompact`, which a failed build never stops for
+ * an order heal), or the store wrote an image the next load adopts. A page with neither (bytes that leave structs
+ * pending, no image) keeps its writers; its joiners wait on the guard's join check. Never throws.
  */
 export function afterOrderStore(document: Y.Doc, pageId: string, outcome: OrderStoreOutcome | null | undefined): void {
   try {
     if (!outcome?.unstable) return;
-    const request: CompactionRequest = { reason: 'order_divergence', userId: null, drain: !outcome.reloadFailed && canStartCompaction(pageId) };
+    const heals = outcome.imaged || unloadCanCompact(document, pageId, 'order_divergence');
+    const request: CompactionRequest = { reason: 'order_divergence', userId: null, drain: !outcome.reloadFailed && canStartCompaction(pageId) && heals };
     if (requestCompaction(document, request)) logCompactionRequested(pageId, request, { structs: outcome.structs });
     if (request.drain) drainSockets(document);
     const word = outcome.reloadFailed ? RELOAD_FAILED : outcome.imaged ? 'heal_image' : 'image_failed';
@@ -435,10 +455,12 @@ interface ContentImage {
  *   - `content` holds no U+FFFD (`storeSafeJson` writes a lone surrogate or NUL as one, which the Yjs tree kept raw);
  *   - every write-idem ledger entry and the lineage epoch read from the raw bytes (the row path's reader, which
  *     integrates nothing), and the epoch is the heal row's;
- *   - the rebuilt page's ADR 0019 digest equals that digest (`buildCompacted`, under the compaction deadline:
- *     `storeSafeJson(fromYdoc(rebuilt))` is exactly the stored `content`), and it reloads strict-equal to itself.
- * The conversion goes through the server schema, so a tree it normalizes (elements without their default attributes,
- * adjacent text runs: raw or crafted writes) cannot match and stays try-later.
+ *   - the rebuilt page equals `content` with adjacent equal-marked text joined (`buildCompacted` with #827's
+ *     `textRunsDigest`, under the compaction deadline: ProseMirror joins such runs on the way in, so the only
+ *     difference allowed is how Yjs split a run, never a character, a mark or an attribute), and it reloads
+ *     strict-equal to itself.
+ * The conversion goes through the server schema, so a tree it normalizes otherwise (elements without their default
+ * attributes: raw or crafted writes) cannot match and stays try-later.
  * Anything else is null (try-later and an alert, as before), logged `COLLAB_COMPACTION_FAILED` `heal_from_content` once:
  * the refusal is remembered for the same row and content (CONTENT_HEAL_RETRY_MS), so a client retrying try-later does
  * not rerun a page-sized conversion per attempt. The swap then also checks `content` is unchanged.
@@ -491,7 +513,9 @@ async function verifiedImageFromContent(
     const update = runWithDeadline(() => {
       const lineage = readRowLineage(row);
       if (lineage.ledgerUnresolved > 0 || lineage.epoch + 1 !== heal.epoch) throw new HealSourceMismatchError();
-      const built = buildCompacted({ json: content }, lineage.ledger, heal.epoch, at, { digest });
+      // `content` is exactly live's projection (its exact digest matched above); the rebuild is checked against it with
+      // split text runs joined, as compaction checks it (#827: ProseMirror joins them on the way in)
+      const built = buildCompacted({ json: content }, lineage.ledger, heal.epoch, at, { runs: textRunsDigest(content) });
       const check = new Y.Doc();
       Y.applyUpdate(check, built.update);
       if (!isReloadStable(check).stable) throw new HealImageUnstableError();
