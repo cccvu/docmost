@@ -59,7 +59,7 @@ const RE_VALIDATE_827 = [
   '   counts a load exactly (the arm specs below) and that W_MAX still bounds the inversion (#827 c);',
   '3. a change to transact/cleanupTransactions: re-run deadline.spec.ts (an interrupted doc stays mid-transaction and',
   '   is discarded; nothing outside it is touched) and the load-throw spec below (an ordinary throw leaves Yjs clean);',
-  '4. any change: re-run yjs-bounds.sizing.bench.cjs on node:22-slim and update the table in doc-bounds.ts and',
+  '4. any change: re-run the sizing bench (yjs-bounds.sizing.bench.cjs) on node:22-slim and update doc-bounds.ts and',
   '   doc-bounds.spec.ts (S_MAX, C_MAX, E_MAX, W_MAX, T_FRAME_MS keep their margins);',
   '5. then update the pins.',
 ].join('\n');

@@ -137,6 +137,8 @@ export interface CollabLocalCopy {
   };
   get(key: string): Promise<unknown>;
   set(key: string, value: number): Promise<unknown>;
+  /** Resolves once the stored copy has been replayed into `doc` (y-indexeddb's `whenSynced`). */
+  whenSynced?: Promise<unknown>;
 }
 
 /** The slice of `HocuspocusProvider` the dirty marker listens to. */
@@ -156,12 +158,35 @@ export interface CollabCopyTracker {
  * marks the copy dirty; the provider's unsynced count reaching 0 (the server applied every frame it was sent, including
  * the Step2 that carries changes from before this session) marks it clean. The marker is written on each change of
  * state only, in order, and this session's own state also counts (a failed write cannot hide this session's edit).
+ * A copy that holds content but no marker at all was written by a bundle older than #827, which kept no marker: its
+ * offline edits are unknown, so it counts as dirty (the Discard-first notice, never a silent clear).
  */
+/** How long `isDirty` waits for the stored copy's replay before it fails dirty (a stuck IndexedDB). */
+export const COPY_REPLAY_WAIT_MS = 2_000;
+
+/** True when `p` resolves within `ms`; false when it rejects or is still pending then. */
+function settlesWithin(p: Promise<unknown>, ms: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    p.then(
+      () => {
+        clearTimeout(timer);
+        resolve(true);
+      },
+      () => {
+        clearTimeout(timer);
+        resolve(false);
+      },
+    );
+  });
+}
+
 export function trackCollabCopy(
   local: CollabLocalCopy,
   provider: CollabCopyProvider,
 ): CollabCopyTracker {
   let dirty = false;
+  let replayed = false;
   let clearedThisSession = false;
   let writes: Promise<unknown> = Promise.resolve();
   const write = (value: 0 | 1) => {
@@ -170,6 +195,7 @@ export function trackCollabCopy(
       .catch(() => undefined);
   };
   const onUpdate = (_update: Uint8Array, origin: unknown) => {
+    if (origin === local) replayed = true;
     if (origin === local || origin === provider || dirty) return;
     dirty = true;
     write(1);
@@ -186,8 +212,10 @@ export function trackCollabCopy(
     async isDirty() {
       if (dirty) return true;
       try {
+        if (local.whenSynced && !(await settlesWithin(local.whenSynced, COPY_REPLAY_WAIT_MS))) return true; // fail dirty
         await writes;
-        return (await local.get(COLLAB_UNSYNCED_KEY)) === 1 || dirty;
+        const marker = await local.get(COLLAB_UNSYNCED_KEY);
+        return marker === 1 || dirty || (marker === undefined && replayed);
       } catch {
         return true;
       }

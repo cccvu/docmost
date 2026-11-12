@@ -88,6 +88,47 @@ describe('#827 compaction registry: arming, rate limit and the in-flight compact
     expect(reg.canStartCompaction('page-early')).toBe(true);
   });
 
+  it('a draining process starts no compaction (stopCompactions, the collab drain), armed or not', () => {
+    clock.uptime = COMPACTION_ARM_DELAY_MS + 1;
+    expect(reg.canStartCompaction('page-drain')).toBe(true);
+    reg.stopCompactions();
+    try {
+      expect(reg.canStartCompaction('page-drain')).toBe(false);
+      expect(reg.compactionArmed()).toBe(true); // a separate gate from the arm delay
+    } finally {
+      reg.resumeCompactionsForTests();
+    }
+    expect(reg.canStartCompaction('page-drain')).toBe(true);
+  });
+
+  it('a page-full mark with an end lapses then; one without holds until cleared', () => {
+    const d = new Y.Doc();
+    expect(reg.isPageFull(d)).toBe(false);
+    reg.markPageFull(d, true, clock.now + 1_000);
+    expect(reg.isPageFull(d)).toBe(true);
+    clock.now += 1_000;
+    expect(reg.isPageFull(d)).toBe(false);
+    reg.markPageFull(d, true);
+    clock.now += 10 * COMPACTION_MIN_INTERVAL_MS;
+    expect(reg.isPageFull(d)).toBe(true);
+    reg.markPageFull(d, false);
+    expect(reg.isPageFull(d)).toBe(false);
+  });
+
+  it('pageFullUntil: a content verdict never lapses; an interval verdict lapses when the lineage\'s interval ends', () => {
+    const d = new Y.Doc();
+    reg.writeLineage(d, 1, clock.now - 60_000);
+    expect(reg.compactedRecently(d)).toBe(true);
+    expect(reg.pageFullUntil(d, { full: true, contentFull: true })).toBeNull();
+    expect(reg.pageFullUntil(d, { full: true, contentFull: false })).toBe(clock.now - 60_000 + COMPACTION_MIN_INTERVAL_MS);
+    expect(reg.pageFullUntil(d, { full: false, contentFull: false })).toBeNull();
+    clock.now += COMPACTION_MIN_INTERVAL_MS;
+    expect(reg.compactedRecently(d)).toBe(false);
+    clock.uptime = 0;
+    clock.now -= COMPACTION_MIN_INTERVAL_MS;
+    expect(reg.compactedRecently(d)).toBe(false); // not armed: nothing compacted by this process counts yet
+  });
+
   it('the real clock is process uptime (a fresh jest worker is not yet armed)', () => {
     restore();
     expect(reg.compactionArmed()).toBe(process.uptime() * 1000 >= COMPACTION_ARM_DELAY_MS);

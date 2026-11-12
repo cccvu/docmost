@@ -12,7 +12,10 @@
  *   - compacting: a compaction of this document is running; joins and writes answer try-later.
  *   - superseded: the stored row now holds a newer lineage (compacted, or another node's); this document must never
  *     store or serve again.
- *   - pageFull: still over a cap after compaction (its visible content is too big): growth is refused, deletes pass.
+ *   - pageFull: the last cap verdict (`capVerdict`: a load, a rebuild, a probe, a mirrored server write, or a frame that
+ *     would grow it) found it at or over a hard cap that compaction cannot fix (its visible content is too big, or it was
+ *     compacted within the interval): an API append/prepend is refused `page_too_large` (`refusesGrowth`). Cleared by
+ *     the next exact measure under the caps (a replace that shrank it, mirrored; a probe; a reload).
  *
  * The lineage epoch is a server-only Yjs root (LINEAGE_ROOT, `{ epoch, at }`) inside `pages.ydoc`, so the bytes and the
  * epoch that labels them can never disagree. Only `writeLineage` writes it (compaction's fresh document), and only the
@@ -55,7 +58,8 @@ interface DocState {
   superseded: boolean;
   /** The epoch the row moved to, when known (another node's foreign lineage, or this node's compaction). */
   supersededBy: number | null;
-  pageFull: boolean;
+  /** Page-full (false: not), until when (ms, the registry's clock; null: until a measure clears it). */
+  pageFull: false | { until: number | null };
 }
 
 const docs = new WeakMap<object, DocState>();
@@ -100,8 +104,10 @@ export function isSuperseded(doc: object): boolean {
 export function supersededBy(doc: object): number | null {
   return docs.get(doc)?.supersededBy ?? null;
 }
-export function isPageFull(doc: object): boolean {
-  return docs.get(doc)?.pageFull === true;
+/** Page-full now: marked, and the mark has not expired (`markPageFull`'s `until`). */
+export function isPageFull(doc: object, now: number = clock.now()): boolean {
+  const full = docs.get(doc)?.pageFull;
+  return !!full && (full.until === null || now < full.until);
 }
 /** True while the document must take no join and no write: compacting, superseded or draining. */
 export function isClosedForCompaction(doc: object): boolean {
@@ -124,8 +130,13 @@ export function markSuperseded(doc: object, epoch: number | null = null): void {
   s.compacting = false;
   if (epoch !== null) s.supersededBy = epoch;
 }
-export function markPageFull(doc: object, full = true): void {
-  stateOf(doc).pageFull = full;
+/**
+ * Set or clear the page-full mark (a cap verdict, every time it measures the page exactly). `until`: the mark lapses
+ * then (a page full only because it was compacted within the interval is compactable again once it ends); null: it
+ * holds until a later verdict clears it (its visible content is too big).
+ */
+export function markPageFull(doc: object, full = true, until: number | null = null): void {
+  stateOf(doc).pageFull = full ? { until } : false;
 }
 
 // --- by page: the compaction in flight (it outlives its document), the rate limit, the per-process limit
@@ -162,12 +173,30 @@ export function compactionArmed(uptimeMs: number = clock.uptimeMs()): boolean {
   return uptimeMs >= COMPACTION_ARM_DELAY_MS;
 }
 
+let stopped = false;
+
 /**
- * Whether a compaction of `pageId` may start now: armed, none in flight for the page, fewer than the per-process
- * limit in flight, and none started for the page within COMPACTION_MIN_INTERVAL_MS.
+ * The process is shutting down (the collab gateway's drain began, seam §3 via `CollabSocketBounds.beginDrain`): no
+ * compaction starts from now on; one in flight finishes. The drain unloads every resident document, and a compaction
+ * at that unload would race the task that replaces this one, which on a rollback may predate #827 (it would merge a
+ * pre-compaction copy into the compacted page). The page compacts on a later residency instead. Final for the process.
+ */
+export function stopCompactions(): void {
+  stopped = true;
+}
+
+/** Undo `stopCompactions` (jest only). */
+export function resumeCompactionsForTests(): void {
+  if (process.env.JEST_WORKER_ID === undefined) throw new Error('resumeCompactionsForTests is for jest only (#827)');
+  stopped = false;
+}
+
+/**
+ * Whether a compaction of `pageId` may start now: armed, the process not draining, none in flight for the page, fewer
+ * than the per-process limit in flight, and none started for the page within COMPACTION_MIN_INTERVAL_MS.
  */
 export function canStartCompaction(pageId: string, now: number = clock.now()): boolean {
-  if (!compactionArmed()) return false;
+  if (!compactionArmed() || stopped) return false;
   if (inflight.has(pageId) || inflight.size >= COMPACTIONS_IN_FLIGHT_MAX) return false;
   const last = lastStarted.get(pageId);
   return last === undefined || now - last >= COMPACTION_MIN_INTERVAL_MS;
@@ -221,6 +250,33 @@ export function lineageEpoch(doc: Y.Doc): number {
   if (epoch === undefined) return 0;
   if (typeof epoch !== 'number' || !Number.isSafeInteger(epoch) || epoch < 0) throw new MalformedLineageError('epoch');
   return epoch;
+}
+
+/** When the document's lineage was written (its last compaction), or null (never compacted, or a value compaction never writes). */
+export function lineageAt(doc: Y.Doc): number | null {
+  if (!doc.share.has(LINEAGE_ROOT)) return null;
+  const at = doc.getMap<unknown>(LINEAGE_ROOT).get('at');
+  return typeof at === 'number' && Number.isFinite(at) ? at : null;
+}
+
+/**
+ * The document's lineage was compacted within COMPACTION_MIN_INTERVAL_MS (while compaction is armed): no compaction of
+ * it can run before the interval ends, and the last one did not keep it under the caps. A cap verdict reads this as
+ * page-full (`capVerdict`'s `recentlyCompacted`).
+ */
+export function compactedRecently(doc: Y.Doc, now: number = clock.now()): boolean {
+  const at = lineageAt(doc);
+  return at !== null && compactionArmed() && now - at < COMPACTION_MIN_INTERVAL_MS;
+}
+
+/**
+ * When a page-full verdict lapses: null (never, until a measure clears it) when the page's visible content is too big
+ * (`contentFull`), else when the compaction interval of its lineage ends (it is compactable again then).
+ */
+export function pageFullUntil(doc: Y.Doc, verdict: { full: boolean; contentFull: boolean }): number | null {
+  if (!verdict.full || verdict.contentFull) return null;
+  const at = lineageAt(doc);
+  return at === null ? null : at + COMPACTION_MIN_INTERVAL_MS;
 }
 
 /** Write the lineage of a freshly built (compacted) document. The ONE writer of LINEAGE_ROOT. */

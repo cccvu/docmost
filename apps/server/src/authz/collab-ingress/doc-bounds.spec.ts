@@ -23,13 +23,9 @@ import {
 } from './doc-bounds';
 
 /**
- * #827 sizing: the bounds in doc-bounds.ts against what yjs 13.6.30 costs. Measured by yjs-bounds.sizing.bench.cjs,
- * on the production base image, with the fork's own tree mounted read-only:
- *
- *   docker run --rm --network none -v <docmost>:/docmost:ro node:22-slim \
- *     node --expose-gc /docmost/apps/server/src/authz/collab-ingress/yjs-bounds.sizing.bench.cjs /docmost
- *
- * (about 90 s; a second argument runs only the benches whose name starts with it, e.g. `honest`). 2026-11-11: Node
+ * #827 sizing: the bounds in doc-bounds.ts against what yjs 13.6.30 costs. Measured by the sizing bench, which lives
+ * with the super-repo's load kit (scripts/load/collab/yjs-bounds.sizing.bench.cjs; it loads this fork's real
+ * deadline.ts and conflict-scan.ts and says how to run it), on the production base image. 2026-11-11: Node
  * 22.23.4 (production) and Node 24.21.0, x86. The full table is in doc-bounds.ts; the numbers the rules use are below.
  * A Node or yjs bump re-runs the bench and updates both, and the assertions hold the margins.
  */
@@ -134,12 +130,7 @@ describe('#827 sizing: the bounds keep their margins over the measured honest wo
     expect(readerStep2ChargeMs(3 * 1024 * 1024, S_MAX)).toBeGreaterThan(250);
   });
 
-  it('the bench is the one the table names (anti-vacuity: it loads the real modules and measures each case)', () => {
-    const bench = readFileSync(join(__dirname, 'yjs-bounds.sizing.bench.cjs'), 'utf8');
-    for (const mod of ['deadline.ts', 'conflict-scan.ts', 'conflict-scan.testkit.ts']) expect(bench).toContain(`loadTs('${mod}')`);
-    for (const kind of ['vm.overhead', 'vm.cutoff', 'honest.paste', 'honest.offlineStep2', 'honest.meterAccepted', 'honest.selectAll', 'honest.selectAllAtS', 'honest.pasteProse', 'honest.typingAtIds', 'honest.loadCapped', 'honest.compaction', 'honest.readerStep2', 'attack.a', 'attack.b', 'attack.c']) {
-      expect(bench).toContain(`'${kind}'`);
-    }
+  it('the table names its bench and the Node it was measured on', () => {
     const table = readFileSync(join(__dirname, 'doc-bounds.ts'), 'utf8');
     expect(table).toContain('Node 22.23.4');
     expect(table).toContain('yjs-bounds.sizing.bench.cjs');

@@ -7,7 +7,7 @@
  *
  * How: one precompiled `vm.Script('run()')` and one reused context. `run` is the outer-realm function, so the work runs
  * in this realm, with this realm's `yjs`; the `timeout` makes Node start a watchdog that terminates execution once `ms`
- * pass. Measured (yjs-bounds.sizing.bench.cjs, deadline.spec.ts): the cut lands within about ±1.5 ms of `ms` on Yjs
+ * pass. Measured (the #827 sizing bench, deadline.spec.ts): the cut lands within about ±1.5 ms of `ms` on Yjs
  * and plain JS loops, the call costs about 24 µs on Node 22 and 40 µs on Node 24 (the watchdog thread), and termination
  * never leaks into the caller.
  *

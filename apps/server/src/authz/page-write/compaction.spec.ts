@@ -37,8 +37,10 @@ import {
 import {
   awaitCompaction,
   compactionRequest,
+  isClosedForCompaction,
   isCompacting,
   isCompactionInflight,
+  isPageFull,
   isSuperseded,
   LINEAGE_ROOT,
   lineageEpoch,
@@ -287,7 +289,7 @@ describe('loadStoredYdoc (#827): the bounded load', () => {
     return scan.steps;
   };
   /**
-   * Load-order inversion (#827 vector c, yjs-bounds.sizing.bench.cjs attack.c): client 500 places M siblings from a to
+   * Load-order inversion (#827 vector c): client 500 places M siblings from a to
    * e, client 900000 reverse-types N items between c and d. Each frame is cheap live; a load integrates 900000 first,
    * so each sibling walks all N.
    */
@@ -412,15 +414,19 @@ describe('loadStoredYdoc (#827): the bounded load', () => {
     expect(store.calls.read).toBe(0);
   });
 
-  it('a page past a soft cap asks for compaction at its next unload; past the cap it drains', () => {
+  it('a page past a soft step cap asks for compaction at its next unload; at the cap too (past it the walk trips)', () => {
     const bytes = inverted();
     const steps = loadSteps(bytes);
     const soft = new Y.Doc();
     loadStoredYdoc(soft, nextPageId(), bytes, memoryStore(null), { steps: Math.ceil(steps / 0.9), deadlineMs: 60_000 });
     expect(compactionRequest(soft)).toEqual({ reason: 'load_steps', userId: null, drain: false });
+    // the cap is a hard bound past it (capVerdict: strictly over), where the meter trips and the load is refused
     const exact = new Y.Doc();
     loadStoredYdoc(exact, nextPageId(), bytes, memoryStore(null), { steps, deadlineMs: 60_000 });
-    expect(compactionRequest(exact)).toEqual({ reason: 'load_steps', userId: null, drain: true });
+    expect(compactionRequest(exact)).toEqual({ reason: 'load_steps', userId: null, drain: false });
+    expect(() => loadStoredYdoc(new Y.Doc(), nextPageId(), bytes, memoryStore(null), { steps: steps - 1, deadlineMs: 60_000 })).toThrow(
+      expect.objectContaining({ reason: COLLAB_PAGE_COMPACTING_REASON }) as never,
+    );
   });
 
   describe('the structure caps follow the update guard: only when compaction would bring the page under the soft caps', () => {
@@ -452,8 +458,11 @@ describe('loadStoredYdoc (#827): the bounded load', () => {
       const lines: string[] = [];
       const spy = jest.spyOn(Logger.prototype, 'warn').mockImplementation((m: unknown) => void lines.push(String(m)));
       try {
-        const hard = load(churnedBytes, { structs: total.structs, clientIds: roomy, children: roomy });
+        const hard = load(churnedBytes, { structs: total.structs - 1, clientIds: roomy, children: roomy });
         expect(compactionRequest(hard)).toEqual({ reason: 'structs', userId: null, drain: true });
+        expect(isPageFull(hard)).toBe(false);
+        const atCap = load(churnedBytes, { structs: total.structs, clientIds: roomy, children: roomy });
+        expect(compactionRequest(atCap)).toEqual({ reason: 'structs', userId: null, drain: false }); // a hard cap is strictly past it
         const soft = load(churnedBytes, { structs: Math.ceil(total.structs / 0.9), clientIds: roomy, children: roomy });
         expect(compactionRequest(soft)).toEqual({ reason: 'structs', userId: null, drain: false });
       } finally {
@@ -463,19 +472,42 @@ describe('loadStoredYdoc (#827): the bounded load', () => {
     });
 
     it('history past the client-ids cap: requested (compaction leaves one id)', () => {
-      const doc = load(churnedBytes, { structs: roomy, clientIds: total.clients, children: roomy });
+      const doc = load(churnedBytes, { structs: roomy, clientIds: total.clients - 1, children: roomy });
       expect(compactionRequest(doc)).toEqual({ reason: 'client_ids', userId: null, drain: true });
     });
 
-    it('visible content past the structs cap: neither requested nor drained (compaction would keep every struct)', () => {
-      expect(compactionRequest(load(freshBytes, { structs: freshTotal.structs, clientIds: roomy, children: roomy }))).toBeNull();
-      expect(compactionRequest(load(freshBytes, { structs: Math.ceil(freshTotal.structs / 0.9), clientIds: roomy, children: roomy }))).toBeNull();
+    it('visible content past the structs cap: neither requested nor drained (compaction would keep every struct), marked page-full', () => {
+      const past = load(freshBytes, { structs: freshTotal.structs - 1, clientIds: roomy, children: roomy });
+      expect(compactionRequest(past)).toBeNull();
+      expect(isPageFull(past)).toBe(true); // an API append/prepend answers page_too_large (refusesGrowth)
+      expect(refusesGrowth(past, 'append')).toBe(true);
+      expect(refusesGrowth(past, 'replace')).toBe(false);
+      const near = load(freshBytes, { structs: Math.ceil(freshTotal.structs / 0.9), clientIds: roomy, children: roomy });
+      expect(compactionRequest(near)).toBeNull();
+      expect(isPageFull(near)).toBe(false);
+    });
+
+    it('past a hard cap before compaction can start (not armed): requested for the next unload, never drained (joins are served)', () => {
+      restoreClock();
+      restoreClock = setCompactionClockForTests({ now: () => now, uptimeMs: () => COMPACTION_ARM_DELAY_MS - 1 });
+      const doc = load(churnedBytes, { structs: total.structs - 1, clientIds: roomy, children: roomy });
+      expect(compactionRequest(doc)).toEqual({ reason: 'structs', userId: null, drain: false });
+      expect(isClosedForCompaction(doc)).toBe(false);
+    });
+
+    it('history past a hard cap, compacted within the interval: page-full, not drained (no compaction may start yet)', () => {
+      const recent = churnedPage(10);
+      writeLineage(recent, 1, now - 1_000);
+      const bytes = Y.encodeStateAsUpdate(recent);
+      const doc = load(bytes, { structs: countStructs(recent).structs - 1, clientIds: roomy, children: roomy });
+      expect(isPageFull(doc)).toBe(true);
+      expect(isClosedForCompaction(doc)).toBe(false);
     });
 
     it('history past a cap but live children past the soft children cap: not requested (compaction keeps every child)', () => {
       const children = live.children;
       expect(children).toBeGreaterThan(1);
-      const caps = { structs: total.structs, clientIds: total.clients, children: Math.ceil(children / 0.8) };
+      const caps = { structs: total.structs - 1, clientIds: total.clients - 1, children: Math.ceil(children / 0.8) };
       expect(compactionRequest(load(churnedBytes, caps))).toBeNull();
       // One child of headroom more and it helps again: the children bound is what decided.
       expect(compactionRequest(load(churnedBytes, { ...caps, children: Math.ceil(children / 0.8) + 2 }))).toEqual({

@@ -28,8 +28,10 @@
  * frame larger than this cap before decoding it (`frame-too-large`), and counts per-page structure caps (structs,
  * client ids, children of one element, load walk steps: collab-ingress/doc-bounds.ts). A page past a cap is compacted
  * (page-write/compaction.ts): rebuilt from its visible content, which sheds the history these bytes also count. A page
- * still over a cap after compaction is `page-full`: the guard refuses editor growth, and the collab handler refuses an
- * API append/prepend with this file's `page_too_large` (`refusesGrowth`, seam #2); a replace still works. So the bytes
+ * past a cap compaction cannot fix (its visible content) is `page-full` (the cap rule, collab-ingress/live-structure.ts
+ * `capVerdict`): the guard refuses editor growth past it, and once an exact measure found the page there (a load, a
+ * rebuild, a probe, a mirrored write) the collab handler refuses an API append/prepend with this file's
+ * `page_too_large` (`refusesGrowth`, seam #2); a replace still works. So the bytes
  * measured here can also shrink now, when a compaction rewrites the row's ydoc.
  */
 import { Logger, ServiceUnavailableException, UnprocessableEntityException } from '@nestjs/common';

@@ -55,6 +55,7 @@ import { collabSocketLimitLog, type SocketLimitLog } from './socket-limit-log';
 import { answerCollabPings, type PongSocket } from './socket-pong';
 import { admitCollabUserConnection, CollabUserConnections, CollabUserConnectionsExtension } from './user-connections';
 import { AUTHZ_MODE, type AuthzMode } from '../mode/authz-mode';
+import { stopCompactions } from '../page-write/compaction-registry';
 
 /** The ws client socket `open` wires: what the bounded socket, the frame check and the keepalive read. */
 export type CollabClientSocket = RawCollabSocket &
@@ -128,12 +129,14 @@ export class CollabSocketBounds implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * First in the gateway's `destroy` (seam §3), with its resident documents: sets `draining` and logs the start. The
-   * returned callback logs the done line once the documents have unloaded. A second call logs nothing new.
+   * First in the gateway's `destroy` (seam §3), with its resident documents: sets `draining`, stops compaction for the
+   * rest of the process (#827, `stopCompactions`) and logs the start. The returned callback logs the done line once the
+   * documents have unloaded. A second call logs nothing new.
    */
   beginDrain(documents: number): () => void {
     if (this.drainingSince !== null) return () => undefined;
     const since = (this.drainingSince = this.now());
+    stopCompactions(); // #827: the drain's unloads never compact (a rollback's older task may serve the page next)
     this.drainLog.log(`${COLLAB_DRAIN_TOKEN} ${JSON.stringify({ phase: 'start', documents })}`);
     let done = false;
     return () => {

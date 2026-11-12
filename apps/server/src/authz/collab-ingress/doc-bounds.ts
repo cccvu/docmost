@@ -6,8 +6,8 @@
  * honest select-all over a huge page) are bounded here by a wall-clock deadline on the work (deadline.ts), by per-page
  * structure caps that compaction restores, and by a step budget on loads and probes (the #816 meter, armed on the doc).
  *
- * Calibrated by yjs-bounds.sizing.bench.cjs on the production image's Node (doc-bounds.spec.ts says how to run it and
- * holds the numbers below against these constants). 2026-11-11, x86 (svr-2-dell), yjs 13.6.30; Node 22.23.4 =
+ * Calibrated by the sizing bench (yjs-bounds.sizing.bench.cjs, kept with the super-repo's load kit) on the production
+ * image's Node (doc-bounds.spec.ts holds the numbers below against these constants). 2026-11-11, x86 (svr-2-dell), yjs 13.6.30; Node 22.23.4 =
  * node:22-slim (production), Node 24.21.0 for comparison. Times in ms unless marked.
  *
  *   the deadline (vm timeout)                         node 22        node 24
@@ -40,11 +40,8 @@
  *     honest walk steps 40,001; encode (the probe's other half) 28 / 46 / 97
  *   compaction rebuild (read out, build, encode): 60k structs 77, 120k 136, 300k 285   (node 24: 65, 113, 259)
  *   reader Step2: Y.snapshot 51–56 ns per struct, snapshotContainsUpdate 37–42 ms/MiB   (node 24: 38–58, 32–39)
- *   attacks, unbounded → under a 250 ms deadline (cut at, node 22)
- *     (a) 9-byte delete, D=1000/2000/4000 next to 20k tombstones   764 / 1,608 / 3,567   → 250.5 / 249.6 / 250.6
- *     (b) 20k ascending delete ranges, 50k/100k structs after       352 / 959              → 250.7 / 250.7
- *     (c) inversion M=N=1000/2000/4000 (frames ≤ 5.6 each): load   96 / 362 / 1,413 (88–95 ns per step; metered
- *         183 / 723 / 2,910, about 180 ns per step), M·N + 2,999 steps                       → ran 92 / 250.7 / 250.7
+ *   the stall paths the deadline exists for: measured unbounded and cut within about 1 ms of a 250 ms deadline (the
+ *   numbers stay in ADR 0036's private copy)
  *
  * Not measured: Graviton (production is ARM). Each rule below keeps at least the stated margin over the x86 Node 22
  * number; the strike rule (a first deadline is a 1013, only a repeat is a 4422) absorbs a one-off GC or CPU stall.

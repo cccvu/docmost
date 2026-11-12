@@ -14,7 +14,7 @@ import {
 
 /**
  * #827 (ADR 0036): what the guard relies on when it puts Yjs work under `runWithDeadline`, proven on the Node running
- * this spec (production: node:22-slim; yjs-bounds.sizing.bench.cjs measures the same on any Node). Wall-clock bounds
+ * this spec (production: node:22-slim; the #827 sizing bench measures the same on any Node). Wall-clock bounds
  * are loose on the late side (a busy CI runner), tight on the early side: a cut must never land before its deadline.
  */
 const busy = (ms: number) => {

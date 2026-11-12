@@ -78,11 +78,12 @@ import { isTransactionOrigin, MessageType } from '@hocuspocus/server';
 import { PAGE_MAX_YDOC_BYTES } from '../page-write/page-size';
 import {
   canStartCompaction,
-  compactionArmed,
+  compactedRecently,
+  compactionRequest,
   isClosedForCompaction,
-  isPageFull,
+  isDraining,
+  pageFullUntil,
   lineageEpoch,
-  LINEAGE_ROOT,
   markPageFull,
   requestCompaction,
   type CompactionReason,
@@ -92,10 +93,9 @@ import { ConflictScan, installConflictScanMeter, type ConflictScanMeter } from '
 import { COLLAB_PAGE_COMPACTING_REASON, epochStaleReason } from './collab-reasons';
 import { COLLAB_PAGE_COMPACTION_TOKEN, logCompactionRequested, type CompactionLogSink } from './compaction-log';
 import { isDeadlineExceeded, runWithDeadline, type DeadlineRunner } from './deadline';
-import { compactionWouldHelp, liveStructure } from './live-structure';
+import { capVerdict, compactionWouldHelp, liveStructure } from './live-structure';
 import {
   C_MAX,
-  COMPACTION_MIN_INTERVAL_MS,
   E_MAX,
   LOAD_DEADLINE_MS,
   MIRROR_DEADLINE_MS,
@@ -104,7 +104,6 @@ import {
   PROBE_MIN_INTERVAL_MS,
   readerStep2ChargeMs,
   S_MAX,
-  softCap,
   T_FRAME_MS,
   W_MAX,
 } from './doc-bounds';
@@ -653,7 +652,11 @@ export class CollabUpdateGuard {
     try {
       epoch = lineageEpoch(frame.document);
     } catch {
-      return this.refuse(frame, header, { rule: 'internal' }); // a malformed lineage root: fail closed, never guess
+      // A malformed lineage root: fail closed in every mode, never guess (an epoch gate, not a content rule)
+      this.refuse(frame, header, { rule: 'internal' }); // enforce: throws
+      const reason = reasonFor('internal');
+      this.refusedConnections.set(frame.connection, reason); // report mode: this connection's later frames too
+      throw { code: COLLAB_REFUSAL_CODE, reason };
     }
     if (clientEpoch(frame.requestParameters) === epoch) return;
     const reason = epochStaleReason(epoch);
@@ -753,10 +756,10 @@ export class CollabUpdateGuard {
       // 1. Stateless pre-pass: a refusal here touches no shadow, so a refuse/reconnect loop costs no rebuild.
       const pre = prePass(payload);
       let violation = pre.violation;
-      if (violation && this.mode === 'enforce') return this.refuse(frame, header, violation);
+      if (violation && this.enforces(violation.rule)) return this.refuse(frame, header, violation);
       // 1b. #816: client ids live has never seen, charged before anything integrates them.
       violation ??= this.chargeNewClientIds(frame, pre.clients);
-      if (violation && this.mode === 'enforce') return this.refuse(frame, header, violation);
+      if (violation && this.enforces(violation.rule)) return this.refuse(frame, header, violation);
       // 2. The shadow step.
       const dirtier = doc.dirty ? doc.dirtiedBy : null;
       const blame = dirtier !== null && dirtier !== userId ? dirtier : null;
@@ -779,7 +782,7 @@ export class CollabUpdateGuard {
       }
       violation ??= result.violation;
       if (!violation) for (const v of result.reportOnly) this.log('COLLAB_LEGACY_PENDING_INVALID', doc.live, { rule: v.rule });
-      if (violation && this.mode === 'enforce') {
+      if (violation && this.enforces(violation.rule)) {
         // The shadow holds the refused frame; live never will. Rebuilt lazily by the next frame that needs it
         // (ensureShadow), so a refuse/reconnect loop pays no rebuild per refusal, and that rebuild is this user's.
         doc.dirty = true;
@@ -823,49 +826,54 @@ export class CollabUpdateGuard {
   }
 
   /**
-   * #827: the structure caps after an accepted shadow apply, counted on what the frame touched. A frame that GROWS the
-   * page past a hard cap is refused. `compact` (1013, the page drains and compacts) only when the page compacted, with
-   * this frame's growth on top (the editor resends it), would sit under the soft caps (`compactionHelps`): its history
-   * is what is too big. Otherwise `full` (4422 page-full, nothing drains): its visible content is, and compaction keeps
-   * every live struct and child (so a children cap is never compacted away; an honest dense paste never drains the
-   * page for nothing), or the page was compacted within the interval and is over again. Under the hard caps, the
+   * #827: the structure caps after an accepted shadow apply, counted on what the frame touched, through the one cap rule
+   * (`capVerdict`, live-structure.ts). A frame that GROWS the page past a hard cap is refused. `compact` (1013, the page
+   * drains and compacts) only when the page compacted, with this frame's growth on top (room for what its editor was
+   * doing; the frame itself never applies, and the drain sends that editor's dirty copy to the Discard-first notice),
+   * would sit under the soft caps (`compactionHelps`): its history is what is too big. Otherwise `full` (4422
+   * page-full, nothing drains): its visible content is, and compaction keeps every live struct and child (so a children
+   * cap is never compacted away; an honest dense paste never drains the page for nothing), or the page was compacted
+   * within the interval and is over again. Under the hard caps, the
    * frame's counts are kept, and past a soft cap compaction is requested for the next unload, again only when it would
    * help. Deletes always pass.
    */
   private checkCaps(doc: DocGuard, result: ShadowResult, userId: string): 'ok' | 'full' | 'compact' {
     const structs = doc.structs + result.structDelta;
     const clients = result.clientsAfter;
-    const hard: CompactionReason | null =
-      result.added > 0 && structs > this.caps.structs
-        ? 'structs'
-        : clients > result.clientsBefore && clients > this.caps.clientIds
-          ? 'client_ids'
-          : result.children > this.caps.children
-            ? 'children'
-            : null;
-    let verdict: 'ok' | 'full' | 'compact' = 'ok';
-    if (hard !== null) {
-      // The page's counts are still those without the frame; its growth (every struct it added, taken as live) and the
-      // live children of what it touched are added on top.
-      verdict = this.compactionHelps(doc, result.added, result.children) && !this.pageIsFull(doc) ? 'compact' : 'full';
-      if (verdict === 'compact') this.needsCompaction(doc, hard, userId, true);
-      if (this.mode === 'enforce') return verdict; // refused: the counts stay those of the page without it
-    }
+    // The page's counts are still those without the frame; its growth (every struct it added, taken as live) and the
+    // live children of what it touched are added on top.
+    const growth = capVerdict(
+      [
+        { reason: 'structs', n: structs, cap: this.caps.structs, grew: result.added > 0 },
+        { reason: 'client_ids', n: clients, cap: this.caps.clientIds, grew: clients > result.clientsBefore },
+        { reason: 'children', n: result.children, cap: this.caps.children },
+      ],
+      () => this.compactionHelps(doc, result.added, result.children),
+      () => compactedRecently(doc.live, this.now()),
+    );
+    const verdict: 'ok' | 'full' | 'compact' = growth.full ? 'full' : growth.hard ? 'compact' : 'ok';
+    // `full` refuses this frame only: the page without it may be small (a refused 3 MiB paste), so the API's page-full
+    // mark is left to the exact measures (`measured`, the load).
+    if (verdict === 'compact') this.needsCompaction(doc, growth.reason!, userId, true);
+    if (verdict !== 'ok' && this.mode === 'enforce') return verdict; // refused: the counts stay those of the page without it
     doc.structs = structs;
     doc.liveChildren = Math.max(doc.liveChildren, result.children);
-    const soft: CompactionReason | null =
-      structs >= softCap(this.caps.structs)
-        ? 'structs'
-        : clients >= softCap(this.caps.clientIds)
-          ? 'client_ids'
-          : null; // a children soft cap: compaction keeps every live child, so it never helps
-    if (soft !== null && this.compactionHelps(doc)) this.needsCompaction(doc, soft, userId, false);
+    // Past a soft cap: requested for the next unload (a children soft cap: compaction keeps every live child, so it
+    // never helps, and `compactionHelps` reads the children too).
+    const soft = capVerdict(
+      [
+        { reason: 'structs', n: structs, cap: this.caps.structs, grew: false },
+        { reason: 'client_ids', n: clients, cap: this.caps.clientIds, grew: false },
+      ],
+      () => this.compactionHelps(doc),
+    );
+    if (soft.reason !== null) this.needsCompaction(doc, soft.reason, userId, false);
     return verdict;
   }
 
   /**
    * #827: would a compaction bring the page, plus `frameStructs` structs and an element of `frameChildren` live
-   * children (a refused frame's growth, which its editor resends), back under the soft caps? Compaction keeps the live
+   * children (a refused frame's growth: room for that editor's work), back under the soft caps? Compaction keeps the live
    * structs (at most: the rebuild merges runs), every live child and one client id. Read from the counts measured
    * exactly at the last rebuild, mirror or probe, plus every struct counted since (growth is taken as live, so the
    * estimate errs toward page-full; the refused frame dirties the shadow, and the rebuild the next frame makes measures
@@ -882,18 +890,6 @@ export class CollabUpdateGuard {
     doc.liveStructs = live.structs;
     doc.liveChildren = live.children;
     doc.structsAtMeasure = doc.structs;
-  }
-
-  /**
-   * #827: a page over a hard cap whose lineage was compacted within COMPACTION_MIN_INTERVAL_MS (or that compaction
-   * marked full): no compaction can run before then, and the last one did not bring it under. Marked page-full.
-   */
-  private pageIsFull(doc: DocGuard): boolean {
-    if (isPageFull(doc.live)) return true;
-    const at = lineageAt(doc.live);
-    if (at === null || !compactionArmed() || this.now() - at >= COMPACTION_MIN_INTERVAL_MS) return false;
-    markPageFull(doc.live);
-    return true;
   }
 
   /**
@@ -1141,6 +1137,11 @@ export class CollabUpdateGuard {
         this.runWithDeadline(() => Y.applyUpdate(shadow, update, MIRROR), this.deadlines.mirror);
         created.structs = structCount(shadow.store); // O(ids): server writes are rare
         this.measureLive(created, shadow); // O(structs), as rare
+        // The cap rule on the exact counts (an API append can cross a cap, a replace can bring the page back under), on
+        // the next turn: a drain closes sockets, never from inside a Yjs listener.
+        setImmediate(() => {
+          if (!created.destroyed && created.shadow === shadow && !created.dirty) this.measured(created, false, 'structs');
+        });
       } catch (err) {
         created.shadow = null;
         created.dirty = true;
@@ -1163,7 +1164,13 @@ export class CollabUpdateGuard {
 
   private ensureShadow(doc: DocGuard): ShadowState {
     if (doc.unavailable) return 'unavailable';
-    if (doc.overBounds) return 'compacting';
+    if (doc.overBounds) {
+      // The rebuild tripped, so the page waits on a compaction. When its request could not drain then (not armed yet,
+      // within the interval, another in flight), ask again: `needsCompaction` upgrades it to a drain once one can start.
+      // Otherwise an idle socket (a reader) would keep the page resident, and its writers waiting, for good.
+      if (!isDraining(doc.live)) this.needsCompaction(doc, compactionRequest(doc.live)?.reason ?? 'rebuild_deadline', null, true);
+      return 'compacting';
+    }
     // #827: no O(ids) state comparison: every live change reaches the mirror, which marks the shadow dirty unless it
     // applied it or it is the echo of an inspected frame; a frame accepted but never applied is caught at the flush.
     if (doc.shadow && !doc.dirty) return 'ready';
@@ -1227,19 +1234,26 @@ export class CollabUpdateGuard {
     return 'ready';
   }
 
-  /** #827: after a full load of the page (a rebuild, a probe): over the step budget drains, near a cap requests. */
+  /**
+   * #827: after an exact measure of the page (a rebuild, a probe, a mirrored server write), the one cap rule
+   * (`capVerdict`): over the step budget drains; past a hard structure cap drains when compaction helps, else marks the
+   * page full (its visible content is too big, or it was compacted within the interval); near a cap requests. The
+   * page-full mark follows the verdict, so a page measured back under its caps takes API growth again.
+   */
   private measured(doc: DocGuard, over: boolean, overReason: CompactionReason): void {
-    if (over || doc.steps > this.caps.steps) return this.needsCompaction(doc, overReason, null, true);
-    const soft: CompactionReason | null =
-      doc.steps >= softCap(this.caps.steps)
-        ? 'load_steps'
-        : doc.structs >= softCap(this.caps.structs)
-          ? 'structs'
-          : (doc.shadow?.store.clients.size ?? 0) >= softCap(this.caps.clientIds)
-            ? 'client_ids'
-            : null;
-    // load_steps: compaction rewrites the struct order, which is what costs the walk; structs and ids: only if it helps
-    if (soft !== null && (soft === 'load_steps' || this.compactionHelps(doc))) this.needsCompaction(doc, soft, null, false);
+    if (over) return this.needsCompaction(doc, overReason, null, true);
+    const verdict = capVerdict(
+      [
+        { reason: 'load_steps', n: doc.steps, cap: this.caps.steps },
+        { reason: 'structs', n: doc.structs, cap: this.caps.structs },
+        { reason: 'client_ids', n: doc.shadow?.store.clients.size ?? 0, cap: this.caps.clientIds },
+        { reason: 'children', n: doc.liveChildren, cap: this.caps.children },
+      ],
+      () => this.compactionHelps(doc),
+      () => compactedRecently(doc.live, this.now()),
+    );
+    markPageFull(doc.live, verdict.full, pageFullUntil(doc.live, verdict));
+    if (verdict.reason !== null) this.needsCompaction(doc, verdict.reason, null, verdict.hard);
   }
 
   private markUnavailable(doc: DocGuard): ShadowState {
@@ -1386,6 +1400,15 @@ export class CollabUpdateGuard {
   }
 
   /** Logs the refusal; in enforce mode also closes the session (throws) and counts against the socket's budget. */
+  /**
+   * #827: whether `rule` refuses (enforce mode), or only logs (report mode). A write outside the `default` root is
+   * refused in every mode: the server-only roots (the lineage epoch, the write ledger) are what keep lineages apart, and
+   * a client write there would outlive the kill switch (a forged epoch fails every later connection and compaction).
+   */
+  private enforces(rule: string): boolean {
+    return this.mode === 'enforce' || rule === 'root';
+  }
+
   private refuse(frame: GuardFrame, header: Header, violation: Violation, extra?: RefusalLog): void {
     const reason = reasonFor(violation.rule);
     this.log('COLLAB_UPDATE_REFUSED', frame.document, {
@@ -1400,7 +1423,7 @@ export class CollabUpdateGuard {
       bytes: frame.update.length,
       mode: this.mode,
     });
-    if (this.mode !== 'enforce') return;
+    if (!this.enforces(violation.rule)) return;
     this.refusedConnections.set(frame.connection, reason);
     const ws = frame.connection.webSocket;
     if (ws) {
@@ -1635,13 +1658,6 @@ function clientEpoch(params: GuardFrame['requestParameters']): number {
   const raw = params?.get('cccEpoch');
   if (raw === null || raw === undefined) return 0;
   return /^(0|[1-9][0-9]{0,14})$/.test(raw) ? Number(raw) : Number.NaN;
-}
-
-/** #827: when the page's lineage was written (a compaction), or null (never compacted, or a value compaction never writes). */
-function lineageAt(live: Y.Doc): number | null {
-  if (!live.share.has(LINEAGE_ROOT)) return null;
-  const at = live.getMap<unknown>(LINEAGE_ROOT).get('at');
-  return typeof at === 'number' && Number.isFinite(at) ? at : null;
 }
 
 /** The report-only audit of a freshly built shadow (legacy rows): pure, so it runs inside the rebuild's bounds. */

@@ -2,6 +2,8 @@ import * as Y from 'yjs';
 import {
   compactionRequest,
   isDraining,
+  isPageFull,
+  LINEAGE_ROOT,
   markCompacting,
   markPageFull,
   markSuperseded,
@@ -10,13 +12,13 @@ import {
   writeLineage,
 } from '../page-write/compaction-registry';
 import { awarenessFrame, DOC_NAME, MSG, processCpuMs, RemoteClient, SYNC, syncFrame, typedFrame, step1Frame } from './collab-ingress.testkit';
-import { buildCompacted, snapshotTree } from '../page-write/compaction';
+import { buildCompacted, refusesGrowth, snapshotTree } from '../page-write/compaction';
 import { liveContentDigest } from '../page-write/doc-version';
 import { COLLAB_PAGE_COMPACTING_REASON, epochStaleReason } from './collab-reasons';
 import { ConflictScan, CONFLICT_SCAN_STEPS_PER_FRAME, installConflictScanMeter } from './conflict-scan';
 import { basePage, rawUpdate, type RawStruct } from './conflict-scan.testkit';
 import { deadlineExceeded, isDeadlineExceeded, runWithDeadline, type DeadlineRunner } from './deadline';
-import { COMPACTION_ARM_DELAY_MS, PROBE_DEBOUNCE_MS, PROBE_MIN_INTERVAL_MS, readerStep2ChargeMs, softCap } from './doc-bounds';
+import { COMPACTION_ARM_DELAY_MS, COMPACTION_MIN_INTERVAL_MS, PROBE_DEBOUNCE_MS, PROBE_MIN_INTERVAL_MS, readerStep2ChargeMs, softCap } from './doc-bounds';
 import { SocketLimitLog } from './socket-limit-log';
 import {
   COLLAB_REFUSAL_CODE,
@@ -370,13 +372,22 @@ describe('#827 a page past the load bounds is never rebuilt in a loop', () => {
     Y.applyUpdate(seed, rawUpdate([{ client: 900_000, clock: 0, structs: Array.from({ length: MN }, (_, i) => ch(p.c, i ? [900_000, i - 1] : p.d, 'h')) }]));
     expect(loadSteps(seed)).toBeGreaterThan(MN * MN); // control: the stored page's load walks M·N
     const s = setup(seed, { caps: { steps: 100_000 } });
-    const [first, second] = [70, 71].map((id) => editAs(s.live, id, (d) => textOf(d).insert(0, 'k')));
+    const [first, second, third] = [70, 71, 72].map((id) => editAs(s.live, id, (d) => textOf(d).insert(0, 'k')));
     const spy = jest.spyOn(Y, 'encodeStateAsUpdate');
     expect(s.send(s.conn('a'), first)).toBe(COMPACTING);
     expect(compactionRequest(s.live)).toMatchObject({ reason: 'load_steps', drain: false });
     const rebuilds = spy.mock.calls.filter(([doc]) => doc === s.live).length;
     expect(s.send(s.conn('b'), second)).toBe(COMPACTING);
     expect(spy.mock.calls.filter(([doc]) => doc === s.live).length).toBe(rebuilds);
+    // once a compaction can start, the next writer's frame upgrades the stored request to a drain: an idle reader would
+    // otherwise keep the page resident, and every writer waiting, for good
+    const reader = s.conn('r', true);
+    restoreClock();
+    armed();
+    expect(s.send(s.conn('c'), third)).toBe(COMPACTING);
+    expect(compactionRequest(s.live)).toMatchObject({ reason: 'load_steps', drain: true });
+    expect(reader.webSocket.close).toHaveBeenCalledWith(COLLAB_TRY_LATER_CODE, COLLAB_PAGE_COMPACTING_REASON);
+    expect(spy.mock.calls.filter(([doc]) => doc === s.live).length).toBe(rebuilds); // still no second rebuild
   });
 });
 
@@ -569,6 +580,67 @@ describe('#827 a hard cap drains only when compaction would bring the page under
     }
     return doc;
   };
+
+  it('page-full within the compaction interval lapses with it: the same crossing after the interval drains', () => {
+    let now = Date.now();
+    restoreClock = setCompactionClockForTests({ now: () => now, uptimeMs: () => COMPACTION_ARM_DELAY_MS + 1 });
+    const CAP = 200;
+    const seed = withHistory(150);
+    writeLineage(seed, 1, now - 60_000); // compacted a minute ago
+    const s = setup(seed, { caps: { structs: CAP }, now: () => now });
+    const c = (id: string) => s.conn(id, false, 'cccEpoch=1');
+    const grow = (client: number) =>
+      editAs(s.live, client, (d) => {
+        for (let i = 0; i < 60; i++) textOf(d, i % 5).insert(1, 'q');
+      });
+    expect(s.send(c('a'), editAs(s.live, 70, (d) => textOf(d).insert(0, 'k')))).toBe('applied');
+    // inside the interval: no compaction may start, so the crossing is page-full and nothing drains
+    expect(s.send(c('a'), grow(70))).toBe(REFUSED('page-full'));
+    expect(isDraining(s.live)).toBe(false);
+    // after it: compactable again, nothing sticky left from the first crossing
+    now += COMPACTION_MIN_INTERVAL_MS;
+    expect(s.send(c('b'), grow(71))).toBe(COMPACTING);
+    expect(isDraining(s.live)).toBe(true);
+  });
+
+  it('the API page-full mark follows exact measures: set past a cap compaction cannot fix, cleared by a replace back under', async () => {
+    const s = setup(paragraphs(25), { caps: { children: 20 } });
+    // the first frame builds the shadow, which measures the page: its visible children are past the cap
+    expect(s.send(s.conn('a'), editAs(s.live, 70, (d) => textOf(d).insert(0, 'k')))).toBe('applied');
+    expect(isPageFull(s.live)).toBe(true);
+    expect(refusesGrowth(s.live, 'append')).toBe(true); // an API append/prepend answers page_too_large
+    expect(refusesGrowth(s.live, 'replace')).toBe(false);
+    await settle();
+    // an API replace (a server-local transaction, mirrored), back under the cap
+    s.live.transact(() => {
+      const f = s.live.getXmlFragment('default');
+      f.delete(5, f.length - 5);
+    }, 'api');
+    await settle();
+    expect(isPageFull(s.live)).toBe(false);
+    // an API append past the cap (mirrored): marked again, nothing drains (compaction keeps every live child)
+    s.live.transact(() => {
+      s.live.getXmlFragment('default').insert(0, Array.from({ length: 20 }, () => {
+        const p = new Y.XmlElement('paragraph');
+        p.insert(0, [new Y.XmlText('api')]);
+        return p;
+      }));
+    }, 'api');
+    await settle();
+    expect(isPageFull(s.live)).toBe(true);
+    expect(isDraining(s.live)).toBe(false);
+    // a refused growth FRAME does not mark a small page (its paste, not the page, was too big)
+    const t = setup(paragraphs(2), { caps: { children: 20 } });
+    expect(t.send(t.conn('a'), editAs(t.live, 70, (d) => textOf(d).insert(0, 'k')))).toBe('applied');
+    expect(t.send(t.conn('a'), editAs(t.live, 70, (d) => {
+      d.getXmlFragment('default').insert(0, Array.from({ length: 30 }, () => {
+        const p = new Y.XmlElement('paragraph');
+        p.insert(0, [new Y.XmlText('x')]);
+        return p;
+      }));
+    }))).toBe(REFUSED('page-full'));
+    expect(isPageFull(t.live)).toBe(false);
+  });
 
   it('a history-heavy page over the struct cap drains, and its compaction brings the growth back under the soft cap', () => {
     armed();
@@ -777,6 +849,41 @@ describe('#827 the lineage epoch, on each connection\'s first frame', () => {
     const ok = s.conn('w', false, 'cccEpoch=3');
     expect(s.deliver(ok, step1Frame(s.live))).toBe('applied');
     expect(s.send(ok, editAs(s.live, 70, (d) => textOf(d).insert(0, 'a')))).toBe('applied');
+  });
+
+  it('a malformed lineage root refuses the connection internal (fail closed), whatever epoch it claims', () => {
+    const seed = paragraphs(1);
+    seed.getMap(LINEAGE_ROOT).set('epoch', '2'); // not a number: lineageEpoch throws MalformedLineageError
+    const s = setup(seed);
+    expect(s.deliver(s.conn('w', false, 'cccEpoch=2'), step1Frame(s.live))).toBe(REFUSED('internal'));
+    expect(s.deliver(s.conn('w', false, 'cccEpoch=0'), step1Frame(s.live))).toBe(REFUSED('internal'));
+    expect(s.deliver(s.conn('r', true, ''), step1Frame(s.live))).toBe(REFUSED('internal'));
+  });
+
+  it('report mode still refuses a malformed lineage root (an epoch gate, not a content rule), on every later frame too', () => {
+    const seed = paragraphs(1);
+    seed.getMap(LINEAGE_ROOT).set('epoch', '2');
+    const s = setup(seed, { mode: 'report' });
+    const c = s.conn('w');
+    expect(s.deliver(c, step1Frame(s.live))).toBe(REFUSED('internal'));
+    expect(s.deliver(c, step1Frame(s.live))).toBe(REFUSED('internal'));
+  });
+
+  it('a client write to a server-only root (the lineage epoch, the write ledger) is refused in report mode too', () => {
+    const seed = paragraphs(1);
+    writeLineage(seed, 1, 1);
+    const s = setup(seed, { mode: 'report' });
+    const before = s.state();
+    const c = s.conn('w', false, 'cccEpoch=1');
+    expect(s.deliver(c, step1Frame(s.live))).toBe('applied');
+    expect(s.send(c, editAs(s.live, 70, (d) => d.getMap(LINEAGE_ROOT).set('epoch', 'x')))).toBe(REFUSED('root'));
+    expect(s.send(s.conn('w2', false, 'cccEpoch=1'), editAs(s.live, 71, (d) => d.getMap('__ccc_write_idem').set('k', 1)))).toBe(REFUSED('root'));
+    expect(s.state().equals(before)).toBe(true);
+    // a content rule still only logs in report mode (the kill switch): an invalid node applies
+    expect(s.send(s.conn('w3', false, 'cccEpoch=1'), editAs(s.live, 72, (d) => {
+      const bad = new Y.XmlElement('noSuchNode');
+      d.getXmlFragment('default').insert(0, [bad]);
+    }))).toBe('applied');
   });
 
   it('an unset epoch is 0: every pre-compaction page and copy passes', () => {

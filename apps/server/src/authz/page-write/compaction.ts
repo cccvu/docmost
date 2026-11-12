@@ -52,13 +52,13 @@ import {
   LOAD_DEADLINE_MS,
   S_MAX,
   W_MAX,
-  softCap,
 } from '../collab-ingress/doc-bounds';
 import { COLLAB_PAGE_COMPACTING_REASON, pageCompactingRefusal } from '../collab-ingress/collab-reasons';
-import { compactionWouldHelp, liveStructure, type LiveStructure } from '../collab-ingress/live-structure';
+import { capVerdict, compactionWouldHelp, liveStructure, type LiveStructure } from '../collab-ingress/live-structure';
 import {
   canStartCompaction,
   clearCompacting,
+  compactedRecently,
   compactionRequest,
   isClosedForCompaction,
   isCompacting,
@@ -66,7 +66,9 @@ import {
   isSuperseded,
   lineageEpoch,
   markCompacting,
+  markPageFull,
   markSuperseded,
+  pageFullUntil,
   MalformedLineageError,
   registerInflight,
   requestCompaction,
@@ -262,11 +264,11 @@ export function loadStoredYdoc(
 }
 
 /**
- * A loaded page past a soft cap is compacted at its next unload; past a hard cap it drains now. The update guard's rule
- * (`checkCaps`, `measured`): the step caps always (compaction rewrites the struct order, which is what the walk costs);
- * the structs and client-id caps only when compaction would bring the page under the soft caps (`compactionWouldHelp`
- * on its live structure, measured only then): a page whose visible content is too big is never drained, or queued, for
- * a compaction that keeps it over.
+ * The cap rule (`capVerdict`, live-structure.ts, the update guard's too) on a loaded page: past a soft cap it is
+ * compacted at its next unload; past a hard cap it drains now when a compaction can start (else it waits for the next
+ * unload, and its joins are served meanwhile); past a hard structure cap compaction would not fix (its visible content
+ * is too big, measured with `liveStructure` only then; or it was compacted within the interval) it is marked page-full,
+ * so an API append/prepend answers `page_too_large`.
  */
 function requestIfOverSoftCaps(
   document: Y.Doc,
@@ -275,23 +277,22 @@ function requestIfOverSoftCaps(
   stepCap: number,
   caps: LoadCaps,
 ): void {
-  const measured: Array<[CompactionReason, number, number]> = [
-    ['structs', stats.structs, caps.structs],
-    ['client_ids', stats.clients, caps.clientIds],
-    ['load_steps', stats.steps, stepCap],
-  ];
-  let over = measured.filter(([, n, cap]) => n >= softCap(cap));
-  if (over.length === 0) return;
   let live: LiveStructure | undefined;
-  if (over.some(([reason]) => reason !== 'load_steps')) {
-    live = liveStructure(document); // O(structs), as the load just was; only for a page past a soft cap
-    if (!compactionWouldHelp(live, caps)) over = over.filter(([reason]) => reason === 'load_steps');
-    if (over.length === 0) return;
-  }
+  const verdict = capVerdict(
+    [
+      { reason: 'structs', n: stats.structs, cap: caps.structs },
+      { reason: 'client_ids', n: stats.clients, cap: caps.clientIds },
+      { reason: 'load_steps', n: stats.steps, cap: stepCap },
+    ],
+    () => compactionWouldHelp((live = liveStructure(document)), caps), // O(structs), as the load just was
+    () => compactedRecently(document),
+  );
+  markPageFull(document, verdict.full, pageFullUntil(document, verdict));
+  if (verdict.reason === null) return;
   const request: CompactionRequest = {
-    reason: over[0][0],
+    reason: verdict.reason,
     userId: null,
-    drain: over.some(([, n, cap]) => n >= cap),
+    drain: verdict.hard && canStartCompaction(pageId),
   };
   if (requestCompaction(document, request)) {
     logCompactionRequested(pageId, request, {

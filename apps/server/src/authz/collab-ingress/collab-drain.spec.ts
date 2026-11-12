@@ -2,6 +2,8 @@ import { CollabSocketBounds, COLLAB_DRAIN_TOKEN } from './socket-bounds';
 import { CollabSocketDocuments } from './socket-documents';
 import { SocketLimitLog } from './socket-limit-log';
 import { COLLAB_DRAINING_CLOSE, CollabUserConnections, CollabUserConnectionsExtension } from './user-connections';
+import { canStartCompaction, resumeCompactionsForTests, setCompactionClockForTests } from '../page-write/compaction-registry';
+import { COMPACTION_ARM_DELAY_MS } from './doc-bounds';
 
 /**
  * #810: the drain's late-connection rule. From the start of the gateway's `destroy` (the bounds' `draining`), every
@@ -60,8 +62,13 @@ describe('#810 the drain closes every connection established after it began', ()
     expect(before).toEqual([]);
     expect(bounds.draining).toBe(false);
 
+    const restoreClock = setCompactionClockForTests({ now: () => now, uptimeMs: () => COMPACTION_ARM_DELAY_MS + 1 });
+    expect(canStartCompaction('page-drain')).toBe(true);
     const done = bounds.beginDrain(3);
     expect(bounds.draining).toBe(true);
+    expect(canStartCompaction('page-drain')).toBe(false); // #827: the drain's unloads never compact
+    resumeCompactionsForTests();
+    restoreClock();
     const after: string[] = [];
     await bounds.userConnectionsExtension.connected({ ...payload(after), socketId: 'after' });
     expect(after[0]).toBe('socket 1013 Try Again Later');

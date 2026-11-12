@@ -18,6 +18,7 @@ import {
   COLLAB_EPOCH_QUERY,
   COLLAB_EPOCH_STORAGE_PREFIX,
   COLLAB_UNSYNCED_KEY,
+  COPY_REPLAY_WAIT_MS,
   CollabLocalCopy,
   collabLocalCopyName,
   deleteStaleCollabCopies,
@@ -215,7 +216,7 @@ describe("the dirty marker (ccc-unsynced)", () => {
   });
 
   it("the local copy's own replay and the server's updates are not local edits", async () => {
-    const local = fakeLocal();
+    const local = fakeLocal(new Map([[COLLAB_UNSYNCED_KEY, 0]])); // a copy this bundle marked clean
     const provider = fakeProvider();
     const copy = trackCollabCopy(local, provider);
     const remote = new Y.Doc();
@@ -235,6 +236,38 @@ describe("the dirty marker (ccc-unsynced)", () => {
     provider.unsynced(0);
     expect(await copy.isDirty()).toBe(false);
     expect(store.get(COLLAB_UNSYNCED_KEY)).toBe(0);
+  });
+
+  it("a copy with content and no marker (written by a bundle older than #827) is dirty; an empty one is clean", async () => {
+    const old = fakeLocal();
+    const copy = trackCollabCopy(old, fakeProvider());
+    expect(await copy.isDirty()).toBe(false); // nothing replayed: a first visit
+    const stored = new Y.Doc();
+    stored.getText("t").insert(0, "offline edits the old bundle never marked");
+    Y.applyUpdate(old.doc, Y.encodeStateAsUpdate(stored), old); // y-indexeddb's replay
+    expect(await copy.isDirty()).toBe(true);
+    expect(old.sets).toEqual([]); // a read, never a write
+  });
+
+  it("waits for the stored copy's replay before it answers, and fails dirty when the replay never comes", async () => {
+    vi.useFakeTimers();
+    try {
+      let replay!: () => void;
+      const local = { ...fakeLocal(), whenSynced: new Promise<void>((r) => (replay = r)) };
+      const copy = trackCollabCopy(local, fakeProvider());
+      const answer = copy.isDirty();
+      const stored = new Y.Doc();
+      stored.getText("t").insert(0, "x");
+      Y.applyUpdate(local.doc, Y.encodeStateAsUpdate(stored), local);
+      replay();
+      await expect(answer).resolves.toBe(true);
+      const stuck = { ...fakeLocal(), whenSynced: new Promise<void>(() => undefined) };
+      const pending = trackCollabCopy(stuck, fakeProvider()).isDirty();
+      await vi.advanceTimersByTimeAsync(COPY_REPLAY_WAIT_MS);
+      await expect(pending).resolves.toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("fails dirty: an unreadable marker, or a marker write that failed after this session's edit", async () => {
