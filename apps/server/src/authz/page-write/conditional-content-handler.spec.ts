@@ -441,8 +441,9 @@ describe('CollaborationHandler.conditionalUpdatePageContent — idempotency (#42
     idempotencyKey,
   });
 
-  // The ledger key is namespaced by the acting user (scopedWriteKey), so assertions look it up scoped.
-  const scoped = (key: string) => scopedWriteKey(USER.id, key);
+  // The ledger key is namespaced by the acting user (scopedWriteKey), so assertions look it up scoped, by the
+  // entry the ledger actually records (the h1 digest).
+  const scoped = (key: string) => scopedWriteKey(USER.id, key).entry;
 
   it('applies and records the (user-scoped) key on first sight', async () => {
     const { handler, ledger, opsLog } = build();
@@ -482,8 +483,8 @@ describe('CollaborationHandler.conditionalUpdatePageContent — idempotency (#42
       handler(DOC, { ...payload('SHARED'), user: userB }),
     ).resolves.toEqual({ applied: true }); // NOT suppressed
     expect(opsLog[1]).toContain('insert'); // user-2's write actually ran
-    expect(ledger.has(scopedWriteKey('user-1', 'SHARED'))).toBe(true);
-    expect(ledger.has(scopedWriteKey('user-2', 'SHARED'))).toBe(true);
+    expect(ledger.has(scopedWriteKey('user-1', 'SHARED').entry)).toBe(true);
+    expect(ledger.has(scopedWriteKey('user-2', 'SHARED').entry)).toBe(true);
   });
 
   it('leaves unkeyed writes unchanged (no key ⇒ no ledger entry, always applies)', async () => {
@@ -493,6 +494,34 @@ describe('CollaborationHandler.conditionalUpdatePageContent — idempotency (#42
     expect(ledger.size).toBe(0);
     expect(opsLog[0]).toContain('insert');
     expect(opsLog[1]).toContain('insert'); // both applied — no dedup without a key
+  });
+
+  // #781 lineage (ledger-userid-exposure): the ledger syncs to every viewer, so what the handler records must
+  // carry neither the acting user's id nor the caller's key. The `ledger.has(scoped(..))` assertions above
+  // cannot catch a regression to the raw composite, because they call the same function; this one can.
+  it('records a ledger key that carries neither the user id nor the caller key', async () => {
+    const { handler, ledger } = build();
+    await expect(handler(DOC, payload('K1'))).resolves.toEqual({ applied: true });
+    const keys = [...ledger.keys()];
+    expect(keys).toHaveLength(1);
+    for (const k of keys) {
+      expect(k).not.toContain(USER.id);
+      expect(k).not.toContain('K1');
+    }
+  });
+
+  // One-release dual read: a retry whose first apply ran on a pre-fix replica (raw `${userId}\0${key}` entry)
+  // must still dedup after the roll, and still only for that user (S1).
+  it('a retry recorded raw by a pre-fix replica still dedups; another user\'s raw entry does not', async () => {
+    const { handler, ledger, opsLog } = build();
+    ledger.set('user-1\u0000K1', Date.now());
+    await expect(handler(DOC, payload('K1'))).resolves.toEqual({ applied: false, reason: 'duplicate' });
+    expect(opsLog[0]).not.toContain('insert');
+    // Control: user-2's raw entry with the same key does not suppress user-1's write.
+    const other = build();
+    other.ledger.set('user-2\u0000K1', Date.now());
+    await expect(other.handler(DOC, payload('K1'))).resolves.toEqual({ applied: true });
+    expect(other.opsLog[0]).toContain('insert');
   });
 });
 
@@ -581,13 +610,13 @@ describe('CollaborationHandler.conditionalUpdatePageContent — key × CAS order
     await expect(
       handler(DOC, keyed('K1', stableHash({ different: true }))),
     ).resolves.toEqual({ applied: false, reason: 'precondition' });
-    expect(ledger.has(scopedWriteKey('user-1', 'K1'))).toBe(false);
+    expect(ledger.has(scopedWriteKey('user-1', 'K1').entry)).toBe(false);
     expect(opsLog[0]).not.toContain('insert');
     // The corrected retry (matching digest now) APPLIES — proof the key was not poisoned by the refusal.
     await expect(handler(DOC, keyed('K1', stableHash(LIVE)))).resolves.toEqual({
       applied: true,
     });
-    expect(ledger.has(scopedWriteKey('user-1', 'K1'))).toBe(true);
+    expect(ledger.has(scopedWriteKey('user-1', 'K1').entry)).toBe(true);
   });
 });
 
@@ -918,6 +947,25 @@ describe('CollaborationHandler.conditionalUpdatePageContent — #716', () => {
         handler(DOC, req({ idempotencyKey: 'K2', refuseOverCap: true, expectedContentHash: stableHash(LIVE) })),
       ).resolves.toEqual({ applied: false, reason: 'too_large' });
       expect(hocuspocus.openDirectConnection).not.toHaveBeenCalled();
+    });
+
+    // The resident pre-check is its own call site of the dedup (it only exists under refuseOverCap with a resident
+    // doc, and opens no connection); it reads the pre-fix raw entry too, so the retry is duplicate, not too_large.
+    it('resident: a retry recorded raw by a pre-fix replica answers duplicate (the dual read at the pre-check)', async () => {
+      const { handler, hocuspocus, ledger } = build();
+      ledger.set(`${USER.id}\u0000K`, Date.now());
+      await expect(handler(DOC, req({ idempotencyKey: 'K', refuseOverCap: true }))).resolves.toEqual({
+        applied: false,
+        reason: 'duplicate',
+      });
+      expect(hocuspocus.openDirectConnection).not.toHaveBeenCalled(); // decided at the resident pre-check
+      // Control: another user's raw entry is not this user's retry.
+      const other = build();
+      other.ledger.set('user-2\u0000K', Date.now());
+      await expect(other.handler(DOC, req({ idempotencyKey: 'K', refuseOverCap: true }))).resolves.toEqual({
+        applied: false,
+        reason: 'too_large',
+      });
     });
 
     it('not resident: the connection loads it and the same order applies inside the transaction', async () => {

@@ -3,15 +3,21 @@
  *
  * The collab update guard: refuses, BEFORE Hocuspocus applies it, a client frame that would make any browser's
  * y-tiptap delete content (its delete-on-error syncs to every peer), crash a render, or wedge the server's store; binds
- * each Yjs client id to the user who first used it; and keeps clients out of every root but `'default'` (the `/v1`
- * idempotency ledger, `__ccc_write_idem`, is server-only) and out of Stateless broadcasts.
+ * each Yjs client id to the user who announced it or first wrote it as their own (an id first seen in another client's
+ * relay of a lost lifetime's structs stays unbound until its author's awareness claims it); and keeps clients out of
+ * every root but `'default'` (the `/v1` idempotency ledger, `__ccc_write_idem`, is server-only) and out of Stateless
+ * broadcasts.
  *
  * How: each live Document gets a SHADOW replica (a second Y.Doc kept equal to live by a mirror listener). A frame is
  * applied to the shadow inside `Y.transact(shadow, …, origin, local=false)` — what y-protocols does to live — and
  * inspected inside that transaction, before Yjs's cleanup garbage-collects or merges anything: every struct from the
  * transaction's `beforeState` to the store's end, plus `tr.deleteSet`. So Yjs itself resolves parents, origins, splits
  * and pending structs. A refused frame leaves the shadow ahead of live, so the next frame rebuilds it from live plus the
- * frames accepted but not yet applied (`inflight`), keeping it an exact image of live's future.
+ * frames accepted but not yet applied (`inflight`), keeping it an exact image of live's future. Both the stateless
+ * pre-pass and the shadow judge only what Yjs will integrate: a struct live already holds in full (a y-indexeddb
+ * remount resends the whole local copy, the server's own `/v1` ledger entries and pre-#781 content included) is a
+ * no-op in Yjs and is not refused for its content (see `heldByLive`). The shadow also reads where Yjs LINKED each new
+ * item, not only the parent it names: an item linked after a neighbour of another list is refused `cross-list`.
  *
  * Ordering (Hocuspocus 4.7.1, `Connection.processMessages` and `MessageReceiver.apply`): each document connection
  * queues its frames and handles one at a time: it awaits the `beforeHandleMessage` hooks (one promise chain), then the
@@ -47,8 +53,9 @@
  *
  * Refusal = a throw of `{ code: 4422, reason }`: Hocuspocus closes that ONE document session and sends the reason (the
  * websocket stays up). Reasons the client acts on (apps/client features/editor-ux): `ccc:collab-update-refused:<rule>`
- * (stop sending, read-only, notice) and `ccc:collab-update-unresolved` (reconnect once). A socket whose sessions are
- * refused SOCKET_REFUSAL_BUDGET times is closed outright. An exhausted (user, document) budget is NOT a refusal: the
+ * (stop sending, read-only, notice) and `ccc:collab-update-unresolved` (reconnect once: a missing dependency, or new
+ * clocks at an id whose owner has only announced it so far, logged `foreign-client` at stage `unproven-owner`). A
+ * socket whose sessions are refused SOCKET_REFUSAL_BUDGET times is closed outright. An exhausted (user, document) budget is NOT a refusal: the
  * socket is closed 1013 (`tryLater`), which the editor retries. `COLLAB_UPDATE_GUARD=report` logs instead of either.
  */
 import { Logger } from '@nestjs/common';
@@ -79,8 +86,13 @@ export const COLLAB_REFUSAL_CODE = 4422;
 export const REFUSED_REASON_PREFIX = 'ccc:collab-update-refused:';
 export const UNRESOLVED_REASON = 'ccc:collab-update-unresolved';
 export const SOCKET_REFUSAL_BUDGET = 3;
-/** An honest connection announces one client id (two after Yjs regenerates one); this only bounds memory. */
+/**
+ * An honest connection announces one client id (y-protocols' Awareness keeps the id it was built with, even after Yjs
+ * regenerates the doc's); this only bounds memory.
+ */
 const AWARENESS_BINDS_PER_CONNECTION = 32;
+/** The ids one connection's own awareness announced that are remembered as its ownership evidence (memory bound only). */
+const ANNOUNCED_PER_CONNECTION = AWARENESS_BINDS_PER_CONNECTION;
 /**
  * Awareness-sourced binds per user per document, across that user's connections: past it awareness stops binding that
  * user's ids (never a refusal). Per user, so one writer cannot use up the binds every other user's ids need. An honest
@@ -184,9 +196,13 @@ export interface GuardFrame {
 type Header = { type: number; subtype?: number; payload?: Uint8Array | null };
 /** One awareness entry, its state still the undecoded UTF-8 JSON. */
 type AwarenessEntry = { clientID: number; clock: number; state: Uint8Array };
-/** #816: what a refusal line may add: numbers and fixed words only, never a value from the frame. */
-type RefusalLog = { steps?: number; stage?: 'conflict-scan' };
-type ShadowResult = { violation: Violation | null; binds: Map<number, string>; applied: boolean; log?: RefusalLog };
+/**
+ * #816: what a refusal line may add: numbers and fixed words only, never a value from the frame. `unproven-owner`: a
+ * `foreign-client` at an id whose owner has only announced it, answered `unresolved` (inspectTransaction).
+ */
+type RefusalLog = { steps?: number; stage?: 'conflict-scan' | 'unproven-owner' };
+/** `proven`: awareness-bound ids the sender wrote new clocks at as their owner (no longer `awarenessOnly` once accepted). */
+type ShadowResult = { violation: Violation | null; binds: Map<number, string>; proven?: Set<number>; applied: boolean; log?: RefusalLog };
 type Ranges = Map<number, Array<[number, number]>>;
 
 /** Per live Document: its shadow, client-id bindings and audit results. Dropped with the document (`destroy`). */
@@ -205,6 +221,17 @@ class DocGuard {
   readonly awarenessBinds = new WeakMap<object, number>();
   /** Awareness-sourced binds on this document per user, across that user's connections (AWARENESS_BINDS_PER_USER). */
   readonly awarenessBindsByUser = new Map<string, number>();
+  /**
+   * Per writer connection: the client ids its OWN awareness announced (a non-null state that is not an echo, or one
+   * for an id already bound to its user), whether or not the announcement bound the id. The evidence a struct bind
+   * needs (inspectTransaction). Absent = announced nothing.
+   */
+  readonly announced = new WeakMap<object, Set<number>>();
+  /**
+   * Ids bound by awareness whose owner has written no struct at a new clock in this lifetime. New clocks there from
+   * another user are answered `unresolved`, not refused (the owner's own Step2 may not have landed yet: the mirror race).
+   */
+  readonly awarenessOnly = new Set<number>();
   /** The client id bound to SERVER for the current shadow: unbound again when a rebuild replaces that shadow. */
   shadowBinding: number | null = null;
   /** #816: the user whose refused frame left the shadow dirty: the rebuild is charged to them, not the next sender. */
@@ -223,7 +250,8 @@ export class CollabUpdateGuard {
   /** #790: per (user, document) budgets, least recently used first; and per connection, the ids it already paid for. */
   private readonly userDocBudgets = new Map<string, UserDocBudget>();
   private readonly awarenessNewIds = new WeakMap<object, Set<number>>();
-  private readonly mode: CollabGuardMode;
+  /** Read by the guard extension too: the load repair runs only in enforce mode (#841). */
+  readonly mode: CollabGuardMode;
   private readonly logger: GuardLogger;
   private readonly limitLog: SocketLimitLog;
   private readonly now: () => number;
@@ -461,8 +489,9 @@ export class CollabUpdateGuard {
     let othersMs = 0;
     let applyMs = 0;
     try {
-      // 1. Stateless pre-pass: a refusal here touches no shadow, so a refuse/reconnect loop costs no rebuild.
-      const pre = prePass(payload);
+      // 1. Pre-pass (the per-struct rules; it reads live's state, never the shadow): a refusal here touches no shadow,
+      //    so a refuse/reconnect loop costs no rebuild.
+      const pre = prePass(payload, frame.document);
       let violation = pre.violation;
       if (violation && this.mode === 'enforce') return this.refuse(frame, header, violation);
       // 1b. #816: client ids live has never seen, charged before anything integrates them.
@@ -479,7 +508,7 @@ export class CollabUpdateGuard {
       }
       if (!ready) return this.refuse(frame, header, violation ?? { rule: 'shadow-unavailable' });
       const applyStarted = this.cpuNow();
-      const result = this.applyToShadow(doc, payload, userId);
+      const result = this.applyToShadow(doc, payload, userId, ownedBy(doc.announced.get(frame.connection)));
       applyMs = this.cpuNow() - applyStarted;
       violation ??= result.violation;
       if (violation && this.mode === 'enforce') {
@@ -491,6 +520,7 @@ export class CollabUpdateGuard {
       }
       if (violation) this.refuse(frame, header, violation, result.log); // report mode: logged, and the frame applies
       for (const [client, user] of result.binds) if (!doc.bindings.has(client)) doc.bindings.set(client, user);
+      for (const client of result.proven ?? []) doc.awarenessOnly.delete(client);
       // A frame the shadow could not apply is not replayed into a rebuild (it would fail every rebuild from then on).
       if (result.applied) doc.inflight.push(payload.slice());
       this.scheduleFlush(doc);
@@ -525,7 +555,7 @@ export class CollabUpdateGuard {
    * The frame applied to the shadow inside the conflict-scan meter (#816). A trip or a meter failure throws out of
    * Yjs's stack, before the item it was replaying integrates; the scope says which, never the error's identity.
    */
-  private applyToShadow(doc: DocGuard, payload: Uint8Array, userId: string): ShadowResult {
+  private applyToShadow(doc: DocGuard, payload: Uint8Array, userId: string, own: (client: number) => boolean): ShadowResult {
     const shadow = doc.shadow!;
     const pendingBefore = pendingRanges(shadow.store);
     const scan = new ConflictScan(shadow, this.mode === 'enforce');
@@ -536,7 +566,7 @@ export class CollabUpdateGuard {
           shadow,
           (tr) => {
             Y.applyUpdate(shadow, payload, INSPECT); // V1, as y-protocols reads Step2 and Update
-            out = this.inspectTransaction(doc, tr, userId, pendingBefore);
+            out = this.inspectTransaction(doc, tr, userId, own, pendingBefore);
           },
           INSPECT,
           false,
@@ -557,15 +587,16 @@ export class CollabUpdateGuard {
   }
 
   /** Inside the transaction, after the frame integrated and before any GC or merge. */
-  private inspectTransaction(doc: DocGuard, tr: Y.Transaction, userId: string, pendingBefore: Ranges) {
+  private inspectTransaction(doc: DocGuard, tr: Y.Transaction, userId: string, own: (client: number) => boolean, pendingBefore: Ranges) {
     const shadow = tr.doc;
     const store = shadow.store;
     const root = shadow.share.get('default');
     const touched = new Set<Y.AbstractType<any>>();
     const newTypes: Y.AbstractType<any>[] = [];
     const binds = new Map<number, string>();
+    const proven = new Set<number>();
     const reportOnly: Violation[] = [];
-    const result = (violation: Violation | null): ShadowResult => ({ violation, binds, applied: true });
+    const result = (violation: Violation | null, log?: RefusalLog): ShadowResult => ({ violation, binds, proven, applied: true, ...(log ? { log } : {}) });
 
     for (const [client, structs] of store.clients) {
       const before = tr.beforeState.get(client) ?? 0;
@@ -579,9 +610,20 @@ export class CollabUpdateGuard {
           if (owner === undefined) {
             // Only an id live never saw binds here. An id the stored document already holds (an earlier lifetime) binds
             // by awareness only: bindings are not persisted, so a claim on it after a reload is undetectable (ADR 0036).
-            if (!tr.beforeState.has(client)) binds.set(client, userId);
+            // And only to a sender whose connection announced it, or announced nothing (a pagehide-nulled awareness, a
+            // promoted reader: the rule before this evidence existed). Any other never-seen id is another client's
+            // structs relayed from a lifetime that lost them: it stays unbound, so its author's awareness claims it.
+            if (!tr.beforeState.has(client) && own(client)) binds.set(client, userId);
           } else if (owner !== userId) {
+            // The owner has only announced the id so far: its own Step2 may still be on the way while a peer relays its
+            // lost structs (the mirror race after a lost lifetime). Never applied either way; `unresolved` makes the
+            // sender reconnect once. That recovers a ONE-SIDED relay, and only when the owner's Step2 lands before the
+            // retry (an owner round trip under about twice the relayer's). Residual (ADR 0036 §4): when co-editors' frames
+            // each carry another's unproven id, none lands and none proves, so each is unresolved twice, which is final.
+            if (doc.awarenessOnly.has(client)) return result({ rule: 'foreign-client' }, { stage: 'unproven-owner' });
             return result({ rule: 'foreign-client' });
+          } else if (doc.awarenessOnly.has(client)) {
+            proven.add(client);
           }
         }
         if (!(struct instanceof Y.Item)) continue; // GC: no content, no parent
@@ -753,23 +795,35 @@ export class CollabUpdateGuard {
     });
   }
 
-  /** A writer's awareness entries (already within checkAwareness's bounds) bind the client ids they announce. */
+  /**
+   * A writer's awareness entries (already within checkAwareness's bounds) bind the client ids they announce, and record
+   * them as the connection's ownership evidence (DocGuard.announced).
+   */
   private bindFromAwareness(doc: DocGuard, frame: GuardFrame, entries: AwarenessEntry[]): void {
     const userId = String(frame.context?.user?.id ?? '');
     try {
       for (const { clientID, clock, state } of entries) {
-        if (doc.bindings.has(clientID)) continue;
+        const owner = doc.bindings.get(clientID);
+        if (owner !== undefined && owner !== userId) continue; // another user's (an echo or a removal: checkAwareness)
         // An echo (a provider's `timeout` removal of a peer, or a 3.x provider resending what it was relayed): the server
         // already holds this client's state at this clock (it relayed it), so the echo says nothing about who owns the
         // id: a writer's echo of a READER's state would otherwise bind the reader's id to the writer, refusing the reader
-        // once promoted.
+        // once promoted. An echo of an id already bound to this user (a reconnect resending its own state) still
+        // announces it.
         const held = frame.document.awareness?.meta.get(clientID)?.clock;
-        if (held !== undefined && held >= clock) continue;
+        if (owner === undefined && held !== undefined && held >= clock) continue;
         if (JSON.parse(decodeUtf8(state)) === null) continue; // at most AWARENESS_STATE_MAX_BYTES
+        // Ownership evidence for this connection's struct binds, recorded whether or not the id binds below (past a
+        // bind budget the sender's own id is still its own).
+        const announced = doc.announced.get(frame.connection) ?? new Set<number>();
+        if (announced.size < ANNOUNCED_PER_CONNECTION) announced.add(clientID);
+        doc.announced.set(frame.connection, announced);
+        if (owner !== undefined) continue;
         const used = doc.awarenessBinds.get(frame.connection) ?? 0;
         const byUser = doc.awarenessBindsByUser.get(userId) ?? 0;
-        if (used >= AWARENESS_BINDS_PER_CONNECTION || byUser >= AWARENESS_BINDS_PER_USER) return;
+        if (used >= AWARENESS_BINDS_PER_CONNECTION || byUser >= AWARENESS_BINDS_PER_USER) continue;
         doc.bindings.set(clientID, userId);
+        doc.awarenessOnly.add(clientID);
         doc.awarenessBinds.set(frame.connection, used + 1);
         doc.awarenessBindsByUser.set(userId, byUser + 1);
       }
@@ -780,7 +834,8 @@ export class CollabUpdateGuard {
 
   /** Logs the refusal; in enforce mode also closes the session (throws) and counts against the socket's budget. */
   private refuse(frame: GuardFrame, header: Header, violation: Violation, extra?: RefusalLog): void {
-    const reason = reasonFor(violation.rule);
+    // An unproven owner's id: logged as the foreign-client it is, answered as a reconnect (inspectTransaction).
+    const reason = extra?.stage === 'unproven-owner' ? UNRESOLVED_REASON : reasonFor(violation.rule);
     this.log('COLLAB_UPDATE_REFUSED', frame.document, {
       rule: violation.rule,
       ...(violation.node ? { node: violation.node } : {}),
@@ -816,6 +871,20 @@ export class CollabUpdateGuard {
   }
 }
 
+/**
+ * May a struct at a never-seen id bind it to this connection's user? Yes when its own awareness announced that id, or
+ * announced none (the rule before this evidence: a sender that sends no awareness still gets it, ADR 0036 §4). An honest
+ * 4.7.1 provider sends its own awareness right after Auth and Step1, before its Step2 or any queued Update (with Docmost's
+ * static token; pinned by the client's collab-provider-order.test.ts), so a sender that announced ids and writes another
+ * never-seen one is relaying a peer's structs. Residual: a doc whose id Yjs regenerated (a remote write at its current
+ * id) keeps announcing the old one, so its new id stays unbound (relay-binding.spec.ts); the guard refuses that remote
+ * write at every bound id, so on an honest page it follows only an id collision.
+ */
+const ownedBy =
+  (announced: Set<number> | undefined) =>
+  (client: number): boolean =>
+    announced === undefined || announced.has(client);
+
 /** The UTF-8 bytes `null`: y-protocols' encoding of a removed state (`JSON.stringify(null)`). */
 const isNullState = (state: Uint8Array): boolean =>
   state.length === 4 && state[0] === 0x6e && state[1] === 0x75 && state[2] === 0x6c && state[3] === 0x6c;
@@ -846,11 +915,13 @@ const tryRead = (read: () => Uint8Array): Uint8Array | null => {
 };
 
 /**
- * The stateless rules, on the decoded frame (no document state, so already-known structs are checked too), and the
- * client ids of its structs (Skips excepted: they integrate nothing). `Y.decodeUpdate` keeps the wire order of the
- * delete set (`readDeleteSet` appends, it never sorts).
+ * The stateless rules, on the decoded frame, for every struct live does not already hold (`heldByLive`), and the client
+ * ids of those structs (Skips excepted: they integrate nothing). A held struct is a no-op in Yjs, so neither its content
+ * nor its client id is judged; a struct that is only partly held is judged whole (the shadow then sees the tail Yjs
+ * integrates). The decode and the delete-order rule still cover the WHOLE frame, held structs or not: a delete set is
+ * judged by its wire order alone. `Y.decodeUpdate` keeps that order (`readDeleteSet` appends, it never sorts).
  */
-function prePass(payload: Uint8Array): { violation: Violation | null; clients: Set<number> } {
+function prePass(payload: Uint8Array, live: Y.Doc): { violation: Violation | null; clients: Set<number> } {
   const clients = new Set<number>();
   let decoded: { structs: Array<Y.Item | Y.GC | Y.Skip>; ds: { clients: Map<number, Array<{ clock: number; len: number }>> } };
   try {
@@ -859,12 +930,40 @@ function prePass(payload: Uint8Array): { violation: Violation | null; clients: S
     return { violation: { rule: 'undecodable' }, clients }; // e.g. a lib0 `readAny` value deep enough to overflow the decoder
   }
   let violation: Violation | null = null;
+  const states = new Map<number, number>();
   for (const struct of decoded.structs) {
     if (struct instanceof Y.Skip) continue;
+    if (heldByLive(struct, live, states)) continue; // a remount's resend: Yjs integrates none of it
     clients.add(struct.id.client);
     if (struct instanceof Y.Item) violation ??= structRule(struct);
   }
   return { violation: violation ?? deleteOrder(decoded.ds.clients), clients };
+}
+
+/**
+ * Does live already hold all of `struct`, so that Yjs never integrates it? Yjs's `integrateStructs` integrates a struct
+ * only when `offset === 0 || offset < length` (offset = live's state for its client minus its clock); this is the exact
+ * negation, so a zero-length struct at the state's clock is NOT held (Yjs integrates it, and it is judged). A y-indexeddb
+ * remount honestly resends such structs: the server's own `__ccc_write_idem` ledger entries (pruned ones too, as
+ * ContentDeleted), other users' content, and stored pre-#781 content a stateless rule refuses (the shadow treats that as
+ * legacy).
+ *
+ * Sound because a Y.Doc's state only grows during its lifetime: held when checked means never integrated by any later
+ * apply of this frame. A shadow ahead of live changes nothing here (live is what is read): a struct live lacks is simply
+ * not held, and is judged as before. Two side effects of a held struct remain, both the shadow's as for any struct:
+ * - The decode itself: Yjs's `readClientsStructRefs` calls `doc.get(<root name>)` for a struct whose parent is a root
+ *   name, before the clock check, creating that root. So a struct naming a root live does not hold is never held (it
+ *   is judged `root`), or a frame of held structs could grow live's `share` without bound.
+ * - `getMissing` (splits, a pending park, a throw on a forged parent id): the shadow's `internal` and `unresolved`.
+ * Not counted: structs in live's pending store (`getState` excludes them). Those are judged as before.
+ */
+function heldByLive(struct: Y.Item | Y.GC, live: Y.Doc, states: Map<number, number>): boolean {
+  const { client, clock } = struct.id;
+  let state = states.get(client);
+  if (state === undefined) states.set(client, (state = Y.getState(live.store, client)));
+  if (!(state > clock && clock + struct.length <= state)) return false;
+  const parent = struct instanceof Y.Item ? (struct.parent as unknown) : null;
+  return typeof parent !== 'string' || live.share.has(parent);
 }
 
 function structRule(struct: Y.Item): Violation | null {
@@ -918,6 +1017,16 @@ function checkStruct(item: Y.Item, root: Y.AbstractType<any> | undefined, touche
   const parent = item.parent as Y.AbstractType<any>;
   const parentKind = kindOf(parent);
   if (rootOf(parent) !== root) return { rule: 'root' };
+  // An item is linked after its `left`, into that neighbour's list. Yjs derives the parent FROM the left for a struct
+  // with an origin (getMissing), but the tail of a partly known struct (Item.integrate, offset > 0) is linked after the
+  // same client's previous clock while keeping the parent getMissing resolved (from the wire, or from the ORIGINAL
+  // origin). So a crafted frame names one list and lands in another, one this guard never checks: a string in the root
+  // list wedges every browser and the store; a keyed tail writes another element's attribute and deletes the value it
+  // follows. A remote integration never does it honestly: that previous clock is the same original struct (same parent,
+  // same key), and `right` is always `left.right` or the head of the item's own list, so `left` is the one to read.
+  // Before the `deleted` return: a tail deleted on arrival is still linked into the foreign list.
+  const left = item.left;
+  if (left !== null && (left.parent !== parent || left.parentSub !== item.parentSub)) return { rule: 'cross-list' };
   // #816: Yjs never writes a keyed item with a rightOrigin (typeMapSet and redo leave it null; a split copies it), and one
   // re-walks its key's history. Checked here, not in the pre-pass: an item with an origin or a rightOrigin takes its key
   // from them at integrate time (Yjs's readItem reads parentSub only when both are null), so the wire never shows it.

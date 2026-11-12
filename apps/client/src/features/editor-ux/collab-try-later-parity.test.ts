@@ -16,6 +16,10 @@ import {
   TRY_LATER_CLOSE_REASONS,
   WS_CLOSE_MESSAGE_TOO_BIG,
 } from "./collab-access";
+import {
+  COLLAB_REFUSAL_RULES,
+  collabRefusalCause,
+} from "./collab-refusal-cause";
 
 const INGRESS = join(__dirname, "../../../../server/src/authz/collab-ingress");
 const FILES = [
@@ -109,5 +113,61 @@ describe("server ↔ client collab reasons (#810)", () => {
       TRY_LATER_AUTH_REASONS.includes(r) ||
       TRY_LATER_CLOSE_REASONS.includes(r);
     expect(serverReasons.filter((r) => !known(r))).toEqual([]);
+  });
+});
+
+// The ledger-echo incident (#781 lineage) — the refusal notice's copy follows the rule the server refused on
+// (collab-refusal-cause.ts). Every rule in the server's `CollabRule` union must be a decision on the client: exactly one
+// cause. A new or renamed server rule goes red here until it joins one. The client and server ship in one image, so the
+// two lists are equal; an older cached bundle that meets a newer rule falls back to `other` (collabRefusalCause).
+
+describe("server CollabRule ↔ client refusal causes", () => {
+  const rulesSource = readFileSync(join(INGRESS, "content-rules.ts"), "utf8");
+  const union = rulesSource.match(
+    /export type CollabRule\s*=\s*((?:\s*\|\s*'[a-z-]+')+)\s*;/,
+  );
+  const serverRules = union
+    ? [...union[1].matchAll(/'([a-z-]+)'/g)].map((m) => m[1])
+    : [];
+  const causes = Object.entries(COLLAB_REFUSAL_RULES) as [
+    string,
+    ReadonlySet<string>,
+  ][];
+
+  it("is not vacuous: the server union was read in full", () => {
+    expect(union).not.toBeNull();
+    expect(serverRules.length).toBeGreaterThanOrEqual(28);
+    for (const rule of ["root", "schema", "internal", "unresolved"]) {
+      expect(serverRules).toContain(rule);
+    }
+    expect(new Set(serverRules).size).toBe(serverRules.length);
+  });
+
+  it("every server rule is in exactly one cause", () => {
+    const misplaced = serverRules
+      .map((rule) => [rule, causes.filter(([, set]) => set.has(rule)).map(([c]) => c)] as const)
+      .filter(([, inCauses]) => inCauses.length !== 1);
+    expect(misplaced).toEqual([]);
+    for (const rule of serverRules) {
+      expect([rule, collabRefusalCause(rule)]).toEqual([
+        rule,
+        causes.find(([, set]) => set.has(rule))?.[0],
+      ]);
+    }
+  });
+
+  it("every client entry is a server rule", () => {
+    const server = new Set(serverRules);
+    const extra = causes.flatMap(([cause, set]) =>
+      [...set].filter((rule) => !server.has(rule)).map((rule) => `${cause}:${rule}`),
+    );
+    expect(extra).toEqual([]);
+    expect(collabRefusalCause("not-a-rule-yet")).toBe("other");
+  });
+
+  it("the cause sets are disjoint", () => {
+    const all = causes.flatMap(([, set]) => [...set]);
+    expect(new Set(all).size).toBe(all.length);
+    for (const [, set] of causes) expect(set).toBeInstanceOf(Set);
   });
 });

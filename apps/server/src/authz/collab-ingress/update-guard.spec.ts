@@ -7,7 +7,7 @@ import { MessageType } from '@hocuspocus/server';
 import * as encoding from 'lib0/encoding';
 import { htmlToJson, jsonToHtml } from '../../collaboration/collaboration.util';
 import { serverSchema } from '../page-write/prelim-content';
-import { isDuplicateWriteKey, recordWriteKey, WRITE_IDEM_MAP } from '../page-write/write-idem';
+import { isDuplicateWriteKey, recordWriteKey, scopedWriteKey, WRITE_IDEM_MAP } from '../page-write/write-idem';
 import {
   ALL_NODES_DOC,
   authFrame,
@@ -508,15 +508,19 @@ describe('#781 B4: a client id is bound to its user (forged clocks)', () => {
     expect(renderLikeABrowser(live2).text).not.toContain('MINE');
   });
 
-  it('bound by a non-readOnly awareness frame: the forged struct is foreign-client; the victim\'s own edits pass', () => {
+  it('bound by a non-readOnly awareness frame: the forged struct is never applied; the victim\'s own edits pass', () => {
     const { s, victim, vc } = victimSetup();
     expect(s.deliver(vc, awarenessFrame([{ clientID: 1001, state: { user: { name: 'V' } } }]))).toBe('applied');
-    expectRefused(s, s.conn('attacker'), forge(s, 1001, 'FORGED '), REFUSED('foreign-client'));
+    // Before the victim writes at its id, new clocks there are answered unresolved (refused, never applied: the mirror
+    // race after a lost lifetime, relay-binding.spec.ts); once it has written, they are foreign-client.
+    expectRefused(s, s.conn('attacker'), forge(s, 1001, 'FORGED '), UNRESOLVED_REASON);
     expect(s.send(vc, victim.edit(s.live, () => textOf(find(victim.doc, 'paragraph')).insert(0, 'MINE ')))).toBe('applied');
     expect(renderLikeABrowser(s.live).text).toContain('MINE');
+    expectRefused(s, s.conn('attacker'), forge(s, 1001, 'FORGED '), REFUSED('foreign-client'));
   });
 
-  it('bound by the first new struct (a pagehide-nulled awareness, or a regenerated client id)', () => {
+  // A regenerated client id is NOT bound this way once its connection announced its old id: relay-binding.spec.ts pins it.
+  it('bound by the first new struct when the connection announced nothing (a pagehide-nulled awareness)', () => {
     const { s, victim, vc } = victimSetup();
     expect(s.deliver(vc, awarenessFrame([{ clientID: 1001, state: null }]))).toBe('applied'); // null never binds
     expect(s.send(vc, victim.edit(s.live, () => textOf(find(victim.doc, 'paragraph')).insert(0, 'first ')))).toBe('applied');
@@ -560,7 +564,7 @@ describe('#781 B4: a client id is bound to its user (forged clocks)', () => {
     const meta = new Map<number, { clock: number }>([[1001, { clock: 1 }]]);
     (s.live as unknown as { awareness: unknown }).awareness = { meta };
     expect(s.deliver(s.conn('victim'), awarenessFrame([{ clientID: 1001, clock: 2, state: { user: { name: 'V' } } }]))).toBe('applied');
-    expectRefused(s, s.conn('attacker'), forge(s, 1001, 'FORGED '), REFUSED('foreign-client'));
+    expectRefused(s, s.conn('attacker'), forge(s, 1001, 'FORGED '), UNRESOLVED_REASON); // bound by awareness only so far
   });
 
   it('the server\'s own client id is protected', () => {
@@ -694,28 +698,31 @@ describe('#781 deep values and deep trees (stack safety)', () => {
 });
 
 describe('#781 the idempotency ledger, other roots and Stateless frames are not client-writable', () => {
+  // Ledger entries are digests (write-idem.ts): a forger writes the digest of a key it wants to suppress.
+  const VICTIM = scopedWriteKey('victim', 'victim-key');
+  const FORGED = scopedWriteKey('victim', 'forged-key');
   const ledgerSetup = () => {
     const s = setup({ seed: SEED });
-    s.live.transact(() => recordWriteKey(s.live, 'victim-key', Date.now()));
+    s.live.transact(() => recordWriteKey(s.live, VICTIM, Date.now()));
     return s;
   };
   it('forging a ledger entry: control flips isDuplicateWriteKey; treatment refuses root', () => {
     const s = ledgerSetup();
-    const u = new RemoteClient(s.live).edit(s.live, (_f, d) => d.getMap(WRITE_IDEM_MAP).set('forged-key', 1));
-    expect(isDuplicateWriteKey(unguarded(s.live, u), 'forged-key')).toBe(true);
+    const u = new RemoteClient(s.live).edit(s.live, (_f, d) => d.getMap(WRITE_IDEM_MAP).set(FORGED.entry, 1));
+    expect(isDuplicateWriteKey(unguarded(s.live, u), FORGED)).toBe(true);
     expectRefused(s, s.conn('attacker'), u, REFUSED('root'));
   });
   it('overwriting and deleting the victim\'s entry: control drops it; treatment refuses root', () => {
     const changes: Array<[boolean, (m: Y.Map<unknown>) => void]> = [
-      [false, (m) => m.set('victim-key', 'x')],
-      [true, (m) => m.delete('victim-key')],
+      [false, (m) => m.set(VICTIM.entry, 'x')],
+      [true, (m) => m.delete(VICTIM.entry)],
     ];
     for (const [drops, change] of changes) {
       const s = ledgerSetup();
       const u = new RemoteClient(s.live).edit(s.live, (_f, d) => change(d.getMap(WRITE_IDEM_MAP)));
-      if (drops) expect(isDuplicateWriteKey(unguarded(s.live, u), 'victim-key')).toBe(false); // control
+      if (drops) expect(isDuplicateWriteKey(unguarded(s.live, u), VICTIM)).toBe(false); // control
       expectRefused(s, s.conn('attacker'), u, REFUSED('root'));
-      expect(isDuplicateWriteKey(s.live, 'victim-key')).toBe(true);
+      expect(isDuplicateWriteKey(s.live, VICTIM)).toBe(true);
     }
   });
   it('a new root is refused', () => {
@@ -726,6 +733,193 @@ describe('#781 the idempotency ledger, other roots and Stateless frames are not 
     const s = setup({ seed: SEED });
     expect(s.deliver(s.conn('a'), statelessFrame('{"type":"page.updated"}', MSG.Stateless))).toBe(REFUSED('stateless'));
     expect(s.deliver(s.conn('b'), statelessFrame('{"type":"page.updated"}', MSG.BroadcastStateless))).toBe(REFUSED('stateless'));
+  });
+});
+
+/**
+ * The v0.12.3 incident (#781 lineage): a writer's second visit to any page that ever had a keyed `/v1` write was refused
+ * `root`, because the stateless pre-pass judged structs live already held. y-indexeddb stores every root the server
+ * syncs (the `__ccc_write_idem` ledger too) and, on the next mount, applies the stored state in ONE transaction with
+ * itself as origin; HocuspocusProvider 4.7.1 drops only its own origin, so it sends that state back as an Update.
+ */
+describe('#781 a remount resending structs live already holds is not refused (the ledger echo)', () => {
+  const IDB = Symbol('y-indexeddb');
+  /** What the provider sends after a remount: the update event of y-indexeddb's load transaction on a fresh doc. */
+  const remountEcho = (stored: Y.Doc): Uint8Array => {
+    const fresh = new Y.Doc();
+    let echo: Uint8Array | null = null;
+    fresh.on('update', (u: Uint8Array, origin: unknown) => {
+      if (origin === IDB) echo = u;
+    });
+    Y.transact(fresh, () => Y.applyUpdate(fresh, Y.encodeStateAsUpdate(stored)), IDB, false);
+    expect(echo).not.toBeNull();
+    return echo!;
+  };
+  const ledgerItems = (update: Uint8Array): Y.Item[] =>
+    Y.decodeUpdate(update).structs.filter((st): st is Y.Item => st instanceof Y.Item && (st.parent as unknown) === WRITE_IDEM_MAP);
+  /** The seed's client: live holds its clocks, and no user is bound to it (live's own id is the server's). */
+  const seedClient = (s: ReturnType<typeof setup>): number => ((textOf(find(s.live, 'paragraph')) as any)._start as Y.Item).id.client;
+  const ARMS: Array<[string, (live: Y.Doc) => void]> = [
+    ['one live entry', (live) => live.transact(() => recordWriteKey(live, scopedWriteKey('u', 'k1'), Date.now()))],
+    [
+      'every entry pruned (ContentDeleted)',
+      (live) => {
+        live.transact(() => recordWriteKey(live, scopedWriteKey('u', 'k1'), 1_000));
+        live.transact(() => recordWriteKey(live, scopedWriteKey('u', 'k2'), 1_000_000, 10)); // prunes k1 by age
+        live.transact(() => live.getMap(WRITE_IDEM_MAP).delete(scopedWriteKey('u', 'k2').entry));
+        expect(live.getMap(WRITE_IDEM_MAP).size).toBe(0);
+      },
+    ],
+  ];
+
+  it.each(ARMS)('%s: the echo is applied (Update and Step2) as a no-op; a shadow rebuild replaying it stays one', (_arm, write) => {
+    for (const subtype of [SYNC.Update, SYNC.Step2]) {
+      const s = setup({ seed: SEED });
+      write(s.live);
+      const echo = remountEcho(s.live);
+      // non-vacuity (i): the echo carries the server's ledger items, by root name; (iii) the last one ends exactly at
+      // live's state for the server's client (the `<=` edge of the held predicate)
+      const ledger = ledgerItems(echo);
+      expect(ledger.length).toBeGreaterThan(0);
+      expect(ledger.every((st) => st.id.client === s.live.clientID)).toBe(true);
+      expect(Math.max(...ledger.map((st) => st.id.clock + st.length))).toBe(Y.getState(s.live.store, s.live.clientID));
+      const before = s.snapshot();
+      const editor = s.conn('editor');
+      expect(s.send(editor, echo, subtype)).toBe('applied');
+      const after = s.snapshot();
+      expect(sameBytes(after.live, before.live)).toBe(true);
+      expect(sameBytes(after.peer, before.peer)).toBe(true);
+      expect(s.logs.filter((l) => l.startsWith('COLLAB_UPDATE_REFUSED'))).toEqual([]);
+      expect(sameBytes(Y.encodeStateVector(s.guard.shadowOf(s.live)!), Y.encodeStateVector(s.live))).toBe(true);
+      // Another user's shadow-stage refusal (a ledger overwrite) leaves the shadow dirty: the next frame's rebuild replays
+      // the echo from the in-flight list, still a no-op, and the editor's next edit applies.
+      const overwrite = new RemoteClient(s.live).edit(s.live, (_f, d) => d.getMap(WRITE_IDEM_MAP).set(scopedWriteKey('u', 'k1').entry, 'x'));
+      expect(s.send(s.conn('attacker'), overwrite)).toBe(REFUSED('root'));
+      const c = new RemoteClient(s.live);
+      expect(s.send(editor, c.edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'next ')))).toBe('applied');
+      expect(renderLikeABrowser(s.live).text).toBe('next victim text');
+      expect(sameBytes(Y.encodeStateVector(s.guard.shadowOf(s.live)!), Y.encodeStateVector(s.live))).toBe(true);
+      // non-vacuity (ii): the SAME bytes to a live that lacks the ledger are new structs in another root, refused root
+      // in the pre-pass (a fresh setup: its seed has another client id, so nothing of the echo is held there)
+      const other = setup({ seed: SEED });
+      expect(other.live.share.has(WRITE_IDEM_MAP)).toBe(false);
+      expectRefused(other, other.conn('editor'), echo, REFUSED('root'), subtype);
+      expect(other.guard.shadowOf(other.live)).toBeNull();
+    }
+  });
+
+  it('the echo merged with an honest edit is applied; merged with a client ledger delete or overwrite it is refused root', () => {
+    const s = setup({ seed: SEED });
+    s.live.transact(() => recordWriteKey(s.live, scopedWriteKey('u', 'k1'), Date.now()));
+    const edit = new RemoteClient(s.live).edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'new '));
+    expect(s.send(s.conn('editor'), Y.mergeUpdates([remountEcho(s.live), edit]))).toBe('applied');
+    expect(renderLikeABrowser(s.live).text).toBe('new victim text');
+    const changes: Array<(m: Y.Map<unknown>) => void> = [(m) => m.delete(scopedWriteKey('u', 'k1').entry), (m) => m.set(scopedWriteKey('u', 'k1').entry, 'x')];
+    for (const change of changes) {
+      const t = setup({ seed: SEED });
+      t.live.transact(() => recordWriteKey(t.live, scopedWriteKey('u', 'k1'), Date.now()));
+      const u = new RemoteClient(t.live).edit(t.live, (_f, d) => change(d.getMap(WRITE_IDEM_MAP)));
+      expectRefused(t, t.conn('attacker'), Y.mergeUpdates([remountEcho(t.live), u]), REFUSED('root'));
+      expect(isDuplicateWriteKey(t.live, scopedWriteKey('u', 'k1'))).toBe(true);
+    }
+  });
+
+  it('a struct at a clock live holds that names a root live lacks is refused root, and live.share does not grow', () => {
+    const s = setup({ seed: SEED });
+    const client = seedClient(s);
+    const u = rawUpdate([{ client, clock: 0, structs: [{ origin: null, right: null, parent: 'evil-root', sub: 'a', content: new Y.ContentAny([1]) }] }]);
+    expect(Y.getState(s.live.store, client)).toBeGreaterThanOrEqual(1); // precondition: clock 0, length 1 is held
+    // control: Yjs integrates nothing, yet its decode creates the root (so a stream of such frames grows `share`)
+    const control = unguarded(s.live, u);
+    expect(control.share.has('evil-root')).toBe(true);
+    expect(sameBytes(Y.encodeStateVector(control), Y.encodeStateVector(s.live))).toBe(true);
+    expectRefused(s, s.conn('attacker'), u, REFUSED('root'));
+    expect([...s.live.share.keys()]).not.toContain('evil-root');
+    expect(s.guard.shadowOf(s.live)).toBeNull(); // the pre-pass refused it
+  });
+
+  it('a struct live holds only in part (a straddle on a root live holds) is judged whole by the pre-pass', () => {
+    const s = setup({ seed: SEED });
+    s.live.transact(() => recordWriteKey(s.live, scopedWriteKey('u', 'k1'), Date.now()));
+    const client = seedClient(s);
+    const state = Y.getState(s.live.store, client);
+    const u = rawUpdate([
+      { client, clock: state - 1, structs: [{ origin: null, right: null, parent: WRITE_IDEM_MAP, content: new Y.ContentAny([1, 2, 3, 4, 5, 6, 7, 8]) }] },
+    ]);
+    // precondition: the head is held, the tail is new, and live holds the root it names
+    expect(state - 1).toBeGreaterThanOrEqual(0);
+    expect(s.live.share.has(WRITE_IDEM_MAP)).toBe(true);
+    expectRefused(s, s.conn('attacker'), u, REFUSED('root'));
+    // the pre-pass refused it: judging only a struct's head (`clock < state`) would leave this to the shadow
+    expect(s.guard.shadowOf(s.live)).toBeNull();
+
+    // the upper boundary: a struct new by exactly ONE clock is still judged whole (`clock + length <= state`, not `- 1`)
+    const t = setup({ seed: SEED });
+    t.live.transact(() => recordWriteKey(t.live, scopedWriteKey('u', 'k1'), Date.now()));
+    const c2 = seedClient(t);
+    const st = Y.getState(t.live.store, c2);
+    const byOne = rawUpdate([
+      { client: c2, clock: st - 1, structs: [{ origin: null, right: null, parent: WRITE_IDEM_MAP, content: new Y.ContentAny([1, 2]) }] },
+    ]);
+    const decoded = Y.decodeUpdate(byOne).structs[0];
+    // precondition: one clock held, exactly one clock new
+    expect(decoded.id.clock + decoded.length - st).toBe(1);
+    expect(t.live.share.has(WRITE_IDEM_MAP)).toBe(true);
+    expectRefused(t, t.conn('attacker'), byOne, REFUSED('root'));
+    expect(t.guard.shadowOf(t.live)).toBeNull();
+  });
+
+  it('a zero-length struct at the clock live is at is refused zero-length (Yjs integrates it: offset 0)', () => {
+    const s = setup({ seed: SEED });
+    const t = textOf(find(s.live, 'paragraph'));
+    const first = ((t as any)._start as Y.Item).id;
+    const client = seedClient(s);
+    const clock = Y.getState(s.live.store, client);
+    const u = rawUpdate([{ client, clock, structs: [{ origin: [first.client, first.clock], right: null, content: new Y.ContentString('') }] }]);
+    expect(Y.decodeUpdate(u).structs[0].length).toBe(0); // precondition: zero length, at exactly live's state
+    expectRefused(s, s.conn('attacker'), u, REFUSED('zero-length'));
+  });
+
+  it('a frame of held structs only is still judged on its delete set: ranges out of order are refused delete-order', () => {
+    const s = setup({ seed: SEED });
+    const at = ((textOf(find(s.live, 'paragraph')) as any)._start as Y.Item).id;
+    const held = { client: at.client, clock: at.clock, structs: [{ origin: null, right: null, parent: 'default', content: new Y.ContentString('zz') }] };
+    const u = rawUpdate([held], [{ client: at.client, ranges: [[at.clock + 8, 1], [at.clock + 5, 1]] }]);
+    expect(Y.getState(s.live.store, at.client)).toBeGreaterThanOrEqual(at.clock + 2); // precondition: the struct is held
+    expectRefused(s, s.conn('attacker'), u, REFUSED('delete-order'));
+    expect(s.guard.shadowOf(s.live)).toBeNull();
+    // the same held struct with the ranges ascending is applied (the deletes are new, and harmless)
+    const ok = rawUpdate([held], [{ client: at.client, ranges: [[at.clock + 5, 1], [at.clock + 8, 1]] }]);
+    expect(s.send(s.conn('honest'), ok)).toBe('applied');
+    expect(renderLikeABrowser(s.live).text).toBe('victi txt');
+  });
+
+  it('a held struct still meets Yjs: a forged same-client parent id past live\'s state throws in the shadow (internal)', () => {
+    const s = setup({ seed: SEED });
+    const at = ((textOf(find(s.live, 'paragraph')) as any)._start as Y.Item).id;
+    const u = rawUpdate([{ client: at.client, clock: at.clock, structs: [{ origin: null, right: null, parent: [at.client, 9_999], content: new Y.ContentString('x') }] }]);
+    expect(Y.getState(s.live.store, at.client)).toBeGreaterThan(at.clock); // precondition: held, its parent clock is not
+    expect(Y.getState(s.live.store, at.client)).toBeLessThan(9_999);
+    expect(() => unguarded(s.live, u)).toThrow(); // control: Yjs's getMissing throws on it
+    expectRefused(s, s.conn('attacker'), u, REFUSED('internal'));
+  });
+
+  const LEGACY: Array<[string, (d: Y.Doc) => void]> = [
+    ['string-attr', (d) => textOf(find(d, 'paragraph')).format(0, 6, { link: { href: { evil: 1 } } })],
+    ['schema', (d) => d.getXmlFragment('default').insert(1, [new Y.XmlElement('notANode')])],
+    ['content-kind', (d) => textOf(find(d, 'paragraph')).insertEmbed(2, { a: 1 })],
+    ['attr-kind', (d) => find(d, 'paragraph').setAttribute('__proto__', 'x' as never)],
+  ];
+  it.each(LEGACY)('stored pre-#781 content a stateless rule refuses (%s): its echo is applied, the same value new is refused', (rule, write) => {
+    const legacy = prosemirrorJSONToYDoc(schema, SEED, 'default');
+    legacy.transact(() => write(legacy));
+    const s = setup({ legacy: Y.encodeStateAsUpdate(legacy) });
+    const before = Y.encodeStateAsUpdate(s.live);
+    expect(s.send(s.conn('editor'), remountEcho(s.live))).toBe('applied');
+    expect(sameBytes(Y.encodeStateAsUpdate(s.live), before)).toBe(true);
+    // the same value in a struct live does not hold is refused by the same rule
+    const c = new RemoteClient(s.live);
+    expectRefused(s, s.conn('attacker'), c.edit(s.live, (_f, d) => write(d)), REFUSED(rule));
   });
 });
 
@@ -930,6 +1124,32 @@ describe('#781 the Yjs internals the guard reads (re-check on a Yjs 14 / Hocuspo
       Y.iterateDeletedStructs(tr, tr.deleteSet, () => deleted++);
       expect(deleted).toBeGreaterThan(0);
     }, 'probe', false);
+  });
+
+  it('a struct live holds in full is never integrated; a straddling one only from beforeState; a root name is created at decode', () => {
+    const live = new Y.Doc();
+    live.getArray('a').insert(0, [1, 2, 3]);
+    const c = live.clientID;
+    let updates = 0;
+    live.on('update', () => updates++);
+    const sv = Y.encodeStateVector(live);
+    // (a) held in full: no update event, the state vector unchanged, nothing integrated (integrateStructs' offset rule)
+    Y.applyUpdate(live, rawUpdate([{ client: c, clock: 0, structs: [{ origin: null, right: null, parent: 'a', content: new Y.ContentAny([9, 9, 9]) }] }]));
+    expect(updates).toBe(0);
+    expect(sameBytes(Y.encodeStateVector(live), sv)).toBe(true);
+    expect(live.getArray('a').toArray()).toEqual([1, 2, 3]);
+    // (c) held, naming a root live lacks: still no update, but readClientsStructRefs' doc.get created the root
+    Y.applyUpdate(live, rawUpdate([{ client: c, clock: 1, structs: [{ origin: null, right: null, parent: 'zzz', sub: 'k', content: new Y.ContentAny([1]) }] }]));
+    expect(updates).toBe(0);
+    expect(live.share.has('zzz')).toBe(true);
+    // (b) a straddle: only the tail integrates, and it starts at the transaction's beforeState
+    Y.transact(live, (tr) => {
+      Y.applyUpdate(live, rawUpdate([{ client: c, clock: 2, structs: [{ origin: null, right: null, parent: 'a', content: new Y.ContentAny([7, 8]) }] }]));
+      const structs = live.store.clients.get(c)!;
+      const fresh = structs.slice(Y.findIndexSS(structs, tr.beforeState.get(c)!));
+      expect(fresh.map((st) => [st.id.clock, st.length])).toEqual([[3, 1]]);
+    }, 'probe', false);
+    expect(live.getArray('a').toArray()).toEqual([1, 2, 3, 8]);
   });
 
   it('pending structs and deletes are V2 updates the guard can decode', () => {

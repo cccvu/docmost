@@ -12,7 +12,7 @@ import { ConflictScan, installConflictScanMeter } from './conflict-scan';
 type YModule = typeof Y;
 export type RawId = [client: number, clock: number];
 /** One struct: `parent` (a root name or an element's id) is written only when it has neither origin nor right. */
-export type RawStruct = { origin: RawId | null; right: RawId | null; parent?: string | RawId; sub?: string | null; content: Y.ContentString | Y.ContentAny };
+export type RawStruct = { origin: RawId | null; right: RawId | null; parent?: string | RawId; sub?: string | null; content: Y.ContentString | Y.ContentAny | Y.ContentDeleted };
 export type RawClient = { client: number; clock: number; structs: RawStruct[] };
 export type RawDeletes = Array<{ client: number; ranges: Array<[clock: number, len: number]> }>;
 
