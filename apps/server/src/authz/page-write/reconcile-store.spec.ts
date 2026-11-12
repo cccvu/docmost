@@ -9,8 +9,9 @@ import {
   markRowCovered,
   readRootMapEntries,
   reconcileRowIntoDoc,
+  WedgedDocumentError,
 } from './reconcile-store';
-import { isSuperseded, LINEAGE_ROOT, supersededBy, writeLineage } from './compaction-registry';
+import { isSuperseded, LINEAGE_ROOT, liveWedged, supersededBy, writeLineage } from './compaction-registry';
 
 function paragraph(text: string): Y.XmlElement {
   const el = new Y.XmlElement('paragraph');
@@ -266,5 +267,46 @@ describe('reconcileRowIntoDoc foreign lineage (#827)', () => {
     p.setAttribute('textAlign', 'right');
     const d2 = Y.decodeUpdate(rowBytesOf(withAttrs));
     expect(readRootMapEntries(d2.structs, d2.ds, LINEAGE_ROOT)).toEqual({ entries: new Map(), unresolved: 0 });
+  });
+});
+
+describe('reconcileRowIntoDoc into a wedged document (#847)', () => {
+  /** A resident whose Yjs cleanup threw (M2: a parent delete over a stranded keyed piece): wedged for good. */
+  function wedgedResident(): Y.Doc {
+    const doc = docWith(['one', 'two']);
+    const peer = new Y.Doc();
+    peer.clientID = 9;
+    Y.applyUpdate(peer, Y.encodeStateAsUpdate(doc));
+    const sv = Y.encodeStateVector(peer);
+    const p = peer.getXmlFragment('default').get(0) as Y.XmlElement;
+    p.setAttribute('textAlign', 'left');
+    const item = p._map.get('textAlign')!;
+    (item.content as Y.ContentAny).arr.push('center'); // a two-value keyed item (pre-#847 stored shape)
+    item.length = 2;
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(peer, sv));
+    Y.applyUpdate(doc, new Uint8Array([0, 1, 9, 1, 1, 1])); // its second value deleted: the first stranded
+    expect(() => doc.getXmlFragment('default').delete(0, 1)).toThrow();
+    expect(liveWedged(doc)).toBe(true);
+    return doc;
+  }
+
+  it('an out-of-band row is never folded in: the store fails (WedgedDocumentError), nothing integrated', () => {
+    const resident = wedgedResident();
+    const row = new Y.Doc();
+    Y.applyUpdate(row, Y.encodeStateAsUpdate(resident));
+    row.getXmlFragment('default').insert(0, [paragraph('out of band')]);
+    const state = Y.encodeStateVector(resident);
+    expect(() => reconcileRowIntoDoc(resident, rowBytesOf(row))).toThrow(WedgedDocumentError);
+    expect(Y.encodeStateVector(resident)).toEqual(state); // nothing applied
+    expect(coveredRowDigest(resident)).toBeNull();
+    // control: the same reconcile into a healthy copy folds the row in
+    const healthy = new Y.Doc();
+    Y.applyUpdate(healthy, Y.encodeStateAsUpdate(resident));
+    expect(reconcileRowIntoDoc(healthy, rowBytesOf(row))).toEqual({ merged: true });
+  });
+
+  it('a row the wedged document already covers (its own store) is not refused: the store of live\'s encoding proceeds', () => {
+    const resident = wedgedResident();
+    expect(reconcileRowIntoDoc(resident, rowBytesOf(resident))).toEqual({ merged: false });
   });
 });

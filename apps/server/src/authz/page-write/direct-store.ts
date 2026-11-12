@@ -44,3 +44,35 @@ export async function storeDirectWriteNow(
     recordStoreFailure(document);
   }
 }
+
+/**
+ * #847 — the store a WEDGED live document never scheduled. A wedged document (compaction-registry.ts `liveWedged`)
+ * integrates what lands in it (a frame the guard accepted before the wedge and Hocuspocus applied after it, which
+ * Hocuspocus still acknowledges with SyncStatus) but emits no `update`, so Hocuspocus's `handleDocumentUpdate` never
+ * schedules the store it would have. This schedules exactly that one, through the same public `storeDocumentHooks`
+ * (debounced, as an update schedules it), with the last accepted writer's context as the store's `lastContext`. It runs
+ * at the debounce, or at once when the last connection closes (Hocuspocus's `executeNow`), and Hocuspocus unloads the
+ * document only after it: so the compaction at unload finds the row holding live (`holdsItsRow`). Its failure is the
+ * persistence extension's (logged, `recordStoreFailure`), so the heal then skips `not_stored`; anything else that
+ * throws is recorded here. Never rejects.
+ */
+export function scheduleWedgedStore(
+  hocuspocus: Pick<Hocuspocus, 'storeDocumentHooks'>,
+  document: Document,
+  context: unknown,
+): void {
+  try {
+    void Promise.resolve(
+      hocuspocus.storeDocumentHooks(document, {
+        instance: hocuspocus as Hocuspocus,
+        clientsCount: document.getConnectionsCount(),
+        document,
+        documentName: document.name,
+        lastContext: context,
+        lastTransactionOrigin: { source: 'local', context },
+      }),
+    ).catch(() => recordStoreFailure(document));
+  } catch {
+    recordStoreFailure(document);
+  }
+}

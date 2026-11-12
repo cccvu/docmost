@@ -13,7 +13,8 @@ import { displacedItems, isReloadStable, strictOrderDiff } from './order-parity'
 
 /** Pinned: the yjs version and `Item` class source order-parity.ts reads (fields, split and merge rules). */
 const PINNED_YJS_VERSION = '13.6.30';
-const PINNED_ITEM_SHA256 = 'abce0f0d3aaebf08c7d93042a58df1cfb113fdade87d1fd5ad1c62b3428cb0db';
+// #847: re-pinned for patch C ([ccc #847], patches/yjs@13.6.30.patch: Item.integrate's offset branch); stock was abce0f0d….
+const PINNED_ITEM_SHA256 = '9a64ae74788c12f45d9c0ab5f38ac84b83e5c2b9b00b53f771dec7783dacf496';
 const RE_VALIDATE = [
   're-validate order-parity on a yjs bump (#840, ADR 0036). Before updating the pins:',
   '1. diff the new Item class (src/structs/Item.js: fields, splitItem, mergeWith, integrate) and AbstractType/StructStore',

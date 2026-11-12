@@ -1,16 +1,17 @@
 import * as Y from 'yjs';
 import { prosemirrorJSONToYDoc } from '@tiptap/y-tiptap';
 import { serverSchema } from '../page-write/prelim-content';
-import { buildRefused, compactionRequest, isDraining, noteBuildFailed, registerInflight, resetBuildFailuresForTests, resetCompactionGapForTests, setCompactionClockForTests } from '../page-write/compaction-registry';
+import { buildRefused, compactionRequest, isDraining, liveWedged, noteBuildFailed, registerInflight, resetBuildFailuresForTests, resetCompactionGapForTests, setCompactionClockForTests } from '../page-write/compaction-registry';
 import { coveredRowDigest, markRowCovered, unloadCanCompact } from '../page-write/reconcile-store';
 import { COMPACTION_ARM_DELAY_MS, COMPACTION_MIN_INTERVAL_MS } from './doc-bounds';
+import { COLLAB_PAGE_COMPACTING_REASON } from './collab-reasons';
 import { contentOf, processCpuMs, RemoteClient, renderLikeABrowser, step1Frame, syncFrame } from './collab-ingress.testkit';
 import { ConflictScan, CONFLICT_SCAN_STEPS_PER_FRAME, installConflictScanMeter } from './conflict-scan';
 import { rawUpdate, type RawId, type RawStruct } from './conflict-scan.testkit';
 import { checkElement } from './content-rules';
 import * as parentConsistency from './parent-consistency';
 import { EXACT_REPLICA_CAPS, ExactReplicaLog } from './exact-replica';
-import { attachReplicaLog, LOG_OUT_OF_ORDER, LOG_OVER_CAP, LOG_OVER_TOTAL, replicaLogDistrust, replicaLogOf, replicaLogTotal, setReplicaLogTotalForTests } from './exact-replica-registry';
+import { attachReplicaLog, LOG_OUT_OF_ORDER, LOG_OVER_CAP, LOG_OVER_TOTAL, mutationGeneration, replicaLogDistrust, replicaLogOf, replicaLogTotal, setReplicaLogTotalForTests } from './exact-replica-registry';
 import { isReloadStable, strictOrderDiff } from './order-parity';
 import { SocketLimitLog } from './socket-limit-log';
 import {
@@ -37,6 +38,7 @@ import {
  */
 const REFUSED = (rule: string) => `ccc:collab-update-refused:${rule}`;
 const TRY_LATER = 'try-later';
+const COMPACTING = 'compacting';
 const A = 1000; // the attacker's client id
 
 type Conn = { readOnly: boolean; webSocket: { close: jest.Mock }; context: { user: { id: string } } };
@@ -71,6 +73,7 @@ function harness(opts: { base?: Y.Doc; bytes?: Uint8Array; attach?: boolean; cap
       guard.check({ connection: c, document: live, update: frame, context: c.context });
     } catch (err: any) {
       if (err?.code === COLLAB_TRY_LATER_CODE && err?.reason === TRY_LATER_REASON) return TRY_LATER;
+      if (err?.code === COLLAB_TRY_LATER_CODE && err?.reason === COLLAB_PAGE_COMPACTING_REASON) return COMPACTING; // #847: drained to heal
       expect(err).toEqual({ code: COLLAB_REFUSAL_CODE, reason: expect.any(String) });
       return err.reason;
     }
@@ -1031,5 +1034,247 @@ describe('#840 with #827: an order-diverged page always has a heal ahead of it',
     t += 20_001;
     expect(s.join(s.conn('reader2', true))).toBe(TRY_LATER);
     expect(isDraining(s.live)).toBe(true);
+  });
+});
+
+/**
+ * #847 G1-G4 (ADR 0036): a keyed item the stored page already holds, holding several values (written before #847's
+ * per-struct `keyed-split`), split by a frame (a delete of its tail, or an origin inside it), leaves a live keyed piece
+ * that is not its key's head; the next parent delete, an honest one, then wedges live's cleanup for good. The split
+ * itself is refused (`keyedSplitProduct`), in every mode, and so is a frame Yjs itself cannot apply; a wedged live
+ * document is frozen (1013) and heals, with nobody struck.
+ */
+describe('#847 keyed splits of stored items, the crash-class refusals in report mode, and the live wedge', () => {
+  const K = 9; // the stored multi-value keyed item's client id
+  const VALUES = ['left', 'center', 'right'];
+  let t = 4_000_000_000_000;
+  let restore: () => void;
+  beforeEach(() => {
+    restore = setCompactionClockForTests({ now: () => t, uptimeMs: () => COMPACTION_ARM_DELAY_MS + 1 });
+    t += COMPACTION_MIN_INTERVAL_MS * 10;
+  });
+  afterEach(() => {
+    restore();
+    resetBuildFailuresForTests();
+    resetCompactionGapForTests();
+  });
+
+  /** listPage plus, on its second root paragraph `q`, one keyed item K:0..2 holding three `textAlign` values. */
+  function storedHead() {
+    const { doc } = listPage();
+    const q = doc.getXmlFragment('default').get(1) as Y.XmlElement;
+    Y.applyUpdate(doc, rawUpdate([{ client: K, clock: 0, structs: [{ origin: null, right: null, parent: idOf(q), sub: 'textAlign', content: new Y.ContentAny(VALUES) }] }]));
+    const item = q._map.get('textAlign')!;
+    expect([item.length, item.deleted, item.right]).toEqual([3, false, null]); // the stored multi-value head
+    return Y.encodeStateAsUpdate(doc);
+  }
+  /** Loaded as the server loads a stored row (not through the guard), then a guard over it. */
+  const stored = (guard?: CollabUpdateGuard) => harness({ bytes: storedHead(), guard });
+  const reportGuard = (logs: string[]) =>
+    new CollabUpdateGuard({
+      mode: 'report',
+      logger: { warn: (m: string) => logs.push(m) },
+      limitLog: new SocketLimitLog({ warn: () => undefined }),
+      schedule: () => ({ cancel: () => undefined }),
+    });
+  const qOf = (doc: Y.Doc) => doc.getXmlFragment('default').get(1) as Y.XmlElement;
+  const del = (clock: number, len: number) => rawUpdate([], [{ client: K, ranges: [[clock, len]] }]);
+  /** A new `textAlign` value whose origin is INSIDE the stored item (K:1), from `client`. */
+  const midOrigin = (client: number) => rawUpdate([{ client, clock: 0, structs: [{ origin: [K, 1], right: null, content: new Y.ContentAny(['center']) }] }]);
+  /** An honest new paragraph at the top of the page. */
+  const honestInsert = (live: Y.Doc) => new RemoteClient(live).edit(live, (f) => f.insert(0, [new Y.XmlElement('paragraph')]));
+  /**
+   * An honest delete of `q` itself (the parent of the keyed item), as a browser sends it: its transaction's update, from
+   * a replica loaded from live's encoding (where a stranded piece is already deleted, so its delete set never names it).
+   * Not `RemoteClient.edit`: a full-state diff carries the replica's whole delete set, the stranded piece included.
+   */
+  const deleteQ = (live: Y.Doc) => {
+    const peer = new RemoteClient(live);
+    let update: Uint8Array | null = null;
+    peer.doc.on('update', (u: Uint8Array) => (update = u));
+    peer.fragment.delete(1, 1);
+    return update!;
+  };
+  const wedge = (doc: Y.Doc) => {
+    try {
+      doc.getXmlFragment('default').delete(1, 1);
+    } catch {
+      // Yjs's cleanup threw (M2): the document is wedged
+    }
+    return liveWedged(doc);
+  };
+  /** Live with a stranded piece, made server-locally (mirrored into the shadow, never inspected): K:0..1 live, K:2 deleted. */
+  const strandLive = (live: Y.Doc) => {
+    Y.applyUpdate(live, del(2, 1));
+    const piece = Y.getItem(live.store, Y.createID(K, 0)) as Y.Item;
+    expect([piece.length, piece.deleted, piece.right !== null]).toEqual([2, false, true]); // precondition: stranded
+  };
+
+  it('a delete-only split of the stored head is refused keyed-split (control without the rule: applied, then a parent delete wedges live)', () => {
+    for (const [clock, len] of [[2, 1], [1, 1]] as const) {
+      const s = stored();
+      expect(s.send(s.conn('attacker'), del(clock, len))).toBe(REFUSED('keyed-split'));
+      expect(s.send(s.conn('editor'), deleteQ(s.live))).toBe('applied'); // the page is unharmed: an honest delete passes
+      expect(liveWedged(s.live)).toBe(false);
+      // control: the same frame with the rule gone
+      const c = stored();
+      const spy = jest.spyOn(parentConsistency, 'keyedSplitProduct').mockReturnValue(null);
+      try {
+        expect(c.send(c.conn('attacker'), del(clock, len))).toBe('applied');
+      } finally {
+        spy.mockRestore();
+      }
+      expect(wedge(c.live)).toBe(true);
+    }
+  });
+
+  it('a split by an origin inside the stored head is refused keyed-split, for a sender id above and below the item\'s', () => {
+    for (const client of [3, 4000]) {
+      expect(client < K).toBe(client === 3); // both orders of Yjs's conflict resolution
+      const s = stored();
+      expect(s.send(s.conn('attacker'), midOrigin(client))).toBe(REFUSED('keyed-split'));
+      const c = stored();
+      const spy = jest.spyOn(parentConsistency, 'keyedSplitProduct').mockReturnValue(null);
+      try {
+        expect(c.send(c.conn('attacker'), midOrigin(client))).toBe('applied');
+      } finally {
+        spy.mockRestore();
+      }
+      expect(wedge(c.live)).toBe(true);
+    }
+  });
+
+  it('precision: a delete of the whole item, or of its first value only (the rest stays the head), is applied and harmless', () => {
+    for (const [clock, len, left] of [[0, 3, undefined], [0, 1, 'right']] as const) {
+      const s = stored();
+      expect(s.send(s.conn('editor'), del(clock, len))).toBe('applied');
+      expect(qOf(s.live).getAttribute('textAlign')).toBe(left);
+      expect(s.send(s.conn('editor'), deleteQ(s.live))).toBe('applied');
+      expect(liveWedged(s.live)).toBe(false);
+      expect(strictOrderDiff(reloadOf(s.live), s.live)).toBeNull();
+    }
+  });
+
+  it('M1 through the guard (patch C): the tail over a GC integrates as a GC, live reloads into itself; over a live item it is cross-list', () => {
+    for (const deleted of [true, false]) {
+      const base = new Y.Doc();
+      base.clientID = 1;
+      const [p, q, pt, qt] = [new Y.XmlElement('paragraph'), new Y.XmlElement('paragraph'), new Y.XmlText(), new Y.XmlText()];
+      base.transact(() => {
+        base.getXmlFragment('default').insert(0, [p, q]);
+        p.insert(0, [pt]);
+        q.insert(0, [qt]);
+        pt.insert(0, 'P');
+        qt.insert(0, 'Q');
+      });
+      // a fresh replica of the base page by `client`, writing `text` after the first character of paragraph `index`
+      const write = (client: number, index: number, text: string) =>
+        new RemoteClient(base, client).edit(base, (f) => ((f.get(index) as Y.XmlElement).get(0) as Y.XmlText).insert(1, text));
+      const s = harness({ base });
+      expect(s.send(s.conn('attacker'), write(7, 0, 'abc'))).toBe('applied');
+      if (deleted) {
+        expect(s.send(s.conn('editor'), new RemoteClient(s.live).edit(s.live, (f) => f.delete(0, 1)))).toBe('applied');
+        expect(s.live.store.clients.get(7)!.every((x) => x instanceof Y.GC)).toBe(true); // precondition: a GC at K7:0..2
+      }
+      // Yjs integrates the higher id first: 900's insert, then 7's struct at offset 3 (over the GC, or after P's "abc")
+      const frame = Y.mergeUpdates([write(7, 1, 'abcdef'), write(900, 1, 'zz')]);
+      if (!deleted) {
+        expect(s.send(s.conn('attacker'), frame)).toBe(REFUSED('cross-list'));
+        continue;
+      }
+      expect(s.send(s.conn('attacker'), frame)).toBe('applied');
+      expect(s.live.store.clients.get(7)!.map((x) => [x.constructor.name, x.id.clock, x.length])).toEqual([['GC', 0, 6]]);
+      expect(((s.live.getXmlFragment('default').get(0) as Y.XmlElement).get(0) as Y.XmlText).toString()).toBe('Qzz');
+      expect(liveWedged(s.live)).toBe(false);
+      expect(strictOrderDiff(reloadOf(s.live), s.live)).toBeNull();
+      expect(s.send(s.conn('editor'), honestInsert(s.live))).toBe('applied');
+    }
+  });
+
+  it('report mode: keyed-split (new and split products) and a Yjs-stage internal are still refused; a guard bug is logged and applies', () => {
+    const logs: string[] = [];
+    // a new multi-value keyed item (the per-struct rule)
+    const s = stored(reportGuard(logs));
+    const k1 = rawUpdate([{ client: 77, clock: 0, structs: [{ origin: null, right: null, parent: idOf(qOf(s.live)), sub: 'textAlign', content: new Y.ContentAny(['left', 'center']) }] }]);
+    expect(s.send(s.conn('attacker'), k1)).toBe(REFUSED('keyed-split'));
+    // a split of the stored head (the split-product rule)
+    expect(s.send(s.conn('attacker-2'), del(2, 1))).toBe(REFUSED('keyed-split'));
+    expect(logs.filter((l) => l.includes('"rule":"keyed-split"') && l.includes('"mode":"report"'))).toHaveLength(2);
+    // a Yjs throw: live stranded server-locally (mirrored into the shadow), then an honest parent delete wedges the shadow
+    expect(s.send(s.conn('editor'), honestEdit(s.live))).toBe('applied'); // a shadow to mirror into
+    strandLive(s.live);
+    expect(s.send(s.conn('editor-2'), deleteQ(s.live))).toBe(REFUSED('internal'));
+    expect(logs.some((l) => l.includes('"rule":"internal"') && l.includes('"stage":"yjs"') && l.includes('"mode":"report"'))).toBe(true);
+    expect(liveWedged(s.live)).toBe(false); // never reached live
+    // the guard's own inspection failing follows the mode: logged, and the frame applies
+    const r = harness({ guard: reportGuard(logs) });
+    const spy = jest.spyOn(parentConsistency, 'parentConsistencyViolation').mockImplementationOnce(() => {
+      throw new Error('inspection bug');
+    });
+    try {
+      expect(r.send(r.conn('editor'), honestEdit(r.live, 'bug'))).toBe('applied');
+    } finally {
+      spy.mockRestore();
+    }
+    expect(((r.live.getXmlFragment('default').get(1) as Y.XmlElement).get(0) as Y.XmlText).toString()).toMatch(/^bug/);
+    expect(logs.filter((l) => l.includes('"rule":"internal"') && !l.includes('"stage"'))).toHaveLength(1);
+  });
+
+  it('report mode: a keyed split beats a report-only pre-pass violation in the same frame (refused keyed-split, never applied)', () => {
+    const logs: string[] = [];
+    const s = stored(reportGuard(logs));
+    // K:2 then K:1: out of order (`delete-order`, a pre-pass rule, report-only here), and together they strand K:0
+    const frame = rawUpdate([], [{ client: K, ranges: [[2, 1], [1, 1]] }]);
+    expect(s.send(s.conn('attacker'), frame)).toBe(REFUSED('keyed-split'));
+    expect(logs.some((l) => l.includes('"rule":"keyed-split"'))).toBe(true);
+    expect((Y.getItem(s.live.store, Y.createID(K, 0)) as Y.Item).length).toBe(3); // live never split
+  });
+
+  it('control for the Yjs stage: in enforce mode the same honest parent delete is refused internal (yjs), and without the shadow live would wedge', () => {
+    const s = stored();
+    expect(s.send(s.conn('editor'), honestEdit(s.live))).toBe('applied');
+    strandLive(s.live);
+    expect(s.send(s.conn('editor-2'), deleteQ(s.live))).toBe(REFUSED('internal'));
+    expect(s.logs.some((l) => l.includes('"rule":"internal"') && l.includes('"stage":"yjs"'))).toBe(true);
+    expect(wedge(s.live)).toBe(true); // what applying it would have done
+  });
+
+  for (const mode of ['enforce', 'report'] as const) {
+    it(`a wedged live document is frozen (${mode} mode): writers and joiners get 1013 live_wedged, the page heals, nobody is struck`, () => {
+      const logs: string[] = [];
+      const { doc: base, pA } = listPage();
+      const s = harness({ base, guard: mode === 'report' ? reportGuard(logs) : undefined });
+      const lines = () => (mode === 'report' ? logs : s.logs).filter((l) => l.startsWith('COLLAB_ORDER_DIVERGENCE ')).map((l) => JSON.parse(l.slice(l.indexOf('{'))));
+      expect(s.send(s.conn('attacker'), f1(pA))).toBe('applied');
+      expect(s.guard.suspectsOf(s.live)).toEqual(['attacker']); // a suspect before the wedge
+      // the wedge, server-side (any path): a stranded keyed piece, then a parent delete
+      Y.applyUpdate(s.live, rawUpdate([{ client: K, clock: 0, structs: [{ origin: null, right: null, parent: idOf(qOf(s.live)), sub: 'textAlign', content: new Y.ContentAny(VALUES) }] }]));
+      strandLive(s.live);
+      expect(wedge(s.live)).toBe(true);
+      const generation = mutationGeneration(s.live);
+      expect(s.send(s.conn('editor'), honestInsert(s.live))).toBe(TRY_LATER);
+      expect(lines()).toEqual([expect.objectContaining({ where: 'rebuild', outcome: 'live_wedged', suspects: [] })]);
+      expect(compactionRequest(s.live)).toMatchObject({ reason: 'order_divergence', userId: null });
+      expect(isDraining(s.live)).toBe(mode === 'enforce'); // report mode never drains
+      // enforce: the page drains (every later frame and join gets the compacting 1013); report: never drained, still 1013
+      const closed = mode === 'enforce' ? COMPACTING : TRY_LATER;
+      expect(s.join(s.conn('reader', true))).toBe(closed);
+      expect(s.send(s.conn('editor'), honestInsert(s.live))).toBe(closed);
+      expect(lines()).toHaveLength(1); // logged once
+      expect(s.guard.suspectsOf(s.live)).toEqual(['attacker']); // nobody struck: the suspicion is not spent
+      expect(mutationGeneration(s.live)).toBe(generation);
+      expect(liveWedged(s.live)).toBe(true); // never unwedged in place
+    });
+  }
+
+  it('a join is the first to find the wedge: 1013, logged where join, the page heals', () => {
+    const s = stored();
+    strandLive(s.live);
+    expect(wedge(s.live)).toBe(true);
+    expect(s.join(s.conn('reader', true))).toBe(TRY_LATER);
+    expect(s.divergence()).toEqual([expect.objectContaining({ where: 'join', outcome: 'live_wedged', suspects: [] })]);
+    expect(compactionRequest(s.live)).toMatchObject({ reason: 'order_divergence' });
+    expect(isDraining(s.live)).toBe(true);
+    expect(s.send(s.conn('editor'), honestInsert(s.live))).toBe(COMPACTING);
   });
 });

@@ -28,6 +28,7 @@ import {
   WS_CLOSE_MESSAGE_TOO_BIG,
 } from "./collab-access";
 import {
+  COLLAB_LOCAL_COPY_RULE,
   COLLAB_REFUSAL_RULES,
   collabRefusalCause,
 } from "./collab-refusal-cause";
@@ -224,6 +225,14 @@ describe("server CollabRule ↔ client refusal causes", () => {
     );
     expect(extra).toEqual([]);
     expect(collabRefusalCause("not-a-rule-yet")).toBe("other");
+  });
+
+  // #847: the client's own rule (a broken local copy) is the copy cause, outside every set, and never a server rule
+  it("the client's local-copy rule matches no server rule and stays out of the cause sets", () => {
+    expect(serverRules).not.toContain(COLLAB_LOCAL_COPY_RULE);
+    expect(COLLAB_LOCAL_COPY_RULE).not.toMatch(/^[a-z-]+$/); // the server's rule alphabet
+    expect(causes.filter(([, set]) => set.has(COLLAB_LOCAL_COPY_RULE))).toEqual([]);
+    expect(collabRefusalCause(COLLAB_LOCAL_COPY_RULE)).toBe("copy");
   });
 
   it("the cause sets are disjoint", () => {

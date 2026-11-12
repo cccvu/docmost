@@ -20,6 +20,7 @@ import {
   CollabLocalCopy,
   trackCollabCopy,
 } from "./collab-epoch";
+import { watchCollabCopyHealth } from "./collab-copy-health";
 
 /**
  * CCC fork addition (cccvu/wiki-v2#810) — carries out the steps `collab-access.ts` decides for one page editor's
@@ -43,6 +44,9 @@ import {
  *
  * #827: it judges refusals against the epoch its copy claims (`epoch`), feeds the provider's `synced` (which resets
  * the try-later wait), and keeps the local copy's dirty marker (`local`, collab-epoch.ts) for `isCopyDirty`.
+ *
+ * #847: it also watches the local copy's Y.Doc (`collab-copy-health.ts`): a copy that wedged or failed its replay is
+ * refused (`local-copy-broken`), so it stops sending and persisting and the notice offers Reload and Discard.
  */
 
 /** The slice of `HocuspocusProviderWebsocket` the controller drives. */
@@ -116,6 +120,7 @@ export function createCollabAccessController(
   let destroyed = false;
   let retryTimer: ReturnType<typeof setTimeout> | undefined;
   let copy: CollabCopyTracker | null = null;
+  let unwatchCopy: (() => void) | null = null;
   const epoch = options.epoch ?? 0;
 
   // False once destroyed, and once refused: a token refetch already in flight never reopens a refused socket.
@@ -218,7 +223,13 @@ export function createCollabAccessController(
       next.on("close", onClose);
       next.on("unsyncedChanges", onUnsyncedChanges);
       next.on("synced", onSynced);
-      if (options.local) copy = trackCollabCopy(options.local, next);
+      if (options.local) {
+        copy = trackCollabCopy(options.local, next);
+        // #847: a broken copy (wedged, or a replay that threw) is refused like a server refusal
+        unwatchCopy = watchCollabCopyHealth(options.local, () =>
+          handle({ kind: "local-copy-broken" }),
+        );
+      }
       network?.addEventListener("online", onOnline);
     },
     handle,
@@ -238,6 +249,7 @@ export function createCollabAccessController(
         provider.off("synced", onSynced);
       }
       copy?.destroy();
+      unwatchCopy?.();
     },
   };
 }

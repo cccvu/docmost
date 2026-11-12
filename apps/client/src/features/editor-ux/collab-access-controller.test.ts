@@ -18,6 +18,8 @@ import {
   collabRetryDelay,
 } from "./collab-access";
 import { COLLAB_UNSYNCED_KEY, CollabLocalCopy } from "./collab-epoch";
+import { COLLAB_LOCAL_COPY_RULE } from "./collab-refusal-cause";
+import { isWedged, wedgeWithKeyedSplit } from "./collab-copy-health.testkit";
 import { createCollabAccessController } from "./collab-access-controller";
 import { reopensOnVisible } from "./collab-reconnect";
 import {
@@ -662,5 +664,102 @@ describe("the refused rule reaches the controller (refusedRule)", () => {
     expect(second.access.state.refused).toBe(true);
     expect(second.access.state.refusedRule).toBeNull();
     expect(second.access.state.refusalKind).toBe("too-big");
+  });
+});
+
+// cccvu/wiki-v2#847 — a broken local copy (collab-copy-health.ts) through the real provider: the controller refuses it
+// like a server refusal, so the broken copy stops sending, and nothing it watched outlives destroy().
+describe("a broken local copy (#847)", () => {
+  /** A y-indexeddb stand-in: its doc, its custom store, and its `synced` flag. */
+  function idbLocal(synced: boolean) {
+    return (ydoc: Y.Doc) => {
+      const store = new Map<string, unknown>();
+      return {
+        doc: ydoc,
+        synced,
+        get: async (key: string) => store.get(key),
+        set: async (key: string, value: number) => store.set(key, value),
+      };
+    };
+  }
+  const MALFORMED = Uint8Array.from([5, 1, 7, 0, 9]);
+  const TRANSACTION_EVENTS = [
+    "beforeAllTransactions",
+    "afterAllTransactions",
+    "beforeTransaction",
+  ];
+  const listeners = (ydoc: Y.Doc) =>
+    TRANSACTION_EVENTS.map(
+      (e) =>
+        (ydoc as unknown as { _observers: Map<string, Set<unknown>> })._observers
+          .get(e)?.size ?? 0,
+    );
+
+  it("a wedged document (bug M2) is refused with the client's rule: detached, socket closed, never reconnected", async () => {
+    const { access, remote, ydoc, markDisconnected, refetchToken } = setup({
+      local: idbLocal(true),
+    });
+    const first = await openLatest();
+    first.receive(serverFrames.authenticated(DOC));
+    await flush();
+    wedgeWithKeyedSplit(ydoc);
+    expect(isWedged(ydoc)).toBe(true);
+    expect(access.state.refused).toBe(false); // never synchronously, inside the throwing transaction
+    await flush();
+    expect(access.state.refused).toBe(true);
+    expect(access.state.refusedRule).toBe(COLLAB_LOCAL_COPY_RULE);
+    expect(access.state.refusalKind).toBe("generic");
+    expect(collabAllowsEditing(access.state)).toBe(false);
+    expect(remote.isAttached).toBe(false);
+    expect(first.closedByClient).toBe(true);
+    expect(markDisconnected).not.toHaveBeenCalled();
+    expect(refetchToken).not.toHaveBeenCalled();
+    const sentBefore = first.sent.length;
+    ydoc.getText("t").insert(0, "after");
+    await advance(COLLAB_LOST_RETRY_MS * 2);
+    expect(first.sent.length).toBe(sentBefore);
+    expect(sockets()).toHaveLength(1);
+  });
+
+  it("a stored copy whose replay threw is refused, and a later edit (the doc is not wedged) is never sent", async () => {
+    const { access, ydoc, local } = setup({ local: idbLocal(false) });
+    const first = await openLatest();
+    first.receive(serverFrames.authenticated(DOC));
+    await flush();
+    expect(() =>
+      Y.transact(ydoc, () => Y.applyUpdate(ydoc, MALFORMED), local, false),
+    ).toThrow();
+    await flush();
+    expect(access.state.refused).toBe(true);
+    expect(access.state.refusedRule).toBe(COLLAB_LOCAL_COPY_RULE);
+    expect(first.closedByClient).toBe(true);
+    const sentBefore = first.sent.length;
+    ydoc.getText("t").insert(0, "after");
+    await advance(1_000);
+    expect(isWedged(ydoc)).toBe(false);
+    expect(first.sent.length).toBe(sentBefore);
+  });
+
+  it("a healthy copy is not refused (control: the same edit is sent)", async () => {
+    const { access, ydoc } = setup({ local: idbLocal(true) });
+    const first = await openLatest();
+    first.receive(serverFrames.authenticated(DOC));
+    first.receive(serverFrames.syncStep2(DOC, new Y.Doc()));
+    await flush();
+    const sentBefore = first.sent.length;
+    ydoc.getText("t").insert(0, "typed");
+    await advance(1_000);
+    expect(access.state.refused).toBe(false);
+    expect(first.sent.length).toBeGreaterThan(sentBefore);
+  });
+
+  it("after destroy() its listeners are gone and a wedge changes nothing", async () => {
+    const { access, ydoc } = setup({ local: idbLocal(true) });
+    const bound = listeners(ydoc);
+    access.destroy();
+    expect(listeners(ydoc)).toEqual(bound.map((n) => n - 1));
+    wedgeWithKeyedSplit(ydoc);
+    await flush();
+    expect(access.state.refused).toBe(false);
   });
 });

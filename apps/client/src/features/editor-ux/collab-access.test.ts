@@ -26,7 +26,10 @@ import {
   refusedRuleOf,
   WS_CLOSE_MESSAGE_TOO_BIG,
 } from "./collab-access";
-import { collabRefusalCause } from "./collab-refusal-cause";
+import {
+  COLLAB_LOCAL_COPY_RULE,
+  collabRefusalCause,
+} from "./collab-refusal-cause";
 
 /** An unsigned JWT with the given exp (seconds). jwt-decode only decodes. */
 const jwt = (exp: number) =>
@@ -704,6 +707,11 @@ describe("collabRefusalCause", () => {
     expect(collabRefusalCause(null)).toBe("other");
     expect(collabRefusalCause(undefined)).toBe("other");
   });
+
+  it("#847: the client's local-copy rule → copy (the stored-copy notice)", () => {
+    expect(COLLAB_LOCAL_COPY_RULE).toBe("client:local-copy");
+    expect(collabRefusalCause(COLLAB_LOCAL_COPY_RULE)).toBe("copy");
+  });
 });
 
 // cccvu/wiki-v2#810 — the wiring in page-editor.tsx (seam 169) is now one controller (collab-access-controller.ts,
@@ -1064,5 +1072,47 @@ describe("#827 epoch, compaction and the Discard-first rules", () => {
     const step = nextCollabAccess(initialCollabAccess, denied(`${COLLAB_PAGE_COMPACTING_REASON}x`));
     expect(step.state.compacting).toBe(false);
     expect(step.refreshToken).toBe(true);
+  });
+});
+
+// cccvu/wiki-v2#847 — this browser's own Yjs copy broke (collab-copy-health.ts): refused like a server refusal.
+describe("a broken local copy (local-copy-broken, #847)", () => {
+  const broken: CollabAccessEvent = { kind: "local-copy-broken" };
+
+  it("is refused: detach, close the socket, stop editing, the client's own rule, never reconnect, refetch or retry", () => {
+    const step = nextCollabAccess(initialCollabAccess, broken);
+    expect(step.state.refused).toBe(true);
+    expect(step.state.refusalKind).toBe("generic");
+    expect(step.state.refusedRule).toBe(COLLAB_LOCAL_COPY_RULE);
+    expect(collabRefusalCause(step.state.refusedRule)).toBe("copy");
+    expect(collabAllowsEditing(step.state)).toBe(false);
+    expect(step.detach).toBe(true);
+    expect(step.disconnectSocket).toBe(true);
+    expect(step.reconnect || step.refreshToken || step.markDisconnected).toBe(false);
+    expect(step.retryAfterMs).toBe(0);
+    expect(collabAwaitsRetry(step.state)).toBe(false);
+  });
+
+  it("ends a compaction banner and a lost or try-later wait (the notice replaces them)", () => {
+    const compacting = nextCollabAccess(initialCollabAccess, {
+      kind: "server-close",
+      socketConnected: true,
+      reason: COLLAB_PAGE_COMPACTING_REASON,
+    }).state;
+    const step = nextCollabAccess(compacting, broken);
+    expect(step.state.compacting).toBe(false);
+    expect(collabAwaitsRetry(step.state)).toBe(false);
+  });
+
+  it("an editor already refused keeps its refusal (same state, nothing done)", () => {
+    const refused = nextCollabAccess(initialCollabAccess, {
+      kind: "server-close",
+      socketConnected: true,
+      reason: `${COLLAB_UPDATE_REFUSED_PREFIX}schema`,
+    }).state;
+    const step = nextCollabAccess(refused, broken);
+    expect(step.state).toBe(refused);
+    expect(step.state.refusedRule).toBe("schema");
+    expect(step.detach || step.disconnectSocket).toBe(false);
   });
 });

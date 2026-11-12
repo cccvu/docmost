@@ -3,8 +3,7 @@ import { initProseMirrorDoc, updateYFragment } from '@tiptap/y-tiptap';
 import { Node as PMNode } from '@tiptap/pm/model';
 import { serverSchema } from '../page-write/prelim-content';
 import { copyOf, rawUpdate, type RawId } from './conflict-scan.testkit';
-import { parentConsistencyViolation } from './parent-consistency';
-import { isKeyedSplit } from './update-guard';
+import { isKeyedSplit, keyedSplitProduct, parentConsistencyViolation } from './parent-consistency';
 
 /**
  * #840 (ADR 0036): every item a frame integrates sits beside neighbours of its own parent and key. A crafted frame that
@@ -15,8 +14,15 @@ import { isKeyedSplit } from './update-guard';
 /** The parent rule's hit (with the side that differs), or the keyed-split rule's (no side). */
 type Hit = { client: number; clock: number; side?: 'left' | 'right' } | null;
 
-/** #847: the guard's keyed-split rule over what `tr` integrated (the corpus checks it with the parent rule). */
+/**
+ * #847: the guard's keyed-split rules over `tr` (the corpus checks them with the parent rule): the per-struct one on what
+ * it integrated, and the split-product one (`keyedSplitProduct`, the production function) on the keyed pieces its splits
+ * and parent deletes pushed onto `_mergeStructs` (counted: `seen.keyedPieces`).
+ */
 function keyedSplitIn(tr: Y.Transaction): Hit {
+  for (const struct of tr._mergeStructs) if (struct instanceof Y.Item && struct.parentSub !== null) seen.keyedPieces++;
+  const piece = keyedSplitProduct(tr);
+  if (piece) return { client: piece.id.client, clock: piece.id.clock };
   const store = tr.doc.store;
   for (const [client, structs] of store.clients) {
     const before = tr.beforeState.get(client) ?? 0;
@@ -324,7 +330,7 @@ const listItem = (r: () => number, depth: number): Y.XmlElement => {
 };
 
 let watchingKeyed = false;
-const seen = { keyed: 0, frames: 0, step2: 0, peerIntegrations: 0, undo: 0, redo: 0, ytiptap: 0, parentDeletes: 0, nested: 0, remounts: 0, items: 0, withLeft: 0, withRight: 0, deletedNeighbour: 0, grouped: 0, pauses: 0 };
+const seen = { keyed: 0, keyedPieces: 0, frames: 0, step2: 0, peerIntegrations: 0, undo: 0, redo: 0, ytiptap: 0, parentDeletes: 0, nested: 0, remounts: 0, items: 0, withLeft: 0, withRight: 0, deletedNeighbour: 0, grouped: 0, pauses: 0 };
 
 function edit(r: () => number, peer: Peer): void {
   const d = peer.doc;
@@ -516,3 +522,49 @@ describe('#840 parent consistency: honest editing never trips it', () => {
 });
 
 
+
+describe('#847 keyed-split: an honest split of a DELETED keyed run is never a hit', () => {
+  it('a peer sets one attribute three times (its old values merge into one deleted run); an offline peer re-sets it from the first value', () => {
+    const base = new Y.Doc();
+    base.clientID = 1;
+    base.getXmlFragment('default').insert(0, [new Y.XmlElement('paragraph')]);
+    const live = copyOf(base); // gc on, as the server's live document
+    const a = copyOf(base);
+    a.clientID = 5000;
+    const b = copyOf(base);
+    b.clientID = 6000;
+    const p = (d: Y.Doc) => d.getXmlFragment('default').get(0) as Y.XmlElement;
+    const deliver = (from: Y.Doc, to: Y.Doc) => Y.applyUpdate(to, Y.encodeStateAsUpdate(from, Y.encodeStateVector(to)));
+    p(a).setAttribute('textAlign', 'left');
+    deliver(a, live);
+    deliver(live, b); // b now holds a:0 as the head, then goes offline
+    for (const value of ['center', 'right']) {
+      p(a).setAttribute('textAlign', value); // its own transaction each: a:1 and a:2
+      deliver(a, live);
+    }
+    const run = structAt(live, 5000, 0) as Y.Item;
+    expect([run.length, run.deleted]).toEqual([2, true]); // precondition: a:0..1 merged into one deleted run
+    p(b).setAttribute('textAlign', 'center'); // origin a:0: inside the run
+    const frame = Y.encodeStateAsUpdate(b, Y.encodeStateVector(live));
+    let pieces = 0;
+    let hit: Y.Item | null = null;
+    Y.transact(
+      live,
+      (tr) => {
+        Y.applyUpdate(live, frame, 'remote');
+        pieces = tr._mergeStructs.filter((x) => x instanceof Y.Item && x.parentSub !== null).length;
+        hit = keyedSplitProduct(tr);
+      },
+      'remote',
+      false,
+    );
+    expect(pieces).toBeGreaterThan(0); // anti-vacuity: the frame split the deleted run
+    expect(hit).toBeNull();
+    // and the page stays healthy: a parent delete cleans up, a reload equals live
+    deliver(live, a);
+    a.getXmlFragment('default').delete(0, 1);
+    deliver(a, live);
+    expect((live as unknown as { _transactionCleanups: unknown[] })._transactionCleanups).toHaveLength(0);
+    expect(copyOf(live).getXmlFragment('default').toString()).toBe(live.getXmlFragment('default').toString());
+  });
+});

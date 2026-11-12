@@ -110,6 +110,23 @@ export function compactionRequest(doc: object): CompactionRequest | null {
 export function orderHealRequested(doc: object): boolean {
   return docs.get(doc)?.orderHeal === true;
 }
+
+/**
+ * #847: Yjs's cleanup of a transaction on `doc` threw (M2: a parent delete over a stranded keyed piece), so `doc` is
+ * WEDGED for good: every later transaction integrates but is never cleaned up, so it emits no `update` (no broadcast,
+ * no scheduled store, no store generation) and `afterTransaction` never fires again. Its visible tree is still the
+ * correct one (integration and deletion end before cleanup starts; wedge-integrity.spec.ts), and so is a reload of its
+ * encoding. So a wedged live document is frozen, never unwedged in place: the guard refuses its frames and joins 1013
+ * and drains it to heal (a compaction from live), the direct-write gate refuses API writes (503, nothing changed), and
+ * the store's reconcile folds nothing into it. Reads only `_transaction` and `_transactionCleanups`, which Yjs's
+ * `transact`/`cleanupTransactions` (pinned by conflict-scan.spec.ts's sources) set. Also true for a moment INSIDE a
+ * healthy cleanup (a Yjs listener runs with `_transaction` null and the cleanup pending): never read it from a Yjs
+ * listener.
+ */
+export function liveWedged(doc: object): boolean {
+  const d = doc as { _transaction?: unknown; _transactionCleanups?: unknown };
+  return d._transaction === null && Array.isArray(d._transactionCleanups) && d._transactionCleanups.length > 0;
+}
 export function isDraining(doc: object): boolean {
   return docs.get(doc)?.requested?.drain === true;
 }

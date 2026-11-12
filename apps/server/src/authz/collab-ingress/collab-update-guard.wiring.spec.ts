@@ -103,7 +103,7 @@ describe('#781 the collab update guard is wired first, alone and synchronous', (
     expect(definesHook(ts.createSourceFile('x.ts', 'const beforeSyncNot = 1; call(beforeSync);', ts.ScriptTarget.Latest, true), 'beforeSync')).toBe(false);
   });
 
-  it('#827: its hooks are exactly the frame hook, the post-auth join gate and the load pair; only afterLoadDocument is async', () => {
+  it('#827: its hooks are exactly the frame hook, the post-auth join gate, the load pair and (#847) onConfigure; only afterLoadDocument is async', () => {
     const sf = parse(join(__dirname, 'collab-update-guard.extension.ts'));
     const hooks = new Map<string, boolean>();
     const visit = (n: ts.Node) => {
@@ -120,7 +120,8 @@ describe('#781 the collab update guard is wired first, alone and synchronous', (
     visit(sf);
     // No onAuthenticate or onConnect: this extension outranks the auth extension, so a hook there would answer a client
     // that has not authenticated (a compacting refusal would tell it the page exists and is compacting).
-    expect([...hooks.keys()].sort()).toEqual(['afterLoadDocument', 'beforeHandleMessage', 'connected', 'extensionName', 'onLoadDocument', 'priority']);
+    // #847: onConfigure (synchronous, at configure time only) hands the guard Hocuspocus's store path for a wedged live
+    expect([...hooks.keys()].sort()).toEqual(['afterLoadDocument', 'beforeHandleMessage', 'connected', 'extensionName', 'onConfigure', 'onLoadDocument', 'priority']);
     // afterLoadDocument alone: #841's load repair yields a macrotask after #827's load charge (which runs before it)
     expect([...hooks].filter(([, isAsync]) => isAsync).map(([name]) => name)).toEqual(['afterLoadDocument']);
   });

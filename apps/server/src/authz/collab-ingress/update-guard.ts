@@ -115,6 +115,7 @@ import {
   isDraining,
   pageFullUntil,
   lineageEpoch,
+  liveWedged,
   markPageFull,
   requestCompaction,
   type CompactionReason,
@@ -143,7 +144,7 @@ import {
   settleAcceptedFrames,
 } from './exact-replica-registry';
 import { strictOrderDiff } from './order-parity';
-import { parentConsistencyViolation } from './parent-consistency';
+import { isKeyedSplit, keyedSplitProduct, parentConsistencyViolation } from './parent-consistency';
 import { COLLAB_ORDER_DIVERGENCE_TOKEN, logOrderDivergence, type OrderDivergenceSink, type OrderDivergenceWhere } from '../page-write/order-divergence-log';
 import {
   COMPACT_MAX_LIVE_STRUCTS,
@@ -364,9 +365,12 @@ type Header = { type: number; subtype?: number; payload?: Uint8Array | null };
 type AwarenessEntry = { clientID: number; clock: number; state: Uint8Array };
 /**
  * #816: what a refusal line may add: numbers and fixed words only, never a value from the frame. `unproven-owner`: a
- * `foreign-client` at an id whose owner has only announced it, answered `unresolved` (inspectTransaction).
+ * `foreign-client` at an id whose owner has only announced it, answered `unresolved` (inspectTransaction). `yjs`
+ * (#847): an `internal` that Yjs itself threw applying the frame to the shadow or cleaning its transaction up, outside
+ * the guard's inspection, the meter and the deadline: live would throw the same (a half-applied frame, or a cleanup
+ * wedged for good), so it is refused in every mode (`enforces`).
  */
-type RefusalLog = { steps?: number; stage?: 'conflict-scan' | 'unproven-owner' };
+type RefusalLog = { steps?: number; stage?: 'conflict-scan' | 'unproven-owner' | 'yjs' };
 type ShadowResult = {
   violation: Violation | null;
   binds: Map<number, string>;
@@ -496,8 +500,21 @@ class DocGuard {
    * SUSPECTS_PER_PAGE per verdict), however many joins or probes find the page unstable while it cannot heal yet.
    */
   episode: { epoch: number | null; struck: Set<string> } | null = null;
+  /** #847: the context of the last writer frame accepted here (who a forced store of a wedged live is attributed to). */
+  lastWriter: unknown = undefined;
+  /** #847: the wedge was found and handled (logged, the heal asked for, the store forced): once per document. */
+  wedgeHandled = false;
+  /** #847: a wedge check is queued for the next macrotask (one per burst of live transactions). */
+  wedgeCheckQueued = false;
   constructor(readonly live: GuardDocument) {}
 }
+
+/**
+ * #847: schedules a store of a wedged live document through the store path its missing `update` events would have
+ * scheduled (collab-update-guard.extension.ts wires Hocuspocus's own `storeDocumentHooks`), attributed to `context`.
+ * Called outside any Yjs listener; never throws to the guard.
+ */
+export type WedgedStore = (live: GuardDocument, context: unknown) => void;
 
 type Bucket = { tokens: number; at: number };
 /** `cpu` (milliseconds, #816) is only used on the whole-user entry. `deadline` (#827): shadow-apply timeouts since this
@@ -513,6 +530,8 @@ export class CollabUpdateGuard {
   /** #790: per (user, document) budgets, least recently used first; and per connection, the ids it already paid for. */
   private readonly userDocBudgets = new Map<string, UserDocBudget>();
   private readonly awarenessNewIds = new WeakMap<object, Set<number>>();
+  /** #847: see `WedgedStore`; null until the extension is configured (specs set it directly). */
+  private wedgedStore: WedgedStore | null = null;
   /** Read by the guard extension too: the load repair runs only in enforce mode (#841). */
   readonly mode: CollabGuardMode;
   private readonly logger: GuardLogger;
@@ -617,6 +636,11 @@ export class CollabUpdateGuard {
     if (frame.connection.readOnly) return; // Hocuspocus never applies a read-only connection's update (it only nacks it)
     if (!header.payload) return this.refuse(frame, header, { rule: 'undecodable' });
     this.inspect(frame, header, header.payload);
+  }
+
+  /** #847: how a wedged live document is stored (the extension's `onConfigure` wires Hocuspocus's store path). */
+  setWedgedStore(store: WedgedStore | null): void {
+    this.wedgedStore = store;
   }
 
   /** The shadow replica of `live` (specs and diagnostics). */
@@ -764,11 +788,12 @@ export class CollabUpdateGuard {
   /**
    * An exhausted (user, document) budget: close the SOCKET with 1013 first (so Hocuspocus's document CLOSE, sent next,
    * is dropped by the closing socket and the editor sees only a retryable socket close), then throw so this frame and
-   * the ones queued behind it are not applied. Logged `COLLAB_SOCKET_LIMIT`, rate-limited. Report mode only logs.
+   * the ones queued behind it are not applied. Logged `COLLAB_SOCKET_LIMIT`, rate-limited. Report mode only logs, unless
+   * `always` (#847: a wedged live document, frozen in every mode).
    */
-  private tryLater(frame: GuardFrame, limit: SocketLimit): void {
+  private tryLater(frame: GuardFrame, limit: SocketLimit, always = false): void {
     this.limitLog.log(limit, { userId: String(frame.context?.user?.id ?? '') });
-    if (this.mode === 'report') return;
+    if (this.mode === 'report' && !always) return;
     try {
       frame.connection.webSocket?.close(COLLAB_TRY_LATER_CODE, TRY_LATER_REASON);
     } catch {
@@ -926,24 +951,28 @@ export class CollabUpdateGuard {
       const ready = shadowed.ready;
       // #827: a page past the load bounds is replicated by no one until it compacts; its writers wait (1013).
       if (ready === 'compacting') return this.compacting(frame);
-      // #840: nor is a page no exact shadow can be built for, until it heals.
-      if (ready === 'diverged') return this.tryLater(frame, 'order_divergence');
+      // #840: nor is a page no exact shadow can be built for, until it heals. #847: a wedged live in every mode (a frame
+      // applied to it would be acknowledged and never broadcast or stored).
+      if (ready === 'diverged') return this.tryLater(frame, 'order_divergence', liveWedged(doc.live));
       if (ready !== 'ready') return this.refuse(frame, header, violation ?? { rule: 'shadow-unavailable' });
       const applyStarted = this.cpuNow();
       const result = this.applyToShadow(doc, payload, userId, pre, ownedBy(doc.announced.get(frame.connection)));
       const applyMs = this.cpuNow() - applyStarted;
       if (result.timedOut) return this.deadlineStrike(frame, header);
-      // A write outside `default` wins over a report-only pre-pass violation: it is refused in every mode
-      violation = result.violation?.rule === 'root' ? result.violation : (violation ?? result.violation);
+      // A shadow violation refused in every mode (`enforces`: a write outside `default`, a keyed split, a Yjs throw) wins
+      // over a report-only pre-pass violation; otherwise the pre-pass's, which carries no shadow log.
+      const fromShadow = result.violation !== null && (violation === null || this.enforces(result.violation.rule, result.log, true));
+      if (fromShadow) violation = result.violation;
+      const log = fromShadow ? result.log : undefined;
       if (!violation) for (const v of result.reportOnly) this.log('COLLAB_LEGACY_PENDING_INVALID', doc.live, { rule: v.rule });
-      if (violation && this.enforces(violation.rule)) {
+      if (violation && this.enforces(violation.rule, log)) {
         // The shadow holds the refused frame; live never will. Rebuilt lazily by the next frame that needs it
         // (ensureShadow), so a refuse/reconnect loop pays no rebuild per refusal, and that rebuild is this user's.
         doc.dirty = true;
         doc.dirtiedBy = userId;
-        return this.refuse(frame, header, violation, result.log);
+        return this.refuse(frame, header, violation, log);
       }
-      if (violation) this.refuse(frame, header, violation, result.log); // report mode: logged, and the frame applies
+      if (violation) this.refuse(frame, header, violation, log); // report mode: logged, and the frame applies
       // 3. #827: the per-page structure caps, on what the frame changed.
       const caps = result.applied ? this.checkCaps(doc, result, userId) : 'ok';
       if (caps !== 'ok' && this.mode === 'enforce') {
@@ -967,6 +996,7 @@ export class CollabUpdateGuard {
       else if (result.unclear) this.suspect(doc, doc.unclear, userId);
       // #840: the join check's cache key counts only frames that can change what a joiner gets (an empty Step2 cannot)
       if (result.changes) doc.accepted++;
+      doc.lastWriter = frame.context; // #847: a forced store of a wedged live is attributed to the last accepted writer
       // #840: live applies it next on this connection: its raw bytes go into the replay log then, and its apply is timed
       // and charged to this user. Last: nothing after it may throw.
       noteAcceptedFrame(doc.live, frame.connection, {
@@ -1216,6 +1246,9 @@ export class CollabUpdateGuard {
     let out: Inspection | null = null;
     let applied: Y.Transaction | null = null;
     const pendingAtStart = pendingStateOf(store);
+    // #847: where a throw came from. `apply` (Yjs integrating the frame) and `cleanup` (Yjs's cleanup of the
+    // transaction, after the callback returned) are Yjs's own; `inspect` is the guard's.
+    const at = { phase: 'apply' as 'apply' | 'inspect' | 'cleanup' }; // set inside the callback (a closure TS cannot follow)
     try {
       this.meter.metered(scan, () =>
         this.runWithDeadline(
@@ -1225,7 +1258,9 @@ export class CollabUpdateGuard {
               (tr) => {
                 applied = tr;
                 Y.applyUpdate(shadow, payload, INSPECT); // V1, as y-protocols reads Step2 and Update
+                at.phase = 'inspect';
                 out = this.inspectTransaction(doc, tr, userId, own, pendingBefore, pre.clients, tracked);
+                at.phase = 'cleanup';
               },
               INSPECT,
               false,
@@ -1241,7 +1276,11 @@ export class CollabUpdateGuard {
         return { ...failed({ rule: 'apply-deadline' }), timedOut: true };
       }
       if (scan.trip !== null) return failed({ rule: 'conflict-scan' }, { steps: scan.trip.steps });
-      return failed({ rule: 'internal' }, scan.failure !== null ? { stage: 'conflict-scan' } : undefined);
+      if (scan.failure !== null) return failed({ rule: 'internal' }, { stage: 'conflict-scan' });
+      // #847: Yjs threw on its own (M1's half-applied integrate, M2's wedged cleanup). A shadow whose cleanup is stuck
+      // is Yjs's too, whatever the phase: a throw from the inspection unwinds through Yjs's cleanup, which can throw over it.
+      if (at.phase !== 'inspect' || liveWedged(shadow)) return failed({ rule: 'internal' }, { stage: 'yjs' });
+      return failed({ rule: 'internal' });
     }
     const found = out as Inspection | null;
     if (found === null) return failed({ rule: 'internal' });
@@ -1311,6 +1350,13 @@ export class CollabUpdateGuard {
       if (!rootDelete && struct instanceof Y.Item && rootOf(struct.parent as Y.AbstractType<any>) !== root) rootDelete = true;
     });
     if (rootDelete) return result({ rule: 'root' });
+    // #847: a split of a keyed item the page already held (a delete of its tail, or an origin inside it) that leaves a
+    // live piece which is not its key's head. Yjs's integrate deletes a keyed item that lands with a right neighbour and
+    // the old head when a new head lands after it, so a live keyed item that is not the single head can only come from
+    // a split: the next parent delete (an honest one) then wedges live's cleanup for good (parent-consistency.ts). The
+    // per-struct `keyed-split` reads new clocks only; this reads the transaction's split products. Refused in every mode
+    // (`enforces`), a legacy pending item's split too: a crafted frame that splits stored content is never honest.
+    if (keyedSplitProduct(tr) !== null) return result({ rule: 'keyed-split' });
 
     // #827: new clocks come only from the frame's structs and the pending structs it releases (never O(ids)).
     const clients = new Set(frameClients);
@@ -1347,6 +1393,10 @@ export class CollabUpdateGuard {
         }
         if (!(struct instanceof Y.Item)) continue; // GC: no content, no parent
         const v = checkStruct(struct, root, touched, newTypes, grew);
+        // A legacy pending struct's hit is logged, never refused, `keyed-split` included (#847): an unsplit legacy
+        // multi-value head cannot wedge (a parent delete deletes it whole), every split of one is refused above
+        // (`keyedSplitProduct`, every mode), and the frame that releases it is an honest editor's supplying the
+        // missing dependency: refusing it would detach that editor for good.
         if (v && legacy) reportOnly.push(v);
         else if (v) return result(v);
         if (!suspect && !legacy) {
@@ -1440,9 +1490,26 @@ export class CollabUpdateGuard {
         if (isDeadlineExceeded(err)) setImmediate(() => this.needsCompaction(created, 'mirror_deadline', null, true));
       }
     };
+    // #847: a wedging transaction emits no update, and neither does anything live integrates after it, so the wedge is
+    // looked for after every burst of live transactions (its `afterTransaction` still fires), one macrotask later:
+    // never from inside the Yjs listener, where `liveWedged` reads a healthy cleanup in flight as a wedge.
+    const wedgeWatch = () => {
+      if (created.wedgeCheckQueued || created.wedgeHandled) return;
+      created.wedgeCheckQueued = true;
+      setImmediate(() => {
+        created.wedgeCheckQueued = false;
+        try {
+          if (!created.destroyed && !created.wedgeHandled && liveWedged(live)) this.wedgeFound(created, 'probe');
+        } catch {
+          // never out of a timer
+        }
+      });
+    };
     live.on('update', mirror);
+    live.on('afterTransaction', wedgeWatch);
     live.once('destroy', () => {
       live.off('update', mirror);
+      live.off('afterTransaction', wedgeWatch);
       created.destroyed = true;
       created.probeTimer?.cancel();
       created.probeTimer = null;
@@ -1453,7 +1520,15 @@ export class CollabUpdateGuard {
     return created;
   }
 
-  private ensureShadow(doc: DocGuard): ShadowState {
+  private ensureShadow(doc: DocGuard, where: OrderDivergenceWhere = 'rebuild'): ShadowState {
+    // #847: a wedged live document first, whatever else holds: frozen until it heals (compaction-registry.ts
+    // `liveWedged`). Before the ready shortcut: a wedged live emits no update, so the mirror never marked the shadow
+    // stale for whatever live integrated since.
+    if (liveWedged(doc.live)) {
+      if (!doc.wedgeHandled) return this.wedgeFound(doc, where);
+      if (!isDraining(doc.live)) this.needsCompaction(doc, 'order_divergence', null, true);
+      return 'diverged';
+    }
     if (doc.unavailable) return 'unavailable';
     if (doc.overBounds) {
       // The rebuild tripped, so the page waits on a compaction. When its request could not drain then (not armed yet,
@@ -1569,12 +1644,31 @@ export class CollabUpdateGuard {
    * #840: no exact shadow can be built for this document. Its writers wait (1013) and its joiners too; the page drains
    * to heal (a compaction from live) as soon as one can start. Logged, and the suspects struck.
    */
-  private diverge(doc: DocGuard, outcome: string, started: number): ShadowState {
+  /**
+   * #847: live is wedged (`liveWedged`), found by a frame, a join or the watch after a live transaction. Once per
+   * document: the store its missing update events never scheduled is scheduled now (BEFORE the drain closes anyone, so
+   * Hocuspocus runs it at the last close, or at its debounce, and unloads only after it), so every frame acknowledged
+   * into live (one accepted before the wedge and applied after it gets its SyncStatus) reaches the row and the heal can
+   * compact from live (`holdsItsRow`). Then the page diverges: logged `live_wedged`, nobody struck, healed by a drain.
+   */
+  private wedgeFound(doc: DocGuard, where: OrderDivergenceWhere): ShadowState {
+    doc.wedgeHandled = true;
+    if (doc.lastWriter !== undefined && this.wedgedStore !== null) {
+      try {
+        this.wedgedStore(doc.live, doc.lastWriter);
+      } catch {
+        // the store path records its own failure; never a reason to fail the frame path
+      }
+    }
+    return this.diverge(doc, 'live_wedged', this.cpuNow(), where, false);
+  }
+
+  private diverge(doc: DocGuard, outcome: string, started: number, where: OrderDivergenceWhere = 'rebuild', strike = true): ShadowState {
     doc.shadow = null;
     doc.dirty = true;
     doc.diverged = true;
     distrustReplicaLog(doc.live, outcome);
-    this.unstable(doc, 'rebuild', outcome, this.cpuNow() - started);
+    this.unstable(doc, where, outcome, this.cpuNow() - started, strike);
     return 'diverged';
   }
 
@@ -1582,9 +1676,16 @@ export class CollabUpdateGuard {
    * #840: the page's order differs from what a reload (or its replay) builds. Each current suspect is struck (two strikes
    * on a page within the hour hold that user's writer frames there), once per instability episode (`DocGuard.episode`),
    * the line is logged naming them all, and the page heals: a drain when a compaction can start (#827's per-page
-   * interval bounds them), else on the next unload.
+   * interval bounds them), else on the next unload. `strike` false (#847 `live_wedged`): nobody is struck or named (the
+   * wedge's cause is not necessarily anyone suspected, nor the sender of the frame that found it), and the suspicion is
+   * kept.
    */
-  private unstable(doc: DocGuard, where: OrderDivergenceWhere, outcome: string, ms: number): void {
+  private unstable(doc: DocGuard, where: OrderDivergenceWhere, outcome: string, ms: number, strike = true): void {
+    if (!strike) {
+      this.divergence(doc, where, outcome, ms, []);
+      this.needsCompaction(doc, 'order_divergence', null, true);
+      return;
+    }
     const now = this.now();
     const within = (users: Map<string, number>) => [...users].filter(([, at]) => now - at <= ORDER_SUSPECT_WINDOW_MS).map(([user]) => user);
     // No suspect: the users no walk could clear stand in (a contradiction hidden past the walk cap is still theirs).
@@ -1811,6 +1912,12 @@ export class CollabUpdateGuard {
   private checkJoin(frame: GuardFrame): void {
     const doc = this.docFor(frame.document);
     const userId = String(frame.context?.user?.id ?? '');
+    // #847: a wedged live document answers no joiner (its Step2 would serve a state no update ever reaches), in every
+    // mode, before the cached verdicts: frozen until it heals (`ensureShadow` logs it once and asks for the heal).
+    if (liveWedged(doc.live)) {
+      this.ensureShadow(doc, 'join');
+      return this.tryLater(frame, 'order_divergence', true);
+    }
     this.reverify(doc, userId); // a log distrusted for its caps, the total or frame order: its shadow is rebuilt first
     // A page no writer has touched has no shadow, and a join needs none: with nothing in flight its Step2 is live's
     // encoding, so live itself is checked (a page only readers open never builds, or mirrors into, a page-sized copy).
@@ -1893,16 +2000,20 @@ export class CollabUpdateGuard {
     }
   }
 
-  /** Logs the refusal; in enforce mode also closes the session (throws) and counts against the socket's budget. */
   /**
    * #827: whether `rule` refuses (enforce mode), or only logs (report mode). A write outside the `default` root is
    * refused in every mode: the server-only roots (the lineage epoch, the write ledger) are what keep lineages apart, and
    * a client write there would outlive the kill switch (a forged epoch fails every later connection and compaction).
+   * #847: so are the crash-class refusals, which the kill switch (meant for a content rule's false positive) must never
+   * let through to live: `keyed-split` (a later parent delete wedges live's cleanup) and an `internal` Yjs threw itself
+   * (stage `yjs`: live would throw the same, half-applied or wedged). A meter or guard failure keeps following the mode.
+   * `always`: only whether it is refused in every mode.
    */
-  private enforces(rule: string): boolean {
-    return this.mode === 'enforce' || rule === 'root';
+  private enforces(rule: string, log?: RefusalLog, always = false): boolean {
+    return (!always && this.mode === 'enforce') || rule === 'root' || rule === 'keyed-split' || (rule === 'internal' && log?.stage === 'yjs');
   }
 
+  /** Logs the refusal; in enforce mode also closes the session (throws) and counts against the socket's budget. */
   private refuse(frame: GuardFrame, header: Header, violation: Violation, extra?: RefusalLog): void {
     // An unproven owner's id: logged as the foreign-client it is, answered as a reconnect (inspectTransaction).
     const reason = extra?.stage === 'unproven-owner' ? UNRESOLVED_REASON : reasonFor(violation.rule);
@@ -1918,7 +2029,7 @@ export class CollabUpdateGuard {
       bytes: frame.update.length,
       mode: this.mode,
     });
-    if (!this.enforces(violation.rule)) return;
+    if (!this.enforces(violation.rule, extra)) return;
     this.refusedConnections.set(frame.connection, reason);
     const ws = frame.connection.webSocket;
     if (ws) {
@@ -2158,13 +2269,6 @@ function checkStruct(
   grew.add(parent); // #827: a live child added to `parent` (E, the children cap)
   return null;
 }
-
-/**
- * #847: a live keyed item must be one standalone value (Yjs's typeMapSet writes one; a later value of the key deletes
- * it). One holding several values, split by a later delete, wedges live's transaction cleanup (Item.gc on the split);
- * one with a right neighbour is not the key's value. Read inside the frame's transaction, on every item it created.
- */
-export const isKeyedSplit = (item: Y.Item): boolean => item.parentSub !== null && !item.deleted && (item.length !== 1 || item.right !== null);
 
 /**
  * #840 blame (never a refusal): does `item`'s placement contradict what its sender knew when it wrote it? Yjs places an

@@ -41,11 +41,14 @@ import type {
   afterLoadDocumentPayload,
   beforeHandleMessagePayload,
   connectedPayload,
+  Document,
+  onConfigurePayload,
   onLoadDocumentPayload,
 } from '@hocuspocus/server';
 import type * as Y from 'yjs';
 import { COLLAB_LOAD_TRY_LATER_REASON, COLLAB_PAGE_COMPACTING_REASON } from './collab-reasons';
 import { noteLoadRepaired } from '../page-write/compaction';
+import { scheduleWedgedStore } from '../page-write/direct-store';
 import { storeGenerationOf } from '../page-write/store-failure-registry';
 import { repairLegacyValues } from './legacy-repair';
 import { RateLimitedWarn, type SocketLimitLogger } from './socket-limit-log';
@@ -89,6 +92,15 @@ export class CollabUpdateGuardExtension {
       summary: (of, count) => `COLLAB_GUARD_LOG_SUPPRESSED ${JSON.stringify({ of, count })}`,
       now: opts.now,
     });
+  }
+
+  /**
+   * #847: the store a wedged live document never scheduled goes through this Hocuspocus's own store path
+   * (page-write/direct-store.ts `scheduleWedgedStore`). Synchronous: Hocuspocus awaits nothing from it.
+   */
+  onConfigure({ instance }: onConfigurePayload): Promise<void> {
+    this.guard.setWedgedStore((live, context) => scheduleWedgedStore(instance, live as unknown as Document, context));
+    return Promise.resolve();
   }
 
   /**
