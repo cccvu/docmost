@@ -5,11 +5,15 @@ import {
   attachReplicaLog,
   ensureReplicaLog,
   LOG_OVER_CAP,
+  LOG_OUT_OF_ORDER,
+  LOG_OVER_TOTAL,
   hasUnappliedFrames,
   mutationGeneration,
   noteAcceptedFrame,
   replicaLogDistrust,
   replicaLogOf,
+  replicaLogTotal,
+  setReplicaLogTotalForTests,
   settleAcceptedFrames,
 } from './exact-replica-registry';
 import { strictOrderDiff } from './order-parity';
@@ -159,15 +163,206 @@ describe('#840 the replay log, recorded from live', () => {
     for (let i = 0; i < 12; i++) {
       live.transact(() => text(live).insert(0, 'y'.repeat(MiB)), { source: 'local' });
       live.transact(() => text(live).delete(0, MiB), { source: 'local' });
-      peak = Math.max(peak, replicaLogOf(live)?.bytes ?? 0);
+      peak = Math.max(peak, replicaLogOf(live)?.retained ?? 0);
     }
     expect(peak).toBeGreaterThan(MiB); // anti-vacuity: it logged them while it could
-    expect(peak).toBeLessThanOrEqual(EXACT_REPLICA_CAPS.maxBytes + MiB + 1024);
+    expect(peak).toBeLessThanOrEqual(EXACT_REPLICA_CAPS.maxBytes); // retained, by capacity
     expect(replicaLogOf(live)).toBeNull();
     expect(replicaLogDistrust(live)).toBe(LOG_OVER_CAP);
     attachReplicaLog(live, Y.encodeStateAsUpdate(live)); // a verified checkpoint re-arms it, empty
     expect(replicaLogOf(live)!.bytes).toBe(0);
     expect(exact(live)).toBeNull();
+  });
+
+  it('the generation moves only when live\'s encoding can: random honest and crafted frames, empty, re-sent and pending-only ones', () => {
+    // The join check's cache key (#840 part 5): a writer's empty SyncStep2 is a transaction too, so a generation counting
+    // every transaction re-ran the encode, reload and compare on nearly every join of a reconnect storm.
+    let a = 840 >>> 0;
+    const r = () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+    const failures: string[] = [];
+    const tally = { frames: 0, unmoved: 0, emptyUnmoved: 0, pendingOnly: 0, pendingDs: 0, resends: 0 };
+    for (let session = 0; session < 40; session++) {
+      const { live, first } = page();
+      const peers = [11, 12, 13].map((client) => {
+        const doc = new Y.Doc();
+        Y.applyUpdate(doc, Y.encodeStateAsUpdate(live));
+        doc.clientID = client;
+        return { doc, undo: new Y.UndoManager(doc.getXmlFragment('default'), { captureTimeout: 0 }) };
+      });
+      const sent: Uint8Array[] = [];
+      const held: Uint8Array[] = []; // a lagging peer's earlier updates, sent after its later ones
+      let craftedClient = 100 + session * 10;
+      for (let op = 0; op < 50; op++) {
+        const x = r();
+        let frame: Uint8Array;
+        let kind = 'honest';
+        if (x < 0.4) {
+          const p = peers[Math.floor(r() * peers.length)];
+          Y.applyUpdate(p.doc, Y.encodeStateAsUpdate(live, Y.encodeStateVector(p.doc)), 'remote');
+          const sv = Y.encodeStateVector(p.doc);
+          const t = text(p.doc);
+          const y = r();
+          if (y < 0.4 || t.length < 3) t.insert(Math.floor(r() * (t.length + 1)), 'lorem'.slice(0, 1 + Math.floor(r() * 5)));
+          else if (y < 0.6) t.delete(Math.floor(r() * (t.length - 1)), 1 + Math.floor(r() * 2));
+          else if (y < 0.75) t.format(0, Math.max(1, Math.floor(r() * t.length)), { bold: r() < 0.5 ? {} : null });
+          else if (y < 0.88) p.undo.undo();
+          else p.undo.redo();
+          frame = Y.encodeStateAsUpdate(p.doc, sv);
+          if (r() < 0.15) {
+            // a lagging peer: this update waits for the next one
+            held.push(frame);
+            continue;
+          }
+        } else if (x < 0.55) {
+          frame = Y.encodeStateAsUpdate(new Y.Doc()); // an empty Step2: what every writer's reconnect sends
+          kind = 'empty';
+        } else if (x < 0.7 && sent.length) {
+          frame = sent[Math.floor(r() * sent.length)]; // a re-sent frame: known structs, already deleted ranges
+          kind = 'resend';
+        } else if (x < 0.8) {
+          // pending only: a crafted client's later clocks with its earlier ones missing, sometimes released later
+          const c = craftedClient++;
+          frame = rawUpdate([{ client: c, clock: 1 + Math.floor(r() * 3), structs: [{ origin: [1, first + Math.floor(r() * 5)], right: null, content: new Y.ContentString('p') }] }]);
+          if (r() < 0.5) held.push(rawUpdate([{ client: c, clock: 0, structs: [{ origin: [1, first], right: null, content: new Y.ContentString('q') }] }]));
+          kind = 'pending';
+        } else if (x < 0.86) {
+          frame = rawUpdate([], [{ client: 900 + Math.floor(r() * 3), ranges: [[Math.floor(r() * 4), 1 + Math.floor(r() * 3)]] }]); // deletes of unknown items: pendingDs
+          kind = 'pendingDs';
+        } else if (x < 0.93 && held.length) {
+          frame = held.splice(Math.floor(r() * held.length), 1)[0];
+        } else {
+          // crafted: S1-like items with contradictory origins
+          frame = rawUpdate([{ client: craftedClient++, clock: 0, structs: [{ origin: [1, first + 5], right: [1, first + 1 + Math.floor(r() * 3)], content: new Y.ContentString('X') }] }]);
+          kind = 'crafted';
+        }
+        const before = Y.encodeStateAsUpdate(live);
+        const generation = mutationGeneration(live);
+        const pendingBefore = live.store.pendingStructs;
+        const svBefore = Y.encodeStateVector(live);
+        Y.applyUpdate(live, frame, 'remote');
+        sent.push(frame);
+        tally.frames++;
+        const after = Y.encodeStateAsUpdate(live);
+        if (kind === 'resend') tally.resends++;
+        if (kind === 'pending' && Buffer.from(svBefore).equals(Buffer.from(Y.encodeStateVector(live)))) tally.pendingOnly++;
+        if (kind === 'pendingDs' && live.store.pendingDs !== null) tally.pendingDs++;
+        if (mutationGeneration(live) !== generation) continue;
+        tally.unmoved++;
+        if (kind === 'empty') tally.emptyUnmoved++;
+        if (!Buffer.from(before).equals(Buffer.from(after))) {
+          failures.push(`session ${session} op ${op} (${kind}, pending ${pendingBefore ? 'set' : 'none'}): the generation did not move, the encoding did`);
+        }
+      }
+    }
+    expect(failures.slice(0, 5)).toEqual([]);
+    // Anti-vacuity: no-op transactions left it alone (an empty Step2 always), and the corpus held pending structs and deletes.
+    expect(tally.emptyUnmoved).toBeGreaterThan(tally.frames / 20);
+    expect(tally.unmoved).toBeGreaterThan(tally.emptyUnmoved);
+    expect(tally.pendingOnly).toBeGreaterThan(50);
+    expect(tally.pendingDs).toBeGreaterThan(50);
+    expect(tally.resends).toBeGreaterThan(50);
+  });
+
+  it('a split Yjs does not merge back (a redone item) changes the encoding with no new clock and no delete: the generation moves', () => {
+    const doc = new Y.Doc();
+    doc.clientID = 7;
+    const t = doc.getText('t');
+    const undo = new Y.UndoManager(t, { captureTimeout: 0 });
+    t.insert(0, 'abcdef');
+    undo.stopCapturing();
+    t.delete(0, 6);
+    undo.undo(); // the deleted run is redone: its item carries `redone`, and Item.mergeWith refuses to merge it again
+    attachReplicaLog(doc, Y.encodeStateAsUpdate(doc));
+    const before = Y.encodeStateAsUpdate(doc);
+    const sv = Y.encodeStateVector(doc);
+    const generation = mutationGeneration(doc);
+    // a re-sent known id whose origin points inside that run: integrate skips it, but reading its origin splits the run
+    Y.applyUpdate(doc, rawUpdate([{ client: 7, clock: 0, structs: [{ origin: [7, 2], right: null, content: new Y.ContentString('a') }] }]), 'remote');
+    expect(Buffer.from(Y.encodeStateVector(doc)).equals(Buffer.from(sv))).toBe(true);
+    expect(Buffer.from(Y.encodeStateAsUpdate(doc)).equals(Buffer.from(before))).toBe(false); // anti-vacuity
+    expect(mutationGeneration(doc)).toBe(generation + 1);
+  });
+
+  it('live applying accepted frames out of the order they were accepted in (across connections) makes it untrusted', () => {
+    for (const inOrder of [true, false]) {
+      const { live } = page();
+      const [c1, c2] = [connection(), connection()];
+      const edit = (client: number, s: string) => {
+        const peer = new Y.Doc();
+        Y.applyUpdate(peer, Y.encodeStateAsUpdate(live));
+        peer.clientID = client;
+        text(peer).insert(2, s);
+        return Y.encodeStateAsUpdate(peer, Y.encodeStateVector(live));
+      };
+      const [u1, u2] = [edit(21, 'one'), edit(22, 'two')];
+      accept(live, c1, u1);
+      accept(live, c2, u2);
+      if (inOrder) fromConnection(live, c1, u1);
+      fromConnection(live, c2, u2);
+      if (!inOrder) fromConnection(live, c1, u1);
+      expect(replicaLogDistrust(live)).toBe(inOrder ? null : LOG_OUT_OF_ORDER);
+      if (inOrder) expect(exact(live)).toBeNull();
+    }
+  });
+
+  it('one process total across documents: past it the largest logs stop being trusted (their bytes go); a destroyed document releases its share', () => {
+    const KiB = 1024;
+    const LIMIT = 256 * KiB;
+    const restore = setReplicaLogTotalForTests(LIMIT);
+    try {
+      const docs = Array.from({ length: 12 }, () => page().live);
+      let peak = 0;
+      let distrusted = 0;
+      for (let round = 0; round < 40; round++) {
+        docs.forEach((live, i) => {
+          // a server write, inserted then deleted: the page stays tiny, the log keeps every byte
+          const n = 1 + ((round * 7 + i * 13) % 9) * KiB;
+          live.transact(() => text(live).insert(0, 'z'.repeat(n)), { source: 'local' });
+          live.transact(() => text(live).delete(0, n), { source: 'local' });
+          peak = Math.max(peak, replicaLogTotal());
+          if (replicaLogDistrust(live) === LOG_OVER_TOTAL) {
+            distrusted++;
+            attachReplicaLog(live, Y.encodeStateAsUpdate(live)); // what the guard's next frame does when the reload is stable
+            expect(exact(live)).toBeNull();
+          }
+        });
+      }
+      expect(distrusted).toBeGreaterThan(10); // anti-vacuity: the total was reached, often
+      expect(peak).toBeLessThanOrEqual(LIMIT); // asked before it grows: never past it, not even by one entry
+      docs[0].transact(() => text(docs[0]).insert(0, 'h'), { source: 'local' });
+      const held = replicaLogOf(docs[0])!.retained;
+      expect(held).toBeGreaterThan(0);
+      const before = replicaLogTotal();
+      docs[0].destroy();
+      expect(replicaLogTotal()).toBe(before - held);
+      expect(replicaLogOf(docs[0])).toBeNull();
+      const rest = docs.slice(1).reduce((n, live) => n + (replicaLogOf(live)?.retained ?? 0), 0);
+      for (const live of docs.slice(1)) live.destroy();
+      expect(replicaLogTotal()).toBe(before - held - rest); // what other specs' documents still hold
+    } finally {
+      restore();
+    }
+  });
+
+  it('the process total counts retained capacity, and an over-cap entry or a re-armed checkpoint frees it', () => {
+    const { live } = page();
+    const before = replicaLogTotal();
+    live.transact(() => text(live).insert(0, 'q'), { source: 'local' });
+    const log = replicaLogOf(live)!;
+    expect(log.retained).toBeGreaterThan(log.bytes); // capacity, not just what is used
+    expect(replicaLogTotal() - before).toBe(log.retained);
+    attachReplicaLog(live, Y.encodeStateAsUpdate(live));
+    expect(replicaLogTotal()).toBe(before);
+    live.transact(() => text(live).insert(0, 'y'.repeat(EXACT_REPLICA_CAPS.maxBytes)), { source: 'local' }); // over its cap at once
+    expect(replicaLogDistrust(live)).toBe(LOG_OVER_CAP);
+    expect(replicaLogTotal()).toBe(before);
+    live.destroy();
   });
 
   it('a document nobody attached a log to gets one untrusted (the guard\'s fallback)', () => {

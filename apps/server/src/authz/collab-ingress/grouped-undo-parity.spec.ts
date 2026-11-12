@@ -17,6 +17,13 @@ import type * as OrderParity from './order-parity';
  */
 
 const SESSIONS = 1500;
+/**
+ * The keyed-hunk arm's sessions: a sixth of the corpus (it costs as much per session as the others). On the seeds
+ * below it leaves the undoing peer unconverged in about one session in seven (40 and 32 of 250 at captureTimeout 500
+ * and 0, measured 2026-11-12), so KEYED_MIN_UNCONVERGED (about a quarter of that) still proves the arm reaches the shape.
+ */
+const KEYED_SESSIONS = SESSIONS / 6;
+const KEYED_MIN_UNCONVERGED = 10;
 const OPS = 120;
 /** Live is compared with its reload every CHECK_EVERY steps; every replica at the end. */
 const CHECK_EVERY = 40;
@@ -356,7 +363,7 @@ describe('#840 honest grouped-undo corpus', () => {
     const base = captureTimeout ? 0 : 50_000_000;
     const ok = corpus(patched, captureTimeout, base);
     const bad = corpus(noList, captureTimeout, base);
-    const badKeyed = corpus(noKeyed, captureTimeout, base, SESSIONS / 3);
+    const badKeyed = corpus(noKeyed, captureTimeout, base, KEYED_SESSIONS);
     const brief = (x: Tally) => ({ ...x, first: x.first?.slice(0, 200) });
     console.log(`#840 grouped-undo corpus, captureTimeout ${captureTimeout}: ${JSON.stringify({ patched: ok, noList: brief(bad), noKeyed: brief(badKeyed) })}`);
     // Anti-vacuity: the corpus undid, redid, grouped typing into stack items (500; pauses still split them) or not (0),
@@ -375,7 +382,7 @@ describe('#840 honest grouped-undo corpus', () => {
     expect(bad.sessions).toBe(SESSIONS);
     expect(bad.diverged).toBeGreaterThan(SESSIONS / 100);
     for (const k of ['liveUnstable', 'peerUnstable', 'unconverged'] as const) expect({ [k]: bad[k] > 0 }).toEqual({ [k]: true });
-    expect(badKeyed.sessions).toBe(SESSIONS / 3);
-    expect(badKeyed.unconverged).toBeGreaterThan(SESSIONS / 300);
+    expect(badKeyed.sessions).toBe(KEYED_SESSIONS);
+    expect(badKeyed.unconverged).toBeGreaterThan(KEYED_MIN_UNCONVERGED);
   });
 });

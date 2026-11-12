@@ -8,7 +8,7 @@ import { ConflictScan, CONFLICT_SCAN_STEPS_PER_FRAME, installConflictScanMeter }
 import { rawUpdate, type RawId, type RawStruct } from './conflict-scan.testkit';
 import { checkElement } from './content-rules';
 import { EXACT_REPLICA_CAPS, ExactReplicaLog } from './exact-replica';
-import { attachReplicaLog, LOG_OVER_CAP, replicaLogDistrust, replicaLogOf } from './exact-replica-registry';
+import { attachReplicaLog, LOG_OUT_OF_ORDER, LOG_OVER_CAP, LOG_OVER_TOTAL, replicaLogDistrust, replicaLogOf, replicaLogTotal, setReplicaLogTotalForTests } from './exact-replica-registry';
 import { isReloadStable, strictOrderDiff } from './order-parity';
 import { SocketLimitLog } from './socket-limit-log';
 import {
@@ -101,6 +101,7 @@ function listPage() {
   });
   return { doc, pA: idOf(p) };
 }
+const countStructs = (doc: Y.Doc) => [...doc.store.clients.values()].reduce((n, structs) => n + structs.length, 0);
 const idOf = (type: Y.AbstractType<any>): RawId => [type._item!.id.client, type._item!.id.clock];
 const el = (name: string) => new Y.ContentType(new Y.XmlElement(name));
 const listItemOf = (doc: Y.Doc) => ((doc.getXmlFragment('default').get(0) as Y.XmlElement).get(0) as Y.XmlElement);
@@ -290,7 +291,26 @@ describe('#840 the rebuild: reload when it is live, replay otherwise, and the tr
     expect(strictOrderDiff(exactCopy(s.live), s.live)).toBeNull();
   });
 
-  it('the log never outgrows its caps by more than a frame: past them, the next frame checkpoints (stable) or heals (not)', () => {
+  it('frames live applies out of the order the guard accepted them in: the shadow is rebuilt and verified before the next frame', () => {
+    const s = harness({ attach: true });
+    const [a, b] = [s.conn('a'), s.conn('b')];
+    const fa = honestEdit(s.live, 'aaa');
+    const fb = new RemoteClient(s.live).edit(s.live, (f) => (f.get(1) as Y.XmlElement).setAttribute('textAlign', 'center'));
+    expect(s.deliver(a, syncFrame(fa))).toBe('applied'); // accepted, not applied yet
+    expect(s.deliver(b, syncFrame(fb))).toBe('applied');
+    Y.applyUpdate(s.live, fb, { source: 'connection', connection: b }); // b's first: not the order the shadow took
+    Y.applyUpdate(s.live, fa, { source: 'connection', connection: a });
+    expect(replicaLogDistrust(s.live)).toBe(LOG_OUT_OF_ORDER);
+    const shadowBefore = s.guard.shadowOf(s.live);
+    expect(s.join(s.conn('reader', true))).toBe('applied'); // a join re-verifies first too
+    expect(s.guard.shadowOf(s.live)).not.toBe(shadowBefore); // rebuilt (its reload was live: the log re-armed)
+    expect(replicaLogOf(s.live)).not.toBeNull();
+    expect(s.send(s.conn('editor'), honestEdit(s.live))).toBe('applied');
+    expect(strictOrderDiff(s.guard.shadowOf(s.live)!, s.live)).toBeNull();
+    expect(s.divergence()).toEqual([]);
+  });
+
+  it('the log never outgrows its cap: an entry that does not fit drops it, and the next frame checkpoints (stable) or heals (not)', () => {
     // Insert-then-delete keeps the page tiny while every inserted byte stays in the log: no cap of the page sees it.
     const MiB = 1024 * 1024;
     const s = harness({ attach: true, cpuNow: () => 0 });
@@ -305,15 +325,84 @@ describe('#840 the rebuild: reload when it is live, replay otherwise, and the tr
         expect(s.send(editor, frame())).toBe('applied');
         // past its caps the registry stops trusting it (its bytes go); the next frame re-arms it from a stable reload
         if (replicaLogDistrust(s.live) === LOG_OVER_CAP) overs++;
-        peak = Math.max(peak, replicaLogOf(s.live)?.bytes ?? 0);
+        peak = Math.max(peak, replicaLogOf(s.live)?.retained ?? 0);
       }
     }
     expect(overs).toBeGreaterThan(0); // anti-vacuity: it did reach the cap
-    expect(peak).toBeLessThanOrEqual(EXACT_REPLICA_CAPS.maxBytes + 2 * MiB);
+    expect(peak).toBeGreaterThan(4 * MiB);
+    expect(peak).toBeLessThanOrEqual(EXACT_REPLICA_CAPS.maxBytes); // retained, by capacity: no doubling past the cap
     expect(s.send(editor, honestEdit(s.live))).toBe('applied');
     expect(replicaLogOf(s.live)!.bytes).toBeLessThan(EXACT_REPLICA_CAPS.maxBytes);
     expect(strictOrderDiff(exactCopy(s.live), s.live)).toBeNull();
     expect(s.divergence()).toEqual([]);
+  });
+});
+
+describe('#840 the process total of replay logs (#679: native memory)', () => {
+  it('many pages growing past the total stay within it; each distrusted log re-arms at its next frame (stable) or the page heals (not)', () => {
+    const KiB = 1024;
+    const LIMIT = 512 * KiB;
+    const restore = setReplicaLogTotalForTests(LIMIT);
+    try {
+      const logs: string[] = [];
+      const guard = new CollabUpdateGuard({
+        mode: 'enforce',
+        logger: { warn: (m: string) => logs.push(m) },
+        limitLog: new SocketLimitLog({ warn: () => undefined }),
+        cpuNow: () => 0,
+        schedule: () => ({ cancel: () => undefined }),
+      });
+      const stable = Array.from({ length: 10 }, () => harness({ attach: true, guard }));
+      // a legacy unstable row, its load bytes attached: its writers go on (replay) until its log is distrusted
+      const unstableRow = (() => {
+        const doc = new Y.Doc();
+        doc.clientID = 1;
+        const p = new Y.XmlElement('paragraph');
+        const t = new Y.XmlText();
+        doc.transact(() => {
+          doc.getXmlFragment('default').insert(0, [p, new Y.XmlElement('paragraph')]);
+          p.insert(0, [t]);
+          t.insert(0, 'abcdef');
+          (doc.getXmlFragment('default').get(1) as Y.XmlElement).insert(0, [new Y.XmlText()]);
+        });
+        const first = (t as any)._start.id.clock as number;
+        Y.applyUpdate(doc, rawUpdate([{ client: 2, clock: 0, structs: [{ origin: [1, first + 5], right: [1, first + 3], content: new Y.ContentString('X') }] }]));
+        return Y.encodeStateAsUpdate(doc);
+      })();
+      const shaky = harness({ bytes: unstableRow, attach: true, guard });
+      expect(isReloadStable(shaky.live).stable).toBe(false);
+      const pages = [...stable.map((p) => ({ p, size: 24 * KiB })), { p: shaky, size: 64 * KiB }];
+      let peak = 0;
+      let rearmed = 0;
+      let healed = false;
+      for (let round = 0; round < 12; round++) {
+        for (const { p, size } of pages) {
+          const editor = p.conn('editor');
+          const was = replicaLogDistrust(p.live);
+          const result = p.send(editor, honestEdit(p.live, 'w'.repeat(size)));
+          peak = Math.max(peak, replicaLogTotal());
+          if (was !== LOG_OVER_TOTAL) continue;
+          // the frame after the distrust re-verified the page first
+          if (p === shaky) {
+            expect(result).toBe(TRY_LATER);
+            const lines = logs.filter((l) => l.startsWith('COLLAB_ORDER_DIVERGENCE ')).map((l) => JSON.parse(l.slice(l.indexOf('{'))));
+            expect(lines).toContainEqual(expect.objectContaining({ where: 'rebuild', outcome: 'log_over_total' }));
+            expect(compactionRequest(p.live)).toMatchObject({ reason: 'order_divergence' });
+            healed = true;
+          } else {
+            expect(result).toBe('applied');
+            expect(replicaLogOf(p.live)).not.toBeNull(); // re-armed from the stable reload
+            expect(strictOrderDiff(exactCopy(p.live), p.live)).toBeNull();
+            rearmed++;
+          }
+        }
+      }
+      expect(rearmed).toBeGreaterThan(5); // anti-vacuity: the total was reached and stable pages re-armed
+      expect(healed).toBe(true);
+      expect(peak).toBeLessThanOrEqual(LIMIT);
+    } finally {
+      restore();
+    }
   });
 });
 
@@ -386,6 +475,28 @@ describe('#840 the join gate: a joiner is answered only from a reload-stable pag
     expect(s.send(s.conn('editor'), honestEdit(s.live))).toBe('applied'); // writers are not refused for it
   });
 
+  it('a reconnect storm of empty Step2s (each a live transaction) leaves the join cached: nothing a joiner gets changed', async () => {
+    const s = harness();
+    expect(s.send(s.conn('editor'), honestEdit(s.live))).toBe('applied');
+    await new Promise((r) => setImmediate(r));
+    expect(s.join(s.conn('reader', true))).toBe('applied');
+    const empty = Y.encodeStateAsUpdate(new Y.Doc());
+    const encodes = jest.spyOn(Y, 'encodeStateAsUpdate');
+    try {
+      for (let i = 0; i < 5; i++) {
+        const writer = s.conn(`writer-${i}`);
+        expect(s.deliver(writer, syncFrame(empty, 1), empty)).toBe('applied');
+        expect(s.join(writer)).toBe('applied');
+      }
+      expect(encodes).not.toHaveBeenCalled();
+      expect(s.send(s.conn('editor'), honestEdit(s.live))).toBe('applied'); // a real change: checked again
+      expect(s.join(s.conn('reader-2', true))).toBe('applied');
+      expect(encodes).toHaveBeenCalled();
+    } finally {
+      encodes.mockRestore();
+    }
+  });
+
   it('the check covers the frames in flight (the joiner\'s Step2 is encoded after they apply): live alone is stable', () => {
     const { doc: base, pA } = listPage();
     const s = harness({ base });
@@ -396,6 +507,41 @@ describe('#840 the join gate: a joiner is answered only from a reload-stable pag
     expect(s.join(s.conn('reader', true))).toBe(TRY_LATER);
     Y.applyUpdate(s.live, frame, { source: 'connection', connection: attacker });
     expect(isReloadStable(s.live).stable).toBe(false); // what the joiner would have been served
+  });
+
+  it('with a frame in flight both orders are checked: live unstable and the shadow stable is not answered either', () => {
+    // A legacy unstable row (S1 in the first paragraph), its load bytes attached; a writer's frame deletes that paragraph.
+    // Live plus the frame reloads stable, live alone does not: a joiner whose Step2 is encoded before the frame applies
+    // builds a reload of live.
+    const doc = new Y.Doc();
+    doc.clientID = 1;
+    const p = new Y.XmlElement('paragraph');
+    const t = new Y.XmlText();
+    const q = new Y.XmlElement('paragraph');
+    doc.transact(() => {
+      doc.getXmlFragment('default').insert(0, [p, q]);
+      p.insert(0, [t]);
+      t.insert(0, 'abcdef');
+      q.insert(0, [new Y.XmlText('other')]);
+    });
+    const first = (t as any)._start.id.clock as number;
+    Y.applyUpdate(doc, rawUpdate([{ client: 2, clock: 0, structs: [{ origin: [1, first + 5], right: [1, first + 3], content: new Y.ContentString('X') }] }]));
+    const s = harness({ bytes: Y.encodeStateAsUpdate(doc), attach: true });
+    expect(isReloadStable(s.live).stable).toBe(false);
+    const editor = s.conn('editor');
+    const drop = new RemoteClient(s.live).edit(s.live, (f) => f.delete(0, 1));
+    expect(s.deliver(editor, syncFrame(drop))).toBe('applied'); // accepted, not applied yet
+    expect(isReloadStable(s.guard.shadowOf(s.live)!).stable).toBe(true); // live plus the frame: stable
+    expect(s.join(s.conn('reader', true))).toBe(TRY_LATER); // live alone is not
+    expect(s.divergence()).toEqual([expect.objectContaining({ where: 'join', outcome: 'unstable' })]);
+    Y.applyUpdate(s.live, drop, { source: 'connection', connection: editor });
+    // control: a stable page with an honest frame in flight is answered (both orders reload into themselves)
+    const ok = harness();
+    const writer = ok.conn('writer');
+    const edit = honestEdit(ok.live);
+    expect(ok.deliver(writer, syncFrame(edit))).toBe('applied');
+    expect(ok.join(ok.conn('reader', true))).toBe('applied');
+    Y.applyUpdate(ok.live, edit, { source: 'connection', connection: writer });
   });
 
   it('a join that must rebuild while a frame is in flight still checks live plus that frame (the rebuild\'s reload is live alone)', () => {
@@ -425,6 +571,8 @@ describe('#840 the join gate: a joiner is answered only from a reload-stable pag
     const s = harness({ bytes: stored, attach: true });
     expect(s.join(s.conn('reader', true))).toBe(TRY_LATER);
     expect(s.divergence()).toEqual([expect.objectContaining({ where: 'join', suspects: [] })]);
+    expect(s.divergence()[0].structs).toBe(countStructs(s.live)); // live's, not the unmeasured shadow's 0
+    expect(s.divergence()[0].structs).toBeGreaterThan(0);
     expect(s.guard.shadowOf(s.live)).toBeNull(); // checked on live itself (below)
   });
 
@@ -479,6 +627,71 @@ describe('#840 the join gate: a joiner is answered only from a reload-stable pag
     expect(s.divergence()).toEqual([expect.objectContaining({ where: 'probe', outcome: 'unstable', suspects: ['attacker'] })]);
     expect(compactionRequest(s.live)).toMatchObject({ reason: 'order_divergence' });
     expect(replicaLogOf(s.live)!.entries).toBe(1); // not advanced past an unstable state
+  });
+});
+
+describe('#840 strikes: once per user per instability episode', () => {
+  it('repeated joins in one episode strike each suspect once (the log lines still name them); a second episode strikes again', () => {
+    let t = 3_000_000_000_000;
+    const logs: string[] = [];
+    const limitLogs: string[] = [];
+    const guard = new CollabUpdateGuard({
+      mode: 'enforce',
+      logger: { warn: (m: string) => logs.push(m) },
+      limitLog: new SocketLimitLog({ warn: (m: string) => limitLogs.push(m) }),
+      now: () => t,
+      schedule: () => ({ cancel: () => undefined }),
+    });
+    const name = 'page.00000000-0000-4000-8000-000000000841';
+    const { doc: base, pA } = listPage();
+    const s = harness({ base, guard, name });
+    const lines = () => logs.filter((l) => l.startsWith('COLLAB_ORDER_DIVERGENCE ')).map((l) => JSON.parse(l.slice(l.indexOf('{'))));
+    // episode 1: the page is unstable and cannot heal yet (the compaction cannot start), so joins keep finding it
+    expect(s.send(s.conn('attacker'), f1(pA))).toBe('applied');
+    expect(s.join(s.conn('reader', true))).toBe(TRY_LATER);
+    for (let i = 0; i < 4; i++) {
+      t += 1_000;
+      // the same user a suspect again within the episode (an honest user can be, by an induced local-order difference)
+      expect(s.send(s.conn('attacker'), f1(pA, A + 10 + i))).toBe('applied');
+      expect(s.join(s.conn('reader', true))).toBe(TRY_LATER);
+    }
+    expect(lines().filter((l) => l.where === 'join')).toHaveLength(5);
+    expect(lines().every((l) => l.suspects.includes('attacker'))).toBe(true);
+    expect(s.send(s.conn('attacker'), honestEdit(s.live))).toBe('applied'); // one strike: not held
+    expect(limitLogs.some((l) => l.includes('"limit":"order_strikes"'))).toBe(false);
+    // episode 2: a heal (a new document for the page), destabilized again: the second strike holds the author
+    const healed = prosemirrorJSONToYDoc(serverSchema(), contentOf(s.live), 'default');
+    const s2 = harness({ bytes: Y.encodeStateAsUpdate(healed), attach: true, guard, name });
+    const li = listItemOf(s2.live);
+    expect(s2.send(s2.conn('attacker'), f1(idOf(li.get(0) as Y.XmlElement), A + 1))).toBe('applied');
+    expect(s2.join(s2.conn('reader', true))).toBe(TRY_LATER);
+    expect(s2.send(s2.conn('attacker'), honestEdit(s2.live))).toBe(TRY_LATER);
+    expect(limitLogs.some((l) => l.includes('"limit":"order_strikes"'))).toBe(true);
+  });
+});
+
+describe('#840 strikes: a stable verdict ends the episode', () => {
+  it('unstable, then stable again on the same document (the crafted run deleted), then unstable: a new episode, a second strike', () => {
+    const limitLogs: string[] = [];
+    const guard = new CollabUpdateGuard({
+      mode: 'enforce',
+      logger: { warn: () => undefined },
+      limitLog: new SocketLimitLog({ warn: (m: string) => limitLogs.push(m) }),
+      schedule: () => ({ cancel: () => undefined }),
+    });
+    const { doc: base, pA } = listPage();
+    const s = harness({ base, guard, name: 'page.00000000-0000-4000-8000-000000000842' });
+    expect(s.send(s.conn('attacker'), f1(pA))).toBe('applied');
+    expect(s.join(s.conn('reader', true))).toBe(TRY_LATER); // episode 1: struck once
+    // an editor deletes the bullet list holding the crafted run: the page reloads into itself again
+    expect(s.send(s.conn('editor'), new RemoteClient(s.live).edit(s.live, (f) => f.delete(0, 1)))).toBe('applied');
+    expect(isReloadStable(s.live).stable).toBe(true);
+    expect(s.join(s.conn('reader', true))).toBe('applied'); // stable: the episode is over
+    const q = s.live.getXmlFragment('default').get(0) as Y.XmlElement;
+    expect(s.send(s.conn('attacker'), f1(idOf(q), A + 1))).toBe('applied');
+    expect(s.join(s.conn('reader', true))).toBe(TRY_LATER); // episode 2: the second strike
+    expect(s.send(s.conn('attacker'), new RemoteClient(s.live).edit(s.live, (f) => ((f.get(0) as Y.XmlElement).get(0) as Y.XmlText).insert(0, 'a')))).toBe(TRY_LATER);
+    expect(limitLogs.some((l) => l.includes('"limit":"order_strikes"'))).toBe(true);
   });
 });
 

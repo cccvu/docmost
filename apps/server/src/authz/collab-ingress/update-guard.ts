@@ -77,11 +77,14 @@
  * `keyed-split` (a live keyed item that is not one standalone value, #847). Live's own apply of each accepted frame is
  * timed and charged to its sender (the shadow's apply once, live's once); live far slower than the shadow marks the
  * shadow for a verified rebuild. A joiner's SyncStep1 (its Step2 answer, and every reload, is in reload order) is
- * answered only for a page whose shadow (live plus the frames in flight) is reload-stable, checked once per mutation
- * and charged to the joiner; an unstable page answers 1013 and heals. Senders whose items contradict their own origins
- * (an origin not to the item's left, a rightOrigin not to its right, or one of their own earlier items between) are
- * suspects; each instability found strikes them, and two strikes on a page within an hour hold that user's writer
- * frames there at 1013 for an hour. Never a refusal: blame is a heuristic.
+ * answered only for a page whose shadow (live plus the frames in flight) is reload-stable, and with frames in flight
+ * live too, checked once per change of what a joiner can get and charged to the joiner; an unstable page answers 1013
+ * and heals. Senders whose items contradict their own origins (an origin not to the item's left, a rightOrigin not to
+ * its right, or one of their own earlier items between) are suspects; an instability found strikes them, once per
+ * episode (until a stable verdict or a heal), and two strikes on a page within an hour hold that user's writer frames
+ * there at 1013 for an hour. Never a refusal: blame is a heuristic. The replay logs are native memory: capped per page
+ * and in total (exact-replica-registry.ts); a log dropped for either, or for frames live applied out of the guard's
+ * order, makes the next frame or join rebuild and re-verify the page.
  *
  * Refusal = a throw of `{ code: 4422, reason }`: Hocuspocus closes that ONE document session and sends the reason (the
  * websocket stays up). Reasons the client acts on (apps/client features/editor-ux): `ccc:collab-update-refused:<rule>`
@@ -117,12 +120,16 @@ import { EXACT_REPLICA_CAPS } from './exact-replica';
 import {
   attachReplicaLog,
   distrustReplicaLog,
+  encodingChanged,
   ensureReplicaLog,
   hasUnappliedFrames,
   LOG_OVER_CAP,
+  LOG_OVER_TOTAL,
   mutationGeneration,
   noteAcceptedFrame,
+  pendingStateOf,
   replicaLogDistrust,
+  replicaLogNeedsReverify,
   replicaLogOf,
   settleAcceptedFrames,
 } from './exact-replica-registry';
@@ -353,6 +360,8 @@ type ShadowResult = {
   /** #840: the frame's integrate walk on the shadow (the replay log's step cost), and whether its sender is a suspect. */
   steps: number;
   suspect: boolean;
+  /** #840: the shadow's encoding may have changed (`encodingChanged`): what the join check's cache key counts. */
+  changes: boolean;
 };
 /** What `inspectTransaction` finds inside the transaction. `extra`: struct-array lengths, mid-transaction, of clients a
  *  delete reached that the pre-pass did not name (a keyed overwrite deletes the key's previous item). */
@@ -426,11 +435,18 @@ class DocGuard {
   destroyed = false;
   /** #840: no exact shadow can be built: writers wait (1013) and the page heals. Final for this document. */
   diverged = false;
-  /** #840: frames accepted on this document (with live's generation, the join check's cache key) and the last key verified. */
+  /** #840: frames accepted on this document that can change its encoding (with live's generation, the join check's cache
+   *  key) and the last key verified. */
   accepted = 0;
   verified: string | null = null;
   /** #840: user → when they last sent an item contradicting its own origins (oldest first, SUSPECTS_PER_PAGE at most). */
   readonly suspects = new Map<string, number>();
+  /**
+   * #840: the instability episode: from the first unstable verdict until a stable one or a heal (a new document, or a
+   * new lineage epoch on this one). Each user is struck at most once per episode (`struck`, bounded by
+   * SUSPECTS_PER_PAGE per verdict), however many joins or probes find the page unstable while it cannot heal yet.
+   */
+  episode: { epoch: number | null; struck: Set<string> } | null = null;
   constructor(readonly live: GuardDocument) {}
 }
 
@@ -847,13 +863,11 @@ export class CollabUpdateGuard {
       violation ??= this.chargeNewClientIds(frame, pre.clients);
       if (violation && this.enforces(violation.rule)) return this.refuse(frame, header, violation);
       // 2. The shadow step. #840: the replay log only grows between checkpoints and recording never drops an entry, so
-      // past its caps it stops being trusted (exact-replica-registry.ts) whoever wrote it (a server write is logged too).
-      // This frame then rebuilds first (charged to this user): a reload equal to live re-arms it, otherwise the page
-      // heals. So a log never holds more than its caps plus one entry, whatever the page's caps see (an insert, deleted).
-      if (!doc.dirty && doc.shadow !== null && replicaLogDistrust(doc.live) === LOG_OVER_CAP) {
-        doc.dirty = true;
-        doc.dirtiedBy = userId;
-      }
+      // an entry past its caps, or past the process total, makes it stop being trusted (exact-replica-registry.ts)
+      // whoever wrote it (a server write is logged too). This frame then rebuilds first (charged to this user): a reload
+      // equal to live re-arms it, otherwise the page heals. So a log never holds more than its cap, and all of them
+      // never more than the total, whatever the page's caps see (an insert, deleted).
+      this.reverify(doc, userId);
       const shadowed = this.readyShadow(doc, userId);
       othersMs = shadowed.othersMs;
       const ready = shadowed.ready;
@@ -896,7 +910,8 @@ export class CollabUpdateGuard {
         if (result.added > 0) this.scheduleProbe(doc, userId);
       }
       if (result.suspect) this.suspect(doc, userId);
-      doc.accepted++;
+      // #840: the join check's cache key counts only frames that can change what a joiner gets (an empty Step2 cannot)
+      if (result.changes) doc.accepted++;
       // #840: live applies it next on this connection: its raw bytes go into the replay log then, and its apply is timed
       // and charged to this user. Last: nothing after it may throw.
       noteAcceptedFrame(doc.live, frame.connection, {
@@ -910,6 +925,17 @@ export class CollabUpdateGuard {
     } finally {
       this.chargeCpu(userId, this.cpuNow() - started - othersMs, workStarted);
     }
+  }
+
+  /**
+   * #840: a log distrusted for its caps or the process total (`replicaLogNeedsReverify`) is re-armed only by a verified
+   * checkpoint, so the page's shadow is rebuilt first (charged to `userId`): a reload equal to live re-arms it, otherwise
+   * the page heals.
+   */
+  private reverify(doc: DocGuard, userId: string): void {
+    if (doc.dirty || doc.shadow === null || !replicaLogNeedsReverify(doc.live)) return;
+    doc.dirty = true;
+    doc.dirtiedBy = userId;
   }
 
   /**
@@ -1110,8 +1136,11 @@ export class CollabUpdateGuard {
       clientsAfter: clientsBefore,
       steps: scan.steps,
       suspect: false,
+      changes: false,
     });
     let out: Inspection | null = null;
+    let applied: Y.Transaction | null = null;
+    const pendingAtStart = pendingStateOf(store);
     try {
       this.meter.metered(scan, () =>
         this.runWithDeadline(
@@ -1119,6 +1148,7 @@ export class CollabUpdateGuard {
             Y.transact(
               shadow,
               (tr) => {
+                applied = tr;
                 Y.applyUpdate(shadow, payload, INSPECT); // V1, as y-protocols reads Step2 and Update
                 out = this.inspectTransaction(doc, tr, userId, pendingBefore, pre.clients, tracked);
               },
@@ -1155,6 +1185,7 @@ export class CollabUpdateGuard {
       clientsAfter: store.clients.size,
       steps: scan.steps,
       suspect: found.suspect,
+      changes: applied === null || encodingChanged(applied, pendingAtStart),
     };
     // Report mode: the meter counted past the cap and threw nothing; the frame is logged as it would have been refused.
     if (scan.trip !== null) return { ...result, violation: { rule: 'conflict-scan' }, log: { steps: scan.steps } };
@@ -1388,13 +1419,14 @@ export class CollabUpdateGuard {
       return 'compacting';
     }
     if (built.exact) {
+      doc.episode = null; // #840: live reloads into itself: any instability episode is over
       attachReplicaLog(live, state); // reload-stable: this encoding rebuilds live exactly
       // With nothing in flight that reload is exactly what a joiner's Step2 builds: the join check is answered.
       if (inflight.length === 0) doc.verified = `${mutationGeneration(live)}:${doc.accepted}`;
     } else {
       // #840: the reload is not live's order. Replay live's own inputs instead.
       const log = replicaLogOf(live);
-      if (!log || log.overCap()) return this.diverge(doc, log || replicaLogDistrust(live) === LOG_OVER_CAP ? 'log_over_cap' : 'log_untrusted', started);
+      if (!log || log.overCap()) return this.diverge(doc, log ? 'log_over_cap' : untrustedOutcome(replicaLogDistrust(live)), started);
       const replica = fresh();
       replica.getXmlFragment('default');
       const replay = new ConflictScan(replica, this.mode === 'enforce', this.caps.steps + EXACT_REPLICA_CAPS.maxSteps);
@@ -1447,8 +1479,9 @@ export class CollabUpdateGuard {
 
   /**
    * #840: the page's order differs from what a reload (or its replay) builds. Each current suspect is struck (two strikes
-   * on a page within the hour hold that user's writer frames there), the line is logged, and the page heals: a drain
-   * when a compaction can start (#827's per-page interval bounds them), else on the next unload.
+   * on a page within the hour hold that user's writer frames there), once per instability episode (`DocGuard.episode`),
+   * the line is logged naming them all, and the page heals: a drain when a compaction can start (#827's per-page
+   * interval bounds them), else on the next unload.
    */
   private unstable(doc: DocGuard, where: OrderDivergenceWhere, outcome: string, ms: number): void {
     const now = this.now();
@@ -1456,7 +1489,11 @@ export class CollabUpdateGuard {
     for (const [user, at] of doc.suspects) if (now - at <= ORDER_SUSPECT_WINDOW_MS) suspects.push(user);
     doc.suspects.clear();
     const page = doc.live.name ?? '';
+    const epoch = epochOrNull(doc.live);
+    if (doc.episode === null || doc.episode.epoch !== epoch) doc.episode = { epoch, struck: new Set() };
     for (const user of suspects) {
+      if (doc.episode.struck.has(user)) continue; // struck once this episode; the line below still names them
+      doc.episode.struck.add(user);
       const budget = this.budgetOf(user, page);
       budget.strikes = budget.strikes.filter((at) => now - at < ORDER_STRIKE_WINDOW_MS);
       budget.strikes.push(now);
@@ -1469,7 +1506,9 @@ export class CollabUpdateGuard {
   /** #840: the COLLAB_ORDER_DIVERGENCE line (rate-limited with the guard's other lines). Never throws. */
   private divergence(doc: DocGuard, where: OrderDivergenceWhere, outcome: string, ms: number, suspects: readonly string[]): void {
     try {
-      logOrderDivergence({ page: pageIdOf(doc.live) ?? null, where, structs: doc.structs, ms, suspects, outcome }, false, this.divergenceLog);
+      // No shadow (a lazy join, or one just dropped): the guard's count is unmeasured, so live's own (O(client ids)).
+      const structs = doc.shadow !== null ? doc.structs : structCount(doc.live.store);
+      logOrderDivergence({ page: pageIdOf(doc.live) ?? null, where, structs, ms, suspects, outcome }, false, this.divergenceLog);
     } catch {
       // a log line is never a reason to fail
     }
@@ -1589,6 +1628,10 @@ export class CollabUpdateGuard {
     const writers = [...doc.writersSinceProbe];
     doc.writersSinceProbe.clear();
     doc.lastProbeAt = this.now();
+    if (doc.shadow !== null && replicaLogNeedsReverify(doc.live)) {
+      doc.dirty = true; // the next frame or join rebuilds and re-verifies it (charged to that user)
+      doc.dirtiedBy = null;
+    }
     const shadow = doc.shadow;
     if (doc.destroyed || !shadow || doc.dirty) return false;
     const workStarted = this.now();
@@ -1607,13 +1650,25 @@ export class CollabUpdateGuard {
   /**
    * #840: a reload of the shadow (what a joiner, a restart or a compaction builds), under the step budget and `deadline`,
    * compared strictly with live when every accepted frame has applied (the shadow is live then; stable, its encoding
-   * becomes the replay log's checkpoint), otherwise with the shadow (live plus the frames in flight). `over`: the
-   * reload tripped, ran out of time, or Yjs failed on its own encoding (fail closed).
+   * becomes the replay log's checkpoint). With frames in flight, a joiner may build either order: a reload of live plus
+   * the frames (4.7.1 encodes its Step2 after they apply) or a reload of live with the frames applied on top. So both
+   * must hold: a reload of the shadow equals the shadow, and a reload of live equals live (then a checkpoint too). `over`:
+   * a reload tripped, ran out of time, or Yjs failed on its own encoding (fail closed).
    */
   private reloadCheck(doc: DocGuard, deadline: number): { verdict: 'stable' | 'unstable' | 'over' | 'unencodable'; steps: number } {
     // No shadow (checkJoin on a page no writer has touched, nothing in flight): live itself.
-    const source = doc.shadow ?? doc.live;
-    const target = doc.shadow !== null && hasUnappliedFrames(doc.live) ? doc.shadow : doc.live;
+    const inFlight = doc.shadow !== null && hasUnappliedFrames(doc.live);
+    const first = this.reloadEquals(doc, doc.shadow ?? doc.live, inFlight ? doc.shadow! : doc.live, deadline);
+    const checked = first.verdict !== 'stable' || !inFlight ? first : { verdict: this.reloadEquals(doc, doc.live, doc.live, deadline).verdict, steps: first.steps };
+    if (checked.verdict === 'stable') doc.episode = null; // #840: a stable verdict ends the instability episode
+    return checked;
+  }
+
+  /**
+   * Does a reload of `source`'s encoding strict-equal `target` (`source` itself, or live when the shadow is live)?
+   * Metered, the deadline innermost. Equal to live: that encoding is the replay log's new checkpoint.
+   */
+  private reloadEquals(doc: DocGuard, source: Y.Doc, target: Y.Doc, deadline: number): { verdict: 'stable' | 'unstable' | 'over' | 'unencodable'; steps: number } {
     const scratch = new Y.Doc({ gc: doc.live.gc, gcFilter: doc.live.gcFilter });
     const scan = new ConflictScan(scratch, true, this.caps.steps);
     let state: Uint8Array;
@@ -1639,19 +1694,22 @@ export class CollabUpdateGuard {
 
   /**
    * #840: a SyncStep1 is a join: 4.7.1 answers it with a Step2 encoded from live once the hooks resolved, so the joiner
-   * builds a reload of live plus the frames in flight, which is the shadow. It is answered only when a reload of the
-   * shadow strict-equals it: checked once per mutation of the page (live's transactions, frames accepted), under the
-   * meter and the probe deadline, and charged to the joiner (who waits, 1013, while in collab CPU debt). An unstable page
-   * answers 1013 (try later) and heals; so does one that cannot be verified (over the bounds, or no exact shadow).
+   * builds a reload of live plus the frames in flight, which is the shadow (or, encoded before they apply, a reload of
+   * live with them on top). It is answered only when a reload of the shadow strict-equals it, and with frames in flight
+   * a reload of live strict-equals live (`reloadCheck`): checked once per change of what a joiner can get (live's
+   * generation, which moves only on a transaction that can change its encoding, and the accepted frames that can), under
+   * the meter and the probe deadline, and charged to the joiner (who waits, 1013, while in collab CPU debt). An unstable
+   * page answers 1013 (try later) and heals; so does one that cannot be verified (over the bounds, or no exact shadow).
    */
   private checkJoin(frame: GuardFrame): void {
     const doc = this.docFor(frame.document);
+    const userId = String(frame.context?.user?.id ?? '');
+    this.reverify(doc, userId); // a log distrusted for its caps, the total or frame order: its shadow is rebuilt first
     // A page no writer has touched has no shadow, and a join needs none: with nothing in flight its Step2 is live's
     // encoding, so live itself is checked (a page only readers open never builds, or mirrors into, a page-sized copy).
     const lazy = doc.shadow === null && !doc.dirty && !doc.unavailable && !doc.overBounds && !doc.diverged && !hasUnappliedFrames(doc.live);
     const key = `${mutationGeneration(doc.live)}:${doc.accepted}`;
     if (doc.verified === key && (doc.shadow !== null || lazy) && !doc.dirty) return;
-    const userId = String(frame.context?.user?.id ?? '');
     if (!this.take(this.budgetFor(frame, true).cpu, USER_COLLAB_CPU_BURST_MS, CPU_MS_REFILL_EVERY_MS, 0)) {
       this.tryLater(frame, 'user_collab_cpu'); // throws unless report mode
     }
@@ -1989,6 +2047,22 @@ function isVisible(type: Y.AbstractType<any>): boolean {
 }
 const idOf = (type: Y.AbstractType<any>): string => (type._item ? `${type._item.id.client}:${type._item.id.clock}` : 'root');
 const pageIdOf = (live: { name?: string }): string | undefined => live.name?.replace(/^page\./, '');
+
+/** #840: live's lineage epoch, or null when its lineage root is malformed (an episode is per epoch). */
+function epochOrNull(live: Y.Doc): number | null {
+  try {
+    return lineageEpoch(live);
+  } catch {
+    return null;
+  }
+}
+
+/** #840: the divergence outcome for a rebuild that needed the replay log and found it untrusted. */
+function untrustedOutcome(why: string | null): string {
+  if (why === LOG_OVER_CAP) return 'log_over_cap';
+  if (why === LOG_OVER_TOTAL) return 'log_over_total';
+  return 'log_untrusted';
+}
 
 /** #827: structs in a store, O(client ids): only where Yjs already paid O(structs) (a rebuild, a probe, a mirror). */
 function structCount(store: Y.Doc['store']): number {

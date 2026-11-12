@@ -14,11 +14,13 @@
  * unstable page is served corrupted whatever decides authorization.
  *
  *   ccc_page_heal_image(page_id) primary key, references pages(id) on delete cascade
- *     image       a verified, reload-stable compaction of the live document (#827's tree copy at the next epoch); NULL
- *                 when it could not be built or verified: the page then answers try-later until an operator acts
- *     row_sha     sha256 (base64) of the raw `pages.ydoc` it accompanies (compaction's CAS digest)
- *     epoch       the image's lineage epoch (-1: unknown, the live lineage was malformed)
- *     created_at  when the store wrote it
+ *     image           a verified, reload-stable compaction of the live document (#827's tree copy at the next epoch);
+ *                     NULL when it could not be built or verified: the load then rebuilds it from `pages.content` when
+ *                     that verifies against `content_digest`, else answers try-later until an operator acts
+ *     row_sha         sha256 (base64) of the raw `pages.ydoc` it accompanies (compaction's CAS digest)
+ *     epoch           the image's lineage epoch (-1: unknown, the live lineage was malformed)
+ *     content_digest  live's ADR 0019 digest at that store (`stableHash` of the `content` it wrote); NULL: unknown
+ *     created_at      when the store wrote it
  */
 import { Logger } from '@nestjs/common';
 import { sql } from 'kysely';
@@ -44,9 +46,12 @@ export async function installHealImageTable(db: KyselyDB): Promise<void> {
         image      bytea,
         row_sha    text        not null,
         epoch      integer     not null,
-        created_at timestamptz not null default now()
+        created_at timestamptz not null default now(),
+        content_digest text
       )
     `.execute(trx);
+    // A table made by an earlier #840 build has no content_digest yet (its rows read as NULL: no rebuild from content).
+    await sql`alter table ccc_page_heal_image add column if not exists content_digest text`.execute(trx);
   });
 }
 

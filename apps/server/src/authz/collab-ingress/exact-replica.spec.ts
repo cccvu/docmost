@@ -97,7 +97,7 @@ describe('#840 ExactReplicaLog: replay, not reload', () => {
       if (r() < 0.8 || t.length < 2) t.insert(Math.floor(r() * (t.length + 1)), 'lorem ipsum '.slice(0, 1 + Math.floor(r() * 12)));
       else t.delete(Math.floor(r() * (t.length - 1)), 1);
     }
-    expect(log.entries).toBe(1500); // past the initial 64-entry table and 4 KiB buffer
+    expect(log.entries).toBe(1500); // past the initial 4 KiB buffer
     expect(log.bytes).toBeGreaterThan(4096);
     expect(strictOrderDiff(log.rebuild(), live)).toBeNull();
   });
@@ -159,24 +159,50 @@ describe('#840 ExactReplicaLog: replay, not reload', () => {
     expect(tryAdvance(log, live)).toBe(true);
   });
 
-  it('caps: over at more than maxBytes or maxSteps, never at them; the defaults', () => {
+  it('caps: over at more than maxBytes of RETAINED memory (the buffer capacity) or maxSteps, never at them; the defaults', () => {
     expect(EXACT_REPLICA_CAPS).toEqual({ maxBytes: 8 * 1024 * 1024, maxSteps: 5_000_000 });
-    const byBytes = new ExactReplicaLog(new Uint8Array([0, 0]), { maxBytes: 10, maxSteps: 1e9 });
+    // 6 + 4 bytes of entries, each behind a 4-byte length: 18 retained
+    const byBytes = new ExactReplicaLog(new Uint8Array([0, 0]), { maxBytes: 18, maxSteps: 1e9 });
+    expect(byBytes.retained).toBe(0); // nothing allocated before the first entry
     byBytes.recordFrame(new Uint8Array(6), 1);
     byBytes.recordServerUpdate(new Uint8Array(4), 1);
-    expect([byBytes.bytes, byBytes.overCap()]).toEqual([10, false]);
+    expect([byBytes.bytes, byBytes.retained, byBytes.overCap()]).toEqual([10, 18, false]);
+    expect(byBytes.wouldRetain(0, 0)).toBe(Infinity); // one more length does not fit
     byBytes.recordFrame(new Uint8Array(1), 0);
     expect(byBytes.overCap()).toBe(true);
     const bySteps = new ExactReplicaLog(new Uint8Array([0, 0]), { maxBytes: 1e9, maxSteps: 5 });
     bySteps.recordFrame(new Uint8Array(1), 3);
     bySteps.recordServerUpdate(new Uint8Array(1), 2);
     expect([bySteps.steps, bySteps.overCap()]).toEqual([5, false]);
+    expect(bySteps.wouldRetain(1, 1)).toBe(Infinity);
     bySteps.recordServerUpdate(new Uint8Array(1), 1);
     expect(bySteps.overCap()).toBe(true);
     bySteps.advance(new Uint8Array([0, 0]));
-    expect(bySteps.overCap()).toBe(false);
+    expect([bySteps.overCap(), bySteps.retained]).toEqual([false, 0]); // advance frees the buffers
+    expect(bySteps.wouldRetain(1, NaN)).toBe(Infinity);
     bySteps.recordFrame(new Uint8Array(1), NaN); // a caller's broken meter fails closed, never under the cap forever
     expect(bySteps.overCap()).toBe(true);
+  });
+
+  it('growth never allocates past the cap: a log that fits retains at most maxBytes (no 2x overshoot)', () => {
+    const KiB = 1024;
+    for (const [cap, entry] of [[EXACT_REPLICA_CAPS.maxBytes, 64 * KiB], [EXACT_REPLICA_CAPS.maxBytes, 100], [100 * KiB, 3 * KiB + 7]] as const) {
+      const log = new ExactReplicaLog(new Uint8Array([0, 0]), { maxBytes: cap, maxSteps: 1e12 });
+      const u = new Uint8Array(entry);
+      let appended = 0;
+      for (;;) {
+        const after = log.wouldRetain(u.length, 1);
+        if (!Number.isFinite(after)) break;
+        log.recordFrame(u, 1);
+        appended++;
+        expect(log.retained).toBe(after); // what it said it would retain
+        expect(log.retained).toBeLessThanOrEqual(cap);
+        expect(log.overCap()).toBe(false);
+      }
+      // it filled the cap, not half of it: the buffer grew to the cap instead of doubling past it
+      expect(log.bytes + 4 * appended).toBeGreaterThan(cap * 0.75);
+      expect(log.retained).toBeLessThanOrEqual(cap);
+    }
   });
 
   it('never merges updates (not live\'s order, and far slower than the replay)', () => {

@@ -6,7 +6,9 @@
 //   1. the row's ydoc is read under the SAME withLock findById (one locked read) — TOCTOU,
 //   2. the reconcile runs BEFORE the write payload is serialized — TOCTOU,
 //   3. the write payload is serialized INSIDE the FOR UPDATE transaction — TOCTOU (moving it out but after
-//      the reconcile would stay green on #2 alone yet reopen the window),
+//      the reconcile would stay green on #2 alone yet reopen the window). #840: the one exception is a snapshot taken
+//      BEFORE the lock whose bytes provably hold the locked row (the row is the bytes the document covered then);
+//      any other row is serialized again inside, after the reconcile,
 //   4. a failed store is RECORDED (never re-thrown) and a successful one CLEARS the flag,
 //   5. a failed store does not fire the post-store side effects,
 //   6. the two alarm call-sites fire (logStaleReconcile on merge, logStoreFailure on failure) — dropping
@@ -48,9 +50,12 @@ jest.mock('@docmost/db/utils', () => ({
 
 const reconcileRowIntoDoc = jest.fn(() => ({ merged: false }));
 const markRowCovered = jest.fn();
+// #840: the reconcile memo read with the pre-lock snapshot (null: the document covers no known row bytes).
+const coveredRowDigest = jest.fn((..._a: unknown[]) => null as string | null);
 jest.mock('./reconcile-store', () => ({
   reconcileRowIntoDoc: (...a: unknown[]) => reconcileRowIntoDoc(...(a as [])),
   markRowCovered: (...a: unknown[]) => markRowCovered(...(a as [])),
+  coveredRowDigest: (...a: unknown[]) => coveredRowDigest(...(a as [])),
 }));
 const recordStoreFailure = jest.fn();
 const clearStoreFailure = jest.fn();
@@ -76,18 +81,34 @@ jest.mock('./collab-drift-log', () => ({
   logPostStoreFailure: (...a: unknown[]) => logPostStoreFailure(...(a as [])),
 }));
 // #840: the order check and the heal row (heal-image.spec.ts, heal-image.pg.spec.ts) need real yjs; here every store
-// is order-stable and drops no heal row.
-jest.mock('./heal-image', () => ({
-  checkStoreOrder: () => ({ stable: true, why: null, structs: 0, ms: 0, source: null }),
-  persistOrderState: async () => ({ unstable: false, imaged: false, ydocWritten: false, structs: 0, ms: 0 }),
+// is order-stable and drops no heal row. The snapshot's placement is real: heal-image's prepareStore and
+// storeSnapshotUnderLock, minus the order check, over the real persistence-steps (snapshotForStore, snapshotHoldsRow).
+jest.mock('./heal-image', () => {
+  const steps = jest.requireActual('./persistence-steps');
+  const stable = { stable: true, why: null, structs: 0, ms: 0, source: null, image: null };
+  const take = (doc: unknown, underLock: boolean) => ({
+    coveredRow: underLock ? null : steps.coveredRowAtSnapshot(doc),
+    snapshot: steps.snapshotForStore(doc),
+    order: stable,
+    underLock,
+  });
+  return {
+  prepareStore: async (doc: unknown) => take(doc, false),
+  storeSnapshotUnderLock: async (doc: unknown, _page: string, prepared: { coveredRow: string | null }, row: Uint8Array | null) =>
+    steps.snapshotHoldsRow(prepared.coveredRow, row) ? prepared : take(doc, true),
+  persistOrderState: async () => ({ unstable: false, reloadFailed: false, imaged: false, ydocWritten: false, structs: 0, ms: 0 }),
   afterOrderStore: () => undefined,
   loadStableYdoc: async () => undefined,
   noteLoadedBytes: () => undefined,
-}));
+  };
+});
 // blank-clobber-guard is left REAL (pure JSON, no heavy imports) so the null-ydoc tests exercise its
 // actual structural classifier.
 
+import { createHash } from 'node:crypto';
 import { PersistenceExtension } from '../../collaboration/extensions/persistence.extension';
+
+const digestOf = (b: Uint8Array) => createHash('sha256').update(b).digest('base64');
 
 describe('PersistenceExtension.onStoreDocument reconcile seam (#390)', () => {
   const document = { broadcastStateless: jest.fn() };
@@ -121,6 +142,7 @@ describe('PersistenceExtension.onStoreDocument reconcile seam (#390)', () => {
     reconcileRowIntoDoc.mockReturnValue({ merged: false });
     isStoreCurrent.mockReturnValue(false);
     storeGenerationOf.mockReturnValue(7);
+    coveredRowDigest.mockReturnValue(null);
     mockTx.inside = false;
     mockTx.serializeSawInside = undefined;
   });
@@ -151,8 +173,27 @@ describe('PersistenceExtension.onStoreDocument reconcile seam (#390)', () => {
     await run(ext);
 
     expect(reconcileRowIntoDoc).toHaveBeenCalledWith(document, expect.anything());
-    expect(order.indexOf('reconcile')).toBeLessThan(order.indexOf('serialize'));
-    expect(mockTx.serializeSawInside).toBe(true); // serialize ran while inside executeTx (under the row lock)
+    // #840: the pre-lock snapshot does not cover this row, so the payload is serialized again after the reconcile.
+    expect(order).toEqual(['serialize', 'reconcile', 'serialize']);
+    expect(mockTx.serializeSawInside).toBe(true); // the last serialize (the one written) ran inside executeTx
+  });
+
+  it('#840: a snapshot taken before the lock is written only when the locked row is the bytes the document covered then', async () => {
+    const row = Buffer.from([9]);
+    const order: string[] = [];
+    reconcileRowIntoDoc.mockImplementation(() => (order.push('reconcile'), { merged: false }));
+    fromYdoc.mockImplementation(() => (order.push(mockTx.inside ? 'serialize:in-tx' : 'serialize:before-lock'), { type: 'doc', content: [{ type: 'paragraph' }] }));
+    coveredRowDigest.mockReturnValue(digestOf(row));
+    const covered = build({ id: 'page-1', slugId: 's', content: { type: 'doc', content: [] }, ydoc: row });
+    await run(covered.ext);
+    expect(order).toEqual(['serialize:before-lock', 'reconcile']); // one snapshot, outside the lock, and it is written
+    expect(covered.updatePage).toHaveBeenCalledTimes(1);
+
+    order.length = 0; // another node wrote the row: the snapshot is taken again under the lock, after the reconcile
+    const moved = build({ id: 'page-1', slugId: 's', content: { type: 'doc', content: [] }, ydoc: Buffer.from([8]) });
+    await run(moved.ext);
+    expect(order).toEqual(['serialize:before-lock', 'reconcile', 'serialize:in-tx']);
+    coveredRowDigest.mockReturnValue(null);
   });
 
   it('emits COLLAB_STALE_RECONCILE (logStaleReconcile) when the reconcile merges', async () => {
@@ -250,14 +291,14 @@ describe('PersistenceExtension.onStoreDocument one-store-per-write seam (#731)',
     expect(collabHistory.addContributors).toHaveBeenCalledWith('page-1', ['human']);
   });
 
-  it('reads the generation after the reconcile and before serializing, inside the locked transaction', async () => {
+  it('reads the generation in the same run as the serialization it records: before the lock, or after the reconcile inside it', async () => {
     const order: string[] = [];
     reconcileRowIntoDoc.mockImplementation(() => (order.push('reconcile'), { merged: false }));
     storeGenerationOf.mockImplementation(() => (order.push(mockTx.inside ? 'generation:in-tx' : 'generation:outside'), 7));
     fromYdoc.mockImplementation(() => (order.push('serialize'), { type: 'doc', content: [{ type: 'paragraph' }] }));
-    const { ext } = build(ROW);
+    const { ext } = build(ROW); // #840: a row the pre-lock snapshot does not cover: serialized again under the lock
     await run(ext);
-    expect(order).toEqual(['reconcile', 'generation:in-tx', 'serialize']);
+    expect(order).toEqual(['generation:outside', 'serialize', 'reconcile', 'generation:in-tx', 'serialize']);
   });
 
   it('a committed WRITE marks the generation and seeds the reconcile memo with the bytes it wrote', async () => {

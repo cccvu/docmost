@@ -59,10 +59,7 @@ import {
 } from '../../authz/page-write/collab-drift-log';
 // #731: the load reads `content` only for a legacy row; the store yields a loop turn between its page-sized steps.
 // CCC #773: the store's snapshot (persistence-steps) makes the stored projection storable (no lone surrogate or NUL).
-import {
-  findPageRowForLoad,
-  snapshotForStore,
-} from '../../authz/page-write/persistence-steps';
+import { findPageRowForLoad } from '../../authz/page-write/persistence-steps';
 import { yieldToEventLoop } from '../../authz/page-write/yield-to-event-loop';
 // CCC #827: the bounded load (a page too costly to load answers try-later and is compacted from its row), compaction at
 // unload, and no store for a document a compaction superseded. The policy lives in authz/page-write/compaction.
@@ -74,10 +71,11 @@ import {
 // from it), hand the guard's replica log the exact bytes each load applied, and install the heal table at boot.
 import {
   afterOrderStore,
-  checkStoreOrder,
   loadStableYdoc,
   noteLoadedBytes,
   persistOrderState,
+  prepareStore,
+  storeSnapshotUnderLock,
   type OrderStoreOutcome,
 } from '../../authz/page-write/heal-image';
 import { installHealImageTableAtBoot } from '../../authz/page-write/heal-image.installer';
@@ -176,10 +174,10 @@ export class PersistenceExtension implements Extension {
 
     const pageId = getPageId(documentName);
 
-    // #390: serialization is deferred to INSIDE the row's FOR UPDATE transaction, AFTER the reconcile, so the
-    // persisted payload is always a snapshot of `document` taken under the lock — hence a superset of the
-    // locked row and never a stale subset that could clobber an out-of-band write. Declared here because the
-    // post-write side effects below also read the final values.
+    // #390: the persisted payload is always a superset of the locked row, never a stale subset that could clobber
+    // an out-of-band write: a snapshot taken under the lock AFTER the reconcile, or (CCC #840) one taken before the
+    // lock whose bytes provably hold the locked row. Declared here because the post-write side effects below also
+    // read the final values.
     let tiptapJson: any = null;
     let ydocState: Buffer = null;
     let textContent: string = null;
@@ -192,6 +190,8 @@ export class PersistenceExtension implements Extension {
     const editingUserIds = this.consumeContributors(documentName);
 
     try {
+      // CCC #840: the snapshot, its order check and an unstable store's heal image, BEFORE the row lock (heal-image.ts).
+      const prepared = await prepareStore(document, pageId);
       await executeTx(this.db, async (trx) => {
         page = await this.pageRepo.findById(pageId, {
           withLock: true,
@@ -223,11 +223,11 @@ export class PersistenceExtension implements Extension {
           }
         }
 
-        // Serialize AFTER the reconcile, under the lock (see #390 TOCTOU note above). #731: the generation, `fromYdoc`
-        // and the encode are ONE synchronous run (an edit in a later yield bumps the generation: the next store runs).
-        const snapshot = snapshotForStore(document);
-        // CCC #840: in the same synchronous run, whether exactly these bytes reload into live's order.
-        const order = checkStoreOrder(document, snapshot);
+        // #390: the payload must be a superset of the locked row. CCC #840: the snapshot taken before the lock when it
+        // provably is (the row is the bytes the document covered then), else one taken now, AFTER the reconcile. #731:
+        // the generation, `fromYdoc` and the encode are ONE synchronous run (a later edit bumps the generation: the next
+        // store runs).
+        const { snapshot, order } = await storeSnapshotUnderLock(document, pageId, prepared, page.ydoc);
         coveredGeneration = snapshot.generation;
         tiptapJson = snapshot.json;
         ydocState = snapshot.state;

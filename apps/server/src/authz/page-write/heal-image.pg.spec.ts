@@ -18,6 +18,8 @@ import { compactionStoreOf, isPageCompactingRefusal, resetLoadTripsForTests } fr
 import { awaitCompaction, compactionRequest, lineageEpoch, setCompactionClockForTests } from './compaction-registry';
 import { liveContentDigest } from './doc-version';
 import { healStoreOf } from './heal-image';
+import { resetLoadDivergenceLogForTests } from './order-divergence-log';
+import { tiptapExtensions } from '../../collaboration/collaboration.util';
 import { recordWriteKey } from './write-idem';
 
 /**
@@ -55,6 +57,19 @@ function seed() {
   return { bytes: Y.encodeStateAsUpdate(b.doc), content: json(b.doc), frame };
 }
 
+/**
+ * The seed as the editor and the API write it (through the server schema: every default attribute present), so a
+ * rebuild from its `content` can reproduce it; and S1's frame against its text.
+ */
+function schemaSeed() {
+  const doc = TiptapTransformer.toYdoc({ type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'abcdefgh' }] }] } as never, 'default', tiptapExtensions);
+  const text = (doc.getXmlFragment('default').get(0) as Y.XmlElement).get(0) as Y.XmlText;
+  const start = (text as unknown as { _start: Y.Item })._start.id;
+  const frame = (client = start.client + 1, insert = 'XYZ') =>
+    rawUpdate([{ client, clock: 0, structs: [{ origin: [start.client, start.clock + 5], right: [start.client, start.clock + 3], content: new Y.ContentString(insert) }] }]);
+  return { bytes: Y.encodeStateAsUpdate(doc), content: json(doc), frame };
+}
+
 /** A stable state with more in it (another node's write): the seed plus a paragraph. */
 function stableOther(text: string): Uint8Array {
   const b = basePage('abcdefgh');
@@ -65,6 +80,9 @@ function stableOther(text: string): Uint8Array {
   });
   return Y.encodeStateAsUpdate(b.doc);
 }
+
+/** Type into the first paragraph's text, as the editor does. */
+const typeInto = (doc: Y.Doc, text: string) => ((doc.getXmlFragment('default').get(0) as Y.XmlElement).get(0) as Y.XmlText).insert(0, text);
 
 /** `doc`'s state vector covers every client clock in `sv` (I1). */
 function covers(doc: Y.Doc, sv: Uint8Array): boolean {
@@ -94,8 +112,8 @@ d('heal image crash matrix on real Postgres (#840)', () => {
     (await pg<{ content: unknown; ydoc: Buffer; updatedAt: Date }[]>`
       select content, ydoc, updated_at as "updatedAt" from pages where id = ${pageId}`)[0];
   const heal = async () =>
-    (await pg<{ image: Buffer | null; rowSha: string; epoch: number }[]>`
-      select image, row_sha as "rowSha", epoch from ccc_page_heal_image where page_id = ${pageId}`)[0] ?? null;
+    (await pg<{ image: Buffer | null; rowSha: string; epoch: number; contentDigest: string | null }[]>`
+      select image, row_sha as "rowSha", epoch, content_digest as "contentDigest" from ccc_page_heal_image where page_id = ${pageId}`)[0] ?? null;
   const writeYdoc = (bytes: Uint8Array) => pg`update pages set ydoc = ${Buffer.from(bytes)} where id = ${pageId}`;
 
   function stack() {
@@ -174,6 +192,7 @@ d('heal image crash matrix on real Postgres (#840)', () => {
     jest.spyOn(Logger.prototype, 'warn').mockImplementation(capture);
     jest.spyOn(Logger.prototype, 'error').mockImplementation(capture);
     jest.spyOn(Logger.prototype, 'debug').mockImplementation(() => undefined);
+    resetLoadDivergenceLogForTests();
     now += 2 * COMPACTION_MIN_INTERVAL_MS;
     armed = true;
     restoreClock = setCompactionClockForTests({ now: () => now, uptimeMs: () => (armed ? COMPACTION_ARM_DELAY_MS + 1 : 0) });
@@ -207,8 +226,7 @@ d('heal image crash matrix on real Postgres (#840)', () => {
    * An unstable store that commits on `s`: returns pre-crash live (its content, digest and state vector) and the
    * committed row's bytes.
    */
-  async function unstableCommit(s: ReturnType<typeof stack>) {
-    const sd = seed();
+  async function unstableCommit(s: ReturnType<typeof stack>, sd: { bytes: Uint8Array; content: unknown; frame: () => Uint8Array } = seed()) {
     await insert(sd.content, sd.bytes);
     const { conn, doc } = await openPage(s);
     await destabilize(conn, sd.frame());
@@ -241,6 +259,7 @@ d('heal image crash matrix on real Postgres (#840)', () => {
     expect(h).not.toBeNull();
     expect(h!.rowSha).toBe(sha(r.ydoc)); // the image names exactly the bytes it accompanies
     expect(h!.epoch).toBe(1);
+    expect(h!.contentDigest).toBe(live.digest); // live's ADR 0019 digest, which the content written beside it carries
     expect(Buffer.from(r.ydoc)).toEqual(Buffer.from(Y.encodeStateAsUpdate(doc))); // raw bytes, no item lost (I1)
     expect(covers(loaded(r.ydoc), live.sv)).toBe(true);
     expect(r.content).toEqual(live.json); // live-order content
@@ -421,7 +440,7 @@ d('heal image crash matrix on real Postgres (#840)', () => {
     expect(divergence().map((e) => e.outcome)).toEqual(['heal_image', 'stale_dropped']);
   });
 
-  it('the image cannot be built at the store: raw row + a heal row without an image; the page answers try-later and alerts', async () => {
+  it('the image cannot be built at the store and `content` cannot reproduce live (no default attributes): try-later and an alert', async () => {
     const sd = seed();
     await insert(sd.content, sd.bytes);
     const s = stack();
@@ -449,7 +468,156 @@ d('heal image crash matrix on real Postgres (#840)', () => {
     expect(isPageCompactingRefusal(again.refused)).toBe(true); // I2: unavailable, never served unstable
     expect(Buffer.from((await row()).ydoc)).toEqual(Buffer.from(committed.ydoc)); // nothing healed from a lossy source
     expect(await heal()).toEqual(h);
+    // The rebuild from `content` goes through the schema, which fills in the bare paragraph's default attributes: its
+    // digest is not live's, so it is refused (I3), logged, and the page alerts.
+    expect(lines.some((l) => l.startsWith('COLLAB_COMPACTION_FAILED ') && l.includes('"heal_from_content"'))).toBe(true);
     expect(divergence().map((e) => e.outcome)).toEqual(['image_failed', 'image_missing']);
+  });
+
+  it('the image cannot be built at the store: the restart rebuilds it from `content`, verified, and heals by the same CAS (I1–I3)', async () => {
+    const s = stack();
+    const sd = schemaSeed();
+    await insert(sd.content, sd.bytes);
+    const { conn, doc } = await openPage(s);
+    await destabilize(conn, sd.frame());
+    expect(isReloadStable(doc).stable).toBe(false); // precondition
+    let calls = 0; // the store's deadlines: its reload (1), the image build (2)
+    const restore = overrideDeadlineForTests((fn, ms) => {
+      if (++calls === 2) throw deadlineExceeded(ms);
+      return fn();
+    });
+    try {
+      await expect(s.handlers.flushPageContent(DOC)).resolves.toEqual({ flushed: true });
+    } finally {
+      restore();
+    }
+    const live = { json: json(doc), digest: liveContentDigest(doc), sv: Y.encodeStateVector(doc) };
+    await crash(conn);
+    const committed = await row();
+    expect(await heal()).toMatchObject({ image: null, rowSha: sha(committed.ydoc), epoch: 1, contentDigest: live.digest });
+    expect(covers(loaded(committed.ydoc), live.sv)).toBe(true); // I1 at the crash point
+
+    // Not armed: try-later, nothing rebuilt or written.
+    armed = false;
+    const early = await tryOpen(stack());
+    armed = true;
+    expect(isPageCompactingRefusal(early.refused)).toBe(true);
+    expect(Buffer.from((await row()).ydoc)).toEqual(Buffer.from(committed.ydoc));
+
+    const { doc: served } = await tryOpen(stack());
+    expect(isReloadStable(served!).stable).toBe(true); // I2
+    expect(json(served!)).toEqual(live.json); // what live showed at the store, in live's order
+    expect(liveContentDigest(served!)).toBe(live.digest); // I3: verified against the digest stored with the heal row
+    expect(lineageEpoch(served!)).toBe(1);
+    expect(await heal()).toBeNull(); // the CAS deleted it
+    const stored = loaded((await row()).ydoc);
+    expect(isReloadStable(stored).stable).toBe(true);
+    expect(json(stored)).toEqual(live.json);
+    expect(strictOrderDiff(replicaLogOf(served!)!.rebuild(), served!)).toBeNull();
+    expect(divergence().map((e) => e.outcome)).toEqual(['image_failed', 'not_armed', 'healed_from_content']);
+    expect(lines.filter((l) => l.startsWith('COLLAB_ORDER_DIVERGENCE ') && l.includes('"image_missing"'))).toEqual([]);
+  });
+
+  it('`content` changed under a heal row with no image (not live\'s at that store): nothing is rebuilt from it; try-later and an alert', async () => {
+    const s = stack();
+    const sd = schemaSeed();
+    await insert(sd.content, sd.bytes);
+    const { conn } = await openPage(s);
+    await destabilize(conn, sd.frame());
+    let calls = 0;
+    const restore = overrideDeadlineForTests((fn, ms) => {
+      if (++calls === 2) throw deadlineExceeded(ms);
+      return fn();
+    });
+    try {
+      await expect(s.handlers.flushPageContent(DOC)).resolves.toEqual({ flushed: true });
+    } finally {
+      restore();
+    }
+    await crash(conn);
+    const committed = await row();
+    // A writer this code does not know of rewrites `content` alone: its own rebuild would match it, the stored digest does not.
+    await pg`update pages set content = ${pg.json(sd.content as never)} where id = ${pageId}`;
+    const again = await tryOpen(stack());
+    expect(isPageCompactingRefusal(again.refused)).toBe(true);
+    expect(Buffer.from((await row()).ydoc)).toEqual(Buffer.from(committed.ydoc));
+    expect(divergence().map((e) => e.outcome)).toEqual(['image_failed', 'image_missing']);
+  });
+
+  it('a store whose reload misses its deadline (one slow reload on an honest page): heal row with an image, no drain, reload_failed; the next store clears it', async () => {
+    const s = stack();
+    const sd = schemaSeed();
+    await insert(sd.content, sd.bytes);
+    const { conn, doc } = await openPage(s);
+    await conn.transact((d) => typeInto(d, 'typed')); // as the editor types: into the paragraph's text
+    expect(isReloadStable(doc).stable).toBe(true); // honest and stable
+    let calls = 0;
+    const restore = overrideDeadlineForTests((fn, ms) => {
+      if (++calls === 1) throw deadlineExceeded(ms); // the store's reload only
+      return fn();
+    });
+    try {
+      await expect(s.handlers.flushPageContent(DOC)).resolves.toEqual({ flushed: true });
+    } finally {
+      restore();
+    }
+    const r = await row();
+    const h = await heal();
+    expect(h).toMatchObject({ rowSha: sha(r.ydoc), epoch: 1 }); // fail closed for a crash: the unknown order is recoverable
+    expect(h!.image).not.toBeNull();
+    expect(compactionRequest(doc)).toMatchObject({ reason: 'order_divergence', drain: false }); // never a page-wide drain
+    expect(divergence()).toEqual([expect.objectContaining({ where: 'store', outcome: 'reload_failed' })]);
+    expect(lines.filter((l) => l.startsWith('COLLAB_ORDER_DIVERGENCE ') && l.includes('ERROR'))).toEqual([]);
+
+    await conn.transact((d) => typeInto(d, 'more'));
+    await expect(s.handlers.flushPageContent(DOC)).resolves.toEqual({ flushed: true });
+    expect(await heal()).toBeNull(); // the next store reloads fine: stable, the heal row goes
+  });
+
+  it('the store\'s reload AND its image build fail: a heal row with no image; the restart rebuilds it from `content`', async () => {
+    const s = stack();
+    const sd = schemaSeed();
+    await insert(sd.content, sd.bytes);
+    const { conn, doc } = await openPage(s);
+    await conn.transact((d) => typeInto(d, 'typed')); // as the editor types: into the paragraph's text
+    const restore = overrideDeadlineForTests((_fn, ms) => {
+      throw deadlineExceeded(ms); // two missed deadlines
+    });
+    try {
+      await expect(s.handlers.flushPageContent(DOC)).resolves.toEqual({ flushed: true });
+    } finally {
+      restore();
+    }
+    const live = { json: json(doc), digest: liveContentDigest(doc) };
+    await crash(conn);
+    expect(await heal()).toMatchObject({ image: null, epoch: 1, contentDigest: live.digest });
+    const { doc: served } = await tryOpen(stack());
+    expect(json(served!)).toEqual(live.json);
+    expect(isReloadStable(served!).stable).toBe(true);
+    expect(await heal()).toBeNull();
+    expect(divergence().map((e) => e.outcome)).toEqual(['reload_failed', 'healed_from_content']);
+  });
+
+  it('the row moved before the store took its lock (another node\'s write): snapshot, check and image are taken under the lock, a superset of that row (I1, #390)', async () => {
+    const s = stack();
+    const sd = seed();
+    await insert(sd.content, sd.bytes);
+    const { conn, doc } = await openPage(s);
+    await destabilize(conn, sd.frame());
+    const other = stableOther('another node'); // same lineage as the seed: the reconcile folds it in
+    await writeYdoc(other);
+    await expect(s.handlers.flushPageContent(DOC)).resolves.toEqual({ flushed: true });
+    const r = await row();
+    expect(covers(loaded(r.ydoc), Y.encodeStateVector(loaded(other)))).toBe(true); // the other node's write is kept
+    expect(JSON.stringify(json(doc))).toContain('another node');
+    const h = await heal();
+    expect(h!.rowSha).toBe(sha(r.ydoc)); // names exactly the bytes written under the lock
+    expect(JSON.stringify(json(loaded(h!.image!)))).toContain('another node');
+    expect(JSON.stringify(json(loaded(h!.image!)))).toContain('XYZ');
+    await crash(conn);
+    const { doc: served } = await tryOpen(stack());
+    expect(json(served!)).toEqual(json(doc));
+    expect(isReloadStable(served!).stable).toBe(true);
   });
 
   it('a stale heal row over STABLE bytes (a pre-#840 writer): served, and the stale row dropped', async () => {
@@ -465,7 +633,7 @@ d('heal image crash matrix on real Postgres (#840)', () => {
     expect(Buffer.from((await row()).ydoc)).toEqual(Buffer.from(other));
   });
 
-  it('a stale heal row over UNSTABLE bytes: try-later and alert; nothing is healed from the stale image', async () => {
+  it('a stale heal row over UNSTABLE bytes: served as the pre-#840 writer served it, the stale row dropped, compacted from that tree', async () => {
     const s = stack();
     const { conn } = await unstableCommit(s);
     await crash(conn);
@@ -476,11 +644,22 @@ d('heal image crash matrix on real Postgres (#840)', () => {
     const unstable = Y.encodeStateAsUpdate(elsewhere);
     expect(isReloadStable(loaded(unstable)).stable).toBe(false); // precondition
     await writeYdoc(unstable);
-    const again = await tryOpen(stack());
-    expect(isPageCompactingRefusal(again.refused)).toBe(true);
+    expect(h).not.toBeNull();
+    const s2 = stack();
+    const { conn: reader, doc: served } = await openPage(s2);
+    expect(served).not.toBeNull(); // never try-later for an operator: it is the legacy case
+    expect(textOf(served)).toBe(textOf(loaded(unstable))); // the reload order the pre-#840 task served
+    expect(covers(served, Y.encodeStateVector(elsewhere))).toBe(true); // I1: nothing of the row lost
+    expect(await heal()).toBeNull(); // the stale row is gone (the image named other bytes: never used)
     expect(Buffer.from((await row()).ydoc)).toEqual(Buffer.from(unstable));
-    expect(await heal()).toEqual(h);
-    expect(lines.some((l) => l.startsWith('COLLAB_ORDER_DIVERGENCE ') && l.includes('"stale_unstable"'))).toBe(true);
+    expect(compactionRequest(served)).toMatchObject({ reason: 'order_divergence', drain: false });
+    expect(divergence().map((e) => e.outcome)).toEqual(['heal_image', 'stale_legacy']);
+    const shown = json(served);
+    await reader.disconnect(); // the unload compacts from the loaded tree
+    await awaitCompaction(pageId);
+    const compacted = loaded((await row()).ydoc);
+    expect(isReloadStable(compacted).stable).toBe(true);
+    expect(json(compacted)).toEqual(shown);
   });
 
   it('a legacy unstable row (no heal row): served as today, compaction from that tree requested; then stable for good', async () => {
