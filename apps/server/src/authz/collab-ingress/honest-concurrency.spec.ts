@@ -18,6 +18,7 @@ import { compactionRequest } from '../page-write/compaction-registry';
 import { PAGE_MAX_YDOC_BYTES } from '../page-write/page-size';
 import { C_MAX, E_MAX } from './doc-bounds';
 import { SocketLimitLog } from './socket-limit-log';
+import { markRowCovered } from '../page-write/reconcile-store';
 import { COLLAB_REFUSAL_CODE, COLLAB_TRY_LATER_CODE, CollabUpdateGuard, UNRESOLVED_REASON, USER_COLLAB_CPU_BURST_MS } from './update-guard';
 
 /**
@@ -347,6 +348,7 @@ describe('#827 honest work at the caps is never refused', () => {
     live.name = DOC_NAME;
     live.getConnections = () => [];
     if (seed) Y.applyUpdate(live, Y.encodeStateAsUpdate(seed));
+    markRowCovered(live, Y.encodeStateAsUpdate(live)); // a stored row the unload can compact
     const lines: string[] = [];
     // The production bounds, held in CPU time (the worker's own: a busy CI runner's waits are not the frame's cost)
     const guard = new CollabUpdateGuard({

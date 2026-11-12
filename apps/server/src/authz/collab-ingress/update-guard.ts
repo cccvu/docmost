@@ -83,6 +83,7 @@ import { decodeUtf8 } from 'lib0/string';
 import * as Y from 'yjs';
 import { isTransactionOrigin, MessageType } from '@hocuspocus/server';
 import { PAGE_MAX_YDOC_BYTES } from '../page-write/page-size';
+import { unloadCanCompact } from '../page-write/reconcile-store';
 import {
   canStartCompaction,
   compactedRecently,
@@ -285,6 +286,11 @@ export interface CollabGuardOptions {
   cpuNow?: () => number;
   /** #827: the deadline runner (deadline.ts); specs inject one that times out on cue. */
   runWithDeadline?: DeadlineRunner;
+  /**
+   * #827: whether an unload could compact `live` (reconcile-store's `unloadCanCompact`: its row bytes are covered, and a
+   * build of them has not failed for good). Specs replace it.
+   */
+  rowCovered?: (live: Y.Doc) => boolean;
   /** #827: the largest Step2/Update payload; PAGE_MAX_YDOC_BYTES. */
   maxFrameBytes?: number;
   caps?: Partial<DocCaps>;
@@ -433,6 +439,7 @@ export class CollabUpdateGuard {
   private readonly meter: ConflictScanMeter;
   /** #827: named so deadline.fitness.spec.ts finds every call. */
   private readonly runWithDeadline: DeadlineRunner;
+  private readonly rowCovered: (live: Y.Doc) => boolean;
   private readonly maxFrameBytes: number;
   private readonly caps: DocCaps;
   private readonly deadlines: GuardDeadlines;
@@ -450,6 +457,7 @@ export class CollabUpdateGuard {
     this.now = opts.now ?? Date.now;
     this.cpuNow = opts.cpuNow ?? (() => performance.now());
     this.runWithDeadline = opts.runWithDeadline ?? runWithDeadline;
+    this.rowCovered = opts.rowCovered ?? ((live) => unloadCanCompact(live, pageIdOf(live as { name?: string }) ?? ''));
     this.maxFrameBytes = opts.maxFrameBytes ?? PAGE_MAX_YDOC_BYTES;
     this.caps = { structs: S_MAX, clientIds: C_MAX, children: E_MAX, steps: W_MAX, compactLive: COMPACT_MAX_LIVE_STRUCTS, ...opts.caps };
     this.deadlines = { frame: T_FRAME_MS, load: LOAD_DEADLINE_MS, probe: PROBE_DEADLINE_MS, mirror: MIRROR_DEADLINE_MS, ...opts.deadlines };
@@ -908,6 +916,12 @@ export class CollabUpdateGuard {
     if (verdict !== 'ok' && this.mode === 'enforce') return verdict; // refused: the counts stay those of the page without it
     doc.structs = structs;
     doc.liveChildren = Math.max(doc.liveChildren, result.children);
+    if (exactLive !== undefined) {
+      // the exact count (the shadow holds this frame) replaces the estimate until the next growth, so the walk does not
+      // repeat on every frame until the next probe
+      doc.liveStructs = exactLive;
+      doc.structsAtMeasure = structs;
+    }
     // Past a soft cap: requested for the next unload (a children soft cap: compaction keeps every live child, so it
     // never helps, and `compactionHelps` reads the children too).
     const soft = capVerdict(
@@ -930,6 +944,9 @@ export class CollabUpdateGuard {
    * again). O(1).
    */
   private compactionHelps(doc: DocGuard, frameStructs = 0, frameChildren = 0, exactStructs?: number): boolean {
+    // An unload can compact only a page whose row bytes are covered: otherwise a drain would close everyone for a
+    // compaction that never runs (and the resent frame would drain it again on every reload). Such a page is page-full.
+    if (!this.rowCovered(doc.live)) return false;
     const structs = exactStructs ?? doc.liveStructs + Math.max(0, doc.structs - doc.structsAtMeasure) + frameStructs;
     return compactionWouldHelp({ structs, children: Math.max(doc.liveChildren, frameChildren) }, this.caps);
   }

@@ -14,6 +14,7 @@ import {
 import { awarenessFrame, DOC_NAME, MSG, processCpuMs, RemoteClient, SYNC, syncFrame, typedFrame, step1Frame } from './collab-ingress.testkit';
 import { buildCompacted, refusesGrowth, snapshotTree } from '../page-write/compaction';
 import { liveContentDigest } from '../page-write/doc-version';
+import { markRowCovered } from '../page-write/reconcile-store';
 import { COLLAB_PAGE_COMPACTING_REASON, epochStaleReason } from './collab-reasons';
 import { ConflictScan, CONFLICT_SCAN_STEPS_PER_FRAME, installConflictScanMeter } from './conflict-scan';
 import { basePage, rawUpdate, type RawStruct } from './conflict-scan.testkit';
@@ -50,6 +51,7 @@ function setup(seed: Y.Doc | null, opts: CollabGuardOptions = {}) {
   const live = new Y.Doc() as Y.Doc & { name: string; getConnections: () => Conn[] };
   live.name = DOC_NAME;
   if (seed) Y.applyUpdate(live, Y.encodeStateAsUpdate(seed));
+  markRowCovered(live, Y.encodeStateAsUpdate(live)); // loaded from a stored row the unload can compact (the store's view)
   const conns: Conn[] = [];
   live.getConnections = () => conns;
   const logs: string[] = [];
@@ -418,6 +420,19 @@ describe('#827 (d) client ids: Yjs pays every id on every transaction, so the pa
     expect(s.state().equals(before)).toBe(true);
     expect(compactionRequest(s.live)).toMatchObject({ reason: 'client_ids', drain: true });
     expect(other.webSocket.close).toHaveBeenCalledWith(COLLAB_TRY_LATER_CODE, COLLAB_PAGE_COMPACTING_REASON);
+  });
+
+  it('a page whose unload could not compact (its row bytes not covered, or a build of them failed) is page-full, never drained', () => {
+    armed();
+    // reconcile-store's unloadCanCompact says no: a drain would close everyone for a compaction that never runs, and the
+    // resent frame would drain it again on every reload. The crossing frame gets the final answer instead.
+    const s = setup(withIds(CAP - 1), { caps: { clientIds: CAP }, rowCovered: () => false });
+    const other = s.conn('other');
+    expect(s.send(s.conn('a'), editAs(s.live, 5000, (d) => textOf(d).insert(0, 'k')))).toBe('applied'); // CAP ids
+    expect(s.send(s.conn('a'), editAs(s.live, 5001, (d) => textOf(d).insert(0, 'k')))).toBe(REFUSED('page-full'));
+    expect(isDraining(s.live)).toBe(false);
+    expect(compactionRequest(s.live)).toBeNull();
+    expect(other.webSocket.close).not.toHaveBeenCalled();
   });
 
   it('past the soft cap compaction is requested for the next unload (no drain)', () => {

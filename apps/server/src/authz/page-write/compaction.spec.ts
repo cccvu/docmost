@@ -34,6 +34,7 @@ import {
   skipStoreOfSuperseded,
   snapshotTree,
   startRowCompaction,
+  textRunsDigest,
 } from './compaction';
 import {
   awaitCompaction,
@@ -55,7 +56,7 @@ import {
   writeLineage,
 } from './compaction-registry';
 import { COMPACTION_ARM_DELAY_MS, COMPACTION_MIN_INTERVAL_MS } from '../collab-ingress/doc-bounds';
-import { coveredRowDigest, markRowCovered } from './reconcile-store';
+import { coveredRowDigest, markRowCovered, unloadCanCompact } from './reconcile-store';
 import { stableHash } from './stable-hash';
 import { hasStoreFailure, markStoredAt, storeGenerationOf } from './store-failure-registry';
 import { storeSafeJson } from './store-safe-json';
@@ -574,6 +575,61 @@ describe('compactOnUnload (#827)', () => {
     expect(treated.cellOf(loaded).getAttribute('colspan')).toBeUndefined(); // the compacted row holds the repaired page
   });
 
+  it('a page whose load repair removed a mark (a split text run) compacts: the digest check joins equal-marked runs', async () => {
+    const src = churnedPage(10, { type: 'doc', content: [para(text('hello world'))] });
+    // a stored legacy mark value the guard refuses (a link href that is a number): the repair deletes its opening format
+    // item and leaves the closing one, so Yjs never joins the run back, and fromYdoc gives two text nodes
+    ((src.getXmlFragment('default').get(0) as Y.XmlElement).get(0) as Y.XmlText).format(0, 2, { link: { href: 5 } });
+    const bytes = Y.encodeStateAsUpdate(src);
+    const content = storeSafeJson(TiptapTransformer.fromYdoc(src, 'default'));
+    const store = memoryStore({ content, ydoc: bytes, contentHash: md5(content) });
+    const pageId = nextPageId();
+    const doc = new Y.Doc() as CompactableDocument;
+    loadStoredYdoc(doc, pageId, bytes, store, { steps: 1e9, deadlineMs: 60_000, caps: { structs: 1e9, clientIds: countStructs(src).clients - 1, children: 1e9 } });
+    const ext = new CollabUpdateGuardExtension(new CollabUpdateGuard({ mode: 'enforce', logger: { warn: () => undefined } }), {
+      logger: { warn: () => undefined },
+    });
+    await ext.afterLoadDocument({ document: doc, documentName: `page.${pageId}` } as never);
+    const runs = (TiptapTransformer.fromYdoc(doc, 'default') as { content: Array<{ content: unknown[] }> }).content[0].content;
+    expect(runs.length).toBeGreaterThan(1); // non-vacuity: the repaired page holds a split run
+    Object.assign(doc, { name: `page.${pageId}`, connections: new Map(), getConnectionsCount: () => 0 });
+    await compactOnUnload(doc, store);
+    expect(isSuperseded(doc)).toBe(true);
+    const loaded = new Y.Doc();
+    Y.applyUpdate(loaded, store.row!.ydoc!);
+    expect(textRunsDigest(storeSafeJson(TiptapTransformer.fromYdoc(loaded, 'default')))).toBe(
+      textRunsDigest(storeSafeJson(TiptapTransformer.fromYdoc(doc, 'default'))),
+    );
+  });
+
+  it('a build that failed deterministically is not tried again for the same bytes, nor drained for', async () => {
+    const live = churnedPage(6);
+    const pageId = nextPageId();
+    const stored = Y.encodeStateAsUpdate(live);
+    const content = storeSafeJson(TiptapTransformer.fromYdoc(live, 'default'));
+    const store = memoryStore({ content, ydoc: stored, contentHash: md5(content) });
+    const doc = resident(live, pageId, stored);
+    expect(unloadCanCompact(doc, pageId)).toBe(true);
+    let builds = 0;
+    const restore = overrideDeadlineForTests(() => {
+      builds++;
+      throw new Error('a build that always fails');
+    });
+    try {
+      requestCompaction(doc, { reason: 'client_ids', userId: null, drain: true });
+      await compactOnUnload(doc, store);
+      expect(builds).toBe(1);
+      expect(isSuperseded(doc)).toBe(false);
+      expect(unloadCanCompact(doc, pageId)).toBe(false); // the guard and the load read it as page-full, never drain it
+      now += 2 * COMPACTION_MIN_INTERVAL_MS;
+      await compactOnUnload(doc, store);
+      expect(builds).toBe(1); // skipped (failed_before), no second build
+      expect(logged.some((l) => l.includes('"event":"skipped"') && l.includes('"why":"failed_before"'))).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
   it('a row whose bytes leave structs pending is never drained at load (its unload could not compact): requested only', () => {
     const src = churnedPage(10);
     const a = new Y.Doc();
@@ -776,7 +832,7 @@ describe('compactOnUnload (#827)', () => {
 });
 
 describe('compactFromRow (#827): the row content is the source', () => {
-  it('a row build that ran out of time is not retried for the same bytes; other bytes are', async () => {
+  it('a row build that ran out of time twice is not retried for the same bytes; other bytes are', async () => {
     const live = churnedPage(4);
     const bytes = Y.encodeStateAsUpdate(live);
     const content = storeSafeJson(TiptapTransformer.fromYdoc(live, 'default'));
@@ -790,11 +846,15 @@ describe('compactFromRow (#827): the row content is the source', () => {
       await awaitCompaction(pageId);
       expect(store.calls.read).toBe(1);
       now += 2 * COMPACTION_MIN_INTERVAL_MS; // past the per-page interval and the process gap
-      expect(startRowCompaction(store, pageId, 'load_trip', sha(bytes))).toBe(false); // the same bytes: not again
-      expect(store.calls.read).toBe(1);
-      expect(startRowCompaction(store, pageId, 'load_trip', 'other-bytes-digest')).toBe(true); // a store wrote since
+      expect(startRowCompaction(store, pageId, 'load_trip', sha(bytes))).toBe(true); // one overrun may be a stall
       await awaitCompaction(pageId);
       expect(store.calls.read).toBe(2);
+      now += 2 * COMPACTION_MIN_INTERVAL_MS;
+      expect(startRowCompaction(store, pageId, 'load_trip', sha(bytes))).toBe(false); // the same bytes, twice: not again
+      expect(store.calls.read).toBe(2);
+      expect(startRowCompaction(store, pageId, 'load_trip', 'other-bytes-digest')).toBe(true); // a store wrote since
+      await awaitCompaction(pageId);
+      expect(store.calls.read).toBe(3);
     } finally {
       restore();
     }

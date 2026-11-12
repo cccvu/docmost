@@ -249,6 +249,43 @@ export function isCompactionInflight(pageId: string): boolean {
   return inflight.has(pageId);
 }
 
+// --- builds that failed: not tried again for the same row bytes
+
+/**
+ * Compaction builds that failed for a page's row bytes (the digest an unload's compare-and-swap names, or the row's
+ * own on the row path). A build that failed deterministically (the digest check, a malformed lineage, any error) fails
+ * again on the same bytes; one that ran out of COMPACTION_DEADLINE_MS twice will too (one may be a stall). Such bytes are
+ * never compacted again, nor drained for: the cap rule reads the page as one compaction cannot help (page-full), so a
+ * failing page is never closed to everyone every interval. Other bytes (a store wrote, a break-glass cleared the row)
+ * are tried again, and a compaction that succeeds forgets the page. Bounded: the oldest entries go first.
+ */
+const buildFailures = new Map<string, { digest: string; strikes: number; needed: number }>();
+const BUILD_FAILURES_MAX = 10_000;
+
+export function noteBuildFailed(pageId: string, digest: string, outOfTime: boolean): void {
+  const known = buildFailures.get(pageId);
+  const strikes = known && known.digest === digest ? known.strikes + 1 : 1;
+  buildFailures.delete(pageId);
+  buildFailures.set(pageId, { digest, strikes, needed: outOfTime ? 2 : 1 });
+  if (buildFailures.size > BUILD_FAILURES_MAX) buildFailures.delete(buildFailures.keys().next().value!);
+}
+
+/** True when a build of `pageId` from these row bytes failed for good (`noteBuildFailed`). */
+export function buildRefused(pageId: string, digest: string): boolean {
+  const known = buildFailures.get(pageId);
+  return !!known && known.digest === digest && known.strikes >= known.needed;
+}
+
+export function forgetBuildFailure(pageId: string): void {
+  buildFailures.delete(pageId);
+}
+
+/** Clear every recorded build failure (jest only). */
+export function resetBuildFailuresForTests(): void {
+  if (process.env.JEST_WORKER_ID === undefined) throw new Error('resetBuildFailuresForTests is for jest only (#827)');
+  buildFailures.clear();
+}
+
 // --- the lineage epoch
 
 /** The lineage root holds something only compaction could not have written: refuse rather than guess an epoch. */

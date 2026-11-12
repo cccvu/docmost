@@ -57,10 +57,12 @@ import {
 import { COLLAB_PAGE_COMPACTING_REASON, pageCompactingRefusal } from '../collab-ingress/collab-reasons';
 import { capVerdict, compactionWouldHelp, liveStructure, type LiveStructure } from '../collab-ingress/live-structure';
 import {
+  buildRefused,
   canStartCompaction,
   clearCompacting,
   compactedRecently,
   compactionRequest,
+  forgetBuildFailure,
   isClosedForCompaction,
   isCompacting,
   isPageFull,
@@ -69,10 +71,12 @@ import {
   markCompacting,
   markPageFull,
   markSuperseded,
+  noteBuildFailed,
   pageFullUntil,
   MalformedLineageError,
   registerInflight,
   requestCompaction,
+  resetBuildFailuresForTests,
   writeLineage,
   type CompactionReason,
   type CompactionRequest,
@@ -81,8 +85,8 @@ import { accumulates } from './page-size';
 import { liveContentDigest } from './doc-version';
 import { storedProjection } from './persistence-steps';
 import { serverSchema } from './prelim-content';
-import { coveredRowDigest, lineageEpochOfStructs, markRowCovered } from './reconcile-store';
-import { stableHash } from './stable-hash';
+import { coveredRowDigest, lineageEpochOfStructs, markRowCovered, unloadCanCompact } from './reconcile-store';
+import { stableHash, stableStringify } from './stable-hash';
 import { hasStoreFailure, isStoreCurrent, recordStoreFailure, storeGenerationOf } from './store-failure-registry';
 import { storeSafeJson } from './store-safe-json';
 import { carryLedgerOver, ledgerOfDecoded, ledgerOfDoc, type LedgerEntry } from './write-idem';
@@ -215,7 +219,7 @@ function noteLoadTrip(pageId: string, digest: string, deterministic: boolean): v
 export function resetLoadTripsForTests(): void {
   if (process.env.JEST_WORKER_ID === undefined) throw new Error('resetLoadTripsForTests is for jest only (#827)');
   loadTrips.clear();
-  rowBuildsOutOfTime.clear();
+  resetBuildFailuresForTests();
 }
 
 let meterInstance: ConflictScanMeter | null = null;
@@ -327,7 +331,7 @@ function requestIfOverSoftCaps(
     // Drain only when the unload can compact: a compaction can start, and the row is covered (a row whose bytes left
     // structs pending is not, and no writer can join a draining page to store it), or the drain would repeat on every
     // load with nothing compacting. Otherwise the request waits; a frame or probe can drain it once writers stored.
-    drain: verdict.hard && canStartCompaction(pageId) && coveredRowDigest(document) !== null,
+    drain: verdict.hard && canStartCompaction(pageId) && unloadCanCompact(document, pageId),
   };
   if (requestCompaction(document, request)) {
     logCompactionRequested(pageId, request, {
@@ -368,6 +372,7 @@ export async function compactOnUnload(document: CompactableDocument, db: KyselyD
     if (!holdsItsRow(document)) return skipUnload(pageId, request, 'not_stored');
     const covered = coveredRowDigest(document);
     if (covered === null) return skipUnload(pageId, request, 'uncovered');
+    if (buildRefused(pageId, covered)) return skipUnload(pageId, request, 'failed_before');
     if (!canStartCompaction(pageId)) return;
     markCompacting(document); // synchronously: from here joins and writes answer try-later
     marked = true;
@@ -381,7 +386,7 @@ export async function compactOnUnload(document: CompactableDocument, db: KyselyD
 }
 
 /** A requested compaction the unload cannot run: logged when it drained the page (everyone was closed for it). */
-function skipUnload(pageId: string, request: CompactionRequest, why: 'not_stored' | 'uncovered'): void {
+function skipUnload(pageId: string, request: CompactionRequest, why: 'not_stored' | 'uncovered' | 'failed_before'): void {
   if (request.drain) logPageCompaction('skipped', pageId, { reason: request.reason, why });
 }
 
@@ -408,14 +413,15 @@ async function compactResident(
     const generation = storeGenerationOf(document);
     const fromEpoch = lineageEpoch(document);
     const tree = snapshotTree(document.getXmlFragment('default'));
-    const expected = stableHash(storedProjection(document)); // the ADR 0019 digest (doc-version.ts's)
+    // The ADR 0019 digest (doc-version.ts's), with adjacent same-marked text merged (`textRunsDigest`)
+    const expected = textRunsDigest(storedProjection(document));
     const ledger = ledgerOfDoc(document);
     const before = countStructs(document);
     await yieldToEventLoop();
     if (storeGenerationOf(document) !== generation) return abandon(document, pageId, request.reason, 'changed');
     const at = Date.now();
     const built = runWithDeadline(
-      () => buildCompacted({ tree }, ledger, fromEpoch + 1, at, { digest: expected }),
+      () => buildCompacted({ tree }, ledger, fromEpoch + 1, at, { runs: expected }),
       COMPACTION_DEADLINE_MS,
     );
     await yieldToEventLoop();
@@ -425,6 +431,7 @@ async function compactResident(
     });
     if (!swap.swapped) return abandon(document, pageId, request.reason, swap.why);
     markSuperseded(document, built.epoch);
+    forgetBuildFailure(pageId);
     loadTrips.delete(pageId);
     closeJoinedConnections(document);
     logCompactionDone(pageId, request.reason, 'unload', {
@@ -436,6 +443,7 @@ async function compactResident(
     });
   } catch (err) {
     clearCompacting(document);
+    noteBuildFailed(pageId, covered, isDeadlineExceeded(err));
     logCompactionFailed(pageId, request.reason, isDeadlineExceeded(err) ? 'deadline' : failureWhy(err), err);
   }
 }
@@ -470,19 +478,11 @@ export function skipStoreOfSuperseded(document: object): boolean {
 
 /** Start a compaction of `pageId` from its row in the background, when one may start. Returns whether it started. */
 /**
- * Row bytes (by page) whose build from `content` ran out of COMPACTION_DEADLINE_MS: a build of the same bytes would run
- * out again, so it is not retried (each try stalls the process for the whole deadline, charged to no one). Other bytes
- * (a store wrote, a break-glass cleared the row) are tried again. Bounded: the oldest entries go first.
- */
-const rowBuildsOutOfTime = new Map<string, string>();
-const ROW_BUILDS_OUT_OF_TIME_MAX = 10_000;
-
-/**
- * Start a compaction of `pageId` from its row (after a load trip), unless one may not start now, or the build of these
- * very bytes (`digest`, when the caller has it) already ran out of time.
+ * Start a compaction of `pageId` from its row (after a load trip), unless one may not start now, or a build of these
+ * very bytes (`digest`, when the caller has it) already failed for good (`buildRefused`).
  */
 export function startRowCompaction(store: CompactionStore, pageId: string, reason: CompactionReason, digest?: string): boolean {
-  if (digest !== undefined && rowBuildsOutOfTime.get(pageId) === digest) return false;
+  if (digest !== undefined && buildRefused(pageId, digest)) return false;
   if (!canStartCompaction(pageId)) return false;
   logCompactionRequested(pageId, { reason, userId: null, drain: false }, null);
   void registerInflight(pageId, compactFromRow(store, pageId, reason));
@@ -530,6 +530,7 @@ export async function compactFromRow(
       return 'skipped';
     }
     loadTrips.delete(pageId);
+    forgetBuildFailure(pageId);
     logCompactionDone(pageId, reason, 'row', {
       fromEpoch: built.lineage.epoch,
       toEpoch: built.epoch,
@@ -541,11 +542,7 @@ export async function compactFromRow(
     return 'done';
   } catch (err) {
     const outOfTime = isDeadlineExceeded(err);
-    if (outOfTime && rowDigest !== undefined) {
-      rowBuildsOutOfTime.delete(pageId);
-      rowBuildsOutOfTime.set(pageId, rowDigest);
-      if (rowBuildsOutOfTime.size > ROW_BUILDS_OUT_OF_TIME_MAX) rowBuildsOutOfTime.delete(rowBuildsOutOfTime.keys().next().value!);
-    }
+    if (rowDigest !== undefined) noteBuildFailed(pageId, rowDigest, outOfTime);
     logCompactionFailed(pageId, reason, outOfTime ? 'deadline' : failureWhy(err), err);
     return 'failed';
   }
@@ -655,7 +652,7 @@ export function buildCompacted(
   ledger: readonly LedgerEntry[],
   epoch: number,
   at: number,
-  expected: { digest: string } | { content: unknown },
+  expected: { digest: string } | { runs: string } | { content: unknown },
 ): CompactedBuild {
   let built: Y.Doc;
   if ('tree' in source) {
@@ -680,7 +677,9 @@ export function buildCompacted(
       const same =
         'digest' in expected
           ? digest === expected.digest
-          : schemaDigest(storedProjection(check)) === schemaDigest(expected.content);
+          : 'runs' in expected
+            ? textRunsDigest(storedProjection(check)) === expected.runs
+            : schemaDigest(storedProjection(check)) === schemaDigest(expected.content);
       if (!same || lineageEpoch(check) !== epoch) throw new CompactionDigestMismatchError();
       return { update, epoch, counts: countStructs(check), digest };
     } finally {
@@ -689,6 +688,43 @@ export function buildCompacted(
   } finally {
     built.destroy();
   }
+}
+
+/**
+ * The ADR 0019 digest of a stored projection with adjacent text nodes of equal marks merged into one: the same
+ * ProseMirror document (ProseMirror itself joins such nodes), told apart only by how Yjs split the run. A live page can
+ * hold such a split (a delete of a mark's opening format item that leaves its closing one, as the #781 load repair
+ * does, keeps Yjs from cleaning the run up, and `fromYdoc` then emits two text nodes), while the rebuilt page never
+ * does; compared exactly, such a page could never compact. After its compaction the page's exact digest changes once
+ * (a conditional write that held the old one gets one 412 and re-reads).
+ */
+export function textRunsDigest(projection: unknown): string {
+  return stableHash(mergeTextRuns(projection));
+}
+
+function mergeTextRuns(node: unknown): unknown {
+  if (Array.isArray(node)) return node.map(mergeTextRuns);
+  if (node === null || typeof node !== 'object') return node;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(node)) out[k] = k === 'content' && Array.isArray(v) ? joinRuns(v) : mergeTextRuns(v);
+  return out;
+}
+
+function joinRuns(children: unknown[]): unknown[] {
+  const joined: unknown[] = [];
+  for (const raw of children) {
+    const child = mergeTextRuns(raw) as { type?: unknown; text?: unknown; marks?: unknown };
+    const last = joined[joined.length - 1] as { type?: unknown; text?: unknown; marks?: unknown } | undefined;
+    if (
+      last && last.type === 'text' && child?.type === 'text' && typeof last.text === 'string' && typeof child.text === 'string' &&
+      Object.keys(last).every((k) => k === 'type' || k === 'text' || k === 'marks') &&
+      Object.keys(child).every((k) => k === 'type' || k === 'text' || k === 'marks') &&
+      stableStringify(last.marks ?? []) === stableStringify(child.marks ?? [])
+    ) {
+      joined[joined.length - 1] = { ...last, text: last.text + child.text };
+    } else joined.push(child);
+  }
+  return joined;
 }
 
 /**
