@@ -98,8 +98,10 @@
  * an owner's frame refused that way (`unproven-owner`) leaves a claim: its own structs and delete set, bounded per user
  * and per process, for CLAIM_TTL_MS. A peer's relay there is compared with the claim before the shadow step (R0–R6:
  * every struct, position and content, piece by piece); attested clocks bind nothing, prove nothing, and pass through
- * every rule below, and the apply must leave them as compared (deleted, or GC with evidence). A failed comparison
- * spends that relayer's one guess on that claim. So co-editors whose frames each carry another's unproven id (a crash
+ * every rule below, and the apply must leave them as compared (deleted, or GC with evidence). Any answer the claim
+ * decided that does not land the relay (a failed comparison, missing claim coverage, or a matched relay refused with
+ * its frame for another rule) spends that relayer's one guess on that claim; only an `unresolved` for another unproven
+ * id, which a mismatch answers too, spends nothing. So co-editors whose frames each carry another's unproven id (a crash
  * that lost both their tails) no longer block each other; a forgery is still never applied. Two pre-pass shape rules
  * keep the decoded frame equal to what Yjs integrates: no zero-length struct of any kind, one block per client
  * (`client-blocks`).
@@ -389,10 +391,12 @@ type AwarenessEntry = { clientID: number; clock: number; state: Uint8Array };
 /**
  * #816: what a refusal line may add: numbers and fixed words only, never a value from the frame. `unproven-owner`: a
  * `foreign-client` at an id whose owner has only announced it, answered `unresolved` (inspectTransaction). #842 `claim`,
- * with it: why no owner claim attested the relay (`none`, `uncovered`: R1/R2, `mismatch`: a failed comparison, now
- * burned, `burned`: compared and failed before), or `full`: the sender's own claim found no room (relay-claims.ts).
+ * with it: why no owner claim attested the relay (`none`, `uncovered`: R0/R1/R2, `mismatch`: a failed comparison, now
+ * burned, `burned`: answered before, `budget`: the frame's claim decode budget was spent), or `full`: the sender's own
+ * claim found no room (relay-claims.ts). `matched` on a refusal at any other stage: a relay a claim attested was refused
+ * with its frame, and its relayer is now burned on that claim.
  */
-type RefusalLog = { steps?: number; stage?: 'conflict-scan' | 'unproven-owner'; claim?: ClaimOutcome | 'full' };
+type RefusalLog = { steps?: number; stage?: 'conflict-scan' | 'unproven-owner'; claim?: ClaimOutcome | 'full' | 'matched' };
 type ShadowResult = {
   violation: Violation | null;
   binds: Map<number, string>;
@@ -950,6 +954,11 @@ export class CollabUpdateGuard {
     const workStarted = this.now();
     const started = this.cpuNow();
     let othersMs = 0;
+    // #842: a relay an owner claim attested, compared and applied to the shadow, whose frame has not landed (yet). Every
+    // exit that does not land it burns the relayer on each claim it matched (the guess budget, relay-claims.ts): a
+    // refusal for any other rule, a deadline strike, a cap. Except an `unresolved` at stage `unproven-owner`.
+    let unlanded = false;
+    let relay: AttestResult | null = null;
     try {
       // 1. Pre-pass (the per-struct rules; it reads live's state, never the shadow): a refusal here touches no shadow,
       //    so a refuse/reconnect loop costs no rebuild.
@@ -962,7 +971,7 @@ export class CollabUpdateGuard {
       // 1c. #842: new clocks at another user's awareness-only id, compared with that owner's claim (relay-claims.ts),
       //     against live's state (the shadow's new clocks never start below it). The shadow step then lets exactly the
       //     attested clocks through to every content rule, and checks the deletes and GCs they promised.
-      const relay = this.attestRelays(doc, frame, userId, pre);
+      relay = this.attestRelays(doc, frame, userId, pre);
       // 2. The shadow step. #840: the replay log only grows between checkpoints and recording never drops an entry, so
       // an entry past its caps, or past the process total, makes it stop being trusted (exact-replica-registry.ts)
       // whoever wrote it (a server write is logged too). This frame then rebuilds first (charged to this user): a reload
@@ -979,6 +988,7 @@ export class CollabUpdateGuard {
       if (ready !== 'ready') return this.refuse(frame, header, violation ?? { rule: 'shadow-unavailable' });
       const applyStarted = this.cpuNow();
       const result = this.applyToShadow(doc, payload, userId, pre, ownedBy(doc.announced.get(frame.connection)), relay.attested);
+      unlanded = relay.attested.size > 0;
       const applyMs = this.cpuNow() - applyStarted;
       if (result.timedOut) return this.deadlineStrike(frame, header);
       // A write outside `default` wins over a report-only pre-pass violation: it is refused in every mode
@@ -989,7 +999,12 @@ export class CollabUpdateGuard {
         // (ensureShadow), so a refuse/reconnect loop pays no rebuild per refusal, and that rebuild is this user's.
         doc.dirty = true;
         doc.dirtiedBy = userId;
-        return this.refuse(frame, header, violation, this.unprovenOwner(doc, frame, userId, payload, pre, relay, result));
+        const log = this.unprovenOwner(doc, frame, userId, payload, pre, relay, result);
+        // #842: answered `unresolved` for another unproven id, exactly what a mismatch here answers: it reveals nothing
+        // about the claim, so it burns nothing (honest co-editors relaying several crashed owners need that). Any other
+        // refusal of a matched relay answers something the claim decided: it burns, and says so.
+        if (log?.stage === 'unproven-owner') unlanded = false;
+        return this.refuse(frame, header, violation, unlanded ? { ...log, claim: 'matched' } : log);
       }
       if (violation) this.refuse(frame, header, violation, result.log); // report mode: logged, and the frame applies
       // 3. #827: the per-page structure caps, on what the frame changed.
@@ -1000,6 +1015,7 @@ export class CollabUpdateGuard {
       }
       if (caps === 'full') this.refuse(frame, header, { rule: 'page-full' }); // throws unless report mode
       if (caps === 'compact') this.compacting(frame); // throws unless report mode
+      unlanded = false; // #842: accepted: a matched relay lands with it
       this.budgetFor(frame).deadline = 0; // an accepted frame clears the strike
       for (const [client, user] of result.binds) if (!doc.bindings.has(client)) doc.bindings.set(client, user);
       for (const client of result.proven ?? []) doc.awarenessOnly.delete(client);
@@ -1033,6 +1049,7 @@ export class CollabUpdateGuard {
       });
       this.scheduleFlush(doc);
     } finally {
+      if (unlanded && relay) for (const att of relay.attested.values()) doc.claims.burnAttested(att, userId);
       this.chargeCpu(userId, this.cpuNow() - started - othersMs, workStarted);
     }
   }
@@ -1046,6 +1063,11 @@ export class CollabUpdateGuard {
    * that never returns.
    */
   private attestRelays(doc: DocGuard, frame: GuardFrame, userId: string, pre: PrePass): AttestResult {
+    try {
+      this.claimLedger.prune(this.now()); // expired claims' bytes go back on every frame, not only on claim activity
+    } catch {
+      // bookkeeping only
+    }
     const candidates: number[] = [];
     for (const client of pre.clients) {
       const owner = doc.bindings.get(client);
@@ -1075,7 +1097,9 @@ export class CollabUpdateGuard {
     if (result.log?.stage !== 'unproven-owner') return result.log;
     const outcomes = new Set<ClaimOutcome>(relay.failed.values());
     for (const [client, why] of result.relayFailed ?? []) {
-      if (why === 'failed') doc.claims.burn(relay.attested.get(client)!.owner, userId);
+      // `failed`: the apply broke what the comparison promised (R4/R6): burned on the claim it matched. `pending`: its
+      // clocks did not all integrate, answered `unresolved` like a mismatch (an exempt answer, see inspect).
+      if (why === 'failed') doc.claims.burnAttested(relay.attested.get(client)!, userId);
       outcomes.add(why === 'failed' ? 'mismatch' : 'uncovered');
     }
     let recorded: RecordOutcome = 'none';
@@ -1095,7 +1119,9 @@ export class CollabUpdateGuard {
           ? 'full'
           : outcomes.has('uncovered')
             ? 'uncovered'
-            : 'none';
+            : outcomes.has('budget')
+              ? 'budget'
+              : 'none';
     return { ...result.log, claim };
   }
 

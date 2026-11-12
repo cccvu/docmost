@@ -28,22 +28,33 @@
  *   R6 a claim GC matches only a relay GC. A relay GC over a claimed Item matches only with evidence AFTER the apply:
  *      the claimed struct's origin or rightOrigin resolves to a GC, or the parent Yjs would derive for it is no longer
  *      visible (never wire-only: a forged GC beside a deleted item in a live parent would turn later inserts into GC).
- * A failed R3/R5/R6 comparison burns the relayer for that claim instance (the guess budget: one comparison per relayer
- * per claim, so a mismatch is never an oracle for more than one guess). Missing coverage (R1/R2) or no claim burns
- * nothing.
+ * The guess budget: each relayer gets ONE answer per claim instance that does not land. Every answer that depended on
+ * the claim burns the relayer for that instance: a failed R3/R5/R6 comparison and missing claim coverage (R2: the
+ * claim's length is an answer too) here, at once; a match whose frame is then refused for any other reason, or whose
+ * apply fails its R4/R6 checks, in the guard (`burnAttested`). The one exception is a matched frame answered
+ * `unresolved` for ANOTHER unproven id (stage `unproven-owner`): a mismatch there answers the very same, so it tells the
+ * relayer nothing, and honest co-editors relaying several crashed owners need it. Missing coverage on the relay's own
+ * side (R0/R1, decided before the claim is read) and no usable claim burn nothing: they say nothing about the claim.
  *
  * Bounds (limits.ts): a claim is native bytes, one per (user, document), the latest replacing the earlier; per user and
- * per process totals are budgeted BEFORE a claim is stored, and a full budget records nothing (never an eviction). A
- * claim is used only within CLAIM_TTL_MS, while its owner's binding and awareness-only state at x hold, and while the
- * guard says the owner may still write (update-guard.ts). Dropped on prove, TTL, or the document's destroy.
+ * per process totals are budgeted BEFORE a claim is stored, and a full budget records nothing new (no other user's claim
+ * is ever evicted; the owner's own earlier claim is replaced either way). A claim is used only within CLAIM_TTL_MS,
+ * while its owner's binding and awareness-only state at x hold, and while the guard says the owner may still write
+ * (update-guard.ts). Dropped on prove, TTL, or the document's destroy. Decoding is bounded per frame: the relay-side
+ * checks and the claim's range run first (no decode), candidates are judged one owner at a time so at most ONE decoded
+ * claim is held, and a frame may decode at most CLAIM_DECODE_BYTES_PER_FRAME of claims (one largest frame, what the
+ * pre-pass already decodes for the frame itself); past it an id is not compared (`budget`, nothing burned).
  *
  * Pure: no Hocuspocus, no logger, no clock of its own. Never throws: any exception is "no match" (today's `unresolved`).
  */
 import * as Y from 'yjs';
-import { CLAIM_BYTES_PER_USER, CLAIM_BYTES_TOTAL, CLAIM_TTL_MS } from './limits';
+import { CLAIM_BYTES_PER_USER, CLAIM_BYTES_TOTAL, CLAIM_DECODE_BYTES_PER_FRAME, CLAIM_TTL_MS } from './limits';
 
-/** Why an id was not attested: no valid claim, R1/R2 coverage, a failed comparison (burned now), or burned earlier. */
-export type ClaimOutcome = 'none' | 'uncovered' | 'mismatch' | 'burned';
+/**
+ * Why an id was not attested: no usable claim, R0/R1/R2 coverage (burned when the claim decided it), a failed
+ * comparison (burned now), burned earlier, or the frame's decode budget spent (not compared, nothing burned).
+ */
+export type ClaimOutcome = 'none' | 'uncovered' | 'mismatch' | 'burned' | 'budget';
 export type RecordOutcome = 'recorded' | 'full' | 'none';
 
 type DecodedStruct = Y.Item | Y.GC | Y.Skip;
@@ -64,6 +75,8 @@ export interface GcEvidence {
 /** An id whose relayed clocks [from, to) matched `owner`'s claim, with the checks the apply must still pass. */
 export interface Attested {
   owner: string;
+  /** The claim instance it matched: a refusal of the frame burns the relayer on exactly this one (`burnAttested`). */
+  claim: OwnerClaim;
   from: number;
   to: number;
   /** R4: clock ranges [start, end) the relay ends deleted: every struct there must be deleted after the apply. */
@@ -84,6 +97,8 @@ export interface AttestQuery {
   /** May `owner`'s claim still be used (the guard's policy: not narrowed to read-only on this document). */
   ownerMayWrite(owner: string): boolean;
   now: number;
+  /** Claim bytes this frame may decode (default CLAIM_DECODE_BYTES_PER_FRAME; specs pass less). */
+  decodeBytes?: number;
 }
 
 export interface AttestResult {
@@ -96,6 +111,8 @@ export interface OwnerClaim {
   readonly ids: ReadonlySet<number>;
   bytes: Uint8Array | null;
   readonly size: number;
+  /** Per claimed id, the clock range [from, to) its structs span (R2's precondition, checked before any decode). */
+  readonly ranges: ReadonlyMap<number, readonly [number, number]>;
   readonly at: number;
   /** Relayers that failed a comparison against THIS instance (the guess budget). */
   readonly burned: Set<string>;
@@ -168,7 +185,8 @@ export class RelayClaims {
   /**
    * Record `owner`'s claim from its refused frame: its own structs at `ids` (every other client in the frame dropped by
    * a state vector of MAX) and the frame's whole delete set. Replaces the owner's earlier claim on this document (a new
-   * instance: a fresh guess budget). `full` when a bound has no room: nothing is recorded and nothing evicted.
+   * instance: a fresh guess budget). `full` when a bound has no room: nothing new is recorded, the owner's earlier claim
+   * is gone either way (released first, so a retry of the same size always fits), and no other user's is evicted.
    */
   record(owner: string, ids: ReadonlySet<number>, payload: Uint8Array, frameClients: Iterable<number>, now: number): RecordOutcome {
     try {
@@ -180,7 +198,10 @@ export class RelayClaims {
       this.drop(owner);
       const size = own.buffer.byteLength; // by capacity: what it retains
       if (!this.ledger.reserve(owner, size)) return 'full';
-      const claim: OwnerClaim = { owner, ids: new Set(ids), bytes: own, size, at: now, burned: new Set(), live: true, home: this };
+      const meta = Y.parseUpdateMeta(own);
+      const ranges = new Map<number, readonly [number, number]>();
+      for (const [client, from] of meta.from) ranges.set(client, [from, meta.to.get(client) ?? from]);
+      const claim: OwnerClaim = { owner, ids: new Set(ids), bytes: own, size, ranges, at: now, burned: new Set(), live: true, home: this };
       this.claims.set(owner, claim);
       this.ledger.enqueue(claim);
       return 'recorded';
@@ -200,9 +221,12 @@ export class RelayClaims {
     for (const claim of [...this.claims.values()]) this.release(claim);
   }
 
-  /** `relayer` failed a check against `owner`'s current claim after the apply (R4/R6): no more comparisons for it. */
-  burn(owner: string, relayer: string): void {
-    this.claims.get(owner)?.burned.add(relayer);
+  /**
+   * `relayer`'s matched relay did not land (its frame was refused, or its apply failed R4/R6): no more comparisons for
+   * it against that claim instance (the guess budget: the refusal answered something the claim decided).
+   */
+  burnAttested(att: Attested, relayer: string): void {
+    att.claim.burned.add(relayer);
   }
 
   /** Whether `owner` holds a claim here (specs and diagnostics). */
@@ -220,8 +244,9 @@ export class RelayClaims {
   }
 
   /**
-   * For each candidate id, the clocks the relay may write there (`attested`), or why not (`failed`). A failed R3/R5/R6
-   * comparison burns the relayer for that claim instance. Never throws.
+   * For each candidate id, the clocks the relay may write there (`attested`), or why not (`failed`). Answers that depend
+   * on the claim and do not attest burn the relayer for that claim instance. Never throws. Decoding is bounded (see the
+   * header): cheap checks first, one owner's decoded claim at a time, CLAIM_DECODE_BYTES_PER_FRAME per frame.
    */
   attest(q: AttestQuery): AttestResult {
     const attested = new Map<number, Attested>();
@@ -231,40 +256,95 @@ export class RelayClaims {
     } catch {
       // bookkeeping only
     }
-    const decoded = new Map<OwnerClaim, DecodedFrame>();
+    // 1. Without decoding any claim: the claim's usability, the relay's own R0/R1, and R2 against the claim's range.
+    const ready = new Map<OwnerClaim, Array<[number, Fresh]>>();
     for (const x of q.candidates) {
-      let outcome: ClaimOutcome | Attested;
+      let outcome: ClaimOutcome | [OwnerClaim, Fresh];
       try {
-        outcome = this.attestOne(q, x, decoded);
+        outcome = this.prepare(q, x);
       } catch {
         outcome = 'none';
       }
       if (typeof outcome === 'string') failed.set(x, outcome);
-      else attested.set(x, outcome);
+      else {
+        const list = ready.get(outcome[0]);
+        if (list) list.push([x, outcome[1]]);
+        else ready.set(outcome[0], [[x, outcome[1]]]);
+      }
+    }
+    // 2. One owner at a time: its claim decoded once, compared at each of its ids, and released before the next.
+    let budget = q.decodeBytes ?? CLAIM_DECODE_BYTES_PER_FRAME;
+    for (const [claim, xs] of ready) {
+      if (claim.bytes === null || claim.size > budget) {
+        for (const [x] of xs) failed.set(x, 'budget');
+        continue;
+      }
+      budget -= claim.size;
+      let own: DecodedFrame | null = null;
+      try {
+        own = Y.decodeUpdate(claim.bytes) as unknown as DecodedFrame;
+      } catch {
+        // a malformed claim: no match
+      }
+      for (const [x, fresh] of xs) {
+        if (claim.burned.has(q.relayer)) {
+          failed.set(x, 'burned'); // another of this owner's ids just failed: one answer per claim
+          continue;
+        }
+        let verdict: ReturnType<typeof compareFresh> | 'none';
+        try {
+          verdict = own === null ? 'none' : compareFresh(q.frame, own, x, fresh);
+        } catch {
+          verdict = 'none';
+        }
+        if (verdict === 'mismatch' || verdict === 'uncovered') {
+          claim.burned.add(q.relayer); // the claim decided it
+          failed.set(x, verdict);
+        } else if (verdict === 'none') failed.set(x, 'none');
+        else attested.set(x, { owner: claim.owner, claim, ...verdict });
+      }
     }
     return { attested, failed };
   }
 
-  private attestOne(q: AttestQuery, x: number, decoded: Map<OwnerClaim, DecodedFrame>): ClaimOutcome | Attested {
+  /** The checks that need no decoded claim. R0/R1 say nothing about the claim (no burn); R2 by range does (burn). */
+  private prepare(q: AttestQuery, x: number): ClaimOutcome | [OwnerClaim, Fresh] {
     const owner = q.ownerOf(x);
     if (owner === undefined || owner === q.relayer || !q.isAwarenessOnly(x)) return 'none';
     const claim = this.claims.get(owner);
     if (!claim || !claim.live || claim.bytes === null || !claim.ids.has(x)) return 'none';
     if (q.now - claim.at > this.ledger.ttlMs || !q.ownerMayWrite(owner)) return 'none';
     if (claim.burned.has(q.relayer)) return 'burned';
-    let own = decoded.get(claim);
-    if (own === undefined) {
-      own = Y.decodeUpdate(claim.bytes) as unknown as DecodedFrame;
-      decoded.set(claim, own);
+    const fresh = scanRelay(q.frame, x, q.stateOf(x));
+    if (fresh === 'uncovered') return 'uncovered';
+    const range = claim.ranges.get(x);
+    if (range === undefined || fresh.from < range[0] || fresh.to > range[1]) {
+      claim.burned.add(q.relayer); // R2 by range: the claim's extent is an answer
+      return 'uncovered';
     }
-    const verdict = compareRelay(q.frame, own, x, q.stateOf(x));
-    if (verdict === 'mismatch') {
-      claim.burned.add(q.relayer);
-      return 'mismatch';
-    }
-    if (verdict === 'uncovered') return 'uncovered';
-    return { owner, ...verdict };
+    return [claim, fresh];
   }
+}
+
+/** R0/R1 on the relay alone: its structs at x past live's state, contiguous from it, none straddling it. */
+interface Fresh {
+  structs: Array<Y.Item | Y.GC>;
+  from: number;
+  to: number;
+}
+function scanRelay(relay: DecodedFrame, x: number, liveState: number): Fresh | 'uncovered' {
+  const structs: Array<Y.Item | Y.GC> = [];
+  let next = liveState;
+  for (const s of relay.structs) {
+    if (s.id.client !== x) continue;
+    if (!(s.length > 0)) return 'uncovered'; // a zero-length struct (the pre-pass refuses it first)
+    if (s.id.clock + s.length <= liveState) continue; // held: Yjs integrates none of it
+    if (s instanceof Y.Skip || s.id.clock !== next) return 'uncovered'; // R1 (a straddle), or a gap (it would pend)
+    structs.push(s as Y.Item | Y.GC);
+    next = s.id.clock + s.length;
+  }
+  if (!structs.length) return 'uncovered';
+  return { structs, from: liveState, to: next };
 }
 
 /**
@@ -277,19 +357,17 @@ export function compareRelay(
   claim: DecodedFrame,
   x: number,
   liveState: number,
-): 'uncovered' | 'mismatch' | Omit<Attested, 'owner'> {
+): 'uncovered' | 'mismatch' | Omit<Attested, 'owner' | 'claim'> {
   // R0/R1: every struct at x ending past live's state, none of them starting below it, contiguous.
-  const fresh: Array<Y.Item | Y.GC> = [];
-  let next = liveState;
-  for (const s of relay.structs) {
-    if (s.id.client !== x) continue;
-    if (!(s.length > 0)) return 'uncovered'; // a zero-length struct (the pre-pass refuses it first)
-    if (s.id.clock + s.length <= liveState) continue; // held: Yjs integrates none of it
-    if (s instanceof Y.Skip || s.id.clock !== next) return 'uncovered'; // R1 (a straddle), or a gap (it would pend)
-    fresh.push(s as Y.Item | Y.GC);
-    next = s.id.clock + s.length;
-  }
-  if (!fresh.length) return 'uncovered';
+  const fresh = scanRelay(relay, x, liveState);
+  return fresh === 'uncovered' ? fresh : compareFresh(relay, claim, x, fresh);
+}
+
+/** R2–R6 for a relay that passed R0/R1 (`scanRelay`). */
+function compareFresh(relay: DecodedFrame, claim: DecodedFrame, x: number, scanned: Fresh): 'uncovered' | 'mismatch' | Omit<Attested, 'owner' | 'claim'> {
+  const fresh = scanned.structs;
+  const next = scanned.to;
+  const liveState = scanned.from;
   // The claim's structs at x: contiguous, ascending (Skips are gaps: never covered).
   const own: DecodedStruct[] = [];
   for (const s of claim.structs) {
@@ -430,7 +508,7 @@ class Cover {
  * R4 range must be deleted in `store`, and every R6 GC must have its evidence. `pending`: the clocks did not all
  * integrate (a missing dependency: the frame is refused either way). Never throws.
  */
-export function verifyAttested(store: Y.Doc['store'], x: number, att: Attested): 'ok' | 'pending' | 'failed' {
+export function verifyAttested(store: Y.Doc['store'], x: number, att: Omit<Attested, 'claim'>): 'ok' | 'pending' | 'failed' {
   try {
     if (Y.getState(store, x) < att.to) return 'pending';
     const structs = store.clients.get(x)!;

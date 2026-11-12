@@ -202,13 +202,20 @@ export const COLLAB_REPLICA_LOG_TOTAL_BYTES = 128 * 1024 * 1024;
  * #842 owner claims (relay-claims.ts): the bytes of a writer's own structs from a frame refused `unproven-owner`, kept so
  * a peer's relay of them can be compared clock for clock. One claim per (user, document), the latest replacing the
  * earlier; budgeted BEFORE it is stored, and when either bound is full it is not recorded (logged `claim: 'full'`, the
- * frame keeps today's `unresolved`): nothing is ever evicted, so no user can push out another's claim. Per user: one
- * largest frame (PAGE_MAX_YDOC_BYTES_CEILING). Per process: 64 MiB of native memory (#679), on top of the three
- * totals above. A claim lives CLAIM_TTL_MS: longer than the editor's bounded `unresolved` retries (about 15.5 s).
+ * frame keeps today's `unresolved`): no other user's claim is ever evicted, so no user can push out another's (the
+ * owner's own earlier claim is replaced either way). Per user: one largest frame (PAGE_MAX_YDOC_BYTES_CEILING). Per
+ * process: 64 MiB of native memory (#679), on top of the three totals above. A claim lives CLAIM_TTL_MS: longer than the
+ * editor's bounded `unresolved` retries (about 15.5 s).
+ *
+ * Heap: a DECODED claim costs many times its bytes (each struct an object), so a frame decodes at most
+ * CLAIM_DECODE_BYTES_PER_FRAME of claims, holds one decoded claim at a time, and decodes none for a relay its own
+ * structs or the claim's range already rule out. So comparing costs at most one largest frame's decode, what the
+ * pre-pass already spends on the frame itself, whatever the number of claims on the page.
  */
 export const CLAIM_BYTES_PER_USER = PAGE_MAX_YDOC_BYTES_CEILING;
 export const CLAIM_BYTES_TOTAL = 64 * 1024 * 1024;
 export const CLAIM_TTL_MS = 30_000;
+export const CLAIM_DECODE_BYTES_PER_FRAME = PAGE_MAX_YDOC_BYTES_CEILING;
 
 /**
  * Authenticated collab connections (one per document per socket) one user may hold in this process

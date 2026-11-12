@@ -354,7 +354,58 @@ describe('#842 forgeries at the owner\'s id answer unresolved, live byte-identic
     expectUnresolved(s, aConn, forged, 'mismatch');
   });
 
-  it('clocks beyond the claim (R2): uncovered, nothing burned', () => {
+  describe('R5 for elements and marks: what a peer would plant at a co-editor\'s position', () => {
+    const para = (d: Y.Doc) => {
+      const p = new Y.XmlElement('paragraph');
+      const t = new Y.XmlText();
+      p.insert(0, [t]);
+      t.insert(0, 'B-para');
+      d.getXmlFragment('default').insert(1, [p]);
+    };
+    const bold = (d: Y.Doc) => firstText(d).format(0, 4, { bold: true }); // B marks stored text: ContentFormat at B's id
+    const withA = (edit: (d: Y.Doc) => void) => (c: Ctx) => {
+      relayed(c, c.b, edit, c.a);
+      relayed(c, c.a, typeAt0('A-lost '), c.b);
+    };
+    const nth = (block: StructBlock, pick: (it: Y.Item) => boolean) => block.structs.findIndex((st) => st instanceof Y.Item && pick(st));
+    it.each<[string, (d: Y.Doc) => void, (it: Y.Item) => boolean, (it: Y.Item) => Y.Item]>([
+      [
+        'an element of another name (heading for paragraph)',
+        para,
+        (it) => it.content instanceof Y.ContentType,
+        (it) => cloneItem(it, { content: new Y.ContentType(new Y.XmlElement('heading')) }),
+      ],
+      [
+        'a mark of another key (italic for bold)',
+        bold,
+        (it) => it.content instanceof Y.ContentFormat && (it.content as Y.ContentFormat).value !== null,
+        (it) => cloneItem(it, { content: new Y.ContentFormat('italic', (it.content as Y.ContentFormat).value) }),
+      ],
+      [
+        'a mark of another value (a link href)',
+        bold,
+        (it) => it.content instanceof Y.ContentFormat && (it.content as Y.ContentFormat).value !== null,
+        (it) => cloneItem(it, { content: new Y.ContentFormat((it.content as Y.ContentFormat).key, { href: 'https://forged.example' }) }),
+      ],
+    ])('%s', (_name, edit, pick, forge) => {
+      const l1 = lifetime1(withA(edit));
+      const { s, aConn } = claimed(l1);
+      const forged = rewritten(s, l1.a, (blocks) => {
+        const block = blockOf(blocks, B_ID);
+        const i = nth(block, pick);
+        expect(i).toBeGreaterThanOrEqual(0); // precondition: the struct the forgery rewrites is in the relay
+        block.structs[i] = forge(block.structs[i] as Y.Item);
+      });
+      expect(sameBytes(forged, s.step2(l1.a.doc))).toBe(false);
+      expectUnresolved(s, aConn, forged, 'mismatch');
+      // control: unforged, the same relay lands (on a fresh claim: A is burned for this one)
+      const fresh = lifetime1(withA(edit));
+      const c = claimed(fresh);
+      expect(c.s.send(c.aConn, c.s.step2(fresh.a.doc))).toBe('applied');
+    });
+  });
+
+  it('clocks beyond the claim (R2): uncovered, and burned (the claim\'s extent is an answer too)', () => {
     const l1 = lifetime1();
     const { s, aConn } = claimed(l1);
     const forged = rewritten(s, l1.a, (blocks) => {
@@ -363,7 +414,13 @@ describe('#842 forgeries at the owner\'s id answer unresolved, live byte-identic
       block.structs.push(new Y.Item(Y.createID(B_ID, last.id.clock + last.length), null, Y.createID(B_ID, last.id.clock + last.length - 1), null, (last as Y.Item).rightOrigin, null, null, new Y.ContentString('X')));
     });
     expectUnresolved(s, aConn, forged, 'uncovered');
-    expect(s.send(s.conn('A'), s.step2(l1.a.doc))).toBe('applied'); // not burned
+    expectUnresolved(s, s.conn('A'), s.step2(l1.a.doc), 'burned'); // right, and no longer compared
+    const bRetry = s.conn('B');
+    expect(s.announce(bRetry, B_ID, 2)).toBe('applied');
+    // recovery still converges: A's refused frames left A's own claim, so B's retry lands on it (proving B), then A's
+    expect(s.send(bRetry, s.step2(l1.b.doc))).toBe('applied');
+    expect(s.send(s.conn('A'), s.step2(l1.a.doc))).toBe('applied');
+    expect(renderLikeABrowser(s.live).text).toContain('B-lost');
   });
 
   it('a repeated client block (the first exact, the second forged) is refused client-blocks before any comparison', () => {
@@ -402,6 +459,8 @@ describe('#842 forgeries at the owner\'s id answer unresolved, live byte-identic
       blocks.splice(0, blocks.length, block); // B's id alone
     });
     expectUnresolved(s, aConn, forged, 'uncovered');
+    // decided on the relay alone (R1), before the claim is read: it says nothing about the claim, so nothing is burned
+    expect(s.send(s.conn('A'), s.step2(l1.a.doc))).toBe('applied');
   });
 
   it('a relay GC for a claimed Item in a live parent (R6, no evidence after the apply): mismatch', () => {
@@ -552,6 +611,14 @@ describe('#842 what records a claim, and what keeps one usable', () => {
     expectUnresolved(s, aConn, s.step2(l1.a.doc), 'none');
   });
 
+  it('another user\'s read-only connection (a viewer on the page) leaves the owner\'s claim usable', () => {
+    const l1 = lifetime1();
+    const { s, aConn } = claimed(l1);
+    s.conn('V', true); // a reader of the page, not the owner
+    expect(s.send(aConn, s.step2(l1.a.doc))).toBe('applied');
+    expect(s.attestedLines()).toHaveLength(1);
+  });
+
   it('past CLAIM_TTL_MS: the claim is not used', () => {
     let t = 1_000_000;
     const l1 = lifetime1();
@@ -571,6 +638,35 @@ describe('#842 what records a claim, and what keeps one usable', () => {
     expect(s.send(bRetry, typeAtFrom(s, l1.b, 'B-new '), SYNC.Update)).toBe('applied'); // new clocks: B_ID proven
     expect(ledger.bytes('B')).toBe(0);
     expect(ledger.bytes()).toBe(0);
+  });
+
+  it('past CLAIM_TTL_MS its bytes go back at the next frame on any page, without any claim activity', () => {
+    let t = 1_000_000;
+    const ledger = new ClaimLedger();
+    const l1 = lifetime1();
+    const { s } = claimed(l1, { now: () => t, ledger });
+    expect(ledger.bytes('B')).toBeGreaterThan(0);
+    t += CLAIM_TTL_MS + 1;
+    const other = lifetime(l1.stored, { now: () => t, ledger }); // another document, same process
+    const c = other.conn('C');
+    expect(other.announce(c, 9009)).toBe('applied');
+    expect(other.send(c, typeAtFrom(other, new RemoteClient(other.live, 9009), 'C '), SYNC.Update)).toBe('applied');
+    expect(ledger.bytes('B')).toBe(0);
+    expect(ledger.bytes()).toBe(0);
+    expect(s.guard).toBeDefined();
+  });
+
+  it('an owner\'s next claim replaces its earlier one: the earlier bytes go back first', () => {
+    const ledger = new ClaimLedger();
+    const claims = new RelayClaims(ledger);
+    const { b, stored } = lifetime1();
+    const own = Y.encodeStateAsUpdate(b.doc, Y.encodeStateVector(docOf(stored)));
+    expect(claims.record('B', new Set([B_ID]), own, [B_ID], 0)).toBe('recorded');
+    const one = ledger.bytes('B');
+    expect(one).toBeGreaterThan(0);
+    expect(claims.record('B', new Set([B_ID]), own, [B_ID], 1)).toBe('recorded');
+    expect(ledger.bytes('B')).toBe(one);
+    expect(ledger.bytes()).toBe(one);
   });
 
   it('the document\'s destroy drops every claim and its bytes', () => {
@@ -673,6 +769,131 @@ describe('#842 the guess budget: one comparison per relayer per claim instance',
     });
     expect(answers[0]).toEqual(answers[1]);
     expect(answers[0]).toEqual({ answer: 'applied', text: 'A-lost A-stored B-stored base', refusals: 1 });
+  });
+});
+
+describe('#842 the guess budget: every answer the claim decided burns, whatever rule refuses the frame', () => {
+  /** A's Step2 with B's block first, its first item's content `bContent` (null: unchanged), and A's own text item
+   *  turned into a shadow-only violation: a matched relay walks on into it, a mismatch stops at B's id. */
+  const probe = (s: Life, a: RemoteClient, bContent: string | null) =>
+    rewritten(s, a, (blocks) => {
+      const bi = blocks.findIndex((b) => b.client === B_ID);
+      const [bBlock] = blocks.splice(bi, 1);
+      blocks.unshift(bBlock);
+      if (bContent !== null) bBlock.structs[0] = cloneItem(bBlock.structs[0] as Y.Item, { content: new Y.ContentString(bContent) });
+      const aBlock = blockOf(blocks, A_ID);
+      const it = aBlock.structs[0] as Y.Item;
+      aBlock.structs[0] = cloneItem(it, { content: new Y.ContentAny(Array.from((it.content as Y.ContentString).str)) });
+    });
+
+  it('a right guess refused for another rule burns the relayer (logged `matched`): never a free confirmation', () => {
+    const l1 = lifetime1();
+    const { s } = claimed(l1);
+    const before = s.state();
+    const answer = s.send(s.conn('A'), probe(s, l1.a, null));
+    expect(answer).not.toBe(UNRESOLVED_REASON); // the oracle the budget must pay for: a different answer than a miss
+    expect(answer).toMatch(/^ccc:collab-update-refused:/);
+    expect(s.lastClaim()).toBe('matched');
+    expect(sameBytes(s.state(), before)).toBe(true);
+    // the one answer is spent: the next probe, right or not, is never compared
+    expectUnresolved(s, s.conn('A'), s.step2(l1.a.doc), 'burned');
+  });
+
+  it('a wrong guess in the same probe is a mismatch, burned too', () => {
+    const l1 = lifetime1();
+    const { s } = claimed(l1);
+    expect(s.send(s.conn('A'), probe(s, l1.a, 'B-lozt '))).toBe(UNRESOLVED_REASON);
+    expect(s.lastClaim()).toBe('mismatch');
+    expectUnresolved(s, s.conn('A'), s.step2(l1.a.doc), 'burned');
+  });
+
+  it('a match answered `unresolved` for ANOTHER unproven id burns nothing (a miss answers the same); the relay lands next', () => {
+    const l1 = lifetime1((c) => {
+      relayed(c, c.b, typeAt0('B-lost '), c.a);
+      c.m = new RemoteClient(c.life1, M_ID);
+      relayed(c, c.m, typeAt0('M-lost '), c.a); // M's lost edit: M announces, never sends, so it has no claim
+      relayed(c, c.a, typeAt0('A-lost '), c.b);
+    });
+    const { s, aConn } = claimed(l1);
+    expect(s.announce(s.conn('M'), M_ID)).toBe('applied');
+    expectUnresolved(s, aConn, s.step2(l1.a.doc), 'none'); // B's id matched; M's has no claim
+    const { blocks, ds } = blocksOf(s.step2(l1.a.doc));
+    expect(s.send(s.conn('A'), encodeStructs(blocks.filter((b) => b.client === B_ID), ds))).toBe('applied');
+    expect(s.attestedLines()).toHaveLength(1);
+  });
+});
+
+describe('#842 attest decodes within bounds: cheap checks first, one owner\'s claim at a time, a per-frame budget', () => {
+  const decode = (u: Uint8Array) => Y.decodeUpdate(u) as unknown as DecodedFrame;
+  /** B and M each lost a tail that reached A; both claims recorded; A's relay of both. */
+  function twoOwners() {
+    const l1 = lifetime1((c) => {
+      relayed(c, c.b, typeAt0('B-lost '), c.a);
+      c.m = new RemoteClient(c.life1, M_ID);
+      relayed(c, c.m, typeAt0('M-lost '), c.a);
+    });
+    const base = docOf(l1.stored);
+    const sv = Y.encodeStateVector(base);
+    const ledger = new ClaimLedger();
+    const claims = new RelayClaims(ledger);
+    expect(claims.record('B', new Set([B_ID]), Y.encodeStateAsUpdate(l1.b.doc, sv), [B_ID], 0)).toBe('recorded');
+    expect(claims.record('M', new Set([M_ID]), Y.encodeStateAsUpdate(l1.m!.doc, sv), [B_ID, M_ID], 0)).toBe('recorded');
+    const relay = Y.encodeStateAsUpdate(l1.a.doc, sv);
+    const owners: Record<number, string> = { [B_ID]: 'B', [M_ID]: 'M' };
+    const q = (frame: Uint8Array, extra: object = {}) => ({
+      relayer: 'A',
+      frame: decode(frame),
+      candidates: [B_ID, M_ID],
+      stateOf: (client: number) => Y.getState(base.store, client),
+      ownerOf: (client: number) => owners[client],
+      isAwarenessOnly: () => true,
+      ownerMayWrite: () => true,
+      now: 0,
+      ...extra,
+    });
+    return { l1, base, ledger, claims, relay, q };
+  }
+  let decodes: jest.SpyInstance;
+  beforeEach(() => {
+    decodes = jest.spyOn(Y, 'decodeUpdate');
+  });
+  afterEach(() => decodes.mockRestore());
+
+  it('honest: each owner\'s claim decoded once, and both ids attested', () => {
+    const { claims, relay, q } = twoOwners();
+    const query = q(relay);
+    decodes.mockClear();
+    const out = claims.attest(query);
+    expect([...out.attested.keys()].sort()).toEqual([B_ID, M_ID].sort());
+    expect(decodes).toHaveBeenCalledTimes(2);
+  });
+
+  it('a relay past a claim\'s range is answered without decoding it (and burned); a relay-side straddle decodes nothing, burns nothing', () => {
+    const { claims, relay, q, base } = twoOwners();
+    const { blocks, ds } = blocksOf(relay);
+    const block = blockOf(blocks, B_ID);
+    const last = block.structs[block.structs.length - 1] as Y.Item;
+    block.structs.push(new Y.Item(Y.createID(B_ID, last.id.clock + last.length), null, Y.createID(B_ID, last.id.clock + last.length - 1), null, last.rightOrigin, null, null, new Y.ContentString('X')));
+    const longer = encodeStructs(blocks.filter((b) => b.client === B_ID), ds);
+    const L = Y.getState(base.store, B_ID);
+    const straddle = q(relay, { stateOf: (client: number) => (client === B_ID ? L + 1 : Y.getState(base.store, client)), candidates: [B_ID] });
+    const longQuery = q(longer, { candidates: [B_ID] });
+    decodes.mockClear();
+    expect(claims.attest(straddle).failed.get(B_ID)).toBe('uncovered');
+    expect(claims.attest(longQuery).failed.get(B_ID)).toBe('uncovered');
+    expect(decodes).not.toHaveBeenCalled();
+    expect(claims.attest(q(relay, { candidates: [B_ID] })).failed.get(B_ID)).toBe('burned'); // the range answer was spent
+  });
+
+  it('past the frame\'s decode budget an owner\'s ids are not compared (`budget`), and nothing is burned', () => {
+    const { claims, relay, q, ledger } = twoOwners();
+    const query = q(relay, { decodeBytes: ledger.bytes('B') });
+    decodes.mockClear();
+    const out = claims.attest(query);
+    expect(out.attested.has(B_ID)).toBe(true);
+    expect(out.failed.get(M_ID)).toBe('budget');
+    expect(decodes).toHaveBeenCalledTimes(1);
+    expect(claims.attest(q(relay)).attested.has(M_ID)).toBe(true); // not burned: compared on the next frame
   });
 });
 
