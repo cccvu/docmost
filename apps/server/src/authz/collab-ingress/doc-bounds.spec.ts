@@ -15,6 +15,7 @@ import {
   READER_STEP2_MS_PER_MIB,
   READER_STEP2_SNAPSHOT_NS_PER_STRUCT,
   S_MAX,
+  SLOW_HOST_FACTOR,
   SOFT_CAP_FRACTION,
   T_FRAME_MS,
   W_MAX,
@@ -61,34 +62,38 @@ const NODE22 = {
 const NODE24 = { shadowHonestMax: 315, shadowPaste3MiB: 227.1, selectAllAtE: 315, keystrokeAtC: 13.0, loadCappedMetered: 133.2, vmUsPerCall: 40.4, vmOvershootMax: 1.7 };
 
 describe('#827 sizing: the bounds keep their margins over the measured honest work', () => {
-  it('T_FRAME_MS is at least 2.5× the slowest honest shadow apply on node 22 and node 24, and under 1 s', () => {
-    for (const m of [NODE22, NODE24]) expect(T_FRAME_MS).toBeGreaterThanOrEqual(2.5 * Math.max(m.shadowHonestMax, m.shadowPaste3MiB));
-    expect(T_FRAME_MS).toBeGreaterThanOrEqual(2.5 * Math.max(NODE22.shadowOffline, NODE22.shadowMeterAccepted, NODE22.selectAllAtE));
-    expect(T_FRAME_MS).toBeLessThanOrEqual(1_000); // an accepted frame just under it costs ~2·T once
+  it('T_FRAME_MS is at least 2.5× the slowest honest shadow apply on a host SLOW_HOST_FACTOR slower, and at most 2 s', () => {
+    // The x86 calibration box is fast: honest frames at the caps ran past 800 ms on the local pool's Zen 2 runner (PR 844)
+    expect(SLOW_HOST_FACTOR).toBeGreaterThanOrEqual(2.5);
+    const margin = 2.5 * SLOW_HOST_FACTOR;
+    for (const m of [NODE22, NODE24]) expect(T_FRAME_MS).toBeGreaterThanOrEqual(margin * Math.max(m.shadowHonestMax, m.shadowPaste3MiB));
+    expect(T_FRAME_MS).toBeGreaterThanOrEqual(margin * Math.max(NODE22.shadowOffline, NODE22.shadowMeterAccepted, NODE22.selectAllAtE));
+    // an accepted frame just under it costs ~2·T once; then the sender's CPU debt holds it to about a tenth of a core
+    expect(T_FRAME_MS).toBeLessThanOrEqual(2_000);
     expect(T_FRAME_MS).toBeGreaterThan(100 * NODE22.vmOvershootMax); // the cut is far finer than the bound
   });
 
   it('the caps sit with at least 2× headroom over the honest work they allow, and below the shapes that stall', () => {
     // E_MAX: the largest E of the sweep whose honest select-all at S_MAX stays ≤ ~0.7 s of frame (the next does not),
-    // with T_FRAME_MS's 2.5× margin over its shadow apply
+    // with T_FRAME_MS's margin over its shadow apply on a slow host
     expect(E_MAX).toBe(14_000);
     expect(NODE22.selectAllAtEFrame).toBeLessThanOrEqual(700);
     expect(NODE22.selectAllNextEFrame).toBeGreaterThan(700);
-    expect(T_FRAME_MS).toBeGreaterThanOrEqual(2.5 * NODE22.selectAllAtE);
+    expect(T_FRAME_MS).toBeGreaterThanOrEqual(2.5 * SLOW_HOST_FACTOR * NODE22.selectAllAtE);
     expect(NODE22.selectAllPastE / NODE22.selectAllAtE).toBeGreaterThan(20_000 / 14_000); // why E is capped: superlinear past it
     // an honest 3 MiB paste of prose (150-byte paragraphs) fits every cap under its soft cap
     expect(NODE22.pasteProse150Paragraphs).toBeLessThan(softCap(E_MAX));
     expect(NODE22.pasteProse150Structs).toBeLessThan(softCap(S_MAX));
-    expect(T_FRAME_MS).toBeGreaterThanOrEqual(2.5 * NODE22.pasteProse150);
+    expect(T_FRAME_MS).toBeGreaterThanOrEqual(2.5 * SLOW_HOST_FACTOR * NODE22.pasteProse150);
     expect(C_MAX).toBe(20_000);
     // a keystroke at C_MAX, charged to the CPU debt (100 ms/s refill), leaves room for 5 keys/s with 1.5× to spare
     expect(5 * NODE22.keystrokeAtC * 1.5).toBeLessThan(100);
     expect(5 * NODE22.keystrokePastC).toBeGreaterThan(100); // at 50k ids an honest typist would run into debt
     expect(S_MAX).toBe(150_000);
-    expect(LOAD_DEADLINE_MS).toBeGreaterThanOrEqual(8 * NODE22.loadMaxMetered);
-    expect(PROBE_DEADLINE_MS).toBeGreaterThanOrEqual(7 * NODE22.probeCapped);
-    expect(COMPACTION_DEADLINE_MS).toBeGreaterThanOrEqual(10 * NODE22.compactionCapped);
-    expect(MIRROR_DEADLINE_MS).toBeGreaterThanOrEqual(2.5 * NODE22.apiReplaceAtCaps);
+    expect(LOAD_DEADLINE_MS).toBeGreaterThanOrEqual(3 * SLOW_HOST_FACTOR * NODE22.loadMaxMetered);
+    expect(PROBE_DEADLINE_MS).toBeGreaterThanOrEqual(5 * SLOW_HOST_FACTOR * NODE22.probeCapped);
+    expect(COMPACTION_DEADLINE_MS).toBeGreaterThanOrEqual(5 * SLOW_HOST_FACTOR * NODE22.compactionCapped);
+    expect(MIRROR_DEADLINE_MS).toBeGreaterThanOrEqual(2.5 * SLOW_HOST_FACTOR * NODE22.apiReplaceAtCaps);
     expect(MIRROR_DEADLINE_MS).toBeGreaterThanOrEqual(T_FRAME_MS);
   });
 
@@ -103,9 +108,9 @@ describe('#827 sizing: the bounds keep their margins over the measured honest wo
     expect((W_MAX * 2 * NODE22.loadNsPerStep) / 1e6).toBeLessThan(LOAD_DEADLINE_MS); // the meter trips first, metered
   });
 
-  it('the unbounded attacks the deadline cuts are multiples of T_FRAME_MS', () => {
-    expect(NODE22.attackA4000).toBeGreaterThan(4 * T_FRAME_MS);
-    expect(NODE22.attackC4000Load).toBeGreaterThan(T_FRAME_MS);
+  it('the unbounded attacks the deadline cuts reach past T_FRAME_MS; the load inversion is the step budget\'s', () => {
+    expect(NODE22.attackA4000).toBeGreaterThan(T_FRAME_MS); // and grows with D: the deadline is what bounds it
+    expect(NODE22.attackC4000Load).toBeGreaterThan(LOAD_DEADLINE_MS / 3); // W_MAX trips first (the W_MAX case above)
   });
 
   it('soft caps, probe pacing and compaction timing', () => {

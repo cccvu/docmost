@@ -43,34 +43,47 @@
  *   the stall paths the deadline exists for: measured unbounded and cut within about 1 ms of a 250 ms deadline (the
  *   numbers stay in ADR 0036's private copy)
  *
- * Not measured: Graviton (production is ARM). Each rule below keeps at least the stated margin over the x86 Node 22
- * number; the strike rule (a first deadline is a 1013, only a repeat is a 4422) absorbs a one-off GC or CPU stall.
+ * Not measured: Graviton (production is ARM). The x86 box above is fast: on the local CI pool's 4-core laptop CPU
+ * (AMD Zen 2) honest frames at the caps ran past an 800 ms frame deadline in main-thread CPU time (PR 844 CI), so a
+ * production-class core can be about 2.5× slower. Each deadline below therefore keeps its margin over the x86 Node 22
+ * number × SLOW_HOST_FACTOR; the strike rule (a first deadline is a 1013, only a repeat is a 4422) absorbs a one-off
+ * GC or CPU stall.
  */
+
+/** How much slower than the calibration box a host may run honest Yjs work (doc-bounds.spec.ts holds the margins). */
+export const SLOW_HOST_FACTOR = 2.5;
 
 const MINUTE = 60_000;
 
 // --- deadlines (deadline.ts): a timeout means "outcome unknown", so the work's document is discarded
 
 /**
- * The shadow apply of one frame. ≥ 2.5× the slowest honest shadow apply measured (319 ms, a select-all at S_MAX and
- * E_MAX; 306 ms past S_MAX; 261 ms the densest 3 MiB paste). An accepted frame just under it costs about 2·T of the
- * process once (the shadow, then live), after which the sender's CPU debt applies.
+ * The shadow apply of one frame. ≥ 2.5× SLOW_HOST_FACTOR × the slowest honest shadow apply measured (319 ms, a
+ * select-all at S_MAX and E_MAX; 306 ms past S_MAX; 261 ms the densest 3 MiB paste). An accepted frame just under it
+ * costs about 2·T of the process once (the shadow, then live), after which the sender's CPU debt applies (burst 2 s,
+ * refill 0.1 s per second: about a tenth of a core per account, whatever T is).
  */
-export const T_FRAME_MS = 800;
+export const T_FRAME_MS = 2_000;
 /**
- * The vm backstop of a load (the step budget W_MAX trips first on every walk it counts). ≥ 8× the slowest honest load
- * measured (348 ms metered, 320k structs: past S_MAX).
+ * The vm backstop of a load (the step budget W_MAX trips first on every walk it counts). ≥ 3× SLOW_HOST_FACTOR × the
+ * slowest honest load measured (348 ms metered, 320k structs: past S_MAX).
  */
 export const LOAD_DEADLINE_MS = 3_000;
-/** The probe (encode the shadow, load it metered into a scratch doc). ≥ 7× the honest probe at the caps (211 ms). */
-export const PROBE_DEADLINE_MS = 1_500;
+/**
+ * The probe (encode the shadow, load it metered into a scratch doc). ≥ 5× SLOW_HOST_FACTOR × the honest probe at the
+ * caps (211 ms; a timeout drains the page, with no strike).
+ */
+export const PROBE_DEADLINE_MS = 3_000;
 /**
  * A server-local update mirrored into the shadow (an API write, a Redis-relayed or reconcile update): a timeout
- * discards the shadow and requests compaction, never refuses. ≥ 2.5× an API replace at the caps (a select-all plus a
- * 3 MiB insert: ~570 ms).
+ * discards the shadow and requests compaction, never refuses. ≥ 2.5× SLOW_HOST_FACTOR × an API replace at the caps (a
+ * select-all plus a 3 MiB insert: ~570 ms).
  */
-export const MIRROR_DEADLINE_MS = 1_500;
-/** A compaction build (read out, rebuild, digest check, encode). ≥ 10× the measured rebuild at the caps (136 ms). */
+export const MIRROR_DEADLINE_MS = 4_000;
+/**
+ * A compaction build (read out, rebuild, digest check, encode). ≥ 5× SLOW_HOST_FACTOR × the measured rebuild at the
+ * caps (136 ms; the whole build with its digest checks measured about 240 ms at 98k structs).
+ */
 export const COMPACTION_DEADLINE_MS = 3_000;
 
 // --- per-page structure caps (counted in the guard, O(touched))
@@ -89,8 +102,8 @@ export const C_MAX = 20_000;
 /**
  * Live children of any one element (the root included). Yjs's delete-set merge splices once per run of a client's
  * struct array, so a select-all costs ~c·E·S, and superlinear in E (the table: at S_MAX, 0.42 s of frame at 10k, 1.15 s
- * at 20k). The LARGEST E whose honest select-all at S_MAX stays ≤ ~0.7 s of frame on Node 22 (638 ms; 15k is 703) and
- * whose shadow apply (319 ms) keeps T_FRAME_MS's 2.5× margin (15k's 350 does not). So a 3 MiB paste
+ * at 20k). The LARGEST E whose honest select-all at S_MAX stays ≤ ~0.7 s of frame on Node 22 (638 ms; 15k is 703):
+ * the whole frame (shadow and live) blocks the process, and on a host SLOW_HOST_FACTOR slower that is ~1.6 s. So a 3 MiB paste
  * of prose fits: paragraphs from ~110 bytes of text (about 3 MiB / 14k encoded), where 10k refused anything under ~150.
  * Compaction keeps every live child: a page past E is page-full, never drained.
  */
