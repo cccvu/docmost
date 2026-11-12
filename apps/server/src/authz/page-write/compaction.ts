@@ -28,7 +28,7 @@
  *
  * The build runs under `runWithDeadline` (COMPACTION_DEADLINE_MS) and touches only documents it made: the live
  * document is read before it, outside the deadline. Its row's lineage and ledger are read from the decoded update
- * (reconcile-store.ts `readRootMapEntries`), which integrates nothing and so also works on a row too costly to load.
+ * (write-idem.ts `ledgerOfDecoded`, over reconcile-store.ts `readRootMapEntries`), which integrates nothing and so also works on a row too costly to load.
  *
  * Logs: `COLLAB_PAGE_COMPACTION {"event":"requested"|"done"|"skipped"|"load_refused",…}` and `COLLAB_COMPACTION_FAILED
  * {…}`, written only through collab-ingress/compaction-log.ts, the guard's emitter too (check-infra-config §14 lists
@@ -81,11 +81,11 @@ import { accumulates } from './page-size';
 import { liveContentDigest } from './doc-version';
 import { storedProjection } from './persistence-steps';
 import { serverSchema } from './prelim-content';
-import { coveredRowDigest, lineageEpochOfStructs, markRowCovered, readRootMapEntries } from './reconcile-store';
+import { coveredRowDigest, lineageEpochOfStructs, markRowCovered } from './reconcile-store';
 import { stableHash } from './stable-hash';
 import { hasStoreFailure, isStoreCurrent, recordStoreFailure, storeGenerationOf } from './store-failure-registry';
 import { storeSafeJson } from './store-safe-json';
-import { WRITE_IDEM_MAP } from './write-idem';
+import { carryLedgerOver, ledgerOfDecoded, ledgerOfDoc, type LedgerEntry } from './write-idem';
 import { yieldToEventLoop } from './yield-to-event-loop';
 
 /**
@@ -504,20 +504,8 @@ export async function compactFromRow(
 
 // --- reading the lineage and the ledger
 
-export interface LedgerEntry {
-  key: string;
-  ts: number;
-}
-
-/** The live document's #429 write-idem ledger (number-valued entries; anything else is corrupt and was pruned anyway). */
-export function ledgerOfDoc(doc: Y.Doc): LedgerEntry[] {
-  if (!doc.share.has(WRITE_IDEM_MAP)) return [];
-  const out: LedgerEntry[] = [];
-  for (const [key, ts] of doc.getMap<unknown>(WRITE_IDEM_MAP).entries()) {
-    if (typeof ts === 'number' && Number.isFinite(ts)) out.push({ key, ts });
-  }
-  return out;
-}
+/** The ledger as compaction reads and carries it (write-idem.ts owns the root: write-idem.fitness.spec.ts). */
+export { ledgerOfDoc, type LedgerEntry };
 
 export interface RowLineage extends PageCounts {
   epoch: number;
@@ -534,11 +522,7 @@ export function readRowLineage(bytes: Uint8Array): RowLineage {
   const { structs, ds } = Y.decodeUpdate(bytes);
   const epoch = lineageEpochOfStructs(structs, ds);
   if (epoch === null) throw new MalformedLineageError('epoch');
-  const { entries, unresolved } = readRootMapEntries(structs, ds, WRITE_IDEM_MAP);
-  const ledger: LedgerEntry[] = [];
-  for (const [key, { value }] of entries) {
-    if (typeof value === 'number' && Number.isFinite(value)) ledger.push({ key, ts: value });
-  }
+  const { ledger, unresolved } = ledgerOfDecoded(structs, ds);
   const clients = new Set<number>();
   for (const s of structs) clients.add(s.id.client);
   return { epoch, ledger, ledgerUnresolved: unresolved, structs: structs.length, clients: clients.size };
@@ -636,12 +620,7 @@ export function buildCompacted(
     built = TiptapTransformer.toYdoc(source.json as never, 'default', tiptapExtensions);
   }
   try {
-    built.transact(() => {
-      if (ledger.length > 0) {
-        const map = built.getMap<number>(WRITE_IDEM_MAP);
-        for (const { key, ts } of ledger) map.set(key, ts);
-      }
-    });
+    built.transact(() => carryLedgerOver(built, ledger));
     writeLineage(built, epoch, at);
     const update = Y.encodeStateAsUpdate(built);
     const check = new Y.Doc();

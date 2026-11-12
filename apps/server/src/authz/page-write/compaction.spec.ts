@@ -59,7 +59,10 @@ import { stableHash } from './stable-hash';
 import { hasStoreFailure, markStoredAt, storeGenerationOf } from './store-failure-registry';
 import { storeSafeJson } from './store-safe-json';
 import { serverSchema } from './prelim-content';
-import { recordWriteKey, WRITE_IDEM_MAP } from './write-idem';
+import { recordWriteKey, scopedWriteKey, type StoredLedgerKey, WRITE_IDEM_MAP } from './write-idem';
+
+/** A ledger key as production records it (PR 91: the map holds its digest, `.entry`). */
+const wk = (user: string, key: string) => scopedWriteKey(user, key);
 import { PageTooLargeException } from './page-size';
 
 const sha = (b: Uint8Array) => createHash('sha256').update(b).digest('base64');
@@ -183,8 +186,8 @@ afterEach(() => {
 describe('buildCompacted (#827)', () => {
   it('rebuilds the visible content exactly (the ADR 0019 digest), with the ledger and the next epoch, and sheds history', () => {
     const live = churnedPage(30);
-    recordWriteKey(live, 'user\u0000key-a', 1000);
-    recordWriteKey(live, 'user\u0000key-b', 2000);
+    recordWriteKey(live, wk('user', 'key-a'), 1000);
+    recordWriteKey(live, wk('user', 'key-b'), 2000);
     const before = countStructs(live);
     const expected = digestOf(live);
 
@@ -197,8 +200,8 @@ describe('buildCompacted (#827)', () => {
     expect(lineageEpoch(loaded)).toBe(1);
     expect(loaded.getMap(LINEAGE_ROOT).get('at')).toBe(42);
     expect(ledgerOfDoc(loaded)).toEqual([
-      { key: 'user\u0000key-a', ts: 1000 },
-      { key: 'user\u0000key-b', ts: 2000 },
+      { key: wk('user', 'key-a').entry, ts: 1000 },
+      { key: wk('user', 'key-b').entry, ts: 2000 },
     ]);
     // the history is gone: one client id for the content and the lineage, far fewer structs
     expect(built.counts).toEqual(countStructs(loaded));
@@ -242,7 +245,7 @@ describe('buildCompacted (#827)', () => {
 describe('readRowLineage (#827): the ledger and epoch from stored bytes, nothing integrated', () => {
   it('reads what compaction wrote', () => {
     const live = churnedPage(2);
-    const built = buildCompacted({ tree: snapshotTree(live.getXmlFragment('default')) }, [{ key: 'k', ts: 7 }], 4, 0, {
+    const built = buildCompacted({ tree: snapshotTree(live.getXmlFragment('default')) }, [{ key: 'k' as StoredLedgerKey, ts: 7 }], 4, 0, {
       digest: digestOf(live),
     });
     const r = readRowLineage(built.update);
@@ -252,22 +255,22 @@ describe('readRowLineage (#827): the ledger and epoch from stored bytes, nothing
   it('follows re-set and pruned ledger keys through their origin chains (other clients included), and skips deletions', () => {
     const doc = new Y.Doc();
     doc.getXmlFragment('default');
-    recordWriteKey(doc, 'a', 1, 100, 10);
-    recordWriteKey(doc, 'b', 2, 100, 10);
+    recordWriteKey(doc, wk('u', 'a'), 1, 100, 10);
+    recordWriteKey(doc, wk('u', 'b'), 2, 100, 10);
     // another client prunes 'a' (age) and sets it again: its new entry carries no parent, only an origin
     const other = new Y.Doc();
     Y.applyUpdate(other, Y.encodeStateAsUpdate(doc));
-    recordWriteKey(other, 'c', 500, 100, 10); // prunes a (1) and b (2)
-    recordWriteKey(other, 'a', 501, 100, 10);
+    recordWriteKey(other, wk('u', 'c'), 500, 100, 10); // prunes a (1) and b (2)
+    recordWriteKey(other, wk('u', 'a'), 501, 100, 10);
     Y.applyUpdate(doc, Y.encodeStateAsUpdate(other, Y.encodeStateVector(doc)));
-    doc.getMap(WRITE_IDEM_MAP).set('c', 502); // a re-set by the first client, over the other's entry
+    doc.getMap(WRITE_IDEM_MAP).set(wk('u', 'c').entry, 502); // a re-set by the first client, over the other's entry
 
     const fromBytes = readRowLineage(Y.encodeStateAsUpdate(doc));
     const sort = (l: Array<{ key: string; ts: number }>) => [...l].sort((x, y) => x.key.localeCompare(y.key));
     expect(sort(fromBytes.ledger)).toEqual(sort(ledgerOfDoc(doc)));
     expect(sort(fromBytes.ledger)).toEqual([
-      { key: 'a', ts: 501 },
-      { key: 'c', ts: 502 },
+      { key: wk('u', 'a').entry, ts: 501 },
+      { key: wk('u', 'c').entry, ts: 502 },
     ]);
     expect(fromBytes.epoch).toBe(0); // never compacted
   });
@@ -537,7 +540,7 @@ describe('compactOnUnload (#827)', () => {
 
   function setup(rounds = 10) {
     const live = churnedPage(rounds);
-    recordWriteKey(live, 'u\u0000k', 123);
+    recordWriteKey(live, wk('u', 'k'), 123);
     const pageId = nextPageId();
     const stored = Y.encodeStateAsUpdate(live);
     const content = storeSafeJson(TiptapTransformer.fromYdoc(live, 'default'));
@@ -558,7 +561,7 @@ describe('compactOnUnload (#827)', () => {
     Y.applyUpdate(loaded, store.row!.ydoc!);
     expect(digestOf(loaded)).toBe(expected);
     expect(lineageEpoch(loaded)).toBe(1);
-    expect(ledgerOfDoc(loaded)).toEqual([{ key: 'u\u0000k', ts: 123 }]);
+    expect(ledgerOfDoc(loaded)).toEqual([{ key: wk('u', 'k').entry, ts: 123 }]);
     expect(countStructs(loaded).clients).toBe(1);
     expect(isCompactionInflight(pageId)).toBe(false);
     // one line, its token first (check-infra-config §14 reads the first word), then one JSON object (compaction-log.ts)
@@ -716,7 +719,7 @@ describe('compactOnUnload (#827)', () => {
 describe('compactFromRow (#827): the row content is the source', () => {
   it('rebuilds from content, keeps the ledger read from the bytes, and moves to the next epoch', async () => {
     const live = churnedPage(8);
-    recordWriteKey(live, 'u\u0000k', 9);
+    recordWriteKey(live, wk('u', 'k'), 9);
     writeLineage(live, 2, 0);
     const content = storeSafeJson(TiptapTransformer.fromYdoc(live, 'default'));
     const store = memoryStore({ content, ydoc: Y.encodeStateAsUpdate(live), contentHash: md5(content) });
@@ -725,7 +728,7 @@ describe('compactFromRow (#827): the row content is the source', () => {
     Y.applyUpdate(loaded, store.row!.ydoc!);
     expect(digestOf(loaded)).toBe(stableHash(content));
     expect(lineageEpoch(loaded)).toBe(3);
-    expect(ledgerOfDoc(loaded)).toEqual([{ key: 'u\u0000k', ts: 9 }]);
+    expect(ledgerOfDoc(loaded)).toEqual([{ key: wk('u', 'k').entry, ts: 9 }]);
   });
 
   it('content the conversion fills in (default attributes) still compacts: the same document through the schema', async () => {

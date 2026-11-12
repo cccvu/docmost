@@ -69,6 +69,7 @@ import {
 } from "@/features/editor-ux/collab-access-controller";
 import { reopensOnVisible } from "@/features/editor-ux/collab-reconnect";
 import { CollabPageNotices } from "@/features/editor-ux/collab-refusal-notice";
+import { collabHeaderStatus } from "@/features/editor-ux/collab-header-status";
 import { clearLocalCollabCopy } from "@/features/editor-ux/collab-local-copy";
 import { collabLocalCopyName, useCollabEpoch, withCollabEpoch } from "@/features/editor-ux/collab-epoch";
 import DrawioMenu from "./components/drawio/drawio-menu";
@@ -413,12 +414,17 @@ export default function PageEditor({
   useEffect(() => {
     const timeout = setTimeout(() => {
       if (yjsConnectionStatus === WebSocketStatus.Connecting || !isSynced) {
-        setYjsConnectionStatus(WebSocketStatus.Disconnected);
+        setYjsConnectionStatus(collabHeaderStatus(WebSocketStatus.Disconnected, collabAccess.refused)); // CCC (#781)
       }
     }, 7500);
 
     return () => clearTimeout(timeout);
-  }, [yjsConnectionStatus, isSynced]);
+  }, [yjsConnectionStatus, isSynced, collabAccess.refused]);
+  // CCC (#781): after a refusal nothing retries, so the header never says "Retrying..." (collab-header-status.ts)
+  useEffect(() => {
+    const next = collabHeaderStatus(yjsConnectionStatus, collabAccess.refused);
+    if (next !== yjsConnectionStatus) setYjsConnectionStatus(next);
+  }, [yjsConnectionStatus, collabAccess.refused]);
   useEffect(() => {
     if (!editor) return;
     editor.setEditable(
@@ -447,6 +453,8 @@ export default function PageEditor({
       <CollabPageNotices // CCC (#781, #810, #827): refusal notices and the compaction banner
         access={collabAccess}
         epoch={collabEpoch}
+        passive={!(editable && currentPageEditMode === PageEditMode.Edit)}
+        showsLocalCopy={!showStatic}
         clearLocalCopy={() => clearLocalCollabCopy(providersRef.current?.local)}
       />
       {showStatic ? (

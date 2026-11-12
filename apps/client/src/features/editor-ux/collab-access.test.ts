@@ -23,8 +23,10 @@ import {
   initialCollabAccess,
   isCollabTokenExpired,
   nextCollabAccess,
+  refusedRuleOf,
   WS_CLOSE_MESSAGE_TOO_BIG,
 } from "./collab-access";
+import { collabRefusalCause } from "./collab-refusal-cause";
 
 /** An unsigned JWT with the given exp (seconds). jwt-decode only decodes. */
 const jwt = (exp: number) =>
@@ -591,6 +593,117 @@ describe("disconnectSocket", () => {
   });
 });
 
+// The ledger-echo incident (#781 lineage): the notice's copy follows the rule the server refused on, so the state keeps
+// it (`refusedRule`) instead of only "refused"; `collab-refusal-cause.ts` maps it to a cause.
+describe("the refused rule (refusedRule)", () => {
+  const refusedClose = (rule: string, code?: number) =>
+    ({
+      kind: "server-close",
+      socketConnected: true,
+      reason: `${COLLAB_UPDATE_REFUSED_PREFIX}${rule}`,
+      code,
+    }) as const;
+
+  it("is null before any refusal", () => {
+    expect(initialCollabAccess.refusedRule).toBeNull();
+  });
+
+  it.each(["root", "schema", "shadow-unavailable", "client-ids", "cross-list"])(
+    "a refusal on %s records that rule (a document CLOSE or a raw 4422 close with the reason)",
+    (rule) => {
+      for (const code of [undefined, 1000, 4422]) {
+        const step = nextCollabAccess(initialCollabAccess, refusedClose(rule, code));
+        expect(step.state.refused).toBe(true);
+        expect(step.state.refusedRule).toBe(rule);
+        expect(step.state.refusalKind).toBe("generic");
+      }
+    },
+  );
+
+  it("a 1009 records no rule (the notice's too-big copy decides), whatever its reason says", () => {
+    const step = nextCollabAccess(initialCollabAccess, refusedClose("schema", 1009));
+    expect(step.state.refusalKind).toBe("too-big");
+    expect(step.state.refusedRule).toBeNull();
+  });
+
+  it('a second unresolved records "unresolved" (a client-made value: the server never sends it with the prefix)', () => {
+    const first = nextCollabAccess(initialCollabAccess, {
+      kind: "server-close",
+      socketConnected: true,
+      reason: COLLAB_UPDATE_UNRESOLVED,
+    });
+    expect(first.state.refusedRule).toBeNull();
+    const second = nextCollabAccess(first.state, {
+      kind: "server-close",
+      socketConnected: true,
+      reason: COLLAB_UPDATE_UNRESOLVED,
+    });
+    expect(second.state.refused).toBe(true);
+    expect(second.state.refusedRule).toBe("unresolved");
+  });
+
+  it("refusedRuleOf takes only the contract prefix", () => {
+    expect(refusedRuleOf(`${COLLAB_UPDATE_REFUSED_PREFIX}root`)).toBe("root");
+    expect(refusedRuleOf(COLLAB_UPDATE_REFUSED_PREFIX)).toBe("");
+    for (const other of [
+      undefined,
+      "",
+      "ccc:collab-update-refused", // no separator
+      "xccc:collab-update-refused:root",
+      COLLAB_UPDATE_UNRESOLVED,
+    ]) {
+      expect(refusedRuleOf(other)).toBeNull();
+    }
+  });
+
+  it("the incident: a refusal on root is the copy cause, never the change cause", () => {
+    expect(
+      collabRefusalCause(refusedRuleOf(`${COLLAB_UPDATE_REFUSED_PREFIX}root`)),
+    ).toBe("copy");
+  });
+});
+
+describe("collabRefusalCause", () => {
+  it.each([
+    ["root", "copy"],
+    ["foreign-client", "copy"],
+    ["client-ids", "copy"],
+    ["unresolved", "copy"],
+    ["schema", "change"],
+    ["number-attr", "change"],
+    ["conflict-scan", "change"],
+    ["delete-order", "change"],
+    ["internal", "other"],
+    ["shadow-unavailable", "other"],
+    ["stateless", "other"],
+    ["auth", "other"],
+    ["awareness", "other"],
+    ["cross-list", "other"],
+  ])("%s → %s", (rule, cause) => {
+    expect(collabRefusalCause(rule)).toBe(cause);
+  });
+
+  // An unknown, missing or hostile rule gets the generic copy, and never reaches an object prototype.
+  it.each([
+    "__proto__",
+    "constructor",
+    "toString",
+    "hasOwnProperty",
+    "",
+    "ROOT",
+    "root ",
+    "mark",
+    "a-rule-a-newer-server-adds",
+  ])("unknown %j → other", (rule) => {
+    expect(collabRefusalCause(rule)).toBe("other");
+  });
+
+  it("no rule → other", () => {
+    expect(collabRefusalCause(null)).toBe("other");
+    expect(collabRefusalCause(undefined)).toBe("other");
+  });
+});
+
 // cccvu/wiki-v2#810 — the wiring in page-editor.tsx (seam 169) is now one controller (collab-access-controller.ts,
 // tested with the real 4.7.1 provider in collab-access-controller.test.ts); these scans pin only what stays in the seam.
 describe("page-editor wiring", () => {
@@ -626,7 +739,7 @@ describe("page-editor wiring", () => {
 
   it("the notices are told the access state, the epoch and how to clear the local copy", () => {
     expect(source).toMatch(
-      /<CollabPageNotices[^>]*\s+access=\{collabAccess\}\s+epoch=\{collabEpoch\}\s+clearLocalCopy=\{\(\) => clearLocalCollabCopy\(providersRef\.current\?\.local\)\}/,
+      /<CollabPageNotices[^>]*\s+access=\{collabAccess\}\s+epoch=\{collabEpoch\}\s+passive=\{[^}]*\}\s+showsLocalCopy=\{!showStatic\}\s+clearLocalCopy=\{\(\) => clearLocalCollabCopy\(providersRef\.current\?\.local\)\}/,
     );
     expect(source).not.toMatch(/collabAccess\.refused &&/); // the notice decides what shows (a clean epoch switch shows none)
   });
@@ -645,6 +758,29 @@ describe("page-editor wiring", () => {
     // the Hocuspocus document name is not the copy's: it stays page.<id> at every epoch
     expect(source).toMatch(/const documentName = `page\.\$\{pageId\}`;/);
     expect(source).toMatch(/name: documentName,/);
+  });
+
+  // The ledger-echo incident: the notice's copy, its role and its Discard wording follow the refusal and the view.
+  it("the refusal notice gets the rule's cause, passive outside Edit mode, and whether this browser's copy is shown", () => {
+    // the cause comes from `refusedRule` inside CollabPageNotices (collab-refusal-notice.test.tsx pins it)
+    expect(source).toMatch(
+      /<CollabPageNotices[^\n]*\n\s*access=\{collabAccess\}\s*epoch=\{collabEpoch\}\s*passive=\{!\(editable && currentPageEditMode === PageEditMode\.Edit\)\}\s*showsLocalCopy=\{!showStatic\}/,
+    );
+  });
+
+  // collab-header-status.test.ts drives the rule through the real provider; these pin that page-editor applies it.
+  it("the header status goes through collabHeaderStatus: the 7.5 s check and a refusal effect", () => {
+    expect(source).toMatch(
+      /setTimeout\(\(\) => \{\s*if \(yjsConnectionStatus === WebSocketStatus\.Connecting \|\| !isSynced\) \{\s*setYjsConnectionStatus\(collabHeaderStatus\(WebSocketStatus\.Disconnected, collabAccess\.refused\)\);[^\n]*\n\s*\}\s*\}, 7500\);\s*return \(\) => clearTimeout\(timeout\);\s*\}, \[yjsConnectionStatus, isSynced, collabAccess\.refused\]\);/,
+    );
+    expect(source).toMatch(
+      /useEffect\(\(\) => \{\s*const next = collabHeaderStatus\(yjsConnectionStatus, collabAccess\.refused\);\s*if \(next !== yjsConnectionStatus\) setYjsConnectionStatus\(next\);\s*\}, \[yjsConnectionStatus, collabAccess\.refused\]\);/,
+    );
+    // no other path writes "disconnected" to the header except the controller's markDisconnected (never on a refusal)
+    expect(source.match(/setYjsConnectionStatus\(WebSocketStatus\.Disconnected\)/g)).toHaveLength(1);
+    expect(source).toMatch(
+      /markDisconnected: \(\) =>\s*setYjsConnectionStatus\(WebSocketStatus\.Disconnected\),/,
+    );
   });
 });
 

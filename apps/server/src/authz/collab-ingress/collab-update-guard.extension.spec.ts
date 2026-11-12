@@ -632,7 +632,8 @@ describe('#827 joins and loads through a real Hocuspocus 4.7.1', () => {
     const charge = jest.spyOn(s.guard, 'chargeLoad');
     const t0 = performance.now();
     const sock = await s.connect('reader');
-    for (let i = 0; i < 200 && charge.mock.calls.length === 0; i++) await new Promise((r) => setTimeout(r, 5)); // the load ends after the Authenticated
+    // the load ends after the Authenticated; the document is resident once afterLoadDocument's load repair (#841) resolved
+    for (let i = 0; i < 200 && (charge.mock.calls.length === 0 || !s.hp.documents.has(DOC_NAME)); i++) await new Promise((r) => setTimeout(r, 5));
     const wall = performance.now() - t0;
     expect(authAnswers(sock)).toEqual(['authenticated']);
     expect(charge).toHaveBeenCalledTimes(1);
@@ -668,15 +669,17 @@ describe('#827 joins and loads through a real Hocuspocus 4.7.1', () => {
     expect(s.guard.cpuBalance('looper')).toBeLessThan(USER_COLLAB_CPU_BURST_MS - 30);
   });
 
-  it('afterLoadDocument never throws, whatever the guard does', async () => {
+  it('afterLoadDocument never throws or rejects, whatever the guard does, and charges before it yields', async () => {
     const guard = new CollabUpdateGuard({ logger: { warn: () => undefined } });
     const ext = new CollabUpdateGuardExtension(guard);
     const doc = new Y.Doc();
     ext.onLoadDocument({ document: doc, context: { user: { id: 'u' } }, requestHeaders: new Headers({ 'sec-websocket-key': 'k' }) } as never);
     doc.transact(() => doc.getXmlFragment('default').insert(0, [new Y.XmlElement('paragraph')]));
-    jest.spyOn(guard, 'chargeLoad').mockImplementation(() => {
+    const charge = jest.spyOn(guard, 'chargeLoad').mockImplementation(() => {
       throw new Error('boom');
     });
-    expect(ext.afterLoadDocument({ document: doc } as never)).toBeUndefined();
+    const done = ext.afterLoadDocument({ document: doc } as never);
+    expect(charge).toHaveBeenCalledTimes(1); // the #827 charge runs synchronously, before the repair's yield (#841)
+    await expect(done).resolves.toBeUndefined();
   });
 });
