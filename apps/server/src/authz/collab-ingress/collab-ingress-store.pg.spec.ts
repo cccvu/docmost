@@ -38,6 +38,7 @@ const USERS: Record<string, { id: string; name: string }> = {
   attacker: { id: uuid(901), name: 'Attacker' },
   editor: { id: uuid(902), name: 'Editor' },
   peer: { id: uuid(903), name: 'Peer' },
+  writer: { id: uuid(904), name: 'Writer' },
 };
 const REFUSED = (rule: string) => `ccc:collab-update-refused:${rule}`;
 const settle = async () => {
@@ -327,5 +328,73 @@ d('the collab store behind the ingress guard (#781)', () => {
     await expect(second.handlers.flushPageContent(DOC, { withDigest: true })).resolves.toMatchObject({ flushed: true });
     expect(storeFailures).toEqual([]);
     expect(JSON.stringify((await row()).content)).toContain(`"text":"B-after B-lost ${storedPrefix ? 'B-stored ' : ''}seed text"`);
+  });
+
+  it('#842 MUTUAL crash: each Step2 relays the other\'s lost edits; the first is unresolved, the second lands on the first\'s claim, the retry lands, the row holds both', async () => {
+    const B_ID = 1001; // writer
+    const A_ID = 2002; // peer
+    const first = node(true);
+    const bSock = await first.connect('writer');
+    const aSock = await first.connect('peer');
+    const live = first.live();
+    const b = new RemoteClient(live, B_ID);
+    const a = new RemoteClient(live, A_ID);
+    bSock.deliver(syncFrame(b.edit(live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'B-lost ')), SYNC.Update, MSG.Sync, DOC));
+    await settle();
+    a.sync(live); // the first node relays B's edit to A ...
+    aSock.deliver(syncFrame(a.edit(live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'A-lost ')), SYNC.Update, MSG.Sync, DOC));
+    await settle();
+    b.sync(live); // ... and A's to B
+    expect(JSON.stringify(TiptapTransformer.fromYdoc(live, 'default'))).toContain('A-lost B-lost');
+    // Lifetime 1 is abandoned unstored (the process dies inside the store debounce). Both keep typing while disconnected.
+    expect(JSON.stringify((await row()).content)).not.toMatch(/A-lost|B-lost/);
+    a.doc.transact(() => textOf(a.fragment.get(0) as Y.XmlElement).insert(0, 'A-after '));
+    b.doc.transact(() => textOf(b.fragment.get(0) as Y.XmlElement).insert(0, 'B-after '));
+
+    const second = node(true);
+    const bSock2 = await second.connect('writer');
+    const aSock2 = await second.connect('peer');
+    const live2 = second.live();
+    expect([Y.getState(live2.store, A_ID), Y.getState(live2.store, B_ID)]).toEqual([0, 0]); // nothing of theirs is stored
+    // both providers' startSync awareness first, then the two crossed Step2s (each answers the server's Step1)
+    bSock2.deliver(awarenessFrame([{ clientID: B_ID, clock: 1, state: { user: {} } }], DOC));
+    aSock2.deliver(awarenessFrame([{ clientID: A_ID, clock: 1, state: { user: {} } }], DOC));
+    await settle();
+    const aStep2 = Y.encodeStateAsUpdate(a.doc, Y.encodeStateVector(live2));
+    const bStep2 = Y.encodeStateAsUpdate(b.doc, Y.encodeStateVector(live2));
+    // precondition: crossed (each writes new clocks at the other's announced, unproven id)
+    const writes = (u: Uint8Array) => new Set(Y.decodeUpdate(u).structs.map((st) => st.id.client));
+    expect([writes(aStep2).has(B_ID), writes(bStep2).has(A_ID)]).toEqual([true, true]);
+    aSock2.deliver(syncFrame(aStep2, SYNC.Step2, MSG.Sync, DOC));
+    await settle();
+    expect(aSock2.closeReasons()).toEqual([UNRESOLVED_REASON]); // B's id is unproven and no claim of B's exists yet
+    bSock2.deliver(syncFrame(bStep2, SYNC.Step2, MSG.Sync, DOC));
+    await settle();
+    // B's relay of A's lost edit equals A's claim (A's own refused frame): it lands, though A's id is still unproven
+    expect(bSock2.closeReasons()).toEqual([]);
+    const afterB = JSON.stringify(TiptapTransformer.fromYdoc(live2, 'default'));
+    expect(afterB).toContain('A-lost');
+    expect(afterB).not.toContain('A-after'); // A's own new edit is not B's to relay: only A's retry brings it
+    // A's provider retries at once (collab-access.ts COLLAB_UNRESOLVED_RETRY_MS[0]): a new Auth on the same socket, its
+    // awareness, and a Step2 answering the server's new Step1
+    await second.connect('peer', aSock2);
+    aSock2.deliver(
+      awarenessFrame([{ clientID: A_ID, clock: 2, state: { user: {} } }], DOC),
+      syncFrame(Y.encodeStateAsUpdate(a.doc, Y.encodeStateVector(live2)), SYNC.Step2, MSG.Sync, DOC),
+    );
+    await settle();
+    expect(aSock2.closeReasons()).toEqual([UNRESOLVED_REASON]); // no refusal was final
+    expect(bSock2.closeReasons()).toEqual([]);
+    expect(Y.encodeStateAsUpdate(a.doc, Y.encodeStateVector(live2)).length).toBe(Y.encodeStateAsUpdate(new Y.Doc()).length); // A converged
+    expect(Y.encodeStateAsUpdate(b.doc, Y.encodeStateVector(live2)).length).toBe(Y.encodeStateAsUpdate(new Y.Doc()).length); // B converged
+    await expect(second.handlers.flushPageContent(DOC, { withDigest: true })).resolves.toMatchObject({ flushed: true });
+    expect(storeFailures).toEqual([]);
+    const stored = await pg<{ content: unknown; last_updated_by_id: string; contributor_ids: string[] }[]>`
+      select content, last_updated_by_id, contributor_ids from pages where id = ${PAGE_ID}`;
+    const text = JSON.stringify(stored[0].content);
+    for (const lost of ['A-lost', 'B-lost', 'A-after', 'B-after', 'seed text']) expect({ lost, stored: text.includes(lost) }).toEqual({ lost, stored: true });
+    expect(stored[0].content).toEqual(TiptapTransformer.fromYdoc(live2, 'default')); // the row is live
+    expect(stored[0].last_updated_by_id).toBe(USERS.peer.id); // A's retry was the last change
+    expect([...stored[0].contributor_ids].sort()).toEqual([USERS.editor.id, USERS.peer.id, USERS.writer.id].sort()); // the creator, both editors
   });
 });

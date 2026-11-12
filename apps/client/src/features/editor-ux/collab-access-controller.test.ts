@@ -14,9 +14,11 @@ import {
   COLLAB_COMPACTING_BASE_MS,
   COLLAB_LOST_RETRY_MS,
   COLLAB_TRY_LATER_BASE_MS,
+  COLLAB_UNRESOLVED_RETRY_MS,
   collabAllowsEditing,
   collabRetryDelay,
 } from "./collab-access";
+import { collabRefusalCause } from "./collab-refusal-cause";
 import { COLLAB_UNSYNCED_KEY, CollabLocalCopy } from "./collab-epoch";
 import { createCollabAccessController } from "./collab-access-controller";
 import { reopensOnVisible } from "./collab-reconnect";
@@ -434,6 +436,114 @@ describe("lost (#790, #810)", () => {
     expect(sockets()).toHaveLength(2);
     await advance(1);
     expect(sockets()).toHaveLength(3);
+  });
+});
+
+// cccvu/wiki-v2#842 — an `unresolved` close is retried a bounded number of times: at once, then through the same jittered
+// retry timer as a try later, never at the provider's fixed 1 s. Only a full sync acknowledgement resets the budget.
+describe("unresolved (#842: bounded retries)", () => {
+  const UNRESOLVED = "ccc:collab-update-unresolved";
+
+  /** The server could not decide this socket's frame: a document CLOSE with the unresolved reason. */
+  async function unresolvedOn(s: ScriptedSocket) {
+    s.receive(serverFrames.close(DOC, UNRESOLVED));
+    await flush();
+  }
+
+  /** Open the newest socket and authenticate it (the replay is judged after the authentication). */
+  async function openAuthenticated() {
+    const s = await openLatest();
+    s.receive(serverFrames.authenticated(DOC));
+    await flush();
+    return s;
+  }
+
+  it("retries at once, then after 0.5, 1, 2 s, one socket per wait; the replay landing resets the budget", async () => {
+    const { access, ydoc, markDisconnected, refetchToken } = setup({
+      random: () => 1, // the longest jittered waits
+    });
+    ydoc.getText("t").insert(0, "lost in the crash "); // the copy this editor replays
+    let s = await openAuthenticated();
+    await unresolvedOn(s);
+    expect(s.closedByClient).toBe(true);
+    expect(sockets()).toHaveLength(2); // the first retry: at once, as before #842
+    for (const wait of [500, 1_000, 2_000]) {
+      s = await openAuthenticated();
+      await unresolvedOn(s);
+      expect(s.closedByClient).toBe(true); // the controller closed it: its timer owns the redial
+      expect(collabAllowsEditing(access.state)).toBe(true);
+      const before = sockets().length;
+      await advance(wait - 1);
+      expect(sockets()).toHaveLength(before); // neither early nor the provider's own 1 s reconnect
+      await advance(1);
+      expect(sockets()).toHaveLength(before + 1);
+    }
+    expect(access.state.unresolvedAttempts).toBe(4);
+
+    // the owner's frame has reached the server: this open's replay lands, and every frame it sent is acknowledged
+    const serverDoc = new Y.Doc();
+    s = await openAuthenticated();
+    s.receive(serverFrames.syncStep1(DOC, serverDoc));
+    await flush();
+    applyClientSync(s, serverDoc);
+    expect(serverDoc.getText("t").toString()).toContain("lost in the crash");
+    s.receive(serverFrames.syncStatus(DOC));
+    await flush();
+    expect(access.state.unresolvedAttempts).toBe(0);
+    expect(access.state.refused).toBe(false);
+
+    // a fresh budget: the next unresolved reconnects at once again
+    const before = sockets().length;
+    await unresolvedOn(s);
+    expect(sockets()).toHaveLength(before + 1);
+    expect(access.state.unresolvedAttempts).toBe(1);
+    expect(markDisconnected).not.toHaveBeenCalled();
+    expect(refetchToken).not.toHaveBeenCalled();
+  });
+
+  it("an authentication alone never resets the budget: the 7th unresolved is refused for good (cause copy)", async () => {
+    const { access, markDisconnected, refetchToken } = setup({
+      random: () => 0, // the shortest jittered waits: half of each
+    });
+    const opened: number[] = [];
+    let now = 0;
+    let s = await openAuthenticated();
+    for (const wait of [0, 250, 500, 1_000, 2_000, 4_000]) {
+      await unresolvedOn(s);
+      expect(access.state.refused).toBe(false);
+      await advance(wait);
+      now += wait;
+      opened.push(now);
+      expect(sockets()).toHaveLength(opened.length + 1);
+      s = await openAuthenticated();
+    }
+    expect(opened).toEqual([0, 250, 750, 1_750, 3_750, 7_750]);
+    expect(access.state.unresolvedAttempts).toBe(6);
+
+    await unresolvedOn(s);
+    expect(access.state.refused).toBe(true);
+    expect(access.state.refusedRule).toBe("unresolved");
+    expect(access.state.refusalKind).toBe("generic");
+    expect(collabRefusalCause(access.state.refusedRule)).toBe("copy");
+    expect(collabAllowsEditing(access.state)).toBe(false);
+    expect(s.closedByClient).toBe(true);
+    await advance(COLLAB_LOST_RETRY_MS);
+    expect(sockets()).toHaveLength(7); // final: nothing reopens it
+    expect(markDisconnected).not.toHaveBeenCalled(); // the notice speaks; the header never says "Retrying..."
+    expect(refetchToken).not.toHaveBeenCalled();
+  });
+
+  it("the timer never redials a socket something else already reopened (the tab became visible)", async () => {
+    const { socket } = setup({ random: () => 1 });
+    let s = await openAuthenticated();
+    await unresolvedOn(s); // at once
+    s = await openAuthenticated();
+    await unresolvedOn(s); // waits 0.5 s
+    expect(reopensOnVisible("visible", WebSocketStatus.Disconnected, socket)).toBe(true);
+    void socket.connect(); // the visibility effect
+    expect(sockets()).toHaveLength(3);
+    await advance(COLLAB_UNRESOLVED_RETRY_MS[1]);
+    expect(sockets()).toHaveLength(3); // the timer saw shouldConnect and stood down
   });
 });
 

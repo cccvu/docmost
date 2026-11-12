@@ -14,6 +14,9 @@
  * (A document CLOSE after the first sync needs neither: @hocuspocus/provider 4.7.1 emits `synced` only when it becomes
  * true, and the detach comes before the socket's own disconnect, so the header keeps reading `connected`.)
  *
+ * #842: an `unresolved` retry's wait (up to 8 s) is not a refusal: the socket is closed and does retry, so "Retrying..."
+ * is true there. Only once its budget is spent is it a refusal, and quiet like any other.
+ *
  * page-editor.tsx (seam 169) passes every status it would set through `collabHeaderStatus`, and a small effect applies
  * it whenever the refusal or the status changes. `""` is the atom's initial value, which ConnectionWarning ignores.
  */

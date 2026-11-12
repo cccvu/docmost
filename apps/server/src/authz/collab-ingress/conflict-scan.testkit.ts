@@ -56,6 +56,54 @@ export function rawUpdate(clients: RawClient[], ds: RawDeletes = [], YY: YModule
   return enc.toUint8Array();
 }
 
+/** A block of structs one client wrote, from `clock` on (#842: decoded structs, hand-built GCs and Skips). */
+export type StructBlock = { client: number; clock: number; structs: Array<Y.Item | Y.GC | Y.Skip> };
+
+/**
+ * #842: a V1 update from structs, block by block as given (no sort, no merge, a client repeated if asked): each struct
+ * writes itself (`Item.write` takes a decoded item's root name or parent id as Yjs's own diff does), then `ds`.
+ */
+export function encodeStructs(blocks: StructBlock[], ds: RawDeletes = []): Uint8Array {
+  const enc = new Y.UpdateEncoderV1() as any;
+  encoding.writeVarUint(enc.restEncoder, blocks.length);
+  for (const { client, clock, structs } of blocks) {
+    encoding.writeVarUint(enc.restEncoder, structs.length);
+    enc.writeClient(client);
+    encoding.writeVarUint(enc.restEncoder, clock);
+    for (const s of structs) (s as unknown as { write(e: unknown, offset: number): void }).write(enc, 0);
+  }
+  encoding.writeVarUint(enc.restEncoder, ds.length);
+  for (const { client, ranges } of ds) {
+    enc.resetDsCurVal();
+    encoding.writeVarUint(enc.restEncoder, client);
+    encoding.writeVarUint(enc.restEncoder, ranges.length);
+    for (const [clock, len] of ranges) {
+      enc.writeDsClock(clock);
+      enc.writeDsLen(len);
+    }
+  }
+  return enc.toUint8Array();
+}
+
+/** #842: an update's struct blocks (consecutive structs of one client) and delete set, as `encodeStructs` takes them. */
+export function blocksOf(update: Uint8Array): { blocks: StructBlock[]; ds: RawDeletes } {
+  const decoded = Y.decodeUpdate(update);
+  const blocks: StructBlock[] = [];
+  for (const s of decoded.structs as Array<Y.Item | Y.GC | Y.Skip>) {
+    const last = blocks[blocks.length - 1];
+    if (last && last.client === s.id.client && last.structs.length) {
+      const end = last.structs[last.structs.length - 1];
+      if (end.id.clock + end.length === s.id.clock) {
+        last.structs.push(s);
+        continue;
+      }
+    }
+    blocks.push({ client: s.id.client, clock: s.id.clock, structs: [s] });
+  }
+  const ds: RawDeletes = [...decoded.ds.clients].map(([client, items]) => ({ client, ranges: items.map((d) => [d.clock, d.len] as [number, number]) }));
+  return { blocks, ds };
+}
+
 /** A page as the editor stores it: `default` > paragraph > XmlText(`text`), all by client 1. */
 export function basePage(text = 'hello world', YY: YModule = Y) {
   const doc = new YY.Doc();

@@ -13,6 +13,7 @@ import {
   COLLAB_TRY_LATER_BASE_MS,
   COLLAB_UPDATE_REFUSED_PREFIX,
   COLLAB_UPDATE_UNRESOLVED,
+  COLLAB_UNRESOLVED_RETRY_MS,
   CollabAccessEvent,
   CollabAccessState,
   classifyCollabCloseReason,
@@ -263,77 +264,115 @@ describe("collab update refusal (#781)", () => {
     }
   });
 
-  it("the first unresolved reconnects once, keeps editing, and does not detach", () => {
+  it("the first unresolved reconnects at once, keeps editing, and does not detach", () => {
     const step = nextCollabAccess(
       initialCollabAccess,
       close(COLLAB_UPDATE_UNRESOLVED),
     );
     expect(step.reconnect).toBe(true);
     expect(step.detach).toBe(false);
+    expect(step.disconnectSocket).toBe(false); // the reconnect closes and reopens it on its own `disconnect` event
+    expect(step.retryAfterMs).toBe(0); // at once, as before #842
     expect(step.refreshToken).toBe(false);
     expect(step.markDisconnected).toBe(false);
-    expect(step.state.unresolvedRetried).toBe(true);
+    expect(step.state.unresolvedAttempts).toBe(1);
     expect(step.state.refused).toBe(false);
     expect(collabAllowsEditing(step.state)).toBe(true);
   });
 
-  it("the first unresolved on a closing socket leaves the reconnect to the provider but still spends the retry", () => {
+  it("the first unresolved on a closing socket leaves the reconnect to the provider but still spends that retry", () => {
     const step = nextCollabAccess(
       initialCollabAccess,
       close(COLLAB_UPDATE_UNRESOLVED, false),
     );
     expect(step.reconnect).toBe(false);
-    expect(step.state.unresolvedRetried).toBe(true);
-    const second = nextCollabAccess(
-      step.state,
-      close(COLLAB_UPDATE_UNRESOLVED),
-    );
-    expect(second.state.refused).toBe(true);
-    expect(second.detach).toBe(true);
-  });
-
-  it("a second unresolved with no sync-acked in between is refused, even across a re-authentication", () => {
-    let state: CollabAccessState = nextCollabAccess(
-      initialCollabAccess,
-      close(COLLAB_UPDATE_UNRESOLVED),
-    ).state;
-    // the reconnect re-authenticates (and may even refetch the token first): neither is proof the replay landed
-    for (const event of [
-      { kind: "auth-failed", tokenExpired: true },
-      { kind: "authenticated", scope: "read-write" },
-      { kind: "authenticated", scope: "readonly" },
-      { kind: "authenticated", scope: "read-write" },
-      close(undefined),
-    ] as const) {
-      state = nextCollabAccess(state, event).state;
-      expect(state.unresolvedRetried).toBe(true);
+    expect(step.retryAfterMs).toBe(0);
+    expect(step.state.unresolvedAttempts).toBe(1);
+    // the next one is the first timed retry, whether or not its socket is still open
+    for (const connected of [true, false]) {
+      const second = nextCollabAccess(
+        step.state,
+        close(COLLAB_UPDATE_UNRESOLVED, connected),
+      );
+      expect(second.state.refused).toBe(false);
+      expect(second.reconnect).toBe(false);
+      expect(second.disconnectSocket).toBe(true);
+      expect(second.retryAfterMs).toBe(500);
+      expect(second.state.unresolvedAttempts).toBe(2);
     }
-    const second = nextCollabAccess(state, close(COLLAB_UPDATE_UNRESOLVED));
-    expect(second.reconnect).toBe(false);
-    expect(second.detach).toBe(true);
-    expect(second.state.refused).toBe(true);
-    expect(collabAllowsEditing(second.state)).toBe(false);
   });
 
-  it("sync-acked (every sent frame applied) clears the retry, so a later unresolved reconnects once again", () => {
-    const first = nextCollabAccess(
-      initialCollabAccess,
-      close(COLLAB_UPDATE_UNRESOLVED),
-    );
-    const authed = nextCollabAccess(first.state, {
+  // #842: co-editors who both lost edits in a crash relay each other's structs; a retry lands once the owner's own frame
+  // reached the server, which can take more than one round trip. Bounded: no retry helps when no owner ever sends.
+  it("is retried 6 times (at once, then 0.5, 1, 2, 4, 8 s, never marking the header), even across re-authentication; the 7th is refused", () => {
+    expect(COLLAB_UNRESOLVED_RETRY_MS).toEqual([0, 500, 1_000, 2_000, 4_000, 8_000]);
+    let state: CollabAccessState = initialCollabAccess;
+    const waits: number[] = [];
+    for (let i = 0; i < COLLAB_UNRESOLVED_RETRY_MS.length; i += 1) {
+      const step = nextCollabAccess(state, close(COLLAB_UPDATE_UNRESOLVED));
+      expect(step.state.refused).toBe(false);
+      expect(step.detach).toBe(false);
+      expect(step.refreshToken).toBe(false);
+      expect(step.markDisconnected).toBe(false); // the closed socket's own status is the truth: it is retrying
+      expect(step.state.unresolvedAttempts).toBe(i + 1);
+      expect(collabAllowsEditing(step.state)).toBe(true);
+      expect(collabAwaitsRetry(step.state)).toBe(true); // the controller's timer redials only while this holds
+      if (i === 0) {
+        expect([step.reconnect, step.disconnectSocket]).toEqual([true, false]);
+      } else {
+        expect([step.reconnect, step.disconnectSocket]).toEqual([false, true]); // the retry timer owns the redial
+        expect(step.retryMinMs).toBe(step.retryAfterMs / 2); // half to all of the wait, never the 1 s floor
+      }
+      waits.push(step.retryAfterMs);
+      state = step.state;
+      // the reconnect re-authenticates (and may even refetch the token first): neither is proof the replay landed
+      for (const event of [
+        { kind: "auth-failed", tokenExpired: true },
+        { kind: "authenticated", scope: "read-write" },
+        { kind: "authenticated", scope: "readonly" },
+        { kind: "authenticated", scope: "read-write" },
+        { kind: "synced" }, // the server's Step2 applied: says nothing about this copy's own
+        close(undefined),
+      ] as const) {
+        state = nextCollabAccess(state, event).state;
+        expect(state.unresolvedAttempts).toBe(i + 1);
+      }
+    }
+    expect(waits).toEqual(COLLAB_UNRESOLVED_RETRY_MS);
+    const last = nextCollabAccess(state, close(COLLAB_UPDATE_UNRESOLVED));
+    expect(last.reconnect).toBe(false);
+    expect(last.retryAfterMs).toBe(0);
+    expect(last.markDisconnected).toBe(false); // nothing retries any more: the notice speaks, not the header
+    expect(last.detach).toBe(true);
+    expect(last.disconnectSocket).toBe(true);
+    expect(last.state.refused).toBe(true);
+    expect(last.state.refusedRule).toBe("unresolved");
+    expect(collabRefusalCause(last.state.refusedRule)).toBe("copy");
+    expect(collabAllowsEditing(last.state)).toBe(false);
+    expect(collabAwaitsRetry(last.state)).toBe(false);
+  });
+
+  it("sync-acked (every sent frame applied) resets the budget, so a later unresolved reconnects at once again", () => {
+    let state: CollabAccessState = initialCollabAccess;
+    for (let i = 0; i < 4; i += 1) {
+      state = nextCollabAccess(state, close(COLLAB_UPDATE_UNRESOLVED)).state;
+    }
+    const authed = nextCollabAccess(state, {
       kind: "authenticated",
       scope: "read-write",
     });
     const acked = nextCollabAccess(authed.state, { kind: "sync-acked" });
-    expect(acked.state.unresolvedRetried).toBe(false);
+    expect(acked.state.unresolvedAttempts).toBe(0);
+    expect(collabAwaitsRetry(acked.state)).toBe(false);
     expect(acked.reconnect || acked.refreshToken || acked.detach).toBe(false);
     const later = nextCollabAccess(
       acked.state,
       close(COLLAB_UPDATE_UNRESOLVED),
     );
     expect(later.reconnect).toBe(true);
+    expect(later.retryAfterMs).toBe(0);
     expect(later.state.refused).toBe(false);
-    expect(later.state.unresolvedRetried).toBe(true);
+    expect(later.state.unresolvedAttempts).toBe(1);
   });
 
   it("sync-acked with no retry pending is a no-op that keeps the same state object (no re-render per ack)", () => {
@@ -354,10 +393,10 @@ describe("collab update refusal (#781)", () => {
       lost: true,
       readOnly: true,
       refreshed: true,
-      unresolvedRetried: true,
+      unresolvedAttempts: 3,
     };
     const step = nextCollabAccess(state, { kind: "sync-acked" });
-    expect(step.state).toEqual({ ...state, unresolvedRetried: false });
+    expect(step.state).toEqual({ ...state, unresolvedAttempts: 0 });
   });
 
   it.each([undefined, "", "Forbidden", "ccc:collab-update-refused"])(
@@ -372,6 +411,7 @@ describe("collab update refusal (#781)", () => {
         detach: false,
         disconnectSocket: false,
         retryAfterMs: 0,
+        retryMinMs: COLLAB_RETRY_MIN_MS,
       });
       expect(live.state).toBe(initialCollabAccess);
       const dead = nextCollabAccess(initialCollabAccess, close(reason, false));
@@ -456,7 +496,7 @@ describe("a socket close with 1009 (a frame over the server's maxPayload) (#790)
         code: 1000,
       }),
       nextCollabAccess(
-        { ...initialCollabAccess, unresolvedRetried: true },
+        { ...initialCollabAccess, unresolvedAttempts: COLLAB_UNRESOLVED_RETRY_MS.length },
         { kind: "server-close", socketConnected: true, reason: COLLAB_UPDATE_UNRESOLVED },
       ),
     ];
@@ -482,6 +522,7 @@ describe("a socket close with 1009 (a frame over the server's maxPayload) (#790)
         detach: false,
         disconnectSocket: false,
         retryAfterMs: 0,
+        retryMinMs: COLLAB_RETRY_MIN_MS,
       });
     },
   );
@@ -626,20 +667,21 @@ describe("the refused rule (refusedRule)", () => {
     expect(step.state.refusedRule).toBeNull();
   });
 
-  it('a second unresolved records "unresolved" (a client-made value: the server never sends it with the prefix)', () => {
-    const first = nextCollabAccess(initialCollabAccess, {
+  it('an unresolved past its retries records "unresolved" (a client-made value: the server never sends it with the prefix)', () => {
+    const unresolved = {
       kind: "server-close",
       socketConnected: true,
       reason: COLLAB_UPDATE_UNRESOLVED,
-    });
-    expect(first.state.refusedRule).toBeNull();
-    const second = nextCollabAccess(first.state, {
-      kind: "server-close",
-      socketConnected: true,
-      reason: COLLAB_UPDATE_UNRESOLVED,
-    });
-    expect(second.state.refused).toBe(true);
-    expect(second.state.refusedRule).toBe("unresolved");
+    } as const;
+    let state: CollabAccessState = initialCollabAccess;
+    for (let i = 0; i < COLLAB_UNRESOLVED_RETRY_MS.length; i += 1) {
+      state = nextCollabAccess(state, unresolved).state;
+      expect(state.refused).toBe(false);
+      expect(state.refusedRule).toBeNull();
+    }
+    const refused = nextCollabAccess(state, unresolved);
+    expect(refused.state.refused).toBe(true);
+    expect(refused.state.refusedRule).toBe("unresolved");
   });
 
   it("refusedRuleOf takes only the contract prefix", () => {
@@ -894,7 +936,7 @@ describe("try later (#810)", () => {
     const step = nextCollabAccess(refused, tryLaterEvents[0][1]);
     expect(step.state).toBe(refused);
     expect(step.disconnectSocket || step.markDisconnected || step.retryAfterMs > 0).toBe(false);
-    expect(collabAwaitsRetry({ ...refused, tryLaterAttempts: 3, lost: true })).toBe(false);
+    expect(collabAwaitsRetry({ ...refused, tryLaterAttempts: 3, lost: true, unresolvedAttempts: 2 })).toBe(false);
   });
 });
 
@@ -906,6 +948,10 @@ describe("collabRetryDelay (#810)", () => {
     expect(collabRetryDelay(1_000, () => 0)).toBe(COLLAB_RETRY_MIN_MS);
     expect(collabRetryDelay(5_000, () => 7)).toBe(5_000); // a bad random source is clamped
     expect(collabRetryDelay(5_000, () => -1)).toBe(2_500);
+    // #842: a step may lower the floor (the unresolved schedule's sub-second waits keep their jitter)
+    expect(collabRetryDelay(500, () => 0, 250)).toBe(250);
+    expect(collabRetryDelay(500, () => 1, 250)).toBe(500);
+    expect(collabRetryDelay(1_000, () => 0, 500)).toBe(500);
     for (let i = 0; i < 200; i += 1) {
       const d = collabRetryDelay(5_000);
       expect(d).toBeGreaterThanOrEqual(2_500);
@@ -1029,7 +1075,7 @@ describe("#827 epoch, compaction and the Discard-first rules", () => {
   });
 
   it("a sync with nothing to clear keeps the same state object (no re-render per sync)", () => {
-    const prev = { ...initialCollabAccess, unresolvedRetried: true };
+    const prev = { ...initialCollabAccess, unresolvedAttempts: 2 };
     expect(nextCollabAccess(prev, { kind: "synced" }).state).toBe(prev);
   });
 
