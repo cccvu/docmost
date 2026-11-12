@@ -596,14 +596,49 @@ describe('#827 a hard cap drains only when compaction would bring the page under
     expect(control.send(control.conn('a'), editAs(control.live, 70, (d) => textOf(d).insert(0, 'k')))).toBe('applied');
     expect(control.send(control.conn('a'), grow(control.live, 70))).toBe(COMPACTING);
     expect(isDraining(control.live)).toBe(true);
-    // treatment: its live structs (about 15) are over a ceiling of 10: no build is attempted, the growth is page-full
+    // treatment: its live structs (about 15) are over a ceiling of 10: the ceiling is a hard cap on live structs, so any
+    // growth is page-full (the keystroke too), nothing drains, no build is attempted; a delete passes
     const s = setup(withHistory(150), { caps: { structs: CAP, compactLive: 10 } });
     const other = s.conn('other');
-    expect(s.send(s.conn('a'), editAs(s.live, 70, (d) => textOf(d).insert(0, 'k')))).toBe('applied');
-    expect(s.send(s.conn('a'), grow(s.live, 70))).toBe(REFUSED('page-full'));
+    expect(s.send(s.conn('a'), editAs(s.live, 70, (d) => textOf(d).insert(0, 'k')))).toBe(REFUSED('page-full'));
+    expect(s.send(s.conn('b'), grow(s.live, 71))).toBe(REFUSED('page-full'));
     expect(isDraining(s.live)).toBe(false);
     expect(compactionRequest(s.live)).toBeNull();
     expect(other.webSocket.close).not.toHaveBeenCalled();
+    expect(s.send(s.conn('c'), editAs(s.live, 72, (d) => textOf(d).delete(0, 1)))).toBe('applied');
+  });
+
+  it('the live-struct cap: growth past COMPACT_MAX_LIVE_STRUCTS is page-full, measured exactly (history never counts)', async () => {
+    // a page of 12 live structs with heavy history: the O(1) estimate (every struct added since the last measure, as
+    // live) passes a cap of 40 after churn, but the exact count stays under it, so churn is never refused
+    const s = setup(paragraphs(4, 'hello'), { caps: { compactLive: 40 } });
+    const c = s.conn('a');
+    for (let i = 0; i < 30; i++) {
+      expect(s.send(c, editAs(s.live, 70, (d) => textOf(d, i % 4).insert(0, 'x')))).toBe('applied');
+      expect(s.send(c, editAs(s.live, 70, (d) => textOf(d, i % 4).delete(0, 1)))).toBe('applied');
+    }
+    // real growth past the cap is page-full: a paste of 40 paragraphs (each a paragraph and a text: 80 live structs)
+    const paste = editAs(s.live, 71, (d) =>
+      d.getXmlFragment('default').insert(0, Array.from({ length: 40 }, () => {
+        const p = new Y.XmlElement('paragraph');
+        p.insert(0, [new Y.XmlText('p')]);
+        return p;
+      })),
+    );
+    expect(s.send(s.conn('b'), paste)).toBe(REFUSED('page-full'));
+    expect(isDraining(s.live)).toBe(false);
+    expect(s.send(c, editAs(s.live, 70, (d) => textOf(d).delete(0, 1)))).toBe('applied'); // rebuilds the refused shadow
+    expect(isPageFull(s.live)).toBe(false);
+    // a page measured past it (an API write, mirrored) is marked page-full for the API
+    s.live.transact(() => {
+      s.live.getXmlFragment('default').insert(0, Array.from({ length: 40 }, () => {
+        const p = new Y.XmlElement('paragraph');
+        p.insert(0, [new Y.XmlText('api')]);
+        return p;
+      }));
+    }, 'api');
+    await settle();
+    expect(isPageFull(s.live)).toBe(true);
   });
 
   it('page-full within the compaction interval lapses with it: the same crossing after the interval drains', () => {

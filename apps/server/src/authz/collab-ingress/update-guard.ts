@@ -261,7 +261,7 @@ export interface DocCaps {
   clientIds: number;
   children: number;
   steps: number;
-  /** Live structs past which compaction is never attempted (COMPACT_MAX_LIVE_STRUCTS; `compactionWouldHelp`). */
+  /** Live structs: a hard cap on growth, and past it no structure-cap compaction (COMPACT_MAX_LIVE_STRUCTS). */
   compactLive: number;
 }
 /** #827: the deadlines, in ms (doc-bounds.ts). */
@@ -886,13 +886,19 @@ export class CollabUpdateGuard {
     const clients = result.clientsAfter;
     // The page's counts are still those without the frame; its growth (every struct it added, taken as live) and the
     // live children of what it touched are added on top.
+    // Live structs: what a compaction keeps and must rebuild within COMPACTION_DEADLINE_MS, so past COMPACT_MAX_LIVE_STRUCTS
+    // growth is page-full. The O(1) estimate takes every struct added since the last exact measure as live; past the cap
+    // it is replaced by an exact count of the shadow (which holds this frame), so churn never refuses a page under it.
+    const estimate = doc.liveStructs + Math.max(0, doc.structs - doc.structsAtMeasure) + result.added;
+    const exactLive = result.added > 0 && estimate > this.caps.compactLive && doc.shadow ? liveStructure(doc.shadow).structs : undefined;
     const growth = capVerdict(
       [
         { reason: 'structs', n: structs, cap: this.caps.structs, grew: result.added > 0 },
         { reason: 'client_ids', n: clients, cap: this.caps.clientIds, grew: clients > result.clientsBefore },
         { reason: 'children', n: result.children, cap: this.caps.children },
+        { reason: 'structs', n: exactLive ?? estimate, cap: this.caps.compactLive, grew: result.added > 0, hardOnly: true },
       ],
-      () => this.compactionHelps(doc, result.added, result.children),
+      () => this.compactionHelps(doc, result.added, result.children, exactLive),
       () => compactedRecently(doc.live, this.now()),
     );
     const verdict: 'ok' | 'full' | 'compact' = growth.full ? 'full' : growth.hard ? 'compact' : 'ok';
@@ -923,8 +929,8 @@ export class CollabUpdateGuard {
    * estimate errs toward page-full; the refused frame dirties the shadow, and the rebuild the next frame makes measures
    * again). O(1).
    */
-  private compactionHelps(doc: DocGuard, frameStructs = 0, frameChildren = 0): boolean {
-    const structs = doc.liveStructs + Math.max(0, doc.structs - doc.structsAtMeasure) + frameStructs;
+  private compactionHelps(doc: DocGuard, frameStructs = 0, frameChildren = 0, exactStructs?: number): boolean {
+    const structs = exactStructs ?? doc.liveStructs + Math.max(0, doc.structs - doc.structsAtMeasure) + frameStructs;
     return compactionWouldHelp({ structs, children: Math.max(doc.liveChildren, frameChildren) }, this.caps);
   }
 
@@ -1308,6 +1314,7 @@ export class CollabUpdateGuard {
         { reason: 'structs', n: doc.structs, cap: this.caps.structs },
         { reason: 'client_ids', n: doc.shadow?.store.clients.size ?? 0, cap: this.caps.clientIds },
         { reason: 'children', n: doc.liveChildren, cap: this.caps.children },
+        { reason: 'structs', n: doc.liveStructs, cap: this.caps.compactLive, hardOnly: true },
       ],
       () => this.compactionHelps(doc),
       () => compactedRecently(doc.live, this.now()),

@@ -33,6 +33,7 @@ import {
   rethrowDirectOpenRefusal,
   skipStoreOfSuperseded,
   snapshotTree,
+  startRowCompaction,
 } from './compaction';
 import {
   awaitCompaction,
@@ -64,6 +65,8 @@ import { recordWriteKey, scopedWriteKey, type StoredLedgerKey, WRITE_IDEM_MAP } 
 /** A ledger key as production records it (PR 91: the map holds its digest, `.entry`). */
 const wk = (user: string, key: string) => scopedWriteKey(user, key);
 import { PageTooLargeException } from './page-size';
+import { CollabUpdateGuardExtension } from '../collab-ingress/collab-update-guard.extension';
+import { CollabUpdateGuard } from '../collab-ingress/update-guard';
 
 const sha = (b: Uint8Array) => createHash('sha256').update(b).digest('base64');
 const md5 = (v: unknown) => (v == null ? null : createHash('md5').update(JSON.stringify(v)).digest('hex'));
@@ -538,6 +541,62 @@ describe('loadStoredYdoc (#827): the bounded load', () => {
 describe('compactOnUnload (#827)', () => {
   const request = { reason: 'structs' as const, userId: 'u1', drain: false };
 
+  it('a drain requested at load still compacts when the load repair (#781 lineage) changed the document', async () => {
+    const run = async (repairs: boolean) => {
+      const src = churnedPage(10);
+      // a stored legacy value the guard refuses (a colspan out of range), so afterLoadDocument's repair deletes it
+      const cellOf = (d: Y.Doc) => ((d.getXmlFragment('default').get(4) as Y.XmlElement).get(1) as Y.XmlElement).get(0) as Y.XmlElement;
+      if (repairs) src.transact(() => cellOf(src).setAttribute('colspan', 0 as never));
+      const bytes = Y.encodeStateAsUpdate(src);
+      const content = storeSafeJson(TiptapTransformer.fromYdoc(src, 'default'));
+      const store = memoryStore({ content, ydoc: bytes, contentHash: md5(content) });
+      const pageId = nextPageId();
+      const doc = new Y.Doc() as CompactableDocument;
+      // past the client-id cap, which compaction fixes: a drain requested at load
+      loadStoredYdoc(doc, pageId, bytes, store, { steps: 1e9, deadlineMs: 60_000, caps: { structs: 1e9, clientIds: countStructs(src).clients - 1, children: 1e9 } });
+      expect(compactionRequest(doc)).toMatchObject({ drain: true });
+      const ext = new CollabUpdateGuardExtension(new CollabUpdateGuard({ mode: 'enforce', logger: { warn: () => undefined } }), {
+        logger: { warn: () => undefined },
+      });
+      await ext.afterLoadDocument({ document: doc, documentName: `page.${pageId}` } as never);
+      Object.assign(doc, { name: `page.${pageId}`, connections: new Map(), getConnectionsCount: () => 0 });
+      await compactOnUnload(doc, store);
+      return { doc, store, repaired: repairs && cellOf(doc).getAttribute('colspan') === undefined, cellOf };
+    };
+    const control = await run(false);
+    expect(isSuperseded(control.doc)).toBe(true);
+    const treated = await run(true);
+    expect(treated.repaired).toBe(true); // non-vacuity: the repair ran and changed the document
+    expect(isSuperseded(treated.doc)).toBe(true); // it compacted (it used to stay draining, joins and writes refused)
+    expect(treated.store.calls.swap).toBe(1);
+    const loaded = new Y.Doc();
+    Y.applyUpdate(loaded, treated.store.row!.ydoc!);
+    expect(treated.cellOf(loaded).getAttribute('colspan')).toBeUndefined(); // the compacted row holds the repaired page
+  });
+
+  it('a row whose bytes leave structs pending is never drained at load (its unload could not compact): requested only', () => {
+    const src = churnedPage(10);
+    const a = new Y.Doc();
+    Y.applyUpdate(a, Y.encodeStateAsUpdate(src));
+    a.clientID = 9_001;
+    a.getXmlFragment('default').insert(0, [new Y.XmlElement('paragraph')]);
+    const b = new Y.Doc();
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    b.clientID = 9_002;
+    b.getXmlFragment('default').insert(1, [new Y.XmlElement('paragraph')]);
+    // the row holds src and b's struct, but not a's, which b's depends on: b's stays pending on every load
+    const bytes = Y.mergeUpdates([Y.encodeStateAsUpdate(src), Y.encodeStateAsUpdate(b, Y.encodeStateVector(a))]);
+    const doc = new Y.Doc();
+    loadStoredYdoc(doc, nextPageId(), bytes, memoryStore(null), {
+      steps: 1e9,
+      deadlineMs: 60_000,
+      caps: { structs: 1e9, clientIds: countStructs(src).clients - 1, children: 1e9 },
+    });
+    expect(doc.store.pendingStructs).not.toBeNull(); // non-vacuity
+    expect(compactionRequest(doc)).toMatchObject({ drain: false });
+    expect(isClosedForCompaction(doc)).toBe(false);
+  });
+
   function setup(rounds = 10) {
     const live = churnedPage(rounds);
     recordWriteKey(live, wk('u', 'k'), 123);
@@ -717,6 +776,30 @@ describe('compactOnUnload (#827)', () => {
 });
 
 describe('compactFromRow (#827): the row content is the source', () => {
+  it('a row build that ran out of time is not retried for the same bytes; other bytes are', async () => {
+    const live = churnedPage(4);
+    const bytes = Y.encodeStateAsUpdate(live);
+    const content = storeSafeJson(TiptapTransformer.fromYdoc(live, 'default'));
+    const store = memoryStore({ content, ydoc: bytes, contentHash: md5(content) });
+    const pageId = nextPageId();
+    const restore = overrideDeadlineForTests((_fn, ms) => {
+      throw deadlineExceeded(ms);
+    });
+    try {
+      expect(startRowCompaction(store, pageId, 'load_trip', sha(bytes))).toBe(true);
+      await awaitCompaction(pageId);
+      expect(store.calls.read).toBe(1);
+      now += 2 * COMPACTION_MIN_INTERVAL_MS; // past the per-page interval and the process gap
+      expect(startRowCompaction(store, pageId, 'load_trip', sha(bytes))).toBe(false); // the same bytes: not again
+      expect(store.calls.read).toBe(1);
+      expect(startRowCompaction(store, pageId, 'load_trip', 'other-bytes-digest')).toBe(true); // a store wrote since
+      await awaitCompaction(pageId);
+      expect(store.calls.read).toBe(2);
+    } finally {
+      restore();
+    }
+  });
+
   it('rebuilds from content, keeps the ledger read from the bytes, and moves to the next epoch', async () => {
     const live = churnedPage(8);
     recordWriteKey(live, wk('u', 'k'), 9);

@@ -1669,7 +1669,8 @@ describe('#816 conflict scan: a frame whose integrate walks would stall the proc
     // nothing (one client, same origins), so the frame is cheap and accepted. The typist's keystroke, made before it
     // saw them (a higher client id), walks every one of them: one item, ~60k steps, a few ms of Yjs.
     const page = basePage('ab');
-    const s = setup({ seed: page.doc });
+    // #816's per-item rule only: 60,000 live siblings are past #827's live-struct cap (COMPACT_MAX_LIVE_STRUCTS), raised here
+    const s = setup({ seed: page.doc, caps: { compactLive: 100_000 } });
     const typist = new Y.Doc();
     typist.clientID = 3_000_000_000;
     Y.applyUpdate(typist, Y.encodeStateAsUpdate(s.live));

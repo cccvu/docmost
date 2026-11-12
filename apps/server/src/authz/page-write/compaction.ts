@@ -181,6 +181,20 @@ export function loadStatsOf(doc: object): LoadStats | null {
 }
 
 /**
+ * The load repair (legacy-repair.ts, `afterLoadDocument`) changed the freshly loaded document, from `before` (its
+ * generation just before the repair). The document still counts as holding its row for compaction (`holdsItsRow`): the
+ * repair only deletes, and makes the same deletes on every load of those bytes, so the compare-and-swap (on the row's
+ * own bytes) and the digest check (on the repaired document) stay exact. Without this a drain requested at load would
+ * never compact (the unload sees a changed, unstored document) and would refuse every join and write again on each
+ * reload. Only when nothing else changed the document since its load.
+ */
+export function noteLoadRepaired(doc: object, before: number | undefined): void {
+  const stats = loadStats.get(doc);
+  if (!stats || before === undefined || stats.generation !== before) return;
+  stats.generation = storeGenerationOf(doc);
+}
+
+/**
  * Pages whose stored bytes tripped a load: refused at once on the next load (no second walk) while the bytes are the
  * same. A meter trip is deterministic (strikes at once); a deadline can be a one-off stall, so it takes two. Bounded
  * (oldest out); forgotten when a load of the page succeeds or a compaction rewrites it.
@@ -201,6 +215,7 @@ function noteLoadTrip(pageId: string, digest: string, deterministic: boolean): v
 export function resetLoadTripsForTests(): void {
   if (process.env.JEST_WORKER_ID === undefined) throw new Error('resetLoadTripsForTests is for jest only (#827)');
   loadTrips.clear();
+  rowBuildsOutOfTime.clear();
 }
 
 let meterInstance: ConflictScanMeter | null = null;
@@ -247,7 +262,7 @@ export function loadStoredYdoc(
   if (memo) {
     digest = sha256(bytes);
     if (memo.digest === digest && memo.strikes >= LOAD_TRIP_STRIKES) {
-      startRowCompaction(storeOf(db), pageId, 'load_trip');
+      startRowCompaction(storeOf(db), pageId, 'load_trip', digest);
       throw pageCompactingRefusal();
     }
   }
@@ -263,9 +278,10 @@ export function loadStoredYdoc(
   }
   const ms = performance.now() - started;
   if (deadline || scan.trip !== null) {
-    noteLoadTrip(pageId, digest ?? sha256(bytes), !deadline);
+    digest ??= sha256(bytes);
+    noteLoadTrip(pageId, digest, !deadline);
     logPageCompaction('load_refused', pageId, { why: deadline ? 'deadline' : 'steps', steps: scan.steps, bytes: bytes.length, ms: round(ms) });
-    startRowCompaction(storeOf(db), pageId, 'load_trip');
+    startRowCompaction(storeOf(db), pageId, 'load_trip', digest);
     throw pageCompactingRefusal();
   }
   loadTrips.delete(pageId);
@@ -290,13 +306,17 @@ function requestIfOverSoftCaps(
   caps: LoadCaps,
 ): void {
   let live: LiveStructure | undefined;
+  const compactLive = caps.compactLive ?? COMPACT_MAX_LIVE_STRUCTS;
+  // live ≤ every struct, so the walk runs only for a page that could be past COMPACT_MAX_LIVE_STRUCTS
+  const liveStructs = stats.structs > compactLive ? (live = liveStructure(document)).structs : 0;
   const verdict = capVerdict(
     [
       { reason: 'structs', n: stats.structs, cap: caps.structs },
       { reason: 'client_ids', n: stats.clients, cap: caps.clientIds },
       { reason: 'load_steps', n: stats.steps, cap: stepCap },
+      { reason: 'structs', n: liveStructs, cap: compactLive, hardOnly: true },
     ],
-    () => compactionWouldHelp((live = liveStructure(document)), caps), // O(structs), as the load just was
+    () => compactionWouldHelp((live ??= liveStructure(document)), caps), // O(structs), as the load just was
     () => compactedRecently(document),
   );
   markPageFull(document, verdict.full, pageFullUntil(document, verdict));
@@ -304,7 +324,10 @@ function requestIfOverSoftCaps(
   const request: CompactionRequest = {
     reason: verdict.reason,
     userId: null,
-    drain: verdict.hard && canStartCompaction(pageId),
+    // Drain only when the unload can compact: a compaction can start, and the row is covered (a row whose bytes left
+    // structs pending is not, and no writer can join a draining page to store it), or the drain would repeat on every
+    // load with nothing compacting. Otherwise the request waits; a frame or probe can drain it once writers stored.
+    drain: verdict.hard && canStartCompaction(pageId) && coveredRowDigest(document) !== null,
   };
   if (requestCompaction(document, request)) {
     logCompactionRequested(pageId, request, {
@@ -342,9 +365,9 @@ export async function compactOnUnload(document: CompactableDocument, db: KyselyD
     if (document.getConnectionsCount() !== 0) return;
     // Never past an unsaved or failed store: the CAS names the bytes this document last stored (or found stored), or
     // loaded when nothing changed since (a page opened and left without an edit never stores).
-    if (!holdsItsRow(document)) return;
+    if (!holdsItsRow(document)) return skipUnload(pageId, request, 'not_stored');
     const covered = coveredRowDigest(document);
-    if (covered === null) return;
+    if (covered === null) return skipUnload(pageId, request, 'uncovered');
     if (!canStartCompaction(pageId)) return;
     markCompacting(document); // synchronously: from here joins and writes answer try-later
     marked = true;
@@ -355,6 +378,11 @@ export async function compactOnUnload(document: CompactableDocument, db: KyselyD
     const page = pageIdOfDocumentName(document.name) ?? document.name;
     logCompactionFailed(page, compactionRequest(document)?.reason ?? null, 'unexpected', err);
   }
+}
+
+/** A requested compaction the unload cannot run: logged when it drained the page (everyone was closed for it). */
+function skipUnload(pageId: string, request: CompactionRequest, why: 'not_stored' | 'uncovered'): void {
+  if (request.drain) logPageCompaction('skipped', pageId, { reason: request.reason, why });
 }
 
 /** The document holds exactly the row bytes it last covered: stored since its last change, or unchanged since its load. */
@@ -441,7 +469,20 @@ export function skipStoreOfSuperseded(document: object): boolean {
 // --- compaction from the row (after a load trip)
 
 /** Start a compaction of `pageId` from its row in the background, when one may start. Returns whether it started. */
-export function startRowCompaction(store: CompactionStore, pageId: string, reason: CompactionReason): boolean {
+/**
+ * Row bytes (by page) whose build from `content` ran out of COMPACTION_DEADLINE_MS: a build of the same bytes would run
+ * out again, so it is not retried (each try stalls the process for the whole deadline, charged to no one). Other bytes
+ * (a store wrote, a break-glass cleared the row) are tried again. Bounded: the oldest entries go first.
+ */
+const rowBuildsOutOfTime = new Map<string, string>();
+const ROW_BUILDS_OUT_OF_TIME_MAX = 10_000;
+
+/**
+ * Start a compaction of `pageId` from its row (after a load trip), unless one may not start now, or the build of these
+ * very bytes (`digest`, when the caller has it) already ran out of time.
+ */
+export function startRowCompaction(store: CompactionStore, pageId: string, reason: CompactionReason, digest?: string): boolean {
+  if (digest !== undefined && rowBuildsOutOfTime.get(pageId) === digest) return false;
   if (!canStartCompaction(pageId)) return false;
   logCompactionRequested(pageId, { reason, userId: null, drain: false }, null);
   void registerInflight(pageId, compactFromRow(store, pageId, reason));
@@ -460,6 +501,7 @@ export async function compactFromRow(
   reason: CompactionReason,
 ): Promise<CompactionOutcome> {
   const started = performance.now();
+  let rowDigest: string | undefined;
   try {
     const row = await store.readRow(pageId);
     if (!row || !row.ydoc || row.ydoc.length === 0) {
@@ -473,6 +515,7 @@ export async function compactFromRow(
     const bytes = row.ydoc;
     const content = row.content;
     const covered = sha256(bytes);
+    rowDigest = covered;
     await yieldToEventLoop();
     const at = Date.now();
     const built = runWithDeadline(() => {
@@ -497,7 +540,13 @@ export async function compactFromRow(
     });
     return 'done';
   } catch (err) {
-    logCompactionFailed(pageId, reason, isDeadlineExceeded(err) ? 'deadline' : failureWhy(err), err);
+    const outOfTime = isDeadlineExceeded(err);
+    if (outOfTime && rowDigest !== undefined) {
+      rowBuildsOutOfTime.delete(pageId);
+      rowBuildsOutOfTime.set(pageId, rowDigest);
+      if (rowBuildsOutOfTime.size > ROW_BUILDS_OUT_OF_TIME_MAX) rowBuildsOutOfTime.delete(rowBuildsOutOfTime.keys().next().value!);
+    }
+    logCompactionFailed(pageId, reason, outOfTime ? 'deadline' : failureWhy(err), err);
     return 'failed';
   }
 }

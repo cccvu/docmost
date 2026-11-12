@@ -45,6 +45,8 @@ import type {
 } from '@hocuspocus/server';
 import type * as Y from 'yjs';
 import { COLLAB_LOAD_TRY_LATER_REASON, COLLAB_PAGE_COMPACTING_REASON } from './collab-reasons';
+import { noteLoadRepaired } from '../page-write/compaction';
+import { storeGenerationOf } from '../page-write/store-failure-registry';
 import { repairLegacyValues } from './legacy-repair';
 import { RateLimitedWarn, type SocketLimitLogger } from './socket-limit-log';
 import { COLLAB_TRY_LATER_CODE, CollabUpdateGuard, type GuardFrame } from './update-guard';
@@ -192,7 +194,10 @@ export class CollabUpdateGuardExtension {
     const pageId = String(documentName ?? '').replace(/^page\./, '');
     await new Promise<void>((resolve) => setImmediate(resolve));
     try {
+      const before = storeGenerationOf(document);
       const r = this.repair(document);
+      // #827: a repaired document still holds its row for compaction (a drain requested at load must still compact)
+      if (storeGenerationOf(document) !== before) noteLoadRepaired(document, before);
       if (r.attrs || r.marks || r.skipped) {
         this.repairLog.warn('COLLAB_LEGACY_REPAIRED', () =>
           `COLLAB_LEGACY_REPAIRED ${JSON.stringify({ pageId, attrs: r.attrs, marks: r.marks, spills: r.spills, skipped: r.skipped, rules: r.rules })}`,

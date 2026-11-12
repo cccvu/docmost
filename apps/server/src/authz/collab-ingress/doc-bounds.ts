@@ -100,8 +100,8 @@ export const COMPACTION_DEADLINE_MS = 3_200;
 /**
  * Structs in the page's store. On Graviton2 an honest select-all delete at S_MAX and E_MAX costs 0.60 s of shadow apply
  * (1.24 s of frame), a load at the caps 0.69 s, a probe 0.91 s. The largest real page measured is 0.52 MB, about 25k
- * structs: 6× headroom. Compaction sheds history (deleted structs); a page whose LIVE structs pass
- * COMPACT_MAX_LIVE_STRUCTS is not compacted, so it grows to this cap and is then page-full.
+ * structs: 6× headroom. Compaction sheds history (deleted structs); live structs (what it keeps) are capped lower, at
+ * COMPACT_MAX_LIVE_STRUCTS.
  */
 export const S_MAX = 150_000;
 /**
@@ -130,8 +130,13 @@ export const W_MAX = 1_000_000;
  * Live structs (the structs compaction keeps) past which a page is NOT compacted: its rebuild must fit
  * COMPACTION_DEADLINE_MS on Graviton2 with margin. At 50k live structs the row-path build (after a refused load:
  * TiptapTransformer plus the schema digests) is about 1.6 s (2×) and the tree-path build at unload about 0.8 s (4×).
- * The largest real page (about 25k structs) has 2× headroom. A page whose live structure is over it is page-full
- * (growth refused, deletes and replaces pass) and never drains or compacts (`compactionWouldHelp`, the one rule).
+ * The largest real page (about 25k structs) has 2× headroom. It is a hard cap on live structs, decided by the cap rule
+ * (`capVerdict`, a hard-only measure): a frame that grows a page past it is page-full (refused; deletes and replaces
+ * pass), and a load, rebuild, probe or mirrored write that finds a page past it marks it page-full for the API, so every
+ * compaction (each path: a structure cap, the step budget, a probe, a refused load's row build) rebuilds at most about
+ * this much. A page already past it (written before #827, or one API write over it) is never drained for a structure
+ * cap (`compactionWouldHelp` says no); a row build of such a page that runs out of time is not retried for the same
+ * bytes (`startRowCompaction`).
  */
 export const COMPACT_MAX_LIVE_STRUCTS = 50_000;
 /**
