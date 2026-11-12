@@ -103,7 +103,7 @@ describe('#781 the collab update guard is wired first, alone and synchronous', (
     expect(definesHook(ts.createSourceFile('x.ts', 'const beforeSyncNot = 1; call(beforeSync);', ts.ScriptTarget.Latest, true), 'beforeSync')).toBe(false);
   });
 
-  it('#827: its hooks are exactly the frame hook, the post-auth join gate and the load pair, and none is async', () => {
+  it('#827: its hooks are exactly the frame hook, the post-auth join gate and the load pair; only afterLoadDocument is async', () => {
     const sf = parse(join(__dirname, 'collab-update-guard.extension.ts'));
     const hooks = new Map<string, boolean>();
     const visit = (n: ts.Node) => {
@@ -121,10 +121,11 @@ describe('#781 the collab update guard is wired first, alone and synchronous', (
     // No onAuthenticate or onConnect: this extension outranks the auth extension, so a hook there would answer a client
     // that has not authenticated (a compacting refusal would tell it the page exists and is compacting).
     expect([...hooks.keys()].sort()).toEqual(['afterLoadDocument', 'beforeHandleMessage', 'connected', 'extensionName', 'onLoadDocument', 'priority']);
-    expect([...hooks.values()].every((isAsync) => !isAsync)).toBe(true);
+    // afterLoadDocument alone: #841's load repair yields a macrotask after #827's load charge (which runs before it)
+    expect([...hooks].filter(([, isAsync]) => isAsync).map(([name]) => name)).toEqual(['afterLoadDocument']);
   });
 
-  it('#827: the post-auth join gate closes the socket 1013 and never throws; the load gate throws { reason } synchronously (no co-loader shares it); afterLoadDocument never throws', () => {
+  it('#827: the post-auth join gate closes the socket 1013 and never throws; the load gate throws { reason } synchronously (no co-loader shares it); afterLoadDocument never rejects', async () => {
     const guard = new CollabUpdateGuard({ logger: { warn: () => undefined } });
     const ext = new CollabUpdateGuardExtension(guard);
     const live = new Y.Doc() as Y.Doc & { name: string };
@@ -154,8 +155,8 @@ describe('#781 the collab update guard is wired first, alone and synchronous', (
     expect(thrown).toEqual({ reason: COLLAB_LOAD_TRY_LATER_REASON });
     const direct = load(new Headers());
     expect(ext.onLoadDocument(direct as never)).toBeUndefined();
-    expect(ext.afterLoadDocument(direct as never)).toBeUndefined();
-    expect(ext.afterLoadDocument({ document: undefined } as never)).toBeUndefined();
+    await expect(ext.afterLoadDocument(direct as never)).resolves.toBeUndefined();
+    await expect(ext.afterLoadDocument({ document: undefined } as never)).resolves.toBeUndefined();
   });
 
   it('its frame hook returns undefined (never a promise) for every kind of frame', () => {

@@ -10,10 +10,10 @@ import { PersistenceExtension } from '../../collaboration/extensions/persistence
 import { PG_URL, uuid, mkReadModelPg, bootstrapSchema, mkReadModelDb } from '../../service-bridge/read-model-pg.testkit';
 import * as driftLog from '../page-write/collab-drift-log';
 import { hasStoreFailure } from '../page-write/store-failure-registry';
-import { isDuplicateWriteKey, recordWriteKey, WRITE_IDEM_MAP } from '../page-write/write-idem';
-import { authFrame, FakeSocket, MSG, readServerFrame, RemoteClient, SYNC, syncFrame } from './collab-ingress.testkit';
+import { isDuplicateWriteKey, recordWriteKey, scopedWriteKey, WRITE_IDEM_MAP } from '../page-write/write-idem';
+import { authFrame, awarenessFrame, FakeSocket, MSG, readServerFrame, RemoteClient, SYNC, syncFrame } from './collab-ingress.testkit';
 import { CollabUpdateGuardExtension } from './collab-update-guard.extension';
-import { CollabUpdateGuard } from './update-guard';
+import { CollabUpdateGuard, UNRESOLVED_REASON } from './update-guard';
 
 /**
  * #781 on real Postgres (ADR 0036): the REAL store path (Hocuspocus 4.7.1, the real PersistenceExtension and
@@ -193,44 +193,139 @@ d('the collab store behind the ingress guard (#781)', () => {
   });
 
   it('the /v1 idempotency ledger: control erases another writer\'s key; treatment refuses and the key stays', async () => {
+    const VICTIM = scopedWriteKey('victim', 'victim-key'); // entries are digests (write-idem.ts)
     for (const withGuard of [false, true]) {
       const n = node(withGuard);
       const sock = await n.connect('attacker');
       const live = n.live();
-      live.transact(() => recordWriteKey(live, 'victim-key', Date.now()), V1_WRITE);
-      const del = new RemoteClient(live).edit(live, (_f, doc) => doc.getMap(WRITE_IDEM_MAP).delete('victim-key'));
+      live.transact(() => recordWriteKey(live, VICTIM, Date.now()), V1_WRITE);
+      const del = new RemoteClient(live).edit(live, (_f, doc) => doc.getMap(WRITE_IDEM_MAP).delete(VICTIM.entry));
       sock.deliver(syncFrame(del, SYNC.Update, MSG.Sync, DOC));
       await settle();
       await expect(n.handlers.flushPageContent(DOC)).resolves.toMatchObject({ flushed: true });
       if (!withGuard) {
-        expect(isDuplicateWriteKey(live, 'victim-key')).toBe(false); // control: a client erased another's write key
+        expect(isDuplicateWriteKey(live, VICTIM)).toBe(false); // control: a client erased another's write key
         for (const s of sockets.splice(0)) s.close(1000, 'next arm');
         await settle();
         continue;
       }
       expect(sock.closeReasons()).toEqual([REFUSED('root')]);
-      expect(isDuplicateWriteKey(live, 'victim-key')).toBe(true);
+      expect(isDuplicateWriteKey(live, VICTIM)).toBe(true);
     }
   });
 
+  it('a writer\'s y-indexeddb remount after a keyed /v1 write (its ledger entry stored) is applied, a no-op', async () => {
+    const n = node(true);
+    const first = await n.connect('editor');
+    const live = n.live();
+    // A real keyed write changes content with its key (a content-neutral write is not stored: persistence skips an
+    // unchanged row, and the ledger entry would never reach it).
+    live.transact(() => {
+      textOf(live.getXmlFragment('default').get(0) as Y.XmlElement).insert(9, ' v1');
+      recordWriteKey(live, scopedWriteKey('u', 'api-key'), Date.now());
+    }, V1_WRITE);
+    await expect(n.handlers.flushPageContent(DOC)).resolves.toMatchObject({ flushed: true });
+    // precondition: the ROW holds the ledger entry (else this is the crash residual below, a different case)
+    const stored = new Y.Doc();
+    Y.applyUpdate(stored, new Uint8Array((await row()).ydoc));
+    expect(isDuplicateWriteKey(stored, scopedWriteKey('u', 'api-key'))).toBe(true);
+    // The browser's local copy holds the server's ledger item; a remount sends the whole copy back as an Update.
+    const browser = new RemoteClient(live);
+    const echo = Y.encodeStateAsUpdate(browser.doc);
+    expect(Y.decodeUpdate(echo).structs.some((st) => st instanceof Y.Item && (st.parent as unknown) === WRITE_IDEM_MAP)).toBe(true);
+    const rowBefore = await row();
+    const remount = await n.connect('editor');
+    const sentBefore = remount.sent.length;
+    remount.deliver(syncFrame(echo, SYNC.Update, MSG.Sync, DOC));
+    await settle();
+    expect(remount.closeReasons()).toEqual([]);
+    expect(first.closeReasons()).toEqual([]);
+    // Hocuspocus answered SyncStatus(true): the Update was applied (a no-op), not refused
+    const statuses = remount.sent.slice(sentBefore).filter((m) => readServerFrame(m).type === MSG.SyncStatus);
+    expect(statuses.map((m) => m[m.length - 1])).toEqual([1]);
+    expect(isDuplicateWriteKey(live, scopedWriteKey('u', 'api-key'))).toBe(true);
+    await expect(n.handlers.flushPageContent(DOC)).resolves.toMatchObject({ flushed: true });
+    const rowAfter = await row();
+    expect(Buffer.from(rowAfter.ydoc).equals(Buffer.from(rowBefore.ydoc))).toBe(true);
+    expect(rowAfter.content).toEqual(rowBefore.content);
+    // and the remounted editor's next edit stores
+    remount.deliver(syncFrame(new RemoteClient(live).edit(live, (f) => textOf(f.get(0) as Y.XmlElement).insert(9, ' and more')), SYNC.Update, MSG.Sync, DOC));
+    await settle();
+    await expect(n.handlers.flushPageContent(DOC, { withDigest: true })).resolves.toMatchObject({ flushed: true });
+    expect(remount.closeReasons()).toEqual([]);
+    expect(storeFailures).toEqual([]);
+    expect(JSON.stringify((await row()).content)).toContain('"text":"seed text and more v1"');
+  });
+
   it('residual (ADR 0036): a browser holding a ledger entry the crashed node never stored is refused on reconnect', async () => {
+    const API_KEY = scopedWriteKey('editor', 'api-key');
     const first = node(true);
     const browserSock = await first.connect('editor');
     const live = first.live();
-    live.transact(() => recordWriteKey(live, 'api-key', Date.now()), V1_WRITE); // broadcast before the debounced store
+    live.transact(() => recordWriteKey(live, API_KEY, Date.now()), V1_WRITE); // broadcast before the debounced store
     const browser = new RemoteClient(live);
-    expect(isDuplicateWriteKey(browser.doc, 'api-key')).toBe(true);
+    expect(isDuplicateWriteKey(browser.doc, API_KEY)).toBe(true);
     expect(browserSock.closeReasons()).toEqual([]);
     // The node crashes inside the store debounce: no store ran, the row lacks the entry. A fresh node loads the row.
     const stored = new Y.Doc();
     Y.applyUpdate(stored, new Uint8Array((await row()).ydoc));
-    expect(isDuplicateWriteKey(stored, 'api-key')).toBe(false);
+    expect(isDuplicateWriteKey(stored, API_KEY)).toBe(false);
     const second = node(true);
     const sock = await second.connect('editor');
     const live2 = second.live();
     sock.deliver(syncFrame(Y.encodeStateAsUpdate(browser.doc, Y.encodeStateVector(second.live())), SYNC.Step2, MSG.Sync, DOC));
     await settle();
     expect(sock.closeReasons()).toEqual([REFUSED('root')]);
-    expect(isDuplicateWriteKey(live2, 'api-key')).toBe(false);
+    expect(isDuplicateWriteKey(live2, API_KEY)).toBe(false);
+  });
+
+  it.each([
+    ['a stored prefix (B typed before the last store and after it: the common case)', true],
+    ['no stored prefix (every edit of B\'s was lost)', false],
+  ])('#781 lineage crash, %s: B announces first, A\'s relay is unresolved, A reconnects once, the row holds B\'s edits', async (_name, storedPrefix) => {
+    const B_ID = 1001;
+    const A_ID = 2002;
+    const first = node(true);
+    const bSock = await first.connect('editor');
+    const live = first.live();
+    const b = new RemoteClient(live, B_ID);
+    const typeB = async (text: string) => {
+      bSock.deliver(syncFrame(b.edit(live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, text)), SYNC.Update, MSG.Sync, DOC));
+      await settle();
+    };
+    if (storedPrefix) {
+      await typeB('B-stored ');
+      await expect(first.handlers.flushPageContent(DOC, { withDigest: true })).resolves.toMatchObject({ flushed: true });
+    }
+    await typeB('B-lost ');
+    expect(JSON.stringify(TiptapTransformer.fromYdoc(live, 'default'))).toContain('B-lost');
+    const a = new RemoteClient(live, A_ID); // A holds B's edit: the first node relayed it
+    // The node crashes inside the store debounce: the row lacks `B-lost`. B keeps typing while disconnected.
+    expect(JSON.stringify((await row()).content)).not.toContain('B-lost');
+    b.doc.transact(() => textOf(b.fragment.get(0) as Y.XmlElement).insert(0, 'B-after '));
+
+    const second = node(true);
+    const bSock2 = await second.connect('editor');
+    const aSock2 = await second.connect('peer');
+    const live2 = second.live();
+    expect(Y.getState(live2.store, B_ID) > 0).toBe(storedPrefix); // precondition: the row holds B's id or not
+    bSock2.deliver(awarenessFrame([{ clientID: B_ID, clock: 1, state: { user: {} } }], DOC)); // B's startSync awareness
+    await settle();
+    const relay = Y.encodeStateAsUpdate(a.doc, Y.encodeStateVector(live2));
+    aSock2.deliver(awarenessFrame([{ clientID: A_ID, clock: 1, state: { user: {} } }], DOC), syncFrame(relay, SYNC.Step2, MSG.Sync, DOC));
+    await settle();
+    expect(aSock2.closeReasons()).toEqual([UNRESOLVED_REASON]);
+    expect(JSON.stringify(TiptapTransformer.fromYdoc(live2, 'default'))).not.toContain('B-lost'); // never applied
+    bSock2.deliver(syncFrame(Y.encodeStateAsUpdate(b.doc, Y.encodeStateVector(live2)), SYNC.Step2, MSG.Sync, DOC));
+    await settle();
+    // A's provider reconnects once on the same socket: a new Auth, its awareness, the same Step2 (now all known clocks)
+    await second.connect('peer', aSock2);
+    aSock2.deliver(awarenessFrame([{ clientID: A_ID, clock: 2, state: { user: {} } }], DOC), syncFrame(relay, SYNC.Step2, MSG.Sync, DOC));
+    await settle();
+    expect(aSock2.closeReasons()).toEqual([UNRESOLVED_REASON]);
+    expect(bSock2.closeReasons()).toEqual([]);
+    await expect(second.handlers.flushPageContent(DOC, { withDigest: true })).resolves.toMatchObject({ flushed: true });
+    expect(storeFailures).toEqual([]);
+    expect(JSON.stringify((await row()).content)).toContain(`"text":"B-after B-lost ${storedPrefix ? 'B-stored ' : ''}seed text"`);
   });
 });

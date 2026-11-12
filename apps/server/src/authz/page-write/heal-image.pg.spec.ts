@@ -20,7 +20,7 @@ import { liveContentDigest } from './doc-version';
 import { healStoreOf } from './heal-image';
 import { resetLoadDivergenceLogForTests } from './order-divergence-log';
 import { tiptapExtensions } from '../../collaboration/collaboration.util';
-import { recordWriteKey } from './write-idem';
+import { recordWriteKey, scopedWriteKey } from './write-idem';
 
 /**
  * #840 T9, the crash matrix on real Postgres (the plan's "Crash safety" table, ADR 0036 #840 amendment). The real path:
@@ -287,7 +287,7 @@ d('heal image crash matrix on real Postgres (#840)', () => {
     const s = stack();
     const { conn, doc } = await unstableCommit(s);
     const before = await row();
-    await conn.transact((d) => recordWriteKey(d, `${uuid(900)}\u0000key-1`, 1234)); // ydoc changes, content does not
+    await conn.transact((d) => recordWriteKey(d, scopedWriteKey(uuid(900), 'key-1'), 1234)); // ydoc changes, content does not
     await expect(s.handlers.flushPageContent(DOC)).resolves.toEqual({ flushed: true });
     const after = await row();
     expect(after.content).toEqual(before.content);

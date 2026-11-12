@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import * as Y from 'yjs';
 // #827: the lineage root and the superseded mark (the registry imports only yjs and constants).
-import { LINEAGE_ROOT, markSuperseded } from './compaction-registry';
+import { buildRefused, LINEAGE_ROOT, markSuperseded } from './compaction-registry';
 
 /**
  * #390 — the SYMMETRIC guard for ADR 0019.
@@ -115,6 +115,16 @@ export function markRowCovered(document: Y.Doc, bytes: Uint8Array | Buffer | nul
  *  reconcile found the row covered). */
 export function coveredRowDigest(document: Y.Doc): string | null {
   return coveredRows.get(document) ?? null;
+}
+
+/**
+ * #827: whether an unload could compact `document`: its row bytes are covered (a row whose bytes leave structs pending
+ * never is) and a build of them has not failed for good (`buildRefused`). The one predicate the load path and the update
+ * guard drain on, and the guard's cap rule reads as "compaction can help".
+ */
+export function unloadCanCompact(document: Y.Doc, pageId: string): boolean {
+  const covered = coveredRowDigest(document);
+  return covered !== null && !buildRefused(pageId, covered);
 }
 
 /** #827: the row and the resident document are of different lineages; the store refused to merge them. */

@@ -24,6 +24,7 @@
 import * as Y from 'yjs';
 import {
   COMPACTION_ARM_DELAY_MS,
+  COMPACTION_GAP_FACTOR,
   COMPACTION_MIN_INTERVAL_MS,
   COMPACTIONS_IN_FLIGHT_MAX,
 } from '../collab-ingress/doc-bounds';
@@ -146,6 +147,12 @@ export function markPageFull(doc: object, full = true, until: number | null = nu
 const inflight = new Map<string, Promise<void>>();
 /** When each page last started a compaction (ms, the registry's clock). Pruned past the interval. */
 const lastStarted = new Map<string, number>();
+/**
+ * Process-wide: no compaction starts before this (ms, the registry's clock). Set when one settles, to its end plus
+ * COMPACTION_GAP_FACTOR × its duration, so back-to-back compactions of different pages hold at most about a third of
+ * the process.
+ */
+let nextStartAt = 0;
 
 export interface CompactionClock {
   /** Wall clock, ms. */
@@ -193,13 +200,22 @@ export function resumeCompactionsForTests(): void {
   stopped = false;
 }
 
+/** Clear the process-wide gap after the last compaction (jest only: specs run many compactions back to back). */
+export function resetCompactionGapForTests(): void {
+  if (process.env.JEST_WORKER_ID === undefined) throw new Error('resetCompactionGapForTests is for jest only (#827)');
+  nextStartAt = 0;
+}
+
 /**
  * Whether a compaction of `pageId` may start now: armed, the process not draining, none in flight for the page, fewer
- * than the per-process limit in flight, and none started for the page within COMPACTION_MIN_INTERVAL_MS.
+ * than the per-process limit in flight, the process-wide gap after the last one elapsed (COMPACTION_GAP_FACTOR), and
+ * none started for the page within COMPACTION_MIN_INTERVAL_MS. A page that may not start waits as for the in-flight
+ * limit: its request stays, and the next unload (or load) tries again.
  */
 export function canStartCompaction(pageId: string, now: number = clock.now()): boolean {
   if (!compactionArmed() || stopped) return false;
   if (inflight.has(pageId) || inflight.size >= COMPACTIONS_IN_FLIGHT_MAX) return false;
+  if (now < nextStartAt) return false;
   const last = lastStarted.get(pageId);
   return last === undefined || now - last >= COMPACTION_MIN_INTERVAL_MS;
 }
@@ -219,6 +235,8 @@ export function registerInflight(pageId: string, compaction: Promise<unknown>, n
   );
   const tracked = settled.finally(() => {
     if (inflight.get(pageId) === tracked) inflight.delete(pageId);
+    const ended = clock.now();
+    nextStartAt = Math.max(nextStartAt, ended + COMPACTION_GAP_FACTOR * Math.max(0, ended - now));
   });
   inflight.set(pageId, tracked);
   return tracked;
@@ -231,6 +249,43 @@ export function awaitCompaction(pageId: string): Promise<void> {
 
 export function isCompactionInflight(pageId: string): boolean {
   return inflight.has(pageId);
+}
+
+// --- builds that failed: not tried again for the same row bytes
+
+/**
+ * Compaction builds that failed for a page's row bytes (the digest an unload's compare-and-swap names, or the row's
+ * own on the row path). A build that failed deterministically (the digest check, a malformed lineage, any error) fails
+ * again on the same bytes; one that ran out of COMPACTION_DEADLINE_MS twice will too (one may be a stall). Such bytes are
+ * never compacted again, nor drained for: the cap rule reads the page as one compaction cannot help (page-full), so a
+ * failing page is never closed to everyone every interval. Other bytes (a store wrote, a break-glass cleared the row)
+ * are tried again, and a compaction that succeeds forgets the page. Bounded: the oldest entries go first.
+ */
+const buildFailures = new Map<string, { digest: string; strikes: number; needed: number }>();
+const BUILD_FAILURES_MAX = 10_000;
+
+export function noteBuildFailed(pageId: string, digest: string, outOfTime: boolean): void {
+  const known = buildFailures.get(pageId);
+  const strikes = known && known.digest === digest ? known.strikes + 1 : 1;
+  buildFailures.delete(pageId);
+  buildFailures.set(pageId, { digest, strikes, needed: outOfTime ? 2 : 1 });
+  if (buildFailures.size > BUILD_FAILURES_MAX) buildFailures.delete(buildFailures.keys().next().value!);
+}
+
+/** True when a build of `pageId` from these row bytes failed for good (`noteBuildFailed`). */
+export function buildRefused(pageId: string, digest: string): boolean {
+  const known = buildFailures.get(pageId);
+  return !!known && known.digest === digest && known.strikes >= known.needed;
+}
+
+export function forgetBuildFailure(pageId: string): void {
+  buildFailures.delete(pageId);
+}
+
+/** Clear every recorded build failure (jest only). */
+export function resetBuildFailuresForTests(): void {
+  if (process.env.JEST_WORKER_ID === undefined) throw new Error('resetBuildFailuresForTests is for jest only (#827)');
+  buildFailures.clear();
 }
 
 // --- the lineage epoch

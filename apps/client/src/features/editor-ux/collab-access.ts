@@ -25,7 +25,8 @@ import { jwtDecode } from "jwt-decode";
  *         replayed and refused again. Final until the page reloads. #790: close the editor's socket too (each page
  *         editor has its own); with nothing attached it would otherwise idle, or reconnect every 30 s (the
  *         provider's message timeout), for as long as the tab stays open. Reload and Discard reload the page, so
- *         they need no socket;
+ *         they need no socket. The `<rule>` is kept (`refusedRule`) and picks the notice's copy
+ *         (`collab-refusal-cause.ts`): a stored copy the server disagrees with is not "your changes were not saved";
  *       - `ccc:collab-update-unresolved` → the server could not decide; reconnect ONCE. The retry is spent until
  *         `sync-acked` (every frame this provider sent was applied), NOT until the next authentication, which
  *         happens before the replay is judged; a second one before that is treated as refused.
@@ -72,6 +73,12 @@ export interface CollabAccessState {
   unresolvedRetried: boolean;
   /** #810, #827: which refusal notice: the Discard-first kinds say a reload would replay the same copy. */
   refusalKind: CollabRefusalKind;
+  /**
+   * The rule the server refused on (`ccc:collab-update-refused:<rule>`), or `"unresolved"` for a second unresolved;
+   * null otherwise (not refused, a 1009, or a reason without the prefix). Picks a generic notice's copy
+   * (`collab-refusal-cause.ts`): it is a server-sent string, so it is only ever looked up, never rendered.
+   */
+  refusedRule: string | null;
   /** #810: "try later" answers since the last completed sync (#827: the retry wait grows with it). */
   tryLaterAttempts: number;
   /** #827: the server is compacting the page: read-only, retrying, until the next completed sync. */
@@ -101,6 +108,7 @@ export const initialCollabAccess: CollabAccessState = {
   refused: false,
   unresolvedRetried: false,
   refusalKind: "generic",
+  refusedRule: null,
   tryLaterAttempts: 0,
   compacting: false,
   epochChangedTo: null,
@@ -178,6 +186,14 @@ export const TRY_LATER_CLOSE_REASONS: readonly string[] = [
   COLLAB_LOAD_TRY_LATER_REASON,
 ];
 export const TRY_LATER_CLOSE_CODES: readonly number[] = [1013, 4429];
+
+/** The rule a refusal names (`ccc:collab-update-refused:<rule>`), or null for any other reason. */
+export function refusedRuleOf(reason: string | undefined): string | null {
+  return typeof reason === "string" &&
+    reason.startsWith(COLLAB_UPDATE_REFUSED_PREFIX)
+    ? reason.slice(COLLAB_UPDATE_REFUSED_PREFIX.length)
+    : null;
+}
 
 export function classifyCollabCloseReason(
   reason: string | undefined,
@@ -294,12 +310,13 @@ export function nextCollabAccess(
       const reason = classifyCollabCloseReason(event.reason, event.code);
       if (reason === "epoch") return epochStep(prev, event.reason, clientEpoch);
       if (reason === "refused") {
-        return refusedStep(prev, collabRefusalKind(event.reason, event.code));
+        const tooBig = event.code === WS_CLOSE_MESSAGE_TOO_BIG;
+        return refusedStep(prev, collabRefusalKind(event.reason, event.code), tooBig ? null : refusedRuleOf(event.reason));
       }
       if (reason === "compacting") return compactingStep(prev);
       if (reason === "try-later") return tryLaterStep(prev);
       if (reason === "unresolved") {
-        if (prev.unresolvedRetried) return refusedStep(prev, "generic");
+        if (prev.unresolvedRetried) return refusedStep(prev, "generic", "unresolved");
         // Reconnect once (a closing socket is reconnected by the provider itself).
         return {
           ...NO_ACTION,
@@ -437,23 +454,27 @@ function epochStep(
   clientEpoch: number,
 ): CollabAccessStep {
   const epoch = parseEpochStaleReason(reason);
-  if (epoch === null || epoch === clientEpoch) return refusedStep(prev, "generic");
-  const step = refusedStep(prev, "compacted");
+  if (epoch === null || epoch === clientEpoch) return refusedStep(prev, "generic", refusedRuleOf(reason));
+  const step = refusedStep(prev, "compacted", refusedRuleOf(reason));
   return { ...step, state: { ...step.state, epochChangedTo: epoch } };
 }
 
 /**
  * #781: stop sending and stop editing. No `markDisconnected`: the header's "connection lost. Retrying..." would be
- * untrue (nothing retries); the refusal notice says what happened and offers the recovery. #810, #827: `kind` tells
- * the notice whether only discarding this browser's copy recovers.
+ * untrue (nothing retries); the refusal notice says what happened and offers the recovery. Not marking it is not
+ * enough on its own: a raw socket close reaches the header before this step, and page-editor's 7.5 s "not synced"
+ * check would mark it after, so page-editor also passes the header status through `collabHeaderStatus`
+ * (`collab-header-status.ts`). #810, #827: `kind` tells the notice whether only discarding this browser's copy
+ * recovers; `rule` picks a generic notice's copy (`collab-refusal-cause.ts`).
  */
 function refusedStep(
   prev: CollabAccessState,
   kind: CollabRefusalKind,
+  rule: string | null,
 ): CollabAccessStep {
   return {
     ...NO_ACTION,
-    state: { ...prev, refused: true, refusalKind: kind, compacting: false },
+    state: { ...prev, refused: true, refusalKind: kind, refusedRule: rule, compacting: false },
     detach: true,
     disconnectSocket: true,
   };

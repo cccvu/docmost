@@ -617,3 +617,50 @@ describe("#827 through the real provider", () => {
     expect(await access.isCopyDirty()).toBe(true);
   });
 });
+
+// The ledger-echo incident (#781 lineage): the notice's copy follows the rule, so the rule must survive the real
+// provider's CLOSE handling (MessageReceiver → forwardClose, code 1000) and a raw socket close with a reason.
+describe("the refused rule reaches the controller (refusedRule)", () => {
+  it.each(["root", "schema"])(
+    "a document CLOSE refused on %s records that rule, detaches, closes the socket and never reconnects",
+    async (rule) => {
+      const { access, markDisconnected } = setup();
+      const socket = await openLatest();
+      socket.receive(serverFrames.authenticated(DOC));
+      await flush();
+      socket.receive(
+        serverFrames.close(DOC, `ccc:collab-update-refused:${rule}`),
+      );
+      await flush();
+      expect(access.state.refused).toBe(true);
+      expect(access.state.refusedRule).toBe(rule);
+      expect(access.state.refusalKind).toBe("generic");
+      expect(socket.closedByClient).toBe(true);
+      expect(markDisconnected).not.toHaveBeenCalled();
+      await advance(60_000);
+      expect(sockets()).toHaveLength(1);
+    },
+  );
+
+  it("a raw 4422 close with the refused reason records the rule; a raw 1009 records none and is too big", async () => {
+    const first = setup();
+    const a = await openLatest();
+    a.receive(serverFrames.authenticated(DOC));
+    await flush();
+    a.serverClose(4422, "ccc:collab-update-refused:schema");
+    await flush();
+    expect(first.access.state.refused).toBe(true);
+    expect(first.access.state.refusedRule).toBe("schema");
+    expect(first.access.state.refusalKind).toBe("generic");
+
+    const second = setup();
+    const b = await openLatest();
+    b.receive(serverFrames.authenticated(DOC));
+    await flush();
+    b.serverClose(1009);
+    await flush();
+    expect(second.access.state.refused).toBe(true);
+    expect(second.access.state.refusedRule).toBeNull();
+    expect(second.access.state.refusalKind).toBe("too-big");
+  });
+});

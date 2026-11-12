@@ -24,7 +24,7 @@ import {
 } from './compaction-registry';
 import { PageTooLargeException } from './page-size';
 import { liveContentDigest } from './doc-version';
-import { recordWriteKey } from './write-idem';
+import { recordWriteKey, scopedWriteKey } from './write-idem';
 import { createHash } from 'node:crypto';
 
 /**
@@ -67,7 +67,7 @@ function churned(rounds: number) {
     });
     Y.applyUpdate(live, Y.encodeStateAsUpdate(editor, Y.encodeStateVector(live)));
   }
-  recordWriteKey(live, `${uuid(900)}\u0000key-1`, 1234);
+  recordWriteKey(live, scopedWriteKey(uuid(900), 'key-1'), 1234);
   return { live, content: TiptapTransformer.fromYdoc(live, 'default') };
 }
 
@@ -195,7 +195,7 @@ d('compaction on real Postgres (#827)', () => {
     expect(isSuperseded(doc)).toBe(true);
     expect(s.hocuspocus.documents.has(`page.${pageId}`)).toBe(false);
     const after = await row();
-    expect(readRowLineage(after.ydoc)).toMatchObject({ epoch: 1, clients: 1, ledger: [{ key: `${uuid(900)}\u0000key-1`, ts: 1234 }] });
+    expect(readRowLineage(after.ydoc)).toMatchObject({ epoch: 1, clients: 1, ledger: [{ key: scopedWriteKey(uuid(900), 'key-1').entry, ts: 1234 }] });
     expect(after.ydoc.length).toBeLessThan(before.ydoc.length);
     expect(after.updatedAt).toEqual(before.updatedAt);
     expect(after.content).toEqual(before.content);
@@ -207,7 +207,7 @@ d('compaction on real Postgres (#827)', () => {
     const reloaded = s.hocuspocus.documents.get(`page.${pageId}`)!;
     expect(lineageEpoch(reloaded)).toBe(1);
     expect(liveContentDigest(reloaded)).toBe(digest);
-    expect(ledgerOfDoc(reloaded)).toEqual([{ key: `${uuid(900)}\u0000key-1`, ts: 1234 }]);
+    expect(ledgerOfDoc(reloaded)).toEqual([{ key: scopedWriteKey(uuid(900), 'key-1').entry, ts: 1234 }]);
   });
 
   it('a load that trips answers the API a retryable 503 and compacts the row; the next load waits for it and serves it', async () => {

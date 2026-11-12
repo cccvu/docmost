@@ -33,9 +33,12 @@ import {
   rethrowDirectOpenRefusal,
   skipStoreOfSuperseded,
   snapshotTree,
+  startRowCompaction,
+  textRunsDigest,
 } from './compaction';
 import {
   awaitCompaction,
+  buildRefused,
   compactionRequest,
   isClosedForCompaction,
   isCompacting,
@@ -54,13 +57,18 @@ import {
   writeLineage,
 } from './compaction-registry';
 import { COMPACTION_ARM_DELAY_MS, COMPACTION_MIN_INTERVAL_MS } from '../collab-ingress/doc-bounds';
-import { coveredRowDigest, markRowCovered } from './reconcile-store';
+import { coveredRowDigest, markRowCovered, unloadCanCompact } from './reconcile-store';
 import { stableHash } from './stable-hash';
 import { hasStoreFailure, markStoredAt, storeGenerationOf } from './store-failure-registry';
 import { storeSafeJson } from './store-safe-json';
 import { serverSchema } from './prelim-content';
-import { recordWriteKey, WRITE_IDEM_MAP } from './write-idem';
+import { recordWriteKey, scopedWriteKey, type StoredLedgerKey, WRITE_IDEM_MAP } from './write-idem';
+
+/** A ledger key as production records it (PR 91: the map holds its digest, `.entry`). */
+const wk = (user: string, key: string) => scopedWriteKey(user, key);
 import { PageTooLargeException } from './page-size';
+import { CollabUpdateGuardExtension } from '../collab-ingress/collab-update-guard.extension';
+import { CollabUpdateGuard } from '../collab-ingress/update-guard';
 
 const sha = (b: Uint8Array) => createHash('sha256').update(b).digest('base64');
 const md5 = (v: unknown) => (v == null ? null : createHash('md5').update(JSON.stringify(v)).digest('hex'));
@@ -183,8 +191,8 @@ afterEach(() => {
 describe('buildCompacted (#827)', () => {
   it('rebuilds the visible content exactly (the ADR 0019 digest), with the ledger and the next epoch, and sheds history', () => {
     const live = churnedPage(30);
-    recordWriteKey(live, 'user\u0000key-a', 1000);
-    recordWriteKey(live, 'user\u0000key-b', 2000);
+    recordWriteKey(live, wk('user', 'key-a'), 1000);
+    recordWriteKey(live, wk('user', 'key-b'), 2000);
     const before = countStructs(live);
     const expected = digestOf(live);
 
@@ -197,8 +205,8 @@ describe('buildCompacted (#827)', () => {
     expect(lineageEpoch(loaded)).toBe(1);
     expect(loaded.getMap(LINEAGE_ROOT).get('at')).toBe(42);
     expect(ledgerOfDoc(loaded)).toEqual([
-      { key: 'user\u0000key-a', ts: 1000 },
-      { key: 'user\u0000key-b', ts: 2000 },
+      { key: wk('user', 'key-a').entry, ts: 1000 },
+      { key: wk('user', 'key-b').entry, ts: 2000 },
     ]);
     // the history is gone: one client id for the content and the lineage, far fewer structs
     expect(built.counts).toEqual(countStructs(loaded));
@@ -242,7 +250,7 @@ describe('buildCompacted (#827)', () => {
 describe('readRowLineage (#827): the ledger and epoch from stored bytes, nothing integrated', () => {
   it('reads what compaction wrote', () => {
     const live = churnedPage(2);
-    const built = buildCompacted({ tree: snapshotTree(live.getXmlFragment('default')) }, [{ key: 'k', ts: 7 }], 4, 0, {
+    const built = buildCompacted({ tree: snapshotTree(live.getXmlFragment('default')) }, [{ key: 'k' as StoredLedgerKey, ts: 7 }], 4, 0, {
       digest: digestOf(live),
     });
     const r = readRowLineage(built.update);
@@ -252,22 +260,22 @@ describe('readRowLineage (#827): the ledger and epoch from stored bytes, nothing
   it('follows re-set and pruned ledger keys through their origin chains (other clients included), and skips deletions', () => {
     const doc = new Y.Doc();
     doc.getXmlFragment('default');
-    recordWriteKey(doc, 'a', 1, 100, 10);
-    recordWriteKey(doc, 'b', 2, 100, 10);
+    recordWriteKey(doc, wk('u', 'a'), 1, 100, 10);
+    recordWriteKey(doc, wk('u', 'b'), 2, 100, 10);
     // another client prunes 'a' (age) and sets it again: its new entry carries no parent, only an origin
     const other = new Y.Doc();
     Y.applyUpdate(other, Y.encodeStateAsUpdate(doc));
-    recordWriteKey(other, 'c', 500, 100, 10); // prunes a (1) and b (2)
-    recordWriteKey(other, 'a', 501, 100, 10);
+    recordWriteKey(other, wk('u', 'c'), 500, 100, 10); // prunes a (1) and b (2)
+    recordWriteKey(other, wk('u', 'a'), 501, 100, 10);
     Y.applyUpdate(doc, Y.encodeStateAsUpdate(other, Y.encodeStateVector(doc)));
-    doc.getMap(WRITE_IDEM_MAP).set('c', 502); // a re-set by the first client, over the other's entry
+    doc.getMap(WRITE_IDEM_MAP).set(wk('u', 'c').entry, 502); // a re-set by the first client, over the other's entry
 
     const fromBytes = readRowLineage(Y.encodeStateAsUpdate(doc));
     const sort = (l: Array<{ key: string; ts: number }>) => [...l].sort((x, y) => x.key.localeCompare(y.key));
     expect(sort(fromBytes.ledger)).toEqual(sort(ledgerOfDoc(doc)));
     expect(sort(fromBytes.ledger)).toEqual([
-      { key: 'a', ts: 501 },
-      { key: 'c', ts: 502 },
+      { key: wk('u', 'a').entry, ts: 501 },
+      { key: wk('u', 'c').entry, ts: 502 },
     ]);
     expect(fromBytes.epoch).toBe(0); // never compacted
   });
@@ -356,6 +364,43 @@ describe('loadStoredYdoc (#827): the bounded load', () => {
     const next = new Y.Doc();
     loadStoredYdoc(next, pageId, store.row!.ydoc!, store, { steps: 10, deadlineMs: 60_000 });
     expect(loadStatsOf(next)!.steps).toBe(0);
+  });
+
+  it('a transient store error is never recorded as a failed build: the next load after the interval compacts, then loads', async () => {
+    const bytes = inverted();
+    const steps = loadSteps(bytes);
+    const pageId = nextPageId();
+    const content = storeSafeJson(TiptapTransformer.fromYdoc(new Y.Doc(), 'default'));
+    const store = memoryStore({ content, ydoc: bytes, contentHash: md5(content) });
+    const bounds = { steps: Math.floor(steps / 2), deadlineMs: 60_000 };
+    // the first row read and the first compare-and-swap fail as Postgres does under a lock or statement timeout
+    const read = store.readRow.bind(store);
+    const swap = store.swapYdoc.bind(store);
+    let reads = 0;
+    let swaps = 0;
+    store.readRow = async (id: string) => {
+      if (reads++ === 0) throw Object.assign(new Error('canceling statement due to lock timeout'), { code: '55P03' });
+      return read(id);
+    };
+    store.swapYdoc = async (id: string, next: Uint8Array, o: SwapOptions) => {
+      if (swaps++ === 0) throw Object.assign(new Error('Connection terminated unexpectedly'), { code: '57P01' });
+      return swap(id, next, o);
+    };
+    for (const round of [1, 2, 3]) {
+      expect(() => loadStoredYdoc(new Y.Doc(), pageId, bytes, store, bounds)).toThrow(
+        expect.objectContaining({ reason: COLLAB_PAGE_COMPACTING_REASON }) as never,
+      );
+      await awaitCompaction(pageId);
+      expect(buildRefused(pageId, sha(bytes))).toBe(false); // a store error is no build failure
+      if (round < 3) {
+        expect(store.row!.ydoc).toBe(bytes); // nothing written yet (read failed, then swap failed)
+        now += 2 * COMPACTION_MIN_INTERVAL_MS; // past the per-page interval and the process gap
+      }
+    }
+    expect(readRowLineage(store.row!.ydoc!).epoch).toBe(1); // the third try compacted the row
+    const next = new Y.Doc();
+    loadStoredYdoc(next, pageId, store.row!.ydoc!, store, bounds); // and the page loads again
+    expect(loadStatsOf(next)!.steps).toBeLessThan(bounds.steps);
   });
 
   it('a page whose load tripped its walk budget is refused at once on the next load, without a second walk', () => {
@@ -535,9 +580,142 @@ describe('loadStoredYdoc (#827): the bounded load', () => {
 describe('compactOnUnload (#827)', () => {
   const request = { reason: 'structs' as const, userId: 'u1', drain: false };
 
+  it('a drain requested at load still compacts when the load repair (#781 lineage) changed the document', async () => {
+    const run = async (repairs: boolean) => {
+      const src = churnedPage(10);
+      // a stored legacy value the guard refuses (a colspan out of range), so afterLoadDocument's repair deletes it
+      const cellOf = (d: Y.Doc) => ((d.getXmlFragment('default').get(4) as Y.XmlElement).get(1) as Y.XmlElement).get(0) as Y.XmlElement;
+      if (repairs) src.transact(() => cellOf(src).setAttribute('colspan', 0 as never));
+      const bytes = Y.encodeStateAsUpdate(src);
+      const content = storeSafeJson(TiptapTransformer.fromYdoc(src, 'default'));
+      const store = memoryStore({ content, ydoc: bytes, contentHash: md5(content) });
+      const pageId = nextPageId();
+      const doc = new Y.Doc() as CompactableDocument;
+      // past the client-id cap, which compaction fixes: a drain requested at load
+      loadStoredYdoc(doc, pageId, bytes, store, { steps: 1e9, deadlineMs: 60_000, caps: { structs: 1e9, clientIds: countStructs(src).clients - 1, children: 1e9 } });
+      expect(compactionRequest(doc)).toMatchObject({ drain: true });
+      const ext = new CollabUpdateGuardExtension(new CollabUpdateGuard({ mode: 'enforce', logger: { warn: () => undefined } }), {
+        logger: { warn: () => undefined },
+      });
+      await ext.afterLoadDocument({ document: doc, documentName: `page.${pageId}` } as never);
+      Object.assign(doc, { name: `page.${pageId}`, connections: new Map(), getConnectionsCount: () => 0 });
+      await compactOnUnload(doc, store);
+      return { doc, store, repaired: repairs && cellOf(doc).getAttribute('colspan') === undefined, cellOf };
+    };
+    const control = await run(false);
+    expect(isSuperseded(control.doc)).toBe(true);
+    const treated = await run(true);
+    expect(treated.repaired).toBe(true); // non-vacuity: the repair ran and changed the document
+    expect(isSuperseded(treated.doc)).toBe(true); // it compacted (it used to stay draining, joins and writes refused)
+    expect(treated.store.calls.swap).toBe(1);
+    const loaded = new Y.Doc();
+    Y.applyUpdate(loaded, treated.store.row!.ydoc!);
+    expect(treated.cellOf(loaded).getAttribute('colspan')).toBeUndefined(); // the compacted row holds the repaired page
+  });
+
+  it('textRunsDigest joins only adjacent text of equal marks: any visible change still differs, and the build refuses it', () => {
+    const t = (text: string, marks?: unknown[]) => ({ type: 'text', text, ...(marks ? { marks } : {}) });
+    const doc = (...runs: unknown[]) => ({ type: 'doc', content: [{ type: 'paragraph', content: runs }] });
+    const bold = [{ type: 'bold' }];
+    const base = textRunsDigest(doc(t('hello world')));
+    expect(textRunsDigest(doc(t('hello'), t(' world')))).toBe(base); // a split run is the same document
+    expect(textRunsDigest(doc(t('hello'), t(' world', bold)))).not.toBe(base); // a mark gained
+    expect(textRunsDigest(doc(t('hello', bold), t(' world', bold)))).not.toBe(textRunsDigest(doc(t('hello', bold), t(' world')))); // lost
+    expect(textRunsDigest(doc(t('hello world!')))).not.toBe(base); // changed text
+    expect(textRunsDigest(doc(t(' world'), t('hello')))).not.toBe(base); // run order
+    expect(textRunsDigest(doc(t('hello'), { ...t(' world'), attrs: { x: 1 } }))).not.toBe(base); // an extra key is never joined
+    expect(textRunsDigest({ type: 'doc', content: [{ type: 'paragraph', content: [t('hello')] }, { type: 'paragraph', content: [t(' world')] }] })).not.toBe(base); // across nodes
+    // the unload's build refuses a tree whose content differs from the digest it was given
+    const live = churnedPage(2);
+    expect(() =>
+      buildCompacted({ tree: snapshotTree(live.getXmlFragment('default')) }, [], 1, 0, { runs: textRunsDigest(storeSafeJson(TiptapTransformer.fromYdoc(churnedPage(2, { type: 'doc', content: [para(text('other'))] }), 'default'))) }),
+    ).toThrow(CompactionDigestMismatchError);
+    expect(() =>
+      buildCompacted({ tree: snapshotTree(live.getXmlFragment('default')) }, [], 1, 0, { runs: textRunsDigest(storeSafeJson(TiptapTransformer.fromYdoc(live, 'default'))) }),
+    ).not.toThrow();
+  });
+
+  it('a page whose load repair removed a mark (a split text run) compacts: the digest check joins equal-marked runs', async () => {
+    const src = churnedPage(10, { type: 'doc', content: [para(text('hello world'))] });
+    // a stored legacy mark value the guard refuses (a link href that is a number): the repair deletes its opening format
+    // item and leaves the closing one, so Yjs never joins the run back, and fromYdoc gives two text nodes
+    ((src.getXmlFragment('default').get(0) as Y.XmlElement).get(0) as Y.XmlText).format(0, 2, { link: { href: 5 } });
+    const bytes = Y.encodeStateAsUpdate(src);
+    const content = storeSafeJson(TiptapTransformer.fromYdoc(src, 'default'));
+    const store = memoryStore({ content, ydoc: bytes, contentHash: md5(content) });
+    const pageId = nextPageId();
+    const doc = new Y.Doc() as CompactableDocument;
+    loadStoredYdoc(doc, pageId, bytes, store, { steps: 1e9, deadlineMs: 60_000, caps: { structs: 1e9, clientIds: countStructs(src).clients - 1, children: 1e9 } });
+    const ext = new CollabUpdateGuardExtension(new CollabUpdateGuard({ mode: 'enforce', logger: { warn: () => undefined } }), {
+      logger: { warn: () => undefined },
+    });
+    await ext.afterLoadDocument({ document: doc, documentName: `page.${pageId}` } as never);
+    const runs = (TiptapTransformer.fromYdoc(doc, 'default') as { content: Array<{ content: unknown[] }> }).content[0].content;
+    expect(runs.length).toBeGreaterThan(1); // non-vacuity: the repaired page holds a split run
+    Object.assign(doc, { name: `page.${pageId}`, connections: new Map(), getConnectionsCount: () => 0 });
+    await compactOnUnload(doc, store);
+    expect(isSuperseded(doc)).toBe(true);
+    const loaded = new Y.Doc();
+    Y.applyUpdate(loaded, store.row!.ydoc!);
+    expect(textRunsDigest(storeSafeJson(TiptapTransformer.fromYdoc(loaded, 'default')))).toBe(
+      textRunsDigest(storeSafeJson(TiptapTransformer.fromYdoc(doc, 'default'))),
+    );
+  });
+
+  it('a build that failed deterministically is not tried again for the same bytes, nor drained for', async () => {
+    const live = churnedPage(6);
+    const pageId = nextPageId();
+    const stored = Y.encodeStateAsUpdate(live);
+    const content = storeSafeJson(TiptapTransformer.fromYdoc(live, 'default'));
+    const store = memoryStore({ content, ydoc: stored, contentHash: md5(content) });
+    const doc = resident(live, pageId, stored);
+    expect(unloadCanCompact(doc, pageId)).toBe(true);
+    let builds = 0;
+    const restore = overrideDeadlineForTests(() => {
+      builds++;
+      throw new Error('a build that always fails');
+    });
+    try {
+      requestCompaction(doc, { reason: 'client_ids', userId: null, drain: true });
+      await compactOnUnload(doc, store);
+      expect(builds).toBe(1);
+      expect(isSuperseded(doc)).toBe(false);
+      expect(unloadCanCompact(doc, pageId)).toBe(false); // the guard and the load read it as page-full, never drain it
+      now += 2 * COMPACTION_MIN_INTERVAL_MS;
+      await compactOnUnload(doc, store);
+      expect(builds).toBe(1); // skipped (failed_before), no second build
+      expect(logged.some((l) => l.includes('"event":"skipped"') && l.includes('"why":"failed_before"'))).toBe(true);
+    } finally {
+      restore();
+    }
+  });
+
+  it('a row whose bytes leave structs pending is never drained at load (its unload could not compact): requested only', () => {
+    const src = churnedPage(10);
+    const a = new Y.Doc();
+    Y.applyUpdate(a, Y.encodeStateAsUpdate(src));
+    a.clientID = 9_001;
+    a.getXmlFragment('default').insert(0, [new Y.XmlElement('paragraph')]);
+    const b = new Y.Doc();
+    Y.applyUpdate(b, Y.encodeStateAsUpdate(a));
+    b.clientID = 9_002;
+    b.getXmlFragment('default').insert(1, [new Y.XmlElement('paragraph')]);
+    // the row holds src and b's struct, but not a's, which b's depends on: b's stays pending on every load
+    const bytes = Y.mergeUpdates([Y.encodeStateAsUpdate(src), Y.encodeStateAsUpdate(b, Y.encodeStateVector(a))]);
+    const doc = new Y.Doc();
+    loadStoredYdoc(doc, nextPageId(), bytes, memoryStore(null), {
+      steps: 1e9,
+      deadlineMs: 60_000,
+      caps: { structs: 1e9, clientIds: countStructs(src).clients - 1, children: 1e9 },
+    });
+    expect(doc.store.pendingStructs).not.toBeNull(); // non-vacuity
+    expect(compactionRequest(doc)).toMatchObject({ drain: false });
+    expect(isClosedForCompaction(doc)).toBe(false);
+  });
+
   function setup(rounds = 10) {
     const live = churnedPage(rounds);
-    recordWriteKey(live, 'u\u0000k', 123);
+    recordWriteKey(live, wk('u', 'k'), 123);
     const pageId = nextPageId();
     const stored = Y.encodeStateAsUpdate(live);
     const content = storeSafeJson(TiptapTransformer.fromYdoc(live, 'default'));
@@ -558,7 +736,7 @@ describe('compactOnUnload (#827)', () => {
     Y.applyUpdate(loaded, store.row!.ydoc!);
     expect(digestOf(loaded)).toBe(expected);
     expect(lineageEpoch(loaded)).toBe(1);
-    expect(ledgerOfDoc(loaded)).toEqual([{ key: 'u\u0000k', ts: 123 }]);
+    expect(ledgerOfDoc(loaded)).toEqual([{ key: wk('u', 'k').entry, ts: 123 }]);
     expect(countStructs(loaded).clients).toBe(1);
     expect(isCompactionInflight(pageId)).toBe(false);
     // one line, its token first (check-infra-config §14 reads the first word), then one JSON object (compaction-log.ts)
@@ -714,9 +892,37 @@ describe('compactOnUnload (#827)', () => {
 });
 
 describe('compactFromRow (#827): the row content is the source', () => {
+  it('a row build that ran out of time twice is not retried for the same bytes; other bytes are', async () => {
+    const live = churnedPage(4);
+    const bytes = Y.encodeStateAsUpdate(live);
+    const content = storeSafeJson(TiptapTransformer.fromYdoc(live, 'default'));
+    const store = memoryStore({ content, ydoc: bytes, contentHash: md5(content) });
+    const pageId = nextPageId();
+    const restore = overrideDeadlineForTests((_fn, ms) => {
+      throw deadlineExceeded(ms);
+    });
+    try {
+      expect(startRowCompaction(store, pageId, 'load_trip', sha(bytes))).toBe(true);
+      await awaitCompaction(pageId);
+      expect(store.calls.read).toBe(1);
+      now += 2 * COMPACTION_MIN_INTERVAL_MS; // past the per-page interval and the process gap
+      expect(startRowCompaction(store, pageId, 'load_trip', sha(bytes))).toBe(true); // one overrun may be a stall
+      await awaitCompaction(pageId);
+      expect(store.calls.read).toBe(2);
+      now += 2 * COMPACTION_MIN_INTERVAL_MS;
+      expect(startRowCompaction(store, pageId, 'load_trip', sha(bytes))).toBe(false); // the same bytes, twice: not again
+      expect(store.calls.read).toBe(2);
+      expect(startRowCompaction(store, pageId, 'load_trip', 'other-bytes-digest')).toBe(true); // a store wrote since
+      await awaitCompaction(pageId);
+      expect(store.calls.read).toBe(3);
+    } finally {
+      restore();
+    }
+  });
+
   it('rebuilds from content, keeps the ledger read from the bytes, and moves to the next epoch', async () => {
     const live = churnedPage(8);
-    recordWriteKey(live, 'u\u0000k', 9);
+    recordWriteKey(live, wk('u', 'k'), 9);
     writeLineage(live, 2, 0);
     const content = storeSafeJson(TiptapTransformer.fromYdoc(live, 'default'));
     const store = memoryStore({ content, ydoc: Y.encodeStateAsUpdate(live), contentHash: md5(content) });
@@ -725,7 +931,7 @@ describe('compactFromRow (#827): the row content is the source', () => {
     Y.applyUpdate(loaded, store.row!.ydoc!);
     expect(digestOf(loaded)).toBe(stableHash(content));
     expect(lineageEpoch(loaded)).toBe(3);
-    expect(ledgerOfDoc(loaded)).toEqual([{ key: 'u\u0000k', ts: 9 }]);
+    expect(ledgerOfDoc(loaded)).toEqual([{ key: wk('u', 'k').entry, ts: 9 }]);
   });
 
   it('content the conversion fills in (default attributes) still compacts: the same document through the schema', async () => {

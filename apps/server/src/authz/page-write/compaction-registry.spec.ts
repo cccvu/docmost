@@ -1,5 +1,5 @@
 import * as Y from 'yjs';
-import { COMPACTION_ARM_DELAY_MS, COMPACTION_MIN_INTERVAL_MS } from '../collab-ingress/doc-bounds';
+import { COMPACTION_ARM_DELAY_MS, COMPACTION_GAP_FACTOR, COMPACTION_MIN_INTERVAL_MS } from '../collab-ingress/doc-bounds';
 import * as reg from './compaction-registry';
 import { WRITE_IDEM_MAP } from './write-idem';
 
@@ -72,6 +72,7 @@ describe('#827 compaction registry: arming, rate limit and the in-flight compact
   beforeEach(() => {
     clock = { now: 1_000_000_000, uptime: COMPACTION_ARM_DELAY_MS };
     restore = reg.setCompactionClockForTests({ now: () => clock.now, uptimeMs: () => clock.uptime });
+    reg.resetCompactionGapForTests();
   });
   afterEach(() => restore());
 
@@ -175,6 +176,30 @@ describe('#827 compaction registry: arming, rate limit and the in-flight compact
     expect(reg.canStartCompaction('p5')).toBe(true); // other pages are not limited by it
     clock.now += 1;
     expect(reg.canStartCompaction('p4')).toBe(true);
+  });
+
+  it('back to back across pages: the next compaction waits COMPACTION_GAP_FACTOR × the last one\'s duration after it ended', async () => {
+    expect(COMPACTION_GAP_FACTOR).toBe(2);
+    let finish!: () => void;
+    const tracked = reg.registerInflight('g1', new Promise<void>((res) => (finish = res)));
+    clock.now += 3_000; // the compaction took 3 s
+    finish();
+    await tracked;
+    // ended at t; the next page may start at t + 6 s, not before (the per-page interval does not limit other pages)
+    expect(reg.canStartCompaction('g2')).toBe(false);
+    clock.now += 2 * 3_000 - 1;
+    expect(reg.canStartCompaction('g2')).toBe(false);
+    clock.now += 1;
+    expect(reg.canStartCompaction('g2')).toBe(true);
+    // a failed compaction counts the same (its build held the process just as long)
+    const failing = reg.registerInflight('g2', Promise.reject(new Error('build failed')));
+    clock.now += 1_000;
+    await failing;
+    expect(reg.canStartCompaction('g3')).toBe(false);
+    clock.now += 2_000;
+    expect(reg.canStartCompaction('g3')).toBe(true);
+    // so a run of back-to-back compactions holds at most a third of the process
+    expect(3_000 / (3_000 + 2 * 3_000)).toBeLessThanOrEqual(1 / 3);
   });
 
   it('refuses a test clock outside jest', () => {

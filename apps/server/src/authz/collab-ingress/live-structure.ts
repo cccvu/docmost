@@ -9,7 +9,7 @@
  */
 import * as Y from 'yjs';
 import type { CompactionReason } from '../page-write/compaction-registry';
-import { softCap } from './doc-bounds';
+import { COMPACT_MAX_LIVE_STRUCTS, softCap } from './doc-bounds';
 
 /** A page's live structure: its non-deleted structs, and the most live children of one element. */
 export interface LiveStructure {
@@ -41,12 +41,16 @@ export function liveStructure(doc: Y.Doc): LiveStructure {
 }
 
 /**
- * Would a compaction bring a page of `live` structure under the soft caps? Compaction keeps the live structs (at most:
- * the rebuild merges runs), every live child and one client id, so the client-id cap always helps and the structs and
- * children caps decide.
+ * Would a compaction bring a page of `live` structure under the soft caps, within what one build may rebuild? Compaction
+ * keeps the live structs (at most: the rebuild merges runs), every live child and one client id, so the client-id cap
+ * always helps and the structs and children caps decide. A page with more live structs than `compactLive`
+ * (COMPACT_MAX_LIVE_STRUCTS: what a build fits in COMPACTION_DEADLINE_MS on production hardware) is not compacted for a
+ * structure cap: past one it is page-full, and it never drains. (The live-struct cap itself is a hard-only measure of the
+ * cap rule, so growth never takes a page past it; the step budget and the probe still compact by order.)
  */
-export function compactionWouldHelp(live: LiveStructure, caps: { structs: number; children: number }): boolean {
-  return live.structs < softCap(caps.structs) && live.children < softCap(caps.children);
+export function compactionWouldHelp(live: LiveStructure, caps: { structs: number; children: number; compactLive?: number }): boolean {
+  const compactLive = caps.compactLive ?? COMPACT_MAX_LIVE_STRUCTS;
+  return live.structs <= compactLive && live.structs < softCap(caps.structs) && live.children < softCap(caps.children);
 }
 
 /** One per-page bound, measured. */
@@ -61,6 +65,11 @@ export interface CapMeasure {
    * frame did not grow: deletes always pass.
    */
   grew?: boolean;
+  /**
+   * A hard bound only: never a soft request (compaction cannot bring it down, e.g. the live structs it keeps). Past its
+   * cap it is page-full whenever `helps()` says no.
+   */
+  hardOnly?: boolean;
 }
 
 /** What a cap verdict asks for. */
@@ -97,7 +106,7 @@ export function capVerdict(
   helps: () => boolean,
   recentlyCompacted: () => boolean = () => false,
 ): CapVerdict {
-  const near = measures.filter((m) => m.n >= softCap(m.cap));
+  const near = measures.filter((m) => m.n >= softCap(m.cap) && (!m.hardOnly || m.n > m.cap));
   if (near.length === 0) return { reason: null, hard: false, full: false, contentFull: false };
   let helped: boolean | undefined;
   let recent: boolean | undefined;

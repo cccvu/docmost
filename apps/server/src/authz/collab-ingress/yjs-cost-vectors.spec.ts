@@ -14,11 +14,12 @@ import {
 import { awarenessFrame, DOC_NAME, MSG, processCpuMs, RemoteClient, SYNC, syncFrame, typedFrame, step1Frame } from './collab-ingress.testkit';
 import { buildCompacted, refusesGrowth, snapshotTree } from '../page-write/compaction';
 import { liveContentDigest } from '../page-write/doc-version';
+import { markRowCovered } from '../page-write/reconcile-store';
 import { COLLAB_PAGE_COMPACTING_REASON, epochStaleReason } from './collab-reasons';
 import { ConflictScan, CONFLICT_SCAN_STEPS_PER_FRAME, installConflictScanMeter } from './conflict-scan';
 import { basePage, rawUpdate, type RawStruct } from './conflict-scan.testkit';
 import { deadlineExceeded, isDeadlineExceeded, runWithDeadline, type DeadlineRunner } from './deadline';
-import { COMPACTION_ARM_DELAY_MS, COMPACTION_MIN_INTERVAL_MS, PROBE_DEBOUNCE_MS, PROBE_MIN_INTERVAL_MS, readerStep2ChargeMs, softCap } from './doc-bounds';
+import { COMPACTION_ARM_DELAY_MS, COMPACTION_MIN_INTERVAL_MS, E_MAX, PROBE_DEBOUNCE_MS, PROBE_MIN_INTERVAL_MS, readerStep2ChargeMs, softCap } from './doc-bounds';
 import { SocketLimitLog } from './socket-limit-log';
 import {
   COLLAB_REFUSAL_CODE,
@@ -50,6 +51,7 @@ function setup(seed: Y.Doc | null, opts: CollabGuardOptions = {}) {
   const live = new Y.Doc() as Y.Doc & { name: string; getConnections: () => Conn[] };
   live.name = DOC_NAME;
   if (seed) Y.applyUpdate(live, Y.encodeStateAsUpdate(seed));
+  markRowCovered(live, Y.encodeStateAsUpdate(live)); // loaded from a stored row the unload can compact (the store's view)
   const conns: Conn[] = [];
   live.getConnections = () => conns;
   const logs: string[] = [];
@@ -391,6 +393,33 @@ describe('#827 a page past the load bounds is never rebuilt in a loop', () => {
   });
 });
 
+describe('#827 an order or deadline drain needs an unload that can compact', () => {
+  it('a page whose build failed for good (or whose row is not covered) is never drained for a rebuild trip', () => {
+    armed();
+    const p = acde();
+    const seed = new Y.Doc();
+    Y.applyUpdate(seed, Y.encodeStateAsUpdate(p.doc));
+    const MN = 600;
+    Y.applyUpdate(seed, rawUpdate([{ client: 500, clock: 0, structs: Array.from({ length: MN }, () => ch(p.a, p.e, 'l')) }]));
+    Y.applyUpdate(seed, rawUpdate([{ client: 900_000, clock: 0, structs: Array.from({ length: MN }, (_, i) => ch(p.c, i ? [900_000, i - 1] : p.d, 'h')) }]));
+    const run = (canCompact: boolean) => {
+      const s = setup(seed, { caps: { steps: 100_000 }, rowCovered: () => canCompact });
+      const reader = s.conn('r', true);
+      expect(s.send(s.conn('a'), editAs(s.live, 70, (d) => textOf(d).insert(0, 'k')))).toBe(COMPACTING); // the rebuild trips
+      return { s, reader };
+    };
+    const control = run(true);
+    expect(compactionRequest(control.s.live)).toMatchObject({ reason: 'load_steps', drain: true });
+    expect(control.reader.webSocket.close).toHaveBeenCalledWith(COLLAB_TRY_LATER_CODE, COLLAB_PAGE_COMPACTING_REASON);
+    const treated = run(false);
+    expect(compactionRequest(treated.s.live)).toMatchObject({ reason: 'load_steps', drain: false });
+    expect(treated.reader.webSocket.close).not.toHaveBeenCalled();
+    // and the next writer frame does not drain it either (the re-ask honours the same predicate)
+    expect(treated.s.send(treated.s.conn('b'), editAs(treated.s.live, 71, (d) => textOf(d).insert(0, 'k')))).toBe(COMPACTING);
+    expect(isDraining(treated.s.live)).toBe(false);
+  });
+});
+
 describe('#827 (d) client ids: Yjs pays every id on every transaction, so the page caps them', () => {
   const CAP = 40;
   const withIds = (n: number) => {
@@ -418,6 +447,19 @@ describe('#827 (d) client ids: Yjs pays every id on every transaction, so the pa
     expect(s.state().equals(before)).toBe(true);
     expect(compactionRequest(s.live)).toMatchObject({ reason: 'client_ids', drain: true });
     expect(other.webSocket.close).toHaveBeenCalledWith(COLLAB_TRY_LATER_CODE, COLLAB_PAGE_COMPACTING_REASON);
+  });
+
+  it('a page whose unload could not compact (its row bytes not covered, or a build of them failed) is page-full, never drained', () => {
+    armed();
+    // reconcile-store's unloadCanCompact says no: a drain would close everyone for a compaction that never runs, and the
+    // resent frame would drain it again on every reload. The crossing frame gets the final answer instead.
+    const s = setup(withIds(CAP - 1), { caps: { clientIds: CAP }, rowCovered: () => false });
+    const other = s.conn('other');
+    expect(s.send(s.conn('a'), editAs(s.live, 5000, (d) => textOf(d).insert(0, 'k')))).toBe('applied'); // CAP ids
+    expect(s.send(s.conn('a'), editAs(s.live, 5001, (d) => textOf(d).insert(0, 'k')))).toBe(REFUSED('page-full'));
+    expect(isDraining(s.live)).toBe(false);
+    expect(compactionRequest(s.live)).toBeNull();
+    expect(other.webSocket.close).not.toHaveBeenCalled();
   });
 
   it('past the soft cap compaction is requested for the next unload (no drain)', () => {
@@ -542,14 +584,17 @@ describe('#827 a hard cap drains only when compaction would bring the page under
     }
   };
   const NO_DEADLINE = { deadlines: { frame: 60_000, load: 60_000, probe: 60_000, mirror: 60_000 } };
-  const prose = 'Honest prose is mostly sentences of ordinary length, with a word in bold here and there, and paragraphs of a few lines. '.repeat(2).slice(0, 150);
+  const sentence = 'Honest prose is mostly sentences of ordinary length, with a word in bold here and there, and paragraphs of a few lines. ';
+  const prose = sentence.repeat(6).slice(0, 600);
 
-  it('an honest 3 MiB paste of prose (150-byte paragraphs) into an empty page is accepted at the real caps', () => {
+  it('an honest 3 MiB paste of prose (600-byte paragraphs) into an empty page is accepted at the real caps', () => {
     armed();
     const s = setup(paragraphs(1), NO_DEADLINE);
     const { update, n } = paste(s.live, 70, prose, true);
     expect(update.length).toBeGreaterThan(2.85 * 1024 * 1024);
-    expect(n).toBeGreaterThan(10_000); // past the 10k E_MAX this used to refuse
+    // E_MAX (6k, sized on Graviton2) admits a 3 MiB paste of paragraphs from about 520 bytes; this one sits under its soft cap
+    expect(n).toBeLessThan(softCap(E_MAX));
+    expect(n).toBeGreaterThan(E_MAX / 2);
     expect(s.send(s.conn('a'), update)).toBe('applied');
     expect(s.live.getXmlFragment('default').length).toBe(n + 1);
     expect(compactionRequest(s.live)).toBeNull(); // under every soft cap: nothing to compact
@@ -561,7 +606,7 @@ describe('#827 a hard cap drains only when compaction would bring the page under
     const other = s.conn('other');
     const before = s.state();
     const { update, n } = paste(s.live, 70, 'abcdefgh', false);
-    expect(n).toBeGreaterThan(14_000); // past E_MAX and S_MAX in live content: no compaction can shed it
+    expect(n).toBeGreaterThan(E_MAX); // past E_MAX (and S_MAX, COMPACT_MAX_LIVE_STRUCTS) in live content: no compaction sheds it
     expect(s.send(s.conn('a'), update)).toBe(REFUSED('page-full'));
     expect(s.state().equals(before)).toBe(true);
     expect(compactionRequest(s.live)).toBeNull();
@@ -580,6 +625,63 @@ describe('#827 a hard cap drains only when compaction would bring the page under
     }
     return doc;
   };
+
+  it('a page whose live structs pass the compaction ceiling (COMPACT_MAX_LIVE_STRUCTS) is page-full at the hard cap and never drains', () => {
+    armed();
+    const CAP = 200;
+    const grow = (live: Y.Doc, client: number) =>
+      editAs(live, client, (d) => {
+        for (let i = 0; i < 60; i++) textOf(d, i % 5).insert(1, 'q');
+      });
+    // control: the same page and crossing, with the ceiling above its live structs, drains to compact
+    const control = setup(withHistory(150), { caps: { structs: CAP, compactLive: 1_000 } });
+    expect(control.send(control.conn('a'), editAs(control.live, 70, (d) => textOf(d).insert(0, 'k')))).toBe('applied');
+    expect(control.send(control.conn('a'), grow(control.live, 70))).toBe(COMPACTING);
+    expect(isDraining(control.live)).toBe(true);
+    // treatment: its live structs (about 15) are over a ceiling of 10: the ceiling is a hard cap on live structs, so any
+    // growth is page-full (the keystroke too), nothing drains, no build is attempted; a delete passes
+    const s = setup(withHistory(150), { caps: { structs: CAP, compactLive: 10 } });
+    const other = s.conn('other');
+    expect(s.send(s.conn('a'), editAs(s.live, 70, (d) => textOf(d).insert(0, 'k')))).toBe(REFUSED('page-full'));
+    expect(s.send(s.conn('b'), grow(s.live, 71))).toBe(REFUSED('page-full'));
+    expect(isDraining(s.live)).toBe(false);
+    expect(compactionRequest(s.live)).toBeNull();
+    expect(other.webSocket.close).not.toHaveBeenCalled();
+    expect(s.send(s.conn('c'), editAs(s.live, 72, (d) => textOf(d).delete(0, 1)))).toBe('applied');
+  });
+
+  it('the live-struct cap: growth past COMPACT_MAX_LIVE_STRUCTS is page-full, measured exactly (history never counts)', async () => {
+    // a page of 12 live structs with heavy history: the O(1) estimate (every struct added since the last measure, as
+    // live) passes a cap of 40 after churn, but the exact count stays under it, so churn is never refused
+    const s = setup(paragraphs(4, 'hello'), { caps: { compactLive: 40 } });
+    const c = s.conn('a');
+    for (let i = 0; i < 30; i++) {
+      expect(s.send(c, editAs(s.live, 70, (d) => textOf(d, i % 4).insert(0, 'x')))).toBe('applied');
+      expect(s.send(c, editAs(s.live, 70, (d) => textOf(d, i % 4).delete(0, 1)))).toBe('applied');
+    }
+    // real growth past the cap is page-full: a paste of 40 paragraphs (each a paragraph and a text: 80 live structs)
+    const paste = editAs(s.live, 71, (d) =>
+      d.getXmlFragment('default').insert(0, Array.from({ length: 40 }, () => {
+        const p = new Y.XmlElement('paragraph');
+        p.insert(0, [new Y.XmlText('p')]);
+        return p;
+      })),
+    );
+    expect(s.send(s.conn('b'), paste)).toBe(REFUSED('page-full'));
+    expect(isDraining(s.live)).toBe(false);
+    expect(s.send(c, editAs(s.live, 70, (d) => textOf(d).delete(0, 1)))).toBe('applied'); // rebuilds the refused shadow
+    expect(isPageFull(s.live)).toBe(false);
+    // a page measured past it (an API write, mirrored) is marked page-full for the API
+    s.live.transact(() => {
+      s.live.getXmlFragment('default').insert(0, Array.from({ length: 40 }, () => {
+        const p = new Y.XmlElement('paragraph');
+        p.insert(0, [new Y.XmlText('api')]);
+        return p;
+      }));
+    }, 'api');
+    await settle();
+    expect(isPageFull(s.live)).toBe(true);
+  });
 
   it('page-full within the compaction interval lapses with it: the same crossing after the interval drains', () => {
     let now = Date.now();

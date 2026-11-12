@@ -20,7 +20,8 @@ import { C_MAX, E_MAX } from './doc-bounds';
 import { SocketLimitLog } from './socket-limit-log';
 import { replicaLogDistrust, replicaLogOf } from './exact-replica-registry';
 import { strictOrderDiff } from './order-parity';
-import { COLLAB_REFUSAL_CODE, COLLAB_TRY_LATER_CODE, CollabUpdateGuard, USER_COLLAB_CPU_BURST_MS } from './update-guard';
+import { markRowCovered } from '../page-write/reconcile-store';
+import { COLLAB_REFUSAL_CODE, COLLAB_TRY_LATER_CODE, CollabUpdateGuard, UNRESOLVED_REASON, USER_COLLAB_CPU_BURST_MS } from './update-guard';
 
 /**
  * #816 (ADR 0036): honest concurrency never trips the CPU bounds. A seeded corpus of 2–5 peers editing one page
@@ -354,6 +355,7 @@ describe('#827 honest work at the caps is never refused', () => {
     live.name = DOC_NAME;
     live.getConnections = () => [];
     if (seed) Y.applyUpdate(live, Y.encodeStateAsUpdate(seed));
+    markRowCovered(live, Y.encodeStateAsUpdate(live)); // a stored row the unload can compact
     const lines: string[] = [];
     // The production bounds, held in CPU time (the worker's own: a busy CI runner's waits are not the frame's cost)
     const guard = new CollabUpdateGuard({
@@ -396,9 +398,9 @@ describe('#827 honest work at the caps is never refused', () => {
     return Y.encodeStateAsUpdate(r, Y.encodeStateVector(live));
   };
 
-  it('a paste just under the frame cap (prose, 400-character paragraphs) is accepted', () => {
+  it('a paste just under the frame cap (prose, 600-character paragraphs, under E_MAX) is accepted', () => {
     const s = caps();
-    const update = paste(s.live, 4242, () => prose(6_400, 400));
+    const update = paste(s.live, 4242, () => prose(4_400, 600));
     expect(update.length).toBeGreaterThan(2.5 * 1024 * 1024);
     expect(update.length).toBeLessThanOrEqual(PAGE_MAX_YDOC_BYTES);
     expect(s.send(s.conn('a'), update)).toBe('applied');
@@ -448,5 +450,232 @@ describe('#827 honest work at the caps is never refused', () => {
     }
     expect(s.live.store.clients.size).toBe(C_MAX);
     expect(compactionRequest(s.live)).toMatchObject({ reason: 'client_ids', drain: false });
+  });
+});
+
+/**
+ * #781 lineage (ADR 0036 §4): a lifetime that lost its editors' last edits (the process died inside the store debounce)
+ * gets them back from whichever browser resends them first: the author's own Step2, or a peer's that the dead lifetime
+ * relayed them to. Lifetime 1 runs unguarded (it is not under test) with debounced stores at random points; then the
+ * crash, edits typed while disconnected, and reloads over the local copy (a new client id). Lifetime 2 is guarded, and
+ * each provider's connect is split as 4.7.1 sends it: Auth, Step1 and its own awareness on a jittered reconnect, then its
+ * Step2 one round trip later (an answer to the server's Step1). The client's rule is modelled: `unresolved` reconnects
+ * once (the close and a new Auth, one round trip), and a second one before a Step2 lands is final.
+ *
+ * Property: no terminal refusal, and every lost edit back in live, except the pinned residual (relay-binding.spec.ts):
+ * editors whose Step2s each carry another's unproven id block each other, and whoever waits on them. Timing assumption,
+ * stated: an author's round trip is at most twice a relayer's (60–110 ms here), so the author's Step2 lands before the
+ * relayer's one retry (relay-binding.spec.ts pins what happens when it does not).
+ */
+const CRASH_SEEDS = 120;
+const crashSeen = { peers: 0, landed: 0, storedPrefix: 0, relays: 0, mirrorRecovered: 0, remounts: 0, mutuallyBlocked: 0 };
+
+type CrashPeer = {
+  user: string;
+  doc: Y.Doc;
+  ownIds: Set<number>;
+  outbox: Uint8Array[];
+  inbox: Uint8Array[];
+  rtt: number;
+  clock: number;
+  retried: boolean;
+  unresolved: number;
+  landed: boolean;
+  terminal: string | null;
+  blockers: CrashPeer[];
+};
+
+/** A light honest edit (lifetime 1 and the outage): typing, a short delete, a new paragraph. */
+function crashEdit(r: () => number, d: Y.Doc): void {
+  const f = d.getXmlFragment('default');
+  const ts = texts(f);
+  d.transact(() => {
+    const x = r();
+    if (x < 0.7 && ts.length) {
+      const t = ts[Math.floor(r() * ts.length)];
+      t.insert(Math.floor(r() * (t.length + 1)), WORDS[Math.floor(r() * WORDS.length)]);
+    } else if (x < 0.85 && ts.length) {
+      const t = ts[Math.floor(r() * ts.length)];
+      if (t.length) t.delete(Math.floor(r() * t.length), 1);
+    } else {
+      f.insert(Math.floor(r() * (f.length + 1)), [paragraph(r, 2)]);
+    }
+  });
+}
+
+function crashSeed(seed: number) {
+  const r = rng(seed * 7919);
+  let nextId = seed * 1000;
+  const peers: CrashPeer[] = [];
+  /** A page mount over `from` (a fresh Y.Doc, a new client id), as the page editor makes on every load. */
+  const mountDoc = (p: CrashPeer, from: Y.Doc) => {
+    const d = new Y.Doc();
+    Y.applyUpdate(d, Y.encodeStateAsUpdate(from), 'remote');
+    d.clientID = ++nextId;
+    d.on('update', (u: Uint8Array, origin: unknown) => {
+      if (origin !== 'remote') p.outbox.push(u);
+    });
+    p.ownIds.add(d.clientID);
+    p.doc = d;
+  };
+
+  // Lifetime 1.
+  const live1 = new Y.Doc();
+  live1.transact(() => live1.getXmlFragment('default').insert(0, Array.from({ length: 6 }, () => paragraph(r, 4))));
+  let stored = Y.encodeStateAsUpdate(live1);
+  live1.on('update', (u: Uint8Array, origin: unknown) => {
+    for (const p of peers) if (p !== origin) p.inbox.push(u);
+  });
+  const n = 2 + Math.floor(r() * 3);
+  for (let i = 0; i < n; i++) {
+    const p: CrashPeer = {
+      user: `user-${i}`,
+      doc: null as never,
+      ownIds: new Set(),
+      outbox: [],
+      inbox: [],
+      rtt: 60 + Math.floor(r() * 51),
+      clock: 0,
+      retried: false,
+      unresolved: 0,
+      landed: false,
+      terminal: null,
+      blockers: [],
+    };
+    mountDoc(p, live1);
+    peers.push(p);
+  }
+  const ops = 20 + Math.floor(r() * 40);
+  for (let op = 0; op < ops; op++) {
+    const p = peers[Math.floor(r() * n)];
+    crashEdit(r, p.doc);
+    if (r() < 0.7) for (const u of p.outbox.splice(0)) Y.applyUpdate(live1, u, p);
+    for (const q of peers) if (q.inbox.length && r() < 0.6) for (const u of q.inbox.splice(0)) Y.applyUpdate(q.doc, u, 'remote');
+    if (r() < 0.06) stored = Y.encodeStateAsUpdate(live1); // a debounced store
+  }
+  // The crash: whatever live1 held past `stored` is gone, and so is every broadcast still in flight.
+  for (const p of peers) {
+    p.inbox.length = 0;
+    for (let k = Math.floor(r() * 3); k > 0; k--) crashEdit(r, p.doc); // typed while disconnected
+    if (r() < 0.25) {
+      crashSeen.remounts++;
+      mountDoc(p, p.doc); // a reload: a new client id over the local copy, which keeps the old id's unsent edits
+      if (r() < 0.5) crashEdit(r, p.doc);
+    }
+    p.outbox.length = 0; // the Step2 carries them
+  }
+
+  // Lifetime 2.
+  const live = new Y.Doc() as Y.Doc & { name: string; awareness: { meta: Map<number, { clock: number }> } };
+  live.name = DOC_NAME;
+  Y.applyUpdate(live, stored);
+  live.awareness = { meta: new Map() };
+  if (peers.some((p) => [...p.ownIds].some((id) => Y.getState(live.store, id) > 0))) crashSeen.storedPrefix++;
+  let now = 1_000_000;
+  const logs: string[] = [];
+  const guard = new CollabUpdateGuard({
+    mode: 'enforce',
+    logger: { warn: (m: string) => logs.push(m) },
+    limitLog: new SocketLimitLog({ warn: (m: string) => logs.push(m) }),
+    now: () => now,
+  });
+  const queue: Array<{ at: number; seq: number; run: () => void }> = [];
+  let seq = 0;
+  const schedule = (at: number, run: () => void) => queue.push({ at, seq: seq++, run });
+  const check = (conn: Conn, frame: Uint8Array): { reason: string; stage?: string } | null => {
+    const logged = logs.length;
+    try {
+      guard.check({ connection: conn, document: live, update: frame, context: conn.context });
+      return null;
+    } catch (err: any) {
+      const line = logs.slice(logged).find((l) => l.startsWith('COLLAB_UPDATE_REFUSED'));
+      const stage = line ? JSON.parse(line.slice(line.indexOf('{'))).stage : undefined;
+      return { reason: `${err?.code} ${err?.reason}`, stage };
+    }
+  };
+  /** Peers whose announced id this update writes new clocks at. */
+  const newClocksAt = (update: Uint8Array): Set<number> => {
+    const out = new Set<number>();
+    for (const s of Y.decodeUpdate(update).structs) if (s.id.clock + s.length > Y.getState(live.store, s.id.client)) out.add(s.id.client);
+    return out;
+  };
+
+  const attempt = (p: CrashPeer) => () => {
+    const conn: Conn = { readOnly: false, webSocket: { close: () => undefined }, context: { user: { id: p.user } } };
+    p.clock++;
+    const refused =
+      check(conn, step1Frame(p.doc)) ??
+      check(conn, awarenessFrame([{ clientID: p.doc.clientID, clock: p.clock, state: { user: { name: p.user } } }]));
+    if (refused) {
+      p.terminal = `connect: ${refused.reason}`;
+      return;
+    }
+    live.awareness.meta.set(p.doc.clientID, { clock: p.clock });
+    const sv = Y.encodeStateVector(live); // the server's Step1, answered one round trip later
+    schedule(now + p.rtt, () => step2(p, conn, sv));
+  };
+  const step2 = (p: CrashPeer, conn: Conn, sv: Uint8Array) => {
+    const reply = Y.encodeStateAsUpdate(p.doc, sv);
+    const written = newClocksAt(reply);
+    const refused = check(conn, syncFrame(reply, SYNC.Step2));
+    if (!refused) {
+      Y.applyUpdate(live, reply, conn);
+      p.landed = true;
+      p.retried = false; // sync-acked
+      crashSeen.landed++;
+      if ([...written].some((id) => !p.ownIds.has(id))) crashSeen.relays++;
+      if (p.unresolved) crashSeen.mirrorRecovered++;
+      return;
+    }
+    p.blockers = peers.filter((q) => q !== p && q.clock > 0 && written.has(q.doc.clientID));
+    if (refused.reason === `${COLLAB_REFUSAL_CODE} ${UNRESOLVED_REASON}` && !p.retried) {
+      p.retried = true;
+      p.unresolved++;
+      schedule(now + p.rtt, attempt(p)); // the close reaches it, and its new Auth reaches the server
+      return;
+    }
+    p.terminal = `${refused.reason}${refused.stage ? ` (${refused.stage})` : ''}`;
+  };
+
+  for (const p of peers) schedule(now + Math.floor(r() * 500), attempt(p)); // jittered reconnects after the crash
+  while (queue.length) {
+    queue.sort((x, y) => x.at - y.at || x.seq - y.seq);
+    const ev = queue.shift()!;
+    now = ev.at;
+    ev.run();
+  }
+  return { live, peers };
+}
+
+describe('#781 lineage: a lost lifetime\'s edits come back through the guard (crash corpus)', () => {
+  it(`${CRASH_SEEDS} seeded crashes of 2–4 editors: no terminal refusal outside the pinned mutual-block residual, nothing lost`, () => {
+    for (let seed = 1; seed <= CRASH_SEEDS; seed++) {
+      const { live, peers } = crashSeed(seed);
+      crashSeen.peers += peers.length;
+      const terminal = peers.filter((p) => p.terminal !== null);
+      // The residual: refused as an unproven owner's id, by an owner that itself never landed (a block cycle).
+      const residual = (p: CrashPeer) =>
+        p.terminal === `${COLLAB_REFUSAL_CODE} ${UNRESOLVED_REASON} (unproven-owner)` && p.blockers.some((q) => q.terminal !== null);
+      expect({ seed, unexplained: terminal.filter((p) => !residual(p)).map((p) => `${p.user}: ${p.terminal}`) }).toEqual({ seed, unexplained: [] });
+      crashSeen.mutuallyBlocked += terminal.length;
+      for (const p of peers) {
+        expect(p.landed !== (p.terminal !== null)).toBe(true); // every editor finished one way or the other
+        expect(p.unresolved).toBeLessThanOrEqual(1);
+      }
+      // every landed editor's edits (its own and those it was relayed) are in live, and it converges with live
+      for (const p of peers.filter((q) => q.landed)) {
+        const missing = Y.decodeUpdate(Y.encodeStateAsUpdate(p.doc, Y.encodeStateVector(live)));
+        expect({ seed, user: p.user, structs: missing.structs.length }).toEqual({ seed, user: p.user, structs: 0 });
+        Y.applyUpdate(p.doc, Y.encodeStateAsUpdate(live, Y.encodeStateVector(p.doc)), 'remote');
+        expect(contentOf(p.doc)).toEqual(contentOf(live));
+      }
+      expect(renderLikeABrowser(live)).toMatchObject({ deleted: false, threw: false });
+    }
+    if (process.env.CONFLICT_SCAN_TALLY) console.log(JSON.stringify(crashSeen));
+    // anti-vacuity: stored prefixes and never-seen ids, relays that landed, the mirror ordering recovered by its one
+    // retry, reloads over a local copy; and the residual shape occurs (fixing it makes this 0: then assert that instead)
+    for (const [k, v] of Object.entries(crashSeen)) expect({ [k]: v > 0 }).toEqual({ [k]: true });
+    expect(crashSeen.storedPrefix).toBeLessThan(CRASH_SEEDS);
+    expect(crashSeen.landed).toBeGreaterThan(crashSeen.mutuallyBlocked);
   });
 });

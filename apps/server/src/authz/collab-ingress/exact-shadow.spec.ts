@@ -1,6 +1,7 @@
 import * as Y from 'yjs';
 import { prosemirrorJSONToYDoc } from '@tiptap/y-tiptap';
 import { serverSchema } from '../page-write/prelim-content';
+import { markRowCovered } from '../page-write/reconcile-store';
 import { compactionRequest, isDraining, registerInflight, setCompactionClockForTests } from '../page-write/compaction-registry';
 import { COMPACTION_ARM_DELAY_MS, COMPACTION_MIN_INTERVAL_MS } from './doc-bounds';
 import { contentOf, processCpuMs, RemoteClient, renderLikeABrowser, step1Frame, syncFrame } from './collab-ingress.testkit';
@@ -45,6 +46,8 @@ function harness(opts: { base?: Y.Doc; bytes?: Uint8Array; attach?: boolean; cap
   const bytes = opts.bytes ?? Y.encodeStateAsUpdate(opts.base ?? listPage().doc);
   Y.applyUpdate(live, bytes);
   if (opts.attach) attachReplicaLog(live, bytes); // what the persistence load does
+  // #827: the load covers its row bytes (loadStoredYdoc), so an unload can compact it and a heal may drain
+  markRowCovered(live, bytes);
   const logs: string[] = [];
   const limitLogs: string[] = [];
   const guard =
@@ -429,7 +432,7 @@ describe('#840 new rules: parent-split and keyed-split (#847) are refused 4422',
     expect(s.live.getXmlFragment('default').delete(1, 1)).toBeUndefined();
   });
 
-  it('an item re-sent with an origin in another text is linked beside the first: refused parent-split', () => {
+  it('an item re-sent with an origin in another text is linked beside the first (a foreign left): refused cross-list (the per-struct rule runs first)', () => {
     const base = new Y.Doc();
     base.clientID = 1;
     const [p, c, pt, ct] = [new Y.XmlElement('paragraph'), new Y.XmlElement('codeBlock'), new Y.XmlText(), new Y.XmlText()];
@@ -445,7 +448,8 @@ describe('#840 new rules: parent-split and keyed-split (#847) are refused 4422',
     expect(s.send(s.conn('attacker'), q.edit(s.live, (f) => ((f.get(1) as Y.XmlElement).get(0) as Y.XmlText).insert(3, 'q')))).toBe('applied');
     const o = (pt as any)._start.id as Y.ID; // 'one' is one struct
     const split = rawUpdate([{ client: 777, clock: 0, structs: [{ origin: [o.client, o.clock + 2], right: null, content: new Y.ContentString('zb') }] }]);
-    expect(s.send(s.conn('attacker'), split)).toBe(REFUSED('parent-split'));
+    // the per-struct `cross-list` rule (#781 lineage) reads the item's left and refuses it before #840's walk runs
+    expect(s.send(s.conn('attacker'), split)).toBe(REFUSED('cross-list'));
   });
 });
 

@@ -29,7 +29,7 @@
  *
  * The build runs under `runWithDeadline` (COMPACTION_DEADLINE_MS) and touches only documents it made: the live
  * document is read before it, outside the deadline. Its row's lineage and ledger are read from the decoded update
- * (reconcile-store.ts `readRootMapEntries`), which integrates nothing and so also works on a row too costly to load.
+ * (write-idem.ts `ledgerOfDecoded`, over reconcile-store.ts `readRootMapEntries`), which integrates nothing and so also works on a row too costly to load.
  *
  * Logs: `COLLAB_PAGE_COMPACTION {"event":"requested"|"done"|"skipped"|"load_refused",…}` and `COLLAB_COMPACTION_FAILED
  * {…}`, written only through collab-ingress/compaction-log.ts, the guard's emitter too (check-infra-config §14 lists
@@ -47,6 +47,7 @@ import { ConflictScan, installConflictScanMeter, type ConflictScanMeter } from '
 import { logCompactionFailed, logCompactionRequested, logPageCompaction } from '../collab-ingress/compaction-log';
 import { isDeadlineExceeded, runWithDeadline } from '../collab-ingress/deadline';
 import {
+  COMPACT_MAX_LIVE_STRUCTS,
   COMPACTION_DEADLINE_MS,
   C_MAX,
   E_MAX,
@@ -57,10 +58,12 @@ import {
 import { COLLAB_PAGE_COMPACTING_REASON, pageCompactingRefusal } from '../collab-ingress/collab-reasons';
 import { capVerdict, compactionWouldHelp, liveStructure, type LiveStructure } from '../collab-ingress/live-structure';
 import {
+  buildRefused,
   canStartCompaction,
   clearCompacting,
   compactedRecently,
   compactionRequest,
+  forgetBuildFailure,
   isClosedForCompaction,
   isCompacting,
   isPageFull,
@@ -69,10 +72,12 @@ import {
   markCompacting,
   markPageFull,
   markSuperseded,
+  noteBuildFailed,
   pageFullUntil,
   MalformedLineageError,
   registerInflight,
   requestCompaction,
+  resetBuildFailuresForTests,
   writeLineage,
   type CompactionReason,
   type CompactionRequest,
@@ -81,11 +86,11 @@ import { accumulates } from './page-size';
 import { liveContentDigest } from './doc-version';
 import { storedProjection } from './persistence-steps';
 import { serverSchema } from './prelim-content';
-import { coveredRowDigest, lineageEpochOfStructs, markRowCovered, readRootMapEntries } from './reconcile-store';
-import { stableHash } from './stable-hash';
+import { coveredRowDigest, lineageEpochOfStructs, markRowCovered, unloadCanCompact } from './reconcile-store';
+import { stableHash, stableStringify } from './stable-hash';
 import { hasStoreFailure, isStoreCurrent, recordStoreFailure, storeGenerationOf } from './store-failure-registry';
 import { storeSafeJson } from './store-safe-json';
-import { WRITE_IDEM_MAP } from './write-idem';
+import { carryLedgerOver, ledgerOfDecoded, ledgerOfDoc, type LedgerEntry } from './write-idem';
 import { yieldToEventLoop } from './yield-to-event-loop';
 import { ensureHealImageTable } from './heal-image.installer';
 
@@ -182,6 +187,20 @@ export function loadStatsOf(doc: object): LoadStats | null {
 }
 
 /**
+ * The load repair (legacy-repair.ts, `afterLoadDocument`) changed the freshly loaded document, from `before` (its
+ * generation just before the repair). The document still counts as holding its row for compaction (`holdsItsRow`): the
+ * repair only deletes, and makes the same deletes on every load of those bytes, so the compare-and-swap (on the row's
+ * own bytes) and the digest check (on the repaired document) stay exact. Without this a drain requested at load would
+ * never compact (the unload sees a changed, unstored document) and would refuse every join and write again on each
+ * reload. Only when nothing else changed the document since its load.
+ */
+export function noteLoadRepaired(doc: object, before: number | undefined): void {
+  const stats = loadStats.get(doc);
+  if (!stats || before === undefined || stats.generation !== before) return;
+  stats.generation = storeGenerationOf(doc);
+}
+
+/**
  * Pages whose stored bytes tripped a load: refused at once on the next load (no second walk) while the bytes are the
  * same. A meter trip is deterministic (strikes at once); a deadline can be a one-off stall, so it takes two. Bounded
  * (oldest out); forgotten when a load of the page succeeds or a compaction rewrites it.
@@ -202,6 +221,7 @@ function noteLoadTrip(pageId: string, digest: string, deterministic: boolean): v
 export function resetLoadTripsForTests(): void {
   if (process.env.JEST_WORKER_ID === undefined) throw new Error('resetLoadTripsForTests is for jest only (#827)');
   loadTrips.clear();
+  resetBuildFailuresForTests();
 }
 
 let meterInstance: ConflictScanMeter | null = null;
@@ -220,8 +240,10 @@ export interface LoadCaps {
   structs: number;
   clientIds: number;
   children: number;
+  /** Live structs past which compaction is never attempted (COMPACT_MAX_LIVE_STRUCTS unless a spec passes smaller). */
+  compactLive?: number;
 }
-const LOAD_CAPS: LoadCaps = Object.freeze({ structs: S_MAX, clientIds: C_MAX, children: E_MAX });
+const LOAD_CAPS: LoadCaps = Object.freeze({ structs: S_MAX, clientIds: C_MAX, children: E_MAX, compactLive: COMPACT_MAX_LIVE_STRUCTS });
 export const LOAD_BOUNDS: LoadBounds = Object.freeze({ steps: W_MAX, deadlineMs: LOAD_DEADLINE_MS, caps: LOAD_CAPS });
 
 /**
@@ -246,7 +268,7 @@ export function loadStoredYdoc(
   if (memo) {
     digest = sha256(bytes);
     if (memo.digest === digest && memo.strikes >= LOAD_TRIP_STRIKES) {
-      startRowCompaction(storeOf(db), pageId, 'load_trip');
+      startRowCompaction(storeOf(db), pageId, 'load_trip', digest);
       throw pageCompactingRefusal();
     }
   }
@@ -262,9 +284,10 @@ export function loadStoredYdoc(
   }
   const ms = performance.now() - started;
   if (deadline || scan.trip !== null) {
-    noteLoadTrip(pageId, digest ?? sha256(bytes), !deadline);
+    digest ??= sha256(bytes);
+    noteLoadTrip(pageId, digest, !deadline);
     logPageCompaction('load_refused', pageId, { why: deadline ? 'deadline' : 'steps', steps: scan.steps, bytes: bytes.length, ms: round(ms) });
-    startRowCompaction(storeOf(db), pageId, 'load_trip');
+    startRowCompaction(storeOf(db), pageId, 'load_trip', digest);
     throw pageCompactingRefusal();
   }
   loadTrips.delete(pageId);
@@ -289,13 +312,17 @@ function requestIfOverSoftCaps(
   caps: LoadCaps,
 ): void {
   let live: LiveStructure | undefined;
+  const compactLive = caps.compactLive ?? COMPACT_MAX_LIVE_STRUCTS;
+  // live ≤ every struct, so the walk runs only for a page that could be past COMPACT_MAX_LIVE_STRUCTS
+  const liveStructs = stats.structs > compactLive ? (live = liveStructure(document)).structs : 0;
   const verdict = capVerdict(
     [
       { reason: 'structs', n: stats.structs, cap: caps.structs },
       { reason: 'client_ids', n: stats.clients, cap: caps.clientIds },
       { reason: 'load_steps', n: stats.steps, cap: stepCap },
+      { reason: 'structs', n: liveStructs, cap: compactLive, hardOnly: true },
     ],
-    () => compactionWouldHelp((live = liveStructure(document)), caps), // O(structs), as the load just was
+    () => compactionWouldHelp((live ??= liveStructure(document)), caps), // O(structs), as the load just was
     () => compactedRecently(document),
   );
   markPageFull(document, verdict.full, pageFullUntil(document, verdict));
@@ -303,7 +330,10 @@ function requestIfOverSoftCaps(
   const request: CompactionRequest = {
     reason: verdict.reason,
     userId: null,
-    drain: verdict.hard && canStartCompaction(pageId),
+    // Drain only when the unload can compact: a compaction can start, and the row is covered (a row whose bytes left
+    // structs pending is not, and no writer can join a draining page to store it), or the drain would repeat on every
+    // load with nothing compacting. Otherwise the request waits; a frame or probe can drain it once writers stored.
+    drain: verdict.hard && canStartCompaction(pageId) && unloadCanCompact(document, pageId),
   };
   if (requestCompaction(document, request)) {
     logCompactionRequested(pageId, request, {
@@ -341,9 +371,10 @@ export async function compactOnUnload(document: CompactableDocument, db: KyselyD
     if (document.getConnectionsCount() !== 0) return;
     // Never past an unsaved or failed store: the CAS names the bytes this document last stored (or found stored), or
     // loaded when nothing changed since (a page opened and left without an edit never stores).
-    if (!holdsItsRow(document)) return;
+    if (!holdsItsRow(document)) return skipUnload(pageId, request, 'not_stored');
     const covered = coveredRowDigest(document);
-    if (covered === null) return;
+    if (covered === null) return skipUnload(pageId, request, 'uncovered');
+    if (buildRefused(pageId, covered)) return skipUnload(pageId, request, 'failed_before');
     if (!canStartCompaction(pageId)) return;
     markCompacting(document); // synchronously: from here joins and writes answer try-later
     marked = true;
@@ -354,6 +385,11 @@ export async function compactOnUnload(document: CompactableDocument, db: KyselyD
     const page = pageIdOfDocumentName(document.name) ?? document.name;
     logCompactionFailed(page, compactionRequest(document)?.reason ?? null, 'unexpected', err);
   }
+}
+
+/** A requested compaction the unload cannot run: logged when it drained the page (everyone was closed for it). */
+function skipUnload(pageId: string, request: CompactionRequest, why: 'not_stored' | 'uncovered' | 'failed_before'): void {
+  if (request.drain) logPageCompaction('skipped', pageId, { reason: request.reason, why });
 }
 
 /** The document holds exactly the row bytes it last covered: stored since its last change, or unchanged since its load. */
@@ -379,16 +415,19 @@ async function compactResident(
     const generation = storeGenerationOf(document);
     const fromEpoch = lineageEpoch(document);
     const tree = snapshotTree(document.getXmlFragment('default'));
-    const expected = stableHash(storedProjection(document)); // the ADR 0019 digest (doc-version.ts's)
+    // The ADR 0019 digest (doc-version.ts's), with adjacent same-marked text merged (`textRunsDigest`)
+    const expected = textRunsDigest(storedProjection(document));
     const ledger = ledgerOfDoc(document);
     const before = countStructs(document);
     await yieldToEventLoop();
     if (storeGenerationOf(document) !== generation) return abandon(document, pageId, request.reason, 'changed');
     const at = Date.now();
-    const built = runWithDeadline(
-      () => buildCompacted({ tree }, ledger, fromEpoch + 1, at, { digest: expected }),
-      COMPACTION_DEADLINE_MS,
-    );
+    let built: CompactedBuild;
+    try {
+      built = runWithDeadline(() => buildCompacted({ tree }, ledger, fromEpoch + 1, at, { runs: expected }), COMPACTION_DEADLINE_MS);
+    } catch (err) {
+      return buildFailed(pageId, covered, err);
+    }
     await yieldToEventLoop();
     const swap = await store.swapYdoc(pageId, built.update, {
       covered,
@@ -396,6 +435,7 @@ async function compactResident(
     });
     if (!swap.swapped) return abandon(document, pageId, request.reason, swap.why);
     markSuperseded(document, built.epoch);
+    forgetBuildFailure(pageId);
     loadTrips.delete(pageId);
     closeJoinedConnections(document);
     logCompactionDone(pageId, request.reason, 'unload', {
@@ -440,7 +480,12 @@ export function skipStoreOfSuperseded(document: object): boolean {
 // --- compaction from the row (after a load trip)
 
 /** Start a compaction of `pageId` from its row in the background, when one may start. Returns whether it started. */
-export function startRowCompaction(store: CompactionStore, pageId: string, reason: CompactionReason): boolean {
+/**
+ * Start a compaction of `pageId` from its row (after a load trip), unless one may not start now, or a build of these
+ * very bytes (`digest`, when the caller has it) already failed for good (`buildRefused`).
+ */
+export function startRowCompaction(store: CompactionStore, pageId: string, reason: CompactionReason, digest?: string): boolean {
+  if (digest !== undefined && buildRefused(pageId, digest)) return false;
   if (!canStartCompaction(pageId)) return false;
   logCompactionRequested(pageId, { reason, userId: null, drain: false }, null);
   void registerInflight(pageId, compactFromRow(store, pageId, reason));
@@ -474,11 +519,16 @@ export async function compactFromRow(
     const covered = sha256(bytes);
     await yieldToEventLoop();
     const at = Date.now();
-    const built = runWithDeadline(() => {
-      const lineage = readRowLineage(bytes);
-      const json = storeSafeJson(content);
-      return { lineage, ...buildCompacted({ json }, lineage.ledger, lineage.epoch + 1, at, { content: json }) };
-    }, COMPACTION_DEADLINE_MS);
+    let built: CompactedBuild & { lineage: ReturnType<typeof readRowLineage> };
+    try {
+      built = runWithDeadline(() => {
+        const lineage = readRowLineage(bytes);
+        const json = storeSafeJson(content);
+        return { lineage, ...buildCompacted({ json }, lineage.ledger, lineage.epoch + 1, at, { content: json }) };
+      }, COMPACTION_DEADLINE_MS);
+    } catch (err) {
+      return buildFailed(pageId, covered, err);
+    }
     await yieldToEventLoop();
     const swap = await store.swapYdoc(pageId, built.update, { covered, contentHash: row.contentHash });
     if (!swap.swapped) {
@@ -486,6 +536,7 @@ export async function compactFromRow(
       return 'skipped';
     }
     loadTrips.delete(pageId);
+    forgetBuildFailure(pageId);
     logCompactionDone(pageId, reason, 'row', {
       fromEpoch: built.lineage.epoch,
       toEpoch: built.epoch,
@@ -501,22 +552,21 @@ export async function compactFromRow(
   }
 }
 
+/**
+ * A compaction build (run under COMPACTION_DEADLINE_MS) threw: record it against the row bytes it was built from
+ * (`noteBuildFailed`: the digest check, a malformed lineage, the deadline) and rethrow to the caller's catch. Only the
+ * build: a store error around it (reading the row, the compare-and-swap: a lock or statement timeout, a dropped
+ * connection) is transient, logged by the caller and retried after the per-page interval, never recorded.
+ */
+function buildFailed(pageId: string, digest: string, err: unknown): never {
+  noteBuildFailed(pageId, digest, isDeadlineExceeded(err));
+  throw err;
+}
+
 // --- reading the lineage and the ledger
 
-export interface LedgerEntry {
-  key: string;
-  ts: number;
-}
-
-/** The live document's #429 write-idem ledger (number-valued entries; anything else is corrupt and was pruned anyway). */
-export function ledgerOfDoc(doc: Y.Doc): LedgerEntry[] {
-  if (!doc.share.has(WRITE_IDEM_MAP)) return [];
-  const out: LedgerEntry[] = [];
-  for (const [key, ts] of doc.getMap<unknown>(WRITE_IDEM_MAP).entries()) {
-    if (typeof ts === 'number' && Number.isFinite(ts)) out.push({ key, ts });
-  }
-  return out;
-}
+/** The ledger as compaction reads and carries it (write-idem.ts owns the root: write-idem.fitness.spec.ts). */
+export { ledgerOfDoc, type LedgerEntry };
 
 export interface RowLineage extends PageCounts {
   epoch: number;
@@ -533,11 +583,7 @@ export function readRowLineage(bytes: Uint8Array): RowLineage {
   const { structs, ds } = Y.decodeUpdate(bytes);
   const epoch = lineageEpochOfStructs(structs, ds);
   if (epoch === null) throw new MalformedLineageError('epoch');
-  const { entries, unresolved } = readRootMapEntries(structs, ds, WRITE_IDEM_MAP);
-  const ledger: LedgerEntry[] = [];
-  for (const [key, { value }] of entries) {
-    if (typeof value === 'number' && Number.isFinite(value)) ledger.push({ key, ts: value });
-  }
+  const { ledger, unresolved } = ledgerOfDecoded(structs, ds);
   const clients = new Set<number>();
   for (const s of structs) clients.add(s.id.client);
   return { epoch, ledger, ledgerUnresolved: unresolved, structs: structs.length, clients: clients.size };
@@ -621,7 +667,7 @@ export function buildCompacted(
   ledger: readonly LedgerEntry[],
   epoch: number,
   at: number,
-  expected: { digest: string } | { content: unknown },
+  expected: { digest: string } | { runs: string } | { content: unknown },
 ): CompactedBuild {
   let built: Y.Doc;
   if ('tree' in source) {
@@ -635,12 +681,7 @@ export function buildCompacted(
     built = TiptapTransformer.toYdoc(source.json as never, 'default', tiptapExtensions);
   }
   try {
-    built.transact(() => {
-      if (ledger.length > 0) {
-        const map = built.getMap<number>(WRITE_IDEM_MAP);
-        for (const { key, ts } of ledger) map.set(key, ts);
-      }
-    });
+    built.transact(() => carryLedgerOver(built, ledger));
     writeLineage(built, epoch, at);
     const update = Y.encodeStateAsUpdate(built);
     const check = new Y.Doc();
@@ -651,7 +692,9 @@ export function buildCompacted(
       const same =
         'digest' in expected
           ? digest === expected.digest
-          : schemaDigest(storedProjection(check)) === schemaDigest(expected.content);
+          : 'runs' in expected
+            ? textRunsDigest(storedProjection(check)) === expected.runs
+            : schemaDigest(storedProjection(check)) === schemaDigest(expected.content);
       if (!same || lineageEpoch(check) !== epoch) throw new CompactionDigestMismatchError();
       return { update, epoch, counts: countStructs(check), digest };
     } finally {
@@ -660,6 +703,43 @@ export function buildCompacted(
   } finally {
     built.destroy();
   }
+}
+
+/**
+ * The ADR 0019 digest of a stored projection with adjacent text nodes of equal marks merged into one: the same
+ * ProseMirror document (ProseMirror itself joins such nodes), told apart only by how Yjs split the run. A live page can
+ * hold such a split (a delete of a mark's opening format item that leaves its closing one, as the #781 load repair
+ * does, keeps Yjs from cleaning the run up, and `fromYdoc` then emits two text nodes), while the rebuilt page never
+ * does; compared exactly, such a page could never compact. After its compaction the page's exact digest changes once
+ * (a conditional write that held the old one gets one 412 and re-reads).
+ */
+export function textRunsDigest(projection: unknown): string {
+  return stableHash(mergeTextRuns(projection));
+}
+
+function mergeTextRuns(node: unknown): unknown {
+  if (Array.isArray(node)) return node.map(mergeTextRuns);
+  if (node === null || typeof node !== 'object') return node;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(node)) out[k] = k === 'content' && Array.isArray(v) ? joinRuns(v) : mergeTextRuns(v);
+  return out;
+}
+
+function joinRuns(children: unknown[]): unknown[] {
+  const joined: unknown[] = [];
+  for (const raw of children) {
+    const child = mergeTextRuns(raw) as { type?: unknown; text?: unknown; marks?: unknown };
+    const last = joined[joined.length - 1] as { type?: unknown; text?: unknown; marks?: unknown } | undefined;
+    if (
+      last && last.type === 'text' && child?.type === 'text' && typeof last.text === 'string' && typeof child.text === 'string' &&
+      Object.keys(last).every((k) => k === 'type' || k === 'text' || k === 'marks') &&
+      Object.keys(child).every((k) => k === 'type' || k === 'text' || k === 'marks') &&
+      stableStringify(last.marks ?? []) === stableStringify(child.marks ?? [])
+    ) {
+      joined[joined.length - 1] = { ...last, text: last.text + child.text };
+    } else joined.push(child);
+  }
+  return joined;
 }
 
 /**
