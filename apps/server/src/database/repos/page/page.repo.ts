@@ -260,22 +260,33 @@ export class PageRepo {
     return trashedIds;
   }
 
-  async restorePage(pageId: string, workspaceId: string): Promise<void> {
+  // CCC seam (UPSTREAM_MODIFICATIONS.md #172, wiki-v2 #556): the reads and both writes run in ONE transaction — the
+  // caller's `trx` when given — so a refused detach rolls the un-trash back too. The event is then emitted before that
+  // caller commits (listeners only enqueue jobs).
+  async restorePage(
+    pageId: string,
+    workspaceId: string,
+    trx?: KyselyTransaction,
+    // CCC seam #172 (#556): a caller that decided the exact set passes it; the walk is skipped, and only those
+    // still-trashed rows are restored. Returns the ids this call restored.
+    opts?: { pageIds?: readonly string[] },
+  ): Promise<string[]> {
+    const restored = await executeTx(this.db, async (trx) => {
     // First, check if the page being restored has a deleted parent
-    const pageToRestore = await this.db
+    const pageToRestore = await trx
       .selectFrom('pages')
       .select(['id', 'parentPageId'])
       .where('id', '=', pageId)
       .executeTakeFirst();
 
     if (!pageToRestore) {
-      return;
+      return [];
     }
 
     // Check if the parent is also deleted
     let shouldDetachFromParent = false;
     if (pageToRestore.parentPageId) {
-      const parent = await this.db
+      const parent = await trx
         .selectFrom('pages')
         .select(['id', 'deletedAt'])
         .where('id', '=', pageToRestore.parentPageId)
@@ -286,7 +297,9 @@ export class PageRepo {
     }
 
     // Find all descendants to restore
-    const pages = await this.db
+    const pages = opts?.pageIds
+      ? opts.pageIds.map((id) => ({ id }))
+      : await trx
       .withRecursive('page_descendants', (db) =>
         db
           .selectFrom('pages')
@@ -304,26 +317,49 @@ export class PageRepo {
       .execute();
 
     const pageIds = pages.map((p) => p.id);
+    let restoredIds = pageIds;
 
     // Restore all pages, but only detach the root page if its parent is deleted
-    await this.db
+    if (opts?.pageIds) {
+      // CCC seam #172 (#556): exactly the decided rows that are still in the trash.
+      restoredIds =
+        pageIds.length === 0
+          ? []
+          : (
+              await trx
+                .updateTable('pages')
+                .set({ deletedById: null, deletedAt: null })
+                .where('id', 'in', pageIds)
+                .where('deletedAt', 'is not', null)
+                .returning('id')
+                .execute()
+            ).map((r) => r.id);
+    } else {
+    await trx
       .updateTable('pages')
       .set({ deletedById: null, deletedAt: null })
       .where('id', 'in', pageIds)
       .execute();
+    }
 
     // If we need to detach the restored page from its deleted parent
     if (shouldDetachFromParent) {
-      await this.db
+      await trx
         .updateTable('pages')
         .set({ parentPageId: null })
         .where('id', '=', pageId)
         .execute();
     }
+    return restoredIds;
+    }, trx);
+
+    if (restored.length > 0) {
     this.eventEmitter.emit(EventName.PAGE_RESTORED, {
-      pageIds: pageIds,
+      pageIds: restored,
       workspaceId: workspaceId,
     });
+    }
+    return restored;
   }
 
   async getRecentPagesInSpace(spaceId: string, pagination: PaginationOptions) {

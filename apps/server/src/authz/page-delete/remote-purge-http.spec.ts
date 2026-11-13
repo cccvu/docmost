@@ -35,21 +35,24 @@ import { AUTHZ_MODE, AuthzMode } from '../mode/authz-mode';
 import { RemotePurgeInterceptor } from './remote-purge.interceptor';
 import { RemotePurgeService } from './remote-purge.service';
 import { RemoteTrashService } from './remote-trash.service';
+import { RemoteRestoreService } from './remote-restore.service';
 
 /**
- * HTTP-boundary proof of #636 W6 and #661 — NOT upstream Docmost code.
+ * HTTP-boundary proof of #636 W6, #661 and #556 — NOT upstream Docmost code.
  *
  * Boots the REAL upstream PageController on Fastify with main.ts's ValidationPipe and response envelope, the REAL
  * RemotePurgeInterceptor registered the way app.module.ts registers it (a global APP_INTERCEPTOR), and the REAL
- * RemotePurgeService and RemoteTrashService over recording databases (their locking on real Postgres is
- * `remote-purge.pg.spec.ts` / `remote-trash.pg.spec.ts`). The caller is a space admin CASL allows. Proves:
+ * RemotePurgeService, RemoteTrashService and RemoteRestoreService over recording databases (their locking on real
+ * Postgres is `remote-purge.pg.spec.ts` / `remote-trash.pg.spec.ts` / `remote-restore.pg.spec.ts`). The caller is a
+ * space admin CASL allows. Proves:
  *  - remote, a restricted descendant → 403 (`purge_needs_edit`, `trash_needs_edit`) and the upstream handler is never
  *    invoked;
  *  - remote, the whole subtree editable → the routine runs and answers exactly the upstream handler's response;
  *  - anti-vacuity: the same remote request WITHOUT the interceptor reaches the handler, which purges / trashes;
  *  - the acting-service header: malformed → 400, a denied service account → 403; native mode ignores it and is
  *    unchanged;
- *  - a body the DTO would refuse is a 400 without reaching either.
+ *  - a body the DTO would refuse is a 400 without reaching either;
+ *  - the same for `POST /pages/restore` (#556): the restore routine answers the handler's page in its envelope.
  * The routines and the handler get SEPARATE stubs, so every call is attributed to the side that made it.
  */
 const USER = { id: '0198c2a1-0000-7000-8000-000000000001' };
@@ -76,6 +79,7 @@ async function bootApp(
     findById: jest.fn().mockResolvedValue(ROW),
     forceDelete: jest.fn().mockResolvedValue([ROOT, CHILD]),
     removePage: jest.fn().mockResolvedValue(undefined),
+    restorePage: jest.fn().mockResolvedValue([ROOT, CHILD]),
     validateCanEdit: jest.fn().mockResolvedValue({ hasRestriction: false }),
     createForUser: jest.fn().mockResolvedValue(allowAdmin),
     audit: jest.fn(),
@@ -119,6 +123,29 @@ async function bootApp(
     { settleProjection: trashSide.settleProjection, tryCheckBulk: trashSide.tryCheckBulk } as never,
     { log: trashSide.audit } as never,
   );
+  // The restore's collaborators: its target is in the trash, and its batch is the root and the child.
+  const restoreSpy = spyKysely((q: SpyQuery) => {
+    if (/with recursive batch/i.test(q.sql)) return [{ id: ROOT }, { id: CHILD }];
+    if (/"content"/.test(q.sql)) return [{ ...ROW, deletedAt: new Date(0) }];
+    return respond(q);
+  });
+  const restoreSide = {
+    findById: jest.fn().mockResolvedValue(ROW),
+    restorePage: jest.fn(async (_id: string, _w: string, _trx: unknown, o: { pageIds: string[] }) => [...o.pageIds]),
+    createForUser: jest.fn().mockResolvedValue(allowAdmin),
+    validateCanEdit: jest.fn().mockResolvedValue({ hasRestriction: false }),
+    settleProjection: jest.fn().mockResolvedValue({ status: 'confirmed' }),
+    tryCheckBulk: jest.fn(decide),
+    audit: jest.fn(),
+  };
+  const restore = new RemoteRestoreService(
+    restoreSpy.db,
+    { findById: restoreSide.findById, restorePage: restoreSide.restorePage } as never,
+    { createForUser: restoreSide.createForUser } as never,
+    { validateCanEdit: restoreSide.validateCanEdit } as never,
+    { settleProjection: restoreSide.settleProjection, tryCheckBulk: restoreSide.tryCheckBulk } as never,
+    { log: restoreSide.audit } as never,
+  );
   const purge = new RemotePurgeService(
     spy.db,
     { findById: purgeSide.findById } as never,
@@ -135,9 +162,10 @@ async function bootApp(
       { provide: AUTHZ_MODE, useValue: mode },
       { provide: RemotePurgeService, useValue: purge },
       { provide: RemoteTrashService, useValue: trash },
+      { provide: RemoteRestoreService, useValue: restore },
       ...(opts.interceptor === false ? [] : [{ provide: APP_INTERCEPTOR, useClass: RemotePurgeInterceptor }]),
       { provide: PageService, useValue: { forceDelete: handler.forceDelete, removePage: handler.removePage } },
-      { provide: PageRepo, useValue: { findById: handler.findById } },
+      { provide: PageRepo, useValue: { findById: handler.findById, restorePage: handler.restorePage } },
       { provide: PageHistoryService, useValue: {} },
       { provide: SpaceAbilityFactory, useValue: { createForUser: handler.createForUser } },
       { provide: PageAccessService, useValue: { validateCanEdit: handler.validateCanEdit } },
@@ -161,7 +189,7 @@ async function bootApp(
   app.useGlobalInterceptors(new TransformHttpResponseInterceptor(app.get(Reflector)));
   await app.init();
   await app.getHttpAdapter().getInstance().ready();
-  return { app, handler, purgeSide, trashSide, spy, trashSpy };
+  return { app, handler, purgeSide, trashSide, restoreSide, spy, trashSpy, restoreSpy };
 }
 
 const del = (app: NestFastifyApplication, payload: unknown, headers: Record<string, string> = {}) =>
@@ -172,12 +200,26 @@ const del = (app: NestFastifyApplication, payload: unknown, headers: Record<stri
     payload: JSON.stringify(payload),
   });
 
+const restoreReq = (app: NestFastifyApplication, payload: unknown, headers: Record<string, string> = {}) =>
+  app.inject({
+    method: 'POST',
+    url: '/pages/restore',
+    headers: { 'content-type': 'application/json', ...headers },
+    payload: JSON.stringify(payload),
+  });
+
 type Booted = Awaited<ReturnType<typeof bootApp>>;
 const handlerUntouched = (h: Booted) => {
   expect(h.handler.findById).not.toHaveBeenCalled();
   expect(h.handler.forceDelete).not.toHaveBeenCalled();
   expect(h.handler.removePage).not.toHaveBeenCalled();
+  expect(h.handler.restorePage).not.toHaveBeenCalled();
   expect(h.handler.audit).not.toHaveBeenCalled();
+};
+const restoreUntouched = (h: Booted) => {
+  expect(h.restoreSide.findById).not.toHaveBeenCalled();
+  expect(h.restoreSide.restorePage).not.toHaveBeenCalled();
+  expect(h.restoreSpy.tx).toEqual([]);
 };
 const purgeUntouched = (h: Booted) => {
   expect(h.purgeSide.findById).not.toHaveBeenCalled();
@@ -358,5 +400,89 @@ describe('native permanent delete — AUTHZ_MODE=native (standalone preserved)',
     const res = await del(h.app, { pageId: ROOT, permanentlyDelete: 'true' });
     expect(res.statusCode).toBe(HttpStatus.BAD_REQUEST);
     handlerUntouched(h);
+  });
+});
+
+describe('native restore (#556)', () => {
+  let h: Booted | undefined;
+  afterEach(async () => {
+    await h?.app.close();
+    h = undefined;
+  });
+
+  it('remote, a batch page the caller cannot edit → 403 restore_needs_edit; the upstream handler is never invoked; nothing restored', async () => {
+    h = await bootApp('remote', { restricted: [CHILD] });
+    const res = await restoreReq(h.app, { pageId: ROOT });
+    expect(res.statusCode).toBe(HttpStatus.FORBIDDEN);
+    expect(res.json()).toMatchObject({ code: 'restore_needs_edit' });
+    handlerUntouched(h);
+    expect(h.restoreSide.restorePage).not.toHaveBeenCalled();
+    expect(h.restoreSide.audit).not.toHaveBeenCalled();
+    expect(h.restoreSpy.tx).toEqual(['begin', 'rollback', 'begin', 'rollback']); // fenced once, then refused
+  });
+
+  it('remote, the batch editable → the routine restores exactly the batch and answers exactly the upstream handler’s response', async () => {
+    h = await bootApp('remote');
+    const res = await restoreReq(h.app, { pageId: ROOT });
+    expect(res.statusCode).toBe(HttpStatus.OK);
+    handlerUntouched(h);
+    expect(h.restoreSide.restorePage).toHaveBeenCalledWith(ROOT, WORKSPACE.id, expect.anything(), {
+      pageIds: [ROOT, CHILD].sort(),
+    });
+    expect(h.restoreSide.audit).toHaveBeenCalledWith(expect.objectContaining({ event: 'page.restored', resourceId: ROOT }));
+    expect(h.restoreSpy.tx).toEqual(['begin', 'commit']);
+    expect(res.json()).toEqual({ data: ROW, success: true, status: 200 });
+
+    const native = await bootApp('native');
+    try {
+      const nativeRes = await restoreReq(native.app, { pageId: ROOT });
+      expect(native.handler.restorePage).toHaveBeenCalledWith(ROOT, WORKSPACE.id);
+      expect([res.statusCode, res.body]).toEqual([nativeRes.statusCode, nativeRes.body]);
+    } finally {
+      await native.app.close();
+    }
+  });
+
+  it('anti-vacuity: WITHOUT the interceptor the same remote request reaches the upstream handler, which restores', async () => {
+    h = await bootApp('remote', { interceptor: false, restricted: [CHILD] });
+    const res = await restoreReq(h.app, { pageId: ROOT });
+    expect(res.statusCode).toBe(HttpStatus.OK);
+    expect(h.handler.restorePage).toHaveBeenCalledWith(ROOT, WORKSPACE.id);
+    restoreUntouched(h);
+  });
+
+  it('the acting-service header: malformed → 400 acting_service_invalid; a service account the PDP denies → 403 (#670)', async () => {
+    h = await bootApp('remote', { saDenied: true });
+    const bad = await restoreReq(h.app, { pageId: ROOT }, { 'x-ccc-acting-service': 'svc-1' });
+    expect([bad.statusCode, bad.json().code]).toEqual([HttpStatus.BAD_REQUEST, 'acting_service_invalid']);
+    restoreUntouched(h);
+    const denied = await restoreReq(h.app, { pageId: ROOT }, { 'x-ccc-acting-service': SA });
+    expect([denied.statusCode, denied.json().code]).toEqual([HttpStatus.FORBIDDEN, 'restore_needs_edit']);
+    expect(h.restoreSide.restorePage).not.toHaveBeenCalled();
+    handlerUntouched(h);
+    // Allowed when the header is absent: the deny was the service leg's.
+    expect((await restoreReq(h.app, { pageId: ROOT })).statusCode).toBe(HttpStatus.OK);
+  });
+
+  it.each([
+    ['no pageId', {}],
+    ['an empty pageId', { pageId: '' }],
+    ['a non-string pageId', { pageId: 42 }],
+  ])('%s → 400, neither the handler nor the routine runs', async (_l, payload) => {
+    h = await bootApp('remote');
+    const res = await restoreReq(h.app, payload);
+    expect(res.statusCode).toBe(HttpStatus.BAD_REQUEST);
+    handlerUntouched(h);
+    restoreUntouched(h);
+  });
+
+  it('native mode: the upstream handler decides and restores; the routine is never touched and the header is ignored', async () => {
+    h = await bootApp('native', { restricted: [CHILD] });
+    const res = await restoreReq(h.app, { pageId: ROOT }, { 'x-ccc-acting-service': 'not-an-id' });
+    expect(res.statusCode).toBe(HttpStatus.OK);
+    expect(h.handler.validateCanEdit).toHaveBeenCalled();
+    expect(h.handler.restorePage).toHaveBeenCalledWith(ROOT, WORKSPACE.id);
+    expect(h.handler.audit).toHaveBeenCalledWith(expect.objectContaining({ event: 'page.restored' }));
+    restoreUntouched(h);
   });
 });

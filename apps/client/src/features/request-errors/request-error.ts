@@ -44,6 +44,12 @@ export function retryAfterMs(error: unknown): number | null {
   return Number.isFinite(seconds) && seconds > 0 ? seconds * 1000 : null;
 }
 
+function clampServerMessage(server: string): string {
+  return server.length > MAX_SERVER_MESSAGE_CHARS
+    ? `${server.slice(0, MAX_SERVER_MESSAGE_CHARS - 1)}…`
+    : server;
+}
+
 function rateLimitMessage(error: unknown, t: Translate): string {
   // Only a string `message` is a human sentence (the WAF's is); an array is a validation shape, and an HTML
   // body has no `message` at all. getApiErrorMessage still does the blank-safe read.
@@ -52,11 +58,7 @@ function rateLimitMessage(error: unknown, t: Translate): string {
     : undefined;
   const server =
     typeof message === "string" ? getApiErrorMessage(error, "").trim() : "";
-  if (server) {
-    return server.length > MAX_SERVER_MESSAGE_CHARS
-      ? `${server.slice(0, MAX_SERVER_MESSAGE_CHARS - 1)}…`
-      : server;
-  }
+  if (server) return clampServerMessage(server);
   const ms = retryAfterMs(error);
   if (ms === null) {
     return t("Too many requests. Please wait a minute, then try again.");
@@ -79,4 +81,31 @@ export function requestErrorMessage(
   }
   const status = errorStatus(error);
   return status === null ? fallback : `${fallback} (HTTP ${status})`;
+}
+
+// wiki-v2 #556: a refusal the server explains — a 403 or 409 whose JSON body carries a machine `code` next to its
+// sentence (the fork's fixed texts, e.g. a restore refused because it would take a page out of its restricted
+// section: "nothing was restored") — is shown in the server's words, bounded. Anything else (a bare 403, a 5xx, the
+// network) gets requestErrorMessage's answer, so a toast never shows an unexplained server string.
+export function refusalMessage(
+  error: unknown,
+  t: Translate,
+  fallback: string,
+): string {
+  const status = errorStatus(error);
+  if (isAxiosError(error) && (status === 403 || status === 409)) {
+    const data: unknown = error.response?.data;
+    const body =
+      data && typeof data === "object"
+        ? (data as { code?: unknown; message?: unknown })
+        : {};
+    if (
+      typeof body.code === "string" &&
+      typeof body.message === "string" &&
+      body.message.trim()
+    ) {
+      return clampServerMessage(body.message.trim());
+    }
+  }
+  return requestErrorMessage(error, t, fallback);
 }
