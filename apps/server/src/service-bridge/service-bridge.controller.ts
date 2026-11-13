@@ -16,6 +16,8 @@ import { RequireServiceScope, ServiceAuthGuard } from './service-auth.guard';
 import { ServiceScope } from './service-scope';
 import { MintSessionDto } from './dto/mint-session.dto';
 import { SessionExternalIdDto } from './dto/session-external-id.dto';
+import { RevokeOtherSessionsDto } from './dto/revoke-other-sessions.dto';
+import { RevokeOtherSessionsResult, SessionRevokeOthersService } from './session-revoke-others.service';
 import { ProvisionUserDto } from './dto/provision-user.dto';
 import { ResolveUserDto } from './dto/resolve-user.dto';
 import { LookupUsersDto } from './dto/lookup-users.dto';
@@ -38,6 +40,7 @@ export class ServiceBridgeController {
     private readonly service: ServiceBridgeService,
     private readonly environmentService: EnvironmentService,
     private readonly workspaces: WorkspaceResolver,
+    private readonly revokeOthers: SessionRevokeOthersService,
   ) {}
 
   @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
@@ -112,6 +115,19 @@ export class ServiceBridgeController {
     // CollabDisconnectModule — the collab/lib0 graph must NOT enter this module's jest-loadable import
     // chain). `userId` is null for a never-provisioned identity (a benign no-op).
     return this.service.deactivateShadowUser(dto.externalId);
+  }
+
+  @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)
+
+  @Post('session/revoke-others')
+  @HttpCode(HttpStatus.OK)
+  @RequireServiceScope(ServiceScope.SessionRevokeOthers)
+  async revokeOtherSessions(@Body() dto: RevokeOtherSessionsDto): Promise<RevokeOtherSessionsResult> {
+    // wiki-v2 #818: sign the identity out of every wiki session except the one `keepToken` proves (passkey
+    // removal). Never deactivates. The fork verifies the token itself; anything it cannot verify keeps nothing.
+    // The caller then force-closes the user's open sockets via `POST /api/collab/force-disconnect-user`; the
+    // kept session's tabs reconnect, the others are refused at connect.
+    return this.revokeOthers.revokeOtherSessions(dto.externalId, dto.keepToken);
   }
 
   @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)

@@ -19,15 +19,42 @@ vi.mock("@/features/auth/services/auth-service", () => ({
 
 vi.mock("@/features/public/services/public-service.ts", () => ({
   requestPasswordless: vi.fn(async () => ({ message: "ok" })),
-  verifyPasswordless: vi.fn(async () => ({ id: "u1", email: "a@b.edu", workspaceId: "ws" })),
+  verifyPasswordless: vi.fn(async () => ({
+    id: "u1",
+    email: "a@b.edu",
+    workspaceId: "ws",
+  })),
 }));
 
 vi.mock("@mantine/notifications", () => ({ notifications: { show: vi.fn() } }));
-vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (s: string) => s }) }));
 
-import { logout, openDocmostSession } from "@/features/auth/services/auth-service";
-import { requestPasswordless, verifyPasswordless } from "@/features/public/services/public-service.ts";
-import { usePasswordless } from "@/features/public/hooks/use-passwordless.ts";
+// #818: the nudge's two inputs (a built-in authenticator; "Don't ask again on this device").
+const nudge = vi.hoisted(() => ({
+  platformAuthenticator: vi.fn(async (): Promise<boolean> => false),
+  dismissed: vi.fn((): boolean => false),
+}));
+vi.mock("@/features/passkeys/lib/capabilities.ts", () => ({
+  platformAuthenticatorAvailable: () => nudge.platformAuthenticator(),
+}));
+vi.mock("@/features/passkeys/lib/nudge-storage.ts", () => ({
+  isPasskeyNudgeDismissed: () => nudge.dismissed(),
+}));
+vi.mock("react-i18next", () => ({
+  useTranslation: () => ({ t: (s: string) => s }),
+}));
+
+import {
+  logout,
+  openDocmostSession,
+} from "@/features/auth/services/auth-service";
+import {
+  requestPasswordless,
+  verifyPasswordless,
+} from "@/features/public/services/public-service.ts";
+import {
+  usePasswordless,
+  type VerifiedSignIn,
+} from "@/features/public/hooks/use-passwordless.ts";
 import { notifications } from "@mantine/notifications";
 
 describe("usePasswordless().completeSignIn — verify → BFF bridge → navigate", () => {
@@ -40,7 +67,9 @@ describe("usePasswordless().completeSignIn — verify → BFF bridge → navigat
       await result.current.completeSignIn({ token: "raw-link-token" });
     });
 
-    expect(verifyPasswordless).toHaveBeenCalledWith({ token: "raw-link-token" });
+    expect(verifyPasswordless).toHaveBeenCalledWith({
+      token: "raw-link-token",
+    });
     expect(openDocmostSession).toHaveBeenCalledTimes(1);
     expect(navigateMock).toHaveBeenCalledTimes(1);
 
@@ -58,7 +87,9 @@ describe("usePasswordless().completeSignIn — verify → BFF bridge → navigat
     const { result } = renderHook(() => usePasswordless());
 
     await act(async () => {
-      await expect(result.current.completeSignIn({ email: "a@b.edu", otp: "123456" })).rejects.toThrow();
+      await expect(
+        result.current.completeSignIn({ email: "a@b.edu", otp: "123456" }),
+      ).rejects.toThrow();
     });
 
     expect(logout).toHaveBeenCalledTimes(1); // platform session rolled back
@@ -125,11 +156,19 @@ describe("usePasswordless().completeSignIn — OAuth resume (#302)", () => {
   });
 
   afterEach(() => {
-    Object.defineProperty(window, "location", { configurable: true, value: realLocation });
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: realLocation,
+    });
   });
 
   it("on resume: bridges best-effort, then FULL-PAGE navigates to /oauth/authorize (never SPA navigate)", async () => {
-    (verifyPasswordless as any).mockResolvedValueOnce({ id: "u1", email: "a@b.edu", workspaceId: "ws", resume: true });
+    (verifyPasswordless as any).mockResolvedValueOnce({
+      id: "u1",
+      email: "a@b.edu",
+      workspaceId: "ws",
+      resume: true,
+    });
     const { result } = renderHook(() => usePasswordless());
 
     await act(async () => {
@@ -142,13 +181,20 @@ describe("usePasswordless().completeSignIn — OAuth resume (#302)", () => {
     expect(navigateMock).not.toHaveBeenCalled(); // NOT a client-side SPA navigate (would 404 on a platform route)
     expect(logout).not.toHaveBeenCalled();
     // the bridge runs before the resume navigation
-    expect((openDocmostSession as any).mock.invocationCallOrder[0]).toBeLessThan(assign.mock.invocationCallOrder[0]);
+    expect(
+      (openDocmostSession as any).mock.invocationCallOrder[0],
+    ).toBeLessThan(assign.mock.invocationCallOrder[0]);
     // The spinner stays UP through the full-page redirect (never re-enable the button mid-nav → no double-submit).
     expect(result.current.isVerifying).toBe(true);
   });
 
   it("on resume: a bridge FAILURE is non-fatal — still resumes /oauth/authorize and does NOT logout (platform session preserved)", async () => {
-    (verifyPasswordless as any).mockResolvedValueOnce({ id: "u1", email: "a@b.edu", workspaceId: "ws", resume: true });
+    (verifyPasswordless as any).mockResolvedValueOnce({
+      id: "u1",
+      email: "a@b.edu",
+      workspaceId: "ws",
+      resume: true,
+    });
     (openDocmostSession as any).mockRejectedValueOnce(new Error("bridge down"));
     const { result } = renderHook(() => usePasswordless());
 
@@ -170,14 +216,23 @@ describe("usePasswordless().completeSignIn — first self-service sign-in notice
   beforeEach(() => vi.clearAllMocks());
 
   it("provisioned: true → one sticky notice, shown after the bridge and before navigating", async () => {
-    (verifyPasswordless as any).mockResolvedValueOnce({ id: "u1", email: "a@b.edu", workspaceId: "ws", provisioned: true });
+    (verifyPasswordless as any).mockResolvedValueOnce({
+      id: "u1",
+      email: "a@b.edu",
+      workspaceId: "ws",
+      provisioned: true,
+    });
     const { result } = renderHook(() => usePasswordless());
     await act(async () => {
       await result.current.completeSignIn({ token: "raw-link-token" });
     });
     expect(notifications.show).toHaveBeenCalledTimes(1);
     const shown = (notifications.show as any).mock.calls[0][0];
-    expect(shown).toMatchObject({ id: "account-provisioned", title: "Your account is ready", autoClose: false });
+    expect(shown).toMatchObject({
+      id: "account-provisioned",
+      title: "Your account is ready",
+      autoClose: false,
+    });
     expect(shown.message).toMatch(/basic access/i);
     // Neutral: no address, domain or institution name in the notice.
     expect(JSON.stringify(shown)).not.toMatch(/@|\.edu|\.org/i);
@@ -187,22 +242,37 @@ describe("usePasswordless().completeSignIn — first self-service sign-in notice
     expect(noticeOrder).toBeLessThan(navigateMock.mock.invocationCallOrder[0]);
   });
 
-  it.each([undefined, false])("provisioned: %s → no notice (an ordinary sign-in)", async (provisioned) => {
-    (verifyPasswordless as any).mockResolvedValueOnce({ id: "u1", email: "a@b.edu", workspaceId: "ws", provisioned });
-    const { result } = renderHook(() => usePasswordless());
-    await act(async () => {
-      await result.current.completeSignIn({ token: "raw-link-token" });
-    });
-    expect(notifications.show).not.toHaveBeenCalled();
-    expect(navigateMock).toHaveBeenCalledTimes(1);
-  });
+  it.each([undefined, false])(
+    "provisioned: %s → no notice (an ordinary sign-in)",
+    async (provisioned) => {
+      (verifyPasswordless as any).mockResolvedValueOnce({
+        id: "u1",
+        email: "a@b.edu",
+        workspaceId: "ws",
+        provisioned,
+      });
+      const { result } = renderHook(() => usePasswordless());
+      await act(async () => {
+        await result.current.completeSignIn({ token: "raw-link-token" });
+      });
+      expect(notifications.show).not.toHaveBeenCalled();
+      expect(navigateMock).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("no notice when the bridge fails (the sign-in was rolled back)", async () => {
-    (verifyPasswordless as any).mockResolvedValueOnce({ id: "u1", email: "a@b.edu", workspaceId: "ws", provisioned: true });
+    (verifyPasswordless as any).mockResolvedValueOnce({
+      id: "u1",
+      email: "a@b.edu",
+      workspaceId: "ws",
+      provisioned: true,
+    });
     (openDocmostSession as any).mockRejectedValueOnce(new Error("bridge down"));
     const { result } = renderHook(() => usePasswordless());
     await act(async () => {
-      await expect(result.current.completeSignIn({ token: "raw-link-token" })).rejects.toThrow();
+      await expect(
+        result.current.completeSignIn({ token: "raw-link-token" }),
+      ).rejects.toThrow();
     });
     expect(notifications.show).not.toHaveBeenCalled();
   });
@@ -214,7 +284,10 @@ describe("usePasswordless().requestEmail — a 429 says to wait (#815)", () => {
   beforeEach(() => vi.clearAllMocks());
 
   const http = (status: number, headers: Record<string, string> = {}) =>
-    Object.assign(new Error(`HTTP ${status}`), { isAxiosError: true, response: { status, headers, data: {} } });
+    Object.assign(new Error(`HTTP ${status}`), {
+      isAxiosError: true,
+      response: { status, headers, data: {} },
+    });
 
   it("429 without Retry-After → the honest 'wait a few minutes' text, and false", async () => {
     (requestPasswordless as any).mockRejectedValueOnce(http(429));
@@ -230,7 +303,9 @@ describe("usePasswordless().requestEmail — a 429 says to wait (#815)", () => {
   });
 
   it("429 with Retry-After → names that wait, and hands it to the page (onRetryAfter)", async () => {
-    (requestPasswordless as any).mockRejectedValueOnce(http(429, { "retry-after": "60" }));
+    (requestPasswordless as any).mockRejectedValueOnce(
+      http(429, { "retry-after": "60" }),
+    );
     const { result } = renderHook(() => usePasswordless());
     const onRetryAfter = vi.fn();
     await act(async () => {
@@ -249,6 +324,288 @@ describe("usePasswordless().requestEmail — a 429 says to wait (#815)", () => {
     await act(async () => {
       await result.current.requestEmail("a@b.edu");
     });
-    expect((notifications.show as any).mock.calls[0][0].message).toMatch(/couldn't send a sign-in email/);
+    expect((notifications.show as any).mock.calls[0][0].message).toMatch(
+      /couldn't send a sign-in email/,
+    );
   });
+});
+
+// #818 — the shared post-verify tail takes a pluggable verifier (a passkey sign-in uses the same order: verify → BFF
+// bridge → resume or screen or navigate), and may hold a full-page screen before navigating: the nudge after an email
+// sign-in, the reminder after a passkey sign-in. Never on an OAuth resume, and only for a caller that renders them.
+describe("usePasswordless().completeSignInWith — pluggable verifier and post-sign-in screens (#818)", () => {
+  const realLocation = window.location;
+  let assign: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    nudge.platformAuthenticator.mockImplementation(async () => false);
+    nudge.dismissed.mockImplementation(() => false);
+    assign = vi.fn();
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: {
+        ...realLocation,
+        href: "http://localhost:5173/login",
+        pathname: "/login",
+        search: "",
+        hash: "",
+        assign,
+      },
+    });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    Object.defineProperty(window, "location", {
+      configurable: true,
+      value: realLocation,
+    });
+  });
+
+  // A verify body (PasskeySignInResponse-shaped); `extra` may carry deliberately malformed members.
+  const passkeyRes = (extra: Record<string, unknown> = {}): VerifiedSignIn =>
+    ({
+      id: "u1",
+      email: "a@b.edu",
+      workspaceId: "ws",
+      ...extra,
+    }) as VerifiedSignIn;
+
+  it("calls the verifier synchronously (before its first await), then bridge, then navigate", async () => {
+    const verify = vi.fn(async () => passkeyRes());
+    const { result } = renderHook(() => usePasswordless());
+    let pending!: Promise<void>;
+    act(() => {
+      pending = result.current.completeSignInWith(verify, {
+        method: "passkey",
+      });
+      // Safari's gesture rule: the ceremony's fetch must start inside the click's own call stack.
+      expect(verify).toHaveBeenCalledTimes(1);
+    });
+    await act(async () => {
+      await pending;
+    });
+    expect(verify.mock.invocationCallOrder[0]).toBeLessThan(
+      (openDocmostSession as any).mock.invocationCallOrder[0],
+    );
+    expect(
+      (openDocmostSession as any).mock.invocationCallOrder[0],
+    ).toBeLessThan(navigateMock.mock.invocationCallOrder[0]);
+    expect(verifyPasswordless).not.toHaveBeenCalled();
+  });
+
+  it("a refused verifier neither bridges nor navigates, and the error reaches the caller", async () => {
+    const refusal = new Error("passkey refused");
+    const { result } = renderHook(() => usePasswordless());
+    await act(async () => {
+      await expect(
+        result.current.completeSignInWith(async () => Promise.reject(refusal), {
+          method: "passkey",
+          screens: true,
+        }),
+      ).rejects.toBe(refusal);
+    });
+    expect(openDocmostSession).not.toHaveBeenCalled();
+    expect(navigateMock).not.toHaveBeenCalled();
+    expect(result.current.isVerifying).toBe(false);
+  });
+
+  it("a passkey sign-in's bridge failure rolls back exactly like the email path", async () => {
+    (openDocmostSession as any).mockRejectedValueOnce(new Error("bridge down"));
+    const { result } = renderHook(() => usePasswordless());
+    let caught: any;
+    await act(async () => {
+      caught = await result.current
+        .completeSignInWith(
+          async () => passkeyRes({ emailConfirmationDueDays: 3 }),
+          { method: "passkey", screens: true },
+        )
+        .catch((e) => e);
+    });
+    expect(caught.stage).toBe("bridge");
+    expect(logout).toHaveBeenCalledTimes(1);
+    expect(result.current.postSignIn).toBeNull();
+    expect(navigateMock).not.toHaveBeenCalled();
+  });
+
+  it("email sign-in + built-in authenticator + not dismissed → the nudge, after the bridge, instead of navigating", async () => {
+    nudge.platformAuthenticator.mockImplementation(async () => true);
+    const { result } = renderHook(() => usePasswordless());
+    await act(async () => {
+      await result.current.completeSignIn(
+        { email: "a@b.edu", otp: "123456" },
+        { screens: true },
+      );
+    });
+    expect(result.current.postSignIn).toEqual({ kind: "nudge" });
+    expect(navigateMock).not.toHaveBeenCalled();
+    expect(openDocmostSession).toHaveBeenCalledTimes(1);
+    // The screen is decided only once the wiki session is open (it would be a lie on a rolled-back sign-in).
+    expect(
+      (openDocmostSession as any).mock.invocationCallOrder[0],
+    ).toBeLessThan(nudge.platformAuthenticator.mock.invocationCallOrder[0]);
+    expect(result.current.isVerifying).toBe(false);
+
+    act(() => result.current.continueAfterSignIn());
+    expect(result.current.postSignIn).toBeNull();
+    expect(navigateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("no nudge when this device said 'Don't ask again', or has no built-in authenticator", async () => {
+    nudge.platformAuthenticator.mockImplementation(async () => true);
+    nudge.dismissed.mockImplementation(() => true);
+    const { result } = renderHook(() => usePasswordless());
+    await act(async () => {
+      await result.current.completeSignIn(
+        { email: "a@b.edu", otp: "123456" },
+        { screens: true },
+      );
+    });
+    expect(result.current.postSignIn).toBeNull();
+    expect(navigateMock).toHaveBeenCalledTimes(1);
+
+    nudge.dismissed.mockImplementation(() => false);
+    nudge.platformAuthenticator.mockImplementation(async () => false);
+    await act(async () => {
+      await result.current.completeSignIn(
+        { email: "a@b.edu", otp: "123456" },
+        { screens: true },
+      );
+    });
+    expect(result.current.postSignIn).toBeNull();
+    expect(navigateMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("a built-in-authenticator probe that never answers does not hold the person: navigate after the bound", async () => {
+    vi.useFakeTimers();
+    nudge.platformAuthenticator.mockImplementation(
+      () => new Promise<boolean>(() => {}),
+    );
+    const { result } = renderHook(() => usePasswordless());
+    let pending!: Promise<void>;
+    act(() => {
+      pending = result.current.completeSignIn(
+        { email: "a@b.edu", otp: "123456" },
+        { screens: true },
+      );
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2000);
+      await pending;
+    });
+    expect(result.current.postSignIn).toBeNull();
+    expect(navigateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("a caller that renders no screens (the magic-link page) navigates as before, even when the nudge would show", async () => {
+    nudge.platformAuthenticator.mockImplementation(async () => true);
+    const { result } = renderHook(() => usePasswordless());
+    await act(async () => {
+      await result.current.completeSignIn({ token: "raw-link-token" });
+    });
+    expect(result.current.postSignIn).toBeNull();
+    expect(navigateMock).toHaveBeenCalledTimes(1);
+    expect(nudge.platformAuthenticator).not.toHaveBeenCalled();
+  });
+
+  it("nudge:false (a passkey's 90-day email re-confirmation) withholds the nudge and navigates", async () => {
+    nudge.platformAuthenticator.mockImplementation(async () => true);
+    const { result } = renderHook(() => usePasswordless());
+    await act(async () => {
+      await result.current.completeSignIn(
+        { email: "a@b.edu", otp: "123456" },
+        { screens: true, nudge: false },
+      );
+    });
+    expect(result.current.postSignIn).toBeNull();
+    expect(navigateMock).toHaveBeenCalledTimes(1);
+    expect(nudge.platformAuthenticator).not.toHaveBeenCalled();
+  });
+
+  it("a passkey sign-in never nudges (it already used a passkey)", async () => {
+    nudge.platformAuthenticator.mockImplementation(async () => true);
+    const { result } = renderHook(() => usePasswordless());
+    await act(async () => {
+      await result.current.completeSignInWith(async () => passkeyRes(), {
+        method: "passkey",
+        screens: true,
+      });
+    });
+    expect(result.current.postSignIn).toBeNull();
+    expect(navigateMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("passkey sign-in with emailConfirmationDueDays → the reminder with those days, not a navigation", async () => {
+    const { result } = renderHook(() => usePasswordless());
+    await act(async () => {
+      await result.current.completeSignInWith(
+        async () => passkeyRes({ emailConfirmationDueDays: 12 }),
+        {
+          method: "passkey",
+          screens: true,
+        },
+      );
+    });
+    expect(result.current.postSignIn).toEqual({
+      kind: "reminder",
+      daysLeft: 12,
+    });
+    expect(navigateMock).not.toHaveBeenCalled();
+  });
+
+  it.each([0, 31, 1.5, "5", null, -1])(
+    "emailConfirmationDueDays %s is not a reminder (outside 1–30 or not an integer)",
+    async (days) => {
+      const { result } = renderHook(() => usePasswordless());
+      await act(async () => {
+        await result.current.completeSignInWith(
+          async () => passkeyRes({ emailConfirmationDueDays: days }),
+          {
+            method: "passkey",
+            screens: true,
+          },
+        );
+      });
+      expect(result.current.postSignIn).toBeNull();
+      expect(navigateMock).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it("an email sign-in carrying emailConfirmationDueDays is still a nudge question, never a reminder", async () => {
+    (verifyPasswordless as any).mockResolvedValueOnce(
+      passkeyRes({ emailConfirmationDueDays: 4 }),
+    );
+    const { result } = renderHook(() => usePasswordless());
+    await act(async () => {
+      await result.current.completeSignIn(
+        { email: "a@b.edu", otp: "123456" },
+        { screens: true },
+      );
+    });
+    expect(result.current.postSignIn).toBeNull();
+  });
+
+  it.each([
+    ["nudge", "email" as const, {}],
+    ["reminder", "passkey" as const, { emailConfirmationDueDays: 2 }],
+  ])(
+    "OAuth resume: never the %s screen; full-page resume as before",
+    async (_name, method, extra) => {
+      nudge.platformAuthenticator.mockImplementation(async () => true);
+      const { result } = renderHook(() => usePasswordless());
+      await act(async () => {
+        await result.current.completeSignInWith(
+          async () => passkeyRes({ resume: true, ...extra }),
+          {
+            method,
+            screens: true,
+          },
+        );
+      });
+      expect(result.current.postSignIn).toBeNull();
+      expect(assign).toHaveBeenCalledWith("/oauth/authorize");
+      expect(navigateMock).not.toHaveBeenCalled();
+      expect(nudge.platformAuthenticator).not.toHaveBeenCalled();
+    },
+  );
 });

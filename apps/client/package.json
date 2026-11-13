@@ -30,6 +30,7 @@
     "@mantine/modals": "9.3.2",
     "@mantine/notifications": "9.3.2",
     "@mantine/spotlight": "9.3.2",
+    "@simplewebauthn/browser": "14.0.0",
     "@slidoapp/emoji-mart": "5.8.7",
     "@slidoapp/emoji-mart-data": "1.2.4",
     "@slidoapp/emoji-mart-react": "1.1.5",

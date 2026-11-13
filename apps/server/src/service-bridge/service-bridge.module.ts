@@ -37,6 +37,9 @@ import { ServiceGroupController } from './service-group.controller';
 import { ServiceGroupService } from './service-group.service';
 import { SpaceGrantCeiling } from './space-grant-ceiling';
 import { HttpAuthzClient } from '../authz/http-authz.client';
+// wiki-v2 #818: revoke-others verifies the caller's keep token with the fork's own TokenService.
+import { TokenModule } from '../core/auth/token.module';
+import { SessionRevokeOthersService } from './session-revoke-others.service';
 
 /**
  * CCC service-bridge — NOT upstream Docmost code.
@@ -51,7 +54,7 @@ import { HttpAuthzClient } from '../authz/http-authz.client';
  * ENFORCEMENT in native mode, not by the accident of a missing secret.
  */
 @Module({
-  imports: [SearchModule, IdempotencyLedgerModule],
+  imports: [SearchModule, IdempotencyLedgerModule, TokenModule],
   controllers: [
     ServiceBridgeController,
     ServiceWorkspaceController,
@@ -83,6 +86,7 @@ import { HttpAuthzClient } from '../authz/http-authz.client';
     ServiceGroupService, // #797 (appended)
     SpaceGrantCeiling, // #797 INV-2 (appended)
     HttpAuthzClient, // #797: the ceiling's PDP client (stateless; each authz module provides its own)
+    SessionRevokeOthersService, // wiki-v2 #818 (appended)
     // #493/#545: the page guards' DB refusals → 409 (inner to AppModule's audit interceptor; see the class).
     { provide: APP_INTERCEPTOR, useClass: PageGuardConflictInterceptor },
   ],

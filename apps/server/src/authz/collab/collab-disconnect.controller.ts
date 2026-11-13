@@ -65,8 +65,11 @@ export class CollabDisconnectController {
    * #455 — account-disable per-user disconnect: force-close EVERY live REALTIME socket for a user
    * (node-local), across BOTH planes — the collab editor sockets (Hocuspocus) AND the notifications/tree
    * socket.io sockets. Invoked by the platform ONLY after `/api/service/session/revoke` has set the shadow
-   * user's `deactivatedAt` — a precise, whole-identity signal — so, UNLIKE `revalidate` above (which
-   * re-checks each connection against the PDP), this closes the sockets unconditionally: the residual it targets is a continuously-open socket with no
+   * user's `deactivatedAt`, or after `/api/service/session/revoke-others` has revoked every other wiki session of
+   * the user (wiki-v2 #818, passkey removal) — each a precise, whole-identity signal — so, UNLIKE `revalidate`
+   * above (which re-checks each connection against the PDP), this closes the sockets unconditionally. After
+   * revoke-others the tabs on the kept session reconnect once (their session is still live); the others are
+   * refused at connect (`isWsConnectionLive`). The residual it targets is a continuously-open socket with no
    * per-message re-auth (a collab editor; a ping-kept-alive notifications feed of titles/renames/comments).
    * Service-secret gated; an erroneous call only forces a transient reconnect that an active user
    * re-authenticates fine. See collaboration.gateway.ts / ws.gateway.ts `forceDisconnectUser` for the
