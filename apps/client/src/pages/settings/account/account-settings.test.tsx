@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, beforeEach, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { MantineProvider } from "@mantine/core";
 
-// CCC (wiki-v2 UI cleanup): Email and Sessions are native-only; the EE MFA section is never mounted.
+// CCC (wiki-v2 UI cleanup): Email is native-only; Sessions show in both modes; the EE MFA section is never mounted.
 const nativeState = vi.hoisted(() => ({ value: false }));
 vi.mock("@/features/auth-native/lib/auth-mode.ts", () => ({
   isNativeAuthEnabled: () => nativeState.value,
@@ -61,17 +61,18 @@ function renderPage() {
 }
 
 describe("AccountSettings", () => {
-  it("remote mode: shows avatar and name only (no shadow email, no wiki-token sessions)", () => {
+  it("remote mode: shows avatar, name and Sessions (no shadow email)", () => {
     renderPage();
     expect(screen.getByTestId("avatar")).toBeTruthy();
     expect(screen.getByTestId("name")).toBeTruthy();
     expect(screen.queryByTestId("change-email")).toBeNull();
-    expect(screen.queryByTestId("session-list")).toBeNull();
+    // "Log out of all devices" is the only self-service way to end other-device wiki sessions (ADR 0034).
+    expect(screen.getByTestId("session-list")).toBeTruthy();
     expect(screen.queryByTestId("mfa")).toBeNull();
-    expect(document.querySelectorAll(".mantine-Divider-root")).toHaveLength(0);
+    expect(screen.queryAllByRole("separator")).toHaveLength(1);
   });
 
-  it("native mode: also shows Email and Sessions, each after one divider", () => {
+  it("native mode: also shows Email, Email and Sessions each after one divider", () => {
     nativeState.value = true;
     renderPage();
     expect(screen.getByTestId("avatar")).toBeTruthy();
@@ -79,6 +80,6 @@ describe("AccountSettings", () => {
     expect(screen.getByTestId("change-email")).toBeTruthy();
     expect(screen.getByTestId("session-list")).toBeTruthy();
     expect(screen.queryByTestId("mfa")).toBeNull();
-    expect(document.querySelectorAll(".mantine-Divider-root")).toHaveLength(2);
+    expect(screen.queryAllByRole("separator")).toHaveLength(2);
   });
 });
