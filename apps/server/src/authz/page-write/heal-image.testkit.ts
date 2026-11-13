@@ -7,19 +7,23 @@
 import { createHash } from 'node:crypto';
 import type { CompactionStore } from './compaction';
 import type { HealImageStore } from './heal-image';
+import type { SealRow } from './binding-seal';
 
 const sha = (b: Uint8Array): string => createHash('sha256').update(b).digest('base64');
 const md5 = (text: string): string => createHash('md5').update(text).digest('hex');
 
 export type MemoryHeal = { image: Uint8Array | null; rowSha: string; epoch: number; contentDigest?: string | null };
-export type MemoryHealStore = HealImageStore & CompactionStore & { heals: Map<string, MemoryHeal> };
+/** #793: the binding seal rows by page id (binding-seal.ts's table). */
+export type MemoryHealStore = HealImageStore & CompactionStore & { heals: Map<string, MemoryHeal>; seals: Map<string, SealRow> };
 
 /** `row` is the spec's fake row (read and written in place); `heals` the heal rows by page id. */
 export function memoryHealStore(row: { ydoc: Uint8Array | null; content?: unknown } = { ydoc: null }): MemoryHealStore {
   const heals = new Map<string, MemoryHeal>();
+  const seals = new Map<string, SealRow>();
   const current = () => (row.ydoc ? sha(row.ydoc) : null);
   return {
     heals,
+    seals,
     async read(pageId) {
       const h = heals.get(pageId);
       return h ? { contentDigest: null, ...h, currentSha: current() } : null;
@@ -54,7 +58,19 @@ export function memoryHealStore(row: { ydoc: Uint8Array | null; content?: unknow
       const before = row.ydoc?.length ?? null;
       row.ydoc = Buffer.from(next);
       heals.delete(pageId);
+      seals.delete(pageId); // #793: the epoch moved
       return { swapped: true, beforeBytes: before };
+    },
+    async claimSeal(pageId, lifetimeId) {
+      const prev = seals.get(pageId) ?? null;
+      seals.set(pageId, { lifetimeId, epoch: null, rowSha: null, entries: null });
+      return prev && { ...prev, entries: prev.entries && prev.entries.map((e) => [...e] as typeof e) };
+    },
+    async commitSeal(pageId, lifetimeId, claimed, seal) {
+      const row = seals.get(pageId);
+      if (claimed ? row?.lifetimeId !== lifetimeId : row !== undefined) return 0;
+      seals.set(pageId, { lifetimeId, epoch: seal.epoch, rowSha: seal.rowSha, entries: seal.entries.map((e) => [...e] as typeof e) });
+      return 1;
     },
   };
 }

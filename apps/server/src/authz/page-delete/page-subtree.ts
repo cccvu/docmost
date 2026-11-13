@@ -1,4 +1,5 @@
 import { PreconditionFailedException } from '@nestjs/common';
+import { sql } from 'kysely';
 import { Page } from '@docmost/db/types/entity.types';
 import { KyselyTransaction } from '@docmost/db/types/kysely.types';
 import { pageEtagOpaque } from '../page-write/page-etag';
@@ -6,16 +7,18 @@ import { pageEtagOpaque } from '../page-write/page-etag';
 /**
  * CCC authorization integration — NOT upstream Docmost code (#636 W6, #661, #618, #589).
  *
- * The subtree reads and locks the remote page-removal routines share: the purge (`RemotePurgeService`), the trash
- * (`RemoteTrashService`) and the trash retention (`RemoteTrashRetentionService`). Each one decides on a set of pages
- * and must then remove EXACTLY that set, so the set is read and locked here, under the caller's transaction:
+ * The subtree reads and locks the remote page lifecycle routines share: the purge (`RemotePurgeService`), the trash
+ * (`RemoteTrashService`), the trash retention (`RemoteTrashRetentionService`) and the restore (`RemoteRestoreService`,
+ * #556). Each one decides on a set of pages and must then change EXACTLY that set, so the set is read and locked here,
+ * under the caller's transaction:
  *  - {@link walkSubtree} is `PageService.forceDelete`'s walk (no workspace or trash filter): what a purge removes;
  *  - {@link walkLive} is `PageRepo.removePage`'s walk (live rows only, stopping at a trashed page): what a trash
  *    would trash;
+ *  - {@link walkTrashBatch} is the pages one trash stamped together with the root: what a restore brings back;
  *  - {@link lockSubtree} locks every row of the full walk, re-walking under the locks until nothing new appears;
  *  - {@link lockSpacesShared} holds the spaces those rows live in `FOR SHARE`, so an archive (an UPDATE of the space
  *    row) waits for the removal, while a page insert or move (`FOR KEY SHARE` on the space) does not.
- * The SQL of each walk is upstream's, verbatim (the specs match on it).
+ * The SQL of the first two walks is upstream's, verbatim (the specs match on it).
  */
 
 /** Subtree recomputations under the locks before a removal gives up with a retryable 409. */
@@ -101,6 +104,29 @@ export async function walkLive(trx: KyselyTransaction, rootId: string): Promise<
     .selectFrom('page_descendants')
     .select(['id'])
     .execute();
+  return rows.map((r) => r.id);
+}
+
+/**
+ * The ids one trash took together with `rootId` (#556), as of this statement: the root when it is trashed, and every
+ * descendant reached through rows carrying the root's exact stamp — the same `deleted_at` and the same `deleted_by_id`
+ * (`IS NOT DISTINCT FROM`, so a null actor matches a null actor). `PageRepo.removePage` writes one timestamp and one
+ * actor to every row of its call, and its walk stops at a page already in the trash, so a sub-page trashed on its own,
+ * earlier, carries another stamp and is not reached; nor is anything under it. A live root has no batch (`[]`).
+ * `UNION`, not `UNION ALL`: a legacy cycle ends instead of recursing. Called under {@link lockSubtree}'s locks, it is
+ * the set a restore decides on.
+ */
+export async function walkTrashBatch(trx: KyselyTransaction, rootId: string): Promise<string[]> {
+  const { rows } = await sql<{ id: string }>`
+    with recursive batch (id, deleted_at, deleted_by_id) as (
+      select id, deleted_at, deleted_by_id from pages where id = ${rootId} and deleted_at is not null
+      union
+      select p.id, p.deleted_at, p.deleted_by_id
+        from pages p join batch b on p.parent_page_id = b.id
+       where p.deleted_at is not distinct from b.deleted_at
+         and p.deleted_by_id is not distinct from b.deleted_by_id
+    )
+    select id from batch`.execute(trx);
   return rows.map((r) => r.id);
 }
 

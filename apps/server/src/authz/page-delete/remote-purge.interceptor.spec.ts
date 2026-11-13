@@ -5,18 +5,20 @@ import { firstValueFrom, of } from 'rxjs';
 // The service module's graph reaches PageService, which pulls in the collab WebSocket stack (lib0 ESM). Stub it.
 jest.mock('../../collaboration/collaboration.gateway', () => ({ CollaborationGateway: class {} }));
 
-import { NATIVE_PURGE_ROUTES, RemotePurgeInterceptor } from './remote-purge.interceptor';
+import { NATIVE_PURGE_ROUTES, NATIVE_RESTORE_ROUTES, RemotePurgeInterceptor } from './remote-purge.interceptor';
 
 /**
- * #636 W6 — `RemotePurgeInterceptor` in isolation: exactly when it takes over the native delete. The HTTP boundary (the
- * real PageController, ValidationPipe, the envelope) is `remote-purge-http.spec.ts`.
+ * #636 W6 / #556 — `RemotePurgeInterceptor` in isolation: exactly when it takes over the native delete and restore.
+ * The HTTP boundary (the real PageController, ValidationPipe, the envelope) is `remote-purge-http.spec.ts`.
  */
 class PageController {
   delete() {}
   restore() {}
+  move() {}
 }
 class OtherController {
   delete() {}
+  restore() {}
 }
 const USER = { id: 'user-1' };
 const WORKSPACE = { id: 'ws-1' };
@@ -44,18 +46,28 @@ const build = (
   mode: 'native' | 'remote',
   purge: (...a: unknown[]) => Promise<unknown> = async () => ({}),
   trash: (...a: unknown[]) => Promise<unknown> = async () => ({ outcome: 'applied', page: { id: 'page-1' } }),
+  restore: (...a: unknown[]) => Promise<unknown> = async () => ({ outcome: 'applied', page: RESTORED }),
 ) => {
   const service = { purge: jest.fn(purge) };
   const trashService = { trash: jest.fn(trash) };
+  const restoreService = { restore: jest.fn(restore) };
   const next = { handle: jest.fn(() => of('handler-result')) };
-  const interceptor = new RemotePurgeInterceptor(mode, service as never, trashService as never, new Reflector());
-  return { interceptor, service, trashService, next };
+  const interceptor = new RemotePurgeInterceptor(
+    mode,
+    service as never,
+    trashService as never,
+    restoreService as never,
+    new Reflector(),
+  );
+  return { interceptor, service, trashService, restoreService, next };
 };
+const RESTORED = { id: 'page-1', slugId: 'slug-1', hasChildren: false };
 const SA = '0198c2a1-0000-7000-8000-00000000005a';
 
 describe('RemotePurgeInterceptor', () => {
-  it('is keyed to the native delete only', () => {
+  it('is keyed to the native delete and the native restore only', () => {
     expect([...NATIVE_PURGE_ROUTES]).toEqual(['PageController.delete']);
+    expect([...NATIVE_RESTORE_ROUTES]).toEqual(['PageController.restore']);
   });
 
   it('remote + permanentlyDelete:true → the purge for the caller, page and workspace; the handler is never called; the envelope is upstream’s', async () => {
@@ -111,13 +123,16 @@ describe('RemotePurgeInterceptor', () => {
     ['native mode, a trash', 'native' as const, { body: { pageId: 'page-1' } }],
     ['native mode ignores the acting-service header, even a malformed one', 'native' as const, { headers: { 'x-ccc-acting-service': 'not-an-id' } }],
     ['a non-http context', 'remote' as const, { type: 'ws' }],
-    ['a sibling handler', 'remote' as const, { handler: 'restore' }],
+    ['a sibling handler', 'remote' as const, { handler: 'move' }],
+    ['native mode, a restore', 'native' as const, { handler: 'restore', body: { pageId: 'page-1' } }],
+    ['the restore handler name on another class', 'remote' as const, { cls: OtherController, handler: 'restore' }],
     ['the same handler name on another class', 'remote' as const, { cls: OtherController }],
   ])('passes through: %s', async (_l, mode, o) => {
     const t = build(mode);
     await expect(firstValueFrom(t.interceptor.intercept(ctx(o), t.next))).resolves.toBe('handler-result');
     expect(t.service.purge).not.toHaveBeenCalled();
     expect(t.trashService.trash).not.toHaveBeenCalled();
+    expect(t.restoreService.restore).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -171,6 +186,90 @@ describe('RemotePurgeInterceptor', () => {
         expect(t.trashService.trash).not.toHaveBeenCalled();
         expect(t.next.handle).not.toHaveBeenCalled();
       }
+    });
+  });
+
+  describe('the native restore (#556)', () => {
+    const restoreCtx = (o: Parameters<typeof ctx>[0] = {}) => ctx({ handler: 'restore', body: { pageId: 'page-1' }, ...o });
+
+    it('remote → the restore routine for the caller, page and workspace; the handler never runs; the envelope carries the routine’s page', async () => {
+      const t = build('remote');
+      await expect(firstValueFrom(t.interceptor.intercept(restoreCtx(), t.next))).resolves.toEqual({
+        data: RESTORED,
+        success: true,
+        status: 200,
+      });
+      expect(t.restoreService.restore).toHaveBeenCalledWith(USER, 'page-1', 'ws-1', undefined);
+      expect(t.service.purge).not.toHaveBeenCalled();
+      expect(t.trashService.trash).not.toHaveBeenCalled();
+      expect(t.next.handle).not.toHaveBeenCalled();
+    });
+
+    it('a noop (a live page) answers its page the same way', async () => {
+      const t = build('remote', undefined, undefined, async () => ({ outcome: 'noop', page: RESTORED }));
+      await expect(firstValueFrom(t.interceptor.intercept(restoreCtx(), t.next))).resolves.toMatchObject({ data: RESTORED });
+    });
+
+    it('a restore refusal propagates, and the handler still never runs', async () => {
+      const t = build('remote', undefined, undefined, async () => Promise.reject(new ForbiddenException({ code: 'restore_needs_edit' })));
+      await expect(firstValueFrom(t.interceptor.intercept(restoreCtx(), t.next))).rejects.toBeInstanceOf(ForbiddenException);
+      expect(t.next.handle).not.toHaveBeenCalled();
+    });
+
+    it('starts only on subscription', () => {
+      const t = build('remote');
+      t.interceptor.intercept(restoreCtx(), t.next);
+      expect(t.restoreService.restore).not.toHaveBeenCalled();
+    });
+
+    it('never reads the delete flag: an extra field the DTO whitelist would strip does not refuse a restore', async () => {
+      const t = build('remote');
+      await firstValueFrom(t.interceptor.intercept(restoreCtx({ body: { pageId: 'page-1', permanentlyDelete: 'yes' } }), t.next));
+      expect(t.restoreService.restore).toHaveBeenCalledWith(USER, 'page-1', 'ws-1', undefined);
+    });
+
+    it.each([
+      ['no pageId', {}],
+      ['an empty pageId', { pageId: '' }],
+      ['a non-string pageId', { pageId: 42 }],
+      ['a null body', null],
+      ['an array body', [{ pageId: 'page-1' }]],
+    ])('fails closed with a 400 on %s: neither the routine nor the handler', async (_l, body) => {
+      const t = build('remote');
+      await expect(firstValueFrom(t.interceptor.intercept(restoreCtx({ body }), t.next))).rejects.toBeInstanceOf(
+        BadRequestException,
+      );
+      expect(t.restoreService.restore).not.toHaveBeenCalled();
+      expect(t.next.handle).not.toHaveBeenCalled();
+    });
+
+    it('the acting-service header: a valid id reaches the routine as its service account', async () => {
+      const t = build('remote');
+      await firstValueFrom(t.interceptor.intercept(restoreCtx({ headers: { 'x-ccc-acting-service': SA } }), t.next));
+      expect(t.restoreService.restore).toHaveBeenCalledWith(USER, 'page-1', 'ws-1', SA);
+    });
+
+    it.each([
+      ['empty', ''],
+      ['duplicated (an array)', [SA, SA]],
+      ['not a principal id', 'service-account-1'],
+    ])('the acting-service header %s → 400 acting_service_invalid; nothing runs', async (_l, value) => {
+      const t = build('remote');
+      const err = await firstValueFrom(
+        t.interceptor.intercept(restoreCtx({ headers: { 'x-ccc-acting-service': value } }), t.next),
+      ).catch((e) => e);
+      expect(err).toBeInstanceOf(BadRequestException);
+      expect((err as BadRequestException).getResponse()).toMatchObject({ code: 'acting_service_invalid' });
+      expect(t.restoreService.restore).not.toHaveBeenCalled();
+      expect(t.next.handle).not.toHaveBeenCalled();
+    });
+
+    it('no authenticated user → 401', async () => {
+      const t = build('remote');
+      await expect(
+        firstValueFrom(t.interceptor.intercept(restoreCtx({ user: undefined }), t.next)),
+      ).rejects.toBeInstanceOf(UnauthorizedException);
+      expect(t.restoreService.restore).not.toHaveBeenCalled();
     });
   });
 

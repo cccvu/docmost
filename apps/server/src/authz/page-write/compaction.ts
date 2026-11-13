@@ -95,6 +95,7 @@ import { storeSafeJson } from './store-safe-json';
 import { carryLedgerOver, ledgerOfDecoded, ledgerOfDoc, type LedgerEntry } from './write-idem';
 import { yieldToEventLoop } from './yield-to-event-loop';
 import { ensureHealImageTable } from './heal-image.installer';
+import { deleteSealInTransaction } from './binding-seal';
 
 /**
  * The non-detaching try-later close code: update-guard.ts's COLLAB_TRY_LATER_CODE (1013), restated rather than imported
@@ -826,6 +827,8 @@ export function kyselyCompactionStore(db: KyselyDB): CompactionStore {
           // #840 (I4): the row now holds a fresh, reload-stable lineage; a heal image of the bytes it replaced goes in the
           // same transaction (heal-image.ts).
           await sql`delete from ccc_page_heal_image where page_id = ${pageId}`.execute(trx);
+          // #793: the epoch moves, so no binding sealed against the replaced bytes may be restored
+          await deleteSealInTransaction(trx as unknown as KyselyDB, pageId);
           if (stillCurrent && !stillCurrent()) throw new StillCurrentRollback();
           const before = rows[0].before === null ? null : Number(rows[0].before);
           return { swapped: true, beforeBytes: before };

@@ -4,6 +4,7 @@ import { ConflictException } from '@nestjs/common';
 import { PageRepo } from '@docmost/db/repos/page/page.repo';
 import { PagePermissionRepo } from '@docmost/db/repos/page/page-permission.repo';
 import { PageService } from '../core/page/services/page.service';
+import { EventName } from '../common/events/event.contants';
 import { CYCLE_LOCK_CLASS, PageCycleGuardInstaller } from './page-cycle-guard.installer';
 import { AuthzOutboxInstaller } from './authz-outbox.installer';
 import {
@@ -54,6 +55,8 @@ d('PageRestrictionGuardInstaller on real Postgres, through the real upstream wri
   let installer: PageRestrictionGuardInstaller;
   /** Pages the (stubbed) PEP reports the mover cannot see — upstream orphans those on a move-to-space. */
   const hidden = new Set<string>();
+  /** The events the engine emitted (#556: a refused restore emits none). */
+  const emitted: string[] = [];
 
   const page = (id: string, parent: string | null, opts: { space?: string; trashed?: boolean } = {}) => pg`
     insert into pages (id, workspace_id, space_id, parent_page_id, position, deleted_at, deleted_by_id)
@@ -140,7 +143,7 @@ d('PageRestrictionGuardInstaller on real Postgres, through the real upstream wri
     installer = new PageRestrictionGuardInstaller(db as never, 'remote');
     await installer.install();
 
-    const events = { emit: () => true };
+    const events = { emit: (name: string) => (emitted.push(name), true) };
     pageRepo = new PageRepo(db as never, {} as never, events as never);
     permRepo = new PagePermissionRepo(db as never, {} as never, {} as never);
     const queue = { add: async () => undefined };
@@ -164,6 +167,7 @@ d('PageRestrictionGuardInstaller on real Postgres, through the real upstream wri
 
   afterEach(async () => {
     hidden.clear();
+    emitted.length = 0;
     await pg`delete from page_access`;
     await pg`delete from pages`;
     await pg`delete from authz_outbox`;
@@ -344,14 +348,19 @@ d('PageRestrictionGuardInstaller on real Postgres, through the real upstream wri
       expect(await outcome(move(uuid(4), null))).toBe('resolved'); // restricted itself
     });
 
-    it('a restore that would detach an unrestricted page from its trashed RESTRICTED parent is refused (half-restore pinned)', async () => {
+    it('a restore that would detach an unrestricted page from its trashed RESTRICTED parent is refused, and NOTHING changes (#556)', async () => {
       await page(uuid(1), null, { trashed: true });
       await page(uuid(2), uuid(1), { trashed: true });
+      await page(uuid(3), uuid(2), { trashed: true });
       await restrict(uuid(1));
+      const outboxBefore = await outboxCount();
       expect(await outcome(pageRepo.restorePage(uuid(2), WS))).toBe(RESTRICTION_STRIP);
-      // restorePage is not transactional upstream: its un-trash committed before the refused detach. The page stays
-      // under its restricted parent — never declassified — but is live under a trashed parent (follow-up issue).
-      expect(await row(uuid(2))).toMatchObject({ parentPageId: uuid(1), deletedAt: null });
+      // Seam #172 (#556): the un-trash and the detach are one transaction, so the refused detach rolls the un-trash
+      // back too — the page and its sub-page stay in the trash under their restricted parent (never half-restored).
+      expect(await row(uuid(2))).toMatchObject({ parentPageId: uuid(1), deletedAt: expect.any(Date) });
+      expect(await row(uuid(3))).toMatchObject({ parentPageId: uuid(2), deletedAt: expect.any(Date) });
+      expect(await outboxCount()).toBe(outboxBefore);
+      expect(emitted).not.toContain(EventName.PAGE_RESTORED);
     });
 
     it('a restore detaching from an UNRESTRICTED trashed parent still works', async () => {
@@ -359,6 +368,7 @@ d('PageRestrictionGuardInstaller on real Postgres, through the real upstream wri
       await page(uuid(2), uuid(1), { trashed: true });
       expect(await outcome(pageRepo.restorePage(uuid(2), WS))).toBe('resolved');
       expect(await row(uuid(2))).toMatchObject({ parentPageId: null, deletedAt: null });
+      expect(emitted).toContain(EventName.PAGE_RESTORED);
     });
 
     // With the per-workspace lock held elsewhere, a write that takes it would wait; `lock_timeout` turns that wait

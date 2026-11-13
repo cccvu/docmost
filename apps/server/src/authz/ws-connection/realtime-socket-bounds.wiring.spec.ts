@@ -34,6 +34,8 @@ const env = {
   getJwtTokenExpiresIn: () => '1h',
   isHttps: () => false,
   getCookieExpiresIn: () => new Date(Date.now() + 60_000),
+  // wiki-v2 #655: the gateway's afterInit installs the handshake origin check (seam §161), which trusts APP_URL alone.
+  getAppUrl: () => 'http://wiki.example.test',
 };
 const jwt = new JwtService({ secret: SECRET });
 const COOKIE = `authToken=${jwt.sign({ sub: 'u1', workspaceId: 'w1', type: 'access', sessionId: 's1' })}`;
@@ -161,6 +163,48 @@ describe('#830 the /socket.io bounds in a real Nest boot (main.ts order)', () =>
     await until(() => closed, 2000, 'the server to close');
     expect(messages).toEqual(expect.arrayContaining(['42["Unauthorized"]', '41']));
     expect(rig.io.engine.clientsCount).toBe(0);
+  });
+
+  it('wiki-v2 #655 composes with the gate: a cross-site handshake with a valid cookie passes the upgrade, then every CONNECT is refused origin_check before the gateway runs', async () => {
+    const connections = jest.fn();
+    rig.io.on('connection', connections);
+    try {
+      const ws = new WebSocket(`ws://127.0.0.1:${rig.port}/socket.io/?EIO=4&transport=websocket`, {
+        headers: { cookie: COOKIE, origin: 'https://evil.example', host: 'wiki.example.test' },
+      });
+      clients.push(ws);
+      const messages: string[] = [];
+      ws.on('message', (d) => messages.push(d.toString()));
+      await until(() => messages.some((m) => m.startsWith('0{')), 2000, 'the open packet (the #830 gate admits a valid cookie)');
+      ws.send('40');
+      await until(() => messages.some((m) => m.startsWith('44')), 2000, 'the CONNECT_ERROR');
+      expect(messages.filter((m) => m.startsWith('44'))).toEqual(['44{"message":"origin_check"}']);
+      // The origin check runs before #830's one-CONNECT count, so a retry is refused the same way (never one_connect),
+      // and the engine connection, which joined no namespace, is left to socket.io's connectTimeout.
+      ws.send('40');
+      await until(() => messages.filter((m) => m.startsWith('44')).length === 2, 2000, 'the second CONNECT_ERROR');
+      expect(messages.filter((m) => m.startsWith('44'))).toEqual(['44{"message":"origin_check"}', '44{"message":"origin_check"}']);
+      expect(connections).not.toHaveBeenCalled();
+      expect((await rig.io.fetchSockets()).length).toBe(0);
+      ws.terminate();
+      await until(() => rig.io.engine.clientsCount === 0, 2000, 'the engine connection to close');
+    } finally {
+      rig.io.off('connection', connections);
+    }
+  });
+
+  it('wiki-v2 #655: a same-origin handshake connects through both layers', async () => {
+    const ws = new WebSocket(`ws://127.0.0.1:${rig.port}/socket.io/?EIO=4&transport=websocket`, {
+      headers: { cookie: COOKIE, origin: 'http://wiki.example.test', host: 'wiki.example.test' },
+    });
+    clients.push(ws);
+    const messages: string[] = [];
+    ws.on('message', (d) => messages.push(d.toString()));
+    await until(() => messages.some((m) => m.startsWith('0{')), 2000, 'the open packet');
+    ws.send('40');
+    await until(() => messages.some((m) => m.startsWith('40{"sid"')), 2000, 'the CONNECT ack');
+    ws.terminate();
+    await until(() => rig.io.engine.clientsCount === 0, 2000, 'the engine connection to close');
   });
 
   it('a ping flood from a client that never reads gets one pong in flight', async () => {

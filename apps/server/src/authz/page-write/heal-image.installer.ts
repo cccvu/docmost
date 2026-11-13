@@ -21,6 +21,17 @@
  *     epoch           the image's lineage epoch (-1: unknown, the live lineage was malformed)
  *     content_digest  live's ADR 0019 digest at that store (`stableHash` of the `content` it wrote); NULL: unknown
  *     created_at      when the store wrote it
+ *
+ * #793: the same install also ensures `ccc_collab_binding_seal` (binding-seal.ts, its only reader and writer): the
+ * collab client-id bindings a document lifetime sealed at its committed clean unload, claimed by the next load. Server
+ * only, like the heal row; never a Y root.
+ *
+ *   ccc_collab_binding_seal(page_id) primary key, references pages(id) on delete cascade
+ *     lifetime_id  the document lifetime that claimed the row at its load (the only one whose unload may seal it)
+ *     epoch        the lineage epoch the seal was taken at (NULL: claimed, not sealed)
+ *     row_sha      sha256 (base64) of the row bytes the sealed lifetime held (NULL: claimed, not sealed)
+ *     entries      [[clientId, userId, clock], …], at most C_MAX (NULL: claimed, not sealed)
+ *     sealed_at    when the seal was committed (NULL: claimed, not sealed)
  */
 import { Logger } from '@nestjs/common';
 import { sql } from 'kysely';
@@ -58,6 +69,17 @@ export async function installHealImageTable(db: KyselyDB): Promise<void> {
        where table_schema = current_schema() and table_name = ${HEAL_IMAGE_TABLE} and column_name = 'content_digest'
     `.execute(trx);
     if (rows.length === 0) await sql`alter table ccc_page_heal_image add column if not exists content_digest text`.execute(trx);
+    // #793 (binding-seal.ts)
+    await sql`
+      create table if not exists ccc_collab_binding_seal (
+        page_id     uuid        primary key references pages(id) on delete cascade,
+        lifetime_id uuid        not null,
+        epoch       integer,
+        row_sha     text,
+        entries     jsonb,
+        sealed_at   timestamptz
+      )
+    `.execute(trx);
   });
 }
 
@@ -80,6 +102,16 @@ export function ensureHealImageTable(db: KyselyDB): Promise<void> {
   return done;
 }
 
+/**
+ * #793: the handle the boot installed the tables on. A lifetime whose load applied no stored ydoc (a fresh page, a
+ * content-only row) never runs `loadStableYdoc`'s claim, so binding-seal.ts seals it through this handle, insert-if-absent.
+ * Null until a boot install succeeded (the specs, which never boot, pass their own).
+ */
+let bootDb: KyselyDB | null = null;
+export function bootSealDb(): KyselyDB | null {
+  return bootDb;
+}
+
 /** The boot install: bounded retries, then a throw that fails the boot (fail closed). */
 export async function installHealImageTableAtBoot(
   db: KyselyDB,
@@ -91,6 +123,7 @@ export async function installHealImageTableAtBoot(
     try {
       await ensureHealImageTable(db);
       logger.log(`${HEAL_IMAGE_TABLE} ensured on Docmost DB`);
+      bootDb = db;
       return;
     } catch (e) {
       const msg = (e as Error).message;

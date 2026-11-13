@@ -29,6 +29,7 @@ import {
   SidebarPagesParams,
 } from "@/features/page/types/page.types";
 import { notifications } from "@mantine/notifications";
+import { refusalMessage } from "@/features/request-errors/request-error";
 import { IPagination, QueryParams } from "@/lib/types.ts";
 import { queryClient } from "@/main.tsx";
 import { buildTree } from "@/features/page/tree/utils";
@@ -243,7 +244,11 @@ export function useRestorePageMutation() {
       queryClient.setQueryData<IPage>(["pages", restoredPage.slugId], merge);
     },
     onError: (error) => {
-      notifications.show({ message: t("Failed to restore page"), color: "red" });
+      // CCC (wiki-v2 #556): a refused restore says why ("nothing was restored"), not just that it failed.
+      notifications.show({
+        message: refusalMessage(error, t, t("Failed to restore page")),
+        color: "red",
+      });
     },
   });
 }

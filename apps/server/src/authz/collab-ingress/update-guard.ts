@@ -8,6 +8,12 @@
  * every root but `'default'` (the `/v1` idempotency ledger, `__ccc_write_idem`, is server-only) and out of Stateless
  * broadcasts.
  *
+ * Bindings across a reload (#793, page-write/binding-seal.ts). The bindings a lifetime proved are sealed only at a
+ * committed clean unload (this guard's live `destroy` handler, naming the row bytes live last covered, unless live is
+ * wedged), claimed by the next load, and restored there awareness-only (`adoptSealed`, every mode) when the row is
+ * those bytes and each id's clock is exactly what was sealed. A lifetime that ends any other way (a crash) seals nothing: the next load restores
+ * none, as before #793.
+ *
  * How: each live Document gets a SHADOW replica (a second Y.Doc kept equal to live by a mirror listener). A frame is
  * applied to the shadow inside `Y.transact(shadow, …, origin, local=false)` — what y-protocols does to live — and
  * inspected inside that transaction, before Yjs's cleanup garbage-collects or merges anything: every struct from the
@@ -122,7 +128,8 @@ import { decodeUtf8 } from 'lib0/string';
 import * as Y from 'yjs';
 import { isTransactionOrigin, MessageType } from '@hocuspocus/server';
 import { PAGE_MAX_YDOC_BYTES } from '../page-write/page-size';
-import { unloadCanCompact } from '../page-write/reconcile-store';
+import { coveredRowDigest, unloadCanCompact } from '../page-write/reconcile-store';
+import { noteSeal, sealLifetimeOf, type SealEntry } from '../page-write/binding-seal';
 import {
   canStartCompaction,
   compactedRecently,
@@ -497,6 +504,12 @@ class DocGuard {
    * another user are answered `unresolved`, not refused (the owner's own Step2 may not have landed yet: the mirror race).
    */
   readonly awarenessOnly = new Set<number>();
+  /**
+   * #793: the ids a committed unload seals (binding-seal.ts), oldest proof first: ids proven this lifetime (awareness-only
+   * until the owner's own struct), ids a struct bound whose connection announced them, and restored ids (still bound).
+   * Never an id bound under the "announced nothing" rule, never one only announced, never the server's.
+   */
+  readonly sealable = new Set<number>();
   /** The client id bound to SERVER for the current shadow: unbound again when a rebuild replaces that shadow. */
   shadowBinding: number | null = null;
   /** #816: the user whose refused frame left the shadow dirty: the rebuild is charged to them, not the next sender.
@@ -702,6 +715,34 @@ export class CollabUpdateGuard {
   /** How many client ids are bound on `live` (specs and diagnostics). */
   bindingCount(live: Y.Doc): number {
     return this.docs.get(live)?.bindings.size ?? 0;
+  }
+
+  /** #793: whether `client` is bound on `live` awareness-only (specs and diagnostics). */
+  isAwarenessOnly(live: Y.Doc, client: number): boolean {
+    return this.docs.get(live)?.awarenessOnly.has(client) ?? false;
+  }
+
+  /**
+   * #793: adopt the bindings `live`'s load restored from the page's seal (binding-seal.ts), AWARENESS-ONLY and never as
+   * proven: a peer's new clocks there are `unresolved` (its relay lands only on the owner's claim, #842), never a final
+   * `foreign-client`, and only the owner's own struct proves the id again (with no `announced` check, so the owner's new
+   * tab replaying its IndexedDB copy proves it too). Another user's awareness at a restored id is `foreign-client`, as at
+   * any bound id. Called by the extension's `afterLoadDocument`, synchronously and in every mode, before any connection
+   * exists (eagerly: `checkAwareness` reads the bindings without creating them). It also creates the document's guard,
+   * so the lifetime's unload seals even when no writer ever sent a frame. Never throws.
+   */
+  adoptSealed(live: Y.Doc, entries: readonly SealEntry[]): void {
+    try {
+      const doc = this.docFor(live as GuardDocument);
+      for (const [client, user] of entries) {
+        if (client === live.clientID || doc.bindings.has(client)) continue;
+        doc.bindings.set(client, user);
+        doc.awarenessOnly.add(client);
+        doc.sealable.add(client);
+      }
+    } catch {
+      // never out of the load: the page then restores nothing, as before #793
+    }
   }
 
   /** How many (user, document) budgets are kept (specs and diagnostics). */
@@ -1051,8 +1092,17 @@ export class CollabUpdateGuard {
       if (caps === 'compact') this.compacting(frame); // throws unless report mode
       unlanded = false; // #842: accepted: a matched relay lands with it
       this.budgetFor(frame).deadline = 0; // an accepted frame clears the strike
-      for (const [client, user] of result.binds) if (!doc.bindings.has(client)) doc.bindings.set(client, user);
-      for (const client of result.proven ?? []) doc.awarenessOnly.delete(client);
+      const announced = doc.announced.get(frame.connection);
+      for (const [client, user] of result.binds) {
+        if (doc.bindings.has(client)) continue;
+        doc.bindings.set(client, user);
+        if (announced?.has(client)) doc.sealable.add(client); // #793: on its connection's own evidence only
+      }
+      for (const client of result.proven ?? []) {
+        doc.awarenessOnly.delete(client);
+        doc.sealable.delete(client); // #793: re-inserted last, the most recently proven
+        doc.sealable.add(client);
+      }
       if (result.proven?.size) doc.claims.drop(userId); // #842: its ids are proven, its claim is moot
       if (result.relayed?.size) {
         // #842: a relay an owner claim attested (counts only)
@@ -1534,7 +1584,9 @@ export class CollabUpdateGuard {
           const owner = doc.bindings.get(client) ?? binds.get(client);
           if (owner === undefined) {
             // Only an id live never saw binds here. An id the stored document already holds (an earlier lifetime) binds
-            // by awareness only: bindings are not persisted, so a claim on it after a reload is undetectable (ADR 0036).
+            // by awareness only: #793 restores an earlier lifetime's bindings only after a clean unload, awareness-only
+            // (`adoptSealed`); any id it did not restore (a crash, a net-zero tail) is unbound, and a claim on it after a
+            // reload is undetectable (ADR 0036).
             // And only to a sender whose connection announced it, or announced nothing (a pagehide-nulled awareness, a
             // promoted reader: the rule before this evidence existed). Any other never-seen id is another client's
             // structs relayed from a lifetime that lost them: it stays unbound, so its author's awareness claims it.
@@ -1681,6 +1733,7 @@ export class CollabUpdateGuard {
     live.on('update', mirror);
     live.on('afterTransaction', wedgeWatch);
     live.once('destroy', () => {
+      this.sealAtUnload(created); // #793: first, while the bindings are intact; never throws
       live.off('update', mirror);
       live.off('afterTransaction', wedgeWatch);
       created.destroyed = true;
@@ -1692,6 +1745,36 @@ export class CollabUpdateGuard {
     });
     this.docs.set(live, created);
     return created;
+  }
+
+  /**
+   * #793: live's `destroy` handler, first. Hocuspocus 4.7.1 destroys a document only once its unload is committed (after
+   * the `beforeUnloadDocument` hooks it re-checks `shouldUnloadDocument`; a join aborts it), so an aborted unload seals
+   * nothing. The seal names the row bytes live last covered (`coveredRowDigest`: its load's, or its last written
+   * store's; none, or a wedged live, seals nothing) and each id with live's clock, which the next load must find
+   * unchanged in exactly those bytes: an id live advanced past them (a failed final store, a net-zero tail) is then not
+   * restored, while one it did not is. So a lifetime that only viewed (whose empty Step2 still moves the document's
+   * generation) seals too, and its restored ids stay protected. The extension's `afterUnloadDocument` commits it
+   * (binding-seal.ts). Never throws.
+   */
+  private sealAtUnload(doc: DocGuard): void {
+    try {
+      const live = doc.live as unknown as Y.Doc & { name?: string };
+      if (!sealLifetimeOf(live) || typeof live.name !== 'string') return;
+      if (liveWedged(live)) return;
+      const rowSha = coveredRowDigest(live);
+      if (rowSha === null) return;
+      const epoch = lineageEpoch(live);
+      const entries: SealEntry[] = [];
+      for (const client of doc.sealable) {
+        const user = doc.bindings.get(client);
+        if (user === undefined || user === SERVER || client === live.clientID) continue;
+        entries.push([client, user, Y.getState(live.store, client)]);
+      }
+      noteSeal(live, live.name, { epoch, rowSha, entries });
+    } catch {
+      // a malformed lineage, or anything else: no seal, so the next load is unclean (the behaviour before #793)
+    }
   }
 
   private ensureShadow(doc: DocGuard, where: OrderDivergenceWhere = 'rebuild'): ShadowState {
@@ -2232,11 +2315,11 @@ export class CollabUpdateGuard {
  * never-seen one is relaying a peer's structs. Residual: a doc whose id Yjs regenerated (a remote write at its current
  * id) keeps announcing the old one, so its new id stays unbound (relay-binding.spec.ts); the guard refuses that remote
  * write at every bound id, so on an honest page it follows only an id collision. An editor of the page can still force
- * one across a reload (#845): bindings are not persisted, so while the document reloads it writes at the victim's id
- * before the victim reconnects; the victim's Yjs then regenerates its id on the relayed write, the new id stays unbound
- * here, and the editor can forge at it (silently dropping the victim's later edits) or claim it by awareness. Closing it
- * needs the client to re-announce under its new id, or persisted bindings (#793) restored awareness-only-like so that
- * owner claims cover them.
+ * one across a reload (#845) where #793 restored nothing (a crash, or an id the seal did not cover): while the document
+ * reloads it writes at the victim's id before the victim reconnects; the victim's Yjs then regenerates its id on the
+ * relayed write, the new id stays unbound here, and the editor can forge at it (silently dropping the victim's later
+ * edits) or claim it by awareness. After a clean unload the victim's id is restored awareness-only, so that write is
+ * `unresolved` and nothing regenerates. Closing the rest needs the client to re-announce under its new id.
  */
 const ownedBy =
   (announced: Set<number> | undefined) =>

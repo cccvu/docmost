@@ -7,7 +7,7 @@ import { scanRoutes } from '../route-guard/static-route-scan';
 // The interceptor module's graph reaches PageService, which pulls in the collab WebSocket stack (lib0 ESM). Stub it.
 jest.mock('../../collaboration/collaboration.gateway', () => ({ CollaborationGateway: class {} }));
 
-import { NATIVE_PURGE_ROUTES } from './remote-purge.interceptor';
+import { NATIVE_PURGE_ROUTES, NATIVE_RESTORE_ROUTES } from './remote-purge.interceptor';
 
 /** True when `name` appears as an identifier in code (comments and strings are ignored, so a doc mention is not a registration). */
 function referencesIdentifier(file: string, src: string, name: string): boolean {
@@ -24,7 +24,7 @@ function referencesIdentifier(file: string, src: string, name: string): boolean 
 
 
 /**
- * Remote page-removal FITNESS TEST (#636 W6, #661, #589, #670) — NOT upstream Docmost code.
+ * Remote page-lifecycle FITNESS TEST (#636 W6, #661, #589, #670, #556) — NOT upstream Docmost code.
  *
  * In remote mode every route that removes pages must go through the remote removal routines: `RemotePurgeService`
  * (space admin on every space AND `page#edit` on every page removed, under locks, after a settle fence) and
@@ -37,7 +37,10 @@ function referencesIdentifier(file: string, src: string, name: string): boolean 
  *  - every `.forceDelete(` call: the two routes above, `RemotePurgeService.purge` and the remote retention — so the
  *    routes that reach it are exactly those two, and the interceptor's key set is exactly the upstream one;
  *  - every `.removePage(` call (the trash sink): `PageService.removePage`, the two routes and `RemoteTrashService`;
- *  - the routines' callers and the holders of an injected `RemotePurgeService` / `RemoteTrashService`;
+ *  - every `.restorePage(` call (the restore sink, #556): the native `PageController.restore` and `RemoteRestoreService`,
+ *    so the restore routes are exactly that one, and the interceptor's restore key set is exactly the upstream one;
+ *  - the routines' callers and the holders of an injected `RemotePurgeService` / `RemoteTrashService` /
+ *    `RemoteRestoreService`;
  *  - that `conditionalDelete` dispatches remote mode to the routines FIRST, before its native replica;
  *  - that page.module.ts registers the trash retention through the mode-selecting provider, never the bare class;
  *  - that the acting-service header is read only by the two entry points, parsed only by `parseActingService`, used
@@ -59,13 +62,16 @@ type SinkKind =
   | 'pagesRowDelete'
   | 'forceDeleteCall'
   | 'removePageCall'
+  | 'restorePageCall'
   | 'deletePageCall'
   | 'cleanupPageCall'
   | 'retireCall'
   | 'purgeCall'
   | 'trashCall'
+  | 'restoreCall'
   | 'purgeServiceInjection'
-  | 'trashServiceInjection';
+  | 'trashServiceInjection'
+  | 'restoreServiceInjection';
 export interface SinkSite {
   kind: SinkKind;
   owner: string;
@@ -85,6 +91,7 @@ export function scanPurgeSinks(
   source: string,
   purgeHolders: ReadonlySet<string>,
   trashHolders: ReadonlySet<string> = new Set(),
+  restoreHolders: ReadonlySet<string> = new Set(),
 ): SinkSite[] {
   const sf = ts.createSourceFile(fileName, source, ts.ScriptTarget.Latest, true);
   const sites: SinkSite[] = [];
@@ -98,6 +105,7 @@ export function scanPurgeSinks(
       }
       if (name === 'forceDelete') sites.push({ kind: 'forceDeleteCall', owner });
       if (name === 'removePage') sites.push({ kind: 'removePageCall', owner });
+      if (name === 'restorePage') sites.push({ kind: 'restorePageCall', owner });
       if (name === 'deletePage') sites.push({ kind: 'deletePageCall', owner });
       if (name === 'cleanupPage') sites.push({ kind: 'cleanupPageCall', owner });
       if (name === 'retire') sites.push({ kind: 'retireCall', owner });
@@ -106,6 +114,9 @@ export function scanPurgeSinks(
       }
       if (name === 'trash' && trashHolders.has(receiverName(node.expression.expression) ?? '')) {
         sites.push({ kind: 'trashCall', owner });
+      }
+      if (name === 'restore' && restoreHolders.has(receiverName(node.expression.expression) ?? '')) {
+        sites.push({ kind: 'restoreCall', owner });
       }
     }
     if (
@@ -117,7 +128,13 @@ export function scanPurgeSinks(
     ) {
       const type = node.type.typeName.getText(sf);
       const kind: SinkKind | undefined =
-        type === 'RemotePurgeService' ? 'purgeServiceInjection' : type === 'RemoteTrashService' ? 'trashServiceInjection' : undefined;
+        type === 'RemotePurgeService'
+          ? 'purgeServiceInjection'
+          : type === 'RemoteTrashService'
+            ? 'trashServiceInjection'
+            : type === 'RemoteRestoreService'
+              ? 'restoreServiceInjection'
+              : undefined;
       if (kind) sites.push({ kind, owner: `${ownerOf(node).replace(/\.constructor$/, '')}#${node.name.text}` });
     }
     const text = literalText(node);
@@ -143,9 +160,14 @@ describe('every route that permanently deletes pages goes through the remote pur
     );
   const holders = injected('purgeServiceInjection');
   const trashHolders = injected('trashServiceInjection');
+  const restoreHolders = injected('restoreServiceInjection');
   const holderNames = new Set(holders.map((h) => h.split('#')[1]));
   const trashHolderNames = new Set(trashHolders.map((h) => h.split('#')[1]));
-  const files = raw.map((f) => ({ ...f, sinks: scanPurgeSinks(f.file, f.src, holderNames, trashHolderNames) }));
+  const restoreHolderNames = new Set(restoreHolders.map((h) => h.split('#')[1]));
+  const files = raw.map((f) => ({
+    ...f,
+    sinks: scanPurgeSinks(f.file, f.src, holderNames, trashHolderNames, restoreHolderNames),
+  }));
   const sitesOf = (kind: SinkKind) =>
     files.flatMap((f) => f.sinks.filter((s) => s.kind === kind).map((s) => `${f.file}:${s.owner}`)).sort();
 
@@ -209,6 +231,32 @@ describe('every route that permanently deletes pages goes through the remote pur
       .map((s) => s.split(':')[1])
       .filter((k) => routeByKey.has(k));
     expect([...NATIVE_PURGE_ROUTES].sort()).toEqual([...new Set(upstream)].sort());
+  });
+
+  it('`.restorePage(` (the restore sink, #556) is called by the native restore route and the remote restore routine only', () => {
+    expect(sitesOf('restorePageCall')).toEqual([
+      'authz/page-delete/remote-restore.service.ts:RemoteRestoreService.decideAndRestore',
+      'core/page/page.controller.ts:PageController.restore',
+    ]);
+    const reachingRoutes = sitesOf('restorePageCall')
+      .map((s) => s.split(':')[1])
+      .filter((k) => routeByKey.has(k))
+      .sort();
+    expect(reachingRoutes).toEqual(['PageController.restore']);
+  });
+
+  it('the interceptor’s restore key set is exactly the UPSTREAM routes that reach restorePage, disjoint from the delete set', () => {
+    const upstream = sitesOf('restorePageCall')
+      .filter((s) => !s.startsWith('authz/'))
+      .map((s) => s.split(':')[1])
+      .filter((k) => routeByKey.has(k));
+    expect([...NATIVE_RESTORE_ROUTES].sort()).toEqual([...new Set(upstream)].sort());
+    expect([...NATIVE_RESTORE_ROUTES].filter((k) => NATIVE_PURGE_ROUTES.has(k))).toEqual([]);
+  });
+
+  it('RemoteRestoreService is injected only into the interceptor, and only its intercept calls it (#556)', () => {
+    expect(restoreHolders.sort()).toEqual(['authz/page-delete/remote-purge.interceptor.ts:RemotePurgeInterceptor#restore']);
+    expect(sitesOf('restoreCall')).toEqual(['authz/page-delete/remote-purge.interceptor.ts:RemotePurgeInterceptor.intercept']);
   });
 
   it('RemotePurgeService and RemoteTrashService are injected only into their two entry points, and only they call them', () => {
@@ -358,11 +406,12 @@ describe('the acting-service header only narrows, and never reaches a log or an 
     .flatMap((f) => scanActingService(f.file, f.src).map((s) => `${f.file}:${s}`))
     .sort();
 
-  it('is read only by the two entry points, parsed only there, and handed only to decideAll as a service subject', () => {
+  it('is read only by the two entry points, parsed only there, and handed only to decideAll as a service subject (#556: the restore too)', () => {
     expect(sites).toEqual([
       'authz/page-delete/remote-purge.interceptor.ts:header@RemotePurgeInterceptor.intercept',
       'authz/page-delete/remote-purge.interceptor.ts:parse@RemotePurgeInterceptor.intercept',
       'authz/page-delete/remote-purge.service.ts:serviceSubject->requirePurgeRights@RemotePurgeService.purge',
+      'authz/page-delete/remote-restore.service.ts:serviceSubject->decideAll@RemoteRestoreService.decideAndRestore',
       'authz/page-delete/remote-trash.service.ts:serviceSubject->decideAll@RemoteTrashService.decideAndTrash',
       'authz/page-write/conditional-page-ops.controller.ts:header@ConditionalPageOpsController.conditionalDelete',
       'authz/page-write/conditional-page-ops.controller.ts:parse@ConditionalPageOpsController.conditionalDelete',
@@ -433,6 +482,18 @@ describe('the page-purge sink scanner recognizes every sink shape (meta-guard)',
     expect(kinds(`class C { h() { return this.pageRepo.deletePage(id); } }`)).toEqual(['deletePageCall@C.h']);
     expect(kinds(`class C { h() { return this.cleanupPage(id); } }`)).toEqual(['cleanupPageCall@C.h']);
     expect(kinds(`class C { h() { return this.pageService.removePage(id, u, ws); } }`)).toEqual(['removePageCall@C.h']);
+    expect(kinds(`class C { h() { return this.pageRepo.restorePage(id, ws, trx, { pageIds }); } }`)).toEqual([
+      'restorePageCall@C.h',
+    ]);
+    expect(
+      scanPurgeSinks('probe.ts', `class C { h() { return this.restore.restore(u, p, w); } }`, new Set(), new Set(), new Set(['restore'])).map(
+        (x) => `${x.kind}@${x.owner}`,
+      ),
+    ).toEqual(['restoreCall@C.h']);
+    expect(kinds(`class C { h() { return this.snapshots.restore(k); } }`)).toEqual([]);
+    expect(kinds(`class C { constructor(private readonly restore: RemoteRestoreService) {} }`)).toEqual([
+      'restoreServiceInjection@C#restore',
+    ]);
     expect(kinds(`class C { h() { return this.retire(id, ws, cutoff); } }`)).toEqual(['retireCall@C.h']);
     expect(
       scanPurgeSinks('probe.ts', `class C { h() { return this.remoteTrash.trash(u, p, w); } }`, new Set(), new Set(['remoteTrash'])).map(
