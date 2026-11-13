@@ -33,25 +33,33 @@ export function PasskeyList({ passkeys, onRemove }: PasskeyListProps) {
     );
   }
 
+  // Four columns with unwrapped name and "Removal not finished" cells are wider than a phone's content
+  // width: scroll inside the table (native overflow), never the Profile page.
   return (
-    <Table verticalSpacing="sm" captionSide="top">
-      <Table.Caption>{t("Your passkeys")}</Table.Caption>
-      <Table.Thead>
-        <Table.Tr>
-          <Table.Th>{t("Passkey")}</Table.Th>
-          <Table.Th>{t("Added")}</Table.Th>
-          <Table.Th>{t("Last used")}</Table.Th>
-          <Table.Th>
-            <VisuallyHidden>{t("Action")}</VisuallyHidden>
-          </Table.Th>
-        </Table.Tr>
-      </Table.Thead>
-      <Table.Tbody>
-        {passkeys.map((passkey) => (
-          <PasskeyRow key={passkey.id} passkey={passkey} onRemove={onRemove} />
-        ))}
-      </Table.Tbody>
-    </Table>
+    <Table.ScrollContainer minWidth={480} type="native">
+      <Table verticalSpacing="sm" captionSide="top">
+        <Table.Caption>{t("Your passkeys")}</Table.Caption>
+        <Table.Thead>
+          <Table.Tr>
+            <Table.Th>{t("Passkey")}</Table.Th>
+            <Table.Th>{t("Added")}</Table.Th>
+            <Table.Th>{t("Last used")}</Table.Th>
+            <Table.Th>
+              <VisuallyHidden>{t("Action")}</VisuallyHidden>
+            </Table.Th>
+          </Table.Tr>
+        </Table.Thead>
+        <Table.Tbody>
+          {passkeys.map((passkey) => (
+            <PasskeyRow
+              key={passkey.id}
+              passkey={passkey}
+              onRemove={onRemove}
+            />
+          ))}
+        </Table.Tbody>
+      </Table>
+    </Table.ScrollContainer>
   );
 }
 
