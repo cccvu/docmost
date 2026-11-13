@@ -5,6 +5,7 @@ import { WebSocket } from 'ws';
 import { WsGateway } from '../../ws/ws.gateway';
 import { EnvironmentService } from '../../integrations/environment/environment.service';
 import { SOCKET_ORIGIN_CHECK_ERROR } from './ws-origin-check';
+import { originCheckLogSink, resetOriginCheckLogForTests } from './origin-check-log';
 
 /**
  * wiki-v2 #655: the socket.io handshake origin check (cross-site WebSocket hijacking), through the REAL
@@ -79,6 +80,21 @@ describe('socket.io handshake origin check through WsGateway.afterInit (#655)', 
 
   it('refuses a foreign Origin carrying the session cookie (connect_error, never authenticated)', async () => {
     refusedWith(await connectAnswer({ Host: 'localhost:3300', Origin: 'https://evil.example', Cookie: 'authToken=t' }));
+  });
+
+  it('a refused handshake writes one FORK_ORIGIN_CHECK_REFUSED socket line; an admitted one writes none', async () => {
+    resetOriginCheckLogForTests();
+    const warn = jest.spyOn(originCheckLogSink, 'warn').mockImplementation(() => undefined);
+    try {
+      refusedWith(await connectAnswer({ Host: 'localhost:3300', Origin: 'https://evil.example', Cookie: 'authToken=t' }));
+      expect(warn.mock.calls.map((c) => c[0])).toEqual([
+        'FORK_ORIGIN_CHECK_REFUSED {"surface":"socket","secFetchSite":"absent","origin":"present","referer":"absent"}',
+      ]);
+      await connectAnswer({ Host: 'localhost:3300', Origin: APP_URL, Cookie: 'authToken=t' });
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it('refuses a same-site sibling (Sec-Fetch-Site same-site, untrusted Origin)', async () => {

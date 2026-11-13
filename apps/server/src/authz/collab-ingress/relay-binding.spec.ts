@@ -84,6 +84,9 @@ function lostLifetime(opts: { storedPrefix: boolean }) {
   return { stored, a, b };
 }
 
+/** #793: the ids this lifetime would seal at a clean unload (update-guard.ts `sealAtUnload` reads exactly this set). */
+const sealableOf = (s: ReturnType<typeof lifetime>): number[] => [...((s.guard as any).docs.get(s.live)?.sealable ?? [])];
+
 /** A third writer impersonating B's id at its next clock. */
 const forgeAtB = (live: Y.Doc) => typeAt0(new RemoteClient(live, B_ID), live, 'FORGED ');
 
@@ -332,6 +335,8 @@ describe('residuals pinned (ADR 0036 §4): equal to the rule before this evidenc
     const silent = s.conn('A'); // announces nothing: a pagehide-nulled awareness looks the same, and so does an attacker
     expect(s.send(silent, s.step2(a.doc), SYNC.Step2)).toBe('applied');
     expect(s.announce(s.conn('B'), { clientID: B_ID })).toBe(REFUSED('foreign-client'));
+    // #793: that misbinding lives for this lifetime only. It is never sealed, so a reload does not carry it forward.
+    expect(sealableOf(s)).not.toContain(B_ID);
   });
 
   it('a null awareness is no announcement: the first struct at a never-seen id binds it to the sender', () => {
@@ -341,6 +346,18 @@ describe('residuals pinned (ADR 0036 §4): equal to the rule before this evidenc
     expect(s.announce(aConn, { clientID: A_ID, state: null })).toBe('applied');
     expect(s.send(aConn, s.step2(a.doc), SYNC.Step2)).toBe('applied');
     expect(s.announce(s.conn('B'), { clientID: B_ID })).toBe(REFUSED('foreign-client'));
+    expect(sealableOf(s)).not.toContain(B_ID); // #793: as above, never sealed
+  });
+
+  it('#793 control: an id its own connection announced and then wrote is sealable (so the two cases above are not vacuous)', () => {
+    const { stored, a } = lostLifetime({ storedPrefix: false });
+    const s = lifetime(stored);
+    typeAt0(a, s.live, 'A-own '); // A's own unsent edit at its never-seen id
+    const aConn = s.conn('A');
+    expect(s.announce(aConn, { clientID: A_ID })).toBe('applied');
+    expect(s.send(aConn, s.step2(a.doc), SYNC.Step2)).toBe('applied');
+    expect(sealableOf(s)).toContain(A_ID); // announced, then written by its own connection: sealed at a clean unload
+    expect(sealableOf(s)).not.toContain(B_ID); // the relayed co-editor id it carried is unbound, never sealable
   });
 });
 

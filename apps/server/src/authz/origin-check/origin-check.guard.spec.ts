@@ -2,6 +2,7 @@ import { ExecutionContext, ForbiddenException } from '@nestjs/common';
 import { EnvironmentService } from '../../integrations/environment/environment.service';
 import { ForkOriginCheckGuard } from './origin-check.guard';
 import { ORIGIN_CHECK_REFUSED_MESSAGE } from './origin-check';
+import { originCheckLogSink, resetOriginCheckLogForTests } from './origin-check-log';
 
 /**
  * wiki-v2 #655: which requests ForkOriginCheckGuard decides, and with which inputs. The decision table itself is
@@ -49,6 +50,23 @@ describe('ForkOriginCheckGuard (#655)', () => {
     'decides every other method: %s from a same-site sibling is refused',
     (method) => refuses(method, SIBLING),
   );
+
+  it('writes one FORK_ORIGIN_CHECK_REFUSED line per refusal, and none for an allowed or safe request', () => {
+    resetOriginCheckLogForTests();
+    const warn = jest.spyOn(originCheckLogSink, 'warn').mockImplementation(() => undefined);
+    try {
+      refuses('POST', SIBLING);
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn.mock.calls[0][0]).toBe(
+        'FORK_ORIGIN_CHECK_REFUSED {"surface":"http","method":"POST","secFetchSite":"same-site","origin":"present","referer":"absent"}',
+      );
+      expect(run('POST', { host: HOST, origin: APP_URL })).toBe(true);
+      expect(run('GET', HOSTILE)).toBe(true);
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
 
   it('decides a request WITHOUT the session cookie (no cookie exemption: login CSRF on native credential routes)', () => {
     refuses('POST', { ...SIBLING });

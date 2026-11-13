@@ -2,6 +2,7 @@ import { CanActivate, ExecutionContext, ForbiddenException, Injectable } from '@
 import type { FastifyRequest } from 'fastify';
 import { EnvironmentService } from '../../integrations/environment/environment.service';
 import { ORIGIN_CHECK_REFUSED_MESSAGE, originCheckAllows, signalsFromHeaders } from './origin-check';
+import { logOriginCheckRefused } from './origin-check-log';
 
 /** The methods that never change state. Every other method is decided (fail closed on an unknown verb). */
 const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
@@ -28,7 +29,8 @@ const SAFE_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
  * explicit allowlist, and none exists. The socket.io handshake gets the same decision from `ws-origin-check.ts`.
  *
  * Registered as an `APP_GUARD` from `OriginCheckModule` (imported by AuthzModule, so no upstream file), it runs before
- * every controller guard; a refusal is a 403 with the platform's message.
+ * every controller guard; a refusal is a 403 with the platform's message and one rate-limited
+ * `FORK_ORIGIN_CHECK_REFUSED` line (origin-check-log.ts: signal shapes only, never a header value).
  */
 @Injectable()
 export class ForkOriginCheckGuard implements CanActivate {
@@ -42,6 +44,7 @@ export class ForkOriginCheckGuard implements CanActivate {
     if (SAFE_METHODS.has((req.method ?? 'GET').toUpperCase())) return true;
 
     if (originCheckAllows(signalsFromHeaders(req.headers), [this.environmentService.getAppUrl()])) return true;
+    logOriginCheckRefused('http', req.headers, req.method);
     throw new ForbiddenException(ORIGIN_CHECK_REFUSED_MESSAGE);
   }
 }

@@ -68,8 +68,9 @@ class RestoreDenied extends Error {
  *    that committed while we waited and detaches. The detach's g2 trigger then takes the per-workspace advisory lock
  *    (485485) while we hold row locks; a move-to-space that holds that lock and then needs one of our rows deadlocks
  *    with us — Postgres aborts one side (40P01), which here is a retryable 503 `engine_busy`, nothing changed.
- * 3. A sub-page trashed on its own before the root carries another stamp, so it stays in the trash (it is listed as a
- *    trash root of its own, and restored by restoring it). A live root has no batch: restoring it changes nothing.
+ * 3. A sub-page trashed on its own before the root carries another stamp, so it stays in the trash. The trash lists
+ *    hide a page whose parent is trashed, so it shows up there (and is restored by restoring it) only once this
+ *    restore has brought its parent back. A live root has no batch: restoring it changes nothing.
  * 4. A deny is fenced once OUTSIDE the transaction and retried, exactly as the trash does (a page created or
  *    unrestricted a moment ago may not be projected yet). Still denied → 403 `restore_needs_edit`; fence unconfirmed →
  *    503 `restore_unconfirmed`; fence disabled → 403. A PDP failure is a 503, never a 403 and never a pass.

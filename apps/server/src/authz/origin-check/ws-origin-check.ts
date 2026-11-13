@@ -1,6 +1,7 @@
 import type { Socket } from 'socket.io';
 import { EnvironmentService } from '../../integrations/environment/environment.service';
 import { originCheckAllows, signalsFromHeaders } from './origin-check';
+import { logOriginCheckRefused } from './origin-check-log';
 
 /** The error a refused handshake gets (`connect_error` on the client). Carries no detail. */
 export const SOCKET_ORIGIN_CHECK_ERROR = 'origin_check';
@@ -15,6 +16,7 @@ export const SOCKET_ORIGIN_CHECK_ERROR = 'origin_check';
  *
  * Registered as namespace middleware by `ws/ws.gateway.ts` `afterInit` (seam #161), so it runs before the gateway's
  * `handleConnection`: a refused socket never authenticates, never joins a room and never reaches a message handler.
+ * A refusal also writes one rate-limited `FORK_ORIGIN_CHECK_REFUSED` line (origin-check-log.ts).
  * Dev: Vite's `/socket.io` proxy rewrites `Origin` to the engine's `APP_URL` while `Host` stays the dev server's,
  * which the trusted list covers.
  */
@@ -26,6 +28,7 @@ export function socketOriginCheck(
       next();
       return;
     }
+    logOriginCheckRefused('socket', socket.handshake.headers);
     next(new Error(SOCKET_ORIGIN_CHECK_ERROR));
   };
 }
