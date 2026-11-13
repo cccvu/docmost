@@ -18,7 +18,7 @@ import {
   UpdateGroupDto,
 } from './dto/group-admin.dto';
 import { EXTERNAL_ID } from './dto/space-admin.dto';
-import { isShadowEmail } from './shadow-user';
+import { externalIdOfShadow } from './shadow-user';
 import { asEngineBusy, refusal } from './resource-version';
 import { BASIC_GROUP_HAS_GRANTS, findDefaultGroup, groupGrantCounts, hasGrants } from './default-group';
 
@@ -488,13 +488,6 @@ export class ServiceGroupService {
       throw err;
     }
   }
-}
-
-/** The integrator externalId a shadow user stands for (its email's local part), or null outside the namespace. */
-export function externalIdOfShadow(email: string | null | undefined): string | null {
-  if (!isShadowEmail(email)) return null;
-  const e = email as string;
-  return e.slice(0, e.lastIndexOf('@')).toLowerCase();
 }
 
 /** A LIKE pattern body that matches `q` literally (backslash is Postgres' default LIKE escape). */

@@ -59,10 +59,14 @@ export class ServiceBridgeController {
   @Post('users/resolve')
   @HttpCode(HttpStatus.OK)
   @RequireServiceScope(ServiceScope.UsersResolve)
-  async resolveUser(@Body() dto: ResolveUserDto): Promise<{ userId: string; workspaceId: string }> {
-    // Read-only existence + workspace lookup for a Docmost-native user the platform has no mapping for.
-    const workspaceId = await this.workspaces.resolveUserWorkspaceId(dto.userId);
-    return { userId: dto.userId, workspaceId };
+  async resolveUser(
+    @Body() dto: ResolveUserDto,
+  ): Promise<{ userId: string; workspaceId: string; externalId: string | null }> {
+    // Read-only existence + workspace lookup for a Docmost user the platform has no mapping for. #871: `externalId`
+    // names the platform identity a shadow user stands for (null for any other user), so a membership written before
+    // that identity's first sign-in projects to the identity, never to an inert anchor.
+    const { workspaceId, externalId } = await this.workspaces.resolveUser(dto.userId);
+    return { userId: dto.userId, workspaceId, externalId };
   }
 
   @SkipTransform() // bare body on the wire (spec), not the upstream envelope (#181)

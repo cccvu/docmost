@@ -108,9 +108,13 @@ remote mode without building a real PDP. It is a skeleton, not a production auth
 You only implement a *caller* for these; the fork is the server. They fall into a few families:
 
 - **Session brokerage** (`service-bridge`): `POST /api/service/users` (provision a shadow user),
-  `POST /api/service/users/resolve` (Docmost user id -> workspace), `POST /api/service/session` (mint a
-  session), `POST /api/service/session/revoke` and `.../session/restore` (account disable and re-enable, #455),
-  and `POST /api/service/session/revoke-others` (sign the other devices out, 1.17.0, wiki-v2 #818).
+  `POST /api/service/users/resolve` (Docmost user id -> workspace and, since 1.18.0, `externalId`),
+  `POST /api/service/session` (mint a session), `POST /api/service/session/revoke` and `.../session/restore`
+  (account disable and re-enable, #455), and `POST /api/service/session/revoke-others` (sign the other devices
+  out, 1.17.0, wiki-v2 #818). `users/resolve` answers `ResolvedUser`, whose `externalId` (1.18.0, wiki-v2 #871)
+  is the identity a shadow user stands for and null for any other user, so a membership written before that
+  identity's first sign-in maps to the identity, not to an inert anchor; a fork before 1.18.0 omits it, which a
+  consumer reads as null.
 - **Workspace** (`workspace`): `GET /api/service/workspace/default` (the canonical workspace id),
   `GET`/`PATCH /api/service/workspace/settings`.
 - **Space control plane** (`spaces`): `GET`/`POST /api/service/spaces`, `GET`/`PATCH

@@ -39,3 +39,10 @@ export function isShadowEmail(email: string | null | undefined): boolean {
     lower.slice(at + 1) === SHADOW_EMAIL_DOMAIN // the domain is EXACTLY the reserved name
   );
 }
+
+/** The integrator externalId a shadow user stands for (its email's local part), or null outside the namespace. */
+export function externalIdOfShadow(email: string | null | undefined): string | null {
+  if (!isShadowEmail(email)) return null;
+  const e = email as string;
+  return e.slice(0, e.lastIndexOf('@')).toLowerCase();
+}

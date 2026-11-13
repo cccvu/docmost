@@ -7,6 +7,7 @@ import {
 import { InjectKysely } from 'nestjs-kysely';
 import { sql } from 'kysely';
 import { KyselyDB } from '@docmost/db/types/kysely.types';
+import { externalIdOfShadow } from './shadow-user';
 
 /**
  * CCC service-bridge — NOT upstream Docmost code.
@@ -57,22 +58,25 @@ export class WorkspaceResolver {
   }
 
   /**
-   * The workspace a specific Docmost user belongs to (existence check + workspace lookup). Read-only and
-   * bounded; 404 if the user id does not exist. Used by the platform to reverse-provision a PDP anchor for a
-   * Docmost-native user it has no mapping for. Raw SQL keeps it a single indexed PK read.
+   * The workspace a specific Docmost user belongs to (existence check + workspace lookup), and — #871 — the platform
+   * identity it is the SHADOW user of (`externalId`, the local part of its reserved-namespace email), or null for any
+   * other user. Read-only and bounded; 404 if the user id does not exist. The platform calls it for a Docmost user it
+   * has no real mapping for: a shadow user is linked to the identity it was provisioned for (the same derivation
+   * `POST /api/service/users` upserts by, so it names the row sign-in would map), anything else gets a PDP anchor.
+   * Raw SQL keeps it a single indexed PK read.
    */
-  async resolveUserWorkspaceId(userId: string): Promise<string> {
+  async resolveUser(userId: string): Promise<{ workspaceId: string; externalId: string | null }> {
     // NOTE: the fork's Kysely runs CamelCasePlugin, which camelCases result keys even for raw `sql` — so a
     // `select workspace_id` column comes back as `workspaceId` (not `workspace_id`). Every raw-sql read in
     // this module reads camelCase result keys for that reason.
     // Companion F5: exclude soft-deleted users (a deleted user must not anchor a PDP grant), and reject a
     // null `workspace_id` (the column is nullable) rather than returning `null` typed as `string` — a bogus
     // anchor is worse than a clean 404.
-    const res = await sql<{ workspaceId: string | null }>`
-      select workspace_id from users where id = ${userId} and deleted_at is null
+    const res = await sql<{ workspaceId: string | null; email: string | null }>`
+      select workspace_id, email from users where id = ${userId} and deleted_at is null
     `.execute(this.db);
     const row = res.rows[0];
     if (!row || !row.workspaceId) throw new NotFoundException('user not found');
-    return row.workspaceId;
+    return { workspaceId: row.workspaceId, externalId: externalIdOfShadow(row.email) };
   }
 }
