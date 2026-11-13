@@ -9,7 +9,8 @@
 #   4. no CCC services (platform / spicedb) are present,
 #   5. the SPA build is delivered precompressed (br / gzip negotiated on Accept-Encoding) with an immutable
 #      Cache-Control on the content-hashed bundle (#309), and every SPA document (`/`, `/index.html`, a deep
-#      route, a missing asset) is the injected shell under the no-store document policy (#409).
+#      route, a missing asset) is the injected shell under the no-store document policy (#409),
+#   6. the engine refuses a cross-site write in-process, with no WAF in front (wiki-v2 #655).
 #
 # Run from anywhere; the script cds to the fork root. Requires docker (compose v2), curl, jq.
 #   docmost/deploy/standalone/smoke.sh
@@ -176,6 +177,35 @@ if [ "$bob_read" = "403" ] || [ "$bob_read" = "404" ]; then
 else
   bad "Bob was NOT denied (HTTP $bob_read) — native authorization is not enforcing! body: $(cat "$TMP/bobread.json")"
 fi
+
+# --- 3d. in-process origin check (wiki-v2 #655): a cross-site write is refused with no WAF in front ------
+# The booted engine decides every unsafe request on Sec-Fetch-Site / Origin / Referer. Alice's signed-in
+# POST /api/users/me is 200 with no browser signal (curl, as above) and from our own origin, and 403 from a
+# foreign origin, from `Origin: null`, and from a same-site sibling. The native login is decided too, with no
+# cookie (login CSRF). Our origin is the scheme://host[:port] part of BASE, never BASE itself.
+log "in-process origin check (#655): cross-site writes refused, same-origin and signal-less writes pass"
+OWN_ORIGIN="$(printf '%s' "$BASE" | sed -E 's#^([A-Za-z][A-Za-z0-9+.-]*://[^/?#]+).*#\1#')"
+# me_with <header...>: Alice's POST /api/users/me with the given extra headers; prints the status code
+me_with() {
+  curl -s -o /dev/null -w '%{http_code}' -b "$A_JAR" -H 'content-type: application/json' "$@" \
+    -d '{}' "${BASE}/api/users/me" || true
+}
+c_own="$(me_with -H "Origin: ${OWN_ORIGIN}" -H 'Sec-Fetch-Site: same-origin')"
+[ "$c_own" = "200" ] && pass "same-origin write (Origin ${OWN_ORIGIN}) -> 200" \
+  || bad "same-origin write (Origin ${OWN_ORIGIN}) -> $c_own (expected 200)"
+c_none="$(me_with)"
+[ "$c_none" = "200" ] && pass "write with no browser signal -> 200" || bad "write with no browser signal -> $c_none (expected 200)"
+c_evil="$(me_with -H 'Origin: https://evil.example')"
+[ "$c_evil" = "403" ] && pass "cross-origin write (Origin https://evil.example) -> 403" \
+  || bad "cross-origin write (Origin https://evil.example) -> $c_evil (expected 403)"
+c_null="$(me_with -H 'Origin: null')"
+[ "$c_null" = "403" ] && pass "write with Origin: null -> 403" || bad "write with Origin: null -> $c_null (expected 403)"
+c_sib="$(me_with -H 'Origin: https://sibling.example.edu' -H 'Sec-Fetch-Site: same-site')"
+[ "$c_sib" = "403" ] && pass "same-site sibling write -> 403" || bad "same-site sibling write -> $c_sib (expected 403)"
+c_login="$(curl -s -o /dev/null -w '%{http_code}' -H 'content-type: application/json' -H 'Origin: https://evil.example' \
+  -d '{"email":"alice@example.com","password":"AlicePw123!"}' "${BASE}/api/auth/login" || true)"
+[ "$c_login" = "403" ] && pass "cross-origin native login (no cookie) -> 403" \
+  || bad "cross-origin native login (no cookie) -> $c_login (expected 403)"
 
 # --- 4. no CCC services present --------------------------------------------------------------------
 log "assert no CCC services (platform / spicedb) in the stack"

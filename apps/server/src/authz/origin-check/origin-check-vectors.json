@@ -1,0 +1,607 @@
+[
+  {
+    "name": "Origin null, no Sec-Fetch-Site, no Referer (sandboxed iframe or no-referrer form)",
+    "rule": "no-site",
+    "signals": {
+      "origin": "null",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "Origin null with Sec-Fetch-Site same-origin (same-origin form under a no-referrer policy)",
+    "rule": "same-origin-or-none",
+    "signals": {
+      "secFetchSite": "same-origin",
+      "origin": "null",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": true
+  },
+  {
+    "name": "Origin null with Sec-Fetch-Site none (user-initiated)",
+    "rule": "same-origin-or-none",
+    "signals": {
+      "secFetchSite": "none",
+      "origin": "null",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": true
+  },
+  {
+    "name": "Origin null with Sec-Fetch-Site cross-site (sandboxed iframe, opaque origin)",
+    "rule": "cross-or-same-site",
+    "signals": {
+      "secFetchSite": "cross-site",
+      "origin": "null",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "Origin null with Sec-Fetch-Site same-site (a sibling page, or a redirect)",
+    "rule": "cross-or-same-site",
+    "signals": {
+      "secFetchSite": "same-site",
+      "origin": "null",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "Origin null with no Sec-Fetch-Site and a foreign Referer (Referer is not consulted, still refused)",
+    "rule": "no-site",
+    "signals": {
+      "origin": "null",
+      "referer": "https://evil.example/x",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "same-origin with a foreign Origin",
+    "rule": "origin-ours",
+    "signals": {
+      "secFetchSite": "same-origin",
+      "origin": "https://evil.example",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "same-origin with an unparseable Origin",
+    "rule": "shape",
+    "signals": {
+      "secFetchSite": "same-origin",
+      "origin": "not a url",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "same-origin with a path-bearing Origin",
+    "rule": "shape",
+    "signals": {
+      "secFetchSite": "same-origin",
+      "origin": "https://wiki.example.com/path",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "same-origin with a comma-joined duplicate Origin",
+    "rule": "shape",
+    "signals": {
+      "secFetchSite": "same-origin",
+      "origin": "https://a.example, https://b.example",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "same-origin with a comma-joined duplicate of our own Origin",
+    "rule": "shape",
+    "signals": {
+      "secFetchSite": "same-origin",
+      "origin": "https://wiki.example.com, https://wiki.example.com",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "same-origin with the default port spelled out (not canonical)",
+    "rule": "shape",
+    "signals": {
+      "secFetchSite": "same-origin",
+      "origin": "https://wiki.example.com:443",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "same-origin with an empty Origin",
+    "rule": "shape",
+    "signals": {
+      "secFetchSite": "same-origin",
+      "origin": "",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "same-origin with an upper-case Origin (not canonical)",
+    "rule": "shape",
+    "signals": {
+      "secFetchSite": "same-origin",
+      "origin": "HTTPS://WIKI.EXAMPLE.COM",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "a comma-joined duplicate Sec-Fetch-Site",
+    "rule": "shape",
+    "signals": {
+      "secFetchSite": "same-origin, cross-site",
+      "origin": "https://wiki.example.com",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "an unknown Sec-Fetch-Site value (same-party)",
+    "rule": "shape",
+    "signals": {
+      "secFetchSite": "same-party",
+      "origin": "https://wiki.example.com",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "a Sec-Fetch-Site in the wrong case (Same-Origin)",
+    "rule": "shape",
+    "signals": {
+      "secFetchSite": "Same-Origin",
+      "origin": "https://wiki.example.com",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "an empty Sec-Fetch-Site",
+    "rule": "shape",
+    "signals": {
+      "secFetchSite": "",
+      "origin": "https://wiki.example.com",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "an Origin that arrives as a header array",
+    "rule": "shape",
+    "signals": {
+      "secFetchSite": "same-origin",
+      "origin": [
+        "https://wiki.example.com",
+        "https://wiki.example.com"
+      ],
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "a Sec-Fetch-Site that arrives as a header array",
+    "rule": "shape",
+    "signals": {
+      "secFetchSite": [
+        "same-origin"
+      ],
+      "origin": "https://wiki.example.com",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "same-origin, Origin host equals Host",
+    "rule": "same-origin-or-none",
+    "signals": {
+      "secFetchSite": "same-origin",
+      "origin": "https://wiki.example.com",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": true
+  },
+  {
+    "name": "same-origin, Host differs but Origin is trusted (a rewritten dev proxy Origin)",
+    "rule": "same-origin-or-none",
+    "signals": {
+      "secFetchSite": "same-origin",
+      "origin": "http://localhost:3300",
+      "host": "localhost:5173"
+    },
+    "trusted": [
+      "http://localhost:3300"
+    ],
+    "allow": true
+  },
+  {
+    "name": "same-origin with no Origin and no Referer",
+    "rule": "same-origin-or-none",
+    "signals": {
+      "secFetchSite": "same-origin",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": true
+  },
+  {
+    "name": "same-origin with no Origin but a foreign Referer",
+    "rule": "referer-ours",
+    "signals": {
+      "secFetchSite": "same-origin",
+      "referer": "https://evil.example/x",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "none with no Origin",
+    "rule": "same-origin-or-none",
+    "signals": {
+      "secFetchSite": "none",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": true
+  },
+  {
+    "name": "none with a foreign Origin",
+    "rule": "origin-ours",
+    "signals": {
+      "secFetchSite": "none",
+      "origin": "https://evil.example",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "same-site from an untrusted sibling",
+    "rule": "origin-ours",
+    "signals": {
+      "secFetchSite": "same-site",
+      "origin": "https://sibling.example.edu",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "same-site from a trusted origin",
+    "rule": "cross-or-same-site",
+    "signals": {
+      "secFetchSite": "same-site",
+      "origin": "https://app.example.com",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": true
+  },
+  {
+    "name": "cross-site from a trusted origin",
+    "rule": "cross-or-same-site",
+    "signals": {
+      "secFetchSite": "cross-site",
+      "origin": "https://app.example.com",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": true
+  },
+  {
+    "name": "cross-site whose Origin host equals Host but is not trusted (contradictory)",
+    "rule": "cross-or-same-site",
+    "signals": {
+      "secFetchSite": "cross-site",
+      "origin": "https://wiki.example.com",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "cross-site with no Origin",
+    "rule": "cross-or-same-site",
+    "signals": {
+      "secFetchSite": "cross-site",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "same-site with no Origin even if the Referer is trusted",
+    "rule": "cross-or-same-site",
+    "signals": {
+      "secFetchSite": "same-site",
+      "referer": "https://app.example.com/page",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "no Sec-Fetch-Site, Origin host equals Host",
+    "rule": "no-site",
+    "signals": {
+      "origin": "https://wiki.example.com",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": true
+  },
+  {
+    "name": "no Sec-Fetch-Site, Origin host equals a Host with a port",
+    "rule": "no-site",
+    "signals": {
+      "origin": "http://localhost:5173",
+      "host": "localhost:5173"
+    },
+    "trusted": [],
+    "allow": true
+  },
+  {
+    "name": "no Sec-Fetch-Site, Origin port differs from the Host port",
+    "rule": "origin-ours",
+    "signals": {
+      "origin": "https://wiki.example.com:8443",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "no Sec-Fetch-Site, a trusted Origin",
+    "rule": "no-site",
+    "signals": {
+      "origin": "https://app.example.com",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": true
+  },
+  {
+    "name": "no Sec-Fetch-Site, an untrusted Origin",
+    "rule": "origin-ours",
+    "signals": {
+      "origin": "https://sibling.example.edu",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "no Sec-Fetch-Site, an unparseable Origin",
+    "rule": "shape",
+    "signals": {
+      "origin": "not a url",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "no Sec-Fetch-Site, a comma-joined duplicate Origin (two Origin header lines)",
+    "rule": "shape",
+    "signals": {
+      "origin": "https://evil.example, https://wiki.example.com",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "no Sec-Fetch-Site, our Origin but no Host header",
+    "rule": "origin-ours",
+    "signals": {
+      "origin": "https://wiki.example.com"
+    },
+    "trusted": [],
+    "allow": false
+  },
+  {
+    "name": "no Sec-Fetch-Site, our Origin but a Host header array",
+    "rule": "origin-ours",
+    "signals": {
+      "origin": "https://wiki.example.com",
+      "host": [
+        "wiki.example.com",
+        "wiki.example.com"
+      ]
+    },
+    "trusted": [],
+    "allow": false
+  },
+  {
+    "name": "no Sec-Fetch-Site, no Origin, an unparseable Referer",
+    "rule": "referer-ours",
+    "signals": {
+      "referer": "not a url",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "no Sec-Fetch-Site, no Origin, a cross-origin Referer",
+    "rule": "referer-ours",
+    "signals": {
+      "referer": "https://sibling.example.edu/form.html",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "no Sec-Fetch-Site, no Origin, a Referer with an opaque origin",
+    "rule": "referer-ours",
+    "signals": {
+      "referer": "data:text/html,x",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": false
+  },
+  {
+    "name": "no Sec-Fetch-Site, no Origin, a same-origin Referer",
+    "rule": "no-site",
+    "signals": {
+      "referer": "https://wiki.example.com/app",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": true
+  },
+  {
+    "name": "no Sec-Fetch-Site, no Origin, a trusted Referer",
+    "rule": "no-site",
+    "signals": {
+      "referer": "https://app.example.com/x",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": true
+  },
+  {
+    "name": "no Sec-Fetch-Site, our Origin and a foreign Referer (Referer is only the fallback)",
+    "rule": "no-site",
+    "signals": {
+      "origin": "https://wiki.example.com",
+      "referer": "https://evil.example/x",
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": true
+  },
+  {
+    "name": "no browser signal at all (curl, the relay, Playwright request API)",
+    "rule": "no-site",
+    "signals": {
+      "host": "wiki.example.com"
+    },
+    "trusted": [
+      "https://app.example.com"
+    ],
+    "allow": true
+  }
+]

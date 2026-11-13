@@ -10,6 +10,7 @@ import { ExportAdmissionModule } from './request-controls/export-admission.modul
 import { RetryAfterModule } from './request-controls/retry-after.module';
 import { NativeFormatModule } from './native-format/native-format.module';
 import { StorableTextModule } from './request-controls/storable-text.module';
+import { OriginCheckModule } from './origin-check/origin-check.module';
 
 /**
  * CCC authorization integration — NOT upstream Docmost code.
@@ -25,7 +26,8 @@ import { StorableTextModule } from './request-controls/storable-text.module';
  * export admission (ExportAdmissionModule, #699: a resource bound, in both modes), and the engine-wide `Retry-After` on
  * every 503 (RetryAfterModule, #696), and the remote-mode refusal of a non-json `format` on the native page routes
  * (NativeFormatModule, #716: their echo converts a whole page on the event loop), and the refusal of a NUL or lone
- * surrogate in any request before its handler, with its Postgres backstop (StorableTextModule, #781).
+ * surrogate in any request before its handler, with its Postgres backstop (StorableTextModule, #781), and the in-process
+ * Fetch-Metadata/Origin CSRF check on every unsafe HTTP request (OriginCheckModule, wiki-v2 #655).
  */
 @Module({
   imports: [
@@ -39,6 +41,7 @@ import { StorableTextModule } from './request-controls/storable-text.module';
     RetryAfterModule, // #696: every 503 carries Retry-After (kept when already set) — both modes
     NativeFormatModule, // #716: remote mode refuses a non-json `format` on native /api/pages/info|create|update
     StorableTextModule, // #781: NUL / lone surrogate in a request → 400 invalid_characters before the handler — both modes
+    OriginCheckModule, // wiki-v2 #655: a cross-site unsafe request → 403 before any controller guard — both modes
   ],
   providers: [HttpAuthzClient],
   exports: [AuthzModeModule, HttpAuthzClient],
