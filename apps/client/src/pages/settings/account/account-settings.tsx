@@ -9,6 +9,8 @@ import { useTranslation } from "react-i18next";
 import SessionList from "@/features/session/components/session-list";
 // CCC (wiki-v2 UI cleanup): the platform owns the email in remote mode.
 import { isNativeAuthEnabled } from "@/features/auth-native/lib/auth-mode.ts";
+// CCC (wiki-v2 #818): Profile → Passkeys (fork-owned; renders its own divider, and nothing without passkeys).
+import PasskeysSection from "@/features/passkeys/components/passkeys-section.tsx";
 
 export default function AccountSettings() {
   const { t } = useTranslation();
@@ -41,6 +43,8 @@ export default function AccountSettings() {
       <Divider my="lg" />
 
       <SessionList />
+
+      <PasskeysSection />
     </>
   );
 }

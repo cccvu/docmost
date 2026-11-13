@@ -37,8 +37,67 @@ const requestEmail = vi.fn(
     _opts?: { onRetryAfter?: (seconds: number) => void },
   ): Promise<boolean> => true,
 );
-const completeSignIn = vi.fn(async () => {});
+const completeSignIn = vi.fn(
+  async (_args: unknown, _opts?: { screens?: boolean }) => {},
+);
+// The #818 pluggable verifier: like the real hook, it calls the verifier BEFORE its first await (the gesture rule).
+const completeSignInWith = vi.fn(
+  async (
+    verify: () => Promise<unknown>,
+    _opts: { method: "email" | "passkey"; screens?: boolean },
+  ) => {
+    await verify();
+  },
+);
+const continueAfterSignIn = vi.fn();
 const showNotification = vi.fn();
+
+// #818 passkey seams. Passkeys are OFF unless a test turns them on (jsdom has no WebAuthn either), so every pre-#818
+// test above sees the page exactly as before.
+const pk = vi.hoisted(() => ({
+  supported: false,
+  postSignIn: null as
+    | null
+    | { kind: "nudge" }
+    | { kind: "reminder"; daysLeft: number },
+  signIn: vi.fn(async (): Promise<unknown> => ({})),
+  disarm: vi.fn(),
+  arm: vi.fn(),
+  handlers: null as null | {
+    onSignedIn: (r: unknown) => void;
+    onFailure: (f: unknown) => void;
+  },
+}));
+vi.mock("@/features/passkeys/lib/capabilities.ts", () => ({
+  passkeysSupported: () => pk.supported,
+}));
+vi.mock("@/features/passkeys/lib/autofill.ts", () => ({
+  armPasskeyAutofill: (h: {
+    onSignedIn: (r: unknown) => void;
+    onFailure: (f: unknown) => void;
+  }) => {
+    pk.arm(h);
+    pk.handlers = h;
+    return pk.disarm;
+  },
+}));
+vi.mock("@/features/passkeys/services/passkey-api.ts", () => ({
+  signInWithPasskey: (...a: unknown[]) => pk.signIn(...(a as [])),
+}));
+vi.mock("@/features/passkeys/components/passkey-nudge.tsx", () => ({
+  PasskeyNudge: ({ onDone }: { onDone: () => void }) => (
+    <button onClick={onDone}>nudge-stub</button>
+  ),
+}));
+vi.mock("@/features/passkeys/components/passkey-reminder.tsx", () => ({
+  PasskeyReminder: ({
+    daysLeft,
+    onDone,
+  }: {
+    daysLeft: number;
+    onDone: () => void;
+  }) => <button onClick={onDone}>reminder-stub {daysLeft}</button>,
+}));
 
 vi.mock("@mantine/notifications", () => ({
   notifications: { show: (...a: unknown[]) => showNotification(...a) },
@@ -60,6 +119,9 @@ vi.mock("@/features/public/hooks/use-passwordless.ts", () => ({
   usePasswordless: () => ({
     requestEmail,
     completeSignIn,
+    completeSignInWith,
+    continueAfterSignIn,
+    postSignIn: pk.postSignIn,
     isRequesting: false,
     isVerifying: false,
   }),
@@ -169,10 +231,13 @@ describe("PasswordlessLogin — the OTP is reachable without destroying it", () 
     fireEvent.click(screen.getByRole("button", { name: /sign in with code/i }));
 
     await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
-    expect(completeSignIn).toHaveBeenCalledWith({
-      email: "user@example.edu",
-      otp: "111111",
-    });
+    expect(completeSignIn).toHaveBeenCalledWith(
+      {
+        email: "user@example.edu",
+        otp: "111111",
+      },
+      { screens: true },
+    );
     expect(requestEmail).not.toHaveBeenCalled();
   });
 
@@ -379,10 +444,13 @@ describe("PasswordlessLogin — the code field takes 6 to 12 digits (#815)", () 
     await openCodeStep();
     pasteOtp("1234 5678");
     await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
-    expect(completeSignIn).toHaveBeenCalledWith({
-      email: "user@example.edu",
-      otp: "12345678",
-    });
+    expect(completeSignIn).toHaveBeenCalledWith(
+      {
+        email: "user@example.edu",
+        otp: "12345678",
+      },
+      { screens: true },
+    );
     // One field, not a row of cells: the whole code is in it.
     expect(otpField().value).toBe("1234 5678");
   });
@@ -391,20 +459,26 @@ describe("PasswordlessLogin — the code field takes 6 to 12 digits (#815)", () 
     await openCodeStep();
     pasteOtp("123456");
     await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
-    expect(completeSignIn).toHaveBeenCalledWith({
-      email: "user@example.edu",
-      otp: "123456",
-    });
+    expect(completeSignIn).toHaveBeenCalledWith(
+      {
+        email: "user@example.edu",
+        otp: "123456",
+      },
+      { screens: true },
+    );
   });
 
   it("an autofill that reports no input type still submits (the length jump is the tell)", async () => {
     await openCodeStep();
     fireEvent.change(otpField(), { target: { value: "87654321" } });
     await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
-    expect(completeSignIn).toHaveBeenCalledWith({
-      email: "user@example.edu",
-      otp: "87654321",
-    });
+    expect(completeSignIn).toHaveBeenCalledWith(
+      {
+        email: "user@example.edu",
+        otp: "87654321",
+      },
+      { screens: true },
+    );
   });
 
   it("auto-submits ONCE: pasting the same code again does not submit it again", async () => {
@@ -432,10 +506,13 @@ describe("PasswordlessLogin — the code field takes 6 to 12 digits (#815)", () 
     await waitFor(() => expect(submit.hasAttribute("disabled")).toBe(false));
     fireEvent.click(submit);
     await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
-    expect(completeSignIn).toHaveBeenCalledWith({
-      email: "user@example.edu",
-      otp: "12345678",
-    });
+    expect(completeSignIn).toHaveBeenCalledWith(
+      {
+        email: "user@example.edu",
+        otp: "12345678",
+      },
+      { screens: true },
+    );
   });
 
   it("a typed hyphen is ignored on submit", async () => {
@@ -443,10 +520,13 @@ describe("PasswordlessLogin — the code field takes 6 to 12 digits (#815)", () 
     typeOtp("1234-5678");
     fireEvent.click(screen.getByRole("button", { name: /sign in with code/i }));
     await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
-    expect(completeSignIn).toHaveBeenCalledWith({
-      email: "user@example.edu",
-      otp: "12345678",
-    });
+    expect(completeSignIn).toHaveBeenCalledWith(
+      {
+        email: "user@example.edu",
+        otp: "12345678",
+      },
+      { screens: true },
+    );
   });
 
   it("a paste with no address yet does not submit; the button does once the address is in", async () => {
@@ -640,5 +720,284 @@ describe("PasswordlessLogin — verify failures (#815)", () => {
     expect(document.activeElement).toBe(field);
     expect(field.selectionStart).toBe(0);
     expect(field.selectionEnd).toBe(field.value.length);
+  });
+});
+
+// #818 passkeys on the login page: autofill arm/abort, a button on each step that runs ONE ceremony from its click,
+// the error table in ONE polite live region, email_confirmation_required → the code step, and the post-sign-in screens.
+describe("PasswordlessLogin — passkeys (#818)", () => {
+  // Real error helpers: the page feeds whatever the api throws to the real #818 table.
+  let PasskeyErrorCtor: typeof import("@/features/passkeys/lib/passkey-errors.ts").PasskeyError;
+  let httpFailureFn: typeof import("@/features/passkeys/lib/passkey-errors.ts").httpFailure;
+  beforeAll(async () => {
+    const mod = await import("@/features/passkeys/lib/passkey-errors.ts");
+    PasskeyErrorCtor = mod.PasskeyError;
+    httpFailureFn = mod.httpFailure;
+  });
+  const refused = (
+    status: number,
+    body: Record<string, unknown> = {},
+    stage: "options" | "request" = "request",
+  ) => new PasskeyErrorCtor(httpFailureFn(stage, status, body, null));
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    pk.supported = true;
+    pk.postSignIn = null;
+    pk.handlers = null;
+    pk.signIn.mockImplementation(async () => ({
+      id: "i",
+      email: "a@b.test",
+      workspaceId: "w",
+    }));
+  });
+  afterEach(() => {
+    pk.supported = false;
+    pk.postSignIn = null;
+  });
+
+  const passkeyButton = () =>
+    screen.getByRole("button", { name: /^sign in with a passkey$/i });
+  const liveRegion = () => {
+    const region = document.querySelector(
+      '[role="status"][aria-live="polite"]',
+    );
+    expect(region).toBeTruthy();
+    return region as HTMLElement;
+  };
+
+  it("step 1's email field offers passkeys in its suggestions (username webauthn)", () => {
+    renderLogin();
+    expect(
+      (screen.getByLabelText(/email/i) as HTMLInputElement).getAttribute(
+        "autocomplete",
+      ),
+    ).toBe("username webauthn");
+  });
+
+  it("arms autofill once on step 1, and aborts it when the step changes", async () => {
+    renderLogin();
+    await waitFor(() => expect(pk.arm).toHaveBeenCalledTimes(1));
+    expect(pk.disarm).not.toHaveBeenCalled();
+    fireEvent.click(
+      screen.getByRole("button", { name: /i already have a code/i }),
+    );
+    await waitFor(() => expect(otpField()).toBeTruthy());
+    expect(pk.disarm).toHaveBeenCalled();
+    expect(pk.arm).toHaveBeenCalledTimes(1); // never re-armed on the code step
+  });
+
+  it("aborts autofill on unmount", async () => {
+    const view = renderLogin();
+    await waitFor(() => expect(pk.arm).toHaveBeenCalledTimes(1));
+    view.unmount();
+    expect(pk.disarm).toHaveBeenCalled();
+  });
+
+  it("no WebAuthn in this browser: no passkey button, no autofill, email unchanged", () => {
+    pk.supported = false;
+    renderLogin();
+    expect(screen.queryByRole("button", { name: /passkey/i })).toBeNull();
+    expect(pk.arm).not.toHaveBeenCalled();
+    expect(
+      screen.getByRole("button", { name: /email me a sign-in code/i }),
+    ).toBeTruthy();
+  });
+
+  it("the step-1 button aborts autofill FIRST, then starts its ceremony synchronously inside the click", async () => {
+    renderLogin();
+    await waitFor(() => expect(pk.arm).toHaveBeenCalledTimes(1));
+    fireEvent.click(passkeyButton());
+    // No waitFor: the verifier (one native fetch, then get()) must already have started within the click.
+    expect(pk.signIn).toHaveBeenCalledTimes(1);
+    expect(pk.disarm.mock.invocationCallOrder[0]).toBeLessThan(
+      pk.signIn.mock.invocationCallOrder[0],
+    );
+    expect(completeSignInWith).toHaveBeenCalledWith(expect.any(Function), {
+      method: "passkey",
+      screens: true,
+    });
+  });
+
+  it("the code step offers 'Didn't get a code? Sign in with a passkey', which runs the ceremony", async () => {
+    await openCodeStep();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: /didn't get a code\? sign in with a passkey/i,
+      }),
+    );
+    expect(pk.signIn).toHaveBeenCalledTimes(1);
+  });
+
+  it("401 passkey_failed → a polite message with 'Try again' and 'Email me a code instead'; Try again is a new ceremony", async () => {
+    pk.signIn.mockRejectedValueOnce(refused(401, { code: "passkey_failed" }));
+    renderLogin();
+    fireEvent.click(passkeyButton());
+    await waitFor(() =>
+      expect(liveRegion().textContent).toBe(
+        "We couldn't sign you in with that passkey.",
+      ),
+    );
+    expect(screen.queryByRole("alert")).toBeNull(); // polite, never an alert
+    fireEvent.click(screen.getByRole("button", { name: /^try again$/i }));
+    expect(pk.signIn).toHaveBeenCalledTimes(2);
+  });
+
+  it("401 passkey_not_recognized → says so and offers email, but no 'Try again'", async () => {
+    pk.signIn.mockRejectedValueOnce(
+      refused(401, { code: "passkey_not_recognized" }),
+    );
+    renderLogin();
+    fireEvent.click(passkeyButton());
+    await waitFor(() =>
+      expect(liveRegion().textContent).toBe(
+        "That passkey isn't set up for this account anymore.",
+      ),
+    );
+    expect(
+      screen.getByRole("button", { name: /email me a code instead/i }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /^try again$/i })).toBeNull();
+  });
+
+  it("a cancelled prompt (NotAllowedError) shows nothing and leaves the button enabled", async () => {
+    pk.signIn.mockRejectedValueOnce(
+      new PasskeyErrorCtor({ kind: "cancelled" }),
+    );
+    renderLogin();
+    fireEvent.click(passkeyButton());
+    await waitFor(() => expect(completeSignInWith).toHaveBeenCalled());
+    await act(async () => {});
+    expect(liveRegion().textContent).toBe("");
+    expect(passkeyButton().hasAttribute("disabled")).toBe(false);
+  });
+
+  it("an older platform (404 on options) hides every passkey control; email unchanged", async () => {
+    pk.signIn.mockRejectedValueOnce(refused(404, {}, "options"));
+    renderLogin();
+    fireEvent.click(passkeyButton());
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /passkey/i })).toBeNull(),
+    );
+    expect(liveRegion().textContent).toMatch(/use an emailed code/i);
+    expect(
+      screen.getByRole("button", { name: /email me a sign-in code/i }),
+    ).toBeTruthy();
+  });
+
+  it("403 email_confirmation_required → the code step for the address the platform named, and a code is mailed", async () => {
+    pk.signIn.mockRejectedValueOnce(
+      refused(403, {
+        code: "email_confirmation_required",
+        email: "owner@example.edu",
+      }),
+    );
+    renderLogin();
+    typeEmail("someone-else@example.edu");
+    fireEvent.click(passkeyButton());
+    await waitFor(() =>
+      expect(requestEmail).toHaveBeenCalledWith(
+        "owner@example.edu",
+        expect.anything(),
+      ),
+    );
+    await waitFor(() => expect(otpField()).toBeTruthy());
+    expect((screen.getByLabelText(/^email/i) as HTMLInputElement).value).toBe(
+      "owner@example.edu",
+    );
+    expect(liveRegion().textContent).toMatch(/confirm your email/i);
+  });
+
+  it("429 → 'Too many attempts…' with email offered, never 'Try again'", async () => {
+    pk.signIn.mockRejectedValueOnce(refused(429, { code: "rate_limited" }));
+    renderLogin();
+    fireEvent.click(passkeyButton());
+    await waitFor(() =>
+      expect(liveRegion().textContent).toMatch(/too many attempts/i),
+    );
+    expect(screen.queryByRole("button", { name: /^try again$/i })).toBeNull();
+  });
+
+  it("'Email me a code instead' on step 1 mails a code to the typed address", async () => {
+    pk.signIn.mockRejectedValueOnce(refused(401, { code: "passkey_failed" }));
+    renderLogin();
+    typeEmail("user@example.edu");
+    fireEvent.click(passkeyButton());
+    const instead = await screen.findByRole("button", {
+      name: /email me a code instead/i,
+    });
+    fireEvent.click(instead);
+    await waitFor(() =>
+      expect(requestEmail).toHaveBeenCalledWith(
+        "user@example.edu",
+        expect.anything(),
+      ),
+    );
+    await waitFor(() => expect(otpField()).toBeTruthy());
+    expect(liveRegion().textContent).toBe("");
+  });
+
+  it("a bridge failure after a good passkey is the session toast, not a passkey message", async () => {
+    completeSignInWith.mockRejectedValueOnce(
+      Object.assign(new Error("session-bridge-failed"), { stage: "bridge" }),
+    );
+    renderLogin();
+    fireEvent.click(passkeyButton());
+    await waitFor(() => expect(showNotification).toHaveBeenCalledTimes(1));
+    expect(liveRegion().textContent).toBe("");
+  });
+
+  it("autofill: a sign-in runs the shared tail as a passkey sign-in with the screens", async () => {
+    renderLogin();
+    await waitFor(() => expect(pk.handlers).toBeTruthy());
+    const res = { id: "i", email: "a@b.test", workspaceId: "w" };
+    act(() => pk.handlers!.onSignedIn(res));
+    await waitFor(() => expect(completeSignInWith).toHaveBeenCalledTimes(1));
+    expect(completeSignInWith.mock.calls[0][1]).toEqual({
+      method: "passkey",
+      screens: true,
+    });
+    await expect(completeSignInWith.mock.calls[0][0]()).resolves.toBe(res);
+  });
+
+  it("autofill: a 429 is announced; an older platform hides the button silently", async () => {
+    renderLogin();
+    await waitFor(() => expect(pk.handlers).toBeTruthy());
+    act(() =>
+      pk.handlers!.onFailure(
+        httpFailureFn("request", 429, { code: "rate_limited" }, null),
+      ),
+    );
+    await waitFor(() =>
+      expect(liveRegion().textContent).toMatch(/too many attempts/i),
+    );
+    act(() => pk.handlers!.onFailure(httpFailureFn("options", 405, {}, null)));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: /passkey/i })).toBeNull(),
+    );
+    expect(liveRegion().textContent).toBe("");
+  });
+
+  it("the email code path asks for the post-sign-in screens", async () => {
+    await openCodeStep();
+    pasteOtp("123456");
+    await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
+    expect(completeSignIn.mock.calls[0][1]).toEqual({ screens: true });
+  });
+
+  it("renders the nudge INSTEAD of the sign-in form, and leaves through continueAfterSignIn", () => {
+    pk.postSignIn = { kind: "nudge" };
+    renderLogin();
+    expect(screen.queryByRole("heading", { name: /^sign in$/i })).toBeNull();
+    expect(pk.arm).not.toHaveBeenCalled(); // no autofill behind a signed-in screen
+    fireEvent.click(screen.getByRole("button", { name: "nudge-stub" }));
+    expect(continueAfterSignIn).toHaveBeenCalledTimes(1);
+  });
+
+  it("renders the reminder with its days left", () => {
+    pk.postSignIn = { kind: "reminder", daysLeft: 12 };
+    renderLogin();
+    fireEvent.click(screen.getByRole("button", { name: "reminder-stub 12" }));
+    expect(continueAfterSignIn).toHaveBeenCalledTimes(1);
   });
 });
