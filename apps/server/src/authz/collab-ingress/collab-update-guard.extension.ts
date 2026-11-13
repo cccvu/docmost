@@ -35,10 +35,18 @@
  * turn after the load's `applyUpdate`, never in the same event-loop block. It runs only while the guard enforces: the
  * repair exists so stored values the guard would refuse stop blocking honest edits, and it deletes them, so
  * `COLLAB_UPDATE_GUARD=report` (the ADR 0036 kill switch) turns it off along with the refusals.
+ *
+ * #793 (page-write/binding-seal.ts): `afterLoadDocument` also adopts, right after the charge and before it yields, the
+ * client-id bindings the load restored from the page's seal, awareness-only and in every mode (`adoptSealed`); a load
+ * that applied no stored ydoc registers a lifetime that seals insert-if-absent. `afterUnloadDocument` commits the seal
+ * the guard took at the document's destroy. It runs first among the unload hooks (this extension outranks RedisSync,
+ * whose `afterUnloadDocument` releases the document's lock) and inside the deploy drain, and NEVER rejects: Hocuspocus
+ * chains the hooks, so a rejection here would skip RedisSync's release.
  */
 import { Logger } from '@nestjs/common';
 import type {
   afterLoadDocumentPayload,
+  afterUnloadDocumentPayload,
   beforeHandleMessagePayload,
   connectedPayload,
   Document,
@@ -47,7 +55,8 @@ import type {
 } from '@hocuspocus/server';
 import type * as Y from 'yjs';
 import { COLLAB_LOAD_TRY_LATER_REASON, COLLAB_PAGE_COMPACTING_REASON } from './collab-reasons';
-import { noteLoadRepaired } from '../page-write/compaction';
+import { commitPendingSeal, unclaimedLifetime } from '../page-write/binding-seal';
+import { noteLoadRepaired, pageIdOfDocumentName } from '../page-write/compaction';
 import { scheduleWedgedStore } from '../page-write/direct-store';
 import { storeGenerationOf } from '../page-write/store-failure-registry';
 import { repairLegacyValues } from './legacy-repair';
@@ -202,6 +211,7 @@ export class CollabUpdateGuardExtension {
     } catch {
       // never out of this hook
     }
+    this.adoptSealed(document as unknown as Y.Doc, documentName); // #793: before any yield, in every mode
     if (this.guard.mode !== 'enforce') return;
     const pageId = String(documentName ?? '').replace(/^page\./, '');
     await new Promise<void>((resolve) => setImmediate(resolve));
@@ -217,6 +227,29 @@ export class CollabUpdateGuardExtension {
       }
     } catch {
       this.repairLog.warn('COLLAB_LEGACY_REPAIR_FAILED', () => `COLLAB_LEGACY_REPAIR_FAILED ${JSON.stringify({ pageId })}`);
+    }
+  }
+
+  /**
+   * #793: the bindings the load restored (its claim in `loadStableYdoc`), adopted awareness-only; a load that ran no
+   * claim (no stored ydoc) registers a lifetime sealed insert-if-absent. Synchronous, never throws.
+   */
+  private adoptSealed(document: Y.Doc | undefined, documentName: unknown): void {
+    try {
+      if (!document) return;
+      const lifetime = unclaimedLifetime(document, pageIdOfDocumentName(String(documentName ?? '')));
+      if (lifetime) this.guard.adoptSealed(document, lifetime.restored);
+    } catch {
+      // never out of this hook: the page then seals and restores nothing, as before #793
+    }
+  }
+
+  /** #793: commit the seal the guard took at the document's destroy (binding-seal.ts). NEVER rejects. */
+  async afterUnloadDocument({ documentName }: afterUnloadDocumentPayload): Promise<void> {
+    try {
+      await commitPendingSeal(String(documentName ?? ''));
+    } catch {
+      // never out of this hook (commitPendingSeal does not reject either)
     }
   }
 }

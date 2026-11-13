@@ -15,6 +15,7 @@ import { compactionRequest, LINEAGE_ROOT, lineageEpoch, noteBuildFailed, orderHe
 import { liveContentDigest } from './doc-version';
 import { afterOrderStore, checkStoreOrder, loadStableYdoc, persistOrderState, prepareStore, resetContentHealRefusalsForTests, storeSnapshotUnderLock, type HealImageStore } from './heal-image';
 import { memoryHealStore } from './heal-image.testkit';
+import { sealLifetimeOf } from './binding-seal';
 import { snapshotForStore } from './persistence-steps';
 import { storeSafeJson } from './store-safe-json';
 import { isDuplicateWriteKey, recordWriteKey, scopedWriteKey } from './write-idem';
@@ -258,6 +259,16 @@ describe('loadStableYdoc (#840): the branches the crash matrix does not reach', 
     expect(store.heals.has(PAGE)).toBe(false);
     expect(liveContentDigest(doc)).toBe(liveContentDigest(live));
     expect(logRebuilds(doc)).toBe(true);
+  });
+
+  it('#793: a heal moves the epoch, so it restores no binding; it still claims the seal for the new lifetime', async () => {
+    const { row, store, raw } = await healedRow();
+    store.seals.set(PAGE, { lifetimeId: 'earlier', epoch: 0, rowSha: sha(raw), entries: [[1, 'u', 3]] });
+    const doc = new Y.Doc();
+    await loadStableYdoc(doc, PAGE, raw, store);
+    expect(sha(row.ydoc!)).not.toBe(sha(raw)); // healed: the image was swapped in
+    expect(sealLifetimeOf(doc)).toMatchObject({ claimed: true, restored: [] });
+    expect(store.seals.get(PAGE)).toEqual({ lifetimeId: sealLifetimeOf(doc)!.lifetimeId, epoch: null, rowSha: null, entries: null });
   });
 
   it('a row that keeps moving: try-later after the bounded re-reads, nothing written', async () => {

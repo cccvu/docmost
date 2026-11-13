@@ -31,7 +31,8 @@
  *     (d) no heal row: served as before; an unstable (legacy, pre-#840) row requests compaction from the loaded tree,
  *         which is the order users already see today, and from then on the only one. A reload that ran out of bounds
  *         (`reload_failed`) is no evidence: logged as such and compacted at unload under the memo (`load_steps`).
- *   Every branch hands the exact bytes it applied to the guard's replica log (`attachReplicaLog`). The load's
+ *   Every branch hands the exact bytes it applied to the guard's replica log (`attachReplicaLog`), and ends with #793's
+ *   claim of the page's binding seal (binding-seal.ts `claimAtLoad`: restored only on (c)/(d)). The load's
  *   `COLLAB_ORDER_DIVERGENCE` lines are rate-limited per page and outcome (order-divergence-log.ts).
  *
  * Invariants (the plan's crash table): I1 `pages.ydoc` always holds every item live had at the last committed store;
@@ -55,6 +56,7 @@ import { ConflictScan, installConflictScanMeter, type ConflictScanMeter } from '
 import { runWithDeadline } from '../collab-ingress/deadline';
 import { COMPACTION_DEADLINE_MS } from '../collab-ingress/doc-bounds';
 import { attachReplicaLog } from '../collab-ingress/exact-replica-registry';
+import { claimAtLoad, claimSealRow, commitSealRow, type BindingSealStore } from './binding-seal';
 import { isReloadStable, strictOrderDiff } from '../collab-ingress/order-parity';
 import {
   buildCompacted,
@@ -413,6 +415,7 @@ export async function loadStableYdoc(
       loadStoredYdoc(document, pageId, image, db as KyselyDB | CompactionStore, bounds);
       attachReplicaLog(document, image);
       log(outcome, false, countStructs(document).structs);
+      await claimAtLoad(document, pageId, store, null); // #793: the epoch moved, so nothing is restored
       return;
     }
     // (c) a stale heal row, or (d) none: the row as it is.
@@ -444,6 +447,7 @@ export async function loadStableYdoc(
     } else if (heal) {
       log('stale_dropped', false, structs);
     }
+    await claimAtLoad(document, pageId, store, rowSha); // #793: restores bindings sealed against exactly these bytes
     return;
   }
 }
@@ -575,8 +579,8 @@ export interface HealRow {
   currentSha: string | null;
 }
 
-/** The statements the heal needs (an interface so the unit specs run without Postgres). */
-export interface HealImageStore {
+/** The statements the heal needs (an interface so the unit specs run without Postgres), and #793's binding seal. */
+export interface HealImageStore extends BindingSealStore {
   /** The page's heal row and its row's current ydoc digest (one statement), or null. */
   read(pageId: string): Promise<HealRow | null>;
   /** The page's ydoc now (null: none, or no page). */
@@ -656,6 +660,8 @@ export function kyselyHealImageStore(db: KyselyDB): HealImageStore {
           set image = excluded.image, row_sha = excluded.row_sha, epoch = excluded.epoch,
               content_digest = excluded.content_digest, created_at = now()`.execute(t);
     },
+    claimSeal: (pageId, lifetimeId) => claimSealRow(db, pageId, lifetimeId),
+    commitSeal: (pageId, lifetimeId, claimed, seal) => commitSealRow(db, pageId, lifetimeId, claimed, seal),
   };
 }
 
