@@ -15,6 +15,10 @@ export enum ServiceScope {
   // credential can be granted revoke without restore (or vice-versa).
   SessionRevoke = 'session:revoke',
   SessionRestore = 'session:restore',
+  // wiki-v2 #818: revoke every wiki session of a shadow user but the one the caller proves it holds (a passkey
+  // removal signs the other devices out). Never deactivates. Its own scope: a credential that may sign other
+  // devices out need not be able to disable the account.
+  SessionRevokeOthers = 'session:revoke-others',
   UsersProvision = 'users:provision',
   // Phase C reverse-coupling: the platform stops reaching into Docmost's DB and instead calls these
   // scoped, service-secret-guarded endpoints. Reads and writes are distinct scopes so a future

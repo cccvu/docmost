@@ -61,6 +61,11 @@ import { AuthzChangeEvent, AuthzChangeEventType } from './authz-change-event';
 import { ChangesResult } from './authz-change-feed.service';
 import { MintSessionDto } from './dto/mint-session.dto';
 import {
+  KEEP_TOKEN_MAX_LENGTH,
+  KEEP_TOKEN_PATTERN,
+  RevokeOtherSessionsDto,
+} from './dto/revoke-other-sessions.dto';
+import {
   AUTH_TIME_SKEW_SECONDS,
   MAX_FRESH_WINDOW_SECONDS,
   mintFreshness,
@@ -333,6 +338,8 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
   const MINT = keysOf<Awaited<ReturnType<ServiceBridgeController['mintSession']>>>({ ok: true });
   const REVOKE = keysOf<Awaited<ReturnType<ServiceBridgeController['revokeSession']>>>({ userId: true, deactivated: true, sessionsRevoked: true });
   const RESTORE = keysOf<Awaited<ReturnType<ServiceBridgeController['restoreSession']>>>({ reactivated: true });
+  // wiki-v2 #818: sign the other devices out (never deactivates).
+  const REVOKE_OTHERS = keysOf<Awaited<ReturnType<ServiceBridgeController['revokeOtherSessions']>>>({ userId: true, revoked: true, kept: true });
   const DEFAULT_WS = keysOf<Awaited<ReturnType<ServiceWorkspaceController['getDefault']>>>({ workspaceId: true });
   // #616: `replayed` is present only on a keyed create, so it is the one optional key.
   const CREATE_SPACE = keysOf<Awaited<ReturnType<ServiceSpaceController['create']>>>({ id: true, slug: true, name: true, replayed: true });
@@ -362,6 +369,7 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     { id: 'mintSession', method: 'post', path: '/api/service/session', expect: { kind: 'inline', keys: MINT } },
     { id: 'revokeSession', method: 'post', path: '/api/service/session/revoke', expect: { kind: 'inline', keys: REVOKE } },
     { id: 'restoreSession', method: 'post', path: '/api/service/session/restore', expect: { kind: 'inline', keys: RESTORE } },
+    { id: 'revokeOtherSessions', method: 'post', path: '/api/service/session/revoke-others', expect: { kind: 'inline', keys: REVOKE_OTHERS } },
     { id: 'getDefaultWorkspace', method: 'get', path: '/api/service/workspace/default', expect: { kind: 'inline', keys: DEFAULT_WS } },
     { id: 'getWorkspaceSettings', method: 'get', path: '/api/service/workspace/settings', expect: { kind: 'ref', name: 'WorkspaceSettings' } },
     { id: 'updateWorkspaceSettings', method: 'patch', path: '/api/service/workspace/settings', expect: { kind: 'ref', name: 'WorkspaceSettings' } },
@@ -908,5 +916,44 @@ describe('service-bridge.openapi.json groups + group space adds (#797)', () => {
       expect([path, method, op(path, method).responses['409'].$ref]).toEqual([path, method, '#/components/responses/GroupConflict']);
     }
     expect(schema('GroupInUseError').properties.code.const).toBe('group_in_use');
+  });
+});
+
+/**
+ * wiki-v2 #818 — `revokeOtherSessions`' request is the DTO exactly, closed, with the DTO caps. `keepToken` in
+ * particular: the fork's ValidationPipe strips an undeclared member silently, so a request schema that carried a
+ * key the DTO lacks (or the other way round) would make every call revoke the caller's own wiki session too.
+ */
+describe('service-bridge.openapi.json revokeOtherSessions (#818)', () => {
+  const S = SPEC as any;
+  const keysOf = <T,>(m: Record<keyof T, true>): string[] => Object.keys(m).sort();
+  const op = () => S.paths['/api/service/session/revoke-others'].post;
+
+  it('RevokeOtherSessionsRequest carries exactly the DTO keys, closed, externalId required, with the DTO caps', () => {
+    const schema = S.components.schemas.RevokeOtherSessionsRequest;
+    expect(Object.keys(schema.properties).sort()).toEqual(
+      keysOf<RevokeOtherSessionsDto>({ externalId: true, keepToken: true }),
+    );
+    expect(schema.additionalProperties).toBe(false);
+    expect(schema.required).toEqual(['externalId']);
+    expect(schema.properties.externalId.$ref).toBe('#/components/schemas/ExternalId');
+    expect(schema.properties.keepToken.maxLength).toBe(KEEP_TOKEN_MAX_LENGTH);
+    expect(schema.properties.keepToken.pattern).toBe(KEEP_TOKEN_PATTERN.source);
+    expect(op().requestBody.content['application/json'].schema.$ref).toBe(
+      '#/components/schemas/RevokeOtherSessionsRequest',
+    );
+  });
+
+  it('answers userId (nullable), revoked and kept, all required', () => {
+    const body = op().responses['200'].content['application/json'].schema;
+    expect([...body.required].sort()).toEqual(['kept', 'revoked', 'userId']);
+    expect(body.properties.userId.type).toEqual(['string', 'null']);
+    expect(body.properties.revoked).toMatchObject({ type: 'integer', minimum: 0 });
+    expect(body.properties.kept.type).toBe('boolean');
+  });
+
+  it('declares the bridge errors, and force-disconnect-user names it as a caller', () => {
+    expect(Object.keys(op().responses).sort()).toEqual(['200', '400', '401', '403', '429', '503']);
+    expect(S.paths['/api/collab/force-disconnect-user'].post.description).toContain('/api/service/session/revoke-others');
   });
 });
