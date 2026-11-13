@@ -10,7 +10,7 @@ import { CollaborationHandler } from '../../collaboration/collaboration.handler'
 import { PersistenceExtension } from '../../collaboration/extensions/persistence.extension';
 import { PG_URL, uuid, mkReadModelPg, bootstrapSchema, mkReadModelDb } from '../../service-bridge/read-model-pg.testkit';
 import * as bindingSeal from '../page-write/binding-seal';
-import { sealLifetimeOf } from '../page-write/binding-seal';
+import { sealLifetimeOf, setSealBarrierMsForTests } from '../page-write/binding-seal';
 import { kyselyCompactionStore } from '../page-write/compaction';
 import * as healImage from '../page-write/heal-image';
 import { installHealImageTableAtBoot } from '../page-write/heal-image.installer';
@@ -133,7 +133,7 @@ d('the binding seal across document lifetimes (#793)', () => {
       await settle();
     };
     const flush = () => expect(handlers.flushPageContent(DOC, { withDigest: true })).resolves.toMatchObject({ flushed: true });
-    return { hocuspocus, connect, live, unloaded, drain, type, flush };
+    return { hocuspocus, guard, connect, live, unloaded, drain, type, flush };
   }
 
   beforeAll(async () => {
@@ -321,7 +321,8 @@ d('the binding seal across document lifetimes (#793)', () => {
     expect(textOfDoc(n2.live())).toContain('U-lost');
   });
 
-  it('a same-node reload that claims before the old lifetime\'s afterUnloadDocument commits: the commit writes 0 rows, nothing stale is left', async () => {
+  /** Gate every seal commit: each starts only once released. */
+  function gatedCommits() {
     const real = bindingSeal.commitSealRow;
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
@@ -331,38 +332,106 @@ d('the binding seal across document lifetimes (#793)', () => {
       commits.push(p);
       return p;
     });
-    const n1 = node();
+    return { release, commits };
+  }
+
+  /** Lifetime 1 on `n1`: U announces V, types and stores, then leaves; resolves once its commit has started. */
+  async function leaveAfterStore(n1: ReturnType<typeof node>, commits: Array<Promise<number>>) {
     const uSock = await n1.connect('editor');
     uSock.deliver(announce(V));
     await settle();
-    const u = new RemoteClient(n1.live(), V);
-    await n1.type(uSock, u, 'U-stored ');
+    await n1.type(uSock, new RemoteClient(n1.live(), V), 'U-stored ');
     await n1.flush();
     uSock.close(1000, 'leaves');
     await waitFor('the old commit to start', () => commits.length === 1);
     expect(n1.hocuspocus.documents.has(DOC)).toBe(false); // destroyed; its afterUnloadDocument waits on the commit
-    await n1.connect('editor'); // the same node loads a new lifetime, which claims the row
-    const mine = sealLifetimeOf(n1.live())!.lifetimeId;
-    expect((await sealRow()).lifetime_id).toBe(mine);
-    release();
-    await expect(commits[0]).resolves.toBe(0);
-    expect(await sealRow()).toMatchObject({ lifetime_id: mine, entries: null });
+  }
+
+  it('a same-node fast reload (Hocuspocus loads it before the old afterUnloadDocument ends): the claim waits for the old commit and restores V', async () => {
+    const { release, commits } = gatedCommits();
+    const n1 = node();
+    await leaveAfterStore(n1, commits);
+    setTimeout(release, 150); // the old commit lands while the new load waits on it
+    await n1.connect('editor'); // the same node loads a new lifetime
+    await expect(commits[0]).resolves.toBe(1);
+    const stored = await rowDoc();
+    expect(sealLifetimeOf(n1.live())!.restored).toEqual([[V, USERS.editor.id, Y.getState(stored.store, V)]]);
+    expect(n1.guard.isAwarenessOnly(n1.live(), V)).toBe(true);
+    expect((await sealRow())).toMatchObject({ lifetime_id: sealLifetimeOf(n1.live())!.lifetimeId, entries: null });
   });
 
-  it('a final store that fails seals nothing (live no longer holds its row)', async () => {
+  it('past the barrier bound the claim goes ahead: the late commit writes 0 rows (its lifetime_id), nothing stale is left', async () => {
+    const restoreBarrier = setSealBarrierMsForTests(50);
+    try {
+      const { release, commits } = gatedCommits();
+      const n1 = node();
+      await leaveAfterStore(n1, commits);
+      await n1.connect('editor'); // claims after the 50 ms bound
+      const mine = sealLifetimeOf(n1.live())!.lifetimeId;
+      expect(sealLifetimeOf(n1.live())!.restored).toEqual([]);
+      expect((await sealRow()).lifetime_id).toBe(mine);
+      release();
+      await expect(commits[0]).resolves.toBe(0);
+      expect(await sealRow()).toMatchObject({ lifetime_id: mine, entries: null });
+    } finally {
+      restoreBarrier();
+    }
+  });
+
+  it('a lifetime that only viewed (its empty Step2 moves the generation, nothing stores) still seals: the next node refuses M at V', async () => {
+    await sealedLifetime();
+    const sealed = (await sealRow()).entries;
+    const n1 = node();
+    const viewer = await n1.connect('peer');
+    viewer.deliver(announce(A_ID), syncFrame(Y.encodeStateAsUpdate(n1.live(), Y.encodeStateVector(n1.live())), SYNC.Step2, MSG.Sync, DOC));
+    await settle();
+    expect(viewer.closeReasons()).toEqual([]);
+    await n1.drain();
+    expect((await sealRow()).entries).toEqual(sealed); // V restored, still bound: sealed again
+
+    const n2 = node();
+    await n2.connect('peer');
+    const mSock = await n2.connect('attacker');
+    mSock.deliver(announce(V, 9));
+    await settle();
+    expect(mSock.closeReasons()).toEqual([REFUSED('foreign-client')]);
+  });
+
+  it('a final store that fails: the ids live advanced past the row are not restored (an honest relay of that tail lands), the others are', async () => {
+    const W = 4004; // A's id
     const n1 = node();
     const uSock = await n1.connect('editor');
+    const aSock = await n1.connect('peer');
     uSock.deliver(announce(V));
+    aSock.deliver(announce(W));
     await settle();
     const u = new RemoteClient(n1.live(), V);
     await n1.type(uSock, u, 'U-stored ');
+    const a = new RemoteClient(n1.live(), W);
+    await n1.type(aSock, a, 'A-stored ');
     await n1.flush();
     await n1.type(uSock, u, 'U-unstored ');
+    a.sync(n1.live()); // A holds U's unstored tail
     jest.spyOn(healImage, 'prepareStore').mockRejectedValueOnce(new Error('store down'));
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
     await n1.drain();
+    const stored = await rowDoc();
     expect(JSON.stringify((await row()).content)).not.toContain('U-unstored'); // precondition: the store failed
-    expect((await sealRow()).entries).toBeNull();
+    const entries = (await sealRow()).entries!;
+    expect(entries.find(([id]) => id === V)![2]).toBeGreaterThan(Y.getState(stored.store, V)); // V advanced past the row
+    expect(entries.find(([id]) => id === W)![2]).toBe(Y.getState(stored.store, W));
+
+    const n2 = node();
+    const aSock2 = await n2.connect('peer');
+    expect(sealLifetimeOf(n2.live())!.restored).toEqual([[W, USERS.peer.id, Y.getState(stored.store, W)]]);
+    aSock2.deliver(announce(W, 2), syncFrame(Y.encodeStateAsUpdate(a.doc, Y.encodeStateVector(n2.live())), SYNC.Step2, MSG.Sync, DOC));
+    await settle();
+    expect(aSock2.closeReasons()).toEqual([]);
+    expect(textOfDoc(n2.live())).toContain('U-unstored');
+    const mSock = await n2.connect('attacker');
+    mSock.deliver(syncFrame(new RemoteClient(n2.live(), W).edit(n2.live(), (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'FORGED ')), SYNC.Update, MSG.Sync, DOC));
+    await settle();
+    expect(mSock.closeReasons()).toEqual([UNRESOLVED_REASON]);
   });
 
   it('a claim that fails is try-later; the next load claims', async () => {

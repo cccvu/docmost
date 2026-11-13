@@ -9,9 +9,9 @@
  * broadcasts.
  *
  * Bindings across a reload (#793, page-write/binding-seal.ts). The bindings a lifetime proved are sealed only at a
- * committed clean unload (this guard's live `destroy` handler, while live holds its row exactly and is not wedged),
- * claimed by the next load, and restored there awareness-only (`adoptSealed`, every mode) when the row and each id's
- * clock are exactly what was sealed. A lifetime that ends any other way (a crash) seals nothing: the next load restores
+ * committed clean unload (this guard's live `destroy` handler, naming the row bytes live last covered, unless live is
+ * wedged), claimed by the next load, and restored there awareness-only (`adoptSealed`, every mode) when the row is
+ * those bytes and each id's clock is exactly what was sealed. A lifetime that ends any other way (a crash) seals nothing: the next load restores
  * none, as before #793.
  *
  * How: each live Document gets a SHADOW replica (a second Y.Doc kept equal to live by a mirror listener). A frame is
@@ -129,7 +129,6 @@ import * as Y from 'yjs';
 import { isTransactionOrigin, MessageType } from '@hocuspocus/server';
 import { PAGE_MAX_YDOC_BYTES } from '../page-write/page-size';
 import { coveredRowDigest, unloadCanCompact } from '../page-write/reconcile-store';
-import { holdsItsRow } from '../page-write/compaction';
 import { noteSeal, sealLifetimeOf, type SealEntry } from '../page-write/binding-seal';
 import {
   canStartCompaction,
@@ -1751,15 +1750,18 @@ export class CollabUpdateGuard {
   /**
    * #793: live's `destroy` handler, first. Hocuspocus 4.7.1 destroys a document only once its unload is committed (after
    * the `beforeUnloadDocument` hooks it re-checks `shouldUnloadDocument`; a join aborts it), so an aborted unload seals
-   * nothing. Sealed only while live holds exactly the row bytes it last covered (`holdsItsRow`, `coveredRowDigest`: the
-   * final store went in, or nothing changed since the load) and is not wedged; each id with live's clock there, which the
-   * next load must find unchanged. The extension's `afterUnloadDocument` commits it (binding-seal.ts). Never throws.
+   * nothing. The seal names the row bytes live last covered (`coveredRowDigest`: its load's, or its last written
+   * store's; none, or a wedged live, seals nothing) and each id with live's clock, which the next load must find
+   * unchanged in exactly those bytes: an id live advanced past them (a failed final store, a net-zero tail) is then not
+   * restored, while one it did not is. So a lifetime that only viewed (whose empty Step2 still moves the document's
+   * generation) seals too, and its restored ids stay protected. The extension's `afterUnloadDocument` commits it
+   * (binding-seal.ts). Never throws.
    */
   private sealAtUnload(doc: DocGuard): void {
     try {
       const live = doc.live as unknown as Y.Doc & { name?: string };
       if (!sealLifetimeOf(live) || typeof live.name !== 'string') return;
-      if (liveWedged(live) || !holdsItsRow(live)) return;
+      if (liveWedged(live)) return;
       const rowSha = coveredRowDigest(live);
       if (rowSha === null) return;
       const epoch = lineageEpoch(live);

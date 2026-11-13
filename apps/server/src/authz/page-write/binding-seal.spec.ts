@@ -12,6 +12,7 @@ import {
   resetBindingSealLogForTests,
   SEAL_ENTRIES_MAX,
   sealLifetimeOf,
+  setSealBarrierMsForTests,
   unclaimedLifetime,
   type SealEntry,
 } from './binding-seal';
@@ -159,12 +160,33 @@ describe('the commit at unload', () => {
     expect(await commitPendingSeal(DOC)).toBe(1);
     expect(store.seals.get(PAGE)!.entries).toEqual([[V, 'u', clocks.v]]);
     expect(await commitPendingSeal(DOC)).toBe(0); // consumed
-    // a same-node reload claims before the old lifetime commits
-    const second = await load(store, bytes);
-    noteSeal(second, DOC, { epoch: 0, rowSha: sha(bytes), entries: [] });
-    await load(store, bytes); // a third lifetime claimed first
-    expect(await commitPendingSeal(DOC)).toBe(0);
-    expect(store.seals.get(PAGE)!.entries).toBeNull();
+    // past the barrier bound, a later lifetime claims before the old one commits (or on another node)
+    const restoreBarrier = setSealBarrierMsForTests(10);
+    try {
+      const second = await load(store, bytes);
+      noteSeal(second, DOC, { epoch: 0, rowSha: sha(bytes), entries: [] });
+      await load(store, bytes); // a third lifetime claimed first
+      expect(await commitPendingSeal(DOC)).toBe(0);
+      expect(store.seals.get(PAGE)!.entries).toBeNull();
+    } finally {
+      restoreBarrier();
+    }
+  });
+
+  it('a claim waits for the same page\'s pending commit in this process, then restores what it sealed', async () => {
+    const { bytes, clocks } = row();
+    const store = memoryHealStore({ ydoc: bytes });
+    const first = await load(store, bytes);
+    noteSeal(first, DOC, { epoch: 0, rowSha: sha(bytes), entries: [[V, 'u', clocks.v]] });
+    let claimed = false;
+    const reload = load(store, bytes).then((doc) => {
+      claimed = true;
+      return doc;
+    });
+    for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
+    expect(claimed).toBe(false); // waiting on the barrier
+    expect(await commitPendingSeal(DOC)).toBe(1);
+    expect(sealLifetimeOf(await reload)!.restored).toEqual([[V, 'u', clocks.v]]);
   });
 
   it('a document with no registered lifetime notes nothing; at most SEAL_ENTRIES_MAX entries, the newest', async () => {

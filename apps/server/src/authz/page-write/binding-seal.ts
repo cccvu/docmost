@@ -13,17 +13,22 @@
  *     claim behind: the load after it restores nothing, which is the behaviour before #793. A failed claim is
  *     try-later (`pageCompactingRefusal`), the row read's own failure domain.
  *   - Restore: only on the plain row branch (a heal or a swap moves the epoch), and per entry only when the seal names
- *     exactly this row (`row_sha`), the same lineage epoch, the loaded clock at that id equals the sealed clock (an
- *     unchanged-JSON store skips the ydoc write, so a net-zero tail is in live but not in the row: such an id is left
- *     unbound, as before), and the id is not the new server id. The guard adopts what is restored AWARENESS-ONLY, in
+ *     exactly this row (`row_sha`: the bytes live last covered, so live held every struct in them), the same lineage
+ *     epoch, the loaded clock at that id equals the sealed clock (live's clock there at the unload), and the id is not
+ *     the new server id. Equal clocks over bytes live covered mean the row holds every struct live ever accepted at
+ *     that id, so nobody can honestly hold a newer one; an id live advanced past the row (a net-zero tail, which an
+ *     unchanged-JSON store never writes; a final store that failed) is left unbound, as before. The guard adopts what is restored AWARENESS-ONLY, in
  *     every mode (collab-update-guard.extension.ts `afterLoadDocument`): a peer's relay there stays `unresolved` until
  *     its owner's claim covers it (#842), and only the owner's own struct proves the id again.
  *   - Seal at a committed unload: the guard snapshots its bindings in the live document's `destroy` handler (Hocuspocus
  *     4.7.1 destroys a document only after its last `shouldUnloadDocument` check, so an unload a join aborted seals
- *     nothing), only while live holds its row exactly (`holdsItsRow`, `coveredRowDigest`) and is not wedged; the
- *     extension's `afterUnloadDocument` commits it (`commitPendingSeal`) with `where lifetime_id = <this lifetime>`, so a
- *     same-node reload that already claimed the row makes it touch nothing. It never throws (a throw would stop RedisSync
- *     releasing the document's lock): a failure logs `COLLAB_BINDING_SEAL_FAILED` and the next load is unclean.
+ *     nothing), naming the row bytes live last covered (`coveredRowDigest`; none, or a wedged live: no seal) and each id
+ *     with live's clock. A lifetime that changed nothing, or only viewed, seals too: its restored ids stay protected.
+ *     The extension's `afterUnloadDocument` commits it (`commitPendingSeal`) with `where lifetime_id = <this lifetime>`.
+ *     A same-node reload's claim first waits for that commit (`awaitPendingCommit`, at most SEAL_BARRIER_MS: Hocuspocus
+ *     4.7.1 starts a new load without waiting for the old unload's hooks); past the bound it claims anyway and the late
+ *     commit touches nothing (the cross-node backstop too). It never throws (a throw would stop RedisSync releasing the
+ *     document's lock): a failure logs `COLLAB_BINDING_SEAL_FAILED` and the next load is unclean.
  *   - A lifetime that loaded no stored ydoc (a fresh page, a content-only row) ran no claim: it seals through the boot's
  *     handle (`bootSealDb`) insert-if-absent, so a row any later load already claimed is never overwritten.
  *   - The epoch moves only in compaction's `swapYdoc`, which deletes the row in its own transaction
@@ -240,6 +245,7 @@ function none(pageId: string, reason: NotRestoredReason, entries?: number): Seal
  */
 export async function claimAtLoad(document: Y.Doc, pageId: string, store: BindingSealStore, rowSha: string | null): Promise<void> {
   const lifetimeId = randomUUID();
+  await awaitPendingCommit(pageId); // a same-node reload: the previous lifetime's seal first
   let prev: SealRow | null;
   try {
     prev = await store.claimSeal(pageId, lifetimeId);
@@ -266,7 +272,38 @@ export function unclaimedLifetime(document: object, pageId: string | null, db: K
 // --- the unload
 
 /** Seals snapshot at a document's destroy, by document name, until its `afterUnloadDocument` commits them. */
-const pending = new Map<string, { lifetime: SealLifetime; seal: Seal }>();
+const pending = new Map<string, { lifetime: SealLifetime; seal: Seal; done: () => void }>();
+/** Per page: the noted seal's commit, settled (whatever its outcome) when it ends. What a same-node claim waits for. */
+const commits = new Map<string, Promise<void>>();
+/** How long a claim waits for a same-node commit: a commit's own lock and statement timeouts are 2 s and 5 s. */
+export const SEAL_BARRIER_MS = 3_000;
+let barrierMs = SEAL_BARRIER_MS;
+/** The specs: another barrier bound; returns the restore. */
+export function setSealBarrierMsForTests(ms: number): () => void {
+  barrierMs = ms;
+  return () => {
+    barrierMs = SEAL_BARRIER_MS;
+  };
+}
+
+/**
+ * The claim's barrier: the commit of a seal noted for `pageId` in this process and not yet ended, awaited for at most
+ * the barrier bound (then the claim goes ahead, and the late commit's `lifetime_id` predicate makes it a no-op). Never
+ * rejects.
+ */
+export async function awaitPendingCommit(pageId: string): Promise<void> {
+  const commit = commits.get(pageId);
+  if (!commit) return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    commit,
+    new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, barrierMs);
+      timer.unref?.();
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
+}
 /** A destroy no unload follows (a failed load) leaves its entry until the name unloads again: bounded. */
 const PENDING_MAX = 10_000;
 
@@ -277,9 +314,22 @@ const PENDING_MAX = 10_000;
 export function noteSeal(document: object, documentName: string, seal: Seal): void {
   const lifetime = lifetimes.get(document);
   if (!lifetime) return;
+  pending.get(documentName)?.done(); // an earlier note no unload followed: nothing commits it now
   pending.delete(documentName);
-  if (pending.size >= PENDING_MAX) pending.delete(pending.keys().next().value);
-  pending.set(documentName, { lifetime, seal: { ...seal, entries: seal.entries.slice(-SEAL_ENTRIES_MAX) } });
+  if (pending.size >= PENDING_MAX) {
+    const [name, oldest] = pending.entries().next().value;
+    oldest.done();
+    pending.delete(name);
+  }
+  let done!: () => void;
+  const commit = new Promise<void>((resolve) => (done = resolve));
+  const pageId = lifetime.pageId;
+  commits.set(pageId, commit);
+  const settle = () => {
+    done();
+    if (commits.get(pageId) === commit) commits.delete(pageId);
+  };
+  pending.set(documentName, { lifetime, seal: { ...seal, entries: seal.entries.slice(-SEAL_ENTRIES_MAX) }, done: settle });
 }
 
 /**
@@ -290,11 +340,13 @@ export async function commitPendingSeal(documentName: string): Promise<number> {
   const noted = pending.get(documentName);
   if (!noted) return 0;
   pending.delete(documentName);
-  const { lifetime, seal } = noted;
+  const { lifetime, seal, done } = noted;
   try {
     return await lifetime.store.commitSeal(lifetime.pageId, lifetime.lifetimeId, lifetime.claimed, seal);
   } catch {
     logSealFailed(lifetime.pageId, 'commit');
     return 0;
+  } finally {
+    done(); // a same-node claim waiting on it goes ahead
   }
 }

@@ -403,11 +403,8 @@ function skipUnload(pageId: string, request: CompactionRequest, why: 'not_stored
   if (request.drain) logPageCompaction('skipped', pageId, { reason: request.reason, why });
 }
 
-/**
- * The document holds exactly the row bytes it last covered: stored since its last change, or unchanged since its load.
- * #793: also the condition for sealing its client-id bindings at unload (update-guard.ts).
- */
-export function holdsItsRow(document: Y.Doc): boolean {
+/** The document holds exactly the row bytes it last covered: stored since its last change, or unchanged since its load. */
+function holdsItsRow(document: Y.Doc): boolean {
   if (isStoreCurrent(document)) return true;
   const stats = loadStats.get(document);
   const generation = storeGenerationOf(document);
