@@ -59,14 +59,20 @@ export function SearchSpotlightFilters({
     }
   }, []);
 
-  const contentTypeOptions = [
+  // CCC (wiki-v2 UI cleanup): only offer "Attachments" when entitled — it was shown
+  // disabled with an "Enterprise" badge (mirrors export-modal.tsx's docx option), and
+  // the Type menu below is hidden when "Pages" is the only option left.
+  const contentTypeOptions: {
+    value: string;
+    label: string;
+    disabled?: boolean;
+  }[] = [
     { value: "page", label: t("Pages") },
-    {
-      value: "attachment",
-      label: t("Attachments"),
-      disabled: !hasAttachmentIndexing,
-    },
+    ...(hasAttachmentIndexing
+      ? [{ value: "attachment", label: t("Attachments") }]
+      : []),
   ];
+  const showTypeMenu = contentTypeOptions.length > 1;
 
   const handleSpaceSelect = (spaceId: string | null) => {
     setSelectedSpaceId(spaceId);
@@ -151,6 +157,8 @@ export function SearchSpotlightFilters({
         </Button>
       </SpaceFilterMenu>
 
+      {/* CCC (wiki-v2 UI cleanup): no Type menu when "Pages" is the only option. */}
+      {showTypeMenu && (
       <Menu
         shadow="md"
         width={220}
@@ -209,6 +217,7 @@ export function SearchSpotlightFilters({
           ))}
         </Menu.Dropdown>
       </Menu>
+      )}
     </div>
   );
 }

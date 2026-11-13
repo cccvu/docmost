@@ -9,14 +9,7 @@ import {
   IconSpaces,
   IconBrush,
   IconCoin,
-  IconLock,
-  IconKey,
-  IconApi,
-  IconLicense,
   IconWorld,
-  IconSparkles,
-  IconHistory,
-  IconShieldCheck,
 } from "@tabler/icons-react";
 import { Link, useLocation } from "react-router-dom";
 import classes from "./settings.module.css";
@@ -25,20 +18,12 @@ import { isCloud } from "@/lib/config.ts";
 import useUserRole from "@/hooks/use-user-role.tsx";
 import { useAtom } from "jotai";
 import { entitlementAtom } from "@/ee/entitlement/entitlement-atom";
-import { Feature } from "@/ee/features";
 import {
-  prefetchApiKeyManagement,
-  prefetchApiKeys,
   prefetchBilling,
   prefetchGroups,
-  prefetchLicense,
-  prefetchScimTokens,
   prefetchShares,
   prefetchSpaces,
-  prefetchSsoProviders,
   prefetchWorkspaceMembers,
-  prefetchAuditLogs,
-  prefetchVerifiedPages,
 } from "@/components/settings/settings-queries.tsx";
 import { mobileSidebarAtom } from "@/components/layouts/global/hooks/atoms/sidebar-atom.ts";
 import { useToggleSidebar } from "@/components/layouts/global/hooks/hooks/use-toggle-sidebar.ts";
@@ -71,12 +56,7 @@ const groupedData: DataGroup[] = [
         icon: IconBrush,
         path: "/settings/account/preferences",
       },
-      {
-        label: "API keys",
-        icon: IconKey,
-        path: "/settings/account/api-keys",
-        feature: Feature.API_KEYS,
-      },
+      // CCC (wiki-v2 UI cleanup): the EE "API keys" item is gone with its route (ADR 0035).
     ],
   },
   {
@@ -105,13 +85,6 @@ const groupedData: DataGroup[] = [
         env: "cloud",
       },
       {
-        label: "Security & SSO",
-        icon: IconLock,
-        path: "/settings/security",
-        feature: Feature.SECURITY_SETTINGS,
-        role: "admin",
-      },
-      {
         label: "Groups",
         icon: IconUsersGroup,
         path: "/settings/groups",
@@ -119,47 +92,9 @@ const groupedData: DataGroup[] = [
       },
       { label: "Spaces", icon: IconSpaces, path: "/settings/spaces" },
       { label: "Public sharing", icon: IconWorld, path: "/settings/sharing" },
-      {
-        label: "Verified pages",
-        icon: IconShieldCheck,
-        path: "/settings/verifications",
-        feature: Feature.PAGE_VERIFICATION,
-      },
-      {
-        // CCC: distinct from the account "API keys" IconKey so the collapsed
-        // icon rail doesn't show two identical keys.
-        label: "API management",
-        icon: IconApi,
-        path: "/settings/api-keys",
-        feature: Feature.API_KEYS,
-        role: "admin",
-      },
-      {
-        label: "AI settings",
-        icon: IconSparkles,
-        path: "/settings/ai",
-        feature: Feature.AI,
-        role: "admin",
-      },
-      {
-        label: "Audit log",
-        icon: IconHistory,
-        path: "/settings/audit",
-        feature: Feature.AUDIT_LOGS,
-        role: "owner",
-        env: "selfhosted",
-      },
-    ],
-  },
-  {
-    heading: "System",
-    items: [
-      {
-        // CCC: distinct icon (was IconKey) so the collapsed rail reads cleanly.
-        label: "License & Edition",
-        icon: IconLicense,
-        path: "/settings/license",
-      },
+      // CCC (wiki-v2 UI cleanup): the EE Security & SSO, Verified pages, API management, AI
+      // settings and Audit log items, and the whole System group (License & Edition), are gone
+      // with their routes: never entitled in either mode (ADR 0035).
     ],
   },
 ];
@@ -206,10 +141,6 @@ export default function SettingsSidebar({
   };
 
   const menuItems = groupedData.map((group) => {
-    if (group.heading === "System" && (!isAdmin || isCloud())) {
-      return null;
-    }
-
     return (
       <div key={group.heading}>
         <Text c="dimmed" className={classes.linkHeader}>
@@ -234,31 +165,8 @@ export default function SettingsSidebar({
             case "Billing":
               prefetchHandler = prefetchBilling;
               break;
-            case "License & Edition":
-              if (entitlements?.tier !== "free") {
-                prefetchHandler = prefetchLicense;
-              }
-              break;
-            case "Security & SSO":
-              prefetchHandler = () => {
-                prefetchSsoProviders();
-                prefetchScimTokens();
-              };
-              break;
             case "Public sharing":
               prefetchHandler = prefetchShares;
-              break;
-            case "API keys":
-              prefetchHandler = prefetchApiKeys;
-              break;
-            case "API management":
-              prefetchHandler = prefetchApiKeyManagement;
-              break;
-            case "Audit log":
-              prefetchHandler = prefetchAuditLogs;
-              break;
-            case "Verified pages":
-              prefetchHandler = prefetchVerifiedPages;
               break;
             default:
               break;

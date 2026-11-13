@@ -1,18 +1,15 @@
 import { FormEvent, useState } from "react";
 import {
-  Anchor,
   Button,
   Container,
   PasswordInput,
-  Text,
   TextInput,
   Title,
 } from "@mantine/core";
 import { Helmet } from "react-helmet-async";
-import { Link } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { PublicShell } from "@/features/public/components/public-shell";
-import { getAppName, isCloud } from "@/lib/config";
+import { getAppName } from "@/lib/config";
 import { useNativeLogin } from "../hooks/use-native-login";
 
 /**
@@ -20,7 +17,9 @@ import { useNativeLogin } from "../hooks/use-native-login";
  *
  * Rendered at `/login` ONLY when the server reports `NATIVE_AUTH_ENABLED` (AUTHZ_MODE=native). Collects
  * email + password and posts to Docmost's own `/api/auth/login`. In remote mode `/login` renders the
- * platform passwordless flow instead. A fresh install links to first-run workspace setup.
+ * platform passwordless flow instead. There is no setup link here: a fresh install (no workspace yet)
+ * is sent to `/setup/register` by the api-client's "workspace not found" redirect. Once a workspace
+ * exists, the setup page only bounces back here (and the server's `SetupGuard` refuses setup).
  */
 export default function NativeLogin() {
   const { t } = useTranslation();
@@ -72,15 +71,6 @@ export default function NativeLogin() {
               {t("Sign in")}
             </Button>
           </form>
-
-          {!isCloud() && (
-            <Text ta="center" mt="md" size="sm" c="dimmed">
-              {t("First time here?")}{" "}
-              <Anchor component={Link} to={"/setup/register"}>
-                {t("Set up your workspace")}
-              </Anchor>
-            </Text>
-          )}
         </Container>
       </PublicShell>
     </>

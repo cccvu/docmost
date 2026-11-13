@@ -10,6 +10,8 @@ import {
   ResponsiveSettingsContent,
   ResponsiveSettingsControl,
 } from "@/components/ui/responsive-settings-row";
+// CCC (wiki-v2 UI cleanup): remote mode keeps only the toggle that is not email-only.
+import { isNativeAuthEnabled } from "@/features/auth-native/lib/auth-mode.ts";
 
 type NotificationKey = keyof NonNullable<IUserSettings["notifications"]>;
 
@@ -107,12 +109,21 @@ function NotificationToggle({
 
 export default function NotificationPref() {
   const { t } = useTranslation();
+  // CCC (wiki-v2 UI cleanup): Docmost sends no mail in remote mode (no MAIL_DRIVER, so its no-op `log`
+  // driver), so the four email-only toggles do nothing there. "Page updates" also gates the in-app
+  // page-update notification (server page.notification.ts filters recipients on it before creating one).
+  const native = isNativeAuthEnabled();
+  const items = native
+    ? notificationItems
+    : notificationItems.filter((item) => item.key === "page.updated");
 
   return (
     <Stack gap="xs">
-      <Title order={2} size="h5">{t("Email notifications")}</Title>
+      <Title order={2} size="h5">
+        {native ? t("Email notifications") : t("Notifications")}
+      </Title>
 
-      {notificationItems.map((item) => (
+      {items.map((item) => (
         <NotificationToggle
           key={item.key}
           settingKey={item.key}

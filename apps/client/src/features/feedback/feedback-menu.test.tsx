@@ -21,7 +21,9 @@ import {
 import { MantineProvider } from "@mantine/core";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { getDefaultStore } from "jotai";
 import TopMenu from "@/components/layouts/global/top-menu";
+import { currentUserAtom } from "@/features/user/atoms/current-user-atom.ts";
 
 const getMock = vi.fn();
 const postMock = vi.fn();
@@ -75,13 +77,16 @@ vi.mock("@/features/public/components/public-auth-buttons.tsx", () => ({
 vi.mock("@/lib/config.ts", () => ({ getSpaceUrl: (s: string) => `/s/${s}` }));
 vi.mock("@/features/user/atoms/current-user-atom.ts", async () => {
   const { atom } = await import("jotai");
-  return {
-    currentUserAtom: atom({
-      user: { name: "Ada", email: "ada@example.edu", avatarUrl: null },
-      workspace: { name: "Wiki", logo: null, settings: {} },
-    }),
-  };
+  return { currentUserAtom: atom<unknown>(null) };
 });
+
+// The stored users.role. useUserRole() (real) reads it only in native mode (#636).
+function signInAs(role: "owner" | "admin" | "member") {
+  getDefaultStore().set(currentUserAtom as never, {
+    user: { name: "Ada", email: "ada@example.edu", avatarUrl: null, role },
+    workspace: { name: "Wiki", logo: null, settings: {} },
+  } as never);
+}
 
 const writeText = vi.fn();
 
@@ -120,6 +125,7 @@ beforeAll(() => {
 
 beforeEach(() => {
   native = false;
+  signInAs("member");
   getMock.mockReset();
   postMock.mockReset();
   writeText.mockReset().mockResolvedValue(undefined);
@@ -230,9 +236,59 @@ describe("avatar menu entry", () => {
     expect(screen.queryByRole("menuitem", { name: "Manage members" })).toBeNull();
     cleanup();
     native = true;
+    signInAs("owner");
     renderMenu();
     openAccountMenu();
     expect(await screen.findByRole("menuitem", { name: "Manage members" })).toBeTruthy();
+  });
+
+  // wiki-v2 UI cleanup: the Workspace group (label, both items, divider) is admin-only, through
+  // useUserRole() — which answers member for everyone in remote mode, whatever users.role says.
+  const workspaceGroup = () => ({
+    label: screen.queryByText("Workspace"),
+    settings: screen.queryByRole("menuitem", { name: "Workspace settings" }),
+    members: screen.queryByRole("menuitem", { name: "Manage members" }),
+  });
+
+  it.each(["owner", "admin", "member"] as const)(
+    "remote %s: no Workspace group and no (synthetic) email line",
+    async (role) => {
+      signInAs(role);
+      renderMenu();
+      openAccountMenu();
+      await screen.findByRole("menuitem", { name: "Logout" });
+      expect(workspaceGroup()).toEqual({ label: null, settings: null, members: null });
+      expect(screen.queryByText("ada@example.edu")).toBeNull();
+      // The Account group is unchanged.
+      expect(screen.getByText("Account")).toBeTruthy();
+      expect(screen.getByRole("menuitem", { name: "My profile" })).toBeTruthy();
+    },
+  );
+
+  it.each(["owner", "admin"] as const)(
+    "native %s: the Workspace group and the email line are shown",
+    async (role) => {
+      native = true;
+      signInAs(role);
+      renderMenu();
+      openAccountMenu();
+      await screen.findByRole("menuitem", { name: "Logout" });
+      const group = workspaceGroup();
+      expect(group.label).toBeTruthy();
+      expect(group.settings?.getAttribute("href")).toBe("/settings/workspace");
+      expect(group.members?.getAttribute("href")).toBe("/settings/members");
+      expect(screen.getByText("ada@example.edu")).toBeTruthy();
+    },
+  );
+
+  it("native member: no Workspace group (no empty header); the email line is shown", async () => {
+    native = true;
+    signInAs("member");
+    renderMenu();
+    openAccountMenu();
+    await screen.findByRole("menuitem", { name: "Logout" });
+    expect(workspaceGroup()).toEqual({ label: null, settings: null, members: null });
+    expect(screen.getByText("ada@example.edu")).toBeTruthy();
   });
 
   it("is hidden in native (standalone) mode and never calls the platform", async () => {

@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import APP_ROUTE, { loginHrefWithReturn } from "@/lib/app-route.ts";
 import { useBrandConfig } from "@/features/brand/brand-hooks.ts";
+import { isNativeAuthEnabled } from "@/features/auth-native/lib/auth-mode.ts";
 
 export function PublicFooter({ year }: { year: number }) {
   const { t } = useTranslation();
@@ -20,13 +21,17 @@ export function PublicFooter({ year }: { year: number }) {
           <Anchor component={Link} to={loginHrefWithReturn()} size="sm">
             {t("Log in")}
           </Anchor>
-          <Anchor component={Link} to={APP_ROUTE.AUTH.REQUEST_ACCESS} size="sm">
-            {t("Request access")}
-          </Anchor>
+          {/* The request-access page posts to the platform; native (standalone) mode has none. */}
+          {!isNativeAuthEnabled() && (
+            <Anchor component={Link} to={APP_ROUTE.AUTH.REQUEST_ACCESS} size="sm">
+              {t("Request access")}
+            </Anchor>
+          )}
           {/* AGPL-3.0 §13: a prominent, standing offer of the Corresponding
-              Source for this network-served, modified Docmost. Keep this link. */}
+              Source for this network-served, modified Docmost. Keep this link, and keep it
+              pointing at the PUBLIC fork (the wiki-v2 super-repo is private, a public 404). */}
           <Anchor
-            href="https://github.com/cccvu/wiki-v2"
+            href="https://github.com/cccvu/docmost/tree/wiki-v2"
             target="_blank"
             rel="noreferrer"
             size="sm"
