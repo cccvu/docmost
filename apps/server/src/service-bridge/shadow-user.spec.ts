@@ -1,4 +1,4 @@
-import { isShadowEmail, SHADOW_EMAIL_DOMAIN, shadowEmailFor } from './shadow-user';
+import { externalIdOfShadow, isShadowEmail, SHADOW_EMAIL_DOMAIN, shadowEmailFor } from './shadow-user';
 
 describe('shadow-user namespace (no-impersonation boundary)', () => {
   it('derives and recognizes the reserved domain (case-insensitive)', () => {
@@ -64,6 +64,33 @@ describe('shadow-user namespace (no-impersonation boundary)', () => {
       const email = shadowEmailFor(id);
       expect(isShadowEmail(email)).toBe(true);
       expect(email.split('@')).toHaveLength(2); // exactly one @ — no domain injection
+    }
+  });
+
+  /**
+   * #871 (moved here from service-group.service.ts): the inverse of `shadowEmailFor`. `users/resolve` and the group
+   * member listing answer it as the identity a shadow user stands for, and the platform LINKS that identity to the
+   * user, so it must name an identity only for an exact reserved-namespace address and must round-trip the
+   * derivation (lower-cased, like the provisioning upsert).
+   */
+  it('#871: externalIdOfShadow inverts shadowEmailFor and names nobody outside the exact namespace', () => {
+    for (const id of ['a', 'abc-123_x.y+z', '9b1f0c2e-0000-4000-8000-000000000001']) {
+      expect(externalIdOfShadow(shadowEmailFor(id))).toBe(id);
+    }
+    // Lower-cased: a case-variant stored address names the identity provisioning derived it from.
+    expect(externalIdOfShadow(`AbC-1@${SHADOW_EMAIL_DOMAIN.toUpperCase()}`)).toBe('abc-1');
+    for (const email of [
+      `attacker@evil.com@${SHADOW_EMAIL_DOMAIN}`, // F7 embedded-@: never `attacker@evil.com`
+      `abc@${SHADOW_EMAIL_DOMAIN}.attacker.com`,
+      `abc@sub.${SHADOW_EMAIL_DOMAIN}`,
+      `@${SHADOW_EMAIL_DOMAIN}`,
+      'real.person@example.edu',
+      'docmost-native+x@users.invalid',
+      '',
+      null,
+      undefined,
+    ]) {
+      expect(externalIdOfShadow(email)).toBeNull();
     }
   });
 });

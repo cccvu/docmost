@@ -300,7 +300,9 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
 
   // The 7 reusable named response schemas, tied to the fork interfaces the controllers actually return.
   const NAMED: Record<string, string[]> = {
-    ProvisionedUser: keysOf<Awaited<ReturnType<ServiceBridgeController['resolveUser']>>>({ userId: true, workspaceId: true }),
+    ProvisionedUser: keysOf<Awaited<ReturnType<ServiceBridgeController['provisionUser']>>>({ userId: true, workspaceId: true }),
+    // #871 (1.18.0): users/resolve also names the identity a shadow user stands for (null for any other user).
+    ResolvedUser: keysOf<Awaited<ReturnType<ServiceBridgeController['resolveUser']>>>({ userId: true, workspaceId: true, externalId: true }),
     WorkspaceSettings: keysOf<WorkspaceSettingsView>({ name: true, defaultPageEditMode: true }),
     SpaceView: keysOf<SpaceView>({ id: true, name: true, slug: true, description: true, visibility: true, memberCount: true, archived: true, createdAt: true }),
     RawSpaceMember: keysOf<RawSpaceMember>({ memberId: true, userId: true, groupId: true, role: true, createdAt: true, version: true }),
@@ -364,7 +366,7 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
 
   const OPS: Array<{ id: string; method: string; path: string; expect: OpExpect }> = [
     { id: 'provisionShadowUser', method: 'post', path: '/api/service/users', expect: { kind: 'ref', name: 'ProvisionedUser' } },
-    { id: 'resolveUser', method: 'post', path: '/api/service/users/resolve', expect: { kind: 'ref', name: 'ProvisionedUser' } },
+    { id: 'resolveUser', method: 'post', path: '/api/service/users/resolve', expect: { kind: 'ref', name: 'ResolvedUser' } },
     { id: 'lookupUsers', method: 'post', path: '/api/service/users/lookup', expect: { kind: 'items', name: 'ShadowUserLookup' } },
     { id: 'mintSession', method: 'post', path: '/api/service/session', expect: { kind: 'inline', keys: MINT } },
     { id: 'revokeSession', method: 'post', path: '/api/service/session/revoke', expect: { kind: 'inline', keys: REVOKE } },
@@ -421,6 +423,15 @@ describe('service-bridge.openapi.json 2xx response bodies match the fork return 
     expect(schema.additionalProperties).toBe(false);
     expect(schema.properties.pageIds.maxItems).toBe(PAGE_AUTHZ_STATE_MAX);
     expect(schema.properties.limit.maximum).toBe(PAGE_AUTHZ_STATE_MAX);
+  });
+
+  // #871: the fork answers `externalId: null` for every non-shadow user (always present, never omitted), so the
+  // document must declare it nullable: a consumer validating against `type: string` would reject every native user.
+  it('#871: ResolvedUser.externalId is a nullable string, and the users/resolve example carries exactly its keys', () => {
+    const schema = SPEC.components.schemas.ResolvedUser;
+    expect(schema.properties.externalId.type).toEqual(['string', 'null']);
+    const ok = (SPEC.paths as any)['/api/service/users/resolve'].post.responses['200'].content['application/json'];
+    expect(sortedKeys(ok.example)).toEqual(NAMED.ResolvedUser);
   });
 
   // #485: `target` is present only when the request named one, so it is the one non-required key.
