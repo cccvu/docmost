@@ -31,12 +31,24 @@ import Paginate from "@/components/common/paginate.tsx";
 import { useCursorPaginate } from "@/hooks/use-cursor-paginate";
 import { useRestorePageModal } from "@/features/page/hooks/use-restore-page-modal.tsx";
 import { PageListIcon } from "@/components/common/page-list-icon";
+import { useSpaceAbility } from "@/features/space/permissions/use-space-ability.ts";
+import {
+  SpaceCaslAction,
+  SpaceCaslSubject,
+} from "@/features/space/permissions/permissions.type.ts";
 
 export default function Trash() {
   const { t } = useTranslation();
   const { spaceSlug } = useParams();
   const { cursor, goNext, goPrev } = useCursorPaginate();
   const { data: space } = useGetSpaceBySlugQuery(spaceSlug);
+  // CCC (wiki-v2 UI cleanup): permanent delete needs space Manage Settings — the same
+  // predicate deleted-page-banner.tsx uses (the server refuses it otherwise).
+  const spaceAbility = useSpaceAbility(space?.membership?.permissions);
+  const canPermanentlyDelete = spaceAbility.can(
+    SpaceCaslAction.Manage,
+    SpaceCaslSubject.Settings,
+  );
   const { data: deletedPages, isLoading } = useDeletedPagesQuery(space?.id, {
     cursor, limit: 50
   });
@@ -167,6 +179,7 @@ export default function Trash() {
                           >
                             {t("Restore")}
                           </Menu.Item>
+                          {canPermanentlyDelete && (
                           <Menu.Item
                             color="red"
                             leftSection={<IconTrash size={16} />}
@@ -174,6 +187,7 @@ export default function Trash() {
                           >
                             {t("Delete")}
                           </Menu.Item>
+                          )}
                         </Menu.Dropdown>
                       </Menu>
                     </Table.Td>

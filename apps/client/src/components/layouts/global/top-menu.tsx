@@ -38,6 +38,7 @@ import { useFeedbackEntry } from "@/features/feedback/use-feedback-entry";
 import { isNativeAuthEnabled } from "@/features/auth-native/lib/auth-mode";
 import { FeedbackMenuItem } from "@/features/feedback/feedback-menu-item";
 import { FeedbackModal } from "@/features/feedback/feedback-modal";
+import useUserRole from "@/hooks/use-user-role.tsx";
 
 export default function TopMenu() {
   const { t } = useTranslation();
@@ -57,6 +58,9 @@ export default function TopMenu() {
   ] = useDisclosure(false);
   // CCC #764: "Send feedback" — visibility + dialog state (fork-owned, features/feedback/).
   const feedback = useFeedbackEntry();
+  // CCC (wiki-v2 UI cleanup): the Workspace group holds admin-only screens. useUserRole()
+  // answers member for everyone in remote mode (#636); native keeps the stored role.
+  const { isAdmin } = useUserRole();
 
   if (!user || !workspace) {
     // Signed-out (e.g. an anonymous visitor who reached an app route): offer Log in / Sign up
@@ -92,29 +96,35 @@ export default function TopMenu() {
         </UnstyledButton>
       </Menu.Target>
       <Menu.Dropdown>
-        <Menu.Label>{t("Workspace")}</Menu.Label>
+        {/* CCC (wiki-v2 UI cleanup): the whole Workspace group (label, items, divider) is
+            admin-only, so a member sees no empty header. */}
+        {isAdmin && (
+          <>
+            <Menu.Label>{t("Workspace")}</Menu.Label>
 
-        <Menu.Item
-          component={Link}
-          to={APP_ROUTE.SETTINGS.WORKSPACE.GENERAL}
-          leftSection={<IconSettings size={16} />}
-        >
-          {t("Workspace settings")}
-        </Menu.Item>
+            <Menu.Item
+              component={Link}
+              to={APP_ROUTE.SETTINGS.WORKSPACE.GENERAL}
+              leftSection={<IconSettings size={16} />}
+            >
+              {t("Workspace settings")}
+            </Menu.Item>
 
-        {/* CCC (wiki-v2 #797): in remote mode members are managed in the Admin Console and
-            the server does not serve the native members screen (directoryRead, 404). */}
-        {isNativeAuthEnabled() && (
-          <Menu.Item
-            component={Link}
-            to={APP_ROUTE.SETTINGS.WORKSPACE.MEMBERS}
-            leftSection={<IconUsers size={16} />}
-          >
-            {t("Manage members")}
-          </Menu.Item>
+            {/* CCC (wiki-v2 #797): in remote mode members are managed in the Admin Console and
+                the server does not serve the native members screen (directoryRead, 404). */}
+            {isNativeAuthEnabled() && (
+              <Menu.Item
+                component={Link}
+                to={APP_ROUTE.SETTINGS.WORKSPACE.MEMBERS}
+                leftSection={<IconUsers size={16} />}
+              >
+                {t("Manage members")}
+              </Menu.Item>
+            )}
+
+            <Menu.Divider />
+          </>
         )}
-
-        <Menu.Divider />
 
         <Menu.Label>{t("Account")}</Menu.Label>
         <Menu.Item component={Link} to={APP_ROUTE.SETTINGS.ACCOUNT.PROFILE}>
@@ -129,9 +139,12 @@ export default function TopMenu() {
               <Text size="sm" fw={500} lineClamp={1}>
                 {user.name}
               </Text>
-              <Text size="xs" c="dimmed" truncate="end">
-                {user.email}
-              </Text>
+              {/* CCC (wiki-v2 UI cleanup): remote users carry a synthetic shadow address; show it in native only. */}
+              {isNativeAuthEnabled() && (
+                <Text size="xs" c="dimmed" truncate="end">
+                  {user.email}
+                </Text>
+              )}
             </div>
           </Group>
         </Menu.Item>

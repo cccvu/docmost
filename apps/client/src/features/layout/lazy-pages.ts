@@ -8,6 +8,9 @@
 // Page / Home / login / Layout (and the other primary cold-load-path routes) stay EAGER on purpose:
 // the page view is the primary cold-load path, and an extra round trip there would cost more than
 // it saves. See lazy-pages.test.ts for the pinned set.
+// wiki-v2 UI cleanup: the EE route pages (/pdf-render, /ai, /templates, /base and the EE /settings
+// pages) are no longer routed in either mode (ADR 0035), so they have no lazy export here; their
+// ee/ sources stay in the tree. Billing and the cloud/MFA pages stay: App.tsx gates them by constant.
 // Chunk-load failures reload the document once (see lazy-with-reload.ts).
 import { createElement, Suspense, type ComponentProps } from "react";
 import { lazyWithReload } from "./lazy-with-reload";
@@ -31,20 +34,15 @@ export const CreateWorkspace = lazyWithReload(() => import("@/ee/pages/create-wo
 export const CloudLogin = lazyWithReload(() => import("@/ee/pages/cloud-login.tsx"));
 export const VerifyEmail = lazyWithReload(() => import("@/ee/pages/verify-email.tsx"));
 
-// ---- public share + pdf render ----------------------------------------------------------------
+// ---- public share -----------------------------------------------------------------------------
 export const ShareLayout = lazyWithReload(
   () => import("@/features/share/components/share-layout.tsx"),
 );
 export const SharedPage = lazyWithReload(() => import("@/pages/share/shared-page.tsx"));
 export const ShareRedirect = lazyWithReload(() => import("@/pages/share/share-redirect.tsx"));
-export const PdfRenderPage = lazyWithReload(() => import("@/ee/pdf-export/pdf-render-page.tsx"));
 
 // ---- in-app, behind <Layout/>, but off the page-view path -------------------------------------
-export const AiChat = lazyWithReload(() => import("@/ee/ai-chat/pages/ai-chat.tsx"));
-export const TemplateList = lazyWithReload(() => import("@/ee/template/pages/template-list"));
-export const TemplateEditor = lazyWithReload(() => import("@/ee/template/pages/template-editor"));
 export const SpaceTrash = lazyWithReload(() => import("@/pages/space/space-trash.tsx"));
-export const BasePage = lazyWithReload(() => import("@/ee/base/pages/base-page.tsx"));
 
 // ---- settings ---------------------------------------------------------------------------------
 export const AccountSettings = lazyWithReload(
@@ -53,28 +51,17 @@ export const AccountSettings = lazyWithReload(
 export const AccountPreferences = lazyWithReload(
   () => import("@/pages/settings/account/account-preferences.tsx"),
 );
-export const UserApiKeys = lazyWithReload(() => import("@/ee/api-key/pages/user-api-keys"));
 export const WorkspaceSettings = lazyWithReload(
   () => import("@/pages/settings/workspace/workspace-settings"),
 );
 export const WorkspaceMembers = lazyWithReload(
   () => import("@/pages/settings/workspace/workspace-members"),
 );
-export const WorkspaceApiKeys = lazyWithReload(
-  () => import("@/ee/api-key/pages/workspace-api-keys"),
-);
 export const Groups = lazyWithReload(() => import("@/pages/settings/group/groups"));
 // App.tsx imported this one relatively ("./pages/settings/group/group-info"); same module.
 export const GroupInfo = lazyWithReload(() => import("@/pages/settings/group/group-info"));
 export const Spaces = lazyWithReload(() => import("@/pages/settings/space/spaces.tsx"));
 export const Shares = lazyWithReload(() => import("@/pages/settings/shares/shares.tsx"));
-export const Security = lazyWithReload(() => import("@/ee/security/pages/security.tsx"));
-export const AiSettings = lazyWithReload(() => import("@/ee/ai/pages/ai-settings.tsx"));
-export const AuditLogs = lazyWithReload(() => import("@/ee/audit/pages/audit-logs.tsx"));
-export const VerifiedPages = lazyWithReload(
-  () => import("@/ee/page-verification/pages/verified-pages.tsx"),
-);
-export const License = lazyWithReload(() => import("@/ee/licence/pages/license.tsx"));
 export const Billing = lazyWithReload(() => import("@/ee/billing/pages/billing.tsx"));
 
 // ---- non-route lazy wrappers ------------------------------------------------------------------

@@ -20,6 +20,8 @@ import {
   SpaceCaslAction,
   SpaceCaslSubject,
 } from "@/features/space/permissions/permissions.type";
+import { usePageQuery } from "@/features/page/queries/page-query";
+import { extractPageSlugId } from "@/lib";
 
 export function useHistoryRestore() {
   const { t } = useTranslation();
@@ -31,14 +33,19 @@ export function useHistoryRestore() {
   const mainEditorTitle = useAtomValue(titleEditorAtom);
   const setHistoryModalOpen = useSetAtom(historyAtoms);
 
-  const { spaceSlug } = useParams();
+  // CCC (wiki-v2 UI cleanup): also read pageSlug, so Restore needs page edit too.
+  const { spaceSlug, pageSlug } = useParams();
   const { data: space } = useSpaceQuery(spaceSlug);
   const spaceAbility = useSpaceAbility(space?.membership?.permissions);
+  // CCC (wiki-v2 UI cleanup): the same cached page query and the same canEdit as
+  // pages/page/page.tsx, so a space writer is not offered Restore on a page they
+  // cannot edit (e.g. a restricted page).
+  const { data: page } = usePageQuery({ pageId: extractPageSlugId(pageSlug) });
+  const canEditPage = !page?.deletedAt && (page?.permissions?.canEdit ?? false);
 
-  const canRestore = spaceAbility.can(
-    SpaceCaslAction.Manage,
-    SpaceCaslSubject.Page,
-  );
+  const canRestore =
+    spaceAbility.can(SpaceCaslAction.Manage, SpaceCaslSubject.Page) &&
+    canEditPage;
 
   const handleRestore = useCallback(() => {
     if (!activeHistoryData) return;

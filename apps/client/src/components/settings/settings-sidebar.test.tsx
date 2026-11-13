@@ -11,6 +11,15 @@ vi.mock("@/features/auth-native/lib/auth-mode.ts", () => ({
 vi.mock("@/hooks/use-user-role.tsx", () => ({
   default: () => ({ isAdmin: true, isOwner: true }),
 }));
+// wiki-v2 UI cleanup: entitled to every EE feature, so an EE item could only be absent because it
+// is gone, not because the entitlement filter hid it.
+vi.mock("@/ee/entitlement/entitlement-atom", async () => {
+  const { atom } = await import("jotai");
+  const { Feature } = await import("@/ee/features");
+  return {
+    entitlementAtom: atom({ tier: "enterprise", features: Object.values(Feature) }),
+  };
+});
 vi.mock("@/lib/config.ts", async (orig) => ({
   ...(await orig<object>()),
   isCloud: () => false,
@@ -21,18 +30,11 @@ vi.mock("@/hooks/use-settings-navigation", () => ({
 vi.mock("@/components/settings/settings-queries.tsx", () => {
   const noop = () => {};
   return {
-    prefetchApiKeyManagement: noop,
-    prefetchApiKeys: noop,
     prefetchBilling: noop,
     prefetchGroups: noop,
-    prefetchLicense: noop,
-    prefetchScimTokens: noop,
     prefetchShares: noop,
     prefetchSpaces: noop,
-    prefetchSsoProviders: noop,
     prefetchWorkspaceMembers: noop,
-    prefetchAuditLogs: noop,
-    prefetchVerifiedPages: noop,
   };
 });
 vi.mock("@/components/layouts/global/hooks/atoms/sidebar-atom.ts", async () => {
@@ -101,4 +103,38 @@ describe("SettingsSidebar — native directory screens (#797)", () => {
       "/settings/groups",
     );
   });
+});
+
+describe("SettingsSidebar — EE items are gone with their routes (wiki-v2 UI cleanup, ADR 0035)", () => {
+  const REMOVED = [
+    "API keys",
+    "Security & SSO",
+    "Verified pages",
+    "API management",
+    "AI settings",
+    "Audit log",
+    "License & Edition",
+  ];
+
+  it.each([false, true])(
+    "native=%s, an entitled owner: no EE item and no System group",
+    (native) => {
+      nativeState.value = native;
+      renderSidebar();
+      for (const label of REMOVED) {
+        expect(screen.queryByRole("link", { name: label }), label).toBeNull();
+      }
+      expect(screen.queryByText("System")).toBeNull();
+      for (const link of screen.getAllByRole("link")) {
+        expect(link.getAttribute("href")).not.toMatch(
+          /^\/settings\/(license|account\/api-keys|api-keys|verifications|audit|security|ai)/,
+        );
+      }
+      // The kept items are still there.
+      expect(screen.getByRole("link", { name: "Profile" })).toBeTruthy();
+      expect(screen.getByRole("link", { name: "Preferences" })).toBeTruthy();
+      expect(screen.getByRole("link", { name: "General" })).toBeTruthy();
+      expect(screen.getByRole("link", { name: "Public sharing" })).toBeTruthy();
+    },
+  );
 });

@@ -24,21 +24,14 @@ vi.mock("@/ee/base/components/base-view", () => deferredBaseView.promise);
 const EXPECTED_LAZY_ROUTES = [
   "AccountPreferences",
   "AccountSettings",
-  "AiChat",
-  "AiSettings",
-  "AuditLogs",
-  "BasePage",
   "Billing",
   "CloudLogin",
   "CreateWorkspace",
   "GroupInfo",
   "Groups",
   "InviteSignup",
-  "License",
   "MfaChallengePage",
   "MfaSetupRequiredPage",
-  "PdfRenderPage",
-  "Security",
   "SetupWorkspace",
   "ShareLayout",
   "ShareRedirect",
@@ -46,14 +39,27 @@ const EXPECTED_LAZY_ROUTES = [
   "Shares",
   "SpaceTrash",
   "Spaces",
+  "VerifyEmail",
+  "WorkspaceMembers",
+  "WorkspaceSettings",
+];
+
+// wiki-v2 UI cleanup: EE pages that are no longer routed in either mode (ADR 0035). Their ee/ sources
+// stay, but a lazy export would be a route nobody can reach; App.tsx's 404 for them is pinned in
+// app-routes.test.tsx.
+const REMOVED_EE_ROUTES = [
+  "AiChat",
+  "AiSettings",
+  "AuditLogs",
+  "BasePage",
+  "License",
+  "PdfRenderPage",
+  "Security",
   "TemplateEditor",
   "TemplateList",
   "UserApiKeys",
   "VerifiedPages",
-  "VerifyEmail",
   "WorkspaceApiKeys",
-  "WorkspaceMembers",
-  "WorkspaceSettings",
 ];
 
 // Plain components that wrap a lazy() in <Suspense> for a NON-route consumer (page.tsx renders
@@ -91,6 +97,12 @@ describe("lazy-pages (issue #309)", () => {
         | { $$typeof?: symbol }
         | undefined;
       expect(component?.$$typeof, name).toBe(Symbol.for("react.lazy"));
+    }
+  });
+
+  it("wiki-v2 UI cleanup: exports none of the unrouted EE pages", () => {
+    for (const name of REMOVED_EE_ROUTES) {
+      expect(name in lazyPages, name).toBe(false);
     }
   });
 

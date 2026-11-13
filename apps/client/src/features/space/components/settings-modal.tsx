@@ -23,6 +23,7 @@ import {
 import { useTranslation } from "react-i18next";
 import { useSpaceSecurityAvailable } from "@/features/feature-availability/feature-gate.tsx";
 import { isNativeAuthEnabled } from "@/features/auth-native/lib/auth-mode.ts";
+import { usePlatformAdminContext } from "@/features/admin-entry/use-platform-admin-context.ts";
 
 interface SpaceSettingsModalProps {
   spaceId: string;
@@ -58,6 +59,15 @@ export default function SpaceSettingsModal({
   // server-injected capability the native sign-in UI uses; in native/standalone mode the
   // native membership management is the source of truth and stays fully editable.
   const membershipManagedExternally = !isNativeAuthEnabled();
+  // CCC (wiki-v2 UI cleanup): the console link is only useful to someone who can change
+  // membership there — a platform workspace admin or a space member manager. Everyone else
+  // is told to ask a space admin. The admin-context query is the header's shared, cached
+  // one (space-details.tsx reads it too); hiding the link is not the control — the console
+  // and the platform decide every membership write.
+  const platformAdminGate = usePlatformAdminContext();
+  const canOpenConsoleForMembers =
+    platformAdminGate === "admin" ||
+    spaceAbility.can(SpaceCaslAction.Manage, SpaceCaslSubject.Member);
 
   return (
     <>
@@ -119,6 +129,8 @@ export default function SpaceSettingsModal({
                       icon={<IconInfoCircle size={18} />}
                       my="md"
                     >
+                      {canOpenConsoleForMembers ? (
+                        <>
                       {t(
                         "Space membership is managed in the Admin Console. To add or remove members, or change their roles, open the Admin Console.",
                       )}{" "}
@@ -129,6 +141,10 @@ export default function SpaceSettingsModal({
                       >
                         {t("Open the Admin Console")}
                       </Anchor>
+                        </>
+                      ) : (
+                        t("Ask a space admin to change who has access.")
+                      )}
                     </Alert>
                   ) : (
                     <Group my="md" justify="flex-end">

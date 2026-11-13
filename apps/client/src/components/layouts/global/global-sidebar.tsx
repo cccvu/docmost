@@ -2,12 +2,10 @@ import { useEffect, useState } from "react";
 import { ScrollArea, Text, Divider, Modal, UnstyledButton, Tooltip } from "@mantine/core";
 import {
   IconHome,
-  IconClock,
   IconStar,
   IconLayoutGrid,
   IconSettings,
   IconUserPlus,
-  IconTemplate,
   IconHeart,
 } from "@tabler/icons-react";
 import { Link, useLocation } from "react-router-dom";
@@ -23,8 +21,7 @@ import { useDisclosure } from "@mantine/hooks";
 import { WorkspaceInviteForm } from "@/features/workspace/components/members/components/workspace-invite-form";
 import { CustomAvatar } from "@/components/ui/custom-avatar";
 import { AvatarIconType } from "@/features/attachments/types/attachment.types";
-import { useHasFeature } from "@/ee/hooks/use-feature";
-import { Feature } from "@/ee/features";
+import useUserRole from "@/hooks/use-user-role.tsx";
 
 export default function GlobalSidebar({
   collapsed = false,
@@ -38,17 +35,15 @@ export default function GlobalSidebar({
   const [active, setActive] = useState(location.pathname);
   const [mobileSidebarOpened] = useAtom(mobileSidebarAtom);
   const toggleMobileSidebar = useToggleSidebar(mobileSidebarAtom);
-  const hasTemplates = useHasFeature(Feature.TEMPLATES);
+  // CCC (wiki-v2 UI cleanup): inviting is a workspace-admin action. useUserRole() answers
+  // member for everyone in remote mode (#636), where the platform owns invites and the
+  // server refuses invites/create; in native mode it is the stored owner/admin role.
+  const { isAdmin } = useUserRole();
+  // CCC (wiki-v2 UI cleanup): the EE Templates item is gone with its route (never entitled, ADR 0035).
   const mainNavItems = [
     { label: "Home", icon: IconHome, path: "/home" },
     { label: "Favorites", icon: IconStar, path: "/favorites" },
     { label: "Spaces", icon: IconLayoutGrid, path: "/spaces" },
-    // CCC: HIDE Templates when this deployment isn't entitled to it (was rendered
-    // disabled with an "Available with a paid license" tooltip). Internal tool —
-    // don't advertise unbuyable paid features.
-    ...(hasTemplates
-      ? [{ label: "Templates", icon: IconTemplate, path: "/templates" }]
-      : []),
   ];
   const { data: favoriteSpacesData, isPending: isFavoritesPending } = useFavoritesQuery("space");
   const favoriteSpaces = favoriteSpacesData?.pages.flatMap((p) => p.items) ?? [];
@@ -147,17 +142,19 @@ export default function GlobalSidebar({
       </ScrollArea>
 
       <div className={classes.bottomSection}>
-        <Tooltip
-          label={t("Invite People")}
-          position="right"
-          withArrow
-          disabled={!collapsed}
-        >
-          <UnstyledButton className={classes.link} onClick={openInvite}>
-            <IconUserPlus className={classes.linkIcon} stroke={2} />
-            <span>{t("Invite People")}</span>
-          </UnstyledButton>
-        </Tooltip>
+        {isAdmin && (
+          <Tooltip
+            label={t("Invite People")}
+            position="right"
+            withArrow
+            disabled={!collapsed}
+          >
+            <UnstyledButton className={classes.link} onClick={openInvite}>
+              <IconUserPlus className={classes.linkIcon} stroke={2} />
+              <span>{t("Invite People")}</span>
+            </UnstyledButton>
+          </Tooltip>
+        )}
         <Tooltip
           label={t("Settings")}
           position="right"
@@ -177,18 +174,20 @@ export default function GlobalSidebar({
         </Tooltip>
       </div>
 
-      <Modal
-        size="550"
-        opened={inviteOpened}
-        onClose={closeInvite}
-        title={t("Invite new members")}
-        centered
-      >
-        <Divider size="xs" mb="xs" />
-        <ScrollArea h="80%">
-          <WorkspaceInviteForm onClose={closeInvite} />
-        </ScrollArea>
-      </Modal>
+      {isAdmin && (
+        <Modal
+          size="550"
+          opened={inviteOpened}
+          onClose={closeInvite}
+          title={t("Invite new members")}
+          centered
+        >
+          <Divider size="xs" mb="xs" />
+          <ScrollArea h="80%">
+            <WorkspaceInviteForm onClose={closeInvite} />
+          </ScrollArea>
+        </Modal>
+      )}
     </div>
   );
 }
