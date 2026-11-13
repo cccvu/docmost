@@ -27,6 +27,10 @@ vi.mock("@/features/user/components/change-email", () => ({
 vi.mock("@/features/session/components/session-list", () => ({
   default: () => <div data-testid="session-list" />,
 }));
+// #818: Profile → Passkeys mounts after Sessions (the section hides itself in native mode and on an old platform).
+vi.mock("@/features/passkeys/components/passkeys-section.tsx", () => ({
+  default: () => <div data-testid="passkeys" />,
+}));
 vi.mock("@/features/user/components/account-mfa-section", () => ({
   AccountMfaSection: () => <div data-testid="mfa" />,
 }));
@@ -70,6 +74,13 @@ describe("AccountSettings", () => {
     expect(screen.getByTestId("session-list")).toBeTruthy();
     expect(screen.queryByTestId("mfa")).toBeNull();
     expect(screen.queryAllByRole("separator")).toHaveLength(1);
+  });
+
+  it("mounts Passkeys right after Sessions (#818)", () => {
+    renderPage();
+    const sessions = screen.getByTestId("session-list");
+    const passkeys = screen.getByTestId("passkeys");
+    expect(sessions.nextElementSibling).toBe(passkeys);
   });
 
   it("native mode: also shows Email, Email and Sessions each after one divider", () => {

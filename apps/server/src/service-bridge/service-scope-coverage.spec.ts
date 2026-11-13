@@ -49,6 +49,7 @@ const EXPECTED_SCOPE: Record<string, ServiceScope> = {
   'ServiceBridgeController.mintSession': ServiceScope.SessionMint,
   'ServiceBridgeController.revokeSession': ServiceScope.SessionRevoke,
   'ServiceBridgeController.restoreSession': ServiceScope.SessionRestore,
+  'ServiceBridgeController.revokeOtherSessions': ServiceScope.SessionRevokeOthers, // wiki-v2 #818
   'ServiceWorkspaceController.getDefault': ServiceScope.WorkspaceRead,
   'ServiceWorkspaceController.getSettings': ServiceScope.WorkspaceRead,
   'ServiceWorkspaceController.updateSettings': ServiceScope.WorkspaceSettingsWrite,

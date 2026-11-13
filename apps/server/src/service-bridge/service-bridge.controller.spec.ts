@@ -16,7 +16,7 @@ describe('ServiceBridgeController.mintSession — clientIp wiring (#330)', () =>
   const makeController = () => {
     const service = { mintSession: jest.fn(async () => 'authtoken-xyz') } as any;
     // environmentService + workspaces are unused by mintSession (cookie set is stubbed); pass minimal stubs.
-    const controller = new ServiceBridgeController(service, {} as any, {} as any);
+    const controller = new ServiceBridgeController(service, {} as any, {} as any, {} as any);
     return { controller, service };
   };
   const res = {} as any; // setDocmostAuthCookie is mocked → res is never touched here
@@ -42,7 +42,7 @@ describe('ServiceBridgeController.mintSession — clientIp wiring (#330)', () =>
 describe('ServiceBridgeController.mintSession — step-up freshness (#713)', () => {
   const makeController = () => {
     const service = { mintSession: jest.fn(async () => 'authtoken-xyz') } as any;
-    return { controller: new ServiceBridgeController(service, {} as any, {} as any), service };
+    return { controller: new ServiceBridgeController(service, {} as any, {} as any, {} as any), service };
   };
   const res = {} as any;
   const now = () => Math.floor(Date.now() / 1000);

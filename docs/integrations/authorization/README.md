@@ -109,7 +109,8 @@ You only implement a *caller* for these; the fork is the server. They fall into 
 
 - **Session brokerage** (`service-bridge`): `POST /api/service/users` (provision a shadow user),
   `POST /api/service/users/resolve` (Docmost user id -> workspace), `POST /api/service/session` (mint a
-  session).
+  session), `POST /api/service/session/revoke` and `.../session/restore` (account disable and re-enable, #455),
+  and `POST /api/service/session/revoke-others` (sign the other devices out, 1.17.0, wiki-v2 #818).
 - **Workspace** (`workspace`): `GET /api/service/workspace/default` (the canonical workspace id),
   `GET`/`PATCH /api/service/workspace/settings`.
 - **Space control plane** (`spaces`): `GET`/`POST /api/service/spaces`, `GET`/`PATCH
@@ -145,7 +146,8 @@ You only implement a *caller* for these; the fork is the server. They fall into 
   `POST /api/service/groups/memberships/lookup` and `POST /api/service/groups/default/ensure`.
 - **Collab** (`collab`): `POST /api/collab/revalidate` (re-check every live realtime connection after a
   narrowing access change and narrow the ones that lost access, #501; it replaced the per-page
-  `force-disconnect` in 1.5.0) and `POST /api/collab/force-disconnect-user` (account disable, #455).
+  `force-disconnect` in 1.5.0) and `POST /api/collab/force-disconnect-user` (account disable, #455, and after
+  `session/revoke-others`, #818).
 
 **Bounded engine workloads (1.11.0; wiki-v2 #696, #642).** `POST /api/service/content/search` answers `503` instead of
 an empty result when the authorization service cannot answer, and `503 { code: engine_busy }` when the search is shed
@@ -200,6 +202,17 @@ and an `update-permission` that raises) apply the same ceiling on the page: read
 `503 { code: grant_ceiling_unconfirmed }`), and refuse a group grantee on an add or a raise
 (`400 { code: group_grant_not_allowed_on_restricted_page }`; existing group grants stay). The native directory reads
 are refused (below), and `search/suggest` returns groups only to a caller who administers the workspace or a space.
+
+**1.17.0 (wiki-v2 #818).** `POST /api/service/session/revoke-others` (scope `session:revoke-others`) takes
+`{ externalId, keepToken? }` and revokes every live session of the shadow user except the one `keepToken` proves. It
+never deactivates the user. The fork verifies `keepToken` itself and keeps a session only when the token is its own
+access token (`APP_SECRET` signature, unexpired, `type` access) whose `sub` and `workspaceId` are that shadow user's
+and whose `sessionId` names a live session of the user. A missing token, or one that fails any check, revokes every
+session: the worst case is that the person signs in again. The answer is `{ userId, revoked, kept }` (`userId` null
+and `revoked` 0 when there is no shadow user); the integrator then calls `POST /api/collab/force-disconnect-user` with
+`userId`, and the kept session's tabs reconnect while the others are refused at connect. `keepToken` is declared in
+the DTO on purpose: the `ValidationPipe` strips an undeclared field silently, which would revoke the caller's own
+session too. A fork before 1.17.0 answers `404`; an integrator must treat that as "not signed out", never as done.
 
 **Native routes refused in remote mode (1.10.0; wiki-v2 #502, #598, #636).** In `AUTHZ_MODE=remote` the engine
 answers `404` to every authenticated caller of the native routes below, before any permission check, and forwards one
@@ -326,10 +339,11 @@ Three properties bind the whole surface:
 - **Mode-gated.** Every route is `404` unless the fork runs `AUTHZ_MODE=remote` (RemoteOnlyGuard, checked
   before the secret). In native mode there is no integrating platform and the surface does not exist.
 - **Scoped + secret-gated.** Every request carries `x-authz-service-secret`; each `/api/service/*` route
-  requires exactly one least-privilege scope (`session:mint`, `users:provision`, `users:resolve`,
+  requires exactly one least-privilege scope (`session:mint`, `session:revoke`, `session:restore`,
+  `session:revoke-others`, `users:provision`, `users:resolve`,
   `workspace:read`, `workspace:settings:write`, `spaces:read`, `spaces:write`, `pages:read`, `pages:authz:read`,
   `pages:import:read`,
-  `content:read`, `content:search`, `attachments:read`, `changes:read`).
+  `content:read`, `content:search`, `attachments:read`, `changes:read`, `groups:read`, `groups:write`).
 - **The platform is the authorization authority.** Identity-mutating endpoints are keyed only on an opaque
   `externalId` (no arbitrary-identity selection). The `content/*` read endpoints are a **privileged data
   plane, not a second gate**: the platform performs the PDP decision first and passes the authorized id set;
