@@ -2,7 +2,11 @@ import { useEffect, useRef, useState } from "react";
 import { Alert, Button, Group, Modal, Stack, Text } from "@mantine/core";
 import { useTranslation } from "react-i18next";
 import { useResendCooldown } from "@/features/public/hooks/use-resend-cooldown.ts";
-import { passkeyUiAction, toPasskeyFailure } from "../lib/passkey-errors.ts";
+import {
+  passkeyUiAction,
+  toPasskeyFailure,
+  type PasskeyFailure,
+} from "../lib/passkey-errors.ts";
 import { removePasskey } from "../services/passkey-api.ts";
 import type {
   ConfirmMethod,
@@ -21,11 +25,30 @@ import { ConfirmItsYouDialog } from "./confirm-its-you-dialog.tsx";
 //   - `503 sign_out_incomplete`: the passkey already no longer works, but the other-device sign-out did not finish.
 //     "Try again" re-sends the same DELETE (it resumes), after the server's Retry-After.
 //   - `404`: the passkey is gone already; the list is refreshed.
+//   - `429 rate_limited`: the platform's only 429 here is the fork's per-principal limit on the other-device sign-out,
+//     which it passes through AFTER the passkey stopped (AGENTS.md #780). So it is held like a `sign_out_incomplete`:
+//     the action waits out its Retry-After (capped), and the list is re-read.
+// Every failure except a cancel and a step-up re-reads the list (`onChanged`): a 429, a dropped connection or a 504
+// can arrive after the server already stopped the passkey, and the row must then show "Removal not finished".
+// The dialog cannot be closed while the DELETE is in flight.
 
 /** Longest the "Try again" button waits for a Retry-After: a misbehaving proxy must not lock it for an hour. */
 const MAX_RETRY_WAIT_SECONDS = 60;
 /** The wait when a 503 carried no Retry-After (the platform always sends 2–5 s). */
 const DEFAULT_RETRY_WAIT_SECONDS = 3;
+
+function retryWait(retryAfterSeconds: number | null): number {
+  return Math.min(
+    retryAfterSeconds ?? DEFAULT_RETRY_WAIT_SECONDS,
+    MAX_RETRY_WAIT_SECONDS,
+  );
+}
+
+function isRateLimited(
+  failure: PasskeyFailure,
+): failure is Extract<PasskeyFailure, { kind: "http" }> {
+  return failure.kind === "http" && failure.status === 429;
+}
 
 export interface RemovePasskeyDialogProps {
   /** The passkey being removed, or null when the dialog is closed. */
@@ -86,11 +109,25 @@ function RemoveFlow({
     let result: RemovePasskeyResponse;
     try {
       result = await removePasskey(passkey.id);
-    } catch (failure) {
+    } catch (thrown) {
+      const failure = toPasskeyFailure(thrown);
+      const action = passkeyUiAction("remove", failure, t);
+      // Anything but a cancel or a step-up may have come after the server stopped the passkey: re-read the list, so
+      // the row says "Removal not finished" (even when this dialog is already gone).
+      if (action.kind !== "none" && action.kind !== "confirm") onChanged();
       if (!mounted.current) return;
       setBusy(false);
       setConfirmed(false);
-      const action = passkeyUiAction("remove", toPasskeyFailure(failure), t);
+      if (isRateLimited(failure)) {
+        // Held like a sign_out_incomplete: the action waits out the server's Retry-After.
+        setError(
+          action.kind === "message"
+            ? action.message
+            : t("Too many attempts, try again in a moment."),
+        );
+        cooldown.start(retryWait(failure.retryAfterSeconds));
+        return;
+      }
       switch (action.kind) {
         case "none":
           return;
@@ -98,20 +135,13 @@ function RemoveFlow({
           setConfirmMethods(action.methods);
           return;
         case "refresh-list":
-          onChanged();
           onClose();
           return;
-        case "removal-incomplete": {
-          const wait = Math.min(
-            action.retryAfterSeconds ?? DEFAULT_RETRY_WAIT_SECONDS,
-            MAX_RETRY_WAIT_SECONDS,
-          );
+        case "removal-incomplete":
           setIncomplete({ message: action.message });
-          cooldown.start(wait);
+          cooldown.start(retryWait(action.retryAfterSeconds));
           // The row now shows "Removal not finished · Try again" behind the dialog.
-          onChanged();
           return;
-        }
         case "message":
           setError(action.message);
           return;
@@ -120,7 +150,11 @@ function RemoveFlow({
           return;
       }
     }
-    if (!mounted.current) return;
+    if (!mounted.current) {
+      // Gone before the answer (the section unmounted): the list must still learn the passkey is removed.
+      onChanged();
+      return;
+    }
     setBusy(false);
     onRemoved(result);
   }
@@ -132,6 +166,10 @@ function RemoveFlow({
       <Modal
         opened={confirmMethods === null}
         onClose={onClose}
+        // Never closable mid-DELETE: its answer decides what the list must show.
+        closeOnEscape={!busy}
+        closeOnClickOutside={!busy}
+        withCloseButton={!busy}
         title={
           resuming
             ? t("Finish removing passkey {{name}}", { name })

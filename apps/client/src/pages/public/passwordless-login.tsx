@@ -51,6 +51,12 @@ interface PasskeyNotice {
   retry: boolean;
 }
 
+/** Two addresses name the same mailbox for the page's purposes: compared trimmed and case-insensitively. */
+function sameAddress(a: string | null, b: string | null): boolean {
+  if (a === null || b === null) return false;
+  return a.trim().toLowerCase() === b.trim().toLowerCase();
+}
+
 /**
  * Passwordless sign-in (magic link + OTP). Two steps, reachable two ways:
  *   1. enter email → request a sign-in email (response is always generic — no account disclosure);
@@ -74,13 +80,14 @@ interface PasskeyNotice {
  * Passkeys (#818) sit beside the email path, never in front of it:
  *   - step 1's email field is `autoComplete="username webauthn"`, and a conditional (autofill) request is armed while
  *     step 1 shows (`armPasskeyAutofill`); it is aborted on a step change, on unmount and before a button starts its
- *     own ceremony, and it re-arms itself only on `passkey_challenge_expired`;
+ *     own ceremony, and it re-arms itself only on `passkey_challenge_expired`, saying "Choose your passkey again";
  *   - "Sign in with a passkey" (step 1) and "Didn't get a code? Sign in with a passkey" (the code step) each run ONE
  *     ceremony straight from the click (Safari's user-gesture rule: `completeSignInWith` calls the verifier before
  *     its first await, and the verifier's first await is its one native options fetch);
  *   - every passkey outcome is announced in ONE polite live region, with "Try again" / "Email me a code instead"
  *     under it as the error table says; `email_confirmation_required` (the 90-day rule) moves to the code step for
- *     the address the platform names and mails a code;
+ *     the address the platform names and mails a code (unless one was just mailed to that same address), and the
+ *     email sign-in that follows shows no nudge (the person already has a passkey);
  *   - an older platform without the routes (404/405), or a browser without WebAuthn, hides every passkey control;
  *   - after the wiki session opens, the shared tail may show the nudge (email sign-in) or the reminder (passkey
  *     sign-in) before navigating (`usePasswordless`; never on an OAuth resume).
@@ -118,6 +125,11 @@ export default function PasswordlessLogin() {
   );
   // The armed autofill request's disarm, so a button can cancel it BEFORE its own ceremony starts.
   const disarmAutofill = useRef<(() => void) | null>(null);
+  // The address the last code was actually mailed to: the resend countdown only vouches for a code sent THERE.
+  const lastSentTo = useRef<string | null>(null);
+  // Set while the code step is the 90-day email re-confirmation of a passkey (`email_confirmation_required`): an
+  // email sign-in for that address must not then offer to "create a passkey". Cleared by any other way into a send.
+  const confirmingPasskeyFor = useRef<string | null>(null);
   const onFirstStep = !sent && !haveCode && !postSignIn;
 
   function showBridgeFailure() {
@@ -157,6 +169,7 @@ export default function PasswordlessLogin() {
     switch (action.kind) {
       case "none":
       case "rearm":
+        // An autofill re-arm is announced by the helper's onExpired (see the autofill handlers below).
         return;
       case "hide":
         setPasskeysOff(true);
@@ -198,6 +211,7 @@ export default function PasswordlessLogin() {
   async function toCodeStepForConfirmation(address: string | null) {
     const target = (address ?? email).trim();
     if (address) setEmail(address);
+    confirmingPasskeyFor.current = target || null;
     if (!target) {
       setPasskeyNotice({
         message: t("Confirm with a code from your email this time."),
@@ -207,7 +221,13 @@ export default function PasswordlessLogin() {
       emailRef.current?.focus();
       return;
     }
-    if (!onFirstStep && cooldown.remaining > 0) {
+    // Inside the countdown a code is already on its way, but only to the address it was sent to: when the platform
+    // named a different one, mail the right one now (the countdown belongs to the old address).
+    if (
+      !onFirstStep &&
+      cooldown.remaining > 0 &&
+      sameAddress(lastSentTo.current, target)
+    ) {
       setPasskeyNotice({
         message: t(
           "To keep using your passkey, confirm your email: enter the code we sent you.",
@@ -218,6 +238,7 @@ export default function PasswordlessLogin() {
       otpRef.current?.focus();
       return;
     }
+    cooldown.reset();
     if (await sendCode(target)) {
       setPasskeyNotice({
         message: t(
@@ -234,6 +255,7 @@ export default function PasswordlessLogin() {
     if (!(await requestEmail(address, { onRetryAfter: cooldown.start }))) {
       return false;
     }
+    lastSentTo.current = address;
     setOtp("");
     setOtpError(null);
     autoSubmitted.current = null;
@@ -245,6 +267,7 @@ export default function PasswordlessLogin() {
   // "Email me a code instead", under a passkey notice.
   function onEmailInstead() {
     setPasskeyNotice(null);
+    confirmingPasskeyFor.current = null;
     const address = email.trim();
     if (onFirstStep) {
       if (address) void sendCode(address);
@@ -261,6 +284,7 @@ export default function PasswordlessLogin() {
   const autofillHandlers = useRef({
     onSignedIn: (_res: PasskeySignInResponse) => {},
     onFailure: (_error: unknown) => {},
+    onExpired: () => {},
   });
   useEffect(() => {
     autofillHandlers.current = {
@@ -271,6 +295,13 @@ export default function PasswordlessLogin() {
         }).catch((error) => onPasskeyFailure("autofill", error));
       },
       onFailure: (error) => void onPasskeyFailure("autofill", error),
+      // The person picked a passkey after the challenge lapsed: the field has re-armed, so say what to do.
+      onExpired: () =>
+        setPasskeyNotice({
+          message: t("That took too long. Choose your passkey again."),
+          offerEmail: false,
+          retry: false,
+        }),
     };
   });
 
@@ -281,6 +312,7 @@ export default function PasswordlessLogin() {
       onSignedIn: (res) => autofillHandlers.current.onSignedIn(res),
       onFailure: (failure) =>
         autofillHandlers.current.onFailure(new PasskeyError(failure)),
+      onExpired: () => autofillHandlers.current.onExpired(),
     });
     disarmAutofill.current = disarm;
     return () => {
@@ -294,7 +326,9 @@ export default function PasswordlessLogin() {
     const trimmed = email.trim();
     if (!trimmed) return;
     setPasskeyNotice(null);
+    confirmingPasskeyFor.current = null;
     if (await requestEmail(trimmed, { onRetryAfter: cooldown.start })) {
+      lastSentTo.current = trimmed;
       setSent(true);
       cooldown.start();
     }
@@ -309,11 +343,13 @@ export default function PasswordlessLogin() {
       return;
     }
     setOtpError(null);
+    // The 90-day re-confirmation of an existing passkey is no moment to offer creating one.
+    const reconfirming = sameAddress(confirmingPasskeyFor.current, email);
     try {
       // `screens`: this page renders the #818 nudge/reminder the shared tail may ask for.
       await completeSignIn(
         { email: email.trim(), otp: normalizeOtp(code) },
-        { screens: true },
+        reconfirming ? { screens: true, nudge: false } : { screens: true },
       );
     } catch (err) {
       // Distinguish "the code was fine but the session bridge failed" from "bad code" (see use-passwordless).
@@ -578,6 +614,7 @@ export default function PasswordlessLogin() {
                       size="xs"
                       onClick={() => {
                         setPasskeyNotice(null);
+                        confirmingPasskeyFor.current = null;
                         setSent(false);
                         setHaveCode(false);
                         setOtp("");

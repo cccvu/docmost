@@ -9,6 +9,7 @@ import {
   vi,
 } from "vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -303,5 +304,52 @@ describe("boundaries", () => {
     expect(dialogSource).not.toMatch(
       /console\/confirm|stepUpConfirmHref|window\.location/,
     );
+  });
+});
+
+describe("focus follows the probe's answer", () => {
+  // The modal opens while the body is still "probing" (nothing to focus but the close button); once the probe
+  // answers, focus must move to what the answer shows, not stay on "Close".
+  function deferredProbe() {
+    let answer: (available: boolean) => void = () => undefined;
+    api.probe.mockImplementation(
+      () => new Promise<boolean>((resolve) => (answer = resolve)),
+    );
+    return (available: boolean) => answer(available);
+  }
+
+  it("a passkey is available → 'Use your passkey'; 'Email me a code instead' → the code field", async () => {
+    const answer = deferredProbe();
+    renderDialog(["passkey", "email"]);
+    await screen.findByText("Checking how you can confirm…");
+    await act(async () => answer(true));
+    const passkeyButton = await screen.findByRole("button", {
+      name: "Use your passkey",
+    });
+    await waitFor(() => expect(document.activeElement).toBe(passkeyButton));
+
+    fireEvent.click(
+      screen.getByRole("button", { name: "Email me a code instead" }),
+    );
+    const field = await screen.findByLabelText(/Confirmation code/);
+    await waitFor(() => expect(document.activeElement).toBe(field));
+  });
+
+  it("no passkey → the code field", async () => {
+    const answer = deferredProbe();
+    renderDialog(["passkey", "email"]);
+    await screen.findByText("Checking how you can confirm…");
+    await act(async () => answer(false));
+    const field = await screen.findByLabelText(/Confirmation code/);
+    await waitFor(() => expect(document.activeElement).toBe(field));
+  });
+
+  it("passkey-only with no passkey → Cancel", async () => {
+    const answer = deferredProbe();
+    renderDialog(["passkey"]);
+    await screen.findByText("Checking how you can confirm…");
+    await act(async () => answer(false));
+    const cancel = await screen.findByRole("button", { name: "Cancel" });
+    await waitFor(() => expect(document.activeElement).toBe(cancel));
   });
 });

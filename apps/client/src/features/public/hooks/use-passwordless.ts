@@ -50,6 +50,12 @@ export interface SignInOptions {
    * Off by default, so a page that does not render them (the magic-link page) navigates exactly as before.
    */
   screens?: boolean;
+  /**
+   * #818: `false` withholds the nudge (only the nudge; the reminder is a passkey sign-in's). The login page passes it
+   * when this email sign-in is the 90-day re-confirmation of a passkey the person already has
+   * (`403 email_confirmation_required` → the code step): offering to "create a passkey" right then is wrong.
+   */
+  nudge?: boolean;
 }
 
 // A built-in-authenticator probe that never answers must not hold a signed-in person on the login page.
@@ -78,6 +84,7 @@ async function hasPlatformAuthenticator(): Promise<boolean> {
 async function choosePostSignInScreen(
   method: SignInMethod,
   res: VerifiedSignIn | undefined,
+  nudge: boolean,
 ): Promise<PostSignInScreen | null> {
   if (method === "passkey") {
     const days = res?.emailConfirmationDueDays;
@@ -88,7 +95,7 @@ async function choosePostSignInScreen(
       ? { kind: "reminder", daysLeft: days }
       : null;
   }
-  if (isPasskeyNudgeDismissed()) return null;
+  if (!nudge || isPasskeyNudgeDismissed()) return null;
   return (await hasPlatformAuthenticator()) ? { kind: "nudge" } : null;
 }
 
@@ -203,7 +210,11 @@ export function usePasswordless() {
       // #818: the nudge or the reminder, AFTER the wiki session is open (both screens call the platform as the
       // signed-in person) and before navigating. The page renders it and calls continueAfterSignIn().
       if (opts.screens === true) {
-        const screen = await choosePostSignInScreen(opts.method, res);
+        const screen = await choosePostSignInScreen(
+          opts.method,
+          res,
+          opts.nudge !== false,
+        );
         if (screen) {
           setPostSignIn(screen);
           return;

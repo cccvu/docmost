@@ -508,6 +508,20 @@ describe("usePasswordless().completeSignInWith — pluggable verifier and post-s
     expect(nudge.platformAuthenticator).not.toHaveBeenCalled();
   });
 
+  it("nudge:false (a passkey's 90-day email re-confirmation) withholds the nudge and navigates", async () => {
+    nudge.platformAuthenticator.mockImplementation(async () => true);
+    const { result } = renderHook(() => usePasswordless());
+    await act(async () => {
+      await result.current.completeSignIn(
+        { email: "a@b.edu", otp: "123456" },
+        { screens: true, nudge: false },
+      );
+    });
+    expect(result.current.postSignIn).toBeNull();
+    expect(navigateMock).toHaveBeenCalledTimes(1);
+    expect(nudge.platformAuthenticator).not.toHaveBeenCalled();
+  });
+
   it("a passkey sign-in never nudges (it already used a passkey)", async () => {
     nudge.platformAuthenticator.mockImplementation(async () => true);
     const { result } = renderHook(() => usePasswordless());

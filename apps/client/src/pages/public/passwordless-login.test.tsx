@@ -38,7 +38,7 @@ const requestEmail = vi.fn(
   ): Promise<boolean> => true,
 );
 const completeSignIn = vi.fn(
-  async (_args: unknown, _opts?: { screens?: boolean }) => {},
+  async (_args: unknown, _opts?: { screens?: boolean; nudge?: boolean }) => {},
 );
 // The #818 pluggable verifier: like the real hook, it calls the verifier BEFORE its first await (the gesture rule).
 const completeSignInWith = vi.fn(
@@ -66,6 +66,7 @@ const pk = vi.hoisted(() => ({
   handlers: null as null | {
     onSignedIn: (r: unknown) => void;
     onFailure: (f: unknown) => void;
+    onExpired?: () => void;
   },
 }));
 vi.mock("@/features/passkeys/lib/capabilities.ts", () => ({
@@ -75,6 +76,7 @@ vi.mock("@/features/passkeys/lib/autofill.ts", () => ({
   armPasskeyAutofill: (h: {
     onSignedIn: (r: unknown) => void;
     onFailure: (f: unknown) => void;
+    onExpired?: () => void;
   }) => {
     pk.arm(h);
     pk.handlers = h;
@@ -976,6 +978,166 @@ describe("PasswordlessLogin — passkeys (#818)", () => {
       expect(screen.queryByRole("button", { name: /passkey/i })).toBeNull(),
     );
     expect(liveRegion().textContent).toBe("");
+  });
+
+  it("autofill: a passkey picked after the challenge expired says to choose it again (politely)", async () => {
+    renderLogin();
+    await waitFor(() => expect(pk.handlers?.onExpired).toBeTypeOf("function"));
+    act(() => pk.handlers!.onExpired!());
+    await waitFor(() =>
+      expect(liveRegion().textContent).toBe(
+        "That took too long. Choose your passkey again.",
+      ),
+    );
+    expect(screen.queryByRole("alert")).toBeNull();
+    // Nothing to click: the field has re-armed itself.
+    expect(screen.queryByRole("button", { name: /^try again$/i })).toBeNull();
+  });
+
+  const confirmationRequired = (address: string) =>
+    refused(403, { code: "email_confirmation_required", email: address });
+
+  it("the 90-day re-confirmation's email sign-in withholds the nudge (the person already has a passkey)", async () => {
+    pk.signIn.mockRejectedValueOnce(confirmationRequired("owner@example.edu"));
+    renderLogin();
+    fireEvent.click(passkeyButton());
+    await waitFor(() => expect(otpField()).toBeTruthy());
+    pasteOtp("123456");
+    await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
+    expect(completeSignIn.mock.calls[0]).toEqual([
+      { email: "owner@example.edu", otp: "123456" },
+      { screens: true, nudge: false },
+    ]);
+  });
+
+  it("'Use a different email' ends the re-confirmation: the next email sign-in may nudge again", async () => {
+    pk.signIn.mockRejectedValueOnce(confirmationRequired("owner@example.edu"));
+    renderLogin();
+    fireEvent.click(passkeyButton());
+    await waitFor(() => expect(otpField()).toBeTruthy());
+    fireEvent.click(
+      screen.getByRole("button", { name: /use a different email/i }),
+    );
+    // Back in via "I already have a code" (no send at all), so only the step-1 re-entry can have ended it.
+    fireEvent.click(
+      screen.getByRole("button", { name: /i already have a code/i }),
+    );
+    await waitFor(() => expect(otpField()).toBeTruthy());
+    pasteOtp("123456");
+    await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
+    expect(completeSignIn.mock.calls[0][0]).toEqual({
+      email: "owner@example.edu",
+      otp: "123456",
+    });
+    expect(completeSignIn.mock.calls[0][1]).toEqual({ screens: true });
+  });
+
+  it("a step-1 'Email me a sign-in code' ends the re-confirmation (after its own send failed)", async () => {
+    pk.signIn.mockRejectedValueOnce(confirmationRequired("owner@example.edu"));
+    requestEmail.mockResolvedValueOnce(false); // the re-confirmation's send: refused, so step 1 stays
+    renderLogin();
+    fireEvent.click(passkeyButton());
+    await waitFor(() => expect(requestEmail).toHaveBeenCalledTimes(1));
+    fireEvent.click(
+      screen.getByRole("button", { name: /email me a sign-in code/i }),
+    );
+    await waitFor(() => expect(otpField()).toBeTruthy());
+    pasteOtp("123456");
+    await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
+    expect(completeSignIn.mock.calls[0][1]).toEqual({ screens: true });
+  });
+
+  it("'Email me a code instead' ends the re-confirmation too", async () => {
+    pk.signIn
+      .mockRejectedValueOnce(confirmationRequired("owner@example.edu"))
+      .mockRejectedValueOnce(refused(401, { code: "passkey_failed" }));
+    renderLogin();
+    fireEvent.click(passkeyButton());
+    await waitFor(() => expect(otpField()).toBeTruthy());
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: /didn't get a code\? sign in with a passkey/i,
+      }),
+    );
+    fireEvent.click(
+      await screen.findByRole("button", { name: /email me a code instead/i }),
+    );
+    pasteOtp("123456");
+    await waitFor(() => expect(completeSignIn).toHaveBeenCalledTimes(1));
+    expect(completeSignIn.mock.calls[0][1]).toEqual({ screens: true });
+  });
+
+  it("re-confirmation inside the countdown for the SAME address (any case) points at the code already sent", async () => {
+    pk.signIn.mockRejectedValueOnce(confirmationRequired(" User@Example.edu"));
+    renderLogin();
+    typeEmail("user@example.edu");
+    fireEvent.click(
+      screen.getByRole("button", { name: /email me a sign-in code/i }),
+    );
+    await waitFor(() => expect(otpField()).toBeTruthy());
+    expect(requestEmail).toHaveBeenCalledTimes(1);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: /didn't get a code\? sign in with a passkey/i,
+      }),
+    );
+    await waitFor(() =>
+      expect(liveRegion().textContent).toBe(
+        "To keep using your passkey, confirm your email: enter the code we sent you.",
+      ),
+    );
+    expect(requestEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-confirmation inside the countdown for a DIFFERENT address mails that address now", async () => {
+    pk.signIn.mockRejectedValueOnce(confirmationRequired("owner@example.edu"));
+    renderLogin();
+    typeEmail("user@example.edu");
+    fireEvent.click(
+      screen.getByRole("button", { name: /email me a sign-in code/i }),
+    );
+    await waitFor(() => expect(otpField()).toBeTruthy());
+    expect(requestEmail).toHaveBeenCalledTimes(1);
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: /didn't get a code\? sign in with a passkey/i,
+      }),
+    );
+    await waitFor(() => expect(requestEmail).toHaveBeenCalledTimes(2));
+    expect(requestEmail.mock.calls[1][0]).toBe("owner@example.edu");
+    await waitFor(() =>
+      expect(liveRegion().textContent).toBe(
+        "To keep using your passkey, confirm your email: we sent you a sign-in code.",
+      ),
+    );
+    expect((screen.getByLabelText(/^email/i) as HTMLInputElement).value).toBe(
+      "owner@example.edu",
+    );
+    // The countdown restarted for the new address.
+    expect(
+      screen.getByRole("button", { name: /^resend email \(\d+s\)$/i }),
+    ).toBeTruthy();
+  });
+
+  it("the old address's countdown does not hold Resend for the new one when that send fails", async () => {
+    pk.signIn.mockRejectedValueOnce(confirmationRequired("owner@example.edu"));
+    renderLogin();
+    typeEmail("user@example.edu");
+    fireEvent.click(
+      screen.getByRole("button", { name: /email me a sign-in code/i }),
+    );
+    await waitFor(() => expect(otpField()).toBeTruthy());
+    requestEmail.mockResolvedValueOnce(false); // the send to owner@ fails, naming no wait
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: /didn't get a code\? sign in with a passkey/i,
+      }),
+    );
+    await waitFor(() => expect(requestEmail).toHaveBeenCalledTimes(2));
+    const resend = await screen.findByRole("button", {
+      name: /^resend email$/i,
+    });
+    expect(resend.hasAttribute("disabled")).toBe(false);
   });
 
   it("the email code path asks for the post-sign-in screens", async () => {

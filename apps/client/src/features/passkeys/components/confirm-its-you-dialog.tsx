@@ -154,6 +154,8 @@ function ConfirmBody({
   const mounted = useRef(false);
   const autoSubmitted = useRef<string | null>(null);
   const codeRef = useRef<HTMLInputElement>(null);
+  const passkeyButtonRef = useRef<HTMLButtonElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
   const codeErrorId = useId();
 
   useEffect(() => {
@@ -210,6 +212,19 @@ function ConfirmBody({
       else startEmail(null);
     });
   }, []);
+
+  // Focus follows the mode. The modal's own initial focus ran while the body was still "probing" (it lands on the close
+  // button), so `data-autofocus` alone never reaches what the probe's answer shows.
+  useEffect(() => {
+    if (mode === "probing") return;
+    const target =
+      mode === "choose"
+        ? passkeyButtonRef.current
+        : mode === "email"
+          ? codeRef.current
+          : cancelRef.current;
+    target?.focus();
+  }, [mode]);
 
   async function finish() {
     setConfirming(true);
@@ -318,7 +333,7 @@ function ConfirmBody({
             t("No passkey is available for your account on this device.")}
         </Alert>
         <Group justify="flex-end">
-          <Button variant="default" onClick={onClose}>
+          <Button ref={cancelRef} variant="default" onClick={onClose}>
             {t("Cancel")}
           </Button>
         </Group>
@@ -336,6 +351,7 @@ function ConfirmBody({
           </Alert>
         )}
         <Button
+          ref={passkeyButtonRef}
           onClick={() => void onUsePasskey()}
           loading={passkeyBusy || confirming}
           data-autofocus

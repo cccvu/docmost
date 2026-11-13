@@ -47,6 +47,7 @@ import {
   passkey,
 } from "./profile-test-support.tsx";
 import type { PasskeyView } from "../types.ts";
+import { PasskeyError } from "../lib/passkey-errors.ts";
 
 const RESULT = { ok: true, platformSessionsRevoked: 2, wikiSessionsRevoked: 3 };
 
@@ -225,6 +226,147 @@ describe("RemovePasskeyDialog: the DELETE", () => {
     );
     await waitFor(() => expect(api.remove).toHaveBeenCalledTimes(1));
     expect(screen.queryByRole("alert")).toBeNull();
+  });
+});
+
+describe("RemovePasskeyDialog: a failure may come after the passkey stopped", () => {
+  const networkError = () =>
+    new PasskeyError({ kind: "network", stage: "request" });
+
+  it.each([
+    ["429", httpError(429, "rate_limited", { retryAfter: "5" })],
+    ["a dropped connection", networkError()],
+    ["504", httpError(504)],
+    ["503 without a code", httpError(503)],
+    ["sign_out_incomplete", httpError(503, "sign_out_incomplete")],
+    ["an unknown throw", new Error("boom")],
+  ])(
+    "%s re-reads the list (the row may now be 'Removal not finished')",
+    async (_name, error) => {
+      api.remove.mockRejectedValueOnce(error);
+      const { onChanged, onRemoved } = renderDialog();
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Remove passkey" }),
+      );
+      await waitFor(() => expect(onChanged).toHaveBeenCalledTimes(1));
+      expect(onRemoved).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["a cancel", ceremonyError("AbortError")],
+    ["step_up_required", httpError(403, "step_up_required")],
+  ])("%s changed nothing on the server: no re-read", async (_name, error) => {
+    api.remove.mockRejectedValueOnce(error);
+    const { onChanged } = renderDialog();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Remove passkey" }),
+    );
+    await waitFor(() => expect(api.remove).toHaveBeenCalledTimes(1));
+    await act(async () => {});
+    expect(onChanged).not.toHaveBeenCalled();
+  });
+
+  it("a 429 holds the action for its Retry-After, then a new click re-sends the DELETE", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    api.remove.mockRejectedValueOnce(
+      httpError(429, "rate_limited", { retryAfter: "2" }),
+    );
+    const { onRemoved } = renderDialog();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Remove passkey" }),
+    );
+    expect((await screen.findByRole("alert")).textContent).toBe(
+      "Too many attempts, try again in a moment.",
+    );
+    const held = screen.getByRole("button", { name: /^Try again \(2s\)$/ });
+    expect(held.hasAttribute("disabled")).toBe(true);
+    for (let i = 0; i < 3; i++) {
+      await act(async () => {
+        vi.advanceTimersByTime(1000);
+      });
+    }
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Remove passkey" }),
+    );
+    await waitFor(() => expect(onRemoved).toHaveBeenCalledWith(RESULT));
+    expect(api.remove).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ["no Retry-After → the default 3 s", undefined, 3],
+    ["a huge Retry-After is capped at 60 s", "3600", 60],
+  ])("a 429 with %s", async (_name, retryAfter, seconds) => {
+    api.remove.mockRejectedValueOnce(
+      httpError(429, "rate_limited", { retryAfter }),
+    );
+    renderDialog();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Remove passkey" }),
+    );
+    const held = await screen.findByRole("button", {
+      name: `Try again (${seconds}s)`,
+    });
+    expect(held.hasAttribute("disabled")).toBe(true);
+  });
+
+  it("cannot be closed while the DELETE is in flight (no close button, Escape ignored); can again after", async () => {
+    let settle: (v: unknown) => void = () => undefined;
+    api.remove.mockImplementationOnce(
+      () => new Promise((resolve) => (settle = resolve)),
+    );
+    const { onClose, onRemoved } = renderDialog();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Remove passkey" }),
+    );
+    await waitFor(() => expect(api.remove).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Close" })).toBeNull(),
+    );
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    expect(onClose).not.toHaveBeenCalled();
+
+    await act(async () => settle(RESULT));
+    await waitFor(() => expect(onRemoved).toHaveBeenCalledTimes(1));
+  });
+
+  it("positive control: idle, the close button and Escape both close", async () => {
+    const { onClose } = renderDialog();
+    fireEvent.keyDown(await screen.findByRole("dialog"), { key: "Escape" });
+    expect(onClose).toHaveBeenCalledTimes(1);
+    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+    expect(onClose).toHaveBeenCalledTimes(2);
+  });
+
+  it("a DELETE that succeeds after the dialog unmounted still re-reads the list", async () => {
+    let settle: (v: unknown) => void = () => undefined;
+    api.remove.mockImplementationOnce(
+      () => new Promise((resolve) => (settle = resolve)),
+    );
+    const { onChanged, onRemoved } = renderDialog();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Remove passkey" }),
+    );
+    await waitFor(() => expect(api.remove).toHaveBeenCalledTimes(1));
+    cleanup();
+    await act(async () => settle(RESULT));
+    expect(onChanged).toHaveBeenCalledTimes(1);
+    expect(onRemoved).not.toHaveBeenCalled();
+  });
+
+  it("a failure after the dialog unmounted still re-reads the list", async () => {
+    let fail: (e: unknown) => void = () => undefined;
+    api.remove.mockImplementationOnce(
+      () => new Promise((_, reject) => (fail = reject)),
+    );
+    const { onChanged } = renderDialog();
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Remove passkey" }),
+    );
+    await waitFor(() => expect(api.remove).toHaveBeenCalledTimes(1));
+    cleanup();
+    await act(async () => fail(httpError(504)));
+    expect(onChanged).toHaveBeenCalledTimes(1);
   });
 });
 

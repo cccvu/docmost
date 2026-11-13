@@ -16,7 +16,9 @@ import {
 //
 // Arm on step 1's mount; DISARM on a step change, on unmount, and BEFORE any button starts its own ceremony (the
 // disarm cancels the open conditional request, so call it first, not after the button's `get()` began).
-// Re-arms (a new fetch) only on `passkey_challenge_expired`; never after a 429 or any other answer.
+// Re-arms (a new fetch) only on `passkey_challenge_expired`; never after a 429 or any other answer. That answer comes
+// from the verify, so the person DID pick a passkey (after the challenge's TTL): the page hears `onExpired` and says
+// "That took too long. Choose your passkey again." while the field re-arms.
 
 export interface AutofillHandlers {
   onSignedIn: (response: PasskeySignInResponse) => void;
@@ -25,6 +27,11 @@ export interface AutofillHandlers {
    * `passkeyUiAction("autofill", …)`; the helper has already stopped, so arm again only from a new mount.
    */
   onFailure: (failure: PasskeyFailure) => void;
+  /**
+   * The person picked a passkey after its challenge expired (`passkey_challenge_expired`), and the request is being
+   * armed again (never past `MAX_AUTOFILL_REARMS`). Announce it politely; the field offers passkeys again.
+   */
+  onExpired?: () => void;
 }
 
 /** A bound on back-to-back re-arms, so a platform that keeps answering "expired" cannot spin the page. */
@@ -60,6 +67,7 @@ export function armPasskeyAutofill(handlers: AutofillHandlers): () => void {
           // Past the bound the field simply stops offering passkeys; the buttons still work.
           if (rearms >= MAX_AUTOFILL_REARMS) return;
           rearms += 1;
+          handlers.onExpired?.();
           continue;
         }
         handlers.onFailure(failure);

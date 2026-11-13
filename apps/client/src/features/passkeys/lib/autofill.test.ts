@@ -63,6 +63,32 @@ describe("armPasskeyAutofill", () => {
     expect(onFailure).not.toHaveBeenCalled();
   });
 
+  it("tells the page on each re-arm after an expired challenge (the person picked a passkey too late)", async () => {
+    const res = { id: "i", email: "a@b.test", workspaceId: "w" };
+    m.signIn.mockRejectedValueOnce(expired()).mockResolvedValueOnce(res);
+    const onExpired = vi.fn();
+    const onSignedIn = vi.fn();
+    const onFailure = vi.fn();
+    armPasskeyAutofill({ onSignedIn, onFailure, onExpired });
+    await flush();
+    expect(onExpired).toHaveBeenCalledTimes(1);
+    // Announced BEFORE the new request opens, and the re-arm still happens.
+    expect(onExpired.mock.invocationCallOrder[0]).toBeLessThan(
+      m.signIn.mock.invocationCallOrder[1],
+    );
+    expect(m.signIn).toHaveBeenCalledTimes(2);
+    expect(onSignedIn).toHaveBeenCalledWith(res);
+    expect(onFailure).not.toHaveBeenCalled();
+  });
+
+  it("announces only the re-arms it makes: never past the bound", async () => {
+    m.signIn.mockRejectedValue(expired());
+    const onExpired = vi.fn();
+    armPasskeyAutofill({ onSignedIn: vi.fn(), onFailure: vi.fn(), onExpired });
+    await flush();
+    expect(onExpired).toHaveBeenCalledTimes(MAX_AUTOFILL_REARMS);
+  });
+
   it("never re-arms after a 429 (or any other answer): reports it once", async () => {
     const limited = new PasskeyError(
       httpFailure("options", 429, { code: "rate_limited" }, "30"),
