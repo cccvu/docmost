@@ -10,6 +10,8 @@ import { ExportAdmissionModule } from './request-controls/export-admission.modul
 import { RetryAfterModule } from './request-controls/retry-after.module';
 import { NativeFormatModule } from './native-format/native-format.module';
 import { StorableTextModule } from './request-controls/storable-text.module';
+import { RequestTimeoutModule } from './request-controls/request-timeout.module';
+import { RealtimeSocketBoundsModule } from './ws-connection/realtime-socket-bounds.module';
 import { OriginCheckModule } from './origin-check/origin-check.module';
 
 /**
@@ -26,8 +28,10 @@ import { OriginCheckModule } from './origin-check/origin-check.module';
  * export admission (ExportAdmissionModule, #699: a resource bound, in both modes), and the engine-wide `Retry-After` on
  * every 503 (RetryAfterModule, #696), and the remote-mode refusal of a non-json `format` on the native page routes
  * (NativeFormatModule, #716: their echo converts a whole page on the event loop), and the refusal of a NUL or lone
- * surrogate in any request before its handler, with its Postgres backstop (StorableTextModule, #781), and the in-process
- * Fetch-Metadata/Origin CSRF check on every unsafe HTTP request (OriginCheckModule, wiki-v2 #655).
+ * surrogate in any request before its handler, with its Postgres backstop (StorableTextModule, #781), the
+ * request-receipt bounds on the HTTP server (RequestTimeoutModule, #763: Fastify's default disabled Node's), the
+ * /socket.io connection bounds installed through socket.io's documented hooks (RealtimeSocketBoundsModule, #830),
+ * and the in-process Fetch-Metadata/Origin CSRF check on every unsafe HTTP request (OriginCheckModule, wiki-v2 #655).
  */
 @Module({
   imports: [
@@ -41,6 +45,8 @@ import { OriginCheckModule } from './origin-check/origin-check.module';
     RetryAfterModule, // #696: every 503 carries Retry-After (kept when already set) — both modes
     NativeFormatModule, // #716: remote mode refuses a non-json `format` on native /api/pages/info|create|update
     StorableTextModule, // #781: NUL / lone surrogate in a request → 400 invalid_characters before the handler — both modes
+    RequestTimeoutModule, // #763: requestTimeout 900 s (Fastify's 0 disabled it) + 60 s deadline on buffered (non-multipart) bodies — both modes
+    RealtimeSocketBoundsModule, // #830: /socket.io upgrade gate (signature-valid ACCESS JWT), one CONNECT per engine connection, engine close on a failed namespace auth — both modes; no-op without WsGateway (collab-main)
     OriginCheckModule, // wiki-v2 #655: a cross-site unsafe request → 403 before any controller guard — both modes
   ],
   providers: [HttpAuthzClient],

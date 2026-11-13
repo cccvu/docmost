@@ -15,6 +15,7 @@ import { useEntitlements } from "@/ee/entitlement/use-entitlements";
 import { entitlementAtom } from "@/ee/entitlement/entitlement-atom";
 import { changeAppLanguage } from "@/lib/date-locale.ts";
 import { useIdentityReconcile } from "@/features/identity-reconcile/use-identity-reconcile";
+import { useSocketAuthProbe } from "@/features/websocket/use-socket-auth-probe";
 
 export function UserProvider({ children }: React.PropsWithChildren) {
   const [, setCurrentUser] = useAtom(currentUserAtom);
@@ -52,6 +53,7 @@ export function UserProvider({ children }: React.PropsWithChildren) {
   useQuerySubscription();
   useTreeSocket();
   useNotificationSocket();
+  useSocketAuthProbe(); // wiki-v2 #830
   useIdentityReconcile(data?.user?.id); // wiki-v2 #761
 
   useEffect(() => {

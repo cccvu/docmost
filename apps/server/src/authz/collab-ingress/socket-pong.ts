@@ -15,7 +15,8 @@
  *
  * Browsers never send pings (the server pings them: socket-keepalive.ts), so only non-browser clients see this.
  * Installed for every collab socket at the upgrade (`CollabSocketBounds.holdUpgraded`, seam §226), before ws reads a
- * frame from it. The /socket.io server (engine.io's own ws server) keeps ws's default: a separate issue.
+ * frame from it. The /socket.io server (engine.io's own ws server) uses it too since #830: its `wsEngine`,
+ * RealtimeWsServer (authz/ws-connection/realtime-socket-bounds.ts), turns `autoPong` off and installs this at the upgrade.
  */
 
 /** The `ws` WebSocket surface used here. */
