@@ -28,10 +28,14 @@ import { isWsConnectionLive } from '../authz/ws-connection/ws-connection-live';
 // CCC seam (UPSTREAM_MODIFICATIONS.md #161, #716): a PDP that cannot list the user's spaces degrades to no space
 // rooms instead of killing the socket (the client never reconnects on its own).
 import { spaceIdsForConnect } from '../authz/ws-connection/ws-space-rooms';
+// CCC seam (UPSTREAM_MODIFICATIONS.md #161, #830): engine.io's ws server bounds (one pong in flight, fragment and chunk
+// caps) and socket.io's connectTimeout, passed at construction; the upgrade gate is installed from authz/.
+import { REALTIME_GATEWAY_OPTIONS } from '../authz/ws-connection/realtime-socket-bounds';
 
 @WebSocketGateway({
   cors: { origin: '*' },
   transports: ['websocket'],
+  ...REALTIME_GATEWAY_OPTIONS,
 })
 export class WsGateway
   implements
