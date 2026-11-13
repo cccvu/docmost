@@ -103,7 +103,7 @@ describe('#781 the collab update guard is wired first, alone and synchronous', (
     expect(definesHook(ts.createSourceFile('x.ts', 'const beforeSyncNot = 1; call(beforeSync);', ts.ScriptTarget.Latest, true), 'beforeSync')).toBe(false);
   });
 
-  it('#827: its hooks are exactly the frame hook, the post-auth join gate, the load pair and (#847) onConfigure; only afterLoadDocument is async', () => {
+  it('#827: its hooks are exactly the frame hook, the post-auth join gate, the load pair, (#847) onConfigure and (#793) afterUnloadDocument; only the after-load and after-unload hooks are async', () => {
     const sf = parse(join(__dirname, 'collab-update-guard.extension.ts'));
     const hooks = new Map<string, boolean>();
     const visit = (n: ts.Node) => {
@@ -121,9 +121,11 @@ describe('#781 the collab update guard is wired first, alone and synchronous', (
     // No onAuthenticate or onConnect: this extension outranks the auth extension, so a hook there would answer a client
     // that has not authenticated (a compacting refusal would tell it the page exists and is compacting).
     // #847: onConfigure (synchronous, at configure time only) hands the guard Hocuspocus's store path for a wedged live
-    expect([...hooks.keys()].sort()).toEqual(['afterLoadDocument', 'beforeHandleMessage', 'connected', 'extensionName', 'onConfigure', 'onLoadDocument', 'priority']);
-    // afterLoadDocument alone: #841's load repair yields a macrotask after #827's load charge (which runs before it)
-    expect([...hooks].filter(([, isAsync]) => isAsync).map(([name]) => name)).toEqual(['afterLoadDocument']);
+    // #793: afterUnloadDocument commits the binding seal the guard took at the destroy (never on a frame's path)
+    expect([...hooks.keys()].sort()).toEqual(['afterLoadDocument', 'afterUnloadDocument', 'beforeHandleMessage', 'connected', 'extensionName', 'onConfigure', 'onLoadDocument', 'priority']);
+    // #841's load repair yields a macrotask after #827's load charge (which runs before it); #793's seal commit awaits
+    // the database after the document is destroyed
+    expect([...hooks].filter(([, isAsync]) => isAsync).map(([name]) => name).sort()).toEqual(['afterLoadDocument', 'afterUnloadDocument']);
   });
 
   it('#827: the post-auth join gate closes the socket 1013 and never throws; the load gate throws { reason } synchronously (no co-loader shares it); afterLoadDocument never rejects', async () => {
@@ -158,6 +160,9 @@ describe('#781 the collab update guard is wired first, alone and synchronous', (
     expect(ext.onLoadDocument(direct as never)).toBeUndefined();
     await expect(ext.afterLoadDocument(direct as never)).resolves.toBeUndefined();
     await expect(ext.afterLoadDocument({ document: undefined } as never)).resolves.toBeUndefined();
+    // #793: the seal commit never rejects either (a rejection would skip RedisSync's lock release)
+    await expect(ext.afterUnloadDocument({ documentName: 'page.p' } as never)).resolves.toBeUndefined();
+    await expect(ext.afterUnloadDocument({} as never)).resolves.toBeUndefined();
   });
 
   it('its frame hook returns undefined (never a promise) for every kind of frame', () => {

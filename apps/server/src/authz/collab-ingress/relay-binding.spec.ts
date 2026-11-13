@@ -131,6 +131,116 @@ describe('the mirror race: B announces its id before A relays B\'s lost structs'
   });
 });
 
+/**
+ * #793: a lifetime that ended in a CLEAN unload (a deploy drain, the last user leaving) sealed its proven bindings, and
+ * the next load restores them awareness-only (page-write/binding-seal.ts; the load and seal paths are pinned on real
+ * Postgres in binding-seal.pg.spec.ts). Here: the guard's side, `adoptSealed`. B typed `B-stored ` (stored: the row holds
+ * every struct B wrote, so the sealed clock equals the loaded clock), then kept typing `B-after ` offline after the unload.
+ */
+function cleanLifetime() {
+  const life1 = new Y.Doc();
+  Y.applyUpdate(life1, Y.encodeStateAsUpdate(prosemirrorJSONToYDoc(serverSchema(), SEED, 'default')));
+  const b = new RemoteClient(life1, B_ID);
+  Y.applyUpdate(life1, typeAt0(b, life1, 'B-stored '));
+  const stored = Y.encodeStateAsUpdate(life1);
+  b.doc.transact(() => textOf(b.fragment.get(0) as Y.XmlElement).insert(0, 'B-after ')); // offline, after the unload
+  return { stored, b, sealedClock: Y.getState(life1.store, B_ID) };
+}
+
+describe('#793: bindings a clean unload sealed come back awareness-only', () => {
+  it('control (nothing restored: a crash, or before #793): M forging first at B\'s stored id is applied and B\'s offline edits are silently lost', () => {
+    const { stored, b } = cleanLifetime();
+    const s = lifetime(stored);
+    expect(s.send(s.conn('M'), forgeAtB(s.live))).toBe('applied');
+    const bConn = s.conn('B');
+    expect(s.announce(bConn, { clientID: B_ID })).toBe('applied');
+    expect(s.send(bConn, s.step2(b.doc), SYNC.Step2)).toBe('applied'); // Yjs drops B's clocks M already took
+    const text = renderLikeABrowser(s.live).text;
+    expect(text).toContain('FORGED');
+    expect(text).not.toContain('B-after');
+  });
+
+  it('restored: M\'s awareness at B\'s id is foreign-client, M\'s forgery is unresolved and never applied; B\'s Step2 proves the id and lands; then M is refused for good', () => {
+    const { stored, b, sealedClock } = cleanLifetime();
+    const s = lifetime(stored);
+    s.guard.adoptSealed(s.live, [[B_ID, 'B', sealedClock]]);
+    expect(s.guard.isAwarenessOnly(s.live, B_ID)).toBe(true);
+    const m = s.conn('M');
+    expect(s.announce(m, { clientID: B_ID })).toBe(REFUSED('foreign-client'));
+    const before = Y.encodeStateAsUpdate(s.live);
+    for (let i = 0; i < 3; i++) expect(s.send(s.conn('M'), forgeAtB(s.live))).toBe(UNRESOLVED_REASON);
+    expect(Buffer.from(Y.encodeStateAsUpdate(s.live)).equals(Buffer.from(before))).toBe(true);
+    const bConn = s.conn('B');
+    expect(s.announce(bConn, { clientID: B_ID })).toBe('applied');
+    expect(s.send(bConn, s.step2(b.doc), SYNC.Step2)).toBe('applied');
+    expect(s.guard.isAwarenessOnly(s.live, B_ID)).toBe(false);
+    expect(renderLikeABrowser(s.live).text).toBe('B-after B-stored base');
+    expect(s.send(s.conn('M'), forgeAtB(s.live))).toBe(REFUSED('foreign-client'));
+  });
+
+  it('restored: B\'s new tab (a new id) replaying the old id\'s offline tail from IndexedDB proves the old id: applied, nothing lost', () => {
+    const { stored, b, sealedClock } = cleanLifetime();
+    const s = lifetime(stored);
+    s.guard.adoptSealed(s.live, [[B_ID, 'B', sealedClock]]);
+    const tab = new RemoteClient(b.doc, B_NEW_TAB);
+    const echo = s.step2(tab.doc);
+    expect(clientsOf(echo)).toEqual(new Set([B_ID])); // precondition: only the old id's offline tail
+    const tabConn = s.conn('B');
+    expect(s.announce(tabConn, { clientID: B_NEW_TAB })).toBe('applied'); // announces its NEW id only
+    expect(s.send(tabConn, echo, SYNC.Step2)).toBe('applied');
+    expect(renderLikeABrowser(s.live).text).toBe('B-after B-stored base');
+    expect(s.send(s.conn('M'), forgeAtB(s.live))).toBe(REFUSED('foreign-client'));
+  });
+
+  it('restored ids are awareness binds for #842\'s claims: crossed relays of both owners\' tails still land (a full binding would refuse the first for good)', () => {
+    const life1 = new Y.Doc();
+    Y.applyUpdate(life1, Y.encodeStateAsUpdate(prosemirrorJSONToYDoc(serverSchema(), SEED, 'default')));
+    const b = new RemoteClient(life1, B_ID);
+    Y.applyUpdate(life1, typeAt0(b, life1, 'B-stored '));
+    const a = new RemoteClient(life1, A_ID);
+    Y.applyUpdate(life1, typeAt0(a, life1, 'A-stored '));
+    b.sync(life1);
+    const stored = Y.encodeStateAsUpdate(life1);
+    const sealed: Array<[number, string, number]> = [
+      [B_ID, 'B', Y.getState(life1.store, B_ID)],
+      [A_ID, 'A', Y.getState(life1.store, A_ID)],
+    ];
+    // each holds the other's new clocks (a lifetime after the restore that relayed them, then lost them)
+    typeAt0(b, b.doc, 'B-lost ');
+    a.sync(b.doc);
+    typeAt0(a, a.doc, 'A-lost ');
+    b.sync(a.doc);
+    const s = lifetime(stored);
+    s.guard.adoptSealed(s.live, sealed);
+    const aConn = s.conn('A');
+    const bConn = s.conn('B');
+    expect(s.announce(bConn, { clientID: B_ID })).toBe('applied');
+    expect(s.announce(aConn, { clientID: A_ID })).toBe('applied');
+    const aStep2 = s.step2(a.doc);
+    const bStep2 = s.step2(b.doc);
+    expect([clientsOf(aStep2).has(B_ID), clientsOf(bStep2).has(A_ID)]).toEqual([true, true]); // precondition: crossed
+    expect(s.send(aConn, aStep2, SYNC.Step2)).toBe(UNRESOLVED_REASON); // never REFUSED('foreign-client')
+    expect(s.send(bConn, bStep2, SYNC.Step2)).toBe('applied'); // B's relay of A's tail equals A's claim
+    const aConn2 = s.conn('A');
+    expect(s.announce(aConn2, { clientID: A_ID, clock: 2 })).toBe('applied');
+    expect(s.send(aConn2, s.step2(a.doc), SYNC.Step2)).toBe('applied');
+    expect(renderLikeABrowser(s.live).text).toBe('A-lost B-lost A-stored B-stored base');
+  });
+
+  it('report mode adopts too (outcomes as today, the bindings recorded); a restored id never replaces a binding or the server id', () => {
+    const { stored, sealedClock } = cleanLifetime();
+    const live = new Y.Doc() as Y.Doc & { name: string };
+    live.name = DOC_NAME;
+    Y.applyUpdate(live, stored);
+    const guard = new CollabUpdateGuard({ mode: 'report', logger: { warn: () => undefined } });
+    guard.adoptSealed(live, [[B_ID, 'B', sealedClock], [live.clientID, 'X', 0]]);
+    expect(guard.isAwarenessOnly(live, B_ID)).toBe(true);
+    expect(guard.isAwarenessOnly(live, live.clientID)).toBe(false);
+    guard.adoptSealed(live, [[B_ID, 'M', sealedClock]]);
+    expect(guard.bindingCount(live)).toBe(2); // the server id and B's, still B's
+  });
+});
+
 describe('a relay of a co-editor\'s lost structs leaves the id unbound', () => {
   it('A relays first; B reconnects with the same id, claims it by awareness and keeps editing; then a forgery is refused', () => {
     const { stored, a, b } = lostLifetime({ storedPrefix: false });
