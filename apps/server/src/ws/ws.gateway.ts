@@ -28,6 +28,9 @@ import { isWsConnectionLive } from '../authz/ws-connection/ws-connection-live';
 // CCC seam (UPSTREAM_MODIFICATIONS.md #161, #716): a PDP that cannot list the user's spaces degrades to no space
 // rooms instead of killing the socket (the client never reconnects on its own).
 import { spaceIdsForConnect } from '../authz/ws-connection/ws-space-rooms';
+// CCC seam (UPSTREAM_MODIFICATIONS.md #161, wiki-v2 #655): refuse a handshake from a foreign origin (cross-site
+// WebSocket hijacking) before handleConnection reads the cookie.
+import { socketOriginCheck } from '../authz/origin-check/ws-origin-check';
 
 @WebSocketGateway({
   cors: { origin: '*' },
@@ -55,6 +58,7 @@ export class WsGateway
   ) {}
 
   afterInit(server: Server): void {
+    server.use(socketOriginCheck(this.environmentService));
     this.wsService.setServer(server);
     this.baseRealtime.setServer(server);
   }
