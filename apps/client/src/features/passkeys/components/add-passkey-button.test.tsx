@@ -146,6 +146,35 @@ describe("AddPasskeyButton", () => {
       httpError(429, "rate_limited"),
       "Too many attempts, try again in a moment.",
     ],
+    // #818: the per-user add budget (`limit: passkey_add`). A long Retry-After says when (a plain message, no
+    // countdown); a short one keeps the burst copy.
+    [
+      httpError(429, "rate_limited", {
+        retryAfter: "86400",
+        limit: "passkey_add",
+      }),
+      "You've added several passkeys recently. Try again in about 24 hours.",
+    ],
+    [
+      httpError(429, "rate_limited", {
+        stage: "options",
+        retryAfter: "1800",
+        limit: "passkey_add",
+      }),
+      "You've added several passkeys recently. Try again in about 30 minutes.",
+    ],
+    [
+      httpError(429, "rate_limited", {
+        retryAfter: "30",
+        limit: "passkey_add",
+      }),
+      "Too many attempts, try again in a moment.",
+    ],
+    // The pk-register burst throttle on the same routes: no `limit` member, so never "you added several passkeys".
+    [
+      httpError(429, "rate_limited", { retryAfter: "900" }),
+      "Too many attempts, try again in a moment.",
+    ],
     [httpError(503), "Temporarily unavailable, try again."],
   ])("shows the table's message (%#)", async (error, text) => {
     api.register.mockRejectedValueOnce(error);

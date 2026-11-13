@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { AxiosError, AxiosHeaders } from "axios";
+import i18next from "i18next";
+import catalog from "../../../../public/locales/en-US/translation.json";
 import {
   PasskeyError,
   failureFromAxios,
@@ -13,6 +15,8 @@ import {
   type PasskeyFailure,
   type PasskeyOperation,
   type PasskeyStage,
+  ADD_BUDGET_NOTICE_SECONDS,
+  PASSKEY_ADD_LIMIT,
 } from "./passkey-errors.ts";
 
 // #818 contract §7: the error code → UI table. `t` returns the key, so assertions read the English copy.
@@ -65,8 +69,34 @@ describe("failure normalization", () => {
       status: 429,
       code: "rate_limited",
       email: null,
+      limit: null,
       retryAfterSeconds: 7,
     });
+  });
+
+  it("reads the add budget's limit member (#818), only as a non-empty string", async () => {
+    const res = new Response(
+      JSON.stringify({
+        code: "rate_limited",
+        limit: "passkey_add",
+        message: "x",
+      }),
+      { status: 429, headers: { "retry-after": "86400" } },
+    );
+    expect(await failureFromResponse(res)).toMatchObject({
+      limit: "passkey_add",
+      retryAfterSeconds: 86400,
+    });
+    expect(
+      failureFromAxios(
+        axiosError(429, { code: "rate_limited", limit: "passkey_add" }),
+      ),
+    ).toMatchObject({ limit: "passkey_add" });
+    for (const limit of [42, ["passkey_add"], ""]) {
+      expect(
+        httpFailure("request", 429, { code: "rate_limited", limit }, "86400"),
+      ).toMatchObject({ limit: null });
+    }
   });
 
   it("survives a non-JSON body (a proxy's HTML page) and an HTTP-date Retry-After", async () => {
@@ -375,6 +405,160 @@ describe("the §7 table", () => {
     ] as PasskeyOperation[]) {
       expect(passkeyUiAction(op, { kind: "cancelled" }, t)).toEqual({
         kind: "none",
+      });
+    }
+  });
+});
+
+// #818 owner decision: the platform limits passkey ADDS per user (a few per 24 h) and answers the over-budget add
+// with `429 rate_limited` + `limit: passkey_add` + a Retry-After of up to a day. "Try again in a moment" would be
+// wrong for that long. The pk-register burst throttle on the same routes answers `rate_limited` without `limit`.
+describe("the add budget (429 rate_limited, limit passkey_add)", () => {
+  const limited = (
+    retryAfter: string | null,
+    stage: PasskeyStage = "request",
+    code: string | null = "rate_limited",
+    limit: string | null = PASSKEY_ADD_LIMIT,
+  ) =>
+    httpFailure(
+      stage,
+      429,
+      {
+        message: "x",
+        ...(code ? { code } : {}),
+        ...(limit ? { limit } : {}),
+      },
+      retryAfter,
+    );
+  const SHORT = "Too many attempts, try again in a moment.";
+
+  // The real catalog through real i18next: proves the plural keys exist and that `count` picks the form.
+  const real = i18next.createInstance();
+  real.init({
+    lng: "en-US",
+    fallbackLng: "en-US",
+    initAsync: false,
+    resources: { "en-US": { translation: catalog } },
+    interpolation: { escapeValue: false },
+  });
+  const realT = (k: string, o?: Record<string, unknown>) => real.t(k, o);
+
+  it.each([
+    [
+      "86400",
+      "You've added several passkeys recently. Try again in about 24 hours.",
+    ],
+    [
+      "1800",
+      "You've added several passkeys recently. Try again in about 30 minutes.",
+    ],
+    [
+      "3600",
+      "You've added several passkeys recently. Try again in about 1 hour.",
+    ],
+    [
+      "3601",
+      "You've added several passkeys recently. Try again in about 2 hours.",
+    ],
+    [
+      "3599",
+      "You've added several passkeys recently. Try again in about 1 hour.",
+    ],
+    [
+      "91",
+      "You've added several passkeys recently. Try again in about 2 minutes.",
+    ],
+  ])(
+    "Retry-After %s on add says when, rounded up, from the catalog",
+    (retryAfter, text) => {
+      for (const stage of ["options", "request"] as const) {
+        expect(
+          passkeyUiAction("add", limited(retryAfter, stage), realT),
+        ).toEqual({
+          kind: "message",
+          message: text,
+          offerEmail: false,
+          retry: false,
+        });
+      }
+    },
+  );
+
+  it.each([["30"], [String(ADD_BUDGET_NOTICE_SECONDS)], [null]])(
+    "Retry-After %s on add keeps the short copy",
+    (retryAfter) => {
+      expect(passkeyUiAction("add", limited(retryAfter), realT)).toEqual({
+        kind: "message",
+        message: SHORT,
+        offerEmail: false,
+        retry: false,
+      });
+    },
+  );
+
+  it("both plural forms of both messages are in the catalog (not just the key's own fallback)", () => {
+    for (const unit of ["minutes", "hours"]) {
+      const key = `You've added several passkeys recently. Try again in about {{count}} ${unit}.`;
+      for (const count of [1, 2]) {
+        expect(real.exists(key, { count }), `${unit} count=${count}`).toBe(
+          true,
+        );
+      }
+    }
+  });
+
+  it("the threshold is 90 s", () => {
+    expect(ADD_BUDGET_NOTICE_SECONDS).toBe(90);
+  });
+
+  it("only the platform's rate_limited code names the add budget", () => {
+    expect(
+      passkeyUiAction("add", limited("86400", "request", null), realT),
+    ).toMatchObject({ kind: "message", message: SHORT });
+  });
+
+  it.each([["900"], ["86400"]])(
+    "a rate_limited without the limit member (the pk-register burst, Retry-After %s) keeps the short copy",
+    (retryAfter) => {
+      for (const stage of ["options", "request"] as const) {
+        expect(
+          passkeyUiAction(
+            "add",
+            limited(retryAfter, stage, "rate_limited", null),
+            realT,
+          ),
+        ).toEqual({
+          kind: "message",
+          message: SHORT,
+          offerEmail: false,
+          retry: false,
+        });
+      }
+    },
+  );
+
+  it("another limit name is not the add budget", () => {
+    expect(
+      passkeyUiAction(
+        "add",
+        limited("86400", "request", "rate_limited", "passkey_register"),
+        realT,
+      ),
+    ).toMatchObject({ kind: "message", message: SHORT });
+  });
+
+  it("never on another operation: removal is never charged to the add budget", () => {
+    for (const op of ["remove", "list", "reauth"] as PasskeyOperation[]) {
+      expect(passkeyUiAction(op, limited("86400"), realT)).toMatchObject({
+        kind: "message",
+        message: SHORT,
+      });
+    }
+    for (const op of ["signin", "autofill"] as PasskeyOperation[]) {
+      expect(passkeyUiAction(op, limited("86400"), realT)).toMatchObject({
+        kind: "message",
+        message: "Too many attempts. Wait a moment, or email me a code.",
+        offerEmail: true,
       });
     }
   });

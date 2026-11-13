@@ -18,6 +18,8 @@ export type PasskeyFailure =
       code: string | null;
       /** Only on sign-in's `403 email_confirmation_required`: the address the code step needs. */
       email: string | null;
+      /** The 429's `limit` member: `passkey_add` only for the per-user add budget (see `PASSKEY_ADD_LIMIT`). */
+      limit: string | null;
       retryAfterSeconds: number | null;
     }
   /** The person dismissed the browser prompt, it timed out, or another ceremony replaced it. Never a banner. */
@@ -60,6 +62,13 @@ export const PASSKEY_CODES = {
   rateLimited: "rate_limited",
 } as const;
 
+/**
+ * The `limit` member the platform adds to `429 rate_limited` only for the per-user add budget. The burst throttle on
+ * the same add routes (`pk-register`, up to 900 s) answers `rate_limited` WITHOUT it, so the wait length alone never
+ * says "you added several passkeys".
+ */
+export const PASSKEY_ADD_LIMIT = "passkey_add";
+
 function bodyField(body: unknown, key: keyof PasskeyErrorBody): string | null {
   if (body === null || typeof body !== "object" || Array.isArray(body)) {
     return null;
@@ -89,6 +98,7 @@ export function httpFailure(
     status,
     code: bodyField(body, "code"),
     email: bodyField(body, "email"),
+    limit: bodyField(body, "limit"),
     retryAfterSeconds: parseRetryAfter(retryAfter),
   };
 }
@@ -296,6 +306,44 @@ export function passkeyUiAction(
   }
 }
 
+/**
+ * The platform's per-user add budget (a few adds per 24 h, owner decision on #818) is named by its `limit` member,
+ * never by the wait length. Its Retry-After can be up to a day, so "in a moment" would be wrong; at or below this it
+ * keeps the short copy. Removal is never charged to that budget, so only `add` reads it.
+ */
+export const ADD_BUDGET_NOTICE_SECONDS = 90;
+
+function isAddBudgetSpent(
+  op: PasskeyOperation,
+  f: Extract<PasskeyFailure, { kind: "http" }>,
+): boolean {
+  return (
+    op === "add" &&
+    f.code === PASSKEY_CODES.rateLimited &&
+    f.limit === PASSKEY_ADD_LIMIT &&
+    f.retryAfterSeconds !== null &&
+    f.retryAfterSeconds > ADD_BUDGET_NOTICE_SECONDS
+  );
+}
+
+/** A plain message, rounded up: minutes under an hour, else hours. No ticking countdown for a wait this long. */
+function addBudgetMessage(
+  f: Extract<PasskeyFailure, { kind: "http" }>,
+  t: Translate,
+): string {
+  const minutes = Math.ceil(f.retryAfterSeconds / 60);
+  if (minutes < 60) {
+    return t(
+      "You've added several passkeys recently. Try again in about {{count}} minutes.",
+      { count: minutes },
+    );
+  }
+  return t(
+    "You've added several passkeys recently. Try again in about {{count}} hours.",
+    { count: Math.ceil(f.retryAfterSeconds / 3600) },
+  );
+}
+
 function httpAction(
   op: PasskeyOperation,
   f: Extract<PasskeyFailure, { kind: "http" }>,
@@ -314,6 +362,7 @@ function httpAction(
   }
 
   if (f.status === 429) {
+    if (isAddBudgetSpent(op, f)) return message(addBudgetMessage(f, t));
     return login
       ? message(t("Too many attempts. Wait a moment, or email me a code."), {
           offerEmail: true,

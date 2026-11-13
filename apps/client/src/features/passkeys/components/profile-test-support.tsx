@@ -58,13 +58,21 @@ export function listResponse(
 export function httpError(
   status: number,
   code?: string,
-  opts: { stage?: "options" | "request"; retryAfter?: string } = {},
+  opts: {
+    stage?: "options" | "request";
+    retryAfter?: string;
+    limit?: string;
+  } = {},
 ): PasskeyError {
   return new PasskeyError(
     httpFailure(
       opts.stage ?? "request",
       status,
-      code ? { message: "x", code } : { message: "x" },
+      {
+        message: "x",
+        ...(code ? { code } : {}),
+        ...(opts.limit ? { limit: opts.limit } : {}),
+      },
       opts.retryAfter ?? null,
     ),
   );

@@ -172,6 +172,27 @@ describe("PasskeyNudge", () => {
     );
   });
 
+  it("the per-user add budget is spent → says when, stays on the screen (#818)", async () => {
+    m.register.mockRejectedValueOnce(
+      new PasskeyError(
+        httpFailure(
+          "options",
+          429,
+          { code: "rate_limited", limit: "passkey_add", message: "x" },
+          "86400",
+        ),
+      ),
+    );
+    const onDone = renderNudge();
+    fireEvent.click(screen.getByRole("button", { name: /create a passkey/i }));
+    await waitFor(() =>
+      expect(status().textContent).toBe(
+        "You've added several passkeys recently. Try again in about 24 hours.",
+      ),
+    );
+    expect(onDone).not.toHaveBeenCalled();
+  });
+
   it("an older platform (404 on options) has nothing to offer: leave", async () => {
     m.register.mockRejectedValueOnce(
       new PasskeyError(httpFailure("options", 404, {}, null)),

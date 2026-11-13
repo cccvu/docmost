@@ -59,6 +59,8 @@ export interface PasskeyErrorBody {
   code?: string;
   email?: string;
   max_age?: number;
+  /** Only on the platform's add-budget 429 (`passkey_add`): which limit refused, beside `code: rate_limited`. */
+  limit?: string;
 }
 
 /** How "Confirm it's you" may re-prove the person: an emailed code, or a passkey. */
