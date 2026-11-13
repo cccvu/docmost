@@ -3,6 +3,7 @@ import { AxiosError, AxiosHeaders } from "axios";
 import {
   errorStatus,
   isRateLimited,
+  refusalMessage,
   requestErrorMessage,
   retryAfterMs,
   type Translate,
@@ -156,5 +157,28 @@ describe("requestErrorMessage (#384)", () => {
     );
     expect(out).toHaveLength(200);
     expect(out.endsWith("…")).toBe(true);
+  });
+});
+
+describe("refusalMessage (#556)", () => {
+  const SENTENCE = "nothing was restored: the page is in a restricted section";
+  it.each<[string, unknown, string]>([
+    ["409 with a code -> the server's sentence", httpError(409, { message: SENTENCE, code: "ccc_page_restriction_strip" }), SENTENCE],
+    ["403 with a code -> the server's sentence", httpError(403, { message: SENTENCE, code: "restore_needs_edit" }), SENTENCE],
+    ["409 without a code -> generic + status", httpError(409, { message: SENTENCE }), `${FALLBACK} (HTTP 409)`],
+    ["403 with a blank message -> generic + status", httpError(403, { message: "  ", code: "x" }), `${FALLBACK} (HTTP 403)`],
+    ["403 with an array message -> generic + status", httpError(403, { message: ["a"], code: "x" }), `${FALLBACK} (HTTP 403)`],
+    ["409 HTML body -> generic + status", httpError(409, "<html/>"), `${FALLBACK} (HTTP 409)`],
+    ["404 with a code -> generic + status", httpError(404, { message: SENTENCE, code: "x" }), `${FALLBACK} (HTTP 404)`],
+    ["503 with a code -> generic + status", httpError(503, { message: SENTENCE, code: "engine_busy" }), `${FALLBACK} (HTTP 503)`],
+    ["429 -> the rate-limit text", httpError(429, { message: "Too many requests" }), "Too many requests"],
+    ["network error", networkError(), "Can't reach the wiki. Check your connection and try again."],
+  ])("%s", (_name, error, expected) => {
+    expect(refusalMessage(error, t, FALLBACK)).toBe(expected);
+  });
+
+  it("clamps a long refusal sentence to 200 characters", () => {
+    const out = refusalMessage(httpError(409, { message: "x".repeat(500), code: "c" }), t, FALLBACK);
+    expect(out).toHaveLength(200);
   });
 });
