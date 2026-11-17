@@ -306,6 +306,11 @@ describe('#763 buffered-body deadline: memory held by unauthenticated JSON drips
   const N = 100;
   const SENT = 512 * KiB; // sent at once, then the last bytes are dripped
   const D = 2500; // long enough to observe the held memory before the deadline, even on a slow runner
+  // Each case takes at least ~D + setup (~3.3 s on a fast machine) and may wait up to ~D + 5 s (control) or
+  // ~2D + 8 s (hook) by its own bounds, with three forced GCs per `held()` poll. Jest's default 5 s is under 2x
+  // that floor, and the 4 vCPU CodeBuild tier ran past it on every run. This budget only bounds a hang; the
+  // cases' own waits and assertions decide pass or fail.
+  const CASE_TIMEOUT_MS = 60_000;
   const payload = Buffer.alloc(SENT, 'a');
   payload[0] = 0x22; // '"'
 
@@ -339,7 +344,7 @@ describe('#763 buffered-body deadline: memory held by unauthenticated JSON drips
     await sleep(D);
     expect(await held()).toBeGreaterThan(0.8 * N * SENT);
     expect(conns.filter((c) => c.isClosed())).toHaveLength(0);
-  });
+  }, CASE_TIMEOUT_MS);
 
   it(`with the hook, the ${N} drips are destroyed at the deadline and the memory returns to baseline`, async () => {
     const base = await settledArrayBuffers();
@@ -356,5 +361,5 @@ describe('#763 buffered-body deadline: memory held by unauthenticated JSON drips
     expect(closed).not.toBe(-1);
     expect(Math.min(...(closed as number[])) - start).toBeGreaterThanOrEqual(D - 5);
     expect(await waitFor(async () => (await held()) < 4 * MiB, 3000)).toBe(true);
-  });
+  }, CASE_TIMEOUT_MS);
 });
