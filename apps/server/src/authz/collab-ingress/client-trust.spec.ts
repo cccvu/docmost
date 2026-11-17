@@ -237,7 +237,10 @@ describe('#810 platformEdgeTrustFetch: the existing authz channel (PLATFORM_AUTH
       await new Promise((r) => server.close(r));
     });
     beforeEach(() => (seen.length = 0));
-    const fetchFor = () => platformEdgeTrustFetch('remote', { PLATFORM_AUTHZ_URL: base, PLATFORM_AUTHZ_SERVICE_SECRET: 's3cret', PLATFORM_AUTHZ_TIMEOUT_MS: '250' })!;
+    // A server that answers gets a generous timeout: on a loaded CI runner the first real fetch in a worker has run
+    // past 250 ms and read as `timeout` instead of the answer. Only the never-answers case needs the short bound.
+    const fetchFor = (timeoutMs = '10000') =>
+      platformEdgeTrustFetch('remote', { PLATFORM_AUTHZ_URL: base, PLATFORM_AUTHZ_SERVICE_SECRET: 's3cret', PLATFORM_AUTHZ_TIMEOUT_MS: timeoutMs })!;
 
     it('GET /authz/edge-trust with the service secret, no body: the parsed JSON', async () => {
       answer = (_req, res) => res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(GOOD));
@@ -260,7 +263,7 @@ describe('#810 platformEdgeTrustFetch: the existing authz channel (PLATFORM_AUTH
     it('a platform that never answers times out at PLATFORM_AUTHZ_TIMEOUT_MS', async () => {
       answer = () => undefined;
       const started = Date.now();
-      expect(await fetchFor()()).toEqual({ reason: 'timeout' });
+      expect(await fetchFor('250')()).toEqual({ reason: 'timeout' });
       expect(Date.now() - started).toBeLessThan(2000);
     });
 
