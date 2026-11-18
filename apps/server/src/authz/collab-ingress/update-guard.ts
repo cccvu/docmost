@@ -120,7 +120,11 @@
  * socket whose sessions are refused SOCKET_REFUSAL_BUDGET times is closed outright. An exhausted (user, document) budget is NOT a refusal: the
  * socket is closed 1013 (`tryLater`), which the editor retries. `COLLAB_UPDATE_GUARD=report` logs instead of either,
  * except for the rules no honest client ever trips and whose apply would outlive the kill switch (`ALWAYS_ENFORCED`),
- * and #847's throw inside Yjs (`internal`, stage `yjs`).
+ * #847's throw inside Yjs (`internal`, stage `yjs`), and a malformed lineage root (`internal`, stage `lineage`).
+ *
+ * Refusal lines (#888). Each `COLLAB_UPDATE_REFUSED` line carries `outcome`, the guard's answer to that frame (`blocked`,
+ * `retry` or `applied`; see `RefusalOutcome`). The lines the page alarm counts (`pagesOn`) are rate-limited in their own
+ * window, per outcome, so lines that do not page can never crowd one out of the log.
  */
 import { Logger } from '@nestjs/common';
 import * as decoding from 'lib0/decoding';
@@ -214,6 +218,24 @@ export const ALWAYS_ENFORCED: ReadonlySet<string> = new Set(['root', 'zero-lengt
 export const COLLAB_REFUSAL_CODE = 4422;
 export const REFUSED_REASON_PREFIX = 'ccc:collab-update-refused:';
 export const UNRESOLVED_REASON = 'ccc:collab-update-unresolved';
+/**
+ * #888: a refusal line's `outcome`, the server's answer to THIS frame (never what the user finally sees):
+ * - `blocked`: refused, and the client stops sending (any refusal but `unresolved`, in a mode that enforces it);
+ * - `retry`: refused, and the client reconnects (`ccc:collab-update-unresolved`, and `epoch-stale`, which follows a
+ *   compaction). After its last `unresolved` retry the client gives up, and a dirty stale copy gets a notice; neither
+ *   pages. The hourly TICKET alarm on every refusal line is the signal for those loops;
+ * - `applied`: report mode logged the rule and let the frame through.
+ */
+export type RefusalOutcome = 'blocked' | 'retry' | 'applied';
+/**
+ * #888: does the PAGE alarm (`ccc-wiki-collab-editing-blocked`, infra/terraform/monitoring.tf) count this refusal line?
+ * Every `blocked` line, and every `internal` line: the report-mode `internal` filter counts the applied ones too (a
+ * server-side fault). Its lines get their own log budget (`pagingLines`), so lines that do not page cannot crowd them
+ * out. update-guard.spec.ts checks this against the alarm's patterns, and check-infra-config 14l(8) checks the spec
+ * still carries those patterns.
+ */
+export const pagesOn = (outcome: RefusalOutcome, rule: string): boolean => outcome === 'blocked' || rule === 'internal';
+const REFUSED_TOKEN = 'COLLAB_UPDATE_REFUSED';
 export const SOCKET_REFUSAL_BUDGET = 3;
 /**
  * An honest connection announces one client id (y-protocols' Awareness keeps the id it was built with, even after Yjs
@@ -408,9 +430,10 @@ type AwarenessEntry = { clientID: number; clock: number; state: Uint8Array };
  * with its frame, and its relayer is now burned on that claim. `yjs` (#847): an `internal` that Yjs itself threw
  * applying the frame to the shadow or cleaning its transaction up, outside the guard's inspection, the meter and the
  * deadline: live would throw the same (a half-applied frame, or a cleanup wedged for good), so it is refused in every
- * mode (`enforces`).
+ * mode (`enforces`). `lineage` (#888): an `internal` for a malformed lineage root (`checkEpoch`), refused in every mode
+ * too (an epoch gate, not a content rule).
  */
-type RefusalLog = { steps?: number; stage?: 'conflict-scan' | 'unproven-owner' | 'yjs'; claim?: ClaimOutcome | 'full' | 'matched' };
+type RefusalLog = { steps?: number; stage?: 'conflict-scan' | 'unproven-owner' | 'yjs' | 'lineage'; claim?: ClaimOutcome | 'full' | 'matched' };
 type ShadowResult = {
   violation: Violation | null;
   binds: Map<number, string>;
@@ -603,6 +626,18 @@ export class CollabUpdateGuard {
     logger: { warn: (message) => this.logger.warn(message) },
     perKey: LOGS_PER_MINUTE,
     summary: (token, count) => `COLLAB_GUARD_LOG_SUPPRESSED ${JSON.stringify({ of: token, count })}`,
+  });
+  /**
+   * #888: the refusal lines the page alarm counts (`pagesOn`), LOGS_PER_MINUTE per OUTCOME a minute, apart from
+   * `logLines`: so a flood of lines that do not page (report mode, retries) cannot hide a blocking refusal, and a flood
+   * of report-mode `internal` lines (`applied`) cannot hide one either. The summary names the outcome and never the
+   * mode: it is not a refusal line, and the page does not count it. It is written only for a minute that already wrote
+   * LOGS_PER_MINUTE lines of that outcome, and each of those already pages (the alarm is `Sum >= 1` in 5 minutes).
+   */
+  private readonly pagingLines = new RateLimitedWarn<RefusalOutcome>({
+    logger: { warn: (message) => this.logger.warn(message) },
+    perKey: LOGS_PER_MINUTE,
+    summary: (outcome, count) => `COLLAB_GUARD_LOG_SUPPRESSED ${JSON.stringify({ of: REFUSED_TOKEN, count, outcome })}`,
   });
   /** #827: compaction-log.ts's lines, through the same per-token window. */
   private readonly compactionLog: CompactionLogSink = {
@@ -923,21 +958,24 @@ export class CollabUpdateGuard {
     try {
       epoch = lineageEpoch(frame.document);
     } catch {
-      // A malformed lineage root: fail closed in every mode, never guess (an epoch gate, not a content rule)
-      this.refuse(frame, header, { rule: 'internal' }); // enforce: throws
+      // A malformed lineage root: fail closed in every mode, never guess (an epoch gate, not a content rule). `enforces`
+      // refuses stage `lineage` in every mode, so this logs it `blocked`, counts it toward the socket's budget and throws.
+      this.refuse(frame, header, { rule: 'internal' }, { stage: 'lineage' });
+      // Never reached; kept so this path fails closed even if `enforces` changes.
       const reason = reasonFor('internal');
-      this.refusedConnections.set(frame.connection, reason); // report mode: this connection's later frames too
+      this.refusedConnections.set(frame.connection, reason);
       throw { code: COLLAB_REFUSAL_CODE, reason };
     }
     if (clientEpoch(frame.requestParameters) === epoch) return;
     const reason = epochStaleReason(epoch);
-    this.log('COLLAB_UPDATE_REFUSED', frame.document, {
+    this.log(REFUSED_TOKEN, frame.document, {
       rule: 'epoch-stale',
       epoch,
       userId: frame.context?.user?.id,
       msgType: header.type,
       readOnly: frame.connection.readOnly,
       mode: this.mode,
+      outcome: 'retry' satisfies RefusalOutcome,
     });
     this.refusedConnections.set(frame.connection, reason);
     throw { code: COLLAB_REFUSAL_CODE, reason };
@@ -2261,18 +2299,24 @@ export class CollabUpdateGuard {
    * #827: whether `rule` refuses (enforce mode), or only logs (report mode). ALWAYS_ENFORCED rules refuse in every
    * mode, and so does #847's other crash-class refusal, which the kill switch (meant for a content rule's false
    * positive) must never let through to live: an `internal` Yjs threw itself (stage `yjs`: live would throw the same,
-   * half-applied or wedged). A meter or guard failure keeps following the mode. `always`: only whether it is refused in
-   * every mode.
+   * half-applied or wedged), and a malformed lineage root (stage `lineage`, #888). A meter or guard failure keeps
+   * following the mode. `always`: only whether it is refused in every mode.
    */
   private enforces(rule: string, log?: RefusalLog, always = false): boolean {
-    return (!always && this.mode === 'enforce') || ALWAYS_ENFORCED.has(rule) || (rule === 'internal' && log?.stage === 'yjs');
+    return (
+      (!always && this.mode === 'enforce') ||
+      ALWAYS_ENFORCED.has(rule) ||
+      (rule === 'internal' && (log?.stage === 'yjs' || log?.stage === 'lineage'))
+    );
   }
 
   /** Logs the refusal; in enforce mode also closes the session (throws) and counts against the socket's budget. */
   private refuse(frame: GuardFrame, header: Header, violation: Violation, extra?: RefusalLog): void {
     // An unproven owner's id: logged as the foreign-client it is, answered as a reconnect (inspectTransaction).
     const reason = extra?.stage === 'unproven-owner' ? UNRESOLVED_REASON : reasonFor(violation.rule);
-    this.log('COLLAB_UPDATE_REFUSED', frame.document, {
+    const enforced = this.enforces(violation.rule, extra);
+    const outcome: RefusalOutcome = !enforced ? 'applied' : reason === UNRESOLVED_REASON ? 'retry' : 'blocked';
+    this.log(REFUSED_TOKEN, frame.document, {
       rule: violation.rule,
       ...(violation.node ? { node: violation.node } : {}),
       ...(violation.mark ? { mark: violation.mark } : {}),
@@ -2283,8 +2327,9 @@ export class CollabUpdateGuard {
       ...(header.subtype !== undefined ? { syncType: header.subtype } : {}),
       bytes: frame.update.length,
       mode: this.mode,
+      outcome,
     });
-    if (!this.enforces(violation.rule, extra)) return;
+    if (!enforced) return;
     this.refusedConnections.set(frame.connection, reason);
     const ws = frame.connection.webSocket;
     if (ws) {
@@ -2301,9 +2346,15 @@ export class CollabUpdateGuard {
     throw { code: COLLAB_REFUSAL_CODE, reason };
   }
 
-  /** Rate-limited structured warn lines, per token. Schema ids, user and page ids only: never a value or any content. */
+  /**
+   * Rate-limited structured warn lines, per token; a refusal line the page alarm counts, per outcome in its own window
+   * (`pagingLines`, #888). Schema ids, user and page ids only: never a value or any content.
+   */
   private log(token: string, live: Y.Doc & { name?: string }, fields: Record<string, unknown>): void {
-    this.logLines.warn(token, () => `${token} ${JSON.stringify({ ...fields, pageId: pageIdOf(live) })}`);
+    const line = () => `${token} ${JSON.stringify({ ...fields, pageId: pageIdOf(live) })}`;
+    const outcome = fields.outcome as RefusalOutcome | undefined;
+    if (token === REFUSED_TOKEN && outcome !== undefined && pagesOn(outcome, String(fields.rule))) this.pagingLines.warn(outcome, line);
+    else this.logLines.warn(token, line);
   }
 }
 

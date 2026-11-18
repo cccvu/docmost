@@ -960,6 +960,9 @@ describe('#827 the lineage epoch, on each connection\'s first frame', () => {
     expect(s.deliver(s.conn('w', false, 'cccEpoch=2'), step1Frame(s.live))).toBe(REFUSED('internal'));
     expect(s.deliver(s.conn('w', false, 'cccEpoch=0'), step1Frame(s.live))).toBe(REFUSED('internal'));
     expect(s.deliver(s.conn('r', true, ''), step1Frame(s.live))).toBe(REFUSED('internal'));
+    // #888: logged as what it is, a refusal that blocks (the page alarm counts it)
+    const lines = s.logs.filter((l) => l.startsWith('COLLAB_UPDATE_REFUSED ')).map((l) => JSON.parse(l.slice(l.indexOf('{'))));
+    expect(lines).toEqual(Array(3).fill(expect.objectContaining({ rule: 'internal', stage: 'lineage', mode: 'enforce', outcome: 'blocked' })));
   });
 
   it('report mode still refuses a malformed lineage root (an epoch gate, not a content rule), on every later frame too', () => {
@@ -969,6 +972,23 @@ describe('#827 the lineage epoch, on each connection\'s first frame', () => {
     const c = s.conn('w');
     expect(s.deliver(c, step1Frame(s.live))).toBe(REFUSED('internal'));
     expect(s.deliver(c, step1Frame(s.live))).toBe(REFUSED('internal'));
+    // #888: logged with its stage and as blocked, so it no longer reads like a report-mode internal that applied
+    const lines = s.logs.filter((l) => l.startsWith('COLLAB_UPDATE_REFUSED ')).map((l) => JSON.parse(l.slice(l.indexOf('{'))));
+    expect(lines).toEqual([expect.objectContaining({ rule: 'internal', stage: 'lineage', mode: 'report', outcome: 'blocked' })]);
+  });
+
+  it('#888 report mode: a malformed lineage counts toward the socket\'s refusal budget, as in enforce mode (the third closes it 4422)', () => {
+    const seed = paragraphs(1);
+    seed.getMap(LINEAGE_ROOT).set('epoch', '2');
+    const s = setup(seed, { mode: 'report' });
+    const ws = { close: jest.fn() };
+    for (let i = 1; i <= SOCKET_REFUSAL_BUDGET; i++) {
+      const c = s.conn(`w${i}`); // one document session each, on one socket
+      c.webSocket = ws;
+      expect(s.deliver(c, step1Frame(s.live))).toBe(REFUSED('internal'));
+      if (i < SOCKET_REFUSAL_BUDGET) expect(ws.close).not.toHaveBeenCalled();
+    }
+    expect(ws.close).toHaveBeenCalledWith(COLLAB_REFUSAL_CODE, REFUSED('internal'));
   });
 
   it('a client write to a server-only root (the lineage epoch, the write ledger) is refused in report mode too', () => {
