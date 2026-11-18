@@ -24,7 +24,7 @@ import { SocketLimitLog } from './socket-limit-log';
 import { replicaLogDistrust, replicaLogOf } from './exact-replica-registry';
 import { strictOrderDiff } from './order-parity';
 import { markRowCovered } from '../page-write/reconcile-store';
-import { COLLAB_REFUSAL_CODE, COLLAB_TRY_LATER_CODE, CollabUpdateGuard, UNRESOLVED_REASON, USER_COLLAB_CPU_BURST_MS } from './update-guard';
+import { COLLAB_REFUSAL_CODE, COLLAB_TRY_LATER_CODE, CollabUpdateGuard, pagesOn, UNRESOLVED_REASON, USER_COLLAB_CPU_BURST_MS } from './update-guard';
 
 /**
  * #816 (ADR 0036): honest concurrency never trips the CPU bounds. A seeded corpus of 2–5 peers editing one page
@@ -743,6 +743,14 @@ type CrashTally = {
   txs: number;
   mixed: number;
   heldChecks: number;
+  /**
+   * #888: the refusal lines read, the most one seed's guard wrote, those with no stage or claim (a suppressed line reads
+   * as one), and those the page alarm counts (`pagesOn`).
+   */
+  refusalLines: number;
+  refusalPerGuard: number;
+  refusalBare: number;
+  pagingLines: number;
 };
 
 async function crashSeed(seed: number, v: CrashVariant, mode: CrashMode, tally: CrashTally) {
@@ -844,8 +852,9 @@ async function crashSeed(seed: number, v: CrashVariant, mode: CrashMode, tally: 
       return { cancel: () => (armed = false) };
     },
   });
-  // Every refusal line is read (the claim word): no per-minute suppression in a corpus that refuses dozens of frames.
-  (guard as unknown as { logLines: { perKey: number } }).logLines.perKey = Infinity;
+  // Every refusal line is read (the claim word): no per-minute suppression in a corpus that refuses dozens of frames, in
+  // either window (#888: the lines the page alarm counts have their own, `pagingLines`).
+  for (const window of ['logLines', 'pagingLines']) (guard as unknown as Record<string, { perKey: number }>)[window].perKey = Infinity;
   const check = (conn: Conn, frame: Uint8Array): { reason: string; stage?: string; claim?: string } | null => {
     const logged = logs.length;
     try {
@@ -917,6 +926,11 @@ async function crashSeed(seed: number, v: CrashVariant, mode: CrashMode, tally: 
     await new Promise<void>((resolve) => setImmediate(resolve)); // the next macrotask: the guard clears its in-flight frames
   }
   tally.attested += logs.filter((l) => l.startsWith('COLLAB_RELAY_ATTESTED ')).length;
+  const refusals = logs.filter((l) => l.startsWith('COLLAB_UPDATE_REFUSED ')).map((l) => JSON.parse(l.slice(l.indexOf('{'))));
+  tally.refusalLines += refusals.length;
+  tally.refusalPerGuard = Math.max(tally.refusalPerGuard, refusals.length);
+  tally.refusalBare += refusals.filter((f) => f.stage === undefined || f.claim === undefined).length;
+  tally.pagingLines += refusals.filter((f) => pagesOn(f.outcome, f.rule)).length;
   tally.claims += ledger.recorded;
   tally.txs += oracle.txs.length;
   tally.mixed += oracle.mixed;
@@ -943,6 +957,10 @@ async function crashCorpus(v: CrashVariant, mode: CrashMode): Promise<CrashTally
     txs: 0,
     mixed: 0,
     heldChecks: 0,
+    refusalLines: 0,
+    refusalPerGuard: 0,
+    refusalBare: 0,
+    pagingLines: 0,
   };
   for (let seed = 1; seed <= CRASH_SEEDS; seed++) {
     const { live, peers, retryMs } = await crashSeed(seed, v, mode, tally);
@@ -1058,6 +1076,11 @@ describe('#781 lineage, #842: a lost lifetime\'s edits come back through the gua
         expect({ [k]: n > 0 }).toEqual({ [k]: true });
       }
       expect(now.storedPrefix).toBeLessThan(CRASH_SEEDS);
+      // #888: every refusal line was read (each carries its stage and claim word: none was suppressed), and the
+      // stress+moves corpus writes more than a minute's 30 from one guard, so the lift above is load-bearing. Honest
+      // recovery never writes a line the page alarm counts.
+      for (const t of [today, now, noBudget]) expect({ refused: t.refusalLines > 0, bare: t.refusalBare, paging: t.pagingLines }).toEqual({ refused: true, bare: 0, paging: 0 });
+      if (v.stress && v.moves) expect(now.refusalPerGuard).toBeGreaterThan(30);
       if (v.moves) expect(now.mixed).toBeGreaterThan(now.txs / 10);
     },
     600_000,

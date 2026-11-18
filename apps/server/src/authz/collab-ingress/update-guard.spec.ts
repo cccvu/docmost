@@ -25,7 +25,8 @@ import {
   syncFrame,
   typedFrame,
 } from './collab-ingress.testkit';
-import { COLLAB_PAGE_COMPACTING_REASON } from './collab-reasons';
+import { COLLAB_PAGE_COMPACTING_REASON, epochStaleReason } from './collab-reasons';
+import { LINEAGE_ROOT, writeLineage } from '../page-write/compaction-registry';
 import { CONFLICT_SCAN_STEPS_PER_FRAME } from './conflict-scan';
 import * as parentConsistency from './parent-consistency';
 import {
@@ -65,8 +66,10 @@ import {
   USER_COLLAB_CPU_BURST_MS,
   USER_COLLAB_CPU_REFILL_MS_PER_SECOND,
   UNRESOLVED_REASON,
+  pagesOn,
   type CollabGuardMode,
   type CollabGuardOptions,
+  type RefusalOutcome,
 } from './update-guard';
 
 /**
@@ -1625,6 +1628,335 @@ describe('#810 (L1) the guard logs through the shared per-key window: per token,
       'COLLAB_GUARD_LOG_SUPPRESSED {"of":"COLLAB_LEGACY_PENDING_INVALID","count":12}',
     ]);
     expect(jest.getTimerCount()).toBe(0);
+  });
+});
+
+/** #888 (f): the rows the parity matrix produces, in order (mode, rule/stage, outcome, and PAGES when the alarm counts it). */
+const PARITY_ROWS: string[] = [
+  'enforce stateless blocked PAGES',
+  'enforce auth blocked PAGES',
+  'enforce message-type blocked PAGES',
+  'enforce awareness blocked PAGES',
+  'enforce unresolved retry',
+  'enforce foreign-client/unproven-owner retry',
+  'enforce foreign-client blocked PAGES',
+  'enforce root blocked PAGES',
+  'enforce zero-length blocked PAGES',
+  'enforce client-blocks blocked PAGES',
+  'enforce keyed-split blocked PAGES',
+  'enforce undecodable blocked PAGES',
+  'enforce internal/yjs blocked PAGES',
+  'enforce internal/conflict-scan blocked PAGES',
+  'enforce internal blocked PAGES',
+  'enforce unknown-mark blocked PAGES',
+  'enforce conflict-scan blocked PAGES',
+  'enforce internal/lineage blocked PAGES',
+  'enforce epoch-stale retry',
+  'report stateless applied',
+  'report auth applied',
+  'report message-type applied',
+  'report awareness applied',
+  'report unresolved applied',
+  'report foreign-client/unproven-owner applied',
+  'report foreign-client applied',
+  'report root blocked PAGES',
+  'report zero-length blocked PAGES',
+  'report client-blocks blocked PAGES',
+  'report keyed-split blocked PAGES',
+  'report internal/yjs blocked PAGES', // the crafted frame (enforce mode refuses it undecodable first)
+  'report internal/yjs blocked PAGES',
+  'report internal/conflict-scan applied PAGES',
+  'report internal applied PAGES',
+  'report unknown-mark applied',
+  'report conflict-scan applied',
+  'report internal/lineage blocked PAGES',
+  'report epoch-stale retry',
+];
+
+/**
+ * #888: the page alarm (`ccc-wiki-collab-editing-blocked`) reads 6 COLLAB_UPDATE_REFUSED patterns from
+ * infra/terraform/monitoring.tf, copied here VERBATIM as AWS pattern text (check-infra-config 14l(8) fails CI when one of
+ * them is missing here). A CloudWatch filter counts only a line that is written, so the lines it counts must never share
+ * a log budget with the lines it does not.
+ */
+const ALARM_PATTERNS: readonly string[] = [
+  String.raw`COLLAB_UPDATE_REFUSED -"COLLAB_GUARD_LOG_SUPPRESSED" -"report" -"unresolved" -"unproven-owner" -"epoch-stale"`,
+  String.raw`COLLAB_UPDATE_REFUSED "report" "root"`,
+  String.raw`COLLAB_UPDATE_REFUSED "report" "zero-length"`,
+  String.raw`COLLAB_UPDATE_REFUSED "report" "client-blocks"`,
+  String.raw`COLLAB_UPDATE_REFUSED "report" "keyed-split"`,
+  String.raw`{ $.msg = "COLLAB_UPDATE_REFUSED*" && $.msg = %\x22rule\x22:\x22internal\x22% && $.msg = %\x22mode\x22:\x22report\x22% }`,
+];
+/**
+ * Does `pattern` match `event` (a pino line: the guard's line is its `msg`)? Only the grammar those patterns use: plain
+ * terms (a bare word or a quoted phrase, matched as a substring of the whole event, `-` excludes), or one structured
+ * pattern on `$.msg` (`"prefix*"` and `%regex%` terms joined by `&&`).
+ */
+function alarmMatches(pattern: string, event: string): boolean {
+  const structured = /^\{ (.*) \}$/.exec(pattern);
+  if (structured) {
+    const msg = String(JSON.parse(event).msg);
+    return structured[1].split(' && ').every((term) => {
+      const m = /^\$\.msg = (?:"([^"*]*)\*"|%([^%]*)%)$/.exec(term);
+      if (!m) throw new Error(`unparsed term: ${term}`);
+      return m[1] !== undefined ? msg.startsWith(m[1]) : new RegExp(m[2]).test(msg);
+    });
+  }
+  return pattern.split(' ').every((term) => {
+    const m = /^(-?)(?:"([^"]+)"|([A-Za-z0-9_-]+))$/.exec(term);
+    if (!m) throw new Error(`unparsed term: ${term}`);
+    return event.includes(m[2] ?? m[3]) !== (m[1] === '-');
+  });
+}
+/** Is this guard line counted by the page alarm? Evaluated on the event pino writes. */
+const pagesAlarm = (line: string) => ALARM_PATTERNS.some((p) => alarmMatches(p, JSON.stringify({ msg: line })));
+
+describe('#888 the refusal lines the page alarm counts have their own log budget, per outcome', () => {
+  afterEach(() => jest.useRealTimers());
+  const X = 8880;
+  type Fields = { rule: string; stage?: string; mode: string; outcome: RefusalOutcome; [k: string]: unknown };
+  const fieldsOf = (line: string): Fields => JSON.parse(line.slice(line.indexOf('{')));
+  const refusals = (logs: string[]): Fields[] => logs.filter((l) => l.startsWith('COLLAB_UPDATE_REFUSED ')).map(fieldsOf);
+  const summaries = (logs: string[]) => logs.filter((l) => l.startsWith('COLLAB_GUARD_LOG_SUPPRESSED '));
+  /** Both windows lifted: the parity matrix reads every line. */
+  const unlimited = (guard: CollabUpdateGuard) => {
+    for (const w of ['logLines', 'pagingLines']) (guard as unknown as Record<string, { perKey: number }>)[w].perKey = Infinity;
+  };
+  let n = 0; // a fresh connection (and user) per frame: no refusal budget or rate is shared
+  const fresh = (s: ReturnType<typeof setup>, name: string) => s.conn(`${name}-${n++}`);
+  /** Refused `stateless` (blocked in enforce mode, applied in report mode: a line that does not page). */
+  const stateless = (s: ReturnType<typeof setup>) => s.deliver(fresh(s, 'stateless'), statelessFrame('{"type":"page.updated"}', MSG.Stateless));
+  /** Refused `zero-length` in every mode (ALWAYS_ENFORCED): blocked. */
+  const zeroLength = (s: ReturnType<typeof setup>) => s.send(fresh(s, 'gc'), encodeStructs([{ client: X, clock: 0, structs: [new Y.GC(Y.createID(X, 0), 0)] }]));
+  /** A meter fault: `internal` at stage `conflict-scan` (blocked in enforce mode; applied in report mode, and it pages). */
+  const meterFault = (s: ReturnType<typeof setup>) => {
+    const conn = fresh(s, 'meter');
+    const client = X + 1000 + n;
+    const c = new RemoteClient(s.live, client);
+    expect(s.send(conn, c.edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'abc')))).toBe('applied');
+    c.doc.transact(() => textOf(c.fragment.get(0) as Y.XmlElement).insert(3, 'd'));
+    const sv = Y.decodeStateVector(Y.encodeStateVector(s.live));
+    sv.set(client, sv.get(client)! - 1); // a reconnect's overlap: Yjs integrates it with offset 1, which reads getItem
+    const overlap = Y.encodeStateAsUpdate(c.doc, Y.encodeStateVector(sv));
+    const getItem = jest.spyOn(Y, 'getItem').mockImplementation(() => {
+      throw new Error('injected');
+    });
+    try {
+      return s.send(conn, overlap, SYNC.Step2);
+    } finally {
+      getItem.mockRestore();
+    }
+  };
+  /** A frame with a missing dependency: `unresolved` (retry in enforce mode). */
+  const missingDependency = (s: ReturnType<typeof setup>) => {
+    const c = new RemoteClient(s.live);
+    c.edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'one '));
+    const sv = Y.encodeStateVector(c.doc);
+    c.doc.transact(() => textOf(c.fragment.get(0) as Y.XmlElement).insert(0, 'two '));
+    return s.send(fresh(s, 'gap'), Y.encodeStateAsUpdate(c.doc, sv));
+  };
+  /** New clocks at an id its owner has only announced: `foreign-client` at stage `unproven-owner` (retry in enforce mode). */
+  const announced = (s: ReturnType<typeof setup>, id: number) =>
+    expect(s.deliver(fresh(s, 'owner'), awarenessFrame([{ clientID: id, state: { user: { name: 'O' } } }]))).toBe('applied');
+  const forgeAt = (s: ReturnType<typeof setup>, id: number) => {
+    const forger = new RemoteClient(s.live, id);
+    return s.send(fresh(s, 'forger'), forger.edit(s.live, () => textOf(find(forger.doc, 'paragraph')).insert(0, 'F')));
+  };
+
+  it('(a) report mode: applied lines that do not page fill their minute; a later blocking refusal is still written, outcome blocked', () => {
+    jest.useFakeTimers({ now: 3_000_000 });
+    const s = setup({ seed: SEED, mode: 'report' });
+    for (let i = 0; i < 40; i++) expect(stateless(s)).toBe('applied');
+    expect(refusals(s.logs).map((l) => [l.rule, l.outcome])).toEqual(Array(30).fill(['stateless', 'applied']));
+    expect(zeroLength(s)).toBe(REFUSED('zero-length'));
+    expect(refusals(s.logs).filter((l) => l.rule === 'zero-length')).toEqual([expect.objectContaining({ mode: 'report', outcome: 'blocked' })]);
+  });
+
+  it('(b) the same flood, then a report-mode internal (a meter fault, applied): written, outcome applied (the alarm counts it)', () => {
+    jest.useFakeTimers({ now: 3_000_000 });
+    const s = setup({ seed: SEED, mode: 'report' });
+    for (let i = 0; i < 40; i++) expect(stateless(s)).toBe('applied');
+    expect(meterFault(s)).toBe('applied');
+    const internal = refusals(s.logs).filter((l) => l.rule === 'internal');
+    expect(internal).toEqual([expect.objectContaining({ stage: 'conflict-scan', mode: 'report', outcome: 'applied' })]);
+  });
+
+  it('(b2) report mode: a flood of paging internal lines (applied) cannot crowd out a blocking refusal: each outcome has its own budget', () => {
+    jest.useFakeTimers({ now: 3_000_000 });
+    const s = setup({ seed: SEED, mode: 'report' });
+    for (let i = 0; i < 35; i++) expect(meterFault(s)).toBe('applied');
+    expect(refusals(s.logs).filter((l) => l.rule === 'internal' && l.outcome === 'applied')).toHaveLength(30);
+    expect(zeroLength(s)).toBe(REFUSED('zero-length'));
+    expect(refusals(s.logs).filter((l) => l.outcome === 'blocked')).toEqual([expect.objectContaining({ rule: 'zero-length', mode: 'report' })]);
+  });
+
+  it('(c) enforce mode: retries (unresolved, unproven-owner) carry outcome retry, fill their own minute, and never hide a blocked line', () => {
+    jest.useFakeTimers({ now: 3_000_000 });
+    const s = setup({ seed: SEED });
+    announced(s, 1001);
+    for (let i = 0; i < 20; i++) {
+      expect(missingDependency(s)).toBe(UNRESOLVED_REASON);
+      expect(forgeAt(s, 1001)).toBe(UNRESOLVED_REASON);
+    }
+    const retries = refusals(s.logs);
+    expect(retries).toHaveLength(30);
+    expect(retries.every((l) => l.outcome === 'retry')).toBe(true);
+    expect(new Set(retries.map((l) => l.stage ?? l.rule))).toEqual(new Set(['unresolved', 'unproven-owner']));
+    expect(stateless(s)).toBe(REFUSED('stateless'));
+    expect(refusals(s.logs).filter((l) => l.outcome === 'blocked')).toEqual([expect.objectContaining({ rule: 'stateless', mode: 'enforce' })]);
+  });
+
+  it('(d) past 30 paging lines a minute: exactly 30 written, then the exact summary at the end of the window, and no timer left', () => {
+    jest.useFakeTimers({ now: 3_000_000 });
+    const s = setup({ seed: SEED });
+    for (let i = 0; i < 42; i++) expect(stateless(s)).toBe(REFUSED('stateless'));
+    expect(refusals(s.logs).map((l) => l.outcome)).toEqual(Array(30).fill('blocked'));
+    expect(summaries(s.logs)).toEqual([]);
+    jest.advanceTimersByTime(60_000);
+    expect(summaries(s.logs)).toEqual(['COLLAB_GUARD_LOG_SUPPRESSED {"of":"COLLAB_UPDATE_REFUSED","count":12,"outcome":"blocked"}']);
+    expect(jest.getTimerCount()).toBe(0);
+    // the summary is not a refusal line: the page never counts it (each of the 30 lines before it already paged)
+    expect(summaries(s.logs).map(pagesAlarm)).toEqual([false]);
+    expect(refusals(s.logs).length).toBe(30);
+    expect(s.logs.filter((l) => l.startsWith('COLLAB_UPDATE_REFUSED ')).every(pagesAlarm)).toBe(true);
+  });
+
+  it('(e) an epoch-stale refusal carries outcome retry, and does not page', () => {
+    const seed = new Y.Doc();
+    seed.getXmlFragment('default').insert(0, [new Y.XmlElement('paragraph')]);
+    writeLineage(seed, 3, 1);
+    const s = setup({ seed });
+    expect(s.deliver(fresh(s, 'stale'), step1Frame(s.live))).toBe(epochStaleReason(3));
+    const [line] = s.logs.filter((l) => l.startsWith('COLLAB_UPDATE_REFUSED '));
+    expect(fieldsOf(line)).toMatchObject({ rule: 'epoch-stale', epoch: 3, mode: 'enforce', outcome: 'retry' });
+    expect(pagesOn('retry', 'epoch-stale')).toBe(false);
+    expect(pagesAlarm(line)).toBe(false);
+  });
+
+  it('(g) every paging summary follows exactly 30 written lines of its outcome in its window; any minute with a paging line wrote one', () => {
+    jest.useFakeTimers({ now: 5_000_000 });
+    const s = setup({ seed: SEED, mode: 'report' });
+    const stamped: Array<{ at: number; line: string }> = [];
+    (s.guard as unknown as { logger: { warn(m: string): void } }).logger = { warn: (line: string) => stamped.push({ at: Date.now(), line }) };
+    const attempts: Array<{ at: number; outcome: 'blocked' | 'applied' }> = [];
+    let state = 888;
+    const rand = () => (state = (state * 1103515245 + 12345) % 2 ** 31) / 2 ** 31;
+    for (let i = 0; i < 400; i++) {
+      const gap = rand();
+      jest.advanceTimersByTime(gap < 0.005 ? 30_000 + Math.floor(rand() * 60_000) : gap < 0.03 ? 3_000 + Math.floor(rand() * 12_000) : Math.floor(rand() * 100));
+      const kind = rand();
+      if (kind < 0.4) {
+        expect(zeroLength(s)).toBe(REFUSED('zero-length'));
+        attempts.push({ at: Date.now(), outcome: 'blocked' });
+      } else if (kind < 0.8) {
+        expect(meterFault(s)).toBe('applied');
+        attempts.push({ at: Date.now(), outcome: 'applied' });
+      } else {
+        expect(stateless(s)).toBe('applied'); // applied, and does not page: the other window
+      }
+    }
+    jest.advanceTimersByTime(60_000); // the last window's summaries
+    const written = stamped
+      .filter(({ line }) => line.startsWith('COLLAB_UPDATE_REFUSED '))
+      .map(({ at, line }) => ({ at, f: fieldsOf(line) }))
+      .filter(({ f }) => pagesOn(f.outcome, f.rule));
+    const paging = stamped
+      .filter(({ line }) => line.startsWith('COLLAB_GUARD_LOG_SUPPRESSED ') && 'outcome' in fieldsOf(line))
+      .map(({ at, line }) => ({ at, ...(fieldsOf(line) as unknown as { of: string; count: number; outcome: string }) }));
+    expect(new Set(paging.map((p) => p.outcome))).toEqual(new Set(['blocked', 'applied'])); // anti-vacuity: both budgets ran out
+    const inWindow = (at: number, end: number) => at >= end - 60_000 && at < end;
+    for (const p of paging) {
+      expect(p.of).toBe('COLLAB_UPDATE_REFUSED');
+      expect(written.filter((w) => w.f.outcome === p.outcome && inWindow(w.at, p.at))).toHaveLength(30);
+      expect(attempts.filter((a) => a.outcome === p.outcome && inWindow(a.at, p.at)).length - 30).toBe(p.count);
+      expect(pagesAlarm(stamped.find((x) => x.at === p.at && x.line.includes(`"outcome":"${p.outcome}"`))!.line)).toBe(false);
+    }
+    for (const a of attempts) expect(written.some((w) => w.f.outcome === a.outcome && w.at > a.at - 60_000 && w.at <= a.at)).toBe(true);
+  });
+
+  it('(f) alarm parity: on a line from every refusal path, in both modes, pagesOn says exactly what the page alarm counts', () => {
+    const rows: string[] = [];
+    const lines: string[] = [];
+    const run = (mode: CollabGuardMode, seed: Y.Doc | unknown, paths: Array<(s: ReturnType<typeof setup>) => unknown>) => {
+      const s = setup({ seed, mode });
+      unlimited(s.guard);
+      for (const path of paths) path(s);
+      lines.push(...s.logs.filter((l) => l.startsWith('COLLAB_UPDATE_REFUSED ')));
+    };
+    const malformed = () => {
+      const d = new Y.Doc();
+      d.getXmlFragment('default').insert(0, [new Y.XmlElement('paragraph')]);
+      d.getMap(LINEAGE_ROOT).set('epoch', '2'); // not a number: lineageEpoch throws
+      return d;
+    };
+    const stale = () => {
+      const d = new Y.Doc();
+      d.getXmlFragment('default').insert(0, [new Y.XmlElement('paragraph')]);
+      writeLineage(d, 3, 1);
+      return d;
+    };
+    const first = (s: ReturnType<typeof setup>) => ((textOf(find(s.live, 'paragraph')) as any)._start as Y.Item).id;
+    for (const mode of ['enforce', 'report'] as const) {
+      run(mode, SEED, [
+        (s) => stateless(s),
+        (s) => s.deliver(fresh(s, 'auth'), authFrame('token')),
+        (s) => s.deliver(fresh(s, 'type'), typedFrame(MSG.QueryAwareness)),
+        (s) => s.deliver(fresh(s, 'awareness'), awarenessFrame([{ clientID: 13, state: { n: 'é'.repeat(4100) } }])),
+        (s) => missingDependency(s),
+        (s) => (announced(s, 1002), forgeAt(s, 1002)),
+        (s) => {
+          // foreign-client: the id is bound to its writer, and another user writes at it
+          const owner = new RemoteClient(s.live, 1003);
+          s.send(fresh(s, 'owner'), owner.edit(s.live, () => textOf(find(owner.doc, 'paragraph')).insert(0, 'mine ')));
+          forgeAt(s, 1003);
+        },
+        (s) => s.send(fresh(s, 'root'), new RemoteClient(s.live).edit(s.live, (_f, d) => d.getMap('__ccc_write_idem').set('k', 1))),
+        (s) => zeroLength(s),
+        (s) => {
+          const at = (str: string) => new Y.Item(Y.createID(X + 1, 0), null, Y.createID(first(s).client, first(s).clock), null, null, null, null, new Y.ContentString(str));
+          s.send(fresh(s, 'blocks'), encodeStructs([{ client: X + 1, clock: 0, structs: [at('GOOD')] }, { client: X + 1, clock: 0, structs: [at('BAD!')] }]));
+        },
+        (s) => {
+          const p = (find(s.live, 'paragraph') as any)._item.id as Y.ID;
+          const split = rawUpdate([{ client: X + 2, clock: 0, structs: [{ origin: null, right: null, parent: [p.client, p.clock], sub: 'textAlign', content: new Y.ContentAny(['left', 'center']) }] }]);
+          s.send(fresh(s, 'keyed'), split);
+        },
+        (s) => s.deliver(fresh(s, 'crafted'), syncFrame(new Uint8Array([0xff, 0xff, 0xff, 0x01]))), // undecodable; report: internal, stage yjs
+        (s) => {
+          // internal, stage yjs: a held struct naming a parent clock past live's state (Yjs's getMissing throws)
+          const at = first(s);
+          s.send(fresh(s, 'parent'), rawUpdate([{ client: at.client, clock: at.clock, structs: [{ origin: null, right: null, parent: [at.client, 9_999], content: new Y.ContentString('x') }] }]));
+        },
+        (s) => meterFault(s), // internal, stage conflict-scan
+        (s) => {
+          // internal with no stage: the guard's own inspection failed
+          const spy = jest.spyOn(parentConsistency, 'parentConsistencyViolation').mockImplementationOnce(() => {
+            throw new Error('inspection bug');
+          });
+          try {
+            s.send(fresh(s, 'inspect'), new RemoteClient(s.live).edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).insert(0, 'a ')));
+          } finally {
+            spy.mockRestore();
+          }
+        },
+        // last: report mode applies it, and a later insert beside it would inherit the mark
+        (s) => s.send(fresh(s, 'mark'), new RemoteClient(s.live).edit(s.live, (f) => textOf(f.get(0) as Y.XmlElement).format(0, 2, { evil: {} }))),
+      ]);
+      const shape = twoClientsShape(1100); // the conflict-scan step cap
+      run(mode, shape.base, [(s) => s.send(fresh(s, 'scan'), shape.frame)]);
+      run(mode, malformed(), [(s) => s.deliver(fresh(s, 'lineage'), step1Frame(s.live))]);
+      run(mode, stale(), [(s) => s.deliver(fresh(s, 'stale'), step1Frame(s.live))]);
+    }
+    for (const line of lines) {
+      const f = fieldsOf(line);
+      const counted = pagesAlarm(line);
+      rows.push(`${f.mode} ${f.rule}${f.stage ? `/${f.stage}` : ''} ${f.outcome}${counted ? ' PAGES' : ''}`);
+      expect({ line, counted }).toEqual({ line, counted: pagesOn(f.outcome, f.rule) });
+      if (f.outcome === 'blocked') expect({ line, counted }).toEqual({ line, counted: true });
+    }
+    expect(rows).toEqual(PARITY_ROWS);
+    // anti-vacuity: every alarm pattern counts some line
+    for (const p of ALARM_PATTERNS) expect({ p, counted: lines.some((l) => alarmMatches(p, JSON.stringify({ msg: l }))) }).toEqual({ p, counted: true });
   });
 });
 
