@@ -65,20 +65,18 @@
 }
 
 /* Focused inputs get a 2px ring (2.4.7; the 1px border change alone is
- * 2.29:1 against the resting #52525b). `:focus`, not `:focus-visible`: a text
- * field shows focus on click too, and `:focus-within` covers MultiSelect /
- * TagsInput, whose bordered element is a div. An outline, not a box-shadow,
- * so forced-colors mode keeps it. `unstyled` inputs opt out by design.
+ * 2.29:1 against the resting #52525b). Drawn inside the box (offset -2px, over
+ * the border): an outer ring is clipped by ScrollArea viewports and
+ * overflow:hidden modals, and an outer ring beside the border reads as two.
+ * Against the input's own background: light 17.72:1 on white, 16.12:1 on
+ * filled gray.1 #f4f4f5; dark 13.27:1 on dark.6, 11.77:1 on filled dark.5.
+ * `:focus`, not `:focus-visible`: a text field shows focus on click too, and
+ * `:focus-within` covers MultiSelect / TagsInput, whose bordered element is a
+ * div. An outline, not a box-shadow, so forced-colors mode keeps it.
+ * `unstyled` inputs opt out by design.
  */
 .mantine-Input-input:not([data-variant="unstyled"]):is(:focus, :focus-within) {
   outline: 2px solid var(--ccc-focus-ring);
-  outline-offset: 2px;
-}
-
-/* Spotlight's borderless search can sit flush in its overflow:hidden modal,
- * where an outer ring would be clipped: draw it inside.
- */
-.mantine-Input-input.mantine-Spotlight-search:is(:focus, :focus-within) {
   outline-offset: -2px;
 }
 /* ccc-input-focus:end */

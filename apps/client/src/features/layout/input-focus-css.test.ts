@@ -83,7 +83,7 @@ describe("a11y-overrides.css: input borders and focus (#906)", () => {
     ).toBe(true);
   });
 
-  it("rings every styled input on focus and focus-within with a 2px outline", () => {
+  it("rings every styled input on focus and focus-within with a 2px outline drawn inside the box", () => {
     const ring = ours.find(
       (r) =>
         r.selector ===
@@ -93,7 +93,20 @@ describe("a11y-overrides.css: input borders and focus (#906)", () => {
     expect(
       declares(ring!.body, "outline", "2px solid var(--ccc-focus-ring)"),
     ).toBe(true);
-    expect(declares(ring!.body, "outline-offset", "2px")).toBe(true);
+    // Inset: an outer ring is clipped by ScrollArea viewports and overflow:hidden modals.
+    expect(declares(ring!.body, "outline-offset", "-2px")).toBe(true);
+  });
+
+  it("no rule moves an input's ring back outside the box", () => {
+    const outward = ours.filter(
+      (r) =>
+        r.selector.includes(".mantine-Input-input") &&
+        r.body
+          .split(";")
+          .map((d) => d.split(":").map((x) => x.trim()))
+          .some(([p, v]) => p === "outline-offset" && !v.startsWith("-")),
+    );
+    expect(outward).toEqual([]);
   });
 
   it("points Mantine's own dark focus rings and dark focus border at the visible colour", () => {
