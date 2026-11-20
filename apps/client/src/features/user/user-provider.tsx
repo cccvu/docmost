@@ -18,7 +18,7 @@ import { useIdentityReconcile } from "@/features/identity-reconcile/use-identity
 import { useSocketAuthProbe } from "@/features/websocket/use-socket-auth-probe";
 
 export function UserProvider({ children }: React.PropsWithChildren) {
-  const [, setCurrentUser] = useAtom(currentUserAtom);
+  const [currentUser, setCurrentUser] = useAtom(currentUserAtom);
   const setEntitlements = useSetAtom(entitlementAtom);
   const { data, isLoading, error, isError } = useCurrentUser();
   const { data: entitlements } = useEntitlements();
@@ -84,6 +84,13 @@ export function UserProvider({ children }: React.PropsWithChildren) {
   }
 
   if (error) {
+    return <></>;
+  }
+
+  // CCC (wiki-v2 #911): the effect above stores the loaded user after this render, and the atom starts
+  // null when nothing is stored (fresh profile, after sign-out). Children read `userAtom` as non-null,
+  // so render them only once it holds the user.
+  if (!currentUser) {
     return <></>;
   }
 
