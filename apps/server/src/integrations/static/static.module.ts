@@ -9,6 +9,8 @@ import { EnvironmentService } from '../environment/environment.service';
 import { AUTHZ_MODE, AuthzMode } from '../../authz/mode/authz-mode';
 // CCC #309 seam: precompressed + immutable-hashed asset delivery (policy lives in authz/http-headers/).
 import { registerClientStatic } from '../../authz/http-headers/client-static';
+// CCC #905 seam: in remote mode the static icon/manifest links point at the platform's /brand bundle.
+import { applyBrandLinks } from '../../authz/http-headers/brand-links';
 
 @Module({})
 export class StaticModule implements OnModuleInit {
@@ -69,7 +71,10 @@ export class StaticModule implements OnModuleInit {
       }
 
       const html = fs.readFileSync(indexTemplateFilePath, 'utf8');
-      const transformedHtml = html.replace(windowVar, windowScriptContent);
+      const transformedHtml = applyBrandLinks(
+        html.replace(windowVar, windowScriptContent),
+        this.authzMode,
+      );
 
       fs.writeFileSync(indexFilePath, transformedHtml);
 

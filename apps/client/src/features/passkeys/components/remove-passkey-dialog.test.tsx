@@ -384,3 +384,60 @@ describe("no client-side revoke (#818: the platform signs the other devices out)
     expect(source).not.toMatch(/platform-client/);
   });
 });
+
+// #907: a loading Button is disabled, and a browser drops focus from a disabled element to <body>. jsdom does not
+// (and cannot blur a disabled element), so each case leaves focus on <body> by hand before the select.
+describe("RemovePasskeyDialog: focus after a failed DELETE (#907)", () => {
+  async function failWith(error: unknown) {
+    let fail: (e: unknown) => void = () => undefined;
+    api.remove.mockImplementationOnce(
+      () => new Promise((_, reject) => (fail = reject)),
+    );
+    renderDialog();
+    const action = await screen.findByRole("button", {
+      name: "Remove passkey",
+    });
+    action.focus();
+    action.blur();
+    expect(document.activeElement).toBe(document.body);
+    fireEvent.click(action);
+    await waitFor(() => expect(action.hasAttribute("disabled")).toBe(true));
+    expect(document.activeElement).toBe(document.body);
+    await act(async () => fail(error));
+    return action;
+  }
+
+  it("focus returns to the action button", async () => {
+    const action = await failWith(httpError(503));
+    await screen.findByRole("alert");
+    await waitFor(() => expect(document.activeElement).toBe(action));
+  });
+
+  it("while a Retry-After holds the action, focus goes to Cancel", async () => {
+    await failWith(httpError(503, "sign_out_incomplete", { retryAfter: "3" }));
+    await screen.findByRole("button", { name: /^Try again \(\d+s\)$/ });
+    await waitFor(() =>
+      expect(document.activeElement).toBe(
+        screen.getByRole("button", { name: "Cancel" }),
+      ),
+    );
+  });
+
+  it("focus that already moved elsewhere is left alone", async () => {
+    let fail: (e: unknown) => void = () => undefined;
+    api.remove.mockImplementationOnce(
+      () => new Promise((_, reject) => (fail = reject)),
+    );
+    renderDialog();
+    const action = await screen.findByRole("button", {
+      name: "Remove passkey",
+    });
+    fireEvent.click(action);
+    const title = screen.getByText("Remove passkey iCloud Keychain?");
+    title.setAttribute("tabindex", "-1");
+    title.focus();
+    await act(async () => fail(httpError(503)));
+    await screen.findByRole("alert");
+    expect(document.activeElement).toBe(title);
+  });
+});

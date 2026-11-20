@@ -189,6 +189,25 @@ export default defineConfig(({ mode }) => {
           target: PLATFORM_URL || "http://localhost:4000",
           changeOrigin: true,
         },
+        // Site icons (wiki-v2 #905) — dev parity with prod, where the server points the static links at /brand
+        // and the ALB routes the root well-known icons to the platform. The root paths go to the platform as is;
+        // the neutral /icons/* and /manifest.json the static shell links are answered with the platform's /brand
+        // files, so the dev origin shows the brand icons before any script runs too. Vite applies the proxy before
+        // it serves public/, so these win over the neutral defaults there.
+        "^/(favicon\\.ico|apple-touch-icon(-precomposed)?\\.png)(\\?.*)?$": {
+          target: PLATFORM_URL || "http://localhost:4000",
+          changeOrigin: true,
+        },
+        "^/icons/(favicon-(16x16|32x32)|app-icon-(192x192|512x512)|apple-touch-icon)\\.png(\\?.*)?$": {
+          target: PLATFORM_URL || "http://localhost:4000",
+          changeOrigin: true,
+          rewrite: (path) => path.replace(/^\/icons\//, "/brand/"),
+        },
+        "^/manifest\\.json(\\?.*)?$": {
+          target: PLATFORM_URL || "http://localhost:4000",
+          changeOrigin: true,
+          rewrite: (path) => path.replace(/^\/manifest\.json/, "/brand/site.webmanifest"),
+        },
         // OAuth 2.1 AS + RFC 9728/8414 discovery live on the platform (#226). In prod the ALB routes /oauth
         // and /.well-known to the platform; mirror that here so the MCP OAuth flow — including the post-login
         // resume of /oauth/authorize (#302, a full-page navigation back to a platform route) — is reachable at
