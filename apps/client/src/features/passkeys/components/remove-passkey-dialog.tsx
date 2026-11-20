@@ -57,7 +57,8 @@ export interface RemovePasskeyDialogProps {
   name: string;
   /** It is the only passkey that still works: removing it leaves email as the only way in. */
   isLast: boolean;
-  onClose: () => void;
+  /** `"gone"`: the passkey was already gone on the server (404), so its row is about to leave the list. */
+  onClose: (outcome?: "gone") => void;
   onRemoved: (result: RemovePasskeyResponse) => void;
   /** The list on screen is stale (a half-finished removal, or the passkey was already gone). */
   onChanged: () => void;
@@ -91,6 +92,9 @@ function RemoveFlow({
   const [confirmed, setConfirmed] = useState(false);
   const cooldown = useResendCooldown(DEFAULT_RETRY_WAIT_SECONDS);
   const mounted = useRef(false);
+  const actionRef = useRef<HTMLButtonElement>(null);
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const wasBusy = useRef(false);
 
   useEffect(() => {
     mounted.current = true;
@@ -98,6 +102,22 @@ function RemoveFlow({
       mounted.current = false;
     };
   }, []);
+
+  // #907: a loading Button is disabled, so the browser dropped focus to <body> while the DELETE ran. When it failed
+  // and this dialog is still the one showing, put focus back: the action, or Cancel while a Retry-After holds it.
+  useEffect(() => {
+    if (busy) {
+      wasBusy.current = true;
+      return;
+    }
+    if (!wasBusy.current) return;
+    wasBusy.current = false;
+    if (confirmMethods !== null) return;
+    const active = document.activeElement;
+    if (active && active !== document.body) return;
+    const action = actionRef.current;
+    (action && !action.disabled ? action : cancelRef.current)?.focus();
+  }, [busy, confirmMethods]);
 
   // A row whose earlier removal did not finish: the passkey already no longer works.
   const resuming = passkey.removalPending || incomplete !== null;
@@ -135,7 +155,7 @@ function RemoveFlow({
           setConfirmMethods(action.methods);
           return;
         case "refresh-list":
-          onClose();
+          onClose("gone");
           return;
         case "removal-incomplete":
           setIncomplete({ message: action.message });
@@ -165,7 +185,7 @@ function RemoveFlow({
     <>
       <Modal
         opened={confirmMethods === null}
-        onClose={onClose}
+        onClose={() => onClose()}
         // Never closable mid-DELETE: its answer decides what the list must show.
         closeOnEscape={!busy}
         closeOnClickOutside={!busy}
@@ -219,10 +239,18 @@ function RemoveFlow({
             </Alert>
           )}
           <Group justify="flex-end">
-            <Button variant="default" onClick={onClose} disabled={busy}>
+            <Button
+              ref={cancelRef}
+              variant="default"
+              onClick={() => onClose()}
+              disabled={busy}
+            >
               {t("Cancel")}
             </Button>
+            {/* Opens focused on the action, not Cancel (APG suggests the least destructive one): deliberate, so the
+                second select after a "Confirm it's you" round trip lands where the status line points (#907). */}
             <Button
+              ref={actionRef}
               color="red"
               loading={busy}
               disabled={cooldown.remaining > 0}

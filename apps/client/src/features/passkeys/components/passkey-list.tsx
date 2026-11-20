@@ -14,12 +14,17 @@ import { passkeyDate, passkeyName } from "./passkey-format.ts";
 
 // wiki-v2 #818 — NOT upstream Docmost code. Profile → Passkeys: the signed-in person's passkeys as a captioned table
 // (provider, Synced / This device only, added, last used). A row whose removal stopped half-way (the passkey no
-// longer works, but the other-device sign-out did not finish) says so and offers "Try again".
+// longer works, but the other-device sign-out did not finish) says so and offers "Try again". Each row's action button
+// carries `data-passkey-action={id}`, so focus can find the row's current button after "Remove" became "Try again"
+// (#907, passkey-focus.ts).
 
 export interface PasskeyListProps {
   passkeys: PasskeyView[];
-  /** Start removing this passkey (or resume a removal that did not finish). Opens the confirm dialog. */
-  onRemove: (passkey: PasskeyView) => void;
+  /**
+   * Start removing this passkey (or resume a removal that did not finish). Opens the confirm dialog; `trigger` is the
+   * row button, where focus returns when it closes (#907).
+   */
+  onRemove: (passkey: PasskeyView, trigger: HTMLElement) => void;
 }
 
 export function PasskeyList({ passkeys, onRemove }: PasskeyListProps) {
@@ -68,7 +73,7 @@ function PasskeyRow({
   onRemove,
 }: {
   passkey: PasskeyView;
-  onRemove: (passkey: PasskeyView) => void;
+  onRemove: PasskeyListProps["onRemove"];
 }) {
   const { t } = useTranslation();
   const name = passkeyName(passkey, t);
@@ -112,7 +117,8 @@ function PasskeyRow({
               size="compact-xs"
               aria-label={t("Try again to remove passkey {{name}}", { name })}
               aria-describedby={`${pendingId} ${addedId}`}
-              onClick={() => onRemove(passkey)}
+              data-passkey-action={passkey.id}
+              onClick={(e) => onRemove(passkey, e.currentTarget)}
             >
               {t("Try again")}
             </Button>
@@ -124,7 +130,8 @@ function PasskeyRow({
             size="xs"
             aria-label={t("Remove passkey {{name}}", { name })}
             aria-describedby={addedId}
-            onClick={() => onRemove(passkey)}
+            data-passkey-action={passkey.id}
+            onClick={(e) => onRemove(passkey, e.currentTarget)}
           >
             {t("Remove")}
           </Button>

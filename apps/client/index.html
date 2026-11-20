@@ -4,9 +4,12 @@
     <meta charset="UTF-8" />
     <link rel="icon" type="image/png" sizes="32x32" href="/icons/favicon-32x32.png" />
     <link rel="icon" type="image/png" sizes="16x16" href="/icons/favicon-16x16.png" />
+    <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0 user-scalable=no" />
     <!-- Neutral defaults; the runtime brand bundle (features/brand) swaps title, favicons and the PWA
-         manifest when one is served (see /brand/manifest.json). -->
+         manifest when one is served (see /brand/manifest.json). In remote mode the server already points the
+         icon, apple-touch and manifest links at /brand at boot (authz/http-headers/brand-links.ts), so clients
+         that never run this script see the brand too. -->
     <title>Wiki</title>
     <meta name="theme-color" content="#18181b" media="(prefers-color-scheme: dark)" />
     <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />

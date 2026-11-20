@@ -8,6 +8,7 @@ import {
   vi,
 } from "vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -324,5 +325,115 @@ describe("PasskeysSection: add and remove", () => {
       expect(screen.queryByText("Remove passkey Passkey?")).toBeNull(),
     );
     expect(api.remove).not.toHaveBeenCalled();
+  });
+});
+
+// #907: the dialog unmounts while still open, so Mantine's focus return never runs; the section restores it.
+describe("PasskeysSection: focus after the remove dialog closes (#907)", () => {
+  const heading = () => screen.getByRole("heading", { name: "Passkeys" });
+
+  /** Focus a row's button and select it (fireEvent does not move focus the way a click or Enter does). */
+  async function openFrom(name: string) {
+    await table();
+    const trigger = screen.getByRole("button", { name });
+    trigger.focus();
+    fireEvent.click(trigger);
+    await screen.findByRole("dialog");
+    return trigger;
+  }
+
+  async function expectFocused(el: HTMLElement) {
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(document.activeElement).toBe(el));
+    expect(document.activeElement).not.toBe(document.body);
+  }
+
+  it.each([
+    [
+      "Cancel",
+      () => fireEvent.click(screen.getByRole("button", { name: "Cancel" })),
+    ],
+    [
+      "Escape",
+      () => fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" }),
+    ],
+    [
+      "the Close button",
+      () => fireEvent.click(screen.getByRole("button", { name: "Close" })),
+    ],
+  ])("%s returns focus to the row's Remove button", async (_name, close) => {
+    renderSection();
+    const trigger = await openFrom("Remove passkey Passkey");
+    close();
+    await expectFocused(trigger);
+    expect(api.remove).not.toHaveBeenCalled();
+  });
+
+  /** The next list answer waits for `release`: the row is still on the page when the dialog closes, as on a network. */
+  function slowReload(next: ReturnType<typeof listResponse>) {
+    let release: () => void = () => undefined;
+    api.list.mockImplementation(
+      () => new Promise((resolve) => (release = () => resolve(next))),
+    );
+    return () => act(async () => release());
+  }
+
+  it("a removal focuses the heading at once, and keeps it once the row has left the list", async () => {
+    renderSection();
+    await openFrom("Remove passkey iCloud Keychain");
+    const release = slowReload(listResponse([KEY]));
+    fireEvent.click(screen.getByRole("button", { name: "Remove passkey" }));
+    await screen.findByText(/Passkey removed/);
+    await expectFocused(heading());
+    // Not the row button that is about to go.
+    expect(
+      screen.getByRole("button", { name: "Remove passkey iCloud Keychain" }),
+    ).toBeTruthy();
+    await release();
+    expect(
+      screen.queryByRole("button", { name: "Remove passkey iCloud Keychain" }),
+    ).toBeNull();
+    expect(document.activeElement).toBe(heading());
+  });
+
+  it("a 404 (already gone) focuses the heading, not the row about to go", async () => {
+    api.remove.mockRejectedValueOnce(httpError(404));
+    renderSection();
+    const trigger = await openFrom("Remove passkey Passkey");
+    const release = slowReload(listResponse([ICLOUD]));
+    fireEvent.click(screen.getByRole("button", { name: "Remove passkey" }));
+    await expectFocused(heading());
+    expect(trigger.isConnected).toBe(true);
+    await release();
+    expect(document.activeElement).toBe(heading());
+  });
+
+  it("after a half-finished removal, closing focuses the row's new Try again", async () => {
+    api.remove.mockRejectedValueOnce(httpError(503, "sign_out_incomplete"));
+    renderSection();
+    const trigger = await openFrom("Remove passkey Passkey");
+    api.list.mockImplementation(async () =>
+      listResponse([ICLOUD, passkey({ ...KEY, removalPending: true })]),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Remove passkey" }));
+    await screen.findByText("Removal not finished. Try again.");
+    // The reload replaced the row's Remove button with "Try again".
+    await waitFor(() => expect(trigger.isConnected).toBe(false));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    const retry = screen.getByRole("button", {
+      name: "Try again to remove passkey Passkey",
+    });
+    await expectFocused(retry);
+  });
+
+  it("a Confirm-it's-you round trip, then Cancel, returns focus to the row's Remove button", async () => {
+    api.remove.mockRejectedValueOnce(httpError(403, "step_up_required"));
+    renderSection();
+    const trigger = await openFrom("Remove passkey Passkey");
+    fireEvent.click(screen.getByRole("button", { name: "Remove passkey" }));
+    fireEvent.click(await screen.findByText("stub-confirm"));
+    await screen.findByRole("status");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await expectFocused(trigger);
   });
 });

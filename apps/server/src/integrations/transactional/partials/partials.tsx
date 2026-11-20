@@ -1,12 +1,10 @@
-import { button as buttonStyle, container, footer, h1, logo, main } from '../css/styles';
+import { button as buttonStyle, container, h1, logo, main } from '../css/styles';
 import {
   Body,
   Container,
   Head,
   Html,
-  Row,
   Section,
-  Text,
 } from 'react-email';
 import * as React from 'react';
 
@@ -21,7 +19,6 @@ export function MailBody({ children }: MailBodyProps) {
       <Body style={main}>
         <MailHeader />
         <Container style={container}>{children}</Container>
-        <MailFooter />
       </Body>
     </Html>
   );
@@ -73,18 +70,6 @@ export function EmailButton({ href, children }: EmailButtonProps) {
         </td>
       </tr>
     </table>
-  );
-}
-
-export function MailFooter() {
-  return (
-    <Section style={footer}>
-      <Row>
-        <Text style={{ textAlign: 'center', color: '#706a7b' }}>
-          © {new Date().getFullYear()} Docmost, All Rights Reserved <br />
-        </Text>
-      </Row>
-    </Section>
   );
 }
 

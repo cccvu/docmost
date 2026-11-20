@@ -16,15 +16,70 @@
   color: var(--mantine-color-dimmed);
 }
 
-/* Mantine variant="default" inputs ship with --mantine-color-default-border
- * = gray.4 (#ced4da), which on white is only 1.49:1 — fails WCAG AA 3:1
- * for non-text. Bump to gray.6 (3.32:1) on the input itself rather than
- * overriding the variable globally, because the same variable backs Card
- * borders, dividers, and other subtle outlines we want to keep airy.
+/* ccc-input-focus:start (wiki-v2 #906). The wiki's a11y-overrides.css and the
+ * admin console's input-focus.css hold this block byte-for-byte (a sync test).
+ *
+ * Input borders and focus. Mantine draws an input's border from `--input-bd`
+ * and shows focus only by swapping that variable (`:focus { outline: none;
+ * --input-bd: var(--input-bd-focus) }`). So the resting colour is set as the
+ * variable on the wrapper, never as `border-color` on the input: a pinned
+ * border-color stops Mantine's focus AND error borders from showing at all.
+ *
+ * Resting border (1.4.11, 3:1 non-text): Mantine's default is gray.4 #a1a1aa
+ * (2.56:1 on white) and dark.4 #3f3f46 (1.50:1 on dark.6 #232327). Light:
+ * gray.6 #52525b, 7.73:1 on white. Dark: dark.3 #a1a1aa, 6.91 / 6.11 / 5.42
+ * on dark.7 #18181b / dark.6 #232327 / dark.5 #2c2c31.
  */
-.mantine-Input-input[data-variant="default"] {
-  border-color: var(--mantine-color-gray-6);
+[data-mantine-color-scheme="light"]
+  .mantine-Input-wrapper[data-variant="default"] {
+  --input-bd: var(--mantine-color-gray-6);
 }
+
+[data-mantine-color-scheme="dark"]
+  .mantine-Input-wrapper[data-variant="default"] {
+  --input-bd: var(--mantine-color-dark-3);
+}
+
+/* Focus ring colour (2.4.7, 1.4.11). Light: the primary filled brandBlack.6
+ * #18181b, 17.72:1 on white. Dark: Mantine uses the primary filled shade 8
+ * #0c0c0f, 1.10:1 on #18181b, so every Mantine ring is invisible; brandBlack.1
+ * #ececee (the dark primary button) is 15.02 / 13.27 / 11.77:1 on dark.7 /
+ * dark.6 / dark.5.
+ */
+[data-mantine-color-scheme="light"] {
+  --ccc-focus-ring: var(--mantine-primary-color-filled);
+}
+
+[data-mantine-color-scheme="dark"] {
+  --ccc-focus-ring: var(--mantine-color-brandBlack-1);
+}
+
+[data-mantine-color-scheme="dark"]
+  .mantine-Input-wrapper:not([data-variant="unstyled"]) {
+  --input-bd-focus: var(--ccc-focus-ring);
+}
+
+[data-mantine-color-scheme="dark"] .mantine-focus-auto:focus-visible,
+[data-mantine-color-scheme="dark"] .mantine-focus-always:focus {
+  outline-color: var(--ccc-focus-ring);
+}
+
+/* Focused inputs get a 2px ring (2.4.7; the 1px border change alone is
+ * 2.29:1 against the resting #52525b). Drawn inside the box (offset -2px, over
+ * the border): an outer ring is clipped by ScrollArea viewports and
+ * overflow:hidden modals, and an outer ring beside the border reads as two.
+ * Against the input's own background: light 17.72:1 on white, 16.12:1 on
+ * filled gray.1 #f4f4f5; dark 13.27:1 on dark.6, 11.77:1 on filled dark.5.
+ * `:focus`, not `:focus-visible`: a text field shows focus on click too, and
+ * `:focus-within` covers MultiSelect / TagsInput, whose bordered element is a
+ * div. An outline, not a box-shadow, so forced-colors mode keeps it.
+ * `unstyled` inputs opt out by design.
+ */
+.mantine-Input-input:not([data-variant="unstyled"]):is(:focus, :focus-within) {
+  outline: 2px solid var(--ccc-focus-ring);
+  outline-offset: -2px;
+}
+/* ccc-input-focus:end */
 
 /* better contrast for disabled inputs */
 .mantine-Input-input:disabled,
