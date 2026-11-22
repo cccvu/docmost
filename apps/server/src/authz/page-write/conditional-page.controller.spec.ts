@@ -107,6 +107,7 @@ describe('ConditionalPageController.conditionalUpdate', () => {
         // `in` rather than `??`: `undefined`/`null` are the outcomes under test, not "unset".
         return 'apply' in opts ? opts.apply : { applied: true };
       }),
+      isQuiesced: jest.fn(() => false),
     };
     const controller = new ConditionalPageController(
       pageRepo as never,
@@ -236,6 +237,24 @@ describe('ConditionalPageController.conditionalUpdate', () => {
       controller.conditionalUpdate(dto(), USER),
     ).rejects.toBeInstanceOf(ServiceUnavailableException);
     expect(pageService.update).not.toHaveBeenCalled();
+  });
+
+  // wiki-v2 #919 (PR 921 review): while collab is quiesced the write is refused before it opens (`reason: 'error'`); say
+  // so with the engine's retryable code, so /v1 answers `503 engine_busy` with Retry-After, never a bare 503.
+  it('503 engine_busy when the refusal was the collab quiesce; still nothing written', async () => {
+    const { controller, gateway, pageService } = build({ apply: { applied: false, reason: 'error' } });
+    gateway.isQuiesced.mockReturnValue(true);
+    const err = await controller.conditionalUpdate(dto({ title: 'New title' }), USER).catch((e) => e);
+    expect(err).toBeInstanceOf(ServiceUnavailableException);
+    expect((err as HttpException).getResponse()).toMatchObject({ code: 'engine_busy' });
+    expect(pageService.update).not.toHaveBeenCalled();
+  });
+
+  it('a quiesced node never recodes an unknown outcome: write_outcome_unknown stays a 500', async () => {
+    const { controller, gateway } = build({ apply: { applied: false, reason: 'applied_unconfirmed' } });
+    gateway.isQuiesced.mockReturnValue(true);
+    const err = await controller.conditionalUpdate(dto(), USER).catch((e) => e);
+    expect(err).toBeInstanceOf(InternalServerErrorException);
   });
 
   // RedisSync disabled makes handleYjsEvent resolve to undefined. That is "we don't know", not "applied".

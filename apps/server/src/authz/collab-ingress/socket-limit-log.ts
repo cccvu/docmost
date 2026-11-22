@@ -44,6 +44,7 @@ export const SOCKET_LIMITS = [
   'user_collab_cpu',
   'frame_deadline',
   'page_compacting',
+  'collab_draining', // #919: a frame or a load refused while the process drains (a quiesce or the shutdown)
   'load_debt',
   'order_divergence',
   'order_strikes',

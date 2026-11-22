@@ -61,6 +61,12 @@ interface DocState {
   superseded: boolean;
   /** The epoch the row moved to, when known (another node's foreign lineage, or this node's compaction). */
   supersededBy: number | null;
+  /**
+   * #919: how it was superseded. `compacted`: this process's own compaction replaced the row with this document's own
+   * content (its CAS proved the row held everything the document held), so nothing of it is lost. `lineage`: the row
+   * moved to another lineage under it, and what it holds since its last store can never be stored.
+   */
+  supersededHow: 'compacted' | 'lineage' | null;
   /** Page-full (false: not), until when (ms, the registry's clock; null: until a measure clears it). */
   pageFull: false | { until: number | null };
   /** #840: an order heal was requested (`order_divergence`, whatever reason came first): see `orderHealRequested`. */
@@ -71,7 +77,7 @@ const docs = new WeakMap<object, DocState>();
 const stateOf = (doc: object): DocState => {
   let s = docs.get(doc);
   if (!s) {
-    s = { requested: null, compacting: false, superseded: false, supersededBy: null, pageFull: false, orderHeal: false };
+    s = { requested: null, compacting: false, superseded: false, supersededBy: null, supersededHow: null, pageFull: false, orderHeal: false };
     docs.set(doc, s);
   }
   return s;
@@ -139,6 +145,11 @@ export function isSuperseded(doc: object): boolean {
 export function supersededBy(doc: object): number | null {
   return docs.get(doc)?.supersededBy ?? null;
 }
+/** #919: superseded by this process's own compaction (its content is in the row), never by a lineage move. */
+export function supersededByCompaction(doc: object): boolean {
+  const s = docs.get(doc);
+  return !!s && s.superseded && s.supersededHow === 'compacted';
+}
 /** Page-full now: marked, and the mark has not expired (`markPageFull`'s `until`). */
 export function isPageFull(doc: object, now: number = clock.now()): boolean {
   const full = docs.get(doc)?.pageFull;
@@ -158,11 +169,15 @@ export function clearCompacting(doc: object): void {
   const s = docs.get(doc);
   if (s) s.compacting = false;
 }
-/** The row moved to another lineage (`epoch` when known). Final: a superseded document never serves or stores again. */
-export function markSuperseded(doc: object, epoch: number | null = null): void {
+/**
+ * The row moved to another lineage (`epoch` when known). Final: a superseded document never serves or stores again.
+ * `how` (#919): `compacted` only from this process's own compaction of this very document; anything else is `lineage`.
+ */
+export function markSuperseded(doc: object, epoch: number | null = null, how: 'compacted' | 'lineage' = 'lineage'): void {
   const s = stateOf(doc);
   s.superseded = true;
   s.compacting = false;
+  s.supersededHow = how;
   if (epoch !== null) s.supersededBy = epoch;
 }
 /**

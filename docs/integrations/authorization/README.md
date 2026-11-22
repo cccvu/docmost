@@ -150,8 +150,14 @@ You only implement a *caller* for these; the fork is the server. They fall into 
   `POST /api/service/groups/memberships/lookup` and `POST /api/service/groups/default/ensure`.
 - **Collab** (`collab`): `POST /api/collab/revalidate` (re-check every live realtime connection after a
   narrowing access change and narrow the ones that lost access, #501; it replaced the per-page
-  `force-disconnect` in 1.5.0) and `POST /api/collab/force-disconnect-user` (account disable, #455, and after
-  `session/revoke-others`, #818).
+  `force-disconnect` in 1.5.0), `POST /api/collab/force-disconnect-user` (account disable, #455, and after
+  `session/revoke-others`, #818), and (1.19.0, wiki-v2 #919) `POST /api/collab/quiesce` and
+  `POST /api/collab/quiesce/abort`: the maintenance freeze. A quiesce runs the engine's shutdown drain (every live
+  document stored, a failed store kept in memory and retried) and answers `{ draining: true, resident, failed }`;
+  until the abort or a restart no collab frame, load or direct write is accepted (`503 engine_busy`, nothing changed),
+  and an inline comment create or resolve is refused `503` before its row is written. Call it until `resident` is 0
+  and `failed` is empty; each call is bounded to about 40 s. The abort hands each kept document's failed store back to
+  its own retry timer; once the process's shutdown drain has begun it lifts nothing (`503 engine_busy`).
 
 **Bounded engine workloads (1.11.0; wiki-v2 #696, #642).** `POST /api/service/content/search` answers `503` instead of
 an empty result when the authorization service cannot answer, and `503 { code: engine_busy }` when the search is shed

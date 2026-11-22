@@ -13,6 +13,7 @@ import * as bindingSeal from '../page-write/binding-seal';
 import { sealLifetimeOf, setSealBarrierMsForTests } from '../page-write/binding-seal';
 import { kyselyCompactionStore } from '../page-write/compaction';
 import * as healImage from '../page-write/heal-image';
+import * as keepFailedStore from '../page-write/keep-failed-store';
 import { installHealImageTableAtBoot } from '../page-write/heal-image.installer';
 import { COLLAB_PAGE_COMPACTING_REASON } from './collab-reasons';
 import { authFrame, awarenessFrame, FakeSocket, MSG, RemoteClient, SYNC, syncFrame } from './collab-ingress.testkit';
@@ -414,6 +415,9 @@ d('the binding seal across document lifetimes (#793)', () => {
     a.sync(n1.live()); // A holds U's unstored tail
     jest.spyOn(healImage, 'prepareStore').mockRejectedValueOnce(new Error('store down'));
     jest.spyOn(console, 'warn').mockImplementation(() => undefined);
+    // wiki-v2 #919: a document whose last store failed now stays resident (keep-failed-store.ts) and its store is
+    // retried; this case pins the seal for the unload that used to follow such a store, so it lifts that veto.
+    jest.spyOn(keepFailedStore, 'keepFailedDocumentResident').mockImplementation(() => undefined);
     await n1.drain();
     const stored = await rowDoc();
     expect(JSON.stringify((await row()).content)).not.toContain('U-unstored'); // precondition: the store failed

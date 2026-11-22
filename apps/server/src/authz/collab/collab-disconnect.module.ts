@@ -3,6 +3,7 @@ import { APP_INTERCEPTOR } from '@nestjs/core';
 import { CollaborationModule } from '../../collaboration/collaboration.module';
 import { CollabDisconnectController } from './collab-disconnect.controller';
 import { CollabFlushController } from './collab-flush.controller';
+import { CollabQuiesceController } from './collab-quiesce.controller';
 import { CollabServiceSecretGuard } from './service-secret.guard';
 import { HttpAuthzClient } from '../http-authz.client';
 import { LiveAccessRevalidator } from '../live-access/live-access.revalidator';
@@ -12,7 +13,8 @@ import { NarrowingSettleInterceptor } from '../live-access/narrowing-settle.inte
  * CCC authorization integration — NOT upstream Docmost code.
  *
  * Mounts the inbound collab-mediated endpoints the platform calls: live-connection revalidation (#501) and
- * account-disable force-disconnect (#455), and flush-page-content (content settle, issue 282). Imports
+ * account-disable force-disconnect (#455), flush-page-content (content settle, issue 282), and the collab quiesce and
+ * its abort (wiki-v2 #919). Imports
  * CollaborationModule for the gateway; UserRepo/PageRepo come from the @Global DatabaseModule and WsGateway
  * from the @Global WsModule. The revalidator (and its periodic sweep) lives here because it needs the collab
  * gateway; the PDP client is provided locally (stateless, env-configured — the same pattern as
@@ -25,7 +27,7 @@ import { NarrowingSettleInterceptor } from '../live-access/narrowing-settle.inte
  */
 @Module({
   imports: [CollaborationModule],
-  controllers: [CollabDisconnectController, CollabFlushController],
+  controllers: [CollabDisconnectController, CollabFlushController, CollabQuiesceController],
   providers: [
     CollabServiceSecretGuard,
     HttpAuthzClient,

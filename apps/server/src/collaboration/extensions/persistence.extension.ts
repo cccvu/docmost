@@ -79,6 +79,12 @@ import {
   type OrderStoreOutcome,
 } from '../../authz/page-write/heal-image';
 import { installHealImageTableAtBoot } from '../../authz/page-write/heal-image.installer';
+// CCC #919: a document whose last store failed stays resident (and its store is retried) until a store succeeds, and a
+// failed store keeps its contributors for that retry. The policy lives in authz/page-write/keep-failed-store.
+import {
+  keepFailedDocumentResident,
+  restoreContributors,
+} from '../../authz/page-write/keep-failed-store';
 
 @Injectable()
 export class PersistenceExtension implements Extension {
@@ -305,7 +311,8 @@ export class PersistenceExtension implements Extension {
       // fail-closes the guarded write instead of trusting a version the row never received (ADR 0019). Also
       // drop `page` so the post-store side effects do not fire for a write that rolled back.
       logStoreFailure(this.logger, pageId, err);
-      recordStoreFailure(document);
+      recordStoreFailure(document, data); // CCC #919: with its payload, the one the retry runs again
+      restoreContributors(this.contributors, documentName, editingUserIds); // CCC #919: kept for that retry
       page = null;
     }
 
@@ -449,8 +456,10 @@ export class PersistenceExtension implements Extension {
   }
 
   // CCC #827 (UPSTREAM_MODIFICATIONS.md #122): compact a document that asked for it, now that nothing holds it (the
-  // document is still resident and RedisSync still holds its lock). Never throws: a throw would keep it resident.
+  // document is still resident and RedisSync still holds its lock). compactOnUnload never throws. CCC #919 first: a
+  // document whose last store failed throws here, which keeps it resident (and its store is retried).
   async beforeUnloadDocument(data: beforeUnloadDocumentPayload) {
+    keepFailedDocumentResident(data);
     await compactOnUnload(data.document, this.db);
   }
 

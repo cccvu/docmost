@@ -4,6 +4,7 @@ import {
   HttpStatus,
   NotFoundException,
   RequestMethod,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import {
   GUARDS_METADATA,
@@ -101,6 +102,7 @@ const build = (
     markThrows?: boolean;
     wsRejects?: boolean;
     queueRejects?: boolean;
+    quiesced?: boolean;
   } = {},
 ) => {
   const calls: string[] = [];
@@ -136,6 +138,7 @@ const build = (
       if (opts.markThrows) throw new Error('collab node unavailable');
       return undefined;
     }),
+    isQuiesced: jest.fn(() => opts.quiesced === true), // #919
   };
   const wsService = {
     emitCommentEvent: jest.fn(async () => {
@@ -414,6 +417,29 @@ describe('CommentResolutionService.setResolved — side effects', () => {
     });
     await expect(t.svc.setResolved(dto(), USER, WORKSPACE)).resolves.toBe(RESOLVED_COMMENT);
     expect(t.calls.slice(3)).toEqual(['update', 'mark', 'readComment', 'ws', 'notify', 'audit']);
+  });
+
+  it('#919: while collab is quiesced, resolving or reopening an INLINE comment is a 503 before any write', async () => {
+    for (const [comment, resolved] of [
+      [{ ...OPEN_COMMENT, type: 'inline' }, true],
+      [{ ...RESOLVED_COMMENT, type: 'inline' }, false],
+    ] as const) {
+      const t = build({ comment, quiesced: true });
+      const err = await thrown(t.svc.setResolved(dto({ resolved }), USER, WORKSPACE));
+      expect(err).toBeInstanceOf(ServiceUnavailableException);
+      expect((err as ServiceUnavailableException).getResponse()).toMatchObject({ code: 'engine_busy' });
+      expect(t.calls).toEqual(['page', 'validateCanComment', 'readComment']); // no row write, no mark, nothing after
+      expect(t.spy.calls).toHaveLength(0);
+    }
+  });
+
+  it('#919: while collab is quiesced, a PAGE comment still resolves (it has no mark), and an inline no-op still answers', async () => {
+    const page = build({ rereads: [RESOLVED_COMMENT], quiesced: true });
+    await expect(page.svc.setResolved(dto(), USER, WORKSPACE)).resolves.toBe(RESOLVED_COMMENT);
+    expect(page.calls).toContain('update');
+    const noop = build({ comment: { ...RESOLVED_COMMENT, type: 'inline' }, quiesced: true });
+    await expect(noop.svc.setResolved(dto(), USER, WORKSPACE)).resolves.toEqual({ ...RESOLVED_COMMENT, type: 'inline' });
+    noSideEffects(noop.calls);
   });
 
   it('a failed socket emit or notification enqueue never fails the request, and the audit still runs', async () => {

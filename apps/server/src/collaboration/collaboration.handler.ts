@@ -52,6 +52,11 @@ import {
   rethrowDirectOpenRefusal,
 } from '../authz/page-write/compaction';
 import { PageTooLargeException } from '../authz/page-write/page-size';
+// CCC #919: no direct write and no settle of a resident document while collab is quiesced (a 503, nothing changed).
+import {
+  assertCollabNotQuiesced,
+  collabDraining,
+} from '../authz/collab-ingress/collab-quiesce';
 
 export type CollabEventHandlers = ReturnType<
   CollaborationHandler['getHandlers']
@@ -89,6 +94,8 @@ export class CollaborationHandler {
         // authoritative and there is nothing to flush. `reason` is absent here ON PURPOSE: this is a
         // successful settle with nothing to do, which the caller must NOT confuse with a failure.
         if (!doc) return { flushed: false };
+        // CCC #919: the drain owns a resident document's stores while collab is quiesced; a guarded write fails closed.
+        if (collabDraining(hocuspocus)) return { flushed: false, reason: 'error' };
         try {
           // Run the pending store, then wait for every store already executing or queued behind one (#790:
           // Hocuspocus 4.x hides a queued store from `isDebounced`, so one mutex drain is not enough).
@@ -451,6 +458,7 @@ export class CollaborationHandler {
     // transaction, so the two are not one event-loop block. Never for a resident document: on that path nothing may
     // yield between the resident pre-check and the transaction (#282). The CAS, dedup and cap inside the transaction
     // decide atomically either way.
+    assertCollabNotQuiesced(hocuspocus); // CCC #919: nothing opens (or loads) while collab is quiesced
     const loads = hocuspocus.documents?.has(documentName) === false;
     const connection = await hocuspocus
       .openDirectConnection(documentName, context)
@@ -460,6 +468,7 @@ export class CollaborationHandler {
       // CCC #827: no write while the page compacts, drains or was superseded (503, nothing changed). Before any Yjs
       // transaction, so a refusal does not even bump the document's generation, and after the last yield.
       assertDocWritable(connection.document);
+      assertCollabNotQuiesced(hocuspocus); // CCC #919: nor writes, when the quiesce began while it opened
       // #716: ONE Yjs transaction around the whole callback (Hocuspocus's DirectConnection.transact does not open
       // one). A nested `applyUpdate` joins it, so a replace's delete + apply — and #429's key record — are one
       // atomic CRDT mutation: one update event, one broadcast, and peers never see the empty fragment between them.

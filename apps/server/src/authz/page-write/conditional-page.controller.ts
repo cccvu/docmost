@@ -25,6 +25,7 @@ import type { KyselyDB } from '@docmost/db/types/kysely.types';
 import { ConditionalUpdateOutcome } from './collab-outcomes';
 import { stableHash } from './stable-hash';
 import { isOverPageCap, PageTooLargeException, withPageGrowthLock } from './page-size';
+import { CollabQuiescedException } from '../collab-ingress/collab-quiesce';
 
 /**
  * EXTENDS `UpdatePageDto` deliberately, rather than restating its fields. The fork's global
@@ -249,6 +250,9 @@ export class ConditionalPageController {
             code: 'write_outcome_unknown',
           });
         }
+        // #919: collab is quiesced for maintenance on this (the one collab) node, so the write was refused before it
+        // opened — say so with the engine's retryable code (`503 engine_busy`, nothing changed), as the native path does.
+        if (result?.reason === 'error' && this.gateway.isQuiesced()) throw new CollabQuiescedException();
         throw new ServiceUnavailableException(
           'could not apply the conditional content write',
         );

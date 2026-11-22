@@ -445,7 +445,7 @@ async function compactResident(
       stillCurrent: () => storeGenerationOf(document) === generation,
     });
     if (!swap.swapped) return abandon(document, pageId, request.reason, swap.why);
-    markSuperseded(document, built.epoch);
+    markSuperseded(document, built.epoch, 'compacted'); // #919: its own content, so not a lost store
     forgetBuildFailure(pageId);
     loadTrips.delete(pageId);
     closeJoinedConnections(document);

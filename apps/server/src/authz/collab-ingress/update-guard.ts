@@ -840,6 +840,29 @@ export class CollabUpdateGuard {
     return false;
   }
 
+  /**
+   * #919: the process drains (a quiesce, or the shutdown: collab-quiesce.ts). Every frame but a CLOSE is refused, in
+   * every mode, before anything decodes it, frames a socket queued before it authenticated included (Hocuspocus 4.7.1
+   * passes them through this hook too): the socket closes 1013 with the compacting reason (the editor waits read-only
+   * and retries, and its reconnect's load is refused while the drain lasts), and nothing is applied or acknowledged.
+   * A CLOSE returns (the caller then checks it as usual): a detach changes no document.
+   */
+  refuseWhileDraining(frame: GuardFrame): void {
+    if (readHeader(frame.update)?.type === MessageType.CLOSE) return;
+    this.limitLog.log('collab_draining', { userId: String(frame.context?.user?.id ?? '') });
+    try {
+      frame.connection.webSocket?.close(COLLAB_TRY_LATER_CODE, COLLAB_PAGE_COMPACTING_REASON);
+    } catch {
+      // already closing
+    }
+    throw { code: COLLAB_TRY_LATER_CODE, reason: COLLAB_PAGE_COMPACTING_REASON };
+  }
+
+  /** #919: a load refused while the process drains (logged rate-limited; the extension throws the refusal). */
+  noteDrainingLoad(user: string): void {
+    this.limitLog.log('collab_draining', { userId: user });
+  }
+
   /** The (user, document) budget of this frame's connection, made most recently used; the least recent past the cap goes. */
   private budgetFor(frame: GuardFrame, wholeUser = false): UserDocBudget {
     return this.budgetOf(String(frame.context?.user?.id ?? ''), wholeUser ? null : (frame.document.name ?? ''));

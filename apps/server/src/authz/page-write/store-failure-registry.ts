@@ -18,15 +18,29 @@ import type * as Y from 'yjs';
 import { docGeneration } from './doc-version';
 
 const storeFailures = new WeakMap<object, true>();
+/**
+ * #919: the payload of the document's last failed store (Hocuspocus's `onStoreDocumentPayload`), when the store that
+ * failed recorded one. The collab drain retries exactly that store (keep-failed-store.ts), so the person who typed the
+ * edit stays its author (the ADR 0019 reason a synthetic store was rejected). Cleared with the failure.
+ */
+const failedPayloads = new WeakMap<object, object>();
 
-export function recordStoreFailure(document: object): void {
+/** `payload`: the failed store's own payload (the persistence seam passes it); kept until a store succeeds. */
+export function recordStoreFailure(document: object, payload?: object): void {
   storeFailures.set(document, true);
+  if (payload) failedPayloads.set(document, payload);
   // #731: a failed store also invalidates what the last successful one covered, so the next store runs in full.
   storedAt.delete(document);
 }
 
 export function clearStoreFailure(document: object): void {
   storeFailures.delete(document);
+  failedPayloads.delete(document);
+}
+
+/** #919: the payload of the last failed store that recorded one, while the failure stands; undefined otherwise. */
+export function failedStorePayload(document: object): object | undefined {
+  return storeFailures.has(document) ? failedPayloads.get(document) : undefined;
 }
 
 export function hasStoreFailure(document: object): boolean {

@@ -20,7 +20,7 @@ function service() {
       findById: jest.fn(async () => ({ id: 'p1' })),
     },
     generalQueue: { add: jest.fn(async () => void calls.push('watchers')) },
-    collaborationGateway: { handleYjsEvent: jest.fn(async () => void calls.push('yjs')) },
+    collaborationGateway: { handleYjsEvent: jest.fn(async () => void calls.push('yjs')), isQuiesced: jest.fn(() => false) },
   } as Record<string, any>;
   // The REAL parse (and with it the #781 content rules); only its calls are counted.
   s.parseProsemirrorContent = jest.fn(async (content: unknown, format: string) => {
@@ -74,5 +74,24 @@ describe('#781 seam #121: PageService.update refuses invalid content BEFORE the 
     await update({ title: 'Renamed' });
     expect(calls).toEqual(['updatePage', 'watchers']);
     expect(s.parseProsemirrorContent).not.toHaveBeenCalled();
+  });
+});
+
+describe('wiki-v2 #919 seam #121: PageService.update refuses a content write while collab is quiesced, BEFORE the row write', () => {
+  it('quiesced: 503 engine_busy, and the title, updatedAt, lastUpdatedById and contributors are untouched (PR 921 review)', async () => {
+    const { s, calls, update } = service();
+    s.collaborationGateway.isQuiesced.mockReturnValue(true);
+    const r = await refusal(update({ title: 'RENAMED BY A REFUSED WRITE', content: doc([{ type: 'bold' }]), operation: 'replace', format: 'json' }));
+    expect(r.status).toBe(503);
+    expect(r.body).toMatchObject({ code: 'engine_busy' });
+    expect(s.pageRepo.updatePage).not.toHaveBeenCalled();
+    expect(calls).toEqual([]);
+  });
+
+  it('quiesced: a metadata-only update still writes the row (it touches no collab state)', async () => {
+    const { s, calls, update } = service();
+    s.collaborationGateway.isQuiesced.mockReturnValue(true);
+    await update({ title: 'Renamed' });
+    expect(calls).toEqual(['updatePage', 'watchers']);
   });
 });
