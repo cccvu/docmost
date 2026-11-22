@@ -6,6 +6,7 @@ import {
   KEPT_RETRY_MS,
   canRetryFailedStore,
   keepFailedDocumentResident,
+  rearmFailedStoreRetries,
   restoreContributors,
   retryFailedStore,
   storeFailedForGood,
@@ -85,6 +86,29 @@ describe('#919 keepFailedDocumentResident', () => {
     bindCollabDrain(i, { draining: true });
     expect(thrownBy(() => keepFailedDocumentResident({ document: d, instance: i }))).toEqual({ reason: KEPT_RESIDENT_REASON });
     expect(i.storeDocumentHooks).not.toHaveBeenCalled();
+  });
+
+  it('rearmFailedStoreRetries (the quiesce abort): schedules each kept, retriable document once; never a healthy or superseded one', () => {
+    jest.useFakeTimers();
+    try {
+      const kept = { name: 'page.k' } as never;
+      const healthy = { name: 'page.h' } as never;
+      const moved = { name: 'page.m' } as never;
+      const keptPayload = { documentName: 'page.k', lastContext: { user: { id: 'alice' } } };
+      recordStoreFailure(kept, keptPayload);
+      recordStoreFailure(moved, { documentName: 'page.m' });
+      markSuperseded(moved);
+      const i = { ...instance(), documents: new Map<string, never>([['page.k', kept], ['page.h', healthy], ['page.m', moved]]) };
+      bindCollabDrain(i, { draining: false });
+      rearmFailedStoreRetries(i as never);
+      rearmFailedStoreRetries(i as never); // twice: still one timer per document
+      expect(i.storeDocumentHooks).not.toHaveBeenCalled();
+      jest.advanceTimersByTime(KEPT_RETRY_MS);
+      expect(i.storeDocumentHooks).toHaveBeenCalledTimes(1);
+      expect(i.storeDocumentHooks).toHaveBeenCalledWith(kept, keptPayload, true);
+    } finally {
+      jest.useRealTimers();
+    }
   });
 
   it("a kept document's awareness interval stops holding the process (unref'd); an unloading one is left alone", () => {

@@ -56,6 +56,7 @@ import { parseUntrustedContent } from '../../../editor-compat/content-parse/cont
 import { hasCopyRestrictionGuard } from '../../../authz/page-copy/copy-restriction.guard';
 // CCC #716 (UPSTREAM_MODIFICATIONS #121): an append/prepend to a page already at the API size cap is refused 422.
 import { applyWithinPageCap, assertPageCanGrow } from '../../../authz/page-write/page-size';
+import { CollabQuiescedException } from '../../../authz/collab-ingress/collab-quiesce'; // CCC seam #121 (wiki-v2 #919)
 // CCC #781 (UPSTREAM_MODIFICATIONS #121): content the collab editor would delete or crash on is refused, 400/422.
 import { assertCollabSafeContent } from '../../../authz/collab-ingress/content-rules';
 import { WatcherService } from '../../watcher/watcher.service';
@@ -237,6 +238,8 @@ export class PageService {
     // CCC #781: likewise parse (and refuse) the content before the row write; updatePageContent applies this parse.
     let parsedContent: unknown;
     if (updatePageDto.content && updatePageDto.operation && updatePageDto.format) {
+      // CCC #919: nor while collab is quiesced — the content write would be refused after the row write (503 engine_busy).
+      if (this.collaborationGateway.isQuiesced()) throw new CollabQuiescedException();
       await assertPageCanGrow(this.db, page.id, updatePageDto.operation);
       parsedContent = await this.parseProsemirrorContent(updatePageDto.content, updatePageDto.format);
     }

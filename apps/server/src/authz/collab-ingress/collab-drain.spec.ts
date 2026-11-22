@@ -95,12 +95,22 @@ describe('#810 the drain closes every connection established after it began', ()
     const generation = bounds.drainGeneration;
     bounds.beginDrain(0, 'quiesce');
     bounds.beginDrain(0, 'quiesce');
-    bounds.beginDrain(0, 'shutdown');
     expect(bounds.draining).toBe(true);
     expect(bounds.drainGeneration).toBe(generation);
-    bounds.endDrain();
+    expect(bounds.endDrain()).toBe(true);
     expect(bounds.draining).toBe(false);
     expect(bounds.drainGeneration).not.toBe(generation);
+    resumeCompactionsForTests();
+  });
+
+  it('#919: once a shutdown drain began, endDrain lifts nothing (that drain is final; PR 921 review)', () => {
+    const bounds = new CollabSocketBounds({ limitLog: quiet(), drainLog: { log: () => undefined } });
+    bounds.beginDrain(0, 'quiesce');
+    bounds.beginDrain(0, 'shutdown');
+    const generation = bounds.drainGeneration;
+    expect(bounds.endDrain()).toBe(false);
+    expect(bounds.draining).toBe(true);
+    expect(bounds.drainGeneration).toBe(generation); // the running shutdown drain is not aborted
     resumeCompactionsForTests();
   });
 });

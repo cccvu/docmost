@@ -199,7 +199,7 @@ describe('#716 seam #121: PageService.update / updatePageContent', () => {
       },
       generalQueue: { add: jest.fn(async () => undefined) },
       parseProsemirrorContent: jest.fn(async () => (calls.push('parse'), { type: 'doc' })),
-      collaborationGateway: { handleYjsEvent: jest.fn(async () => void calls.push('yjs')) },
+      collaborationGateway: { handleYjsEvent: jest.fn(async () => void calls.push('yjs')), isQuiesced: () => false },
     } as Record<string, unknown>;
     s.updatePageContent = PageService.prototype.updatePageContent;
     return s;

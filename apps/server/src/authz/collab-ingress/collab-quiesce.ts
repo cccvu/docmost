@@ -37,12 +37,18 @@
  * calls again until `resident` is 0. A shutdown run retries until its budget ends (SHUTDOWN_DRAIN_BUDGET_MS, under the
  * ECS stopTimeout of 90 s), so the stopped task's last done line says what the process could not store. Runs on one
  * Hocuspocus instance are serialized, each within its budget counted from its call; an abort ends the running one at
- * its next step. Never rejects.
+ * its next step. Never rejects. The abort (`liftCollabQuiesce`) lifts a quiesce only: once the shutdown drain began it
+ * answers 503 and changes nothing, and after a lift each kept document's failed store is retried on its own timer again.
  */
 import { ServiceUnavailableException } from '@nestjs/common';
 import type { Document, Hocuspocus } from '@hocuspocus/server';
 import type { CollabDrainCounts, CollabDrainTrigger } from './socket-bounds';
-import { canRetryFailedStore, retryFailedStore, storeFailedForGood } from '../page-write/keep-failed-store';
+import {
+  canRetryFailedStore,
+  rearmFailedStoreRetries,
+  retryFailedStore,
+  storeFailedForGood,
+} from '../page-write/keep-failed-store';
 import { bindCollabDrain, collabDraining, type CollabDrainState } from './collab-drain-state';
 
 export { bindCollabDrain, collabDraining, type CollabDrainState };
@@ -92,6 +98,34 @@ export class CollabQuiescedException extends ServiceUnavailableException {
   constructor() {
     super({ message: 'collaboration is paused for maintenance; nothing was changed — retry later', code: 'engine_busy' });
   }
+}
+
+/**
+ * 503: the quiesce abort reached a process whose shutdown drain began. That drain is final; nothing was changed. The
+ * process is stopping, so a retry reaches its replacement (the fork's RetryAfterFilter adds `Retry-After`).
+ */
+export class CollabShuttingDownException extends ServiceUnavailableException {
+  constructor() {
+    super({ message: 'this engine process is shutting down; its collab drain cannot be lifted — retry', code: 'engine_busy' });
+  }
+}
+
+/** The part of `CollabSocketBounds` the quiesce abort drives. */
+export interface CollabLiftableBounds {
+  endDrain(): boolean;
+}
+
+/**
+ * The quiesce abort (seam #3, the gateway's `endQuiesce`): lift the drain, then hand the kept documents' failed stores
+ * back to their own retry timers (keep-failed-store.ts). Throws {@link CollabShuttingDownException} and changes
+ * nothing once the shutdown drain began.
+ */
+export function liftCollabQuiesce(
+  hocuspocus: Pick<Hocuspocus, 'storeDocumentHooks' | 'documents'>,
+  bounds: CollabLiftableBounds,
+): void {
+  if (!bounds.endDrain()) throw new CollabShuttingDownException();
+  rearmFailedStoreRetries(hocuspocus);
 }
 
 /** Seam #2 (`withYdocConnection`): throws the 503 while `hocuspocus` drains. */

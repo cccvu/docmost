@@ -35,6 +35,7 @@ import { COLLAB_HOCUSPOCUS_OPTIONS } from '../authz/collab-ingress/limits'; // C
 import { CollabSocketBounds } from '../authz/collab-ingress/socket-bounds'; // CCC seam #3 (#790, #810)
 import {
   bindCollabDrain,
+  liftCollabQuiesce,
   runCollabDrain,
   type CollabDrainResult,
 } from '../authz/collab-ingress/collab-quiesce'; // CCC seam #3 (wiki-v2 #919)
@@ -285,9 +286,12 @@ export class CollaborationGateway {
     return runCollabDrain(this.hocuspocus, this.collabSocketBounds, { trigger: 'quiesce' });
   }
 
-  /** CCC seam (#919): the quiesce abort, `POST /api/collab/quiesce/abort`, the only way the drain flag is lifted. */
+  /**
+   * CCC seam (#919): the quiesce abort, `POST /api/collab/quiesce/abort`, the only way the drain flag is lifted (never
+   * once the shutdown drain began: 503, authz/collab-ingress/collab-quiesce `liftCollabQuiesce`).
+   */
   endQuiesce(): void {
-    this.collabSocketBounds.endDrain();
+    liftCollabQuiesce(this.hocuspocus, this.collabSocketBounds);
   }
 
   /** CCC seam (#919): is collab quiesced (draining)? Read by the inline-comment refusals (authz/comment-resolution). */

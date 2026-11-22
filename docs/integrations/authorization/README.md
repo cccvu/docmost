@@ -156,7 +156,8 @@ You only implement a *caller* for these; the fork is the server. They fall into 
   document stored, a failed store kept in memory and retried) and answers `{ draining: true, resident, failed }`;
   until the abort or a restart no collab frame, load or direct write is accepted (`503 engine_busy`, nothing changed),
   and an inline comment create or resolve is refused `503` before its row is written. Call it until `resident` is 0
-  and `failed` is empty; each call is bounded to about 40 s.
+  and `failed` is empty; each call is bounded to about 40 s. The abort hands each kept document's failed store back to
+  its own retry timer; once the process's shutdown drain has begun it lifts nothing (`503 engine_busy`).
 
 **Bounded engine workloads (1.11.0; wiki-v2 #696, #642).** `POST /api/service/content/search` answers `503` instead of
 an empty result when the authorization service cannot answer, and `503 { code: engine_busy }` when the search is shed

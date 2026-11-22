@@ -105,6 +105,24 @@ function releaseProcessHold(document: Document): void {
   }
 }
 
+/**
+ * #919, after the quiesce abort lifted the drain (collab-quiesce.ts `liftCollabQuiesce`): the kept documents' retries
+ * are this module's again. The drain owned them while it ran, and a timer that fired during it stood down, so without
+ * this a kept document would wait for an unload attempt that, with no connection left, never comes (PR 921 review):
+ * schedule each one. Never throws.
+ */
+export function rearmFailedStoreRetries(
+  instance: Pick<Hocuspocus, 'storeDocumentHooks' | 'documents'>,
+): void {
+  try {
+    for (const document of instance.documents.values()) {
+      if (storeFailedForGood(document) && canRetryFailedStore(document)) scheduleRetry(instance, document);
+    }
+  } catch {
+    // never out of the abort
+  }
+}
+
 function scheduleRetry(instance: Pick<Hocuspocus, 'storeDocumentHooks'>, document: Document): void {
   if (retryPending.has(document)) return;
   retryPending.add(document);

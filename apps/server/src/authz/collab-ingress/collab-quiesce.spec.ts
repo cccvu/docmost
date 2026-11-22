@@ -18,7 +18,7 @@ import { PersistenceExtension } from '../../collaboration/extensions/persistence
 import { authFrame, DOC_NAME, FakeSocket, MSG, readServerFrame, RemoteClient, syncFrame } from './collab-ingress.testkit';
 import { CollabSocketBounds, COLLAB_DRAIN_TOKEN } from './socket-bounds';
 import { SocketLimitLog } from './socket-limit-log';
-import { CollabQuiescedException, SHUTDOWN_DRAIN_BUDGET_MS } from './collab-quiesce';
+import { CollabQuiescedException, CollabShuttingDownException, SHUTDOWN_DRAIN_BUDGET_MS } from './collab-quiesce';
 import { COLLAB_PAGE_COMPACTING_REASON } from './collab-reasons';
 import { memoryHealStore } from '../page-write/heal-image.testkit';
 import { hasStoreFailure, recordStoreFailure } from '../page-write/store-failure-registry';
@@ -307,6 +307,56 @@ describe('#919 the drain state', () => {
     expect(rowText(s.row.ydoc)).toContain('from the API');
     expect(rowText(s.row.ydoc)).toContain('after the abort');
     expect(sock.closed).toBeNull();
+  });
+
+  it('after an abort a kept failed store is retried on its own timer again: the database comes back with no editor and the edit is stored (PR 921 review)', async () => {
+    const s = stack();
+    const sock = await failedEdit(s, 'typed by alice');
+    await expect(run(s.gateway.quiesce())).resolves.toEqual({ resident: 1, failed: [DOC_NAME] }); // closes alice's socket
+    await expect(run(s.gateway.quiesce())).resolves.toEqual({ resident: 1, failed: [DOC_NAME] });
+    expect(sock.closeReasons()).toContain('Reset Connection');
+    s.gateway.endQuiesce();
+    s.db.down = false;
+    await advance(10_000); // the kept document's own retry, re-armed by the abort
+    expect(rowText(s.row.ydoc)).toContain('typed by alice');
+    expect(last(s.updatePage.mock.calls)[0].lastUpdatedById).toBe('alice');
+    expect(s.resident()).toBe(0); // stored, then unloaded as usual
+  });
+
+  it('MUTATION arm: without the re-arm the kept document is never retried after the abort (its edit stays only in memory)', async () => {
+    jest.spyOn(keepFailedStore, 'rearmFailedStoreRetries').mockImplementation(() => undefined);
+    const s = stack();
+    await failedEdit(s, 'typed by alice');
+    await run(s.gateway.quiesce());
+    await run(s.gateway.quiesce());
+    s.gateway.endQuiesce();
+    s.db.down = false;
+    await advance(10 * 60_000);
+    expect(rowText(s.row.ydoc)).not.toContain('typed by alice');
+    expect(s.resident()).toBe(1);
+  });
+
+  it('an abort during the shutdown drain lifts nothing (503 engine_busy): the shutdown keeps draining and retrying (PR 921 review)', async () => {
+    const s = stack();
+    await failedEdit(s, 'kept through the exit');
+    await run(s.gateway.quiesce());
+    const exit = s.gateway.destroy({ close: jest.fn() } as never);
+    await advance();
+    let refusal: unknown;
+    try {
+      s.gateway.endQuiesce();
+    } catch (err) {
+      refusal = err;
+    }
+    expect(refusal).toBeInstanceOf(CollabShuttingDownException);
+    expect((refusal as CollabShuttingDownException).getStatus()).toBe(503);
+    expect((refusal as CollabShuttingDownException).getResponse()).toMatchObject({ code: 'engine_busy' });
+    expect(s.gateway.isQuiesced()).toBe(true);
+    s.db.down = false;
+    await advance(SHUTDOWN_DRAIN_BUDGET_MS);
+    await exit;
+    expect(rowText(s.row.ydoc)).toContain('kept through the exit'); // the shutdown run, not lifted, retried it
+    expect(last(s.drainLines)).toMatch(/^COLLAB_DRAIN done resident=0 failed=0 /);
   });
 
   it('the shutdown and the route run the same drain: same stores, same counts, the same done line but for its trigger', async () => {

@@ -1212,7 +1212,7 @@
         "operationId": "abortCollabQuiesce",
         "tags": ["collab"],
         "summary": "Lift the collab quiesce (wiki-v2 #919).",
-        "description": "Clears the drain flag /api/collab/quiesce set, so collab connections, frames, loads, direct writes and inline comments are accepted again; a document kept in memory with a failed store stays and is retried as usual. The only way to lift the quiesce short of a restart. Gated by the x-authz-service-secret header (no per-route scope) plus RemoteOnlyGuard.",
+        "description": "Clears the drain flag /api/collab/quiesce set, so collab connections, frames, loads, direct writes and inline comments are accepted again, and hands each document kept in memory with a failed store back to its own retry timer (the drain owned the retries while it ran). The only way to lift the quiesce short of a restart. Once the process's shutdown drain has begun it lifts nothing and answers 503 engine_busy (that drain is final; the next task answers a retry). Gated by the x-authz-service-secret header (no per-route scope) plus RemoteOnlyGuard.",
         "requestBody": { "required": false, "content": { "application/json": {
           "schema": { "type": "object", "additionalProperties": false, "properties": {} },
           "example": {}

@@ -122,6 +122,8 @@ export class CollabSocketBounds implements OnModuleInit, OnModuleDestroy {
   private drainingSince: number | null = null;
   /** #919: bumped by every `endDrain`, so a drain run can tell it was aborted. */
   private drainEpoch = 0;
+  /** #919: a shutdown drain began; it is final, so no abort lifts the flag from then on (PR 921 review). */
+  private shutdownBegun = false;
 
   constructor(opts: CollabSocketBoundsOptions = {}) {
     this.limitLog = opts.limitLog ?? collabSocketLimitLog;
@@ -159,6 +161,7 @@ export class CollabSocketBounds implements OnModuleInit, OnModuleDestroy {
    */
   beginDrain(documents: number, trigger: CollabDrainTrigger = 'shutdown'): (left: CollabDrainCounts) => void {
     if (this.drainingSince === null) this.drainingSince = this.now();
+    if (trigger === 'shutdown') this.shutdownBegun = true;
     const since = this.now();
     stopCompactions(); // #827: the drain's unloads never compact (a rollback's older task may serve the page next)
     this.drainLog.log(`${COLLAB_DRAIN_TOKEN} ${JSON.stringify({ phase: 'start', trigger, documents })}`);
@@ -172,13 +175,18 @@ export class CollabSocketBounds implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * #919, the quiesce abort only (`POST /api/collab/quiesce/abort`): lift the drain flag, so connections, frames, loads
-   * and direct writes are admitted again. Compaction stays stopped until the process restarts (harmless: a page then
-   * compacts on a later residency). Nothing else lifts the flag (collab-quiesce.fitness.spec.ts).
+   * #919, the quiesce abort only (`POST /api/collab/quiesce/abort`, via collab-quiesce.ts `liftCollabQuiesce`): lift
+   * the drain flag, so connections, frames, loads and direct writes are admitted again. Answers false and lifts nothing
+   * once a shutdown drain began: that drain is final (the route is still served while Nest stops its modules), and
+   * lifting it would end the shutdown run and its retries of failed stores. Compaction stays stopped until the process
+   * restarts (#827 `stopCompactions` is final): until then a page past the soft caps answers try-later instead of
+   * compacting. Nothing else lifts the flag (collab-quiesce.fitness.spec.ts).
    */
-  endDrain(): void {
+  endDrain(): boolean {
+    if (this.shutdownBegun) return false;
     this.drainingSince = null;
     this.drainEpoch++;
+    return true;
   }
 
   /**

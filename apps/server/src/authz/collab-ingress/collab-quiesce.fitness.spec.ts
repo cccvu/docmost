@@ -5,8 +5,8 @@ import { join, relative, sep } from 'node:path';
  * wiki-v2 #919 fitness — NOT upstream Docmost code. The quiesce must hold until the process exits (the maintenance
  * window's FENCE relies on it: after the ALB rule nothing may write collab state), so the drain flag is lifted in
  * exactly one place, reached from exactly one route:
- *   - only socket-bounds.ts clears `drainingSince` (in `endDrain`);
- *   - only the gateway's `endQuiesce` calls `endDrain`;
+ *   - only socket-bounds.ts clears `drainingSince` (in `endDrain`, which refuses once the shutdown drain began);
+ *   - only collab-quiesce.ts `liftCollabQuiesce` calls `endDrain`, and only the gateway's `endQuiesce` calls that;
  *   - only the abort route (`CollabQuiesceController.abort`) calls `endQuiesce`.
  * And the shutdown and the route run the same drain: `runCollabDrain` is called from the gateway only, once for each.
  * A text scan of every production source (specs and testkits excluded); each list is checked both ways.
@@ -38,11 +38,13 @@ describe('#919 the collab drain is lifted only by the quiesce abort', () => {
   it('only endDrain clears the flag', () => {
     expect(count(/drainingSince\s*=\s*null\s*;/g)).toEqual(['authz/collab-ingress/socket-bounds.ts:1']);
     const bounds = files.find((f) => f.file === 'authz/collab-ingress/socket-bounds.ts')!.text;
-    expect(bounds).toMatch(/endDrain\(\): void \{\s*this\.drainingSince = null;/);
+    expect(bounds).toMatch(/endDrain\(\): boolean \{\s*if \(this\.shutdownBegun\) return false;\s*this\.drainingSince = null;/);
+    expect(bounds).toMatch(/if \(trigger === 'shutdown'\) this\.shutdownBegun = true;/);
   });
 
-  it('only the gateway calls endDrain, and only the abort route calls endQuiesce', () => {
-    expect(count(/\.endDrain\s*\(/g)).toEqual(['collaboration/collaboration.gateway.ts:1']);
+  it('only liftCollabQuiesce calls endDrain, only the gateway calls that, and only the abort route calls endQuiesce', () => {
+    expect(count(/\.endDrain\s*\(/g)).toEqual(['authz/collab-ingress/collab-quiesce.ts:1']);
+    expect(count(/liftCollabQuiesce\s*\(/g)).toEqual(['authz/collab-ingress/collab-quiesce.ts:1', 'collaboration/collaboration.gateway.ts:1']);
     expect(count(/\.endQuiesce\s*\(/g)).toEqual(['authz/collab/collab-quiesce.controller.ts:1']);
     const controller = files.find((f) => f.file === 'authz/collab/collab-quiesce.controller.ts')!.text;
     expect(controller).toMatch(/@Post\('quiesce\/abort'\)\s*abort\(\)[^\n]*\{\s*this\.gateway\.endQuiesce\(\);/);
