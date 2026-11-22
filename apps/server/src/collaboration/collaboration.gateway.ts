@@ -33,6 +33,11 @@ import { disconnectUserConnections } from '../authz/collab/disconnect-user-conne
 import { CollabUpdateGuardExtension } from '../authz/collab-ingress/collab-update-guard.extension'; // CCC seam #3 (#781)
 import { COLLAB_HOCUSPOCUS_OPTIONS } from '../authz/collab-ingress/limits'; // CCC seam #3 (#790)
 import { CollabSocketBounds } from '../authz/collab-ingress/socket-bounds'; // CCC seam #3 (#790, #810)
+import {
+  bindCollabDrain,
+  runCollabDrain,
+  type CollabDrainResult,
+} from '../authz/collab-ingress/collab-quiesce'; // CCC seam #3 (wiki-v2 #919)
 
 @Injectable()
 export class CollaborationGateway {
@@ -75,6 +80,8 @@ export class CollaborationGateway {
         this.loggerExtension,
       ],
     });
+    // CCC #919: the hooks and the handler read the drain flag of this process's bounds through this instance.
+    bindCollabDrain(this.hocuspocus, this.collabSocketBounds);
 
     if (this.withRedis) {
       // @ts-ignore
@@ -269,28 +276,34 @@ export class CollaborationGateway {
     return this.redisSync.releaseLock(documentName);
   }
 
+  /**
+   * CCC seam (UPSTREAM_MODIFICATIONS.md #3, wiki-v2 #919): the collab quiesce, `POST /api/collab/quiesce`. The same
+   * drain as `destroy` (authz/collab-ingress/collab-quiesce), within the route's budget; idempotent, sticky until
+   * `endQuiesce`. Thin pass-through; the caller (authz/collab) owns the authentication.
+   */
+  quiesce(): Promise<CollabDrainResult> {
+    return runCollabDrain(this.hocuspocus, this.collabSocketBounds, { trigger: 'quiesce' });
+  }
+
+  /** CCC seam (#919): the quiesce abort, `POST /api/collab/quiesce/abort`, the only way the drain flag is lifted. */
+  endQuiesce(): void {
+    this.collabSocketBounds.endDrain();
+  }
+
+  /** CCC seam (#919): is collab quiesced (draining)? Read by the inline-comment refusals (authz/comment-resolution). */
+  isQuiesced(): boolean {
+    return this.collabSocketBounds.draining;
+  }
+
   async destroy(collabWsAdapter: CollabWsAdapter): Promise<void> {
-    const drained = this.collabSocketBounds.beginDrain(this.hocuspocus.getDocumentsCount()); // CCC #810: first; new connections closed 1013 (authz/collab-ingress/socket-bounds)
-    // eslint-disable-next-line no-async-promise-executor
-    await new Promise(async (resolve) => {
-      try {
-        // Wait for all documents to unload
-        this.hocuspocus.configuration.extensions.push({
-          async afterUnloadDocument({ instance }) {
-            if (instance.getDocumentsCount() === 0) resolve('');
-          },
-        });
-
-        collabWsAdapter?.close();
-
-        if (this.hocuspocus.getDocumentsCount() === 0) resolve('');
-        this.hocuspocus.closeConnections();
-        this.hocuspocus.flushPendingStores();
-      } catch (error) {
-        console.error(error);
-      }
+    // CCC #810/#919: the one collab drain (authz/collab-ingress/collab-quiesce), shared with the quiesce route: the drain
+    // flag first (new connections closed 1013, frames, loads and direct writes refused), the ws server closed, pending
+    // stores run now, connections closed, a failed store kept resident and retried within the budget, then the
+    // `COLLAB_DRAIN done resident=<n> failed=<n>` line. Never rejects.
+    await runCollabDrain(this.hocuspocus, this.collabSocketBounds, {
+      trigger: 'shutdown',
+      onBegin: () => collabWsAdapter?.close(),
     });
-    drained(); // CCC #810: COLLAB_DRAIN done
 
     await this.hocuspocus.hooks('onDestroy', { instance: this.hocuspocus });
   }

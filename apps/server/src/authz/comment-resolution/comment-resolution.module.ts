@@ -1,8 +1,10 @@
 import { Module } from '@nestjs/common';
+import { APP_INTERCEPTOR } from '@nestjs/core';
 import { PageAccessModule } from '../../core/page/page-access/page-access.module';
 import { CollaborationModule } from '../../collaboration/collaboration.module';
 import { CommentResolutionController } from './comment-resolution.controller';
 import { CommentResolutionService } from './comment-resolution.service';
+import { InlineCommentQuiesceInterceptor } from './inline-comment-quiesce.interceptor';
 
 /**
  * CCC authorization integration — NOT upstream Docmost code.
@@ -14,10 +16,13 @@ import { CommentResolutionService } from './comment-resolution.service';
  *
  * Mounted at the app root (app.module.ts, seam #4) rather than via AuthzModule, for the same reason as
  * ConditionalPageModule: to keep CollaborationModule's heavy graph out of the database-module init chain.
+ *
+ * #919: it also registers the inline-comment quiesce refusal (an APP_INTERCEPTOR acting only on upstream's
+ * `CommentController.create`), here rather than in app.module.ts so no upstream file changes: it needs the gateway.
  */
 @Module({
   imports: [PageAccessModule, CollaborationModule],
   controllers: [CommentResolutionController],
-  providers: [CommentResolutionService],
+  providers: [CommentResolutionService, { provide: APP_INTERCEPTOR, useClass: InlineCommentQuiesceInterceptor }],
 })
 export class CommentResolutionModule {}

@@ -219,7 +219,7 @@ describe('PersistenceExtension.onStoreDocument reconcile seam (#390)', () => {
     );
 
     await expect(run(ext)).resolves.toBeUndefined(); // never throws
-    expect(recordStoreFailure).toHaveBeenCalledWith(document);
+    expect(recordStoreFailure).toHaveBeenCalledWith(document, expect.objectContaining({ document, documentName: 'page.1' })); // #919: with its payload
     expect(logStoreFailure).toHaveBeenCalledTimes(1);
     expect(clearStoreFailure).not.toHaveBeenCalled();
     expect(document.broadcastStateless).not.toHaveBeenCalled(); // side effects skipped for a failed write
@@ -341,7 +341,7 @@ describe('PersistenceExtension.onStoreDocument one-store-per-write seam (#731)',
       throw new Error('db down');
     });
     await expect(run(ext)).resolves.toBeUndefined();
-    expect(recordStoreFailure).toHaveBeenCalledWith(document);
+    expect(recordStoreFailure).toHaveBeenCalledWith(document, expect.objectContaining({ document, documentName: 'page.1' })); // #919: with its payload
     expect(markStoredAt).not.toHaveBeenCalled();
     expect(markRowCovered).not.toHaveBeenCalled();
   });

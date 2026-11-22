@@ -20,6 +20,7 @@ import { ICommentResolvedNotificationJob } from '../../integrations/queue/consta
 import { AuditEvent, AuditResource } from '../../common/events/audit-events';
 import { AUDIT_SERVICE, IAuditService } from '../../integrations/audit/audit.service';
 import { ResolveCommentDto } from './dto';
+import { CollabQuiescedException } from '../collab-ingress/collab-quiesce';
 
 /**
  * ONE answer for every "that comment is not on that page" case: an unknown, trashed, other-workspace or
@@ -45,7 +46,9 @@ const notFound = () => new NotFoundException('comment not found');
  *      about which comment ids exist;
  *   3. the comment must belong to that page and workspace and not be deleted → the SAME 404 as (1);
  *   4. only a thread's first comment carries the resolution → 400 for a reply;
- *   5. already in the requested state → the row, unchanged, with no side effects at all.
+ *   5. already in the requested state → the row, unchanged, with no side effects at all;
+ *   6. (#919) an inline comment while collab is quiesced → 503, before the write: its highlight is a mark in the live
+ *      document, which the quiesce refuses, and the write below would otherwise commit without it.
  *
  * The write is a compare-and-set on `resolved_at`, so two concurrent requests for the same state cannot both
  * report a transition: the loser returns the winner's row and emits nothing (no second notification, no
@@ -105,6 +108,12 @@ export class CommentResolutionService {
     }
 
     if ((comment.resolvedAt != null) === dto.resolved) return comment;
+
+    // #919: nothing is written while collab is quiesced for an inline comment (its mark would be refused after the
+    // write, so the caller would get a resolution whose highlight never changes); a page comment has no mark.
+    if (comment.type === 'inline' && this.collaborationGateway.isQuiesced()) {
+      throw new CollabQuiescedException();
+    }
 
     const now = new Date();
     const changed = await this.db

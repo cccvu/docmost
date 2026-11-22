@@ -157,8 +157,10 @@ describe('#810 T4 the gateway drain, through the real Hocuspocus 4.7.1 and Redis
     expect(h.bus.dropped).toEqual([]);
     expect(sock.closeReasons()).toEqual(['Reset Connection']);
     expect(h.drainLines).toEqual([
-      `${COLLAB_DRAIN_TOKEN} {"phase":"start","documents":1}`,
-      expect.stringMatching(new RegExp(`^${COLLAB_DRAIN_TOKEN} \\{"phase":"done","documents":1,"ms":\\d+\\}$`)),
+      `${COLLAB_DRAIN_TOKEN} {"phase":"start","trigger":"shutdown","documents":1}`,
+      expect.stringMatching(
+        new RegExp(`^${COLLAB_DRAIN_TOKEN} done resident=0 failed=0 \\{"phase":"done","trigger":"shutdown","documents":1,"ms":\\d+\\}$`),
+      ),
     ]);
   });
 
@@ -226,7 +228,7 @@ describe('#810 T4 the gateway drain, through the real Hocuspocus 4.7.1 and Redis
     expect(h.bounds.connections.count('u-late')).toBe(0);
   });
 
-  it('MUTATION arm: with the drain flag never set, the late connection keeps the document and destroy never resolves', async () => {
+  it('MUTATION arm: with the drain flag never set, the late connection keeps the document and destroy does not resolve (until its budget)', async () => {
     const { h, d, late } = await lateAuth(false);
     expect(late.closed).toBeNull();
     expect(d.done()).toBe(false);

@@ -65,7 +65,7 @@ export function reconcileRowIntoDoc(
   // #827: never fold another lineage in (see the header).
   const foreign = foreignLineage(document, rowYdocBytes, decoded.structs);
   if (foreign) {
-    markSuperseded(document, foreign.rowEpoch);
+    markSuperseded(document, foreign.rowEpoch, 'lineage'); // #919: a lost store, never 'compacted'
     throw new ForeignLineageError(foreign.why, foreign.rowEpoch);
   }
 

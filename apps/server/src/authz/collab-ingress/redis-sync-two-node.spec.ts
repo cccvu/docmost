@@ -313,7 +313,7 @@ describe('#810 T1 RedisSync between two collab nodes', () => {
     expect(bus.read(LOCK)).toBe(b.sync.serverId);
   });
 
-  it('the proxied reload case: a proxied Auth that completes after A\'s destroy resolved re-loads the document but leaves no lock', async () => {
+  it('the proxied reload case: a proxied Auth that completes after A\'s destroy resolved does not re-load the document (#919) and leaves no lock', async () => {
     const { a, b } = await owned();
     a.authHolds.set('late', deferred());
     const late = b.connect('late', { holdSlot: true }); // reaches A, whose onAuthenticate is still in flight
@@ -326,10 +326,10 @@ describe('#810 T1 RedisSync between two collab nodes', () => {
     expect(bus.keysMatching('collabLock:')).toEqual([]);
 
     expect(a.loads()).toBe(1);
-    a.authHolds.get('late')!.resolve(); // ...then the late Auth completes on A: it re-loads the document
+    a.authHolds.get('late')!.resolve(); // ...then the late Auth completes on A
     await advance(10_000); // past a lock refresh
-    expect(a.loads()).toBe(2); // it did re-load
-    expect(a.hp.getDocumentsCount()).toBe(0); // the drain rule closed it, and it unloaded again
+    expect(a.loads()).toBe(1); // #919: A is draining, so the load is refused before the row is read (was: a re-load)
+    expect(a.hp.getDocumentsCount()).toBe(0);
     // A's Redis clients are gone, so nothing it did reached Redis: no lock, and no reply or close for B's socket.
     expect(bus.keysMatching('collabLock:')).toEqual([]);
     expect(bus.dropped.map(([c]) => c)).toEqual(expect.arrayContaining(['publish']));

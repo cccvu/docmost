@@ -28,6 +28,11 @@
  *     throw would leak a loaded document. A load that failed (its meter or deadline tripped; a deadline skips Yjs's
  *     cleanup, so `afterAllTransactions` never fires) is charged when Hocuspocus destroys the document.
  *
+ * #919 (collab-quiesce.ts): while the process drains (a quiesce, or the shutdown), the frame hook refuses every frame
+ * but a CLOSE (1013, before the guard's own check) and `onLoadDocument` refuses every load, a socket's (try-later) and a
+ * direct connection's (the compacting refusal, a 503 to the API caller), first and synchronously like the #827 gates.
+ * The drain flag is the one the gateway bound to this Hocuspocus instance (`collabDraining(payload.instance)`).
+ *
  * `afterLoadDocument` is not on any frame's path; after the charge it runs the load repair of legacy values
  * (legacy-repair.ts) once per document lifetime. Hocuspocus 4.7.1 awaits it inside `loadDocument` (after attaching
  * `onUpdate`, before `createDocument` resolves), and a connection, and so every frame, exists only after that; so the
@@ -54,7 +59,8 @@ import type {
   onLoadDocumentPayload,
 } from '@hocuspocus/server';
 import type * as Y from 'yjs';
-import { COLLAB_LOAD_TRY_LATER_REASON, COLLAB_PAGE_COMPACTING_REASON } from './collab-reasons';
+import { COLLAB_LOAD_TRY_LATER_REASON, COLLAB_PAGE_COMPACTING_REASON, pageCompactingRefusal } from './collab-reasons';
+import { collabDraining } from './collab-drain-state';
 import { commitPendingSeal, unclaimedLifetime } from '../page-write/binding-seal';
 import { noteLoadRepaired, pageIdOfDocumentName } from '../page-write/compaction';
 import { scheduleWedgedStore } from '../page-write/direct-store';
@@ -118,6 +124,7 @@ export class CollabUpdateGuardExtension {
    * extension is assignable to its `Extension` type.
    */
   beforeHandleMessage(payload: beforeHandleMessagePayload): Promise<void> {
+    if (collabDraining(payload.instance)) this.guard.refuseWhileDraining(payload as unknown as GuardFrame); // #919
     this.guard.check(payload as unknown as GuardFrame);
     return undefined as unknown as Promise<void>;
   }
@@ -140,10 +147,17 @@ export class CollabUpdateGuardExtension {
     return undefined as unknown as Promise<void>;
   }
 
-  /** #827: the CPU-debt gate for a socket's load, then the load's timing. Synchronous; throws `{ reason }`. */
+  /**
+   * #919: no load while the process drains; #827: the CPU-debt gate for a socket's load; then the load's timing.
+   * Synchronous; throws `{ reason }`.
+   */
   onLoadDocument(payload: onLoadDocumentPayload): Promise<void> {
     const socket = isSocketLoad(payload.requestHeaders);
     const user = userOf(payload.context);
+    if (collabDraining(payload.instance)) {
+      this.guard.noteDrainingLoad(user);
+      throw socket ? { reason: COLLAB_LOAD_TRY_LATER_REASON } : pageCompactingRefusal();
+    }
     if (socket && !this.guard.admitLoad(user)) throw { reason: COLLAB_LOAD_TRY_LATER_REASON };
     this.timeLoad(payload.document as unknown as Y.Doc, socket ? user : null);
     return undefined as unknown as Promise<void>;

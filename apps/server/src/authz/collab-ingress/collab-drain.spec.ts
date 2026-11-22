@@ -75,12 +75,32 @@ describe('#810 the drain closes every connection established after it began', ()
     expect(bounds.connections.count('u1')).toBe(1); // only the one from before the drain
 
     now += 1_234;
-    done();
-    done(); // once
-    expect(bounds.beginDrain(9)).toBeInstanceOf(Function); // a second destroy logs nothing new
+    done({ resident: 0, failed: 0 });
+    done({ resident: 7, failed: 7 }); // once
+    // #919: every drain run logs its own pair (a quiesce, then the shutdown), and the flag stays set
+    const second = bounds.beginDrain(9, 'quiesce');
+    now += 5;
+    second({ resident: 2, failed: 1 });
+    expect(bounds.draining).toBe(true);
     expect(lines).toEqual([
-      `${COLLAB_DRAIN_TOKEN} {"phase":"start","documents":3}`,
-      `${COLLAB_DRAIN_TOKEN} {"phase":"done","documents":3,"ms":1234}`,
+      `${COLLAB_DRAIN_TOKEN} {"phase":"start","trigger":"shutdown","documents":3}`,
+      `${COLLAB_DRAIN_TOKEN} done resident=0 failed=0 {"phase":"done","trigger":"shutdown","documents":3,"ms":1234}`,
+      `${COLLAB_DRAIN_TOKEN} {"phase":"start","trigger":"quiesce","documents":9}`,
+      `${COLLAB_DRAIN_TOKEN} done resident=2 failed=1 {"phase":"done","trigger":"quiesce","documents":9,"ms":5}`,
     ]);
+  });
+
+  it('#919: only endDrain lifts the flag, and it changes the drain generation (a running drain stops on it)', () => {
+    const bounds = new CollabSocketBounds({ limitLog: quiet(), drainLog: { log: () => undefined } });
+    const generation = bounds.drainGeneration;
+    bounds.beginDrain(0, 'quiesce');
+    bounds.beginDrain(0, 'quiesce');
+    bounds.beginDrain(0, 'shutdown');
+    expect(bounds.draining).toBe(true);
+    expect(bounds.drainGeneration).toBe(generation);
+    bounds.endDrain();
+    expect(bounds.draining).toBe(false);
+    expect(bounds.drainGeneration).not.toBe(generation);
+    resumeCompactionsForTests();
   });
 });

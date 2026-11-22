@@ -23,11 +23,15 @@
  * extension (§213). CollaborationModule is a static module, so this is exactly as process-wide as the module-level
  * singletons it replaced, and a spec builds its own. The class is undecorated, so Nest never resolves its options.
  *
- * It also holds the drain flag (#810): the gateway's `destroy` sets it first (`beginDrain`, seam §3), and from then on the
- * `connected` hook closes every new connection 1013 (user-connections.ts), so the drain never waits for the SIGKILL behind
- * a late Auth. `beginDrain` writes `COLLAB_DRAIN {"phase":"start","documents"}` and its returned callback
- * `COLLAB_DRAIN {"phase":"done","documents","ms"}` (`documents`: resident when the drain began), one line each per
- * shutdown, so a deploy's drain and its length show in the logs.
+ * It also holds the drain flag (#810): the collab drain (collab-quiesce.ts `runCollabDrain`, run by the gateway's
+ * `destroy` and, #919, by `POST /api/collab/quiesce`) sets it first (`beginDrain`), and from then on the `connected` hook
+ * closes every new connection 1013 (user-connections.ts), so the drain never waits for the SIGKILL behind a late Auth;
+ * since #919 the update guard extension also refuses every frame and every load, and the handler every direct write
+ * (collab-quiesce.ts). The flag is sticky for the life of the process: only `endDrain` (the quiesce abort) lifts it.
+ * Each drain run writes `COLLAB_DRAIN {"phase":"start","trigger","documents"}` and, through `beginDrain`'s returned
+ * callback, `COLLAB_DRAIN done resident=<n> failed=<n> {"phase":"done","trigger","documents","ms"}` (`documents`:
+ * resident when the run began; `resident` and `failed`: what it left), so a drain, its length and what it could not
+ * store show in the logs. The shutdown run's done line is the last one a stopped task writes (#919 FENCE reads it).
  *
  * Only the rate-limited log sink stays module-level (socket-limit-log.ts): sharing it is its purpose (one quota of lines
  * a minute per limit, for every bound, the module's ws_error line and the update guard). The connect's refusals that are not
@@ -80,13 +84,22 @@ export interface CollabSocketBoundsOptions {
   /** The platform's edge-trust endpoint (client-trust.ts); absent or null: the trust stays unknown, the share off. */
   fetchEdgeTrust?: EdgeTrustFetch | null;
   pingIntervalMs?: number;
-  /** Where the two COLLAB_DRAIN lines go (a Nest logger by default). */
+  /** Where the COLLAB_DRAIN lines go (a Nest logger by default). */
   drainLog?: { log(message: string): void };
   now?: () => number;
 }
 
 /** The token of the drain's start and done lines (#810). */
 export const COLLAB_DRAIN_TOKEN = 'COLLAB_DRAIN';
+
+/** What started a drain run (#919): the quiesce route, or the process's shutdown (the gateway's `destroy`). */
+export type CollabDrainTrigger = 'quiesce' | 'shutdown';
+
+/** What a drain run left: documents still resident (loaded or loading) and how many of them hold a failed store. */
+export interface CollabDrainCounts {
+  resident: number;
+  failed: number;
+}
 
 export class CollabSocketBounds implements OnModuleInit, OnModuleDestroy {
   readonly limitLog: SocketLimitLog;
@@ -107,6 +120,8 @@ export class CollabSocketBounds implements OnModuleInit, OnModuleDestroy {
   private readonly drainLog: { log(message: string): void };
   private readonly now: () => number;
   private drainingSince: number | null = null;
+  /** #919: bumped by every `endDrain`, so a drain run can tell it was aborted. */
+  private drainEpoch = 0;
 
   constructor(opts: CollabSocketBoundsOptions = {}) {
     this.limitLog = opts.limitLog ?? collabSocketLimitLog;
@@ -123,27 +138,47 @@ export class CollabSocketBounds implements OnModuleInit, OnModuleDestroy {
     this.userConnectionsExtension = new CollabUserConnectionsExtension(this.connections, this.documents, () => this.draining);
   }
 
-  /** True from the start of the gateway's `destroy`: every connection established from then on is closed 1013. */
+  /**
+   * True from the start of the first drain (the gateway's `destroy`, or #919 a quiesce) until `endDrain`: every
+   * connection established from then on is closed 1013, and (#919) no frame applies, no document loads and no direct
+   * write runs.
+   */
   get draining(): boolean {
     return this.drainingSince !== null;
   }
 
+  /** #919: changes on every `endDrain` (a running drain compares it to stop once aborted). */
+  get drainGeneration(): number {
+    return this.drainEpoch;
+  }
+
   /**
-   * First in the gateway's `destroy` (seam §3), with its resident documents: sets `draining`, stops compaction for the
-   * rest of the process (#827, `stopCompactions`) and logs the start. The returned callback logs the done line once the
-   * documents have unloaded. A second call logs nothing new.
+   * First in every drain run (collab-quiesce.ts `runCollabDrain`), with the documents resident then: sets `draining`
+   * (sticky: a later run, a shutdown after a quiesce, keeps it), stops compaction for the rest of the process (#827,
+   * `stopCompactions`) and logs the start. The returned callback logs the run's done line once, with what it left.
    */
-  beginDrain(documents: number): () => void {
-    if (this.drainingSince !== null) return () => undefined;
-    const since = (this.drainingSince = this.now());
+  beginDrain(documents: number, trigger: CollabDrainTrigger = 'shutdown'): (left: CollabDrainCounts) => void {
+    if (this.drainingSince === null) this.drainingSince = this.now();
+    const since = this.now();
     stopCompactions(); // #827: the drain's unloads never compact (a rollback's older task may serve the page next)
-    this.drainLog.log(`${COLLAB_DRAIN_TOKEN} ${JSON.stringify({ phase: 'start', documents })}`);
+    this.drainLog.log(`${COLLAB_DRAIN_TOKEN} ${JSON.stringify({ phase: 'start', trigger, documents })}`);
     let done = false;
-    return () => {
+    return (left: CollabDrainCounts) => {
       if (done) return;
       done = true;
-      this.drainLog.log(`${COLLAB_DRAIN_TOKEN} ${JSON.stringify({ phase: 'done', documents, ms: this.now() - since })}`);
+      const counts = `resident=${left.resident} failed=${left.failed}`;
+      this.drainLog.log(`${COLLAB_DRAIN_TOKEN} done ${counts} ${JSON.stringify({ phase: 'done', trigger, documents, ms: this.now() - since })}`);
     };
+  }
+
+  /**
+   * #919, the quiesce abort only (`POST /api/collab/quiesce/abort`): lift the drain flag, so connections, frames, loads
+   * and direct writes are admitted again. Compaction stays stopped until the process restarts (harmless: a page then
+   * compacts on a later residency). Nothing else lifts the flag (collab-quiesce.fitness.spec.ts).
+   */
+  endDrain(): void {
+    this.drainingSince = null;
+    this.drainEpoch++;
   }
 
   /**
