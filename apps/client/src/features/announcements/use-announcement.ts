@@ -8,8 +8,10 @@
 // 200 `application/json` answer with the contract's shape replaces the data; anything else (Docmost's SPA fallback
 // `200 text/html`, a 404 from an older platform during a rolling deploy, a 503) throws, and TanStack keeps the
 // last good answer. That answer is trusted for MAX_STALE_MS after it arrived, or past that while a refetch is in
-// flight (each request has a 10 s deadline, so a hang ends as a failure), and then hidden (the fail-safe: once a refetch has failed, the banner never outlives a cancellation by more
-// than that). Nothing is persisted, so a reload starts clean.
+// flight and none has failed since the answer (each request has a 10 s deadline, so a hang ends as a failure), and
+// then hidden: the fail-safe is that the banner never outlives a cancellation by more than MAX_STALE_MS plus one
+// request deadline, and once a refetch has failed it stays hidden until a good answer. Nothing is persisted, so a
+// reload starts clean.
 //
 // Time: `now` is state, read from the clock only in a lazy initialiser, a timer and a `visibilitychange` callback
 // (fork lint enforces `react-hooks/purity`, so never `Date.now()` during render). One timer is armed at the next
@@ -155,7 +157,7 @@ export interface AnnouncementState {
 }
 
 export function useAnnouncement(): AnnouncementState {
-  const { data } = useQuery({
+  const { data, isError } = useQuery({
     queryKey: ANNOUNCEMENT_QUERY_KEY,
     queryFn: ({ signal }) => fetchAnnouncement(signal),
     enabled: !isNativeAuthEnabled(),
@@ -178,9 +180,13 @@ export function useAnnouncement(): AnnouncementState {
     readDismissedVersion(),
   );
 
-  // While a refetch is in flight the last answer still counts: its outcome decides. A failed one ends `fetching`, so a
-  // stale answer then hides (the fail-safe holds); a good one renews `receivedAt`.
-  const fresh = receivedAt !== null && (isFresh(receivedAt, now) || fetching);
+  // While a refetch is in flight the last answer still counts, but only until a refetch has FAILED since that answer
+  // arrived: the first failure ends the grace for good (until a good answer), so a stale strip never comes back for
+  // the next poll, focus or reconnect refetch. TanStack keeps `status: "error"` (with the old data) from a failed
+  // refetch, through the next fetch, until one succeeds; a good refetch also renews `receivedAt`.
+  const failedSinceAnswer = isError;
+  const fresh =
+    receivedAt !== null && (isFresh(receivedAt, now) || (fetching && !failedSinceAnswer));
   const phase = announcement && fresh ? phaseOf(announcement, now) : null;
   const dismissible = announcement !== null && phase !== null && isDismissible(announcement, now);
   // A dismissal applies only while the announcement is still dismissible: one made while "upcoming" stops

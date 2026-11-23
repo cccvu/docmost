@@ -14,7 +14,7 @@ import { MAX_STALE_MS } from "./announcement-schedule";
 
 // wiki-v2 #939 — the site announcement banner, end to end through the real hook and a stubbed `fetch`, on fake
 // timers (setTimeout + Date only: TanStack's 60 s poll is a setInterval and stays real, so it never fires here;
-// refetches are driven explicitly). NOT upstream Docmost code.
+// refetches are driven explicitly; the one describe that fakes setInterval too drives the real poll). NOT upstream Docmost code.
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
@@ -296,6 +296,23 @@ describe("AnnouncementBanner", () => {
     expect(screen.getByRole("status").textContent).toContain("Maintenance has started.");
   });
 
+  it("keeps the SAME status node through a dismissal and the downtime start, so the message is announced", async () => {
+    const start = NOW + 2 * MIN;
+    respond({ downtimeStartsAt: start, downtimeEndsAt: start + 60 * MIN });
+    renderBanner();
+    await advance();
+    const status = screen.getByRole("status");
+    fireEvent.click(dismissButton()!);
+    expect(region()).toBeNull();
+    expect(screen.getByRole("status")).toBe(status); // hidden strip: the same live region
+
+    await advance(2 * MIN);
+    expect(region()).not.toBeNull();
+    expect(screen.getByRole("status")).toBe(status); // shown again: still the same live region
+    expect(status.isConnected).toBe(true);
+    expect(status.textContent).toContain("Maintenance has started.");
+  });
+
   it("an announcement already in progress on load says nothing in the status line", async () => {
     respond({ downtimeStartsAt: NOW - MIN, downtimeEndsAt: NOW + 60 * MIN });
     renderBanner();
@@ -371,6 +388,26 @@ describe("AnnouncementBanner", () => {
       await advance(1);
       expect(region()).toBeNull();
       expect(headerHeight()).toBe(56);
+    });
+
+    it("after a failed refetch, the next in-flight refetch does not bring the stale strip back", async () => {
+      await staleThenRefetching();
+      await act(async () => settle(new Response("busy", { status: 503 })));
+      await advance(1);
+      expect(region()).toBeNull();
+
+      pending();
+      act(() => {
+        void client.refetchQueries().catch(() => {});
+      });
+      await advance(1);
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(region()).toBeNull(); // in flight again, but a refetch already failed: no grace
+      expect(headerHeight()).toBe(56);
+
+      await act(async () => settle(json({ endsAt: NOW + 60 * MIN })));
+      await advance(1);
+      expect(region()).not.toBeNull(); // a good answer shows it again
     });
 
     it("stays visible while the refetch runs, and keeps it when it succeeds", async () => {
@@ -495,6 +532,54 @@ describe("AnnouncementBanner", () => {
     } finally {
       spy.mockRestore();
     }
+  });
+
+  describe("the 60 s poll against a platform that keeps failing", () => {
+    beforeEach(() => {
+      vi.useRealTimers();
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "setInterval", "clearInterval", "Date"] });
+      vi.setSystemTime(NOW);
+    });
+
+    const hangUntilAborted = () =>
+      fetchMock.mockImplementation(
+        (_input, init) =>
+          new Promise<Response>((_resolve, reject) => {
+            const seen = init?.signal ?? undefined;
+            seen?.addEventListener("abort", () => reject(seen?.reason), { once: true });
+          }),
+      );
+    const slow503 = () =>
+      fetchMock.mockImplementation(
+        () =>
+          new Promise<Response>((resolve) => {
+            setTimeout(() => resolve(new Response("busy", { status: 503 })), 2_000);
+          }),
+      );
+
+    it.each([
+      ["hangs (each poll aborted at 10 s)", hangUntilAborted],
+      ["answers 503 after 2 s", slow503],
+    ])("never shows the stale strip again once it has hidden, when the platform %s", async (_n, failing) => {
+      respondOnce({ endsAt: NOW + 60 * MIN });
+      renderBanner();
+      await advance();
+      expect(region()).not.toBeNull();
+      failing();
+
+      // Every poll fails; the strip hides once the answer is older than 5 minutes (plus at most one deadline).
+      await advance(MAX_STALE_MS + FETCH_TIMEOUT_MS);
+      expect(region()).toBeNull();
+      const polls = fetchMock.mock.calls.length;
+
+      // Then, through several more polls (each one in flight for a while), it never comes back.
+      for (let elapsed = 0; elapsed < 5 * MIN; elapsed += 1_000) {
+        await advance(1_000);
+        expect(region()).toBeNull();
+        expect(headerHeight()).toBe(56);
+      }
+      expect(fetchMock.mock.calls.length).toBeGreaterThanOrEqual(polls + 4); // the poll really ran
+    });
   });
 
   it("a good refetch renews the 5 minutes", async () => {

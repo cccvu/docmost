@@ -143,7 +143,17 @@ export function AnnouncementBanner({ state }: { state: AnnouncementState }) {
     </VisuallyHidden>
   );
 
-  if (!visible || !a || !phase) return status;
+  // The status line stays at the same position in every branch, so React keeps the SAME node while the strip hides
+  // and shows (a dismissal, a hide then the downtime start): a live region inserted along with its text is often
+  // not announced.
+  if (!visible || !a || !phase) {
+    return (
+      <>
+        {null}
+        {status}
+      </>
+    );
+  }
 
   const Icon = SEVERITY_ICON[a.severity];
   const label = labelFor(a, phase, t);
@@ -151,49 +161,51 @@ export function AnnouncementBanner({ state }: { state: AnnouncementState }) {
 
   return (
     <>
-      <section
-        aria-labelledby={labelId}
-        className={classes.banner}
-        data-severity={a.severity}
-        data-phase={phase}
-      >
-        <Icon size={18} className={classes.icon} aria-hidden="true" />
-        <span id={labelId} className={classes.label}>
-          {label}
-        </span>
-        {time && <span className={classes.time}>{time}</span>}
-        <span className={classes.message}>{a.message}</span>
-        <span className={classes.actions}>
-          <Button
-            variant="subtle"
-            color="gray"
-            size="xs"
-            onClick={() => setDetailsOpen(true)}
-            aria-haspopup="dialog"
-          >
-            {t("Details")}
-          </Button>
-          {dismissible && (
-            <ActionIcon
+      <>
+        <section
+          aria-labelledby={labelId}
+          className={classes.banner}
+          data-severity={a.severity}
+          data-phase={phase}
+        >
+          <Icon size={18} className={classes.icon} aria-hidden="true" />
+          <span id={labelId} className={classes.label}>
+            {label}
+          </span>
+          {time && <span className={classes.time}>{time}</span>}
+          <span className={classes.message}>{a.message}</span>
+          <span className={classes.actions}>
+            <Button
               variant="subtle"
               color="gray"
-              size={28}
-              onClick={onDismiss}
-              aria-label={t("Dismiss announcement")}
+              size="xs"
+              onClick={() => setDetailsOpen(true)}
+              aria-haspopup="dialog"
             >
-              <IconX size={16} aria-hidden="true" />
-            </ActionIcon>
-          )}
-        </span>
-      </section>
-      <Modal
-        opened={detailsOpen}
-        onClose={() => setDetailsOpen(false)}
-        title={label}
-        closeButtonProps={{ "aria-label": t("Close") }}
-      >
-        <DetailsBody a={a} t={t} />
-      </Modal>
+              {t("Details")}
+            </Button>
+            {dismissible && (
+              <ActionIcon
+                variant="subtle"
+                color="gray"
+                size={28}
+                onClick={onDismiss}
+                aria-label={t("Dismiss announcement")}
+              >
+                <IconX size={16} aria-hidden="true" />
+              </ActionIcon>
+            )}
+          </span>
+        </section>
+        <Modal
+          opened={detailsOpen}
+          onClose={() => setDetailsOpen(false)}
+          title={label}
+          closeButtonProps={{ "aria-label": t("Close") }}
+        >
+          <DetailsBody a={a} t={t} />
+        </Modal>
+      </>
       {status}
     </>
   );
