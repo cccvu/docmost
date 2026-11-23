@@ -26,6 +26,15 @@ vi.mock("@/features/brand/brand-logo.tsx", () => ({ Brand: () => null }));
 vi.mock("./public-auth-buttons.tsx", () => ({ PublicAuthButtons: () => null }));
 vi.mock("@/lib/config.ts", () => ({ getAppName: () => "Wiki" }));
 vi.mock("@/features/layout/layout-tokens.ts", () => ({ HEADER_HEIGHT: 60 }));
+// wiki-v2 #939: the announcement hook needs a QueryClient this test does not provide; the strip and the header
+// height are covered by features/announcements/announcement-shell-mounts.test.tsx.
+vi.mock("@/features/announcements/use-announcement.ts", () => ({
+  useAnnouncement: () => ({ visible: false }),
+  shellHeaderHeight: () => 60,
+}));
+vi.mock("@/features/announcements/announcement-banner.tsx", () => ({
+  AnnouncementBanner: () => null,
+}));
 
 import { PublicShell } from "./public-shell";
 

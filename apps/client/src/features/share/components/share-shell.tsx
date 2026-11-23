@@ -2,6 +2,7 @@ import React, { useEffect, useMemo } from "react";
 import {
   ActionIcon,
   AppShell,
+  Box,
   Group,
   ScrollArea,
   Tooltip,
@@ -50,6 +51,11 @@ import ShareBranding from '@/features/share/components/share-branding.tsx';
 import { MAIN_CONTENT_ID, SkipToMain } from "@/components/ui/skip-to-main.tsx";
 import { currentUserAtom } from "@/features/user/atoms/current-user-atom.ts";
 import { PublicAuthButtons } from "@/features/public/components/public-auth-buttons.tsx";
+import { AnnouncementBanner } from "@/features/announcements/announcement-banner.tsx";
+import {
+  shellHeaderHeight,
+  useAnnouncement,
+} from "@/features/announcements/use-announcement.ts";
 
 const MemoizedSharedTree = React.memo(SharedTree);
 
@@ -70,6 +76,8 @@ export default function ShareShell({
   const toggleTocMobile = useToggleToc(mobileTableOfContentAsideAtom);
   const toggleToc = useToggleToc(tableOfContentAsideAtom);
   const [fullWidth, setFullWidth] = useAtom(sharedPageFullWidthAtom);
+  // CCC (wiki-v2 #939): the site announcement strip sits above the header row and adds its height.
+  const announcement = useAnnouncement();
 
   const { shareId } = useParams();
   const { data } = useGetSharedPageTreeQuery(shareId);
@@ -95,7 +103,7 @@ export default function ShareShell({
     <>
       <SkipToMain />
       <AppShell
-      header={{ height: HEADER_HEIGHT }}
+      header={{ height: shellHeaderHeight(announcement.visible) }}
       {...(data?.pageTree?.length > 1 && {
         navbar: {
           width: SIDEBAR_WIDTH,
@@ -117,6 +125,8 @@ export default function ShareShell({
       padding="md"
     >
       <AppShell.Header>
+        <AnnouncementBanner state={announcement} />
+        <Box h={HEADER_HEIGHT}>
         <Group wrap="nowrap" justify="space-between" py="sm" px="xl">
           <Group wrap="nowrap">
             {data?.pageTree?.length > 1 && (
@@ -206,6 +216,7 @@ export default function ShareShell({
             {!currentUser?.user && <PublicAuthButtons />}
           </Group>
         </Group>
+        </Box>
       </AppShell.Header>
 
       {data?.pageTree?.length > 1 && (

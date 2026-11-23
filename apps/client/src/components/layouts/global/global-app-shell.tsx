@@ -1,4 +1,4 @@
-import { AppShell, Container } from "@mantine/core";
+import { AppShell, Box, Container } from "@mantine/core";
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { useTranslation } from "react-i18next";
@@ -31,6 +31,11 @@ import {
   SIDEBAR_MIN_WIDTH,
   SIDEBAR_MAX_WIDTH,
 } from "@/features/layout/layout-tokens.ts";
+import { AnnouncementBanner } from "@/features/announcements/announcement-banner.tsx";
+import {
+  shellHeaderHeight,
+  useAnnouncement,
+} from "@/features/announcements/use-announcement.ts";
 
 export default function GlobalAppShell({
   children,
@@ -43,6 +48,8 @@ export default function GlobalAppShell({
   const toggleMobile = useToggleSidebar(mobileSidebarAtom);
   const [desktopOpened] = useAtom(desktopSidebarAtom);
   const [{ isAsideOpen, tab: asideTab }] = useAtom(asideStateAtom);
+  // CCC (wiki-v2 #939): the site announcement strip sits above the header row and adds its height.
+  const announcement = useAnnouncement();
 
   // CCC (issue: UI polish): user-resizable navbar. The width is a single persisted value
   // applied to EVERY sidebar (below), and shared same-origin with the console. The atom
@@ -120,7 +127,7 @@ export default function GlobalAppShell({
           breathe. Keep in sync with the coupled `.aside` margin-top in
           app-shell.module.css. */}
       <AppShell
-      header={{ height: HEADER_HEIGHT }}
+      header={{ height: shellHeaderHeight(announcement.visible) }}
       navbar={{
         // CCC: on desktop (sm+) EVERY sidebar becomes a RAIL_WIDTH icon rail when
         // "collapsed" rather than hiding, and otherwise expands to the SAME
@@ -153,8 +160,11 @@ export default function GlobalAppShell({
       }
       padding="md"
     >
-      <AppShell.Header px="md" className={classes.header}>
-        <AppHeader />
+      <AppShell.Header className={classes.header}>
+        <AnnouncementBanner state={announcement} />
+        <Box h={HEADER_HEIGHT} px="md">
+          <AppHeader />
+        </Box>
       </AppShell.Header>
       <AppShell.Navbar
         ref={navbarRef}
