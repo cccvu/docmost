@@ -1,0 +1,82 @@
+/* wiki-v2 #939 — NOT upstream Docmost code. The site announcement strip: one line, a fixed height (BANNER_HEIGHT in
+   use-announcement.ts, which the shells add to the header height), full width above the header row.
+
+   Colours are light tints: blue for info, gold for warning, red for critical. The message keeps the body text
+   colour (AA on every tint); the label uses a dark shade in light mode and a light one in dark mode, each tuned
+   for AA on its tint. Gold text is the theme's gold-ink (#7a5c00), never the bright fill; never yellow. */
+
+.banner {
+  /* KEEP IN SYNC with BANNER_HEIGHT (use-announcement.ts). */
+  height: 40px;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: var(--mantine-spacing-xs);
+  padding-inline: var(--mantine-spacing-md);
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: var(--mantine-font-size-sm);
+  line-height: 1.2;
+  color: var(--mantine-color-text);
+  border-bottom: 1px solid var(--banner-border);
+  background-color: var(--banner-bg);
+}
+
+.banner[data-severity="info"] {
+  --banner-bg: light-dark(var(--mantine-color-blue-0), rgba(69, 139, 242, 0.16));
+  --banner-border: light-dark(var(--mantine-color-blue-2), rgba(69, 139, 242, 0.35));
+  --banner-accent: light-dark(var(--mantine-color-blue-9), var(--mantine-color-blue-2));
+}
+
+.banner[data-severity="warning"] {
+  --banner-bg: light-dark(var(--mantine-color-gold-1), rgba(242, 204, 12, 0.14));
+  --banner-border: light-dark(var(--mantine-color-gold-3), rgba(242, 204, 12, 0.35));
+  --banner-accent: light-dark(#7a5c00, var(--mantine-color-gold-5));
+}
+
+.banner[data-severity="critical"] {
+  --banner-bg: light-dark(var(--mantine-color-red-0), rgba(212, 53, 53, 0.18));
+  --banner-border: light-dark(var(--mantine-color-red-2), rgba(212, 53, 53, 0.4));
+  --banner-accent: light-dark(var(--mantine-color-red-9), var(--mantine-color-red-2));
+}
+
+.icon {
+  flex-shrink: 0;
+  color: var(--banner-accent);
+}
+
+.label {
+  flex-shrink: 0;
+  font-weight: 600;
+  color: var(--banner-accent);
+}
+
+.time {
+  flex-shrink: 0;
+}
+
+/* The time is in Details too: drop it first on a narrow screen (or at high zoom) so the message keeps room. */
+@media (max-width: $mantine-breakpoint-sm) {
+  .time {
+    display: none;
+  }
+}
+
+.message {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.actions {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.fullMessage {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

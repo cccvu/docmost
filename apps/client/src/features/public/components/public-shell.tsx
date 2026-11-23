@@ -8,6 +8,11 @@ import { getAppName } from "@/lib/config.ts";
 import { Brand } from "@/features/brand/brand-logo.tsx";
 import { PublicAuthButtons } from "./public-auth-buttons.tsx";
 import { HEADER_HEIGHT } from "@/features/layout/layout-tokens.ts";
+import { AnnouncementBanner } from "@/features/announcements/announcement-banner.tsx";
+import {
+  shellHeaderHeight,
+  useAnnouncement,
+} from "@/features/announcements/use-announcement.ts";
 
 /**
  * A lightweight, header-only app shell for the anonymous public surface (front page + request-access).
@@ -26,13 +31,16 @@ export function PublicShell({
 }) {
   const { data: workspace } = useWorkspacePublicDataQuery();
   const name = workspace?.name || getAppName();
+  // wiki-v2 #939: the site announcement strip (the sign-in pages are where a maintenance notice matters most).
+  const announcement = useAnnouncement();
 
   return (
     <>
       <SkipToMain />
-      <AppShell header={{ height: HEADER_HEIGHT }} padding="md">
+      <AppShell header={{ height: shellHeaderHeight(announcement.visible) }} padding="md">
         <AppShell.Header>
-          <Group h="100%" px="md" justify="space-between" wrap="nowrap">
+          <AnnouncementBanner state={announcement} />
+          <Group h={HEADER_HEIGHT} px="md" justify="space-between" wrap="nowrap">
             <Link
               to="/"
               aria-label={name}
