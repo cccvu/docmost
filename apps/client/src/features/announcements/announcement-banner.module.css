@@ -45,8 +45,14 @@
   color: var(--banner-accent);
 }
 
+/* The label and the message may shrink (with an ellipsis); the icon and the actions never do, so Details and
+   Dismiss always stay whole inside the strip, whose `overflow: hidden` would otherwise clip them. Both texts are
+   whole in Details (the dialog title is the label). */
 .label {
-  flex-shrink: 0;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   font-weight: 600;
   color: var(--banner-accent);
 }
@@ -55,18 +61,25 @@
   flex-shrink: 0;
 }
 
-/* The time is in Details too: drop it first on a narrow screen (or at high zoom) so the message keeps room. */
-@media (max-width: $mantine-breakpoint-sm) {
-  .time {
-    display: none;
-  }
-}
-
+/* A zero basis: the message only ever takes the room left over, so it can never push the actions out. */
 .message {
-  flex: 1 1 auto;
+  flex: 1 1 0;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* Narrow screens (or high zoom): drop the time first (it is in Details too) and tighten the spacing, so at 320 px
+   "Scheduled maintenance" still fits whole beside Details and Dismiss (narrower than that, it truncates). */
+@media (max-width: $mantine-breakpoint-sm) {
+  .banner {
+    gap: 4px;
+    padding-inline: var(--mantine-spacing-xs);
+  }
+
+  .time {
+    display: none;
+  }
 }
 
 .actions {
