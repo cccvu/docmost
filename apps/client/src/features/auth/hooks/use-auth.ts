@@ -98,7 +98,15 @@ export default function useAuth() {
 
   const handleLogout = async () => {
     setCurrentUser(RESET);
-    await logout();
+    try {
+      await logout();
+    } catch {
+      // CCC (wiki-v2 #917): only native mode rethrows (remote uses allSettled). The RESET above has
+      // already unmounted the tree and the session is still open, so reload: the page comes back
+      // honestly signed in instead of blank, and a shared machine is not told it signed out.
+      window.location.reload();
+      return;
+    }
     window.location.replace(`${APP_ROUTE.AUTH.LOGIN}?logout=1`);
   };
 

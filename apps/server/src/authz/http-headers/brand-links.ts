@@ -15,9 +15,14 @@ import type { AuthzMode } from '../mode/authz-mode';
  * HTML is served unchanged (the runtime loader still swaps the links after boot), the miss is logged, and
  * `brand-links.spec.ts`, which runs this on the real `apps/client/index.html`, goes red.
  *
+ * When no bundle loads after boot (the platform serves none, or `/brand/manifest.json` stays unreachable), the
+ * runtime loader resets these links to the neutral `/icons/*` and `/manifest.json` hrefs, so a tab never keeps a
+ * `/brand` href that 404s (#915).
+ *
  * Native (standalone) mode has no platform and so no `/brand`: the HTML is left alone there.
  * No brand string or artwork lives here: only the generic `/brand/` paths the platform's bundle serves
- * (`services/platform/test/brand-links-parity.spec.ts` pins every target to a file in that bundle).
+ * (`services/platform/test/brand-links-parity.spec.ts` pins every target to a file in that bundle). The table has a
+ * JSON copy, `brand-link-rewrites.json`, which that platform spec reads; `brand-links.spec.ts` pins the two equal.
  */
 export interface BrandLinkRewrite {
   /** The `rel` attribute of the static `<link>`. */
@@ -59,8 +64,12 @@ export interface BrandLinksResult {
 
 const LINK_TAG = /<link\b[^>]*>/gi;
 
+/**
+ * As strict as the replace in {@link brandStaticLinks} (`href="<from>"`): a space, the lower-case name, `=` and a
+ * double-quoted value. Any other spelling (`href = "…"`, `HREF="…"`) counts as a miss, never a silent no-op (#915).
+ */
 function attr(tag: string, name: string): string | undefined {
-  const m = new RegExp(`\\s${name}\\s*=\\s*"([^"]*)"`, 'i').exec(tag);
+  const m = new RegExp(`\\s${name}="([^"]*)"`).exec(tag);
   return m ? m[1] : undefined;
 }
 

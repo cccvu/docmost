@@ -1,7 +1,9 @@
-// wiki-v2 UI cleanup: page-history "Restore" (desktop history-list.tsx and history-modal-mobile.tsx
-// both read `canRestore` from this hook) needs space Manage Page AND the page's own canEdit, sourced
-// exactly as pages/page/page.tsx does (`!deletedAt && permissions.canEdit`). A space writer is no
-// longer offered Restore on a restricted page they cannot edit. Real CASL over the space rules.
+// wiki-v2 UI cleanup, #858 C1: page-history "Restore" (desktop history-list.tsx and history-modal-mobile.tsx
+// both read `canRestore` from this hook) is the page's own edit right, sourced exactly as pages/page/page.tsx
+// does (`!deletedAt && permissions.canEdit`). That is the server's edit decision (validateCanEdit, and collab's
+// read-only flag): a space writer is not offered Restore on a restricted page they cannot edit, and a page-only
+// editor (a space reader with an edit grant on a restricted page) is. The space's own rules no longer matter:
+// the mock still serves them so re-adding a space gate turns the reader row red.
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { renderHook } from "@testing-library/react";
 import React from "react";
@@ -94,9 +96,15 @@ describe("useHistoryRestore — canRestore", () => {
     expect(canRestore()).toBe(false);
   });
 
-  it("space reader, even with page canEdit: no Restore (space gate unchanged)", () => {
+  it("page-only editor (space reader, page canEdit): Restore offered (matches the server's edit decision)", () => {
     state.rules = READER_RULES;
     state.page = { deletedAt: null, permissions: { canEdit: true } };
+    expect(canRestore()).toBe(true);
+  });
+
+  it("space reader without page canEdit: no Restore", () => {
+    state.rules = READER_RULES;
+    state.page = { deletedAt: null, permissions: { canEdit: false } };
     expect(canRestore()).toBe(false);
   });
 });

@@ -1,6 +1,7 @@
 import { modals } from "@mantine/modals";
 import { Text } from "@mantine/core";
 import { useTranslation } from "react-i18next";
+import { useFocusFallback } from "@/features/layout/use-focus-fallback";
 
 type UseDeleteModalProps = {
   onConfirm: () => void;
@@ -9,6 +10,7 @@ type UseDeleteModalProps = {
 
 export function useDeletePageModal() {
   const { t } = useTranslation();
+  const armFocusFallback = useFocusFallback(); // CCC (wiki-v2 #913): see onConfirm
   const openDeleteModal = ({
     onConfirm,
     isPermanent = false,
@@ -32,7 +34,10 @@ export function useDeletePageModal() {
         cancel: t("Cancel"),
       },
       confirmProps: { color: "red" },
-      onConfirm,
+      onConfirm: () => {
+        armFocusFallback(); // CCC (wiki-v2 #913): the trigger's row/node/banner may go
+        onConfirm();
+      },
     });
   };
 

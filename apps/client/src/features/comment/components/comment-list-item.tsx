@@ -8,10 +8,18 @@ import { pageEditorAtom } from "@/features/editor/atoms/editor-atoms";
 import { isEditorReady } from "@docmost/editor-ext";
 import CommentActions from "@/features/comment/components/comment-actions";
 import CommentMenu from "@/features/comment/components/comment-menu";
-import { useHasFeature } from "@/ee/hooks/use-feature";
-import { Feature } from "@/ee/features";
+import { useCommentResolutionAvailable } from "@/features/feature-availability/feature-gate";
+import {
+  enclosingTab,
+  useFocusFallback,
+} from "@/features/layout/use-focus-fallback";
 import ResolveComment from "@/ee/comment/components/resolve-comment";
-import { useHover } from "@mantine/hooks";
+import {
+  useFocusWithin,
+  useHover,
+  useMediaQuery,
+  useMergedRef,
+} from "@mantine/hooks";
 import {
   useDeleteCommentMutation,
   useUpdateCommentMutation,
@@ -37,6 +45,16 @@ function CommentListItem({
 }: CommentListItemProps) {
   const { t } = useTranslation();
   const { hovered, ref } = useHover();
+  // CCC #913: the actions also show while they hold keyboard focus. They are transparent, not
+  // `visibility: hidden`, at rest, so Tab (and a screen reader) can reach them without a pointer.
+  const { ref: actionsRef, focused: actionsFocused } = useFocusWithin();
+  // CCC #913: a device that cannot hover (touch) shows them always, never as invisible buttons that take taps.
+  const cannotHover = useMediaQuery("(hover: none)");
+  // CCC #913: a deleted comment (its menu held focus) hands focus to its comment tab, else the main content.
+  const rootRef = useRef<HTMLDivElement>(null);
+  const itemRef = useMergedRef(ref, rootRef);
+  const focusTarget = useRef<HTMLElement | null>(null);
+  const armFocusFallback = useFocusFallback(() => focusTarget.current);
   const [isEditing, setIsEditing] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const editor = useAtomValue(pageEditorAtom);
@@ -46,7 +64,8 @@ function CommentListItem({
   const deleteCommentMutation = useDeleteCommentMutation(comment.pageId);
   const resolveCommentMutation = useResolveCommentMutation();
   const [currentUser] = useAtom(currentUserAtom);
-  const canResolve = useHasFeature(Feature.COMMENT_RESOLUTION);
+  // CCC #858: the fork serves /comments/resolve in both modes; the licence entitlement is never granted.
+  const canResolve = useCommentResolutionAvailable();
   const createdAtAgo = useTimeAgo(comment.createdAt);
 
   useEffect(() => {
@@ -74,6 +93,8 @@ function CommentListItem({
   }
 
   async function handleDeleteComment() {
+    focusTarget.current = enclosingTab(rootRef.current);
+    armFocusFallback();
     try {
       await deleteCommentMutation.mutateAsync(comment.id);
       if (isEditorReady(editor)) {
@@ -126,7 +147,7 @@ function CommentListItem({
   }
 
   return (
-    <Box ref={ref} pb="xs">
+    <Box ref={itemRef} pb="xs">
       <Group>
         <CustomAvatar
           size="sm"
@@ -140,7 +161,10 @@ function CommentListItem({
               {comment.creator.name}
             </Text>
 
-            <div style={{ visibility: hovered ? "visible" : "hidden" }}>
+            <div
+              ref={actionsRef}
+              style={{ opacity: hovered || actionsFocused || cannotHover ? 1 : 0 }}
+            >
               {!comment.parentCommentId && canComment && canResolve && (
                 <ResolveComment
                   editor={editor}

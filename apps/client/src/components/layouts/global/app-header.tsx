@@ -33,7 +33,7 @@ import {
   shareSearchSpotlight,
 } from "@/features/search/constants.ts";
 import { NotificationPopover } from "@/features/notification/components/notification-popover.tsx";
-import { workspaceAtom } from "@/features/user/atoms/current-user-atom.ts";
+import { useAiChatAvailable } from "@/features/feature-availability/feature-gate";
 // CCC seam (issue #57): platform-admin entry point → the standalone /console. Self-gating (renders only
 // for a platform workspace admin); advisory-only, all authority is re-enforced server-side by the PDP.
 import { AdminEntryLink } from "@/features/admin-entry/admin-entry-link.tsx";
@@ -48,8 +48,8 @@ export function AppHeader() {
   const { isTrial, trialDaysLeft } = useTrial();
   const location = useLocation();
   const toggleAside = useToggleAside();
-  const [workspace] = useAtom(workspaceAtom);
-  const aiChatEnabled = workspace?.settings?.ai?.chat === true;
+  // CCC #858: the AI entitlement AND the workspace flag (the flag alone links to an unregistered /ai).
+  const aiChatEnabled = useAiChatAvailable();
 
   const isPageRoute = location.pathname.includes("/p/");
 

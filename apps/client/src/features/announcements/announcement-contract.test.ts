@@ -1,7 +1,13 @@
 import { describe, it, expect } from "vitest";
 import { AnnouncementShapeError, parseAnnouncementBody } from "./announcement-contract";
+import vectors from "./announcement-public-vectors.json";
 
 // wiki-v2 #939 — the public GET /bff/announcement body. NOT upstream Docmost code.
+//
+// #946: announcement-public-vectors.json is byte-identical to the platform's
+// services/platform/test/fixtures/announcement-public-vectors.json. The platform's announcement.http.spec.ts proves each
+// `body` is exactly what GET /bff/announcement answers (and that the two copies match); here the real parser must turn
+// each `body` into its `parsed` (times as epoch ms).
 
 const good = {
   version: 3,
@@ -14,6 +20,20 @@ const good = {
 };
 
 describe("parseAnnouncementBody", () => {
+  it("has golden vectors to check (anti-vacuity): a null and at least one announcement", () => {
+    expect(vectors.some((v) => v.parsed === null)).toBe(true);
+    expect(
+      vectors.filter((v) => v.parsed !== null).length,
+    ).toBeGreaterThanOrEqual(2);
+  });
+
+  it.each(vectors.map((v) => [v.name, v] as const))(
+    "golden vector: %s",
+    (_n, v) => {
+      expect(parseAnnouncementBody(v.body)).toEqual(v.parsed);
+    },
+  );
+
   it("parses null", () => {
     expect(parseAnnouncementBody({ announcement: null })).toBeNull();
   });

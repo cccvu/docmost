@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
 import { workspaceAtom } from "@/features/user/atoms/current-user-atom.ts";
 import { getAppName } from "@/lib/config.ts";
+import { useAiChatAvailable } from "@/features/feature-availability/feature-gate";
 import ChatInput from "@/ee/ai-chat/components/chat-input";
 import type {
   ChatAttachment,
@@ -21,7 +22,8 @@ export default function HomeAiPrompt() {
   const navigate = useNavigate();
   const workspace = useAtomValue(workspaceAtom);
 
-  const aiChatEnabled = workspace?.settings?.ai?.chat === true;
+  // CCC #858: the AI entitlement AND the workspace flag (the flag alone links to an unregistered /ai).
+  const aiChatEnabled = useAiChatAvailable();
   if (!aiChatEnabled) return null;
 
   const handleSend = (

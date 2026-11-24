@@ -248,5 +248,10 @@ export const mantineCssResolver: CSSVariablesResolver = (theme) => ({
     "--brand-primary-bg": "var(--mantine-color-brandBlack-1)",
     "--brand-primary-bg-hover": "var(--mantine-color-brandBlack-2)",
     "--brand-on-primary": "var(--mantine-color-brandBlack-9)",
+    // Mantine's dark error colour is red.8 (#a82022): 2.16:1 on the dark input
+    // (dark.6 #232327), so error borders, error text and typed error text all
+    // fail. red.3 (#e3807f) gives 5.07 / 5.71 / 6.46:1 on dark.5 (filled
+    // input) / dark.6 / dark.7 (body), clearing 4.5:1 text and 3:1 borders.
+    "--mantine-color-error": "var(--mantine-color-red-3)",
   },
 });

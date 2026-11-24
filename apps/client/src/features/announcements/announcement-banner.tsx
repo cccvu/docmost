@@ -6,6 +6,9 @@
 //     alert would re-announce on every SPA remount.
 //   - Severity is text plus icon, never colour alone. The strip is one line (fixed height, ellipsis); "Details"
 //     opens a modal with the full message and the downtime lines.
+//   - Below `sm` (a phone, or high zoom) the strip shows the downtime's time, without its year, instead of the
+//     message (#946). Only the display changes: a screen reader hears the same strip at every width (label, the
+//     full time once, message).
 //   - One visually hidden polite status line speaks only when the downtime STARTS mid-session (the "save your work"
 //     moment). It stays mounted while the strip is hidden so it is in the tree before its text changes.
 //   - Dismiss is a ≥24 px icon button with a name, shown only when dismissible; afterwards focus moves to <main>.
@@ -63,13 +66,21 @@ function durationText(ms: number, t: T): string {
   return parts.join(" ");
 }
 
-/** The strip's compact time: the downtime start while upcoming, its end while in progress. */
-function compactTime(a: Announcement, phase: AnnouncementPhase, t: T): string | null {
+/**
+ * The strip's compact time: the downtime start while upcoming, its end while in progress. `long` is the full form
+ * (what a screen reader hears); `short` drops the year for narrow screens (#946) and is only a visual duplicate.
+ */
+function compactTime(
+  a: Announcement,
+  phase: AnnouncementPhase,
+  t: T,
+): { long: string; short: string } | null {
   if (a.downtimeStartsAt === null || a.downtimeEndsAt === null) return null;
   const w = formatWindow(a.downtimeStartsAt, a.downtimeEndsAt);
-  if (phase === "upcoming") return t("Starts {{time}}", { time: w.start.central });
-  if (phase === "in_progress") return t("Until {{time}}", { time: w.end.central });
-  return null;
+  const at = phase === "upcoming" ? w.start : phase === "in_progress" ? w.end : null;
+  if (!at) return null;
+  const key = phase === "upcoming" ? "Starts {{time}}" : "Until {{time}}";
+  return { long: t(key, { time: at.central }), short: t(key, { time: at.centralShort }) };
 }
 
 function DetailsBody({ a, t }: { a: Announcement; t: T }) {
@@ -105,10 +116,86 @@ function DetailsBody({ a, t }: { a: Announcement; t: T }) {
   );
 }
 
-export function AnnouncementBanner({ state }: { state: AnnouncementState }) {
+interface AnnouncementStripProps {
+  a: Announcement;
+  phase: AnnouncementPhase;
+  dismissible: boolean;
+  onDismiss: () => void;
+}
+
+/** The visible strip and its Details dialog. Mounted only while the strip shows, so Details closes with it. */
+function AnnouncementStrip({ a, phase, dismissible, onDismiss }: AnnouncementStripProps) {
   const { t } = useTranslation();
   const labelId = useId();
   const [detailsOpen, setDetailsOpen] = useState(false);
+
+  const Icon = SEVERITY_ICON[a.severity];
+  const label = labelFor(a, phase, t);
+  const time = compactTime(a, phase, t);
+
+  return (
+    <>
+      <section
+        aria-labelledby={labelId}
+        className={classes.banner}
+        data-severity={a.severity}
+        data-phase={phase}
+      >
+        <Icon size={18} className={classes.icon} aria-hidden="true" />
+        <span id={labelId} className={classes.label}>
+          {label}
+        </span>
+        {time && (
+          // Below `sm` the short form shows instead of the long one (and of the message). The long one stays in the
+          // accessibility tree at every width, so a screen reader hears the time once, in full.
+          <span className={classes.time}>
+            <span className={classes.timeLong}>{time.long}</span>
+            <span className={classes.timeShort} aria-hidden="true">
+              {time.short}
+            </span>
+          </span>
+        )}
+        <span className={classes.message}>{a.message}</span>
+        <span className={classes.actions}>
+          <Button
+            variant="subtle"
+            color="gray"
+            size="xs"
+            onClick={() => setDetailsOpen(true)}
+            aria-haspopup="dialog"
+          >
+            {t("Details")}
+          </Button>
+          {dismissible && (
+            <ActionIcon
+              variant="subtle"
+              color="gray"
+              size={28}
+              onClick={() => {
+                setDetailsOpen(false);
+                onDismiss();
+              }}
+              aria-label={t("Dismiss announcement")}
+            >
+              <IconX size={16} aria-hidden="true" />
+            </ActionIcon>
+          )}
+        </span>
+      </section>
+      <Modal
+        opened={detailsOpen}
+        onClose={() => setDetailsOpen(false)}
+        title={label}
+        closeButtonProps={{ "aria-label": t("Close") }}
+      >
+        <DetailsBody a={a} t={t} />
+      </Modal>
+    </>
+  );
+}
+
+export function AnnouncementBanner({ state }: { state: AnnouncementState }) {
+  const { t } = useTranslation();
   const { visible, announcement: a, phase, dismissible, dismiss } = state;
 
   // Speak once when the downtime starts mid-session (previous-render state, not an effect).
@@ -132,81 +219,21 @@ export function AnnouncementBanner({ state }: { state: AnnouncementState }) {
   }, [visible]);
 
   const onDismiss = () => {
-    setDetailsOpen(false);
     dismiss();
     document.getElementById(MAIN_CONTENT_ID)?.focus();
   };
 
-  const status = (
-    <VisuallyHidden role="status" aria-live="polite">
-      {liveText}
-    </VisuallyHidden>
-  );
-
-  // The status line stays at the same position in every branch, so React keeps the SAME node while the strip hides
-  // and shows (a dismissal, a hide then the downtime start): a live region inserted along with its text is often
-  // not announced.
-  if (!visible || !a || !phase) {
-    return (
-      <>
-        {null}
-        {status}
-      </>
-    );
-  }
-
-  const Icon = SEVERITY_ICON[a.severity];
-  const label = labelFor(a, phase, t);
-  const time = compactTime(a, phase, t);
-
+  // One return: the strip is the first child (or null) and the status line always the second, so React keeps the
+  // SAME status node while the strip hides and shows (a dismissal, a hide then the downtime start): a live region
+  // inserted along with its text is often not announced.
   return (
     <>
-      <>
-        <section
-          aria-labelledby={labelId}
-          className={classes.banner}
-          data-severity={a.severity}
-          data-phase={phase}
-        >
-          <Icon size={18} className={classes.icon} aria-hidden="true" />
-          <span id={labelId} className={classes.label}>
-            {label}
-          </span>
-          {time && <span className={classes.time}>{time}</span>}
-          <span className={classes.message}>{a.message}</span>
-          <span className={classes.actions}>
-            <Button
-              variant="subtle"
-              color="gray"
-              size="xs"
-              onClick={() => setDetailsOpen(true)}
-              aria-haspopup="dialog"
-            >
-              {t("Details")}
-            </Button>
-            {dismissible && (
-              <ActionIcon
-                variant="subtle"
-                color="gray"
-                size={28}
-                onClick={onDismiss}
-                aria-label={t("Dismiss announcement")}
-              >
-                <IconX size={16} aria-hidden="true" />
-              </ActionIcon>
-            )}
-          </span>
-        </section>
-        <Modal
-          opened={detailsOpen}
-          onClose={() => setDetailsOpen(false)}
-          title={label}
-          closeButtonProps={{ "aria-label": t("Close") }}
-        >
-          <DetailsBody a={a} t={t} />
-        </Modal>
-      </>
-      {status}
+      {visible && a && phase ? (
+        <AnnouncementStrip a={a} phase={phase} dismissible={dismissible} onDismiss={onDismiss} />
+      ) : null}
+      <VisuallyHidden role="status" aria-live="polite">
+        {liveText}
+      </VisuallyHidden>
     </>
   );
 }

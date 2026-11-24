@@ -66,17 +66,20 @@ describe("PublicAuthButtons", () => {
   it.each(["/login", "/login/verify"])(
     "remote mode on %s: renders neither Log in nor Request access",
     (path) => {
-      renderWithProviders(<PublicAuthButtons />, path);
+      const { container } = renderWithProviders(<PublicAuthButtons />, path);
       expect(screen.queryByRole("link", { name: /log in/i })).toBeNull();
       expect(screen.queryByRole("link", { name: /request access/i })).toBeNull();
+      // #858: nothing at all, not an empty Group that still takes the shell's gap beside the theme toggle.
+      expect(container.querySelector(".mantine-Group-root")).toBeNull();
     },
   );
 
   it("native mode on /login: renders no Log in link to the page the visitor is on", () => {
     nativeState.value = true;
-    renderWithProviders(<PublicAuthButtons />, "/login");
+    const { container } = renderWithProviders(<PublicAuthButtons />, "/login");
     expect(screen.queryByRole("link", { name: /log in/i })).toBeNull();
     expect(screen.queryAllByRole("link")).toHaveLength(0);
+    expect(container.querySelector(".mantine-Group-root")).toBeNull();
   });
 
   it("remote mode on /request-access: renders Log in but not Request access", () => {

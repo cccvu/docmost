@@ -1,3 +1,5 @@
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 /**
@@ -236,5 +238,104 @@ describe("loadBrandConfig", () => {
     expect(mod.sanitizeBrandAssetUrl("https://evil.example/x.png")).toBeUndefined();
     expect(mod.sanitizeBrandAssetUrl("/other/x.png")).toBeUndefined();
     expect(mod.sanitizeBrandAssetUrl("/brand/../secrets.png")).toBeUndefined();
+  });
+});
+
+/**
+ * #915: in remote mode the server points the static links at /brand at boot (server authz/http-headers/brand-links.ts).
+ * When no bundle loads (a 404, or a transient failure that outlived its retry), the runtime loader must put the
+ * neutral links back, or the tab keeps hrefs that 404.
+ */
+describe("static head links when the brand loads neutral (#915)", () => {
+  const SERVER_REWRITTEN = {
+    favicon32: "/brand/favicon-32x32.png",
+    favicon16: "/brand/favicon-16x16.png",
+    appleTouchIcon: "/brand/apple-touch-icon.png",
+    webManifest: "/brand/site.webmanifest",
+  };
+
+  /** The four static links, as the shell (or the server's boot rewrite of it) carries them. */
+  function seedHead(hrefs: typeof SERVER_REWRITTEN): void {
+    document.head.querySelectorAll("link").forEach((link) => link.remove());
+    document.head.insertAdjacentHTML(
+      "beforeend",
+      `<link rel="icon" type="image/png" sizes="32x32" href="${hrefs.favicon32}" />` +
+        `<link rel="icon" type="image/png" sizes="16x16" href="${hrefs.favicon16}" />` +
+        `<link rel="apple-touch-icon" href="${hrefs.appleTouchIcon}" />` +
+        `<link rel="manifest" href="${hrefs.webManifest}" />`,
+    );
+  }
+
+  function headLinks() {
+    const href = (selector: string) => {
+      const found = document.head.querySelectorAll(selector);
+      expect(found).toHaveLength(1);
+      return found[0].getAttribute("href");
+    };
+    return {
+      favicon32: href('link[rel="icon"][sizes="32x32"]'),
+      favicon16: href('link[rel="icon"][sizes="16x16"]'),
+      appleTouchIcon: href('link[rel="apple-touch-icon"]'),
+      webManifest: href('link[rel="manifest"]'),
+    };
+  }
+
+  const NEUTRAL = {
+    favicon32: "/icons/favicon-32x32.png",
+    favicon16: "/icons/favicon-16x16.png",
+    appleTouchIcon: "/icons/apple-touch-icon.png",
+    webManifest: "/manifest.json",
+  };
+
+  it("a clean miss (404) resets the server-rewritten /brand links to the neutral ones", async () => {
+    seedHead(SERVER_REWRITTEN);
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 404 }) as unknown as Response));
+    const mod = await freshModule();
+    expect(await mod.loadBrandConfig()).toEqual(mod.NEUTRAL_BRAND);
+    expect(headLinks()).toEqual(NEUTRAL);
+  });
+
+  it("a transient failure that outlives its retry resets them too", async () => {
+    seedHead(SERVER_REWRITTEN);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => {
+        throw new Error("network down");
+      }),
+    );
+    const mod = await freshModule();
+    expect(await mod.loadBrandConfig()).toEqual(mod.NEUTRAL_BRAND);
+    expect(headLinks()).toEqual(NEUTRAL);
+  });
+
+  it("native mode (links already neutral) writes no href, so the browser refetches nothing", async () => {
+    seedHead(NEUTRAL);
+    // Records are delivered to the callback at the next microtask, i.e. during the awaits below.
+    const hrefWrites: MutationRecord[] = [];
+    const observer = new MutationObserver((records) => hrefWrites.push(...records));
+    observer.observe(document.head, { subtree: true, attributes: true, attributeFilter: ["href"] });
+    vi.stubGlobal("fetch", vi.fn(async () => ({ ok: false, status: 404 }) as unknown as Response));
+    const mod = await freshModule();
+    await mod.loadBrandConfig();
+    hrefWrites.push(...observer.takeRecords());
+    observer.disconnect();
+    expect(hrefWrites).toEqual([]);
+    expect(headLinks()).toEqual(NEUTRAL);
+  });
+
+  it("the neutral hrefs are the static ones index.html links (drift pin)", async () => {
+    const mod = await freshModule();
+    expect(mod.NEUTRAL_BRAND_LINKS).toEqual(NEUTRAL);
+    const shell = new DOMParser().parseFromString(
+      readFileSync(resolve(__dirname, "..", "..", "..", "index.html"), "utf8"),
+      "text/html",
+    );
+    const href = (selector: string) => shell.head.querySelector(selector)?.getAttribute("href");
+    expect({
+      favicon32: href('link[rel="icon"][sizes="32x32"]'),
+      favicon16: href('link[rel="icon"][sizes="16x16"]'),
+      appleTouchIcon: href('link[rel="apple-touch-icon"]'),
+      webManifest: href('link[rel="manifest"]'),
+    }).toEqual(mod.NEUTRAL_BRAND_LINKS);
   });
 });

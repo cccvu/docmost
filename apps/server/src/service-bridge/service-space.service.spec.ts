@@ -84,6 +84,76 @@ describe('ServiceSpaceService.create — transactional atomicity', () => {
 });
 
 /**
+ * #858 — the creator's next request must see the space: after the create COMMITS, one best-effort settle (the PDP
+ * projected to the max committed outbox position, the platform watermark refreshed). A settle that cannot confirm
+ * still answers the space (a create is a widening write); nothing committed or a keyed replay settles nothing.
+ */
+describe('ServiceSpaceService.create — settles once after the commit (#858)', () => {
+  const created = (query: SpyQuery) => (q(query.sql).includes('insert into spaces') ? [{ id: 'sp1', slug: 'sp', name: 'Sp' }] : []);
+  const withSettle = (respond: (q: SpyQuery) => unknown[], settled: boolean | (() => Promise<boolean>), ledger?: unknown) => {
+    const spy = spyKysely(respond);
+    const ceiling = allowAllCeiling();
+    const txAtSettle: string[][] = [];
+    (ceiling.settleBestEffort as jest.Mock).mockImplementation(async () => {
+      txAtSettle.push([...spy.tx]);
+      return typeof settled === 'function' ? settled() : settled;
+    });
+    return { svc: new ServiceSpaceService(spy.db, workspaces(), bridge(), ledger as any, ceiling), spy, ceiling, txAtSettle };
+  };
+  const ledgerFor = (reservation: unknown) => ({
+    reserve: jest.fn(async () => reservation),
+    complete: jest.fn(async () => undefined),
+  });
+
+  it('unkeyed: one settle, after COMMIT', async () => {
+    const t = withSettle(created, true);
+    await expect(t.svc.create({ name: 'Sp', creatorExternalId: 'ext-1' } as any)).resolves.toEqual({ id: 'sp1', slug: 'sp', name: 'Sp' });
+    expect(t.ceiling.settleBestEffort).toHaveBeenCalledTimes(1);
+    expect(t.txAtSettle).toEqual([['begin', 'commit']]);
+  });
+
+  it('a settle that cannot confirm still answers the space', async () => {
+    const t = withSettle(created, false);
+    await expect(t.svc.create({ name: 'Sp', creatorExternalId: 'ext-1' } as any)).resolves.toEqual({ id: 'sp1', slug: 'sp', name: 'Sp' });
+    expect(t.ceiling.settleBestEffort).toHaveBeenCalledTimes(1);
+  });
+
+  it('keyed, fresh: one settle, after COMMIT; replayed:false', async () => {
+    const slot = { namespaceDigest: 'n', op: 'space.create', keyDigest: 'd' };
+    const t = withSettle(created, false, ledgerFor({ outcome: 'fresh', slot }));
+    const keyed = { name: 'Sp', creatorExternalId: 'ext-1', idempotencyKey: 'k', idempotencyNamespace: 'user:ext-1', fingerprint: 'f'.repeat(64) };
+    await expect(t.svc.create(keyed as any, 'shared')).resolves.toEqual({ id: 'sp1', slug: 'sp', name: 'Sp', replayed: false });
+    expect(t.ceiling.settleBestEffort).toHaveBeenCalledTimes(1);
+    expect(t.txAtSettle).toEqual([['begin', 'commit']]);
+  });
+
+  it('keyed replay: no settle (nothing was written)', async () => {
+    const t = withSettle(
+      (query) => (q(query.sql).includes('select id, slug, name from spaces') ? [{ id: 'sp0', slug: 'sp', name: 'Sp' }] : []),
+      true,
+      ledgerFor({ outcome: 'replay', resourceId: 'sp0' }),
+    );
+    const keyed = { name: 'Sp', creatorExternalId: 'ext-1', idempotencyKey: 'k', idempotencyNamespace: 'user:ext-1', fingerprint: 'f'.repeat(64) };
+    await expect(t.svc.create(keyed as any, 'shared')).resolves.toEqual({ id: 'sp0', slug: 'sp', name: 'Sp', replayed: true });
+    expect(t.ceiling.settleBestEffort).not.toHaveBeenCalled();
+  });
+
+  it('a create that did not commit (rollback, or a 409 before any transaction) settles nothing', async () => {
+    const rolledBack = withSettle((query) => {
+      if (q(query.sql).includes('insert into space_members')) throw new Error('member insert failed');
+      return created(query);
+    }, true);
+    await expect(rolledBack.svc.create({ name: 'Sp', creatorExternalId: 'ext-1' } as any)).rejects.toThrow('member insert failed');
+    const taken = withSettle((query) => (q(query.sql).includes('select 1 from spaces') ? [{ exists: 1 }] : []), true);
+    await expect(taken.svc.create({ name: 'Sp', slug: 'taken', creatorExternalId: 'ext-1' } as any)).rejects.toBeInstanceOf(
+      ConflictException,
+    );
+    expect(rolledBack.ceiling.settleBestEffort).not.toHaveBeenCalled();
+    expect(taken.ceiling.settleBestEffort).not.toHaveBeenCalled();
+  });
+});
+
+/**
  * #616 — the KEYED create: the ledger reservation sits in the space insert's own bounded transaction; a replay re-runs
  * nothing; a mismatch writes nothing; the key is bound to the service credential + the creator; no friendly slug
  * pre-check (the retry's own space holds the slug); unkeyed stays byte-identical (no `replayed`).

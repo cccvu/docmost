@@ -8,8 +8,7 @@ import {
 } from "@tabler/icons-react";
 import { modals } from "@mantine/modals";
 import { useTranslation } from "react-i18next";
-import { useHasFeature } from "@/ee/hooks/use-feature";
-import { Feature } from "@/ee/features";
+import { useCommentResolutionAvailable } from "@/features/feature-availability/feature-gate";
 
 type CommentMenuProps = {
   onEditComment: () => void;
@@ -29,7 +28,8 @@ function CommentMenu({
   isParentComment = false,
 }: CommentMenuProps) {
   const { t } = useTranslation();
-  const canResolve = useHasFeature(Feature.COMMENT_RESOLUTION);
+  // CCC #858: the fork serves /comments/resolve in both modes; the licence entitlement is never granted.
+  const canResolve = useCommentResolutionAvailable();
 
   //@ts-ignore
   const openDeleteModal = () =>

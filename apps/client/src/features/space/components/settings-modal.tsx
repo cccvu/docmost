@@ -59,15 +59,6 @@ export default function SpaceSettingsModal({
   // server-injected capability the native sign-in UI uses; in native/standalone mode the
   // native membership management is the source of truth and stays fully editable.
   const membershipManagedExternally = !isNativeAuthEnabled();
-  // CCC (wiki-v2 UI cleanup): the console link is only useful to someone who can change
-  // membership there — a platform workspace admin or a space member manager. Everyone else
-  // is told to ask a space admin. The admin-context query is the header's shared, cached
-  // one (space-details.tsx reads it too); hiding the link is not the control — the console
-  // and the platform decide every membership write.
-  const platformAdminGate = usePlatformAdminContext();
-  const canOpenConsoleForMembers =
-    platformAdminGate === "admin" ||
-    spaceAbility.can(SpaceCaslAction.Manage, SpaceCaslSubject.Member);
 
   return (
     <>
@@ -123,29 +114,12 @@ export default function SpaceSettingsModal({
 
                 <Tabs.Panel value="members">
                   {membershipManagedExternally ? (
-                    <Alert
-                      variant="light"
-                      color="gray"
-                      icon={<IconInfoCircle size={18} />}
-                      my="md"
-                    >
-                      {canOpenConsoleForMembers ? (
-                        <>
-                      {t(
-                        "Space membership is managed in the Admin Console. To add or remove members, or change their roles, open the Admin Console.",
-                      )}{" "}
-                      <Anchor
-                        href="/console"
-                        target="_blank"
-                        rel="noopener noreferrer"
-                      >
-                        {t("Open the Admin Console")}
-                      </Anchor>
-                        </>
-                      ) : (
-                        t("Ask a space admin to change who has access.")
+                    <RemoteMembersNote
+                      canManageMembers={spaceAbility.can(
+                        SpaceCaslAction.Manage,
+                        SpaceCaslSubject.Member,
                       )}
-                    </Alert>
+                    />
                   ) : (
                     <Group my="md" justify="flex-end">
                       {spaceAbility.can(
@@ -187,5 +161,41 @@ export default function SpaceSettingsModal({
         </Modal.Content>
       </Modal.Root>
     </>
+  );
+}
+
+// CCC (wiki-v2 UI cleanup, #858): the remote Members panel's note. The console link is only useful to
+// someone who can change membership there: a platform workspace admin (including one whose admin
+// session needs a fresh sign-in, "reauth": the console re-authenticates them) or a space member
+// manager. Everyone else is told to ask a space admin. A child of the panel, so the admin-context
+// query (the header's shared, cached one; space-details.tsx reads it too) is read only while the modal
+// is open, and never in native mode. Hiding the link is not the control: the console and the platform
+// decide every membership write.
+function RemoteMembersNote({ canManageMembers }: { canManageMembers: boolean }) {
+  const { t } = useTranslation();
+  const platformAdminGate = usePlatformAdminContext();
+  const canOpenConsoleForMembers =
+    platformAdminGate !== "hidden" || canManageMembers;
+
+  return (
+    <Alert
+      variant="light"
+      color="gray"
+      icon={<IconInfoCircle size={18} />}
+      my="md"
+    >
+      {canOpenConsoleForMembers ? (
+        <>
+          {t(
+            "Space membership is managed in the Admin Console. To add or remove members, or change their roles, open the Admin Console.",
+          )}{" "}
+          <Anchor href="/console" target="_blank" rel="noopener noreferrer">
+            {t("Open the Admin Console")}
+          </Anchor>
+        </>
+      ) : (
+        t("Ask a space admin to change who has access.")
+      )}
+    </Alert>
   );
 }

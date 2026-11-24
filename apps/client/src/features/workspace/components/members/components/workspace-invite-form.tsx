@@ -5,6 +5,7 @@ import { UserRole } from "@/lib/types.ts";
 import { userRoleData } from "@/features/workspace/types/user-role-data.ts";
 import { useCreateInvitationMutation } from "@/features/workspace/queries/workspace-query.ts";
 import { useNavigate } from "react-router-dom";
+import APP_ROUTE from "@/lib/app-route.ts";
 import { useTranslation } from "react-i18next";
 
 interface Props {
@@ -24,15 +25,21 @@ export function WorkspaceInviteForm({ onClose }: Props) {
       return regex.test(email);
     });
 
-    await createInvitationMutation.mutateAsync({
-      role: role.toLowerCase(),
-      emails: validEmails,
-      groupIds: groupIds,
-    });
+    // CCC #858: a refused send keeps the modal open (the mutation already shows the server's message), and
+    // the Invites tab is reached by absolute path: the form also opens from the global sidebar.
+    try {
+      await createInvitationMutation.mutateAsync({
+        role: role.toLowerCase(),
+        emails: validEmails,
+        groupIds: groupIds,
+      });
+    } catch {
+      return;
+    }
 
     onClose();
 
-    navigate("?tab=invites");
+    navigate(`${APP_ROUTE.SETTINGS.WORKSPACE.MEMBERS}?tab=invites`);
   }
 
   const handleGroupSelect = (value: string[]) => {

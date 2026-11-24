@@ -11,4 +11,5 @@ export const allowAllCeiling = (): SpaceGrantCeiling =>
   ({
     assertCovers: jest.fn(async () => undefined),
     fence: jest.fn(async () => undefined),
+    settleBestEffort: jest.fn(async () => true),
   }) as unknown as SpaceGrantCeiling;

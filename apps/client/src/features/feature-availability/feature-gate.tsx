@@ -1,7 +1,9 @@
 import React from "react";
+import { useAtomValue } from "jotai";
 import { useHasFeature } from "@/ee/hooks/use-feature";
 import { Feature } from "@/ee/features";
 import { isCloud } from "@/lib/config";
+import { workspaceAtom } from "@/features/user/atoms/current-user-atom";
 
 // CCC feature-availability gate (issue: UI consistency).
 //
@@ -60,6 +62,29 @@ export function useSecuritySettingsAvailable(): boolean {
     isCloud() ||
     hasScim
   );
+}
+
+/**
+ * True iff the AI chat (the `/ai` page and the chat aside) can be used: the AI entitlement AND the
+ * workspace's `ai.chat` setting (wiki-v2 #858). The setting alone is not enough: the server stores it with
+ * no licence check, while the `/ai` route is registered only for an entitled build, so a link gated on the
+ * setting alone lands on a 404 or an empty EE aside. Both hooks are called UNCONDITIONALLY.
+ */
+export function useAiChatAvailable(): boolean {
+  const hasAi = useFeatureAvailable(Feature.AI);
+  const workspace = useAtomValue(workspaceAtom);
+  return hasAi && workspace?.settings?.ai?.chat === true;
+}
+
+/**
+ * True iff a comment thread can be resolved or re-opened from the SPA. Always true (wiki-v2 #858): the fork
+ * serves `POST /api/comments/resolve` itself in both auth modes (`apps/server/src/authz/comment-resolution/`,
+ * mounted unconditionally), decided by the same `validateCanComment` rule as posting a comment. Upstream
+ * gates the UI on the `comment:resolution` licence entitlement, which this build never grants, so threads
+ * resolved through the API showed under "Resolved" while the SPA could neither resolve nor re-open one.
+ */
+export function useCommentResolutionAvailable(): boolean {
+  return true;
 }
 
 /**

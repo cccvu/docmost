@@ -17,6 +17,7 @@ import { useClipboard } from "@/hooks/use-clipboard";
 import { notifications } from "@mantine/notifications";
 import { useNavigate } from "react-router-dom";
 import { useDeleteShareMutation } from "@/features/share/queries/share-query.ts";
+import { useFocusFallback } from "@/features/layout/use-focus-fallback";
 
 interface Props {
   share: ISharedItem;
@@ -26,6 +27,7 @@ export default function ShareActionMenu({ share }: Props) {
   const navigate = useNavigate();
   const clipboard = useClipboard();
   const deleteShareMutation = useDeleteShareMutation();
+  const armFocusFallback = useFocusFallback(); // CCC (wiki-v2 #913): delete unmounts this row
 
   const openPage = () => {
     const pageLink = buildPageUrl(
@@ -47,6 +49,7 @@ export default function ShareActionMenu({ share }: Props) {
     notifications.show({ message: t("Link copied") });
   };
   const onDelete = async () => {
+    armFocusFallback();
     deleteShareMutation.mutateAsync(share.key);
   };
 

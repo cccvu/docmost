@@ -111,6 +111,27 @@ describe("formatInstant — the viewer's own time", () => {
   });
 });
 
+describe("centralShort — the strip's narrow-screen form (#946)", () => {
+  it("drops the year and keeps the date, the time and the abbreviation", () => {
+    const f = formatInstant(T("2026-12-01T06:00:00Z"), { viewerZone: CENTRAL_ZONE });
+    expect(norm(f.central)).toBe("Dec 1, 2026, 12:00 AM CST");
+    expect(norm(f.centralShort)).toBe("Dec 1, 12:00 AM CST");
+  });
+
+  it("reads Central, with each end's own abbreviation, on the fall-back day", () => {
+    const w = formatWindow(T("2026-11-01T06:00:00Z"), T("2026-11-01T09:00:00Z"), { viewerZone: "UTC" });
+    expect(norm(w.start.centralShort)).toBe("Nov 1, 1:00 AM CDT");
+    // same Central day: the end is the time alone, in both forms
+    expect(norm(w.end.centralShort)).toBe("3:00 AM CST");
+  });
+
+  it("keeps the end's date when the window crosses Central midnight", () => {
+    const w = formatWindow(T("2026-11-24T04:00:00Z"), T("2026-11-24T08:00:00Z"), { viewerZone: CENTRAL_ZONE });
+    expect(norm(w.start.centralShort)).toBe("Nov 23, 10:00 PM CST");
+    expect(norm(w.end.centralShort)).toBe("Nov 24, 2:00 AM CST");
+  });
+});
+
 describe("durationParts", () => {
   it.each([
     [0, 0, 0],

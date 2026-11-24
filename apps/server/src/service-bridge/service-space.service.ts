@@ -373,8 +373,9 @@ export class ServiceSpaceService {
       externalId: input.creatorExternalId,
     });
 
+    let created: CreatedSpace;
     try {
-      return await this.db.transaction().execute(async (trx) => {
+      created = await this.db.transaction().execute(async (trx) => {
         const s = await sql<{ id: string; slug: string; name: string | null }>`
           insert into spaces (name, description, slug, creator_id, workspace_id)
           values (${input.name}, ${input.description ?? null}, ${slug}, ${creatorId}, ${workspaceId})
@@ -393,6 +394,18 @@ export class ServiceSpaceService {
       }
       throw e;
     }
+    await this.settleCreated();
+    return created;
+  }
+
+  /**
+   * #858: after a create COMMITS (never on a keyed replay, which wrote nothing), settle the PDP once so the creator's
+   * next request sees the space: the console's member add right after a create is decided on `space#administer` at
+   * the platform's watermark, which lagged the outbox relay and answered 403. Best effort (`settleBestEffort` never
+   * throws): the space is created either way.
+   */
+  private async settleCreated(): Promise<void> {
+    await this.ceiling?.settleBestEffort();
   }
 
   /**
@@ -431,8 +444,9 @@ export class ServiceSpaceService {
       externalId: input.creatorExternalId,
     });
 
+    let created: CreatedSpace;
     try {
-      return await this.db.transaction().execute(async (trx) => {
+      created = await this.db.transaction().execute(async (trx) => {
         await boundLedgerTx(trx);
         const reservation = await ledger.reserve(trx, {
           workspaceId,
@@ -477,6 +491,8 @@ export class ServiceSpaceService {
       }
       throw this.retryableIfBusy(e);
     }
+    if (created.replayed === false) await this.settleCreated();
+    return created;
   }
 
   /**

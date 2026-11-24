@@ -24,6 +24,18 @@ const centralTime = new Intl.DateTimeFormat("en-US", {
   timeZoneName: "short",
 });
 
+// The strip's narrow-screen form (#946): the date without its year. The full form is in Details and is what a
+// screen reader hears on the strip.
+const centralShortDateTime = new Intl.DateTimeFormat("en-US", {
+  timeZone: CENTRAL_ZONE,
+  month: "short",
+  day: "numeric",
+  hour: "numeric",
+  minute: "2-digit",
+  hour12: true,
+  timeZoneName: "short",
+});
+
 const formatterCache = new Map<string, Intl.DateTimeFormat>();
 
 function formatter(key: string, options: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
@@ -77,6 +89,8 @@ export function defaultViewerZone(): string | undefined {
 export interface FormattedInstant {
   /** "Nov 1, 2026, 1:00 AM CDT", or "3:00 AM CST" when the date is dropped. */
   central: string;
+  /** The same without the year: "Nov 1, 1:00 AM CDT", or "3:00 AM CST" when the date is dropped. */
+  centralShort: string;
   /** The viewer's own time when their offset differs from Central's at that instant, else null. */
   viewer: string | null;
 }
@@ -116,6 +130,7 @@ export function formatInstant(
 ): FormattedInstant {
   return {
     central: withDate ? formatCentralDateTime(ms) : centralTime.format(ms),
+    centralShort: withDate ? centralShortDateTime.format(ms) : centralTime.format(ms),
     viewer: viewerTime(ms, viewerZone),
   };
 }

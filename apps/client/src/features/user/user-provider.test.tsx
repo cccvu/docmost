@@ -1,7 +1,16 @@
-import { describe, it, expect, beforeAll, beforeEach, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import {
+  describe,
+  it,
+  expect,
+  beforeAll,
+  beforeEach,
+  afterEach,
+  vi,
+} from "vitest";
+import { act, render, screen } from "@testing-library/react";
 import { MantineProvider } from "@mantine/core";
 import { Provider, createStore } from "jotai";
+import { RESET } from "jotai/utils";
 
 // CCC (wiki-v2 #911): UserProvider stores the loaded user in `currentUserAtom` from an effect, after
 // its first render with the data. A direct load with no stored user (fresh profile, after sign-out)
@@ -44,8 +53,9 @@ vi.mock("@/ee/entitlement/use-entitlements", () => ({
 vi.mock("@/lib/date-locale.ts", () => ({
   changeAppLanguage: vi.fn(async () => {}),
 }));
+const authMode = vi.hoisted(() => ({ native: false }));
 vi.mock("@/features/auth-native/lib/auth-mode.ts", () => ({
-  isNativeAuthEnabled: () => false,
+  isNativeAuthEnabled: () => authMode.native,
 }));
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
@@ -56,8 +66,13 @@ vi.mock("react-i18next", () => ({
 vi.mock("@/features/user/services/user-service.ts", () => ({
   updateUser: vi.fn(),
 }));
+// The real page needs a Router and a HelmetProvider; a marker is enough to pin the 404 branch.
+vi.mock("@/components/ui/error-404.tsx", () => ({
+  Error404: () => <div data-testid="e404" />,
+}));
 
 import { UserProvider } from "./user-provider";
+import { currentUserAtom } from "@/features/user/atoms/current-user-atom";
 import PageWidthPref from "./components/page-width-pref";
 import NotificationPref from "./components/notification-pref";
 
@@ -91,15 +106,44 @@ beforeAll(() => {
   }
 });
 
+const realLocation = window.location;
+const location = vi.hoisted(() => ({
+  replace: vi.fn(),
+  reload: vi.fn(),
+}));
+
 beforeEach(() => {
   window.localStorage?.removeItem("currentUser");
   query.state = { data: loaded, isLoading: false, isError: false, error: null };
+  location.replace.mockReset();
+  location.reload.mockReset();
+  authMode.native = false; // remote mode (production) unless a test says otherwise
+  Object.defineProperty(window, "location", {
+    value: {
+      origin: "http://localhost",
+      pathname: "/p/abc",
+      search: "",
+      replace: location.replace,
+      reload: location.reload,
+    },
+    writable: true,
+    configurable: true,
+  });
 });
 
-function renderPreferences() {
-  // A fresh store: `currentUserAtom` starts null, as on a direct load with nothing stored.
-  return render(
-    <Provider store={createStore()}>
+afterEach(() => {
+  Object.defineProperty(window, "location", {
+    value: realLocation,
+    writable: true,
+    configurable: true,
+  });
+  vi.restoreAllMocks();
+});
+
+function renderPreferences(store = createStore()) {
+  // By default a fresh store: `currentUserAtom` starts null, as on a direct load with nothing stored.
+  const view = render(
+    <Provider store={store}>
       <MantineProvider>
         <UserProvider>
           <PageWidthPref />
@@ -107,6 +151,18 @@ function renderPreferences() {
         </UserProvider>
       </MantineProvider>
     </Provider>,
+  );
+  return { ...view, store };
+}
+
+// What another tab's sign-out looks like here: the browser fires `storage` only in OTHER documents.
+function otherTabCleared(key: string | null = "currentUser") {
+  window.dispatchEvent(
+    new StorageEvent("storage", {
+      key,
+      newValue: null,
+      storageArea: window.localStorage,
+    }),
   );
 }
 
@@ -125,5 +181,136 @@ describe("UserProvider (#911)", () => {
     expect((fullWidth as HTMLInputElement).checked).toBe(true);
     const pageUpdates = screen.getByRole("switch", { name: "Page updates" });
     expect((pageUpdates as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("404 from /users/me renders the not-found page and no children", () => {
+    query.state = {
+      data: undefined,
+      isLoading: false,
+      isError: true,
+      error: { response: { status: 404 } },
+    };
+    renderPreferences();
+    expect(screen.getByTestId("e404")).toBeTruthy();
+    expect(screen.queryAllByRole("switch")).toHaveLength(0);
+  });
+});
+
+describe("UserProvider (#917)", () => {
+  it("RESET after load unmounts the children and throws nothing", async () => {
+    const { store } = renderPreferences();
+    await screen.findByRole("switch", { name: "Toggle full page width" });
+    act(() => store.set(currentUserAtom, RESET));
+    expect(screen.queryAllByRole("switch")).toHaveLength(0);
+    expect(screen.queryByTestId("e404")).toBeNull();
+  });
+
+  it("a same-tab RESET does not redirect (the logout POSTs must not be aborted)", async () => {
+    const { store } = renderPreferences();
+    await screen.findByRole("switch", { name: "Toggle full page width" });
+    act(() => store.set(currentUserAtom, RESET));
+    expect(location.replace).not.toHaveBeenCalled();
+    expect(location.reload).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["the key is removed", "currentUser"],
+    ["storage is cleared", null],
+  ])(
+    "remote mode, another tab signed out (%s): this tab goes to login, returning here",
+    async (_label, key) => {
+      // In remote mode only a sign-out clears the key, and it clears it BEFORE its revokes land: a reload's
+      // /users/me could still answer 200 and bring this tab back signed in, so go to login.
+      renderPreferences();
+      await screen.findByRole("switch", { name: "Toggle full page width" });
+      act(() => otherTabCleared(key));
+      expect(location.replace).toHaveBeenCalledTimes(1);
+      expect(location.replace).toHaveBeenCalledWith("/login?redirect=%2Fp%2Fabc");
+      expect(location.reload).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["the key is removed", "currentUser"],
+    ["storage is cleared", null],
+  ])(
+    "native mode, another tab cleared the stored user (%s): this tab reloads, never straight to login",
+    async (_label, key) => {
+      // A sign-out, but also another tab's native sign-in (it RESETs before it stores) or its failed-logout
+      // reload. The reload asks /users/me: a 401 goes to login with the return path, a 200 comes back signed in.
+      authMode.native = true;
+      renderPreferences();
+      await screen.findByRole("switch", { name: "Toggle full page width" });
+      act(() => otherTabCleared(key));
+      expect(location.reload).toHaveBeenCalledTimes(1);
+      expect(location.replace).not.toHaveBeenCalled();
+    },
+  );
+
+  it("another tab's clear before this load stored a user does not redirect", () => {
+    query.state = { data: undefined, isLoading: true, isError: false, error: null };
+    renderPreferences();
+    act(() => otherTabCleared());
+    expect(location.replace).not.toHaveBeenCalled();
+    expect(location.reload).not.toHaveBeenCalled();
+  });
+
+  it("another tab storing a user (its own load) does not redirect", async () => {
+    renderPreferences();
+    await screen.findByRole("switch", { name: "Toggle full page width" });
+    act(() => {
+      window.dispatchEvent(
+        new StorageEvent("storage", {
+          key: "currentUser",
+          newValue: JSON.stringify(loaded),
+          storageArea: window.localStorage,
+        }),
+      );
+    });
+    expect(location.replace).not.toHaveBeenCalled();
+    expect(location.reload).not.toHaveBeenCalled();
+  });
+
+  it("an unrelated storage key changing does not redirect", async () => {
+    renderPreferences();
+    await screen.findByRole("switch", { name: "Toggle full page width" });
+    act(() => otherTabCleared("something-else"));
+    expect(location.replace).not.toHaveBeenCalled();
+    expect(location.reload).not.toHaveBeenCalled();
+  });
+
+  it("a stale stored user never seeds the children: they render from this load's user", async () => {
+    const store = createStore();
+    // A previous session's copy (another person, or older settings), opposite to `loaded` on both toggles.
+    store.set(currentUserAtom, {
+      user: {
+        id: "u0",
+        settings: {
+          preferences: { fullPageWidth: false },
+          notifications: { "page.updated": true },
+        },
+      },
+      workspace: { id: "w1" },
+    } as never);
+    renderPreferences(store);
+    const fullWidth = await screen.findByRole("switch", {
+      name: "Toggle full page width",
+    });
+    expect((fullWidth as HTMLInputElement).checked).toBe(true);
+    const pageUpdates = screen.getByRole("switch", { name: "Page updates" });
+    expect((pageUpdates as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("malformed /users/me (no workspace) warns once and renders no children", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    query.state = {
+      data: { user: loaded.user, workspace: undefined },
+      isLoading: false,
+      isError: false,
+      error: null,
+    };
+    renderPreferences();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(screen.queryAllByRole("switch")).toHaveLength(0);
   });
 });

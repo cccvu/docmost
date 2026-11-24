@@ -34,6 +34,18 @@ export interface BrandConfig {
 /** What the app renders with no bundle: a generic wiki with no institution marks. */
 export const NEUTRAL_BRAND: BrandConfig = { name: "Wiki", assets: {} };
 
+/**
+ * The neutral static links `index.html` carries (pinned to it by brand-config.test.ts). In remote mode the server
+ * points them at `/brand` at boot (server `authz/http-headers/brand-links.ts`); when no bundle loads, the loader puts
+ * these back so the tab never keeps a `/brand` href that 404s (#915).
+ */
+export const NEUTRAL_BRAND_LINKS = {
+  favicon32: "/icons/favicon-32x32.png",
+  favicon16: "/icons/favicon-16x16.png",
+  appleTouchIcon: "/icons/apple-touch-icon.png",
+  webManifest: "/manifest.json",
+} as const;
+
 /** Same-origin path served by the platform (services/platform/assets/brand). */
 const BRAND_MANIFEST_URL = "/brand/manifest.json";
 const BRAND_ASSET_PREFIX = "/brand/";
@@ -162,13 +174,16 @@ async function fetchWordmarkSvg(url: string): Promise<string | null> {
   }
 }
 
-/** Swap the document's static neutral identity for the runtime brand (title, favicons, PWA manifest). */
+/**
+ * Swap the document's static neutral identity for the runtime brand (title, favicons, PWA manifest). A link the
+ * config has no asset for (every link, when the brand loads neutral) is set back to its neutral href (#915).
+ */
 function applyBrandDocument(config: BrandConfig): void {
   const { assets } = config;
-  if (assets.favicon32) setLink("icon", assets.favicon32, "32x32");
-  if (assets.favicon16) setLink("icon", assets.favicon16, "16x16");
-  if (assets.appleTouchIcon) setLink("apple-touch-icon", assets.appleTouchIcon);
-  if (config.webManifest) setLink("manifest", config.webManifest);
+  setLink("icon", assets.favicon32 ?? NEUTRAL_BRAND_LINKS.favicon32, "32x32");
+  setLink("icon", assets.favicon16 ?? NEUTRAL_BRAND_LINKS.favicon16, "16x16");
+  setLink("apple-touch-icon", assets.appleTouchIcon ?? NEUTRAL_BRAND_LINKS.appleTouchIcon);
+  setLink("manifest", config.webManifest ?? NEUTRAL_BRAND_LINKS.webManifest);
   setMeta("apple-mobile-web-app-title", config.name);
   document.title = config.name;
 }
@@ -182,7 +197,8 @@ function setLink(rel: string, href: string, sizes?: string): void {
     document.head.appendChild(element);
   }
   if (sizes) element.setAttribute("sizes", sizes);
-  element.href = href;
+  // An unchanged href is not rewritten, so the browser does not refetch it (native mode is already neutral).
+  if (element.getAttribute("href") !== href) element.href = href;
 }
 
 function setMeta(name: string, content: string): void {

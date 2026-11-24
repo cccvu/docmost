@@ -1,0 +1,78 @@
+[
+  {
+    "name": "a downtime notice (no show-from: it shows now, until the downtime ends)",
+    "body": {
+      "announcement": {
+        "version": 2,
+        "message": "Security updates: the wiki is down Tuesday night.",
+        "severity": "warning",
+        "startsAt": null,
+        "endsAt": null,
+        "downtimeStartsAt": "2026-12-02T04:00:00.000Z",
+        "downtimeEndsAt": "2026-12-02T08:00:00.000Z"
+      }
+    },
+    "parsed": {
+      "version": 2,
+      "message": "Security updates: the wiki is down Tuesday night.",
+      "severity": "warning",
+      "startsAt": null,
+      "endsAt": null,
+      "downtimeStartsAt": 1796184000000,
+      "downtimeEndsAt": 1796198400000
+    }
+  },
+  {
+    "name": "a show-until notice with a show-from, a line break and a non-ASCII character",
+    "body": {
+      "announcement": {
+        "version": 7,
+        "message": "New editor shortcuts are live.\nSee the Help page – press ? to list them.",
+        "severity": "info",
+        "startsAt": "2026-11-30T15:00:00.000Z",
+        "endsAt": "2026-12-07T05:59:59.999Z",
+        "downtimeStartsAt": null,
+        "downtimeEndsAt": null
+      }
+    },
+    "parsed": {
+      "version": 7,
+      "message": "New editor shortcuts are live.\nSee the Help page – press ? to list them.",
+      "severity": "info",
+      "startsAt": 1796050800000,
+      "endsAt": 1796623199999,
+      "downtimeStartsAt": null,
+      "downtimeEndsAt": null
+    }
+  },
+  {
+    "name": "an urgent notice with no times at all",
+    "body": {
+      "announcement": {
+        "version": 1,
+        "message": "Do not paste passwords into pages.",
+        "severity": "critical",
+        "startsAt": null,
+        "endsAt": null,
+        "downtimeStartsAt": null,
+        "downtimeEndsAt": null
+      }
+    },
+    "parsed": {
+      "version": 1,
+      "message": "Do not paste passwords into pages.",
+      "severity": "critical",
+      "startsAt": null,
+      "endsAt": null,
+      "downtimeStartsAt": null,
+      "downtimeEndsAt": null
+    }
+  },
+  {
+    "name": "nothing to show",
+    "body": {
+      "announcement": null
+    },
+    "parsed": null
+  }
+]

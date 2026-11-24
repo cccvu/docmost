@@ -5,6 +5,7 @@ import {
   pdpChecksFor,
   SpaceGrantCeiling,
   withGrantCeiling,
+  CREATE_SETTLE_MAX_MS,
 } from './space-grant-ceiling';
 
 /**
@@ -116,6 +117,69 @@ describe('SpaceGrantCeiling.fence', () => {
     const err = await pending.ceiling.fence().catch((e) => e);
     expect(err).toBeInstanceOf(ServiceUnavailableException);
     expect(err.getResponse()).toMatchObject({ code: 'grant_unconfirmed' });
+  });
+});
+
+/**
+ * #858: after a space create commits, the service settles once so the creator's next request (the console's member
+ * add, decided on `space#administer` at the platform watermark) sees the projected space. A create is a widening write,
+ * so the settle is best effort: it answers whether the fence was confirmed and NEVER throws.
+ */
+describe('SpaceGrantCeiling.settleBestEffort', () => {
+  it('confirmed → true: one settle to the max committed outbox position, read outside any transaction', async () => {
+    const ok = mk([]);
+    await expect(ok.ceiling.settleBestEffort()).resolves.toBe(true);
+    expect(ok.authz.settleProjection).toHaveBeenCalledTimes(1);
+    expect(ok.spy.calls.some((c) => /from authz_outbox/i.test(c.sql))).toBe(true);
+    expect(ok.spy.tx).toEqual([]);
+  });
+
+  it('waits at most CREATE_SETTLE_MAX_MS (2 s), shorter than the fence, so the relayed create keeps its deadline', async () => {
+    // 2 s + the client's 1.5 s margin stays inside the platform's 8 s relay deadline, and above its 1 s
+    // STALL_MIN_WATCH_MS, so one create settle does not mark the relay stalled on a short blip.
+    expect(CREATE_SETTLE_MAX_MS).toBe(2000);
+    const long = mk([]);
+    (long.ceiling as any).settleMs = 3000;
+    await long.ceiling.settleBestEffort();
+    expect((long.authz.settleProjection as jest.Mock).mock.calls[0][1]).toBe(2000);
+
+    const short = mk([]);
+    (short.ceiling as any).settleMs = 400;
+    await short.ceiling.settleBestEffort();
+    expect((short.authz.settleProjection as jest.Mock).mock.calls[0][1]).toBe(400);
+  });
+
+  it('pending → false and one SPACE_CREATE_SETTLE_PENDING line, never a throw', async () => {
+    const pending = mk([], { settleProjection: jest.fn(async () => ({ status: 'pending', reason: 'timeout' })) });
+    const warn = jest.spyOn((pending.ceiling as any).logger, 'warn').mockImplementation();
+    await expect(pending.ceiling.settleBestEffort()).resolves.toBe(false);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toMatch(/^SPACE_CREATE_SETTLE_PENDING reason=timeout\b/);
+  });
+
+  it('a rejected settle or a failed outbox read → false, never a throw', async () => {
+    const down = mk([], { settleProjection: jest.fn(async () => Promise.reject(new Error('platform down'))) });
+    const warnDown = jest.spyOn((down.ceiling as any).logger, 'warn').mockImplementation();
+    await expect(down.ceiling.settleBestEffort()).resolves.toBe(false);
+    expect(String(warnDown.mock.calls[0][0])).toMatch(/^SPACE_CREATE_SETTLE_PENDING reason=error\b/);
+
+    const settleProjection = jest.fn(async () => ({ status: 'confirmed' }));
+    const authz = { tryCheckBulk: jest.fn(), settleProjection };
+    const dbDown = { selectFrom: () => undefined, getExecutor: () => { throw new Error('db down'); } };
+    const broken = new SpaceGrantCeiling(dbDown as any, authz as any);
+    jest.spyOn((broken as any).logger, 'warn').mockImplementation();
+    await expect(broken.settleBestEffort()).resolves.toBe(false);
+    expect(settleProjection).not.toHaveBeenCalled();
+  });
+
+  it('a disabled settle (AUTHZ_NARROWING_SETTLE_TIMEOUT_MS=0) → false, nothing asked, nothing logged', async () => {
+    const off = mk([]);
+    (off.ceiling as any).settleMs = 0;
+    const warn = jest.spyOn((off.ceiling as any).logger, 'warn').mockImplementation();
+    await expect(off.ceiling.settleBestEffort()).resolves.toBe(false);
+    expect(off.authz.settleProjection).not.toHaveBeenCalled();
+    // Switched off on purpose: not a pending settle, so no SPACE_CREATE_SETTLE_PENDING warning per create.
+    expect(warn).not.toHaveBeenCalled();
   });
 });
 
