@@ -149,7 +149,13 @@ import {
 } from '../page-write/compaction-registry';
 import { COLLAB_CONNECTIONS_PER_USER } from './limits';
 import { ClaimLedger, RelayClaims, verifyAttested, type Attested, type AttestResult, type ClaimOutcome, type DecodedFrame, type RecordOutcome } from './relay-claims';
-import { ConflictScan, installConflictScanMeter, type ConflictScanMeter } from './conflict-scan';
+import {
+  CONFLICT_SCAN_NEAR_CAP_STEPS,
+  CONFLICT_SCAN_STEPS_PER_FRAME,
+  ConflictScan,
+  installConflictScanMeter,
+  type ConflictScanMeter,
+} from './conflict-scan';
 import { COLLAB_PAGE_COMPACTING_REASON, epochStaleReason } from './collab-reasons';
 import { COLLAB_PAGE_COMPACTION_TOKEN, logCompactionRequested, type CompactionLogSink } from './compaction-log';
 import { isDeadlineExceeded, runWithDeadline, type DeadlineRunner } from './deadline';
@@ -463,6 +469,8 @@ type ShadowResult = {
    *  their R4/R6 checks (`verifyAttested`: refused `unproven-owner`, the relayer burned when `failed`). */
   relayed?: Set<number>;
   relayFailed?: Map<number, 'pending' | 'failed'>;
+  /** #832: report mode's meter tripped (its whole count). Logged on its own when the frame is answered for another rule. */
+  trip?: RefusalLog;
 };
 /** What `inspectTransaction` finds inside the transaction. `extra`: struct-array lengths, mid-transaction, of clients a
  *  delete reached that the pre-pass did not name (a keyed overwrite deletes the key's previous item). */
@@ -1155,6 +1163,11 @@ export class CollabUpdateGuard {
       const fromShadow = result.violation !== null && (violation === null || this.enforces(result.violation.rule, result.log, true));
       if (fromShadow) violation = result.violation;
       const log = fromShadow ? result.log : undefined;
+      // #832: a report-mode trip is always logged, also when the frame is answered for another rule (this frame's outcome).
+      if (result.trip && violation?.rule !== 'conflict-scan') {
+        const outcome: RefusalOutcome = violation && this.enforces(violation.rule, log) ? 'blocked' : 'applied';
+        this.refusalLine(frame, header, { rule: 'conflict-scan' }, result.trip, outcome);
+      }
       if (!violation) for (const v of result.reportOnly) this.log('COLLAB_LEGACY_PENDING_INVALID', doc.live, { rule: v.rule });
       if (violation && this.enforces(violation.rule, log)) {
         // The shadow holds the refused frame; live never will. Rebuilt lazily by the next frame that needs it
@@ -1198,6 +1211,10 @@ export class CollabUpdateGuard {
         let clocks = 0;
         for (const client of result.relayed) clocks += relay.attested.get(client)!.to - relay.attested.get(client)!.from;
         this.log('COLLAB_RELAY_ATTESTED', doc.live, { userId, ids: result.relayed.size, clocks });
+      }
+      // #832: an accepted frame under the cap (no report-mode trip) that walked more than half of it (numbers only).
+      if (result.steps > CONFLICT_SCAN_NEAR_CAP_STEPS && result.trip === undefined) {
+        this.log('COLLAB_CONFLICT_SCAN_NEAR_CAP', doc.live, { steps: result.steps, cap: CONFLICT_SCAN_STEPS_PER_FRAME });
       }
       const raw = payload.slice();
       // A frame the shadow could not apply is not replayed into a rebuild (it would fail every rebuild from then on).
@@ -1521,6 +1538,8 @@ export class CollabUpdateGuard {
     for (const ids of [pre.clients, pre.reaches, pendingBefore.keys()]) for (const client of ids) tracked.set(client, lengthOf(store, client));
     const clientsBefore = store.clients.size;
     const scan = new ConflictScan(shadow, this.mode === 'enforce');
+    // #832: a report-mode trip (report mode's meter never throws), carried on every result.
+    const trip = (): { trip?: RefusalLog } => (!scan.enforce && scan.trip !== null ? { trip: { steps: scan.steps } } : {});
     const failed = (violation: Violation, log?: RefusalLog): ShadowResult => ({
       violation,
       binds: new Map(),
@@ -1536,6 +1555,7 @@ export class CollabUpdateGuard {
       suspect: false,
       unclear: false,
       changes: false,
+      ...trip(),
     });
     let out: Inspection | null = null;
     let applied: Y.Transaction | null = null;
@@ -1569,7 +1589,8 @@ export class CollabUpdateGuard {
         doc.shadow = null; // cut mid-transaction: never reused
         return { ...failed({ rule: 'apply-deadline' }), timedOut: true };
       }
-      if (scan.trip !== null) return failed({ rule: 'conflict-scan' }, { steps: scan.trip.steps });
+      // Only an enforcing scan throws at its trip (#832: after a report-mode trip, a throw is Yjs's own or the meter's).
+      if (scan.enforce && scan.trip !== null) return failed({ rule: 'conflict-scan' }, { steps: scan.trip.steps });
       if (scan.failure !== null) return failed({ rule: 'internal' }, { stage: 'conflict-scan' });
       // #847: Yjs threw on its own (M1's half-applied integrate, M2's wedged cleanup). A shadow whose cleanup is stuck
       // is Yjs's too, whatever the phase: a throw from the inspection unwinds through Yjs's cleanup, which can throw over it.
@@ -1601,8 +1622,12 @@ export class CollabUpdateGuard {
       relayFailed: found.relayFailed,
     };
     // Report mode: the meter counted past the cap and threw nothing; the frame is logged as it would have been refused.
-    if (scan.trip !== null) return { ...result, violation: { rule: 'conflict-scan' }, log: { steps: scan.steps } };
-    return result;
+    // #832: unless the inspection found a rule refused in every mode (`root`, `keyed-split`): that refusal stands (a
+    // relabel would let report mode apply it), and the trip is logged with it (`trip`).
+    if (scan.trip !== null && (found.violation === null || !this.enforces(found.violation.rule, found.log, true))) {
+      return { ...result, violation: { rule: 'conflict-scan' }, log: { steps: scan.steps }, ...trip() };
+    }
+    return { ...result, ...trip() };
   }
 
   /**
@@ -2366,19 +2391,7 @@ export class CollabUpdateGuard {
     const reason = extra?.stage === 'unproven-owner' ? UNRESOLVED_REASON : reasonFor(violation.rule);
     const enforced = this.enforces(violation.rule, extra);
     const outcome: RefusalOutcome = !enforced ? 'applied' : reason === UNRESOLVED_REASON ? 'retry' : 'blocked';
-    this.log(REFUSED_TOKEN, frame.document, {
-      rule: violation.rule,
-      ...(violation.node ? { node: violation.node } : {}),
-      ...(violation.mark ? { mark: violation.mark } : {}),
-      ...(violation.key ? { key: violation.key } : {}),
-      ...extra, // #816: `steps` for conflict-scan, `stage` for a meter failure; numbers and fixed words only
-      userId: frame.context?.user?.id,
-      msgType: header.type,
-      ...(header.subtype !== undefined ? { syncType: header.subtype } : {}),
-      bytes: frame.update.length,
-      mode: this.mode,
-      outcome,
-    });
+    this.refusalLine(frame, header, violation, extra, outcome);
     if (!enforced) return;
     this.refusedConnections.set(frame.connection, reason);
     const ws = frame.connection.webSocket;
@@ -2394,6 +2407,23 @@ export class CollabUpdateGuard {
       }
     }
     throw { code: COLLAB_REFUSAL_CODE, reason };
+  }
+
+  /** A refusal line (`COLLAB_UPDATE_REFUSED`), with this frame's `outcome`. */
+  private refusalLine(frame: GuardFrame, header: Header, violation: Violation, extra: RefusalLog | undefined, outcome: RefusalOutcome): void {
+    this.log(REFUSED_TOKEN, frame.document, {
+      rule: violation.rule,
+      ...(violation.node ? { node: violation.node } : {}),
+      ...(violation.mark ? { mark: violation.mark } : {}),
+      ...(violation.key ? { key: violation.key } : {}),
+      ...extra, // #816: `steps` for conflict-scan, `stage` for a meter failure; numbers and fixed words only
+      userId: frame.context?.user?.id,
+      msgType: header.type,
+      ...(header.subtype !== undefined ? { syncType: header.subtype } : {}),
+      bytes: frame.update.length,
+      mode: this.mode,
+      outcome,
+    });
   }
 
   /**
