@@ -601,18 +601,23 @@ class DocGuard {
 export type WedgedStore = (live: GuardDocument, context: unknown) => void;
 
 type Bucket = { tokens: number; at: number };
-/** `cpu` (milliseconds, #816) is only used on the whole-user entry. `deadline` (#827): shadow-apply timeouts since this
- *  (user, document)'s last accepted frame (the strike rule). `strikes`/`heldUntil` (#840): when instabilities this user
- *  was a suspect of were found on the page, and until when their writer frames there wait (1013). Kept by page name, so
- *  a heal (a new document) does not forgive them. */
-type UserDocBudget = { sync: Bucket; ids: Bucket; cpu: Bucket; deadline: number; strikes: number[]; heldUntil: number };
+/** Per (user, document) (`docKey`): sync frames and new client ids (#790). `deadline` (#827): shadow-apply timeouts since
+ *  this (user, document)'s last accepted frame (the strike rule). `strikes`/`heldUntil` (#840): when instabilities this
+ *  user was a suspect of were found on the page, and until when their writer frames there wait (1013). Kept by page
+ *  name, so a heal (a new document) does not forgive them. */
+type DocBudget = { sync: Bucket; ids: Bucket; deadline: number; strikes: number[]; heldUntil: number };
+/** Per user, across documents (`userKey`): sync frames (#790) and collab CPU in milliseconds, as a debt (#816). */
+type UserBudget = { sync: Bucket; cpu: Bucket };
+/** #832: the budgets map's keys, in one place (the same strings as before the split, so nothing that reads one moves). */
+const userKey = (user: string): string => `${user}\u0001`;
+const docKey = (user: string, docName: string): string => `${user}\u0000${docName}`;
 
 export class CollabUpdateGuard {
   private readonly docs = new WeakMap<Y.Doc, DocGuard>();
   private readonly refusedConnections = new WeakMap<object, string>();
   private readonly socketRefusals = new WeakMap<object, number>();
   /** #790: per (user, document) budgets, least recently used first; and per connection, the ids it already paid for. */
-  private readonly userDocBudgets = new Map<string, UserDocBudget>();
+  private readonly userDocBudgets = new Map<string, DocBudget | UserBudget>();
   private readonly awarenessNewIds = new WeakMap<object, Set<number>>();
   /** #847: see `WedgedStore`; null until the extension is configured (specs set it directly). */
   private wedgedStore: WedgedStore | null = null;
@@ -723,7 +728,7 @@ export class CollabUpdateGuard {
     // A Step1 makes Hocuspocus encode the whole document (its Step2 answer); a reader's Step2 makes it snapshot it.
     if (header.subtype === STEP1 || (header.subtype === STEP2 && frame.connection.readOnly)) {
       const ok = this.takeBoth(
-        [this.budgetFor(frame, true).sync, USER_SYNC_BURST, USER_SYNC_REFILL_MS],
+        [this.userBudgetFor(frame).sync, USER_SYNC_BURST, USER_SYNC_REFILL_MS],
         [this.budgetFor(frame).sync, SYNC_BURST, SYNC_REFILL_MS],
       );
       if (!ok) this.tryLater(frame, 'user_sync_budget');
@@ -818,8 +823,9 @@ export class CollabUpdateGuard {
    * to the socket that caused it, so a reload loop pays for itself): logged `load_debt`. Report mode only logs.
    */
   admitLoad(user: string): boolean {
-    if (this.cpuBalance(user) >= 0) return true;
-    this.limitLog.log('load_debt', { userId: user });
+    const balance = this.cpuBalance(user);
+    if (balance >= 0) return true;
+    this.limitLog.log('load_debt', { userId: user, balanceMs: Math.round(balance) }); // #832: the debt's depth
     return this.mode === 'report';
   }
 
@@ -864,39 +870,59 @@ export class CollabUpdateGuard {
   }
 
   /** The (user, document) budget of this frame's connection, made most recently used; the least recent past the cap goes. */
-  private budgetFor(frame: GuardFrame, wholeUser = false): UserDocBudget {
-    return this.budgetOf(String(frame.context?.user?.id ?? ''), wholeUser ? null : (frame.document.name ?? ''));
+  private budgetFor(frame: GuardFrame): DocBudget {
+    return this.docBudget(String(frame.context?.user?.id ?? ''), frame.document.name ?? '');
   }
 
-  /** The budget of (`user`, `docName`), or the whole user's when `docName` is null. */
-  private budgetOf(user: string, docName: string | null): UserDocBudget {
-    const wholeUser = docName === null;
-    const key = wholeUser ? `${user}\u0001` : `${user}\u0000${docName}`;
+  /** The whole-user budget of this frame's connection, likewise. */
+  private userBudgetFor(frame: GuardFrame): UserBudget {
+    return this.userBudget(String(frame.context?.user?.id ?? ''));
+  }
+
+  /** The budget of (`user`, `docName`). */
+  private docBudget(user: string, docName: string): DocBudget {
+    return this.touchBudget(docKey(user, docName), (at) => ({
+      sync: { tokens: SYNC_BURST, at },
+      ids: { tokens: AWARENESS_NEW_IDS_BURST, at },
+      deadline: 0,
+      strikes: [],
+      heldUntil: 0,
+    }));
+  }
+
+  /** The whole user's budget. */
+  private userBudget(user: string): UserBudget {
+    return this.touchBudget(userKey(user), (at) => ({
+      sync: { tokens: USER_SYNC_BURST, at },
+      cpu: { tokens: USER_COLLAB_CPU_BURST_MS, at },
+    }));
+  }
+
+  /** The budget kept at `key` (made by `make` when none is), made most recently used; the least recent past the cap goes. */
+  private touchBudget<T extends DocBudget | UserBudget>(key: string, make: (at: number) => T): T {
     const at = this.now();
-    let budget = this.userDocBudgets.get(key);
+    let budget = this.userDocBudgets.get(key) as T | undefined; // a key's form says which (userKey, docKey)
     if (budget) this.userDocBudgets.delete(key);
-    else {
-      budget = {
-        sync: { tokens: wholeUser ? USER_SYNC_BURST : SYNC_BURST, at },
-        ids: { tokens: AWARENESS_NEW_IDS_BURST, at },
-        cpu: { tokens: USER_COLLAB_CPU_BURST_MS, at },
-        deadline: 0,
-        strikes: [],
-        heldUntil: 0,
-      };
-    }
+    else budget = make(at);
     this.userDocBudgets.set(key, budget);
     if (this.userDocBudgets.size > USER_DOC_BUDGETS_MAX) this.userDocBudgets.delete(this.userDocBudgets.keys().next().value!);
     return budget;
   }
 
+  /**
+   * #816: the whole user's collab CPU balance in ms when it is in debt (below 0), else null. Refills it and makes the
+   * entry most recently used (an entry in debt that dropped out of the map would be forgiven).
+   */
+  private inDebt(frame: GuardFrame): number | null {
+    const cpu = this.userBudgetFor(frame).cpu;
+    this.refill(cpu, USER_COLLAB_CPU_BURST_MS, CPU_MS_REFILL_EVERY_MS);
+    return cpu.tokens < 0 ? cpu.tokens : null;
+  }
+
   /** One token from each bucket, or none from either. */
   private takeBoth(...buckets: Array<[Bucket, number, number]>): boolean {
     const now = this.now();
-    for (const [bucket, burst, refillMs] of buckets) {
-      bucket.tokens = Math.min(burst, bucket.tokens + Math.max(0, now - bucket.at) / refillMs);
-      bucket.at = now;
-    }
+    for (const [bucket, burst, refillMs] of buckets) this.refill(bucket, burst, refillMs, now);
     if (buckets.some(([bucket]) => bucket.tokens < 1)) return false;
     for (const [bucket] of buckets) bucket.tokens -= 1;
     return true;
@@ -910,10 +936,15 @@ export class CollabUpdateGuard {
     return true;
   }
 
-  private refill(bucket: Bucket, burst: number, refillMs: number): void {
-    const now = this.now();
-    bucket.tokens = Math.min(burst, bucket.tokens + Math.max(0, now - bucket.at) / refillMs);
-    bucket.at = now;
+  /** `bucket`'s tokens refilled (one per `refillMs`, at most `burst`) up to `until`. Touches nothing. */
+  private refilled(bucket: Bucket, burst: number, refillMs: number, until: number = this.now()): number {
+    return Math.min(burst, bucket.tokens + Math.max(0, until - bucket.at) / refillMs);
+  }
+
+  /** Refill `bucket` up to `until`, and mark it refilled `at` (by default the same time). */
+  private refill(bucket: Bucket, burst: number, refillMs: number, until: number = this.now(), at: number = until): void {
+    bucket.tokens = this.refilled(bucket, burst, refillMs, until);
+    bucket.at = at;
   }
 
   /**
@@ -921,28 +952,27 @@ export class CollabUpdateGuard {
    * (wall clock) and not while the charged work ran: the event loop was that work's, so it earns nothing back.
    */
   private chargeCpu(user: string, ms: number, workStarted: number): void {
-    const bucket = this.budgetOf(user, null).cpu;
+    const bucket = this.userBudget(user).cpu;
     const now = this.now();
-    bucket.tokens = Math.min(USER_COLLAB_CPU_BURST_MS, bucket.tokens + Math.max(0, Math.min(now, workStarted) - bucket.at) / CPU_MS_REFILL_EVERY_MS);
-    bucket.at = Math.max(bucket.at, now);
+    this.refill(bucket, USER_COLLAB_CPU_BURST_MS, CPU_MS_REFILL_EVERY_MS, Math.min(now, workStarted), Math.max(bucket.at, now));
     bucket.tokens -= Math.max(0, ms);
   }
 
   /** A user's collab CPU balance now, in ms (specs and diagnostics): a full burst when none is kept. Touches nothing. */
   cpuBalance(user: string): number {
-    const bucket = this.userDocBudgets.get(`${user}\u0001`)?.cpu;
+    const bucket = (this.userDocBudgets.get(userKey(user)) as UserBudget | undefined)?.cpu;
     if (!bucket) return USER_COLLAB_CPU_BURST_MS;
-    return Math.min(USER_COLLAB_CPU_BURST_MS, bucket.tokens + Math.max(0, this.now() - bucket.at) / CPU_MS_REFILL_EVERY_MS);
+    return this.refilled(bucket, USER_COLLAB_CPU_BURST_MS, CPU_MS_REFILL_EVERY_MS);
   }
 
   /**
    * An exhausted (user, document) budget: close the SOCKET with 1013 first (so Hocuspocus's document CLOSE, sent next,
    * is dropped by the closing socket and the editor sees only a retryable socket close), then throw so this frame and
    * the ones queued behind it are not applied. Logged `COLLAB_SOCKET_LIMIT`, rate-limited. Report mode only logs, unless
-   * `always` (#847: a wedged live document, frozen in every mode).
+   * `always` (#847: a wedged live document, frozen in every mode). `fields`: numbers only (#832: `balanceMs`).
    */
-  private tryLater(frame: GuardFrame, limit: SocketLimit, always = false): void {
-    this.limitLog.log(limit, { userId: String(frame.context?.user?.id ?? '') });
+  private tryLater(frame: GuardFrame, limit: SocketLimit, always = false, fields: Record<string, number> = {}): void {
+    this.limitLog.log(limit, { userId: String(frame.context?.user?.id ?? ''), ...fields });
     if (this.mode === 'report' && !always) return;
     try {
       frame.connection.webSocket?.close(COLLAB_TRY_LATER_CODE, TRY_LATER_REASON);
@@ -1010,9 +1040,8 @@ export class CollabUpdateGuard {
    */
   private chargeReaderStep2(frame: GuardFrame, bytes: number): void {
     const userId = String(frame.context?.user?.id ?? '');
-    if (!this.take(this.budgetFor(frame, true).cpu, USER_COLLAB_CPU_BURST_MS, CPU_MS_REFILL_EVERY_MS, 0)) {
-      this.tryLater(frame, 'user_collab_cpu'); // throws unless report mode
-    }
+    const debt = this.inDebt(frame);
+    if (debt !== null) this.tryLater(frame, 'user_collab_cpu', false, { balanceMs: Math.round(debt) }); // throws unless report mode
     const known = this.docs.get(frame.document);
     const structs = known?.shadow ? known.structs : structCount(frame.document.store);
     this.chargeCpu(userId, readerStep2ChargeMs(bytes, structs), this.now());
@@ -1075,9 +1104,8 @@ export class CollabUpdateGuard {
     const doc = this.docFor(frame.document);
     const userId = String(frame.context?.user?.id ?? '');
     // 0. #816: a user in CPU debt waits, before any work; #840: so does one held for order strikes on this page.
-    if (!this.take(this.budgetFor(frame, true).cpu, USER_COLLAB_CPU_BURST_MS, CPU_MS_REFILL_EVERY_MS, 0)) {
-      this.tryLater(frame, 'user_collab_cpu'); // throws unless report mode
-    }
+    const debt = this.inDebt(frame);
+    if (debt !== null) this.tryLater(frame, 'user_collab_cpu', false, { balanceMs: Math.round(debt) }); // throws unless report mode
     if (this.budgetFor(frame).heldUntil > this.now()) this.tryLater(frame, 'order_strikes'); // throws unless report mode
     // From here every exit is charged (#816): the pre-pass, any rebuild and the shadow apply, once; live's own apply when
     // it runs (#840). A rebuild someone else's refusal made necessary is theirs; one the server caused is no one's (#827).
@@ -2017,7 +2045,7 @@ export class CollabUpdateGuard {
     for (const user of suspects) {
       if (doc.episode.struck.has(user)) continue; // struck once this episode; the line below still names them
       doc.episode.struck.add(user);
-      const budget = this.budgetOf(user, page);
+      const budget = this.docBudget(user, page);
       budget.strikes = budget.strikes.filter((at) => now - at < ORDER_STRIKE_WINDOW_MS);
       budget.strikes.push(now);
       if (budget.strikes.length >= ORDER_STRIKES_TO_HOLD) budget.heldUntil = now + ORDER_HOLD_MS;
@@ -2249,9 +2277,8 @@ export class CollabUpdateGuard {
       this.needsCompaction(doc, 'order_divergence', null, true);
       return this.tryLater(frame, 'order_divergence'); // throws unless report mode
     }
-    if (!this.take(this.budgetFor(frame, true).cpu, USER_COLLAB_CPU_BURST_MS, CPU_MS_REFILL_EVERY_MS, 0)) {
-      this.tryLater(frame, 'user_collab_cpu'); // throws unless report mode
-    }
+    const debt = this.inDebt(frame);
+    if (debt !== null) this.tryLater(frame, 'user_collab_cpu', false, { balanceMs: Math.round(debt) }); // throws unless report mode
     const workStarted = this.now();
     const started = this.cpuNow();
     let othersMs = 0;

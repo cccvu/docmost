@@ -2372,7 +2372,8 @@ describe('#816 the per-user collab CPU budget (a debt)', () => {
     expect(s.guard.cpuBalance('a')).toBe(USER_COLLAB_CPU_BURST_MS - 3_000);
     cpu.apply = 1;
     expect(s.send(s.conn('a'), edit())).toBe(TRY_LATER);
-    expect(s.limitLogs.some((l) => l.includes('"limit":"user_collab_cpu"'))).toBe(true);
+    const debt = s.limitLogs.find((l) => l.includes('"limit":"user_collab_cpu"'))!;
+    expect(JSON.parse(debt.slice(debt.indexOf('{')))).toEqual({ limit: 'user_collab_cpu', userId: 'a', balanceMs: -1_000 }); // #832: its depth
     expect(s.send(s.conn('b'), edit())).toBe('applied'); // per user
     const refill = (1_000 / USER_COLLAB_CPU_REFILL_MS_PER_SECOND) * 1_000; // wall ms that pay back 1000 ms of debt
     advance(refill - 1_000);
@@ -2450,5 +2451,15 @@ describe('#816 the per-user collab CPU budget (a debt)', () => {
     cpu.apply = 1_500;
     for (let i = 0; i < 4; i++) expect(s.send(s.conn('a'), edit())).toBe('applied');
     expect(s.limitLogs.some((l) => l.includes('"limit":"user_collab_cpu"'))).toBe(true);
+  });
+
+  it('#832: a socket load refused for CPU debt is logged load_debt with the debt\'s depth (balanceMs)', () => {
+    const t = 1_000_000;
+    const s = setup({ seed: SEED, now: () => t });
+    expect(s.guard.admitLoad('a')).toBe(true);
+    expect(s.limitLogs).toEqual([]);
+    s.guard.chargeLoad('a', USER_COLLAB_CPU_BURST_MS + 750, t);
+    expect(s.guard.admitLoad('a')).toBe(false);
+    expect(s.limitLogs.map((l) => JSON.parse(l.slice(l.indexOf('{'))))).toEqual([{ limit: 'load_debt', userId: 'a', balanceMs: -750 }]);
   });
 });
