@@ -339,8 +339,10 @@ export class ContentParsePool {
     const small = !batch && !serializing && bytes <= this.limits.smallInputBytes;
     const waitMs = queue.waitMs ?? this.limits.waitMs;
     const deadlineMs = this.limits.deadlineMs;
-    const admitBy = Date.now() + waitMs;
-    const left = () => Math.max(0, admitBy - Date.now());
+    // wiki-v2 #736: the admission wait is on the monotonic clock too, like the deadline (#734): a wall-clock step
+    // backward would otherwise lengthen a queued request's wait past `waitMs` (and a step forward cut it short).
+    const admitBy = performance.now() + waitMs;
+    const left = () => Math.max(0, admitBy - performance.now());
     const context = `${what} bytes=${bytes}${small ? ' class=small' : ''}`;
     const admit = () => this.budget.admit(budgetKey, { batch, turn, left, context });
     this.budget.prune();

@@ -14,6 +14,7 @@ import {
   ContentParseBusyException,
   ContentParsePool,
   ContentTooComplexException,
+  ConversionBudget,
   ConversionBudgetExhaustedException,
   convertOnBehalfOf,
   isBudgetExempt,
@@ -27,6 +28,7 @@ import {
   type ConversionQueue,
   type SpawnWorker,
 } from './content-parse.service';
+import { type ConversionBudgetClock } from './conversion-budget';
 
 const FIXTURE = path.join(__dirname, '__fixtures__', 'scripted.worker.cjs');
 
@@ -61,9 +63,14 @@ const bq = (principal: string, waitMs: number, budgetTurn: BatchBudgetTurn = { a
 
 /**
  * A pool over the fixture that counts how many workers it started. `mode` is the fixture's start-up behavior; a list
- * gives each successive worker its own (the last one repeats).
+ * gives each successive worker its own (the last one repeats). `budgetClock` replaces the budget's default
+ * (monotonic) clock, for the specs that advance time past a refill.
  */
-const makePool = (limits: Partial<ContentParseLimits> = {}, mode: string | string[] = 'normal') => {
+const makePool = (
+  limits: Partial<ContentParseLimits> = {},
+  mode: string | string[] = 'normal',
+  budgetClock?: ConversionBudgetClock,
+) => {
   const spawned: Worker[] = [];
   const modes = Array.isArray(mode) ? mode : [mode];
   const spawn: SpawnWorker = (memoryMb) => {
@@ -72,7 +79,9 @@ const makePool = (limits: Partial<ContentParseLimits> = {}, mode: string | strin
     spawned.push(w);
     return w;
   };
-  return { pool: new ContentParsePool({ ...LIMITS, ...limits }, spawn), spawned };
+  const merged = { ...LIMITS, ...limits };
+  const budget = budgetClock ? new ConversionBudget(merged, budgetClock) : undefined;
+  return { pool: new ContentParsePool(merged, spawn, budget), spawned };
 };
 
 /** The largest gap between main-thread timer ticks while `work` runs: how long the event loop was blocked. */
@@ -380,15 +389,19 @@ describe('#642 one principal never causes another principal\'s 503', () => {
  * #642 worker-time budget. After the echo fix, one abuser looping deadline-length conversions still kept the single
  * worker busy back to back (7 s + kill + reload > the 8 s wait) and 35% of another person's small writes were refused
  * busy. Each human key now has a bucket of worker time; an empty one is refused at admission with 429 + Retry-After.
- * Real fixture workers; time past a refill is advanced by offsetting `Date.now` (worker threads do not run under fake
- * timers).
+ * Real fixture workers (they do not run under fake timers). wiki-v2 #736: the budget and the admission wait run on the
+ * monotonic clock, so stepping the wall clock moves neither. Time past a refill is advanced on an INJECTED budget
+ * clock (`ahead`, `budgetClock`); `wallStep` steps `Date.now`, for the specs proving a wall-clock step changes nothing.
  */
 describe('#642 the per-principal worker-time budget', () => {
-  let offset = 0;
+  let ahead = 0;
+  let wallStep = 0;
+  const budgetClock: ConversionBudgetClock = { now: () => performance.now() + ahead };
   beforeEach(() => {
-    offset = 0;
+    ahead = 0;
+    wallStep = 0;
     const realNow = Date.now.bind(Date);
-    jest.spyOn(Date, 'now').mockImplementation(() => realNow() + offset);
+    jest.spyOn(Date, 'now').mockImplementation(() => realNow() + wallStep);
   });
   afterEach(() => jest.restoreAllMocks());
 
@@ -494,14 +507,16 @@ describe('#642 the per-principal worker-time budget', () => {
     // ADR 0031: the deadline is the one bound on the single worker. Date.now() steps back 3 s just after dispatch
     // (an NTP/chrony step); a kill decided on it would land at ~3.2 s and hold the worker for everyone that long.
     // The step is taken when the kill timer is armed, i.e. after dispatch by construction, never on a timing guess.
+    // wiki-v2 #736: the pool's DEFAULT budget clock, with a slow refill (0.01 ms per ms: the few real ms of this spec
+    // refill well under 1 ms), so a wall-clock step that reached the budget would show.
     const deadlineMs = 200;
-    const { pool } = track(makePool({ deadlineMs, budgetCapacityMs: 10_000, budgetRefillMsPerMinute: 0 }));
+    const { pool } = track(makePool({ deadlineMs, budgetCapacityMs: 10_000, budgetRefillMsPerMinute: 600 }));
     await pool.parse('warm', 'html', q('background'));
     const real = global.setTimeout;
     const spy = jest
       .spyOn(global, 'setTimeout')
       .mockImplementation(((fn: (...a: unknown[]) => void, ms?: number, ...args: unknown[]) => {
-        if (ms === deadlineMs && offset === 0) offset -= 3_000; // `offset` steers this describe's Date.now spy
+        if (ms === deadlineMs && wallStep === 0) wallStep -= 3_000; // `wallStep` steers this describe's Date.now spy
         return real(fn, ms, ...args);
       }) as typeof setTimeout);
     const started = performance.now();
@@ -512,11 +527,31 @@ describe('#642 the per-principal worker-time budget', () => {
       spy.mockRestore();
     }
     const took = performance.now() - started;
-    expect(offset).toBe(-3_000); // the step happened, mid-conversion
+    expect(wallStep).toBe(-3_000); // the step happened, mid-conversion
     expect(err).toBeInstanceOf(ContentTooComplexException);
     expect(took).toBeGreaterThanOrEqual(deadlineMs);
     expect(took).toBeLessThan(deadlineMs + 1_500); // a postponed kill takes ≥ 3.2 s
-    expect(pool.budgetLeft('user:A')).toBeLessThanOrEqual(10_000 - deadlineMs); // charged its full deadline
+    const before = pool.budgetLeft('user:A');
+    expect(before).toBeLessThanOrEqual(10_000 - deadlineMs); // charged its full deadline
+    // wiki-v2 #736: nor does the refill follow the wall clock. An hour's step forward refills nothing here (on the wall
+    // clock it would refill 36 s, the whole bucket); the 3 s step back above held back nothing either.
+    wallStep += 3_600_000;
+    expect(pool.budgetLeft('user:A') - before).toBeLessThan(1);
+  });
+
+  it("wiki-v2 #736 a wall clock that steps backward does not lengthen a queued request's wait: admission is monotonic", async () => {
+    // B queues behind A's 800 ms conversion with a 150 ms wait, and the wall clock steps back 3 s right after B fixed
+    // its admission deadline (synchronously, before B's first await). On the wall clock B's wait would grow to ~3.15 s
+    // and B would be served once A is done; on the monotonic clock it is refused at its 150 ms, as with no step.
+    const { pool } = track(makePool({ waitMs: 150, deadlineMs: 5_000 }));
+    await pool.parse('warm', 'html', q('background'));
+    const a = pool.parse('sleep:800', 'html', q('user:A'));
+    await new Promise((r) => setTimeout(r, 20)); // A holds the worker
+    const b = pool.parse('b', 'html', q('user:B')).catch((e) => e);
+    wallStep -= 3_000;
+    // Refused, never served: being served would mean it outwaited A's 800 ms on a 150 ms wait.
+    await expect(b).resolves.toBeInstanceOf(ContentParseBusyException);
+    await expect(a).resolves.toMatchObject({ type: 'doc' });
   });
 
   it('an ordinary conversion is charged its wall time; exempt keys are never charged', async () => {
@@ -594,17 +629,21 @@ describe('#642 the per-principal worker-time budget', () => {
 
   it('the refill restores admission', async () => {
     const { pool, spawned } = track(
-      makePool({
-        deadlineMs: 200,
-        budgetCapacityMs: 100,
-        budgetRefillMsPerMinute: 6_000,
-      }),
+      makePool(
+        {
+          deadlineMs: 200,
+          budgetCapacityMs: 100,
+          budgetRefillMsPerMinute: 6_000,
+        },
+        'normal',
+        budgetClock,
+      ),
     );
     await pool.parse('warm', 'html', q('background'));
     await spend(pool, spawned);
     const err = await pool.parse('x', 'html', q('user:A')).catch((e) => e);
     expect(err).toBeInstanceOf(ConversionBudgetExhaustedException);
-    offset += err.retryAfterSeconds * 1000; // the time it was told to wait
+    ahead += err.retryAfterSeconds * 1000; // the time it was told to wait, on the budget's clock
     await expect(pool.parse('again', 'html', q('user:A'))).resolves.toEqual({
       type: 'doc',
       label: 'again',
@@ -722,18 +761,18 @@ describe('#642 the per-principal worker-time budget', () => {
 
   it('idle keys do not accumulate: a bucket that has refilled is dropped (on read, and by the periodic sweep)', async () => {
     const { pool } = track(
-      makePool({ budgetCapacityMs: 1_000, budgetRefillMsPerMinute: 60_000 }),
+      makePool({ budgetCapacityMs: 1_000, budgetRefillMsPerMinute: 60_000 }, 'normal', budgetClock),
     );
     for (let i = 0; i < 20; i++)
       await pool.parse('sleep:5', 'html', q(`user:P${i}`));
     expect(pool.budgetKeys).toBe(20);
-    offset += 61_000; // every bucket is full again, and the sweep is due
+    ahead += 61_000; // every bucket is full again, and the sweep is due
     await pool.parse('trigger', 'html', q('background')); // exempt: sweeps, charges nothing
     expect(pool.budgetKeys).toBe(0);
     // A full bucket read directly is dropped too.
     await pool.parse('sleep:5', 'html', q('user:Q'));
     expect(pool.budgetKeys).toBe(1);
-    offset += 2_000;
+    ahead += 2_000;
     expect(pool.budgetLeft('user:Q')).toBe(1_000);
     expect(pool.budgetKeys).toBe(0);
   });
