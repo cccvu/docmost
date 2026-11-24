@@ -64,6 +64,20 @@
   outline-color: var(--ccc-focus-ring);
 }
 
+/* Switch and SegmentedControl draw their ring on the element after the
+ * visually hidden input (the track, the label), not through the focus classes
+ * above, and in the primary filled colour: invisible in dark too (wiki-v2
+ * #913). Only the colour changes; Mantine keeps the 2px width and offset.
+ */
+[data-mantine-color-scheme="dark"]
+  .mantine-Switch-input:focus-visible
+  + .mantine-Switch-track,
+[data-mantine-color-scheme="dark"]
+  .mantine-SegmentedControl-input:focus-visible
+  + .mantine-SegmentedControl-label {
+  outline-color: var(--ccc-focus-ring);
+}
+
 /* Focused inputs get a 2px ring (2.4.7; the 1px border change alone is
  * 2.29:1 against the resting #52525b). Drawn inside the box (offset -2px, over
  * the border): an outer ring is clipped by ScrollArea viewports and
@@ -73,11 +87,24 @@
  * `:focus`, not `:focus-visible`: a text field shows focus on click too, and
  * `:focus-within` covers MultiSelect / TagsInput, whose bordered element is a
  * div. An outline, not a box-shadow, so forced-colors mode keeps it.
- * `unstyled` inputs opt out by design.
+ * `unstyled` inputs opt out by design. Borderless default-variant fields (the
+ * Spotlight search) get the ring on purpose: it is their only focus indicator.
+ *
+ * Error inputs (wiki-v2 #915): Mantine turns the 1px border red on focus too,
+ * and the ring at -2px would cover it, so there it sits 1px further in (-3px)
+ * and the red border shows around it. The ring keeps its neutral colour
+ * (11.77-17.72:1 on the fills); the red border carries the error state.
  */
 .mantine-Input-input:not([data-variant="unstyled"]):is(:focus, :focus-within) {
   outline: 2px solid var(--ccc-focus-ring);
   outline-offset: -2px;
+}
+
+.mantine-Input-input[data-error]:not([data-variant="unstyled"]):is(
+    :focus,
+    :focus-within
+  ) {
+  outline-offset: -3px;
 }
 /* ccc-input-focus:end */
 

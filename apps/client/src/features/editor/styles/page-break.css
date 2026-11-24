@@ -32,7 +32,7 @@
 }
 
 .ProseMirror .page-break.ProseMirror-selectednode {
-  border-top-color: var(--mantine-primary-color-filled);
+  border-top-color: var(--ccc-focus-ring);
 }
 
 @media print {

@@ -25,7 +25,7 @@
     }
 
     &:focus-visible {
-        outline: 2px solid var(--mantine-primary-color-filled);
+        outline: 2px solid var(--ccc-focus-ring);
         outline-offset: -2px;
     }
 }
@@ -35,7 +35,7 @@
             var(--mantine-color-blue-0),
             var(--mantine-color-dark-5)
     );
-    border-left: 2px solid var(--mantine-primary-color-filled);
+    border-left: 2px solid var(--ccc-focus-ring);
 }
 
 .spaceRow {
