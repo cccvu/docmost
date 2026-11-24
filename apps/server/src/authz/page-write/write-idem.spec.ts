@@ -185,20 +185,25 @@ describe('scopedWriteKey — ledger entries disclose neither the writer nor the 
     expect([...doc.getMap(WRITE_IDEM_MAP).keys()]).toEqual([scopedWriteKey(UID, KEY).entry]);
   });
 
-  it('dual read: an entry a pre-fix replica recorded raw still dedups the same user, and only that user (S1)', () => {
+  // #845: the one-release legacy dual read is removed (v0.12.4 shipped the digest; every rollback target below it also
+  // crosses #827). A raw entry is only an aging tombstone now: it never dedups, for any user.
+  it('a raw entry a pre-v0.12.4 replica recorded no longer dedups (the dual read is removed)', () => {
     const doc = new Y.Doc();
     seedRaw(doc, legacy('user-a', 'K'), NOW); // seeded exactly as an old replica wrote it
+    expect(doc.getMap(WRITE_IDEM_MAP).has(legacy('user-a', 'K'))).toBe(true); // the raw entry is there…
+    expect(isDuplicateWriteKey(doc, scopedWriteKey('user-a', 'K'))).toBe(false); // …and is not read
+    expect(isDuplicateWriteKey(doc, scopedWriteKey('user-b', 'K'))).toBe(false);
+    recordWriteKey(doc, scopedWriteKey('user-a', 'K'), NOW); // the h1 entry of the same pair is
     expect(isDuplicateWriteKey(doc, scopedWriteKey('user-a', 'K'))).toBe(true);
     expect(isDuplicateWriteKey(doc, scopedWriteKey('user-b', 'K'))).toBe(false);
-    expect(isDuplicateWriteKey(doc, scopedWriteKey('user-a', 'K2'))).toBe(false);
   });
 
   // Type pins, checked by scripts/ci/docmost-server-typecheck.mjs (the only type gate for fork specs; never run):
-  // a string, `.entry` included, can neither be checked (it would skip the legacy read and the user scope) nor
-  // recorded (a raw or unscoped entry would bring back the exposure and the S1 hole).
+  // a string, `.entry` included, can neither be checked (it would skip the user scope) nor recorded (a raw or
+  // unscoped entry would bring back the exposure and the S1 hole).
   it('the ledger functions accept a ScopedWriteKey only, never a string (compile-time)', () => {
     const typePins = (doc: Y.Doc) => {
-      // @ts-expect-error `.entry` alone skips the legacy dual read
+      // @ts-expect-error `.entry` alone skips the user scope
       isDuplicateWriteKey(doc, scopedWriteKey('user-a', 'K').entry);
       // @ts-expect-error a raw `userId NUL key` entry must not be recordable
       recordWriteKey(doc, legacy('user-a', 'K'), NOW);
@@ -206,7 +211,7 @@ describe('scopedWriteKey — ledger entries disclose neither the writer nor the 
     expect(typeof typePins).toBe('function');
   });
 
-  it('the dual read is PURE: no transaction, no byte changes', () => {
+  it('the check is PURE, also over a ledger holding a raw entry: no transaction, no byte changes', () => {
     const doc = new Y.Doc();
     seedRaw(doc, legacy('user-a', 'K'), NOW);
     recordWriteKey(doc, scopedWriteKey('user-a', 'K2'), NOW);
@@ -234,16 +239,19 @@ describe('scopedWriteKey — ledger entries disclose neither the writer nor the 
     seedRaw(doc, legacy('user-a', 'OLD'), NOW);
     recordWriteKey(doc, scopedWriteKey('user-a', 'OLD-H1'), NOW, retentionMs, maxEntries);
     seedRaw(doc, legacy('user-a', 'R1'), NOW + retentionMs + 1); // an old replica's write, still in the window
+    // Raw entries are no longer read (#845), so they are checked on the map itself.
+    const holdsRaw = (k: string) => doc.getMap(WRITE_IDEM_MAP).has(legacy('user-a', k));
     // Past the window: the next record ages out both old forms together, and keeps the in-window raw R1.
     recordWriteKey(doc, scopedWriteKey('user-a', 'H1'), NOW + retentionMs + 2, retentionMs, maxEntries);
-    expect(isDuplicateWriteKey(doc, scopedWriteKey('user-a', 'OLD'))).toBe(false);
+    expect(holdsRaw('OLD')).toBe(false);
     expect(isDuplicateWriteKey(doc, scopedWriteKey('user-a', 'OLD-H1'))).toBe(false);
-    expect(isDuplicateWriteKey(doc, scopedWriteKey('user-a', 'R1'))).toBe(true);
+    expect(holdsRaw('R1')).toBe(true);
     seedRaw(doc, legacy('user-a', 'R2'), NOW + retentionMs + 3);
     // Cap 3, a 4th entry evicts the oldest across both forms (the raw R1).
     recordWriteKey(doc, scopedWriteKey('user-a', 'H2'), NOW + retentionMs + 4, retentionMs, maxEntries);
-    expect(isDuplicateWriteKey(doc, scopedWriteKey('user-a', 'R1'))).toBe(false);
-    for (const k of ['H1', 'R2', 'H2']) expect(isDuplicateWriteKey(doc, scopedWriteKey('user-a', k))).toBe(true);
+    expect(holdsRaw('R1')).toBe(false);
+    expect(holdsRaw('R2')).toBe(true);
+    for (const k of ['H1', 'H2']) expect(isDuplicateWriteKey(doc, scopedWriteKey('user-a', k))).toBe(true);
     expect(doc.getMap(WRITE_IDEM_MAP).size).toBe(maxEntries);
   });
 });
