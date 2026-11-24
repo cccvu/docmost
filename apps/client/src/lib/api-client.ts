@@ -32,7 +32,6 @@ api.interceptors.response.use(
       switch (error.response.status) {
         case 401: {
           const url = new URL(error.request.responseURL)?.pathname;
-          if (url === "/api/auth/collab-token") return;
           if (window.location.pathname.startsWith("/share/")) return;
 
           // #310 self-heal: in remote (platform-integrated) mode the relayed Docmost session cookie
@@ -42,6 +41,8 @@ api.interceptors.response.use(
           // bouncing an authenticated user to /login. `openDocmostSession` is imported dynamically to avoid
           // a static import cycle (auth-service imports this module). Loop-guarded via `_docmostRetry`;
           // falls through to the login wall if the re-mint also fails (the platform session is truly gone).
+          // wiki-v2 #755: the collab-token request takes the same one re-mint (the editor's token refetch then
+          // succeeds), but never the login wall (see the break below).
           const config = error.config as
             | (InternalAxiosRequestConfig & { _docmostRetry?: boolean })
             | undefined;
@@ -62,6 +63,11 @@ api.interceptors.response.use(
               // re-mint failed → fall through to the login wall below
             }
           }
+
+          // wiki-v2 #755: a collab-token 401 left after the re-mint REJECTS with its AxiosError (401 is terminal for
+          // the token query), never resolves `undefined` (read as a network error and retried for ~30 s) and never
+          // bounces the tab to /login (upstream exempted this URL from the login wall).
+          if (url === "/api/auth/collab-token") break;
 
           // On a public route (front page / request-access), a 401 from an optional probe (e.g. the
           // anonymous `/users/me` auth check) must NOT hard-redirect to /login — let it reject so the
