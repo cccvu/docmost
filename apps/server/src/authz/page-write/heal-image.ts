@@ -42,18 +42,20 @@
  *
  * Reloads run under the #816 meter with a deadline innermost (the load's budget). Images are built under
  * COMPACTION_DEADLINE_MS from documents they made (the live tree is read with the snapshot, outside any deadline).
- * Logs: `COLLAB_ORDER_DIVERGENCE` (order-divergence-log.ts), and `COLLAB_COMPACTION_FAILED` when an image cannot be
- * built.
+ * Logs: `COLLAB_ORDER_DIVERGENCE` (order-divergence-log.ts), `COLLAB_COMPACTION_FAILED` when an image cannot be
+ * built, and `COLLAB_STORE_NORMALIZED` (#784) when a store's snapshot is not `fromYdoc`'s own output (below).
  */
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import * as Y from 'yjs';
 import { sql } from 'kysely';
+import { Logger } from '@nestjs/common';
 import type { KyselyDB } from '@docmost/db/types/kysely.types';
 import { COLLAB_PAGE_COMPACTING_REASON, pageCompactingRefusal } from '../collab-ingress/collab-reasons';
 import { logCompactionFailed, logCompactionRequested } from '../collab-ingress/compaction-log';
 import { ConflictScan, installConflictScanMeter, type ConflictScanMeter } from '../collab-ingress/conflict-scan';
 import { runWithDeadline } from '../collab-ingress/deadline';
+import { RateLimitedWarn } from '../collab-ingress/socket-limit-log';
 import { COMPACTION_DEADLINE_MS } from '../collab-ingress/doc-bounds';
 import { attachReplicaLog } from '../collab-ingress/exact-replica-registry';
 import { claimAtLoad, claimSealRow, commitSealRow, type BindingSealStore } from './binding-seal';
@@ -235,6 +237,7 @@ export interface PreparedStore {
 export async function prepareStore(document: Y.Doc, pageId: string): Promise<PreparedStore> {
   const coveredRow = coveredRowAtSnapshot(document);
   const snapshot = snapshotForStore(document);
+  noteStoreNormalized(document, pageId, snapshot);
   const order = checkStoreOrder(document, snapshot);
   if (order.stable) return { snapshot, order, coveredRow, underLock: false };
   await yieldToEventLoop();
@@ -255,10 +258,55 @@ export async function storeSnapshotUnderLock(
 ): Promise<PreparedStore> {
   if (snapshotHoldsRow(prepared.coveredRow, rowYdoc)) return prepared;
   const snapshot = snapshotForStore(document);
+  noteStoreNormalized(document, pageId, snapshot);
   const order = checkStoreOrder(document, snapshot);
   if (order.stable) return { snapshot, order, coveredRow: null, underLock: true };
   await yieldToEventLoop();
   return { snapshot, order: withHealImage(pageId, order), coveredRow: null, underLock: true };
+}
+
+// --- the store's normalization line (#784)
+
+export const COLLAB_STORE_NORMALIZED_TOKEN = 'COLLAB_STORE_NORMALIZED';
+/** Lines a minute across all pages; the rest are counted into one `log_suppressed` line when the window ends. */
+export const STORE_NORMALIZED_LOGS_PER_MINUTE = 30;
+/** Where the line goes (the specs spy on it). */
+export const storeNormalizedLogSink: { warn(line: string): void } = {
+  warn: (line) => storeNormalizedLogger.warn(line),
+};
+const storeNormalizedLogger = new Logger('CollabStoreNormalized');
+let storeNormalizedLines = newStoreNormalizedLines();
+function newStoreNormalizedLines(): RateLimitedWarn<typeof COLLAB_STORE_NORMALIZED_TOKEN> {
+  return new RateLimitedWarn({
+    logger: { warn: (line) => storeNormalizedLogSink.warn(line) },
+    perKey: STORE_NORMALIZED_LOGS_PER_MINUTE,
+    summary: (token, count) => `${token} ${JSON.stringify({ reason: 'log_suppressed', count })}`,
+  });
+}
+/** The documents already logged: one line per document lifetime, not one per store of a page that stays poisoned. */
+let storeNormalizedDocs = new WeakSet<Y.Doc>();
+
+/** The specs: a fresh rate-limit window, and no document logged yet. */
+export function resetStoreNormalizedLogForTests(): void {
+  storeNormalizedLines = newStoreNormalizedLines();
+  storeNormalizedDocs = new WeakSet<Y.Doc>();
+}
+
+/**
+ * `COLLAB_STORE_NORMALIZED {"pageId"}` (warn) when the store's snapshot is not `fromYdoc`'s own output: `storeSafeJson`
+ * wrote U+FFFD for a lone surrogate or NUL that Postgres refuses, or reshaped a value `JSON.stringify` writes otherwise
+ * (#773). The page stores and nothing is lost; before #773 the same page wedged its store (`COLLAB_STORE_FAILED`). The
+ * collab ingress does not refuse these strings, so a burst across pages points at a crafted client. At most once per
+ * document lifetime and STORE_NORMALIZED_LOGS_PER_MINUTE a minute; the page id only, never content. Never throws.
+ */
+function noteStoreNormalized(document: Y.Doc, pageId: string, snapshot: StoreSnapshot): void {
+  if (!snapshot.normalized || storeNormalizedDocs.has(document)) return;
+  storeNormalizedDocs.add(document);
+  try {
+    storeNormalizedLines.warn(COLLAB_STORE_NORMALIZED_TOKEN, () => `${COLLAB_STORE_NORMALIZED_TOKEN} ${JSON.stringify({ pageId })}`);
+  } catch {
+    // a log line is never a reason to fail the store
+  }
 }
 
 /** What the store did about order (flat, see StoreOrder). */

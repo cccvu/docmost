@@ -9,6 +9,7 @@ import { CollaborationHandler } from '../../collaboration/collaboration.handler'
 import { PersistenceExtension } from '../../collaboration/extensions/persistence.extension';
 import { PG_URL, uuid, mkReadModelPg, bootstrapSchema, mkReadModelDb } from '../../service-bridge/read-model-pg.testkit';
 import * as driftLog from './collab-drift-log';
+import { resetStoreNormalizedLogForTests, storeNormalizedLogSink } from './heal-image';
 import { hasStoreFailure } from './store-failure-registry';
 
 /**
@@ -120,6 +121,24 @@ d('the collab store on real Postgres (#773)', () => {
 
   /** Every store failure the extension logged (`COLLAB_STORE_FAILED`), as the Postgres error code or the message. */
   let storeFailures: string[];
+  /** Every `COLLAB_STORE_NORMALIZED` line (#784). */
+  let normalized: string[];
+  const NORMALIZED_LINE = `COLLAB_STORE_NORMALIZED {"pageId":"${PAGE_ID}"}`;
+
+  /**
+   * Unload the page on the first node, then load it on a fresh one from the row's bytes and store it there: a store
+   * that really runs (no `isStoreCurrent` skip, which a second store of the same document would hit) and compares the
+   * reloaded document's projection with the row.
+   */
+  async function reloadAndStore(first: ReturnType<typeof stack>) {
+    for (const conn of live.splice(0)) await conn.disconnect();
+    for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
+    expect(first.hocuspocus.documents.has(DOC)).toBe(false);
+    const second = stack(); // a fresh node: the document loads from the row's (raw) ydoc bytes
+    const reloaded = await second.open();
+    await second.persistence.onStoreDocument({ documentName: DOC, document: reloaded, lastContext: { user: USER } } as never);
+    return { second, reloaded };
+  }
 
   beforeAll(async () => {
     await bootstrapSchema(SCHEMA);
@@ -150,6 +169,9 @@ d('the collab store on real Postgres (#773)', () => {
 
   beforeEach(async () => {
     storeFailures = [];
+    normalized = [];
+    resetStoreNormalizedLogForTests();
+    jest.spyOn(storeNormalizedLogSink, 'warn').mockImplementation((line) => void normalized.push(line));
     jest.spyOn(driftLog, 'logStoreFailure').mockImplementation((_logger, _pageId, err) => {
       storeFailures.push(String((err as { code?: string })?.code ?? (err as Error)?.message ?? err));
     });
@@ -195,6 +217,8 @@ d('the collab store on real Postgres (#773)', () => {
     expect(hasStoreFailure(doc)).toBe(false);
     expect(settled).toMatchObject({ flushed: true, contentDigest: expect.any(String) });
     expect(s.updatePage).toHaveBeenCalledTimes(1);
+    // #784: the normalization is logged once, with the page id only (never content).
+    expect(normalized).toEqual([NORMALIZED_LINE]);
 
     const r = await row();
     expect(storable(r.content)).toBe(true);
@@ -243,6 +267,7 @@ d('the collab store on real Postgres (#773)', () => {
     expect(s.lockedReads()).toBe(readsBefore + 1); // the store RAN (not the one-store-per-write skip)…
     expect(s.updatePage).toHaveBeenCalledTimes(1); // …and found the row already holds it: no second write
     expect((await row()).updatedAt).toEqual(before.updatedAt);
+    expect(normalized).toEqual([NORMALIZED_LINE]); // #784: once per document lifetime, not once per store
   });
 
   it('a later ordinary edit to the poisoned page stores', async () => {
@@ -267,17 +292,13 @@ d('the collab store on real Postgres (#773)', () => {
     const doc = await first.open();
     remoteUpdate(doc, poison);
     const settledBefore = await first.handlers.flushPageContent(DOC, { withDigest: true });
-    for (const conn of live.splice(0)) await conn.disconnect();
-    for (let i = 0; i < 5; i++) await new Promise((r) => setTimeout(r, 0));
-    expect(first.hocuspocus.documents.has(DOC)).toBe(false);
     const stored = await row();
 
-    const second = stack(); // a fresh node: the document loads from the row's (raw) ydoc bytes
-    const reloaded = await second.open();
+    const { second, reloaded } = await reloadAndStore(first);
     expect(storable(TiptapTransformer.fromYdoc(reloaded, 'default'))).toBe(false); // the raw value is still live
-    await second.persistence.onStoreDocument({ documentName: DOC, document: reloaded, lastContext: { user: USER } } as never);
 
     expect(storeFailures).toEqual([]);
+    expect(normalized).toEqual([NORMALIZED_LINE, NORMALIZED_LINE]); // #784: one line per document lifetime
     expect(hasStoreFailure(reloaded)).toBe(false);
     expect(second.lockedReads()).toBe(1);
     expect(second.updatePage).not.toHaveBeenCalled();
@@ -286,6 +307,45 @@ d('the collab store on real Postgres (#773)', () => {
     expect(after.content).toEqual(stored.content);
     // The version survives the unload: the reloaded document's digest is the one handed out before.
     await expect(second.handlers.flushPageContent(DOC, { withDigest: true })).resolves.toEqual(settledBefore);
+  });
+
+  // #784: no false positive. A clean page's `fromYdoc` output comes back from storeSafeJson as the same object.
+  it('a clean edit stores without a COLLAB_STORE_NORMALIZED line, on the first node and after a reload', async () => {
+    const s = stack();
+    const doc = await s.open();
+    remoteUpdate(doc, (f) => ((f.get(0) as Y.XmlElement).get(0) as Y.XmlText).insert(9, ' and more', {}));
+    await expect(s.handlers.flushPageContent(DOC)).resolves.toEqual({ flushed: true });
+    expect(storeFailures).toEqual([]);
+    expect(s.updatePage).toHaveBeenCalledTimes(1);
+    expect(textNode((await row()).content, 'seed')?.text).toBe('seed text and more');
+    const { second } = await reloadAndStore(s);
+    expect(second.lockedReads()).toBe(1); // the store ran on the reloaded document
+    expect(normalized).toEqual([]);
+  });
+
+  // #784: the /v1 symptom end to end. A content write on a resident poisoned page used to apply, find the store failed
+  // and answer `500 write_outcome_unknown`.
+  it('a /v1 content write to a resident poisoned page resolves, and the row stores both the write and the poison', async () => {
+    const s = stack();
+    const doc = await s.open();
+    remoteUpdate(doc, poison); // the store stays debounced: the resident document is poisoned when the write arrives
+    expect(storable(TiptapTransformer.fromYdoc(doc, 'default'))).toBe(false);
+
+    await expect(
+      s.handlers.updatePageContent(DOC, {
+        prosemirrorJson: { type: 'doc', content: [{ type: 'paragraph', content: [{ type: 'text', text: 'appended' }] }] },
+        operation: 'append',
+        user: USER,
+      } as never),
+    ).resolves.toBeUndefined();
+
+    expect(storeFailures).toEqual([]);
+    expect(hasStoreFailure(doc)).toBe(false);
+    expect(s.updatePage).toHaveBeenCalled();
+    const r = await row();
+    expect(storable(r.content)).toBe(true);
+    expect(textNode(r.content, 'appended')).toBeDefined();
+    expect(textNode(r.content, 'link')?.marks).toEqual([{ type: 'link', attrs: { href: `x${R}` } }]);
   });
 
   // The shape is attacker-controlled too (#773 security review): each of these reached Postgres raw, or made
@@ -314,7 +374,10 @@ d('the collab store on real Postgres (#773)', () => {
       { a: `x${R}` },
     ],
     ['a BigInt attribute value (JSON.stringify throws on one)', (p) => p.setAttribute('textAlign', BigInt(10) as never), '10'],
-  ])('%s: the store and the settle succeed, and the next store is `unchanged`', async (_name, setAttrs, stored) => {
+    // #784: legacy bytes (the ingress refuses new typed arrays, #781): stored as the index object JSON.stringify writes,
+    // which the projection must equal or every reload rewrites the row.
+    ['a Uint8Array attribute value (ContentBinary)', (p) => p.setAttribute('textAlign', new Uint8Array([1, 2]) as never), { '0': 1, '1': 2 }],
+  ])('%s: the store and the settle succeed, and the store after a reload is `unchanged`', async (_name, setAttrs, stored) => {
     const s = stack();
     const doc = await s.open();
     remoteUpdate(doc, (f) => {
@@ -330,12 +393,16 @@ d('the collab store on real Postgres (#773)', () => {
     expect(s.updatePage).toHaveBeenCalledTimes(1);
     const r = await row();
     expect(storable(r.content)).toBe(true);
-    expect(r.content.content![1].attrs?.textAlign).toEqual(stored);
+    expect(r.content.content![1].attrs?.textAlign).toStrictEqual(stored);
+    expect(normalized).toEqual([NORMALIZED_LINE]);
 
-    // It converges: the same live state stores as `unchanged` and keeps its version.
-    await s.persistence.onStoreDocument({ documentName: DOC, document: doc, lastContext: { user: USER } } as never);
+    // It converges (#784: on a fresh node, so the store really runs): the reloaded state stores as `unchanged` and
+    // keeps its version.
+    const { second } = await reloadAndStore(s);
     expect(storeFailures).toEqual([]);
-    expect(s.updatePage).toHaveBeenCalledTimes(1);
-    await expect(s.handlers.flushPageContent(DOC, { withDigest: true })).resolves.toEqual(settled);
+    expect(second.lockedReads()).toBe(1); // the store ran…
+    expect(second.updatePage).not.toHaveBeenCalled(); // …and found the row already holds it
+    expect((await row()).updatedAt).toEqual(r.updatedAt);
+    await expect(second.handlers.flushPageContent(DOC, { withDigest: true })).resolves.toEqual(settled);
   });
 });
