@@ -271,6 +271,55 @@ describe("api-client collab-token 401 (#755)", () => {
     expect(error).toBeInstanceOf(AxiosError);
     expect(shouldRetryCollabToken(0, error)).toBe(false);
   });
+
+  /** A re-mint (`POST /bff/docmost/session`) failure as the platform client raises it. */
+  function remintError(status: number | null): AxiosError {
+    const config: any = { url: "/bff/docmost/session", headers: {} };
+    return new AxiosError(
+      status == null ? "Network Error" : `Request failed with status code ${status}`,
+      status == null ? "ERR_NETWORK" : "ERR_BAD_RESPONSE",
+      config,
+      {},
+      status == null
+        ? undefined
+        : { status, statusText: "", data: {}, headers: {}, config },
+    );
+  }
+
+  it.each([
+    ["a 503", 503],
+    ["a 429", 429],
+    ["no response (network error)", null],
+  ])(
+    "(f) remote mode: a re-mint that failed transiently with %s rejects with the re-mint's error, which the token query retries",
+    async (_label, status) => {
+      const minted = remintError(status);
+      openDocmostSession.mockRejectedValueOnce(minted);
+      const seen = collabAdapter(Infinity);
+
+      const error = await api.post("/auth/collab-token").catch((e) => e);
+
+      expect(error).toBe(minted);
+      expect(shouldRetryCollabToken(0, error)).toBe(true);
+      expect(openDocmostSession).toHaveBeenCalledTimes(1);
+      expect(seen.calls).toBe(1);
+      expect(window.location.href).toBe("");
+    },
+  );
+
+  it("(g) remote mode: a re-mint refused with 401 (the platform session is gone) rejects with the original, terminal 401", async () => {
+    openDocmostSession.mockRejectedValueOnce(remintError(401));
+    const seen = collabAdapter(Infinity);
+
+    const error = await api.post("/auth/collab-token").catch((e) => e);
+
+    expect(error).toBeInstanceOf(AxiosError);
+    expect(error.config.url).toBe("/auth/collab-token");
+    expect(error.response.status).toBe(401);
+    expect(shouldRetryCollabToken(0, error)).toBe(false);
+    expect(seen.calls).toBe(1);
+    expect(window.location.href).toBe("");
+  });
 });
 
 /**

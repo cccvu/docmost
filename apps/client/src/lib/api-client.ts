@@ -46,6 +46,7 @@ api.interceptors.response.use(
           const config = error.config as
             | (InternalAxiosRequestConfig & { _docmostRetry?: boolean })
             | undefined;
+          let remintError: unknown;
           if (
             !isNativeAuthEnabled() &&
             !isPublicRoutePath(window.location.pathname) &&
@@ -59,15 +60,22 @@ api.interceptors.response.use(
               );
               await openDocmostSession();
               return api(config);
-            } catch {
+            } catch (e) {
               // re-mint failed → fall through to the login wall below
+              remintError = e;
             }
           }
 
           // wiki-v2 #755: a collab-token 401 left after the re-mint REJECTS with its AxiosError (401 is terminal for
           // the token query), never resolves `undefined` (read as a network error and retried for ~30 s) and never
-          // bounces the tab to /login (upstream exempted this URL from the login wall).
-          if (url === "/api/auth/collab-token") break;
+          // bounces the tab to /login (upstream exempted this URL from the login wall). A re-mint that failed
+          // transiently (no response, 429, 5xx) rejects with ITS error instead, so the token query retries it.
+          if (url === "/api/auth/collab-token") {
+            if (isTransientHttpFailure(remintError)) {
+              return Promise.reject(remintError);
+            }
+            break;
+          }
 
           // On a public route (front page / request-access), a 401 from an optional probe (e.g. the
           // anonymous `/users/me` auth check) must NOT hard-redirect to /login — let it reject so the
@@ -112,6 +120,13 @@ api.interceptors.response.use(
     return Promise.reject(error);
   },
 );
+
+// wiki-v2 #755: the token query's own retryable set (shouldRetryCollabToken), for an axios error only.
+function isTransientHttpFailure(error: unknown): boolean {
+  if (!axios.isAxiosError(error)) return false;
+  const status = error.response?.status;
+  return status == null || status === 429 || status >= 500;
+}
 
 function redirectToLogin() {
   const exemptPaths = [
