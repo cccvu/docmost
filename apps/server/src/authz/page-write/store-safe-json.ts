@@ -23,7 +23,9 @@
  *     number becomes `null` and `-0` becomes `0` (what the row reads back, so the no-op check still converges);
  *   - a BigInt (which Yjs carries and `JSON.stringify` throws on, wedging the store the same way) becomes its decimal
  *     string;
- *   - an `ArrayBuffer` view (a `Uint8Array` from `ContentAny`) is left as is: it holds only numbers.
+ *   - a typed array (a `Uint8Array` from `ContentBinary`/`ContentAny`) becomes the plain object of its indices that
+ *     `JSON.stringify` writes, so it deep-equals what the row reads back and a reload does not rewrite the row (#784);
+ *     only legacy data holds one, since the ingress guard refuses new typed arrays (#781).
  * So the result is a plain JSON value with every string storable.
  *
  * Copy-on-write: a clean, plain input comes back as the SAME reference (nothing allocated), and the input is never
@@ -45,16 +47,19 @@ type WellFormedString = string & { isWellFormed(): boolean; toWellFormed(): stri
 /** `s` with every lone surrogate and NUL replaced by U+FFFD; `s` itself when it holds neither. */
 export function storeSafeString(s: string): string {
   if ((s as WellFormedString).isWellFormed() && !s.includes('\0')) return s;
-  return (s as WellFormedString).toWellFormed().replace(/\0/g, '�');
+  return (s as WellFormedString).toWellFormed().replace(/\0/g, '\uFFFD');
 }
 
 /**
  * The JSON value `JSON.stringify(value)` writes, with every string and object key made storable (see above); `value`
  * itself when it is already a plain JSON value with storable strings. Never mutates it. The static type is the input's:
- * the result has the same JSON shape, not necessarily the same runtime classes.
+ * the result has the same JSON shape, not necessarily the same runtime classes. `onChanged` is called when the result
+ * is not `value` itself (something was replaced or reshaped: the store's `COLLAB_STORE_NORMALIZED`, #784).
  */
-export function storeSafeJson<T>(value: T): T {
-  return project(value, '', 0) as T;
+export function storeSafeJson<T>(value: T, onChanged?: () => void): T {
+  const out = project(value, '', 0);
+  if (onChanged && out !== value) onChanged();
+  return out as T;
 }
 
 /** What `JSON.stringify` writes nothing for, inside an object (and `null` for, inside an array). */
@@ -62,9 +67,10 @@ const isUnwritable = (v: unknown): boolean => v === undefined || typeof v === 'f
 
 /**
  * `value` as `JSON.stringify` would see it under `key`, at nesting `depth`; `undefined` where it would write nothing,
- * `null` past the depth bound.
+ * `null` past the depth bound. An array index arrives as a number and becomes the string `toJSON` receives only when
+ * there is a `toJSON` to call (#784).
  */
-function project(input: unknown, key: string, depth: number): unknown {
+function project(input: unknown, key: string | number, depth: number): unknown {
   if (depth > STORE_SAFE_MAX_DEPTH) return isUnwritable(input) ? undefined : null;
   let value = input;
   if (
@@ -73,7 +79,7 @@ function project(input: unknown, key: string, depth: number): unknown {
     typeof (value as { toJSON?: unknown }).toJSON === 'function'
   ) {
     try {
-      value = (value as { toJSON(key: string): unknown }).toJSON(key); // once, as JSON.stringify does
+      value = (value as { toJSON(key: string): unknown }).toJSON(String(key)); // once, as JSON.stringify does
     } catch (e) {
       if (e instanceof RangeError) return null; // a toJSON that overflowed the stack (a deep Y.Map value)
       throw e;
@@ -94,11 +100,10 @@ function project(input: unknown, key: string, depth: number): unknown {
       return undefined; // undefined, a function or a symbol: not JSON
   }
   if (value === null) return null;
-  if (ArrayBuffer.isView(value)) return value;
   if (Array.isArray(value)) {
     let out: unknown[] | undefined;
     for (let i = 0; i < value.length; i++) {
-      const v = project(value[i], String(i), depth + 1) ?? null;
+      const v = project(value[i], i, depth + 1) ?? null;
       if (!Object.is(v, value[i])) (out ??= value.slice())[i] = v; // Object.is: -0 → 0 is a change
     }
     return out ?? value;

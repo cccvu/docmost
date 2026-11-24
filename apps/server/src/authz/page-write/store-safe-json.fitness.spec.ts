@@ -5,8 +5,10 @@
  * JSON holds: a lone surrogate or NUL that Postgres refuses, an attribute value `JSON.stringify` throws on. The collab
  * store and the ADR 0019 digest wrap it in `storeSafeJson`, so each stores and hashes the same storable projection. A
  * new unwrapped use would bring the wedge back on whatever it writes (or hashes). This scans every non-spec server
- * source with the TypeScript AST (comments and strings do not count) and fails on a `fromYdoc` call that is not the
- * direct argument of `storeSafeJson`, or that sits outside the allowlist below.
+ * source with the TypeScript AST and fails on a Y.Doc-to-JSON call (`fromYdoc`, or y-prosemirror's
+ * `yXmlFragmentToProsemirrorJSON` / `yDocToProsemirrorJSON`, #784) that is not the direct argument of
+ * `storeSafeJson`, or that sits outside the allowlist below. Comments and strings do not count, except a string used
+ * as an element-access key (`TiptapTransformer['fromYdoc']`, #784).
  *
  * Run in CI via the `docmost-authz` job's jest glob (`… src/authz …`).
  */
@@ -36,15 +38,28 @@ const walk = (dir: string, out: string[]): string[] => {
 
 type Use = { file: string; line: number; wrapped: boolean };
 
-/** Every reference to a `fromYdoc` name in `text` (a call, a property access, an import, a destructure), and whether
- *  it is a call passed straight to `storeSafeJson(...)`. */
+/** The functions that turn a Y.Doc (or its fragment) into page JSON (#784: y-prosemirror's helpers as well). */
+const NAMES = new Set(['fromYdoc', 'yXmlFragmentToProsemirrorJSON', 'yDocToProsemirrorJSON']);
+
+/** Every reference to one of `NAMES` in `text` (a call, a property or element access, an import, a destructure), and
+ *  whether it is a call passed straight to `storeSafeJson(...)`. */
 const usesIn = (file: string, text: string): Use[] => {
   const sf = ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true);
   const found: Use[] = [];
   const visit = (node: ts.Node): void => {
-    if (ts.isIdentifier(node) && node.text === 'fromYdoc') {
-      // The reference expression: `X.fromYdoc` or a bare `fromYdoc`.
-      const ref = ts.isPropertyAccessExpression(node.parent) && node.parent.name === node ? node.parent : node;
+    const named = ts.isIdentifier(node) && NAMES.has(node.text);
+    const keyed =
+      ts.isStringLiteralLike(node) &&
+      NAMES.has(node.text) &&
+      ts.isElementAccessExpression(node.parent) &&
+      node.parent.argumentExpression === node;
+    if (named || keyed) {
+      // The reference expression: `X.fromYdoc`, `X['fromYdoc']` or a bare `fromYdoc`.
+      const ref = keyed
+        ? (node.parent as ts.ElementAccessExpression)
+        : ts.isPropertyAccessExpression(node.parent) && node.parent.name === node
+          ? node.parent
+          : node;
       const call = ts.isCallExpression(ref.parent) && ref.parent.expression === ref ? ref.parent : undefined;
       const outer = call?.parent;
       const wrapped =
@@ -83,5 +98,17 @@ describe('the live document becomes JSON only through storeSafeJson (#773)', () 
     expect(flagged(`const j = storeSafeJson(x, TiptapTransformer.fromYdoc(doc));`)).toEqual([false]);
     expect(flagged(`const j = storeSafeJson(TiptapTransformer.fromYdoc(doc, 'default'));`)).toEqual([true]);
     expect(flagged(`// TiptapTransformer.fromYdoc(doc) in a comment\nconst s = 'fromYdoc(doc)';`)).toEqual([]);
+  });
+
+  it('is not vacuous: it flags an element-access call and the y-prosemirror converters (#784)', () => {
+    const flagged = (src: string) => usesIn(join(SRC_ROOT, 'x.ts'), src).map((u) => u.wrapped);
+    expect(flagged(`const j = TiptapTransformer['fromYdoc'](doc);`)).toEqual([false]);
+    expect(flagged('const j = TiptapTransformer[`fromYdoc`](doc);')).toEqual([false]);
+    expect(flagged(`const j = storeSafeJson(TiptapTransformer['fromYdoc'](doc));`)).toEqual([true]);
+    expect(flagged(`const j = yXmlFragmentToProsemirrorJSON(f);`)).toEqual([false]);
+    expect(flagged(`import { yDocToProsemirrorJSON } from 'y-prosemirror';\nconst j = yDocToProsemirrorJSON(doc);`)).toEqual([false, false]);
+    expect(flagged(`const j = storeSafeJson(yDocToProsemirrorJSON(doc, 'default'));`)).toEqual([true]);
+    // A string that is not itself the access key does not count: another key, a computed one, an argument.
+    expect(flagged(`const s = x['other']; const t = x['fromYdoc' + '']; f('fromYdoc');`)).toEqual([]);
   });
 });
