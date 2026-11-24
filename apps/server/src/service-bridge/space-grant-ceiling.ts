@@ -149,6 +149,28 @@ export class SpaceGrantCeiling {
     );
     throw grantUnconfirmed();
   }
+
+  /**
+   * #858: settle once after a space create commits, so the creator's next request (the console's member add, decided
+   * on `space#administer` at the platform's freshness watermark) sees the projected space and its creator's admin row.
+   * A create WIDENS access, so unlike {@link fence} this never throws: `false` (logged `SPACE_CREATE_SETTLE_PENDING`)
+   * when the fence was not confirmed, the platform or the outbox read failed, or the settle is disabled.
+   */
+  async settleBestEffort(): Promise<boolean> {
+    try {
+      const settled = await settle(this.authz, this.db, this.settleMs);
+      if (settled.ok) return true;
+      this.logger.warn(
+        `SPACE_CREATE_SETTLE_PENDING reason=${settled.reason}${settled.position ? ` position=${settled.position}` : ''}: ` +
+          "the space is created; the creator's next request may be refused until the PDP catches up",
+      );
+    } catch (e) {
+      this.logger.warn(
+        `SPACE_CREATE_SETTLE_PENDING reason=error: the space is created; the settle failed (${(e as Error).message})`,
+      );
+    }
+    return false;
+  }
 }
 
 /**

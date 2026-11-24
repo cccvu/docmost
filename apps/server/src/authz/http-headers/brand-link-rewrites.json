@@ -1,0 +1,24 @@
+[
+  {
+    "rel": "icon",
+    "sizes": "32x32",
+    "from": "/icons/favicon-32x32.png",
+    "to": "/brand/favicon-32x32.png"
+  },
+  {
+    "rel": "icon",
+    "sizes": "16x16",
+    "from": "/icons/favicon-16x16.png",
+    "to": "/brand/favicon-16x16.png"
+  },
+  {
+    "rel": "apple-touch-icon",
+    "from": "/icons/apple-touch-icon.png",
+    "to": "/brand/apple-touch-icon.png"
+  },
+  {
+    "rel": "manifest",
+    "from": "/manifest.json",
+    "to": "/brand/site.webmanifest"
+  }
+]

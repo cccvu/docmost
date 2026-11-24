@@ -119,6 +119,52 @@ describe('SpaceGrantCeiling.fence', () => {
   });
 });
 
+/**
+ * #858: after a space create commits, the service settles once so the creator's next request (the console's member
+ * add, decided on `space#administer` at the platform watermark) sees the projected space. A create is a widening write,
+ * so the settle is best effort: it answers whether the fence was confirmed and NEVER throws.
+ */
+describe('SpaceGrantCeiling.settleBestEffort', () => {
+  it('confirmed → true: one settle to the max committed outbox position, read outside any transaction', async () => {
+    const ok = mk([]);
+    await expect(ok.ceiling.settleBestEffort()).resolves.toBe(true);
+    expect(ok.authz.settleProjection).toHaveBeenCalledTimes(1);
+    expect(ok.spy.calls.some((c) => /from authz_outbox/i.test(c.sql))).toBe(true);
+    expect(ok.spy.tx).toEqual([]);
+  });
+
+  it('pending → false and one SPACE_CREATE_SETTLE_PENDING line, never a throw', async () => {
+    const pending = mk([], { settleProjection: jest.fn(async () => ({ status: 'pending', reason: 'timeout' })) });
+    const warn = jest.spyOn((pending.ceiling as any).logger, 'warn').mockImplementation();
+    await expect(pending.ceiling.settleBestEffort()).resolves.toBe(false);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0][0])).toMatch(/^SPACE_CREATE_SETTLE_PENDING reason=timeout\b/);
+  });
+
+  it('a rejected settle or a failed outbox read → false, never a throw', async () => {
+    const down = mk([], { settleProjection: jest.fn(async () => Promise.reject(new Error('platform down'))) });
+    const warnDown = jest.spyOn((down.ceiling as any).logger, 'warn').mockImplementation();
+    await expect(down.ceiling.settleBestEffort()).resolves.toBe(false);
+    expect(String(warnDown.mock.calls[0][0])).toMatch(/^SPACE_CREATE_SETTLE_PENDING reason=error\b/);
+
+    const settleProjection = jest.fn(async () => ({ status: 'confirmed' }));
+    const authz = { tryCheckBulk: jest.fn(), settleProjection };
+    const dbDown = { selectFrom: () => undefined, getExecutor: () => { throw new Error('db down'); } };
+    const broken = new SpaceGrantCeiling(dbDown as any, authz as any);
+    jest.spyOn((broken as any).logger, 'warn').mockImplementation();
+    await expect(broken.settleBestEffort()).resolves.toBe(false);
+    expect(settleProjection).not.toHaveBeenCalled();
+  });
+
+  it('a disabled settle (AUTHZ_NARROWING_SETTLE_TIMEOUT_MS=0) → false, nothing asked', async () => {
+    const off = mk([]);
+    (off.ceiling as any).settleMs = 0;
+    jest.spyOn((off.ceiling as any).logger, 'warn').mockImplementation();
+    await expect(off.ceiling.settleBestEffort()).resolves.toBe(false);
+    expect(off.authz.settleProjection).not.toHaveBeenCalled();
+  });
+});
+
 describe('withGrantCeiling', () => {
   it('a local decision runs once and never fences', async () => {
     const fence = jest.fn(async () => undefined);

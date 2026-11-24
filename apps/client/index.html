@@ -9,7 +9,8 @@
     <!-- Neutral defaults; the runtime brand bundle (features/brand) swaps title, favicons and the PWA
          manifest when one is served (see /brand/manifest.json). In remote mode the server already points the
          icon, apple-touch and manifest links at /brand at boot (authz/http-headers/brand-links.ts), so clients
-         that never run this script see the brand too. -->
+         that never run this script see the brand too. When no bundle loads, the SPA resets these four links
+         to the neutral files below (NEUTRAL_BRAND_LINKS in features/brand/brand-config.ts). -->
     <title>Wiki</title>
     <meta name="theme-color" content="#18181b" media="(prefers-color-scheme: dark)" />
     <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />

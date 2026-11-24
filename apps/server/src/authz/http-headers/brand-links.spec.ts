@@ -1,5 +1,5 @@
 import { Logger } from '@nestjs/common';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   BRAND_LINK_REWRITES,
@@ -16,6 +16,18 @@ const INDEX_HTML = readFileSync(
   join(__dirname, '..', '..', '..', '..', 'client', 'index.html'),
   'utf8',
 );
+
+const SERVER_SRC = join(__dirname, '..', '..');
+const CLIENT_DIR = join(__dirname, '..', '..', '..', '..', 'client');
+
+/** A source file with every whitespace run removed and prettier's trailing commas dropped, for seam pins. */
+function squash(path: string): string {
+  return readFileSync(path, 'utf8').replace(/\s+/g, '').replace(/,\)/g, ')');
+}
+
+function count(haystack: string, needle: string): number {
+  return haystack.split(needle).length - 1;
+}
 
 /** Every `<link>` tag's rel/sizes/href, in document order. */
 function links(
@@ -99,6 +111,24 @@ describe('brand static links (#905)', () => {
           '<link rel="manifest" href="/manifest.json" /><link rel="manifest" href="/manifest.json" />',
         ),
     ],
+    // #915: the matcher is as strict as the replace (no spaces around `=`, lower-case name), so a spelling the
+    // replace would not rewrite counts as a miss instead of a silent no-op.
+    [
+      'an attribute is spaced around =',
+      (h: string) =>
+        h.replace(
+          'href="/icons/favicon-32x32.png"',
+          'href = "/icons/favicon-32x32.png"',
+        ),
+    ],
+    [
+      'an attribute name is upper case',
+      (h: string) =>
+        h.replace(
+          'href="/icons/apple-touch-icon.png"',
+          'HREF="/icons/apple-touch-icon.png"',
+        ),
+    ],
   ])(
     'all or nothing: when %s, the HTML is served unchanged and the miss is logged',
     (_name, mutate) => {
@@ -127,5 +157,99 @@ describe('brand static links (#905)', () => {
     expect(html).toContain(
       '<link rel="preload" href="/manifest.json" as="fetch" />',
     );
+  });
+
+  // The JSON copy's basename must differ from `brand-links`: jest resolves `./brand-links` to a `.json` sibling
+  // before the `.ts` module (moduleFileExtensions js, json, ts), which would shadow it in every spec.
+  it('the table is the one the platform parity spec reads: brand-link-rewrites.json deep-equals BRAND_LINK_REWRITES (#915)', () => {
+    expect(BRAND_LINK_REWRITES).toEqual(
+      JSON.parse(
+        readFileSync(join(__dirname, 'brand-link-rewrites.json'), 'utf8'),
+      ),
+    );
+  });
+});
+
+/**
+ * #915: the seams that carry the rewrite to the wire. These are upstream-owned files, read as text (whitespace
+ * removed), because a unit test of the pure function stays green when a merge drops or doubles the call.
+ */
+describe('brand static links: seam pins (#915)', () => {
+  it('static.module.ts calls applyBrandLinks exactly once, and its result is what it writes to index.html (§86)', () => {
+    const src = squash(
+      join(SERVER_SRC, 'integrations', 'static', 'static.module.ts'),
+    );
+    expect(count(src, 'applyBrandLinks(')).toBe(1);
+    expect(src).toContain(
+      'consttransformedHtml=applyBrandLinks(html.replace(windowVar,windowScriptContent),this.authzMode);',
+    );
+    expect(count(src, 'writeFileSync(indexFilePath,')).toBe(1);
+    expect(src).toContain('fs.writeFileSync(indexFilePath,transformedHtml);');
+  });
+
+  it('share-seo.controller.ts serves the rewritten index.html, never the template', () => {
+    const src = squash(
+      join(SERVER_SRC, 'core', 'share', 'share-seo.controller.ts'),
+    );
+    expect(src).toContain(
+      "constindexFilePath=join(clientDistPath,'index.html');",
+    );
+    expect(src).toContain("fs.readFileSync(indexFilePath,'utf8')");
+    expect(src).not.toContain('index-template');
+  });
+
+  it('the Vite dev proxy answers every rewritten href with its /brand target (§11)', () => {
+    const lines = readFileSync(
+      join(CLIENT_DIR, 'vite.config.ts'),
+      'utf8',
+    ).split('\n');
+    // Proxy keys are the `"<pattern>": {` lines; a key's block runs to the next key.
+    const keyAt = lines
+      .map((line, i) => ({ i, m: /^\s*"(.+)": \{$/.exec(line) }))
+      .filter((k) => k.m !== null);
+    const regexKeys = keyAt.filter((k) => k.m![1].startsWith('^/'));
+    expect(regexKeys.length).toBeGreaterThanOrEqual(2); // anti-vacuity
+    for (const r of BRAND_LINK_REWRITES) {
+      const hits = regexKeys.filter((k) =>
+        new RegExp(k.m![1].replace(/\\\\/g, '\\')).test(r.from),
+      );
+      expect({ from: r.from, keys: hits.length }).toEqual({
+        from: r.from,
+        keys: 1,
+      });
+      const next = keyAt.find((k) => k.i > hits[0].i);
+      const block = lines
+        .slice(hits[0].i, next ? next.i : undefined)
+        .join('')
+        .replace(/\s+/g, '');
+      const rewrite =
+        /rewrite:\(path\)=>path\.replace\(\/(.+?)\/,"([^"]*)"\)/.exec(block);
+      expect(rewrite).not.toBeNull();
+      expect(r.from.replace(new RegExp(rewrite![1]), rewrite![2])).toBe(r.to);
+    }
+  });
+
+  it('transactional mail renders no Docmost footer: MailFooter stays deleted (§252)', () => {
+    const dir = join(SERVER_SRC, 'integrations', 'transactional');
+    const partials = readFileSync(
+      join(dir, 'partials', 'partials.tsx'),
+      'utf8',
+    );
+    expect(partials).not.toContain('MailFooter');
+    expect(partials).not.toContain('All Rights Reserved');
+    expect(partials).not.toContain('Docmost');
+    expect(squash(join(dir, 'partials', 'partials.tsx'))).toContain(
+      '<Bodystyle={main}><MailHeader/><Containerstyle={container}>{children}</Container></Body>',
+    );
+    for (const entry of readdirSync(dir, { recursive: true }) as string[]) {
+      if (!/\.tsx?$/.test(entry)) continue;
+      expect({
+        entry,
+        src: readFileSync(join(dir, entry), 'utf8').includes('MailFooter'),
+      }).toEqual({
+        entry,
+        src: false,
+      });
+    }
   });
 });
