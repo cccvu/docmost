@@ -16,6 +16,8 @@ import { entitlementAtom } from "@/ee/entitlement/entitlement-atom";
 import { changeAppLanguage } from "@/lib/date-locale.ts";
 import { useIdentityReconcile } from "@/features/identity-reconcile/use-identity-reconcile";
 import { useSocketAuthProbe } from "@/features/websocket/use-socket-auth-probe";
+import { loginHrefWithReturn } from "@/lib/app-route.ts";
+import { isNativeAuthEnabled } from "@/features/auth-native/lib/auth-mode.ts";
 
 export function UserProvider({ children }: React.PropsWithChildren) {
   const [currentUser, setCurrentUser] = useAtom(currentUserAtom);
@@ -76,17 +78,19 @@ export function UserProvider({ children }: React.PropsWithChildren) {
   }, [data, isLoading]);
 
   // CCC (wiki-v2 #917): another tab cleared the "currentUser" key that current-user-atom.ts stores (or all
-  // of localStorage), so this tab's tree is now blank. That is a sign-out, but in native mode also another
-  // tab's sign-in (it RESETs before it stores) or its failed-logout reload, so never assume signed out:
-  // reload, and let /users/me decide (a 401 goes to login with the return path; a 200 comes back signed in,
-  // as whoever the session now is). `storage` fires only in OTHER documents, so a same-tab clear (the
-  // logout handler, which then POSTs and redirects itself) never lands here.
+  // of localStorage), so this tab's tree is now blank. In remote mode only a sign-out clears it, BEFORE its
+  // revokes land, so go to login (a reload's /users/me could still answer 200). In native mode another tab's
+  // sign-in (it RESETs before it stores) and its failed-logout reload clear it too, while the session is open,
+  // so reload and let /users/me decide (a 401 goes to login with the return path). `storage` fires only in
+  // OTHER documents, so a same-tab clear (the logout handler, which then POSTs and redirects itself) never
+  // lands here.
   useEffect(() => {
     if (!stored) return;
     const onStorage = (e: StorageEvent) => {
       if (e.storageArea !== window.localStorage || e.newValue !== null) return;
       if (e.key !== "currentUser" && e.key !== null) return;
-      window.location.reload();
+      if (isNativeAuthEnabled()) window.location.reload();
+      else window.location.replace(loginHrefWithReturn());
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);

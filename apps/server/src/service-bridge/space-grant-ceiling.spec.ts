@@ -134,12 +134,14 @@ describe('SpaceGrantCeiling.settleBestEffort', () => {
     expect(ok.spy.tx).toEqual([]);
   });
 
-  it('waits at most CREATE_SETTLE_MAX_MS (1 s), shorter than the fence, so the relayed create keeps its deadline', async () => {
-    expect(CREATE_SETTLE_MAX_MS).toBe(1000);
+  it('waits at most CREATE_SETTLE_MAX_MS (2 s), shorter than the fence, so the relayed create keeps its deadline', async () => {
+    // 2 s + the client's 1.5 s margin stays inside the platform's 8 s relay deadline, and above its 1 s
+    // STALL_MIN_WATCH_MS, so one create settle does not mark the relay stalled on a short blip.
+    expect(CREATE_SETTLE_MAX_MS).toBe(2000);
     const long = mk([]);
     (long.ceiling as any).settleMs = 3000;
     await long.ceiling.settleBestEffort();
-    expect((long.authz.settleProjection as jest.Mock).mock.calls[0][1]).toBe(1000);
+    expect((long.authz.settleProjection as jest.Mock).mock.calls[0][1]).toBe(2000);
 
     const short = mk([]);
     (short.ceiling as any).settleMs = 400;

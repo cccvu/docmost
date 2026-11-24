@@ -53,8 +53,9 @@ vi.mock("@/ee/entitlement/use-entitlements", () => ({
 vi.mock("@/lib/date-locale.ts", () => ({
   changeAppLanguage: vi.fn(async () => {}),
 }));
+const authMode = vi.hoisted(() => ({ native: false }));
 vi.mock("@/features/auth-native/lib/auth-mode.ts", () => ({
-  isNativeAuthEnabled: () => false,
+  isNativeAuthEnabled: () => authMode.native,
 }));
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({
@@ -116,6 +117,7 @@ beforeEach(() => {
   query.state = { data: loaded, isLoading: false, isError: false, error: null };
   location.replace.mockReset();
   location.reload.mockReset();
+  authMode.native = false; // remote mode (production) unless a test says otherwise
   Object.defineProperty(window, "location", {
     value: {
       origin: "http://localhost",
@@ -215,11 +217,28 @@ describe("UserProvider (#917)", () => {
     ["the key is removed", "currentUser"],
     ["storage is cleared", null],
   ])(
-    "another tab cleared the stored user (%s): this tab reloads, never straight to login",
+    "remote mode, another tab signed out (%s): this tab goes to login, returning here",
     async (_label, key) => {
-      // A sign-out, but also (native mode) another tab's sign-in, which RESETs before it stores, or its
-      // failed-logout reload. The reload asks /users/me: a 401 goes to login with the return path, a 200
-      // comes back signed in, as whoever the session now is.
+      // In remote mode only a sign-out clears the key, and it clears it BEFORE its revokes land: a reload's
+      // /users/me could still answer 200 and bring this tab back signed in, so go to login.
+      renderPreferences();
+      await screen.findByRole("switch", { name: "Toggle full page width" });
+      act(() => otherTabCleared(key));
+      expect(location.replace).toHaveBeenCalledTimes(1);
+      expect(location.replace).toHaveBeenCalledWith("/login?redirect=%2Fp%2Fabc");
+      expect(location.reload).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["the key is removed", "currentUser"],
+    ["storage is cleared", null],
+  ])(
+    "native mode, another tab cleared the stored user (%s): this tab reloads, never straight to login",
+    async (_label, key) => {
+      // A sign-out, but also another tab's native sign-in (it RESETs before it stores) or its failed-logout
+      // reload. The reload asks /users/me: a 401 goes to login with the return path, a 200 comes back signed in.
+      authMode.native = true;
       renderPreferences();
       await screen.findByRole("switch", { name: "Toggle full page width" });
       act(() => otherTabCleared(key));
