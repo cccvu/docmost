@@ -513,7 +513,8 @@ describe("CollabRefusalNotice for a user without edit permission (canEdit)", () 
     setup(undefined, false, { cause, passive: true, canEdit: false });
     const status = screen.getByRole("status");
     expect(status.textContent).toContain("Live updates are paused on this page");
-    expect(status.textContent).not.toContain("Editing is paused");
+    // Title and body: a reader's notice never says editing is paused (any case).
+    expect(status.textContent!.toLowerCase()).not.toContain("editing is paused");
     expect(status.textContent).toContain("other people's edits no longer appear here");
     expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
   });
@@ -521,6 +522,7 @@ describe("CollabRefusalNotice for a user without edit permission (canEdit)", () 
   it("a writer (canEdit, the default) in Read mode keeps 'Editing is paused on this page'", () => {
     setup(undefined, false, { cause: "other", passive: true, canEdit: true });
     expect(screen.getByRole("status").textContent).toContain("Editing is paused on this page");
+    expect(screen.getByRole("status").textContent).toContain("so editing is paused and other people's edits");
     cleanup();
     setup(undefined, false, { cause: "other", passive: true });
     expect(screen.getByRole("status").textContent).toContain("Editing is paused on this page");

@@ -123,7 +123,7 @@ export function CollabRefusalNotice({
         mb="md"
       >
         <Stack gap="sm">
-          <Text size="sm">{refusalText(kind, cause, t)}</Text>
+          <Text size="sm">{refusalText(kind, cause, canEdit, t)}</Text>
           <Group gap="sm">
             {!discardFirst && (
               <Button size="xs" onClick={() => reload()}>
@@ -194,6 +194,7 @@ export function CollabRefusalNotice({
 function refusalText(
   kind: CollabRefusalKind,
   cause: CollabRefusalCause,
+  canEdit: boolean,
   t: (key: string) => string,
 ) {
   switch (kind) {
@@ -220,10 +221,21 @@ function refusalText(
         "The server did not accept a change from this browser, so editing is paused and other people's edits no longer appear here. Reload the page to continue. If that does not help, discard this browser's copy of the page.",
       );
     case "copy":
+      // #845: a reader never edits, so its body names only the lost live updates (as its title does).
+      if (!canEdit) {
+        return t(
+          "This browser's stored copy of the page does not match the server, so other people's edits no longer appear here. Reload the page to continue. If that does not help, discard this browser's copy of the page.",
+        );
+      }
       return t(
         "This browser's stored copy of the page does not match the server, so editing is paused and other people's edits no longer appear here. Reload the page to continue. If that does not help, discard this browser's copy of the page.",
       );
     default:
+      if (!canEdit) {
+        return t(
+          "The server stopped syncing this page with this browser, so other people's edits no longer appear here. Reload the page to continue. If that does not help, discard this browser's copy of the page.",
+        );
+      }
       return t(
         "The server stopped syncing this page with this browser, so editing is paused and other people's edits no longer appear here. Reload the page to continue. If that does not help, discard this browser's copy of the page.",
       );
