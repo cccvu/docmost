@@ -36,6 +36,7 @@ import {
   SpaceCaslAction,
   SpaceCaslSubject,
 } from "@/features/space/permissions/permissions.type.ts";
+import { useFocusFallback } from "@/features/layout/use-focus-fallback";
 
 export default function Trash() {
   const { t } = useTranslation();
@@ -55,6 +56,7 @@ export default function Trash() {
   const restorePageMutation = useRestorePageMutation();
   const deletePageMutation = useDeletePageMutation();
   const { openRestoreModal } = useRestorePageModal();
+  const armFocusFallback = useFocusFallback(); // CCC (wiki-v2 #913): the delete removes its row
 
   const [selectedPage, setSelectedPage] = useState<{
     title: string;
@@ -68,6 +70,7 @@ export default function Trash() {
   };
 
   const handleDeletePage = async (pageId: string) => {
+    armFocusFallback();
     await deletePageMutation.mutateAsync(pageId);
   };
 
