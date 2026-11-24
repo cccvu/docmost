@@ -43,6 +43,7 @@ export default defineConfig(({ mode }) => {
     POSTHOG_HOST,
     POSTHOG_KEY,
     PLATFORM_URL,
+    MCP_URL,
   } = loadEnv(mode, envPath, "");
 
   return {
@@ -218,6 +219,14 @@ export default defineConfig(({ mode }) => {
         },
         "/.well-known": {
           target: PLATFORM_URL || "http://localhost:4000",
+          changeOrigin: true,
+        },
+        // MCP Streamable HTTP (wiki-v2 #613) lives on the mcp container in dev; in prod the ALB routes /mcp to it.
+        // Anchored like the #905 keys: exactly /mcp, so the dev single origin is the RFC 9728 resource the AS
+        // accepts (<PLATFORM_APP_ORIGIN>/mcp). Its POST answers stream as SSE, which the default proxy passes
+        // through. :4100 is shared with `make console-dev`; MCP_URL overrides the target.
+        "^/mcp(\\?.*)?$": {
+          target: MCP_URL || "http://localhost:4100",
           changeOrigin: true,
         },
         // The platform's versioned API (#764: the wiki's "Send feedback" calls /v1/feedback with the session
