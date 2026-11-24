@@ -125,6 +125,27 @@ describe('withExportConversion (#716)', () => {
     await withExportConversion(ZIP, async () => expect(exportBuildMsLeft()).toBe(45_000), { now: c.now, socket: null });
   });
 
+  it('wiki-v2 #736: the default clock is monotonic: a wall-clock step forward neither ends the build nor one back extends it', async () => {
+    let step = 0;
+    const realNow = Date.now.bind(Date);
+    jest.spyOn(Date, 'now').mockImplementation(() => realNow() + step);
+    await withExportConversion(ZIP, async () => {
+      step = 3_600_000; // on the wall clock: past the deadline at once (export_timeout)
+      expect(exportBuildMsLeft()).toBeGreaterThan(44_000);
+      expect(() => throwIfExportBuildStopped()).not.toThrow();
+      step = -3_600_000; // on the wall clock: an hour more to build
+      expect(exportBuildMsLeft()).toBeLessThanOrEqual(45_000);
+    }, { socket: null });
+  });
+
+  it('wiki-v2 #736: a startedAt on another clock (a wall-clock epoch) never lifts the deadline: taken as now', async () => {
+    await withExportConversion({ ...ZIP, startedAt: Date.now() }, async () => {
+      // Read against the monotonic clock, an epoch start would put the deadline ~56 years out.
+      expect(exportBuildMsLeft()).toBeLessThanOrEqual(45_000);
+      expect(exportBuildMsLeft()).toBeGreaterThan(44_000);
+    }, { socket: null });
+  });
+
   it('a turn missed because the build ran out of time is the build’s timeout, not engine_busy', async () => {
     const c = clock();
     serialize.mockImplementationOnce(async () => {

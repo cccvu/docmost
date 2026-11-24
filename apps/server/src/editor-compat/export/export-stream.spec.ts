@@ -281,6 +281,23 @@ describe('LazyAttachmentStream + ExportStreamRegistry over real JSZip (#699)', (
     expect(() => reg2.attach(generate(zip2))).toThrow(ExportStorageException);
   });
 
+  it('wiki-v2 #736: the cap runs on the monotonic clock: a wall-clock step forward does not end the export at once', async () => {
+    let step = 0;
+    const realNow = Date.now.bind(Date);
+    const spy = jest.spyOn(Date, 'now').mockImplementation(() => realNow() + step);
+    try {
+      const reg = new ExportStreamRegistry('page:p1', LIMITS, logger()); // the default clock
+      step = 3_600_000; // NTP steps the wall clock forward an hour while the pages are built
+      const zip = new JSZip();
+      zip.file('a.md', 'a');
+      const out = reg.attach(generate(zip));
+      expect((await collect(out)).length).toBeGreaterThan(0); // on the wall clock: 0 ms left, wall_cap at once
+      expect(reg.failed).toBeNull();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('a completed archive clears the wall-clock timer and leaves nothing open', async () => {
     const { state, open } = storage(() => synthetic(MiB));
     const reg = new ExportStreamRegistry('page:p1', LIMITS, logger());

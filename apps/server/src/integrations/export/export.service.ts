@@ -104,7 +104,7 @@ export class ExportService {
     userId?: string,
     ignorePermissions = false,
   ) {
-    const startedAt = Date.now(); // CCC seam #196 (#716): the export's build deadline runs from here
+    const startedAt = performance.now(); // CCC seam #196 (#716): the export's build deadline runs from here (monotonic, #736)
     let pages: Page[];
 
     if (includeChildren) {
@@ -190,7 +190,7 @@ export class ExportService {
     userId?: string,
     ignorePermissions = false,
   ) {
-    const startedAt = Date.now(); // CCC seam #196 (#716): the export's build deadline runs from here
+    const startedAt = performance.now(); // CCC seam #196 (#716): the export's build deadline runs from here (monotonic, #736)
     const space = await this.db
       .selectFrom('spaces')
       .select(['id', 'name'])
