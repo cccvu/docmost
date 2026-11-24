@@ -144,6 +144,12 @@ async function refetch() {
 const region = () => screen.queryByRole("region");
 const headerHeight = () => Number(screen.getByTestId("header-height").textContent);
 const dismissButton = () => screen.queryByRole("button", { name: "Dismiss announcement" });
+/** The text a screen reader can reach: everything outside `aria-hidden` subtrees. */
+const spokenText = (el: Element) => {
+  const copy = el.cloneNode(true) as Element;
+  copy.querySelectorAll('[aria-hidden="true"]').forEach((e) => e.remove());
+  return norm(copy.textContent);
+};
 
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
@@ -193,6 +199,33 @@ describe("AnnouncementBanner", () => {
     expect(text).toContain("The wiki will be down for security updates.");
     expect(headerHeight()).toBe(56 + 40);
     expect(document.documentElement.style.scrollPaddingTop).toBe("var(--app-shell-header-offset, 0px)");
+  });
+
+  // #946: narrow screens show a short time (no year) instead of the message. The short form is a visual duplicate:
+  // a screen reader hears the full time once, and the message, at every width.
+  it("adds a short time for narrow screens that screen readers skip; they hear the full time once", async () => {
+    respond(UPCOMING);
+    renderBanner();
+    await advance();
+    const r = region()!;
+    const heard = spokenText(r);
+    expect(heard).toContain("Starts Dec 1, 2026, 12:00 AM CST");
+    expect(heard.match(/Starts/g)).toHaveLength(1);
+    expect(heard).toContain("The wiki will be down for security updates.");
+    const hidden = [...r.querySelectorAll('[aria-hidden="true"]')].map((e) => norm(e.textContent));
+    expect(hidden).toContain("Starts Dec 1, 12:00 AM CST");
+  });
+
+  it("in progress: the short end time is skipped too, and the full one is heard once", async () => {
+    respond({ downtimeStartsAt: NOW - MIN, downtimeEndsAt: Date.parse("2026-12-01T08:00:00Z") });
+    renderBanner();
+    await advance();
+    const r = screen.getByRole("region", { name: "Maintenance in progress" });
+    const heard = spokenText(r);
+    expect(heard).toContain("Until Dec 1, 2026, 2:00 AM CST");
+    expect(heard.match(/Until/g)).toHaveLength(1);
+    const hidden = [...r.querySelectorAll('[aria-hidden="true"]')].map((e) => norm(e.textContent));
+    expect(hidden).toContain("Until Dec 1, 2:00 AM CST");
   });
 
   it("shows nothing (and the plain header height) for a null announcement", async () => {

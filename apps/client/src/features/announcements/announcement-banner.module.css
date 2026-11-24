@@ -45,8 +45,8 @@
   color: var(--banner-accent);
 }
 
-/* The label and the message may shrink (with an ellipsis); the icon and the actions never do, so Details and
-   Dismiss always stay whole inside the strip, whose `overflow: hidden` would otherwise clip them. Both texts are
+/* The label, the time and the message may shrink (with an ellipsis); the icon and the actions never do, so Details
+   and Dismiss always stay whole inside the strip, whose `overflow: hidden` would otherwise clip them. Every text is
    whole in Details (the dialog title is the label). */
 .label {
   flex: 0 1 auto;
@@ -58,7 +58,16 @@
 }
 
 .time {
-  flex-shrink: 0;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The time without its year, for narrow screens; aria-hidden in the markup (a visual duplicate of .timeLong). */
+.timeShort {
+  display: none;
 }
 
 /* A zero basis: the message only ever takes the room left over, so it can never push the actions out. */
@@ -69,21 +78,45 @@
   text-overflow: ellipsis;
 }
 
-/* Narrow screens (or high zoom): drop the time first (it is in Details too) and tighten the spacing, so at 320 px
-   "Scheduled maintenance" still fits whole beside Details and Dismiss (narrower than that, it truncates). */
+/* Narrow screens (or high zoom), #946: when the downtime is matters more than the message (which is whole in
+   Details), so a strip with a time shows the short time instead of the message, and the label gives way first.
+   Hidden texts are hidden visually only: a screen reader still hears the label, the full time once, and the
+   message, at every width. */
 @media (max-width: $mantine-breakpoint-sm) {
   .banner {
     gap: 4px;
     padding-inline: var(--mantine-spacing-xs);
   }
 
-  .time {
-    display: none;
+  /* A zero basis never weighs in the shrink, so the time only shrinks once the label is gone; the label grows back
+     into the room the time leaves, up to its own width. */
+  .label:has(~ .time) {
+    flex: 1 1 0;
+    max-width: max-content;
+  }
+
+  .timeShort {
+    display: inline;
+  }
+
+  .timeLong,
+  .time ~ .message {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
   }
 }
 
+/* The auto margin keeps the actions at the end when no text grows into the room (a narrow strip without its
+   message). */
 .actions {
   flex-shrink: 0;
+  margin-inline-start: auto;
   display: flex;
   align-items: center;
   gap: 4px;
