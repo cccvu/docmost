@@ -7,6 +7,7 @@ jest.mock('../../collaboration/collaboration.util', () => ({
 }));
 
 import { AuthenticationExtension } from '../../collaboration/extensions/authentication.extension';
+import { COLLAB_INVALID_TOKEN_REASON } from '../collab-ingress/auth-refusal';
 import { CollabSocketBounds } from '../collab-ingress/socket-bounds';
 import { PdpSpaceMemberRepo } from '../pdp-space-member.repo';
 import { PdpPagePermissionRepo } from '../pdp-page-permission.repo';
@@ -148,6 +149,8 @@ async function connectDecision(c: Case): Promise<CollabAccess> {
       e instanceof ServiceUnavailableException
     )
       return 'deny';
+    // #755: a session no longer live is refused with the quiet `{ reason }` refusal (logged `session_not_live`)
+    if (JSON.stringify(e) === JSON.stringify({ reason: COLLAB_INVALID_TOKEN_REASON })) return 'deny';
     throw e;
   }
   return data.connectionConfig.readOnly ? 'read' : 'write';

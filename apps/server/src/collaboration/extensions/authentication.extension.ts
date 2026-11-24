@@ -66,8 +66,9 @@ export class AuthenticationExtension implements Extension {
       throw new UnauthorizedException();
     }
 
-    // CCC (wiki-v2 #537, UPSTREAM_MODIFICATIONS #213): the token's session must still be live, the same rule as
-    // /api and the notifications socket. A failed read throws, which refuses the connection.
+    // CCC (wiki-v2 #537, #755, UPSTREAM_MODIFICATIONS #213): the token's session must still be live, the same rule as
+    // /api and the notifications socket; refused logged as `auth_refused` `session_not_live`. A failed read throws,
+    // which refuses the connection.
     if (
       !(await isWsConnectionLive(
         this.userRepo,
@@ -75,7 +76,7 @@ export class AuthenticationExtension implements Extension {
         jwtPayload,
       ))
     ) {
-      throw new UnauthorizedException();
+      throw this.collabSocketBounds.sessionNotLive();
     }
 
     // CCC (wiki-v2 #810, UPSTREAM_MODIFICATIONS #213): the per-user auth rate, charged only once the session is live.

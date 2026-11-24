@@ -9,6 +9,7 @@ import { UnauthorizedException } from '@nestjs/common';
 import { AuthenticationExtension } from '../../collaboration/extensions/authentication.extension';
 import { COLLAB_INVALID_TOKEN_REASON } from '../collab-ingress/auth-refusal';
 import { CollabSocketBounds } from '../collab-ingress/socket-bounds';
+import { SocketLimitLog } from '../collab-ingress/socket-limit-log';
 import { PdpPagePermissionRepo } from '../pdp-page-permission.repo';
 import { PdpSpaceMemberRepo } from '../pdp-space-member.repo';
 import { spyKysely } from '../../service-bridge/kysely-spy.testkit';
@@ -170,6 +171,7 @@ describe('#537 — the collab connect refuses a token whose session is not live'
     session?: (id: string) => Promise<unknown>;
     page?: unknown;
   }) => {
+    const warn = jest.fn();
     const findActiveById = jest.fn(opts.session ?? (async () => liveRow));
     const pageFindById = jest.fn(async () =>
       'page' in opts ? opts.page : { id: 'p1', spaceId: 's1', deletedAt: null },
@@ -183,9 +185,9 @@ describe('#537 — the collab connect refuses a token whose session is not live'
       { getUserSpaceRoles: async () => [{ userId: 'u1', role: 'writer' }] } as any,
       { canUserEditPage: async () => ({ hasAnyRestriction: false, canAccess: true, canEdit: true }) } as any,
       { findActiveById } as any,
-      new CollabSocketBounds(),
+      new CollabSocketBounds({ limitLog: new SocketLimitLog({ warn }) }),
     );
-    return { ext, findActiveById, pageFindById };
+    return { ext, findActiveById, pageFindById, warn };
   };
   const payload = () => ({ documentName: 'page.p1', token: 't', connectionConfig: { readOnly: false } }) as any;
 
@@ -203,19 +205,31 @@ describe('#537 — the collab connect refuses a token whose session is not live'
     expect(findActiveById).not.toHaveBeenCalled();
   });
 
+  // #755: the liveness refusal is the quiet `{ reason }` with the reason Hocuspocus sent before, logged with its cause.
   it('refuses a revoked or expired session (no active row)', async () => {
     const { ext } = build({ session: async () => undefined });
-    await expect(ext.onAuthenticate(payload())).rejects.toBeInstanceOf(UnauthorizedException);
+    await expect(ext.onAuthenticate(payload())).rejects.toEqual({ reason: COLLAB_INVALID_TOKEN_REASON });
   });
 
   it("refuses another user's session", async () => {
     const { ext } = build({ session: async () => ({ ...liveRow, userId: 'u2' }) });
-    await expect(ext.onAuthenticate(payload())).rejects.toBeInstanceOf(UnauthorizedException);
+    await expect(ext.onAuthenticate(payload())).rejects.toEqual({ reason: COLLAB_INVALID_TOKEN_REASON });
   });
 
   it("refuses another workspace's session", async () => {
     const { ext } = build({ session: async () => ({ ...liveRow, workspaceId: 'w2' }) });
-    await expect(ext.onAuthenticate(payload())).rejects.toBeInstanceOf(UnauthorizedException);
+    await expect(ext.onAuthenticate(payload())).rejects.toEqual({ reason: COLLAB_INVALID_TOKEN_REASON });
+  });
+
+  it('logs the liveness refusal as auth_refused with cause session_not_live (#755), and nothing for a live session', async () => {
+    const dead = build({ session: async () => undefined });
+    await expect(dead.ext.onAuthenticate(payload())).rejects.toEqual({ reason: COLLAB_INVALID_TOKEN_REASON });
+    expect(dead.warn.mock.calls).toEqual([
+      [`COLLAB_SOCKET_LIMIT {"limit":"auth_refused","status":401,"cause":"session_not_live"}`],
+    ]);
+    const live = build({});
+    await live.ext.onAuthenticate(payload());
+    expect(live.warn).not.toHaveBeenCalled();
   });
 
   it('a failed session read refuses the connection (throws), never allows', async () => {
@@ -228,9 +242,9 @@ describe('#537 — the collab connect refuses a token whose session is not live'
     await expect(ext.onAuthenticate(payload())).rejects.toBe(boom);
   });
 
-  it('a dead session on a missing page is Unauthorized, not NotFound, and the page is never read', async () => {
+  it('a dead session on a missing page is refused as not live, not NotFound, and the page is never read', async () => {
     const { ext, pageFindById } = build({ session: async () => undefined, page: undefined });
-    await expect(ext.onAuthenticate(payload())).rejects.toBeInstanceOf(UnauthorizedException);
+    await expect(ext.onAuthenticate(payload())).rejects.toEqual({ reason: COLLAB_INVALID_TOKEN_REASON });
     expect(pageFindById).not.toHaveBeenCalled();
   });
 });

@@ -64,6 +64,19 @@ export function invalidCollabTokenRefusal(cause: unknown, limitLog: SocketLimitL
   return collabAuthRefusal(COLLAB_INVALID_TOKEN_REASON);
 }
 
+/**
+ * #755: the token's session is no longer live (revoked, expired, unknown, or another user's or workspace's; the
+ * `isWsConnectionLive` check in the authentication extension, seam #213): logged, rate-limited, as
+ * `COLLAB_SOCKET_LIMIT {"limit":"auth_refused","status":401,"cause":"session_not_live"}` and refused with
+ * COLLAB_INVALID_TOKEN_REASON, which is what the quiet wrapper sent for it before, so the wire and the editor's handling
+ * are unchanged. The cause tells a dead session apart from a missing or disabled user, which log `auth_refused` with
+ * no cause.
+ */
+export function sessionNotLiveRefusal(limitLog: SocketLimitLog = collabSocketLimitLog): CollabAuthRefusal {
+  limitLog.log('auth_refused', { status: 401, cause: 'session_not_live' });
+  return collabAuthRefusal(COLLAB_INVALID_TOKEN_REASON);
+}
+
 /** The hook `quietCollabAuthRefusals` wraps (the authentication extension's, seam #213). */
 export interface CollabAuthenticator<P, R> {
   onAuthenticate(payload: P): Promise<R>;
@@ -71,7 +84,8 @@ export interface CollabAuthenticator<P, R> {
 
 /**
  * The authentication extension's `onAuthenticate`, with its 4xx refusals made quiet (#810 L1). The connect refuses with
- * Nest's HttpExceptions (no such user, a disabled one, a session no longer live, no such page, no access), whose
+ * Nest's HttpExceptions (no such user, a disabled one, no such page, no access; a session no longer live has its own
+ * `sessionNotLiveRefusal` since #755), whose
  * `message` Hocuspocus would log once per attempt (`[onAuthenticate] Unauthorized`). Here an HttpException with a status
  * below 500 is logged, rate-limited, as `COLLAB_SOCKET_LIMIT {"limit":"auth_refused","status":…}` and rethrown as
  * `{ reason: COLLAB_INVALID_TOKEN_REASON }`: what Hocuspocus already sent for it (an HttpException has no `reason`), so
