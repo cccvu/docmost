@@ -497,7 +497,9 @@ describe('#642 the per-principal worker-time budget', () => {
       spy.mockRestore();
     }
     expect(forced).toBe(true);
-    expect(armedAfter.some((ms) => ms > deadlineMs - 100 && ms <= deadlineMs)).toBe(true); // it did re-arm
+    // It did re-arm, for what was left of the deadline. Only the bounds a re-arm can have: a main-thread stall before
+    // the forced 0 ms fire shrinks the remainder, and that is not what this spec tests (wiki-v2 #736).
+    expect(armedAfter.some((ms) => ms > 0 && ms <= deadlineMs)).toBe(true);
     await new Promise((r) => setTimeout(r, deadlineMs + 100)); // a leftover re-armed timer would have fired by now
     expect(spawned.length).toBe(1); // never discarded and replaced
     await expect(pool.parse('after', 'html', q('background'))).resolves.toEqual({ type: 'doc', label: 'after' });
@@ -673,32 +675,35 @@ describe('#642 the per-principal worker-time budget', () => {
   it('a batch is gated once: admitted on its first conversion, its later ones are charged but never wait or fail', async () => {
     // The zip import converts inside its open transaction: a budget wait per page would hold it for minutes.
     // #716 I8: deterministic — no refill (exact charges) and a deadline far past every fixture sleep, so the CI
-    // runner's timer stalls can no longer turn a 60 ms sleep into a deadline kill (the observed flake).
-    const { pool } = track(makePool({ deadlineMs: 5_000, budgetCapacityMs: 200, budgetRefillMsPerMinute: 0 }));
+    // runner's timer stalls can no longer turn a fixture sleep into a deadline kill (the observed flake).
+    // wiki-v2 #736: every budget and sleep ×10 (was capacity 200, sleeps 210 + 60): the same ratios and checks, with
+    // the slack below at 1.3 s instead of 130 ms.
+    const { pool } = track(makePool({ deadlineMs: 20_000, budgetCapacityMs: 2_000, budgetRefillMsPerMinute: 0 }));
     await pool.parse('warm', 'html', q('background'));
     const turn = batchConversion('file-task:1', 'A').budgetTurn;
     expect(turn).toEqual({ admitted: false, overdraftMs: 0 });
     await expect(pool.toHtml('first', bq('user:A', 5_000, turn))).resolves.toBe('<p>first</p>');
     expect(turn.admitted).toBe(true);
     // The same batch spends the human's bucket below zero: charged, never gated.
-    // #734: 210 ms (was 250): still below zero, and 130 ms of slack before the next charge reaches the floor.
-    await pool.toHtml('sleep:210:spend', bq('user:A', 5_000, turn));
+    // #734: 2.1 s (×10 of 210 ms; was 250): below zero by at least 100 ms (a fixture sleep never ends early by the
+    // pool's clock), and 1.3 s of slack before the next charge reaches the floor (4 s - 2.1 s - 0.6 s).
+    await pool.toHtml('sleep:2100:spend', bq('user:A', 5_000, turn));
     const left = pool.budgetLeft('user:A');
     expect(left).toBeLessThan(0);
-    expect(left - 60).toBeGreaterThan(-200); // above the floor even after the next charge, so it is visible in full
-    // The same batch: converted at once, and charged (a 60 ms fixture sleep is at least 60 ms of worker time: the
+    expect(left - 600).toBeGreaterThan(-2_000); // above the floor even after the next charge, so it is visible in full
+    // The same batch: converted at once, and charged (a 600 ms fixture sleep is at least 600 ms of worker time: the
     // fixture's sleep never ends early by the pool's clock, #734).
-    await expect(pool.toHtml('sleep:60:second', bq('user:A', 5_000, turn))).resolves.toEqual({
+    await expect(pool.toHtml('sleep:600:second', bq('user:A', 5_000, turn))).resolves.toEqual({
       type: 'doc',
       label: 'second',
     });
-    expect(pool.budgetLeft('user:A')).toBeLessThanOrEqual(left - 60);
+    expect(pool.budgetLeft('user:A')).toBeLessThanOrEqual(left - 600);
     // Controls: a new batch (a second import) by the same human is gated again, and so is an interactive write.
     await expect(
       pool.toHtml('next import', bq('user:A', 5_000, batchConversion('file-task:2', 'A').budgetTurn)),
     ).rejects.toBeInstanceOf(ConversionBudgetExhaustedException);
     await expect(pool.parse('x', 'html', q('user:A'))).rejects.toBeInstanceOf(ConversionBudgetExhaustedException);
-  });
+  }, 30_000);
 
   it('debt is floored at -capacity: a large admitted batch locks its human out for at most one full refill', async () => {
     // #716 I8 (the flaky case seen in CI): a 200 ms deadline under 60 ms sleeps was killed by a stalled CI
@@ -715,25 +720,27 @@ describe('#642 the per-principal worker-time budget', () => {
   });
 
   it('#716 I3: an admitted batch overdrawn past batchOverdraftMs is refused 429 before any more work', async () => {
+    // wiki-v2 #736: capacity, overdraft limit and sleeps ×10 (were 100, 100, 100 + 250 ms): the same ratios and
+    // checks, with `a`'s slack before the floor at ~1 s instead of ~100 ms. The deadline stays far past every sleep.
     const { pool } = track(
-      makePool({ deadlineMs: 5_000, budgetCapacityMs: 100, budgetRefillMsPerMinute: 0, batchOverdraftMs: 100 }),
+      makePool({ deadlineMs: 20_000, budgetCapacityMs: 1_000, budgetRefillMsPerMinute: 0, batchOverdraftMs: 1_000 }),
     );
     await pool.parse('warm', 'html', q('background'));
     const turn = batchConversion('file-task:1', 'A').budgetTurn;
     await pool.toHtml('first', bq('user:A', 5_000, turn));
-    // #734: 100 + 250 ms (was 150 + 150, which put the overdraft exactly on the 100 ms limit when the conversions
-    // measured exactly their sleeps). The fixture's sleeps never end early by the pool's clock, so the overdraft is
-    // ≥ 150 ms; and `a` leaves ~100 ms of slack before the floor for a late timer.
-    await pool.toHtml('sleep:100:a', bq('user:A', 5_000, turn)); // to about 0: on the books, no overdraft yet
+    // #734: 1 s + 2.5 s (×10 of 100 + 250 ms; was 150 + 150, which put the overdraft exactly on the limit when the
+    // conversions measured exactly their sleeps). The fixture's sleeps never end early by the pool's clock, so the
+    // overdraft is ≥ 1.5 s; and `a` leaves ~1 s of slack before the floor for a late timer.
+    await pool.toHtml('sleep:1000:a', bq('user:A', 5_000, turn)); // to about 0: on the books, no overdraft yet
     expect(turn.overdraftMs).toBe(0);
-    await pool.toHtml('sleep:250:b', bq('user:A', 5_000, turn)); // past the floor by ≥ 150 ms: the overdraft
-    expect(turn.overdraftMs).toBeGreaterThan(100);
+    await pool.toHtml('sleep:2500:b', bq('user:A', 5_000, turn)); // past the floor by ≥ 1.5 s: the overdraft
+    expect(turn.overdraftMs).toBeGreaterThan(1_000);
     const started = Date.now();
     const err = await pool.toHtml('sleep:2000:never', bq('user:A', 5_000, turn)).catch((e) => e);
     expect(err).toBeInstanceOf(ConversionBudgetExhaustedException);
     expect(Date.now() - started).toBeLessThan(1_000); // refused up front: the 2 s conversion never ran
-    expect(pool.budgetLeft('user:A')).toBe(-100); // and nothing more was charged
-  });
+    expect(pool.budgetLeft('user:A')).toBe(-1_000); // and nothing more was charged
+  }, 30_000);
 
   it('a batch caller whose wait cannot cover the refill fails with the same 429', async () => {
     const { pool, spawned } = track(
