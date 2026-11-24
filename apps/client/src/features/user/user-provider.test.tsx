@@ -108,18 +108,21 @@ beforeAll(() => {
 const realLocation = window.location;
 const location = vi.hoisted(() => ({
   replace: vi.fn(),
+  reload: vi.fn(),
 }));
 
 beforeEach(() => {
   window.localStorage?.removeItem("currentUser");
   query.state = { data: loaded, isLoading: false, isError: false, error: null };
   location.replace.mockReset();
+  location.reload.mockReset();
   Object.defineProperty(window, "location", {
     value: {
       origin: "http://localhost",
       pathname: "/p/abc",
       search: "",
       replace: location.replace,
+      reload: location.reload,
     },
     writable: true,
     configurable: true,
@@ -205,21 +208,23 @@ describe("UserProvider (#917)", () => {
     await screen.findByRole("switch", { name: "Toggle full page width" });
     act(() => store.set(currentUserAtom, RESET));
     expect(location.replace).not.toHaveBeenCalled();
+    expect(location.reload).not.toHaveBeenCalled();
   });
 
   it.each([
     ["the key is removed", "currentUser"],
     ["storage is cleared", null],
   ])(
-    "another tab signs out (%s): this tab goes to login, returning here",
+    "another tab cleared the stored user (%s): this tab reloads, never straight to login",
     async (_label, key) => {
+      // A sign-out, but also (native mode) another tab's sign-in, which RESETs before it stores, or its
+      // failed-logout reload. The reload asks /users/me: a 401 goes to login with the return path, a 200
+      // comes back signed in, as whoever the session now is.
       renderPreferences();
       await screen.findByRole("switch", { name: "Toggle full page width" });
       act(() => otherTabCleared(key));
-      expect(location.replace).toHaveBeenCalledTimes(1);
-      expect(location.replace).toHaveBeenCalledWith(
-        "/login?redirect=%2Fp%2Fabc",
-      );
+      expect(location.reload).toHaveBeenCalledTimes(1);
+      expect(location.replace).not.toHaveBeenCalled();
     },
   );
 
@@ -228,6 +233,7 @@ describe("UserProvider (#917)", () => {
     renderPreferences();
     act(() => otherTabCleared());
     expect(location.replace).not.toHaveBeenCalled();
+    expect(location.reload).not.toHaveBeenCalled();
   });
 
   it("another tab storing a user (its own load) does not redirect", async () => {
@@ -243,6 +249,7 @@ describe("UserProvider (#917)", () => {
       );
     });
     expect(location.replace).not.toHaveBeenCalled();
+    expect(location.reload).not.toHaveBeenCalled();
   });
 
   it("an unrelated storage key changing does not redirect", async () => {
@@ -250,6 +257,7 @@ describe("UserProvider (#917)", () => {
     await screen.findByRole("switch", { name: "Toggle full page width" });
     act(() => otherTabCleared("something-else"));
     expect(location.replace).not.toHaveBeenCalled();
+    expect(location.reload).not.toHaveBeenCalled();
   });
 
   it("a stale stored user never seeds the children: they render from this load's user", async () => {

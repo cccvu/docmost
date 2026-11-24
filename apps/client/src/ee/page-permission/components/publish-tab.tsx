@@ -1,4 +1,4 @@
-import { useEffect, useId, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   ActionIcon,
   Anchor,
@@ -60,10 +60,24 @@ export function PublishTab({ pageId, readOnly, isRestricted, workspaceSharingDis
   const [refusal, setRefusal] = useState<{ pageId: string; message: string }>();
   const publishRefusal = refusal?.pageId === pageId ? refusal.message : null;
   const refusalId = useId();
+  const refusalRef = useRef<HTMLParagraphElement>(null);
+  const focusRefusal = useRef(false);
   const noteRefusal = (err: unknown) => {
     const message = sharePublishRefusal(err);
-    if (message) setRefusal({ pageId, message });
+    if (!message) return;
+    focusRefusal.current = true;
+    setRefusal({ pageId, message });
   };
+  // CCC #913: the refusal disables the switch the user just pressed, which then cannot keep focus. Hand it to
+  // the reason (tabIndex -1), unless focus already moved on to something usable.
+  useEffect(() => {
+    if (!publishRefusal || !focusRefusal.current) return;
+    focusRefusal.current = false;
+    const active = document.activeElement as HTMLInputElement | null;
+    if (!active || active === document.body || active.disabled) {
+      refusalRef.current?.focus();
+    }
+  }, [publishRefusal]);
 
   // CCC #858: optimistic, and rolled back when the server refuses (the mutation shows the server's message).
   const handleChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -240,13 +254,13 @@ export function PublishTab({ pageId, readOnly, isRestricted, workspaceSharingDis
           checked={isPagePublic}
           disabled={readOnly || (!!publishRefusal && !isPagePublic)}
           size="xs"
-          aria-label={t("Share to web")}
+          aria-label={isPagePublic ? t("Shared to web") : t("Share to web")}
           {...refusalProps}
         />
       </Group>
 
       {publishRefusal && (
-        <Text id={refusalId} size="xs" c="dimmed">
+        <Text id={refusalId} ref={refusalRef} tabIndex={-1} size="xs" c="dimmed">
           {publishRefusal}
         </Text>
       )}

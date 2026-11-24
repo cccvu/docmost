@@ -214,6 +214,28 @@ describe("CommentListItem keyboard actions (#913)", () => {
     act(() => trigger.blur());
     expect(actions.style.opacity).toBe("0");
   });
+
+  it("on a device that cannot hover (touch), the actions are always shown: never invisible but tappable", () => {
+    const real = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: query === "(hover: none)",
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    })) as unknown as typeof window.matchMedia;
+    try {
+      renderItem();
+      const trigger = screen.getByRole("button", { name: "Comment menu" });
+      const actions = trigger.closest("div[style]") as HTMLElement;
+      expect(actions.style.opacity).toBe("1");
+    } finally {
+      window.matchMedia = real;
+    }
+  });
 });
 
 describe("CommentListItem delete focus (#913)", () => {

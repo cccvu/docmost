@@ -5,6 +5,7 @@ import {
   pdpChecksFor,
   SpaceGrantCeiling,
   withGrantCeiling,
+  CREATE_SETTLE_MAX_MS,
 } from './space-grant-ceiling';
 
 /**
@@ -133,6 +134,19 @@ describe('SpaceGrantCeiling.settleBestEffort', () => {
     expect(ok.spy.tx).toEqual([]);
   });
 
+  it('waits at most CREATE_SETTLE_MAX_MS (1 s), shorter than the fence, so the relayed create keeps its deadline', async () => {
+    expect(CREATE_SETTLE_MAX_MS).toBe(1000);
+    const long = mk([]);
+    (long.ceiling as any).settleMs = 3000;
+    await long.ceiling.settleBestEffort();
+    expect((long.authz.settleProjection as jest.Mock).mock.calls[0][1]).toBe(1000);
+
+    const short = mk([]);
+    (short.ceiling as any).settleMs = 400;
+    await short.ceiling.settleBestEffort();
+    expect((short.authz.settleProjection as jest.Mock).mock.calls[0][1]).toBe(400);
+  });
+
   it('pending → false and one SPACE_CREATE_SETTLE_PENDING line, never a throw', async () => {
     const pending = mk([], { settleProjection: jest.fn(async () => ({ status: 'pending', reason: 'timeout' })) });
     const warn = jest.spyOn((pending.ceiling as any).logger, 'warn').mockImplementation();
@@ -156,12 +170,14 @@ describe('SpaceGrantCeiling.settleBestEffort', () => {
     expect(settleProjection).not.toHaveBeenCalled();
   });
 
-  it('a disabled settle (AUTHZ_NARROWING_SETTLE_TIMEOUT_MS=0) → false, nothing asked', async () => {
+  it('a disabled settle (AUTHZ_NARROWING_SETTLE_TIMEOUT_MS=0) → false, nothing asked, nothing logged', async () => {
     const off = mk([]);
     (off.ceiling as any).settleMs = 0;
-    jest.spyOn((off.ceiling as any).logger, 'warn').mockImplementation();
+    const warn = jest.spyOn((off.ceiling as any).logger, 'warn').mockImplementation();
     await expect(off.ceiling.settleBestEffort()).resolves.toBe(false);
     expect(off.authz.settleProjection).not.toHaveBeenCalled();
+    // Switched off on purpose: not a pending settle, so no SPACE_CREATE_SETTLE_PENDING warning per create.
+    expect(warn).not.toHaveBeenCalled();
   });
 });
 

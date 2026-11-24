@@ -115,7 +115,9 @@ function renderTab() {
 }
 
 function shareSwitch() {
-  return screen.getByRole("switch", { name: "Share to web" }) as HTMLInputElement;
+  return screen.getByRole("switch", {
+    name: /^Share(d)? to web$/,
+  }) as HTMLInputElement;
 }
 
 function calledUrls() {
@@ -132,20 +134,24 @@ describe("PublishTab (#858)", () => {
     route({ share: DIRECT_SHARE });
     renderTab();
     await waitFor(() => expect(shareSwitch().checked).toBe(true));
+    // The name matches the visible label (WCAG 2.5.3): "Shared to web" while public.
+    expect(screen.getByRole("switch", { name: "Shared to web" })).toBe(shareSwitch());
     expect(screen.getByRole("switch", { name: "Include sub-pages" })).toBeTruthy();
     expect(
       screen.getByRole("switch", { name: "Search engine indexing" }),
     ).toBeTruthy();
   });
 
-  it("share_not_permitted: the switch rolls back, is disabled and says why", async () => {
+  it("share_not_permitted: the switch rolls back, is disabled and says why, and focus moves to the reason", async () => {
     route({
       create: httpError(403, { code: "share_not_permitted", message: REFUSAL }),
     });
     renderTab();
     await loaded();
     expect(shareSwitch().checked).toBe(false);
+    expect(screen.getByRole("switch", { name: "Share to web" })).toBe(shareSwitch());
 
+    shareSwitch().focus();
     fireEvent.click(shareSwitch());
 
     await waitFor(() => expect(shareSwitch().disabled).toBe(true));
@@ -154,6 +160,40 @@ describe("PublishTab (#858)", () => {
     const describedBy = shareSwitch().getAttribute("aria-describedby") ?? "";
     expect(describedBy.split(" ")).toContain(note.id);
     expect(note.id).not.toBe("");
+    // The pressed switch is now disabled, so it cannot keep focus: the reason takes it (#913).
+    await waitFor(() => expect(document.activeElement).toBe(note));
+  });
+
+  it("share_not_permitted after the user moved on: focus stays where they put it", async () => {
+    let refuse!: () => void;
+    route({});
+    const base = postMock.getMockImplementation()!;
+    postMock.mockImplementation((url: string, ...rest: unknown[]) =>
+      url === "/shares/create"
+        ? new Promise((_, reject) => {
+            refuse = () =>
+              reject(
+                httpError(403, { code: "share_not_permitted", message: REFUSAL }),
+              );
+          })
+        : base(url, ...rest),
+    );
+    renderTab();
+    await loaded();
+    const elsewhere = document.createElement("button");
+    document.body.appendChild(elsewhere);
+    try {
+      shareSwitch().focus();
+      fireEvent.click(shareSwitch());
+      await waitFor(() => expect(calledUrls()).toContain("/shares/create"));
+      elsewhere.focus();
+      refuse();
+
+      await waitFor(() => expect(screen.getByText(REFUSAL)).toBeTruthy());
+      expect(document.activeElement).toBe(elsewhere);
+    } finally {
+      elsewhere.remove();
+    }
   });
 
   it("any other refusal rolls the switch back and leaves it usable, with no inline note", async () => {
@@ -163,12 +203,14 @@ describe("PublishTab (#858)", () => {
     renderTab();
     await loaded();
 
+    shareSwitch().focus();
     fireEvent.click(shareSwitch());
 
     await waitFor(() => expect(calledUrls()).toContain("/shares/create"));
     await waitFor(() => expect(notifyMock).toHaveBeenCalled());
     expect(shareSwitch().checked).toBe(false);
     expect(shareSwitch().disabled).toBe(false);
+    expect(document.activeElement).toBe(shareSwitch());
     expect(screen.queryByText(REFUSAL)).toBeNull();
     expect(shareSwitch().hasAttribute("aria-describedby")).toBe(false);
   });
@@ -199,6 +241,7 @@ describe("PublishTab (#858)", () => {
     })) as HTMLInputElement;
     expect(indexing.checked).toBe(false);
 
+    indexing.focus();
     fireEvent.click(indexing);
 
     await waitFor(() => expect(screen.getByText(REFUSAL)).toBeTruthy());
@@ -210,5 +253,8 @@ describe("PublishTab (#858)", () => {
     expect(subPages.disabled).toBe(true);
     // Unpublishing stays possible: it narrows access, which the publish rule never blocks.
     expect(shareSwitch().disabled).toBe(false);
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByText(REFUSAL)),
+    );
   });
 });

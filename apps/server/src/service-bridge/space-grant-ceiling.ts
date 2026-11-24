@@ -99,6 +99,18 @@ export function grantUnconfirmed(): ServiceUnavailableException {
   });
 }
 
+/**
+ * #858: the post-create settle's own cap. Shorter than the fence's ({@link purgeSettleWaitMs}, up to 3 s): it runs
+ * inside the relayed create's deadline (the platform's `DOCMOST_RELAY_TIMEOUT_MS`, 8 s) after the write committed,
+ * and a create that outlives that deadline is answered "outcome unknown" although it succeeded. The client adds
+ * `SETTLE_MARGIN_MS` (1.5 s) to it, so the worst case is 2.5 s.
+ */
+export const CREATE_SETTLE_MAX_MS = 1000;
+
+/**
+ * The membership grant ceiling, plus the space create's best-effort settle ({@link settleBestEffort}), which lives
+ * here because it shares the ceiling's settle plumbing (the outbox read, the platform client and the timeout knob).
+ */
 @Injectable()
 export class SpaceGrantCeiling {
   private readonly logger = new Logger(SpaceGrantCeiling.name);
@@ -154,12 +166,14 @@ export class SpaceGrantCeiling {
    * #858: settle once after a space create commits, so the creator's next request (the console's member add, decided
    * on `space#administer` at the platform's freshness watermark) sees the projected space and its creator's admin row.
    * A create WIDENS access, so unlike {@link fence} this never throws: `false` (logged `SPACE_CREATE_SETTLE_PENDING`)
-   * when the fence was not confirmed, the platform or the outbox read failed, or the settle is disabled.
+   * when the fence was not confirmed or the platform or the outbox read failed; `false` with no log when the settle
+   * is switched off (`AUTHZ_NARROWING_SETTLE_TIMEOUT_MS=0`). Waits at most {@link CREATE_SETTLE_MAX_MS}.
    */
   async settleBestEffort(): Promise<boolean> {
     try {
-      const settled = await settle(this.authz, this.db, this.settleMs);
+      const settled = await settle(this.authz, this.db, Math.min(this.settleMs, CREATE_SETTLE_MAX_MS));
       if (settled.ok) return true;
+      if (settled.reason === 'settle-disabled') return false;
       this.logger.warn(
         `SPACE_CREATE_SETTLE_PENDING reason=${settled.reason}${settled.position ? ` position=${settled.position}` : ''}: ` +
           "the space is created; the creator's next request may be refused until the PDP catches up",

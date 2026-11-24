@@ -14,7 +14,12 @@ import {
   useFocusFallback,
 } from "@/features/layout/use-focus-fallback";
 import ResolveComment from "@/ee/comment/components/resolve-comment";
-import { useFocusWithin, useHover, useMergedRef } from "@mantine/hooks";
+import {
+  useFocusWithin,
+  useHover,
+  useMediaQuery,
+  useMergedRef,
+} from "@mantine/hooks";
 import {
   useDeleteCommentMutation,
   useUpdateCommentMutation,
@@ -43,6 +48,8 @@ function CommentListItem({
   // CCC #913: the actions also show while they hold keyboard focus. They are transparent, not
   // `visibility: hidden`, at rest, so Tab (and a screen reader) can reach them without a pointer.
   const { ref: actionsRef, focused: actionsFocused } = useFocusWithin();
+  // CCC #913: a device that cannot hover (touch) shows them always, never as invisible buttons that take taps.
+  const cannotHover = useMediaQuery("(hover: none)");
   // CCC #913: a deleted comment (its menu held focus) hands focus to its comment tab, else the main content.
   const rootRef = useRef<HTMLDivElement>(null);
   const itemRef = useMergedRef(ref, rootRef);
@@ -156,7 +163,7 @@ function CommentListItem({
 
             <div
               ref={actionsRef}
-              style={{ opacity: hovered || actionsFocused ? 1 : 0 }}
+              style={{ opacity: hovered || actionsFocused || cannotHover ? 1 : 0 }}
             >
               {!comment.parentCommentId && canComment && canResolve && (
                 <ResolveComment
