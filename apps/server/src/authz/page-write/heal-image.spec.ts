@@ -345,8 +345,8 @@ describe('a reload that throws at the store is no evidence of instability (#840 
       const closes: Array<[number, string]> = [];
       const live = Object.assign(calm, { getConnections: () => [{ webSocket: { close: (code: number, reason: string) => closes.push([code, reason]) } }] });
       afterOrderStore(live, PAGE, out);
-      // requested as any reload past its bounds is (#827's memo still holds), never as an order heal
-      expect(compactionRequest(live)).toEqual({ reason: 'load_steps', userId: null, drain: false });
+      // requested as `reload_failed` (#851; #827's memo still holds), never as an order heal
+      expect(compactionRequest(live)).toEqual({ reason: 'reload_failed', userId: null, drain: false });
       expect(orderHealRequested(live)).toBe(false);
       expect(closes).toEqual([]); // never a page-wide drain for one slow reload
       expect(outcomes(warn)).toEqual(['reload_failed']);
@@ -386,7 +386,7 @@ describe('a reload that throws at the store is no evidence of instability (#840 
       const doc = new Y.Doc();
       await loadStableYdoc(doc, PAGE, stable, memoryHealStore({ ydoc: stable }));
       expect(calls).toBe(2);
-      expect(compactionRequest(doc)).toEqual({ reason: 'load_steps', userId: null, drain: false });
+      expect(compactionRequest(doc)).toEqual({ reason: 'reload_failed', userId: null, drain: false }); // #851
       expect(orderHealRequested(doc)).toBe(false);
       expect(outcomes(warn)).toEqual(['reload_failed']);
       expect(logRebuilds(doc)).toBe(true); // served as loaded

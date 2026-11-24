@@ -18,8 +18,8 @@
  *     runs Yjs left split are joined, #827's `textRunsDigest`, and it reloads strict-equal to itself), with `row_sha` =
  *     sha256 of the raw bytes, or no image when it cannot be built.
  *     After the commit, compaction is requested: unstable (`order_divergence`) drains now when one can start; unknown
- *     (`load_steps`, so #827's build-failure memo still holds) waits for the next unload (one slow reload is no
- *     evidence; a joiner still meets the guard's join check).
+ *     (`reload_failed`, #851: not an order heal, so #827's build-failure memo still holds) waits for the next unload
+ *     (one slow reload is no evidence; a joiner still meets the guard's join check).
  *   - Load (`loadStableYdoc`, the only loader of `pages.ydoc`; heal-image.fitness.spec.ts pins it).
  *     (a) a heal row naming the row's bytes: once compaction is armed, one transaction compare-and-swaps the image in
  *         and deletes the heal row (compaction's own swap, which deletes it), then the image is served; before that,
@@ -30,7 +30,8 @@
  *         ydoc without one, and it served the reload order): the stale row is dropped and the row is (d).
  *     (d) no heal row: served as before; an unstable (legacy, pre-#840) row requests compaction from the loaded tree,
  *         which is the order users already see today, and from then on the only one. A reload that ran out of bounds
- *         (`reload_failed`) is no evidence: logged as such and compacted at unload under the memo (`load_steps`).
+ *         (`reload_failed`) is no evidence: logged as such and compacted at unload under the memo (reason
+ *         `reload_failed`, #851).
  *   Every branch hands the exact bytes it applied to the guard's replica log (`attachReplicaLog`), and ends with #793's
  *   claim of the page's binding seal (binding-seal.ts `claimAtLoad`: restored only on (c)/(d)). The load's
  *   `COLLAB_ORDER_DIVERGENCE` lines are rate-limited per page and outcome (order-divergence-log.ts).
@@ -94,7 +95,7 @@ const meter = (): ConflictScanMeter => (meterInstance ??= installConflictScanMet
  * when they are, else the first difference's kind, or `reload_failed` when the reload threw (a trip of the walk budget
  * or the deadline, a malformed state). Only the reload runs under the meter and the deadline; live is read outside.
  */
-const RELOAD_FAILED = 'reload_failed';
+const RELOAD_FAILED = 'reload_failed' satisfies CompactionReason;
 
 function reloadDiff(live: Y.Doc, encoded: Uint8Array, bounds: LoadBounds): string | null {
   const reload = new Y.Doc({ gc: live.gc, gcFilter: live.gcFilter });
@@ -358,8 +359,8 @@ export async function persistOrderState(
  * After the store committed: an unstable one requests compaction from live (`order_divergence`), drains the page now
  * when a compaction can start (its sockets close 1013, so it unloads and compacts; the heal row covers a crash until
  * then), and logs. An unknown order (`reload_failed`: one slow reload, a GC pause on an honest page) never drains and
- * is never an order heal (`load_steps`, so a failed build's memo still holds): it is compacted at its next unload, and
- * a joiner is still checked by the guard's own join check. #827: like every drain,
+ * is never an order heal (requested as `reload_failed`, #851, so a failed build's memo still holds): it is compacted at
+ * its next unload, and a joiner is still checked by the guard's own join check. #827: like every drain,
  * only when the page heals after it: the unload can compact it (`unloadCanCompact`, which a failed build never stops for
  * an order heal), or the store wrote an image the next load adopts. A page with neither (bytes that leave structs
  * pending, no image) keeps its writers; its joiners wait on the guard's join check. Never throws.
@@ -367,9 +368,9 @@ export async function persistOrderState(
 export function afterOrderStore(document: Y.Doc, pageId: string, outcome: OrderStoreOutcome | null | undefined): void {
   try {
     if (!outcome?.unstable) return;
-    // An unknown order is no evidence of instability: requested as the guard requests a reload that ran out of bounds
-    // (`load_steps`), so #827's build-failure memo still holds for it. Only `order_divergence` lifts that memo.
-    const reason: CompactionReason = outcome.reloadFailed ? 'load_steps' : 'order_divergence';
+    // An unknown order is no evidence of instability: requested as `reload_failed` (#851), which like the guard's
+    // `load_steps` is no order heal, so #827's build-failure memo still holds for it. Only `order_divergence` lifts it.
+    const reason: CompactionReason = outcome.reloadFailed ? RELOAD_FAILED : 'order_divergence';
     const heals = outcome.imaged || unloadCanCompact(document, pageId, reason);
     const request: CompactionRequest = { reason, userId: null, drain: !outcome.reloadFailed && canStartCompaction(pageId) && heals };
     if (requestCompaction(document, request)) logCompactionRequested(pageId, request, { structs: outcome.structs });
@@ -482,9 +483,9 @@ export async function loadStableYdoc(
     }
     if (why === RELOAD_FAILED) {
       // The reload ran out of bounds: no evidence either way (a GC pause on an honest page). Compacted at its unload as
-      // any page whose reload trips is (`load_steps`, under #827's build-failure memo); a joiner is still checked by the
-      // guard's own join check.
-      const request: CompactionRequest = { reason: 'load_steps', userId: null, drain: false };
+      // any page whose reload trips is (`reload_failed`, #851: under #827's build-failure memo); a joiner is still
+      // checked by the guard's own join check.
+      const request: CompactionRequest = { reason: RELOAD_FAILED, userId: null, drain: false };
       if (requestCompaction(document, request)) logCompactionRequested(pageId, request, { structs });
       log(RELOAD_FAILED, false, structs);
     } else if (why !== null) {
