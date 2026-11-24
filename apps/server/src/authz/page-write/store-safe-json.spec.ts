@@ -139,6 +139,22 @@ describe('storeSafeJson (#773)', () => {
     expect(bytes).toEqual(new Uint8Array([0, 0xd8])); // the input is not written to
   });
 
+  // #784: the store's COLLAB_STORE_NORMALIZED reads this. Never for a clean input, which comes back as itself.
+  it('calls onChanged exactly when the result is not the input itself', () => {
+    const calls = (v: unknown): number => {
+      let n = 0;
+      storeSafeJson(v, () => n++);
+      return n;
+    };
+    expect(calls({ type: 'doc', content: [{ type: 'text', text: EMOJI, marks: [{ type: 'bold', attrs: {} }] }] })).toBe(0);
+    expect(calls([1, 'x', null, { a: [true] }])).toBe(0);
+    expect(calls({ a: [`x\0`] })).toBe(1);
+    expect(calls({ [HIGH]: 1 })).toBe(1);
+    expect(calls({ d: new Date(0) })).toBe(1); // reshaped by toJSON, nothing replaced
+    expect(calls({ b: new Uint8Array([1]) })).toBe(1);
+    expect(calls({ u: undefined })).toBe(1);
+  });
+
   // #784: an array index reaches project() as a number; toJSON must still get the string key, as in JSON.stringify.
   it('passes toJSON an array element its index as a string', () => {
     const seen: unknown[] = [];
