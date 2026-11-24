@@ -6,6 +6,11 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import * as Y from "yjs";
 import {
+  applyAwarenessUpdate,
+  Awareness,
+  encodeAwarenessUpdate,
+} from "y-protocols/awareness";
+import {
   HocuspocusProvider,
   HocuspocusProviderWebsocket,
   WebSocketStatus,
@@ -871,5 +876,154 @@ describe("a broken local copy (#847)", () => {
     wedgeWithKeyedSplit(ydoc);
     await flush();
     expect(access.state.refused).toBe(false);
+  });
+});
+
+// cccvu/wiki-v2 #845 — Yjs regenerates `doc.clientID` (in the remote transaction's cleanup) when a remote update writes at
+// it; y-protocols' Awareness keeps the id it was built with. The controller follows the document's id: the old id's state
+// is removed (a null at its next clock), the new id is announced at a clock every receiver applies (≥ 1), and nothing is
+// sent when there is no local state.
+describe("the awareness follows a regenerated client id (#845)", () => {
+  const awarenesses: Awareness[] = [];
+  afterEach(() => {
+    for (const a of awarenesses.splice(0)) a.destroy();
+  });
+
+  /** A real Y.Doc and Awareness behind the controller's provider slice (the parts a fake provider leaves out). */
+  function bound() {
+    const doc = new Y.Doc();
+    const awareness = new Awareness(doc);
+    awarenesses.push(awareness);
+    const provider = {
+      configuration: {},
+      detach: () => {},
+      on: () => {},
+      off: () => {},
+      document: doc,
+      awareness,
+    };
+    const access = createCollabAccessController({
+      socket: { shouldConnect: true, status: WebSocketStatus.Connected, connect: async () => {}, disconnect: () => {}, on: () => {}, off: () => {} } as any,
+      initialToken: TOKEN,
+      refetchToken: async () => ({ isSuccess: true, data: { token: FRESH } }),
+      onState: () => {},
+      markDisconnected: () => {},
+      network: null,
+    });
+    access.bind(provider);
+    // What the provider sends: every awareness `update`, encoded when it is emitted (as awarenessUpdateHandler does).
+    const sent: Uint8Array[] = [];
+    awareness.on("update", ({ added, updated, removed }: Record<string, number[]>) => {
+      sent.push(encodeAwarenessUpdate(awareness, added.concat(updated, removed)));
+    });
+    return { doc, awareness, access, sent };
+  }
+
+  /** A remote update that writes at the doc's own id (a copy of the doc plus one insert at its id): Yjs regenerates it. */
+  function regenerate(doc: Y.Doc) {
+    const before = doc.clientID;
+    const twin = new Y.Doc();
+    Y.applyUpdate(twin, Y.encodeStateAsUpdate(doc));
+    twin.clientID = doc.clientID;
+    twin.getText("server").insert(0, "x");
+    Y.applyUpdate(doc, Y.encodeStateAsUpdate(twin), "server");
+    expect(doc.clientID).not.toBe(before); // anti-vacuity: Yjs did regenerate
+    return before;
+  }
+
+  /** A peer that already holds `awareness`'s current local state at its current clock. */
+  function peerOf(awareness: Awareness) {
+    const peer = new Awareness(new Y.Doc());
+    awarenesses.push(peer);
+    applyAwarenessUpdate(peer, encodeAwarenessUpdate(awareness, [awareness.clientID]), "remote");
+    return peer;
+  }
+
+  it("a receiver that applies every frame sent ends with the new id's state and without the old id (a clock-0 announce would be dropped)", () => {
+    const { doc, awareness, sent } = bound();
+    awareness.setLocalStateField("user", { name: "Ada" });
+    const peer = peerOf(awareness);
+    const state = awareness.getLocalState();
+    const old = regenerate(doc);
+    const now = doc.clientID;
+    expect(awareness.clientID).toBe(now);
+    expect(awareness.getLocalState()).toEqual(state);
+    expect(awareness.getStates().has(old)).toBe(false);
+    expect(awareness.meta.get(now)!.clock).toBeGreaterThanOrEqual(1);
+    expect(peer.getStates().get(old)).toEqual(state); // before the frames: the peer still shows the old id
+    for (const frame of sent) applyAwarenessUpdate(peer, frame, "remote");
+    expect(peer.getStates().get(now)).toEqual(state);
+    expect(peer.getStates().has(old)).toBe(false);
+  });
+
+  it("follows every regeneration, not only the first", () => {
+    const { doc, awareness, sent } = bound();
+    awareness.setLocalStateField("user", { name: "Ada" });
+    const peer = peerOf(awareness);
+    const seen = [doc.clientID];
+    for (let i = 0; i < 3; i += 1) {
+      regenerate(doc);
+      seen.push(doc.clientID);
+      expect(awareness.clientID).toBe(doc.clientID);
+    }
+    for (const frame of sent) applyAwarenessUpdate(peer, frame, "remote");
+    expect(peer.getStates().get(doc.clientID)).toEqual({ user: { name: "Ada" } });
+    for (const id of seen.slice(0, -1)) expect(peer.getStates().has(id)).toBe(false);
+  });
+
+  it("with no local state (after a page hide), moves the id and its clock but sends nothing; the next state goes out at a clock receivers apply", () => {
+    const { doc, awareness, sent } = bound();
+    awareness.setLocalState(null);
+    const peer = new Awareness(new Y.Doc());
+    awarenesses.push(peer);
+    sent.length = 0;
+    regenerate(doc);
+    expect(awareness.clientID).toBe(doc.clientID);
+    expect(sent).toEqual([]);
+    awareness.setLocalState({ user: { name: "Ada" } });
+    for (const frame of sent) applyAwarenessUpdate(peer, frame, "remote");
+    expect(peer.getStates().get(doc.clientID)).toEqual({ user: { name: "Ada" } });
+  });
+
+  it("an id regenerated before bind is followed at bind (the one-shot check)", () => {
+    const doc = new Y.Doc();
+    const awareness = new Awareness(doc);
+    awarenesses.push(awareness);
+    awareness.setLocalStateField("user", { name: "Ada" });
+    regenerate(doc);
+    expect(awareness.clientID).not.toBe(doc.clientID);
+    const access = createCollabAccessController({
+      socket: { shouldConnect: true, status: WebSocketStatus.Connected, connect: async () => {}, disconnect: () => {}, on: () => {}, off: () => {} } as any,
+      initialToken: TOKEN,
+      refetchToken: async () => ({ isSuccess: true, data: { token: FRESH } }),
+      onState: () => {},
+      markDisconnected: () => {},
+      network: null,
+    });
+    access.bind({ configuration: {}, detach: () => {}, on: () => {}, off: () => {}, document: doc, awareness });
+    expect(awareness.clientID).toBe(doc.clientID);
+    expect(awareness.getLocalState()).toEqual({ user: { name: "Ada" } });
+    access.destroy();
+  });
+
+  it("after destroy(), a regeneration leaves the awareness alone (the listener is gone)", () => {
+    const { doc, awareness, access, sent } = bound();
+    access.destroy();
+    const old = regenerate(doc);
+    expect(awareness.clientID).toBe(old);
+    expect(sent).toEqual([]);
+  });
+
+  it("a provider without a document or an awareness binds and destroys without throwing", () => {
+    const access = createCollabAccessController({
+      socket: { shouldConnect: true, status: WebSocketStatus.Connected, connect: async () => {}, disconnect: () => {}, on: () => {}, off: () => {} } as any,
+      initialToken: TOKEN,
+      refetchToken: async () => ({ isSuccess: true, data: { token: FRESH } }),
+      onState: () => {},
+      markDisconnected: () => {},
+      network: null,
+    });
+    expect(() => access.bind({ configuration: {}, detach: () => {}, on: () => {}, off: () => {} })).not.toThrow();
+    expect(() => access.destroy()).not.toThrow();
   });
 });
