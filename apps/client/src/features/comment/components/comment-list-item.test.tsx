@@ -1,7 +1,8 @@
 // CCC (fork-owned test, wiki-v2 #858 + #913). A comment thread can be resolved and re-opened from the SPA: the
 // fork serves POST /api/comments/resolve in both modes, so the never-granted `comment:resolution` licence
 // entitlement no longer hides the action. And deleting a comment through its confirm dialog puts keyboard
-// focus back on the comment tab instead of dropping it on <body> when the comment unmounts.
+// focus back on the comment tab instead of dropping it on <body> when the comment unmounts. The actions are
+// reachable by keyboard: transparent at rest rather than hidden, and shown while they hold focus.
 import { describe, it, expect, beforeAll, beforeEach, vi } from "vitest";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MantineProvider, Tabs } from "@mantine/core";
@@ -196,6 +197,22 @@ describe("CommentListItem hover resolve (#858)", () => {
         resolved: true,
       }),
     );
+  });
+});
+
+describe("CommentListItem keyboard actions (#913)", () => {
+  it("keeps the actions reachable without a pointer and shows them while they hold focus", () => {
+    renderItem();
+    // No hover: the actions are transparent, never `visibility: hidden` (which takes them out of the Tab order
+    // and the accessibility tree, so a keyboard user could not resolve or delete).
+    const trigger = screen.getByRole("button", { name: "Comment menu" });
+    const actions = trigger.closest("div[style]") as HTMLElement;
+    expect(actions.style.visibility).toBe("");
+    expect(actions.style.opacity).toBe("0");
+    act(() => trigger.focus());
+    expect(actions.style.opacity).toBe("1");
+    act(() => trigger.blur());
+    expect(actions.style.opacity).toBe("0");
   });
 });
 
