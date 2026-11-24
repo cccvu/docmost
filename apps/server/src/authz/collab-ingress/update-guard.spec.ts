@@ -543,12 +543,35 @@ describe('#781 B4: a client id is bound to its user (forged clocks)', () => {
     expectRefused(s, s.conn('attacker'), forge(s, 1001, 'FORGED '), REFUSED('foreign-client'));
   });
 
-  // A regenerated client id is NOT bound this way once its connection announced its old id: relay-binding.spec.ts pins it.
+  // A regenerated client id is NOT bound this way once its connection announced its old id, unless the client announces
+  // the new one (#845): relay-binding.spec.ts pins both.
   it('bound by the first new struct when the connection announced nothing (a pagehide-nulled awareness)', () => {
     const { s, victim, vc } = victimSetup();
     expect(s.deliver(vc, awarenessFrame([{ clientID: 1001, state: null }]))).toBe('applied'); // null never binds
     expect(s.send(vc, victim.edit(s.live, () => textOf(find(victim.doc, 'paragraph')).insert(0, 'first ')))).toBe('applied');
     expectRefused(s, s.conn('attacker'), forge(s, 1001, 'FORGED '), REFUSED('foreign-client'));
+  });
+
+  it('#845: a state for an id this connection already announced is not parsed again; a new connection\'s is', () => {
+    const { s, vc } = victimSetup();
+    const meta = new Map<number, { clock: number }>();
+    (s.live as unknown as { awareness: unknown }).awareness = { meta };
+    const move = (c: Conn, clock: number) => {
+      const out = s.deliver(c, awarenessFrame([{ clientID: 1001, clock, state: { user: { name: 'V' }, cursor: clock } }]));
+      meta.set(1001, { clock }); // what Hocuspocus then applies
+      return out;
+    };
+    expect(move(vc, 1)).toBe('applied'); // announced and bound (awareness-only)
+    const parse = jest.spyOn(JSON, 'parse');
+    try {
+      expect(move(vc, 2)).toBe('applied'); // a cursor move: nothing to learn
+      expect(parse).not.toHaveBeenCalled();
+      expect(move(s.conn('victim'), 3)).toBe('applied'); // the same user's new connection: its own evidence
+      expect(parse).toHaveBeenCalledTimes(1);
+    } finally {
+      parse.mockRestore();
+    }
+    expectRefused(s, s.conn('attacker'), forge(s, 1001, 'FORGED '), UNRESOLVED_REASON); // still bound to the victim
   });
 
   it('accepted: awareness echoes, a reader claiming a writer\'s id, a remount resending a bound peer\'s cached structs', () => {

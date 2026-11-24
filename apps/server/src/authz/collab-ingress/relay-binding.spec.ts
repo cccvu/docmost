@@ -4,7 +4,14 @@ import { prosemirrorJSONToYDoc } from '@tiptap/y-tiptap';
 import { serverSchema } from '../page-write/prelim-content';
 import { authFrame, awarenessFrame, contentOf, DOC_NAME, FakeSocket, RemoteClient, renderLikeABrowser, SYNC, syncFrame } from './collab-ingress.testkit';
 import { CollabUpdateGuardExtension } from './collab-update-guard.extension';
-import { AWARENESS_BINDS_PER_USER, AWARENESS_NEW_IDS_REFILL_MS, COLLAB_REFUSAL_CODE, CollabUpdateGuard, UNRESOLVED_REASON } from './update-guard';
+import {
+  AWARENESS_BINDS_PER_USER,
+  AWARENESS_NEW_IDS_REFILL_MS,
+  COLLAB_REFUSAL_CODE,
+  CollabUpdateGuard,
+  UNRESOLVED_REASON,
+  type CollabGuardOptions,
+} from './update-guard';
 
 /**
  * #781 lineage (ADR 0036 §4): a client id is bound to a user by that user's own awareness, or by its first struct only
@@ -515,13 +522,15 @@ describe('the per-connection announcement evidence is bounded', () => {
   });
 });
 
-describe('pinned residual (ADR 0036 §4): a regenerated client id is no longer bound by its first struct', () => {
+describe('pinned residual (ADR 0036 §4): a client that does not re-announce its regenerated id', () => {
   it('a connection that announced its old id writes at a never-seen regenerated id: applied, unbound, and forgeable', () => {
     // Yjs gives a doc a new clientID when a remote transaction touches its current one; y-protocols' Awareness keeps
-    // announcing the id it was built with. So the connection's evidence names only the old id, and the new id joins the
-    // stored-id class (#793). Honest regeneration needs a remote write at the doc's current id, which the guard refuses
-    // (or answers unresolved) for every bound id, so on an honest page it follows only an id collision. A connection
-    // whose awareness is null, or absent, keeps the old rule and binds it (update-guard.spec.ts B4).
+    // announcing the id it was built with unless the client re-announces (the editor does since #845: the real-Hocuspocus
+    // case below). A client that does not (an older bundle, a custom client) leaves the connection's evidence naming only
+    // the old id, and the new id joins the stored-id class (#793). Honest regeneration needs a remote write at the doc's
+    // current id, which the guard refuses (or answers unresolved) for every bound id, so on an honest page it follows
+    // only an id collision. A connection whose awareness is null, or absent, keeps the old rule and binds it
+    // (update-guard.spec.ts B4).
     const s = lifetime(Y.encodeStateAsUpdate(prosemirrorJSONToYDoc(serverSchema(), SEED, 'default')));
     const victim = s.conn('V');
     expect(s.announce(victim, { clientID: B_ID })).toBe('applied');
@@ -537,7 +546,7 @@ describe('pinned residual (ADR 0036 §4): a regenerated client id is no longer b
 });
 
 describe('the orderings through a real Hocuspocus 4.7.1 (its awareness meta, queues and CLOSE)', () => {
-  const TOKENS: Record<string, string> = { A: 'A', B: 'B' };
+  const TOKENS: Record<string, string> = { A: 'A', B: 'B', V: 'V', M: 'M' };
   const settle = async () => {
     for (let i = 0; i < 6; i++) await new Promise((r) => setImmediate(r));
   };
@@ -553,8 +562,8 @@ describe('the orderings through a real Hocuspocus 4.7.1 (its awareness meta, que
   });
 
   /** Lifetime 2: a fresh Hocuspocus that loads `stored`. */
-  async function server(stored: Uint8Array) {
-    const guard = new CollabUpdateGuard({ mode: 'enforce', logger: { warn: () => undefined } });
+  async function server(stored: Uint8Array, opts: CollabGuardOptions = {}) {
+    const guard = new CollabUpdateGuard({ mode: 'enforce', logger: { warn: () => undefined }, ...opts });
     const hp = new Hocuspocus({
       quiet: true,
       debounce: 5,
@@ -584,7 +593,7 @@ describe('the orderings through a real Hocuspocus 4.7.1 (its awareness meta, que
       await settle();
       return sock;
     };
-    return { connect, live: () => hp.documents.get(DOC_NAME)! };
+    return { connect, guard, live: () => hp.documents.get(DOC_NAME)! };
   }
   /** What a 4.7.1 provider sends after Auth: its own awareness, then (after the server's Step1) its Step2. */
   const handshake = async (sock: FakeSocket, clientID: number, clock: number, doc: Y.Doc, live: Y.Doc) => {
@@ -654,5 +663,68 @@ describe('the orderings through a real Hocuspocus 4.7.1 (its awareness meta, que
     expect(aSock2.closeReasons()).toEqual([]);
     expect(bSock.closeReasons()).toEqual([]);
     expect(renderLikeABrowser(s.live())).toMatchObject({ deleted: false, threw: false, text: 'A-lost B-lost A-stored B-stored base' });
+  });
+
+  /**
+   * #845: Yjs regenerated the victim's id X to Z (a remote write at X). The editor (collab-access-controller.ts) then
+   * sends, back to back inside that transaction's cleanup and before any struct at Z, two awareness frames: X's removal
+   * (null, at X's clock c + 1), then its state under Z at c + 2 (Z's clock seeded from X's). y-protocols drops a
+   * never-seen id's state at clock 0 (the clock-0 case: the guard binds it anyway, but Hocuspocus stores and relays
+   * nothing). Either way Z binds at its announce, before its first struct, and costs one new awareness id.
+   */
+  it.each([
+    ['at the old id\'s clock + 2 (the editor\'s announce): Hocuspocus keeps and relays it', 3, true],
+    ['at clock 0: y-protocols drops it, yet the guard binds it', 0, false],
+  ])('the regenerated id announced %s: a peer\'s write there is unresolved, then foreign-client once its owner wrote', async (_name, zClock, kept) => {
+    const X = 5005;
+    const Z = 6006;
+    const M_ID = 7007;
+    const t = 1_000_000; // a fixed clock: the awareness-id budget never refills
+    const s = await server(Y.encodeStateAsUpdate(prosemirrorJSONToYDoc(serverSchema(), SEED, 'default')), { now: () => t });
+    const idsLeft = (): number => (s.guard as any).userDocBudgets.get(`V\u0000${DOC_NAME}`).ids.tokens;
+    const sealable = (): number[] => [...((s.guard as any).docs.get(s.live())?.sealable ?? [])];
+    const vSock = await s.connect('V');
+    const victim = new RemoteClient(s.live(), X);
+    await handshake(vSock, X, 1, victim.doc, s.live());
+    vSock.deliver(syncFrame(typeAt0(victim, s.live(), 'old '), SYNC.Update));
+    await settle();
+    expect(vSock.closeReasons()).toEqual([]);
+    const idsBefore = idsLeft();
+
+    // c = 1 (X's announce above): X null at c + 1, then Z at c + 2 (or 0)
+    vSock.deliver(awarenessFrame([{ clientID: X, clock: 2, state: null }]));
+    await settle();
+    vSock.deliver(awarenessFrame([{ clientID: Z, clock: zClock, state: { user: { name: 'V' } } }]));
+    await settle();
+    expect(vSock.closeReasons()).toEqual([]);
+    expect(s.guard.isAwarenessOnly(s.live(), Z)).toBe(true); // bound to V by its announce, before any struct at Z
+    expect(idsBefore - idsLeft()).toBe(1); // only Z is new to the page's awareness (X's removal is not)
+    const states = s.live().awareness.getStates();
+    expect(states.has(X)).toBe(false);
+    expect(states.has(Z)).toBe(kept);
+
+    // A peer writes at Z before the victim's first struct there: unresolved, never applied
+    const before = Y.encodeStateAsUpdate(s.live());
+    const mSock = await s.connect('M');
+    await handshake(mSock, M_ID, 1, new RemoteClient(s.live(), M_ID).doc, s.live());
+    mSock.deliver(syncFrame(typeAt0(new RemoteClient(s.live(), Z), s.live(), 'FORGED '), SYNC.Update));
+    await settle();
+    expect(mSock.closeReasons()).toEqual([UNRESOLVED_REASON]);
+    expect(Buffer.from(Y.encodeStateAsUpdate(s.live())).equals(Buffer.from(before))).toBe(true);
+
+    // The victim's own first struct at Z proves it (and, announced on its connection, makes it sealable)
+    vSock.deliver(syncFrame(typeAt0(new RemoteClient(s.live(), Z), s.live(), 'mine '), SYNC.Update));
+    await settle();
+    expect(vSock.closeReasons()).toEqual([]);
+    expect(s.guard.isAwarenessOnly(s.live(), Z)).toBe(false);
+    expect(sealable()).toContain(Z);
+
+    // From then on a peer's write at Z is the plain refusal
+    const mSock2 = await s.connect('M');
+    await handshake(mSock2, M_ID, 2, new RemoteClient(s.live(), M_ID).doc, s.live());
+    mSock2.deliver(syncFrame(typeAt0(new RemoteClient(s.live(), Z), s.live(), 'FORGED '), SYNC.Update));
+    await settle();
+    expect(mSock2.closeReasons()).toEqual([REFUSED('foreign-client')]);
+    expect(renderLikeABrowser(s.live()).text).toBe('mine old base');
   });
 });

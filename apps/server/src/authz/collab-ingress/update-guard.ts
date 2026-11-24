@@ -244,8 +244,8 @@ export const pagesOn = (outcome: RefusalOutcome, rule: string): boolean => outco
 const REFUSED_TOKEN = 'COLLAB_UPDATE_REFUSED';
 export const SOCKET_REFUSAL_BUDGET = 3;
 /**
- * An honest connection announces one client id (y-protocols' Awareness keeps the id it was built with, even after Yjs
- * regenerates the doc's); this only bounds memory.
+ * An honest connection announces one client id, two when Yjs regenerates the doc's (#845: the editor then retires the
+ * old id and announces the new one, collab-access-controller.ts); this only bounds memory.
  */
 const AWARENESS_BINDS_PER_CONNECTION = 32;
 /** The ids one connection's own awareness announced that are remembered as its ownership evidence (memory bound only). */
@@ -2343,6 +2343,9 @@ export class CollabUpdateGuard {
       for (const { clientID, clock, state } of entries) {
         const owner = doc.bindings.get(clientID);
         if (owner !== undefined && owner !== userId) continue; // another user's (an echo or a removal: checkAwareness)
+        // #845: an id this connection already announced, bound to this user (every cursor move): nothing below would
+        // change, so its state is not parsed again.
+        if (owner === userId && doc.announced.get(frame.connection)?.has(clientID)) continue;
         // An echo (a provider's `timeout` removal of a peer, or a 3.x provider resending what it was relayed): the server
         // already holds this client's state at this clock (it relayed it), so the echo says nothing about who owns the
         // id: a writer's echo of a READER's state would otherwise bind the reader's id to the writer, refusing the reader
@@ -2443,14 +2446,23 @@ export class CollabUpdateGuard {
  * announced none (the rule before this evidence: a sender that sends no awareness still gets it, ADR 0036 §4). An honest
  * 4.7.1 provider sends its own awareness right after Auth and Step1, before its Step2 or any queued Update (with Docmost's
  * static token; pinned by the client's collab-provider-order.test.ts), so a sender that announced ids and writes another
- * never-seen one is relaying a peer's structs. Residual: a doc whose id Yjs regenerated (a remote write at its current
- * id) keeps announcing the old one, so its new id stays unbound (relay-binding.spec.ts); the guard refuses that remote
- * write at every bound id, so on an honest page it follows only an id collision. An editor of the page can still force
- * one across a reload (#845) where #793 restored nothing (a crash, or an id the seal did not cover): while the document
- * reloads it writes at the victim's id before the victim reconnects; the victim's Yjs then regenerates its id on the
- * relayed write, the new id stays unbound here, and the editor can forge at it (silently dropping the victim's later
- * edits) or claim it by awareness. After a clean unload the victim's id is restored awareness-only, so that write is
- * `unresolved` and nothing regenerates. Closing the rest needs the client to re-announce under its new id.
+ * never-seen one is relaying a peer's structs.
+ *
+ * #845, a regenerated id. Yjs gives a doc a new id on a remote write at its current one, and y-protocols' Awareness keeps
+ * the id it was built with. A client that does not re-announce writes at a never-seen id its connection did not
+ * announce: unbound here and forgeable (relay-binding.spec.ts pins it). Before the editor's fix, 4.7.1's provider then
+ * removed every awareness state but the doc's new id at its next socket close, the local one included: presence was
+ * lost for the rest of the mount, and the reconnect announced nothing, so the new id bound by its first struct again.
+ * The editor now retires the old id (null at its clock c + 1) and announces the new one at c + 2, before any struct at
+ * it (collab-access-controller.ts), so the new id binds at its announce, before its first struct, for one new awareness
+ * id (relay-binding.spec.ts, through a real Hocuspocus); a reconnect announces it after Step1. What remains: an
+ * announce dropped by the gateway's awareness rate limit, or answered 1013 by the awareness new-id budget, leaves the
+ * new id unbound until the next renewal (15 s) or reconnect; a stale or custom client still binds it by its first
+ * struct on a connection that announced nothing. The guard refuses a remote write at every bound
+ * id, so on an honest page a regeneration follows only an id collision, or an editor forcing one across a reload where
+ * #793 restored nothing (a crash, or an id the seal did not cover): it writes at the victim's id before the victim
+ * reconnects. After a clean unload the victim's id is restored awareness-only, so that write is `unresolved` and nothing
+ * regenerates.
  */
 const ownedBy =
   (announced: Set<number> | undefined) =>
