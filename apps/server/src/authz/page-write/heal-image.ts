@@ -50,7 +50,7 @@ import { performance } from 'node:perf_hooks';
 import * as Y from 'yjs';
 import { sql } from 'kysely';
 import { Logger } from '@nestjs/common';
-import type { KyselyDB } from '@docmost/db/types/kysely.types';
+import type { KyselyDB, KyselyTransaction } from '@docmost/db/types/kysely.types';
 import { COLLAB_PAGE_COMPACTING_REASON, pageCompactingRefusal } from '../collab-ingress/collab-reasons';
 import { logCompactionFailed, logCompactionRequested } from '../collab-ingress/compaction-log';
 import { ConflictScan, installConflictScanMeter, type ConflictScanMeter } from '../collab-ingress/conflict-scan';
@@ -331,7 +331,7 @@ export interface OrderStoreOutcome {
  */
 export async function persistOrderState(
   db: KyselyDB | HealImageStore,
-  trx: unknown,
+  trx: KyselyTransaction,
   pageId: string,
   snapshot: StoreSnapshot,
   order: StoreOrder,
@@ -638,10 +638,10 @@ export interface HealImageStore extends BindingSealStore {
   /** Delete the heal row iff it still names `rowSha` and the row's ydoc no longer has that digest. */
   dropStale(pageId: string, rowSha: string): Promise<void>;
   /** In the store's transaction: delete the page's heal row; when there was one and `ydoc` is given, write `ydoc` alone. True: written. */
-  clear(trx: unknown, pageId: string, ydoc: Uint8Array | null): Promise<boolean>;
+  clear(trx: KyselyTransaction, pageId: string, ydoc: Uint8Array | null): Promise<boolean>;
   /** In the store's transaction: write `ydoc` alone when given (no `updated_at`, no `content`), and upsert the heal row. */
   put(
-    trx: unknown,
+    trx: KyselyTransaction,
     pageId: string,
     heal: { image: Uint8Array | null; rowSha: string; epoch: number; contentDigest: string | null },
     ydoc: Uint8Array | null,
@@ -691,22 +691,20 @@ export function kyselyHealImageStore(db: KyselyDB): HealImageStore {
     },
     async clear(trx, pageId, ydoc) {
       await ensureHealImageTable(db);
-      const t = trx as KyselyDB;
-      const { rows } = await sql`delete from ccc_page_heal_image where page_id = ${pageId} returning page_id`.execute(t);
+      const { rows } = await sql`delete from ccc_page_heal_image where page_id = ${pageId} returning page_id`.execute(trx);
       if (rows.length === 0 || !ydoc) return false;
-      await sql`update pages set ydoc = ${Buffer.from(ydoc)} where id = ${pageId}`.execute(t);
+      await sql`update pages set ydoc = ${Buffer.from(ydoc)} where id = ${pageId}`.execute(trx);
       return true;
     },
     async put(trx, pageId, heal, ydoc) {
       await ensureHealImageTable(db);
-      const t = trx as KyselyDB;
-      if (ydoc) await sql`update pages set ydoc = ${Buffer.from(ydoc)} where id = ${pageId}`.execute(t);
+      if (ydoc) await sql`update pages set ydoc = ${Buffer.from(ydoc)} where id = ${pageId}`.execute(trx);
       await sql`
         insert into ccc_page_heal_image (page_id, image, row_sha, epoch, content_digest)
         values (${pageId}, ${heal.image ? Buffer.from(heal.image) : null}, ${heal.rowSha}, ${heal.epoch}, ${heal.contentDigest})
         on conflict (page_id) do update
           set image = excluded.image, row_sha = excluded.row_sha, epoch = excluded.epoch,
-              content_digest = excluded.content_digest, created_at = now()`.execute(t);
+              content_digest = excluded.content_digest, created_at = now()`.execute(trx);
     },
     claimSeal: (pageId, lifetimeId) => claimSealRow(db, pageId, lifetimeId),
     commitSeal: (pageId, lifetimeId, claimed, seal) => commitSealRow(db, pageId, lifetimeId, claimed, seal),

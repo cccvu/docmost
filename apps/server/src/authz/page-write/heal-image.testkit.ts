@@ -5,9 +5,13 @@
  * specs: pass it as the extension's `db`. heal-image.pg.spec.ts runs the Postgres stores.
  */
 import { createHash } from 'node:crypto';
+import type { KyselyTransaction } from '@docmost/db/types/kysely.types';
 import type { CompactionStore } from './compaction';
 import type { HealImageStore } from './heal-image';
 import type { SealRow } from './binding-seal';
+
+/** The store transaction the memory store's `clear`/`put` ignore (#851: the Postgres store's is a real `KyselyTransaction`). */
+export const NO_TRX = {} as KyselyTransaction;
 
 const sha = (b: Uint8Array): string => createHash('sha256').update(b).digest('base64');
 const md5 = (text: string): string => createHash('md5').update(text).digest('hex');
