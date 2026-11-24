@@ -114,3 +114,42 @@ describe('#810 the drain closes every connection established after it began', ()
     resumeCompactionsForTests();
   });
 });
+
+describe('wiki-v2 #736 the drain budget is on the monotonic clock', () => {
+  it('a wall-clock step back mid-drain does not run it past its budget', async () => {
+    const { runCollabDrain } = jest.requireActual('./collab-quiesce') as typeof import('./collab-quiesce');
+    // One resident document whose store never goes idle: the drain can only end at its budget.
+    const listeners = new Set<() => void>();
+    const document = {
+      name: 'page.p',
+      saveMutex: { isLocked: () => true },
+      getConnectionsCount: () => 1,
+      on: (_e: string, fn: () => void) => listeners.add(fn),
+      off: (_e: string, fn: () => void) => listeners.delete(fn),
+    };
+    const hocuspocus = {
+      documents: new Map([['page.p', document]]),
+      loadingDocuments: new Map(),
+      unloadingDocuments: new Map(),
+      debouncer: { isDebounced: () => false, isCurrentlyExecuting: () => false, executeNow: () => undefined },
+      flushPendingStores: () => undefined,
+      closeConnections: () => undefined,
+      unloadDocument: async () => undefined,
+    };
+    const bounds = { drainGeneration: 1, beginDrain: () => () => undefined };
+    let step = 0;
+    const realNow = Date.now.bind(Date);
+    const spy = jest.spyOn(Date, 'now').mockImplementation(() => realNow() + step);
+    try {
+      const started = realNow();
+      const drain = runCollabDrain(hocuspocus as never, bounds as never, { trigger: 'quiesce', budgetMs: 200 });
+      step = -3_600_000; // NTP steps the wall clock back an hour, just after the drain took its deadline
+      const outcome = await Promise.race([drain, new Promise((r) => setTimeout(() => r('still draining'), 3_000))]);
+      expect(outcome).toEqual({ resident: 1, failed: [] }); // answered at its budget: on the wall clock, an hour on
+      expect(realNow() - started).toBeLessThan(3_000);
+    } finally {
+      spy.mockRestore();
+      bounds.drainGeneration = 2; // stop a run that outlived the check (only a broken clock leaves one)
+    }
+  });
+});

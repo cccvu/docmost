@@ -109,6 +109,14 @@ export const UNKNOWN_CAP = 3;
 export const UNKNOWN_GRACE_MS = 120_000;
 /** Minimum gap between two passes; bursts of signals collapse into the one queued pass. */
 const MIN_GAP_MS = 250;
+
+/**
+ * wiki-v2 #736: the pass spacing, the unknown-run grace and the log throttle are in-process durations on the MONOTONIC
+ * clock (never logged as instants, stored or compared with a timestamp). On the wall clock a step back stalled the next
+ * pass by the step (a revocation reaching open sessions an hour late) and delayed the unknown-run narrowing; a step
+ * forward narrowed early. The global `performance` is read, so jest's fake timers and spies drive it.
+ */
+const monotonicNow = (): number => performance.now();
 /** The trailing pass after a signal: covers a connection that authenticated before the projection landed. */
 const TRAILING_PASS_MS = 2000;
 /** Users processed concurrently within one pass (each is one user read, its page reads and one bulk check). */
@@ -185,7 +193,7 @@ export class LiveAccessRevalidator implements OnModuleInit, OnModuleDestroy {
       this.queued = this.current
         .catch(() => undefined)
         .then(async () => {
-          const gap = MIN_GAP_MS - (Date.now() - this.lastPassEndedAt);
+          const gap = Math.min(MIN_GAP_MS, MIN_GAP_MS - (monotonicNow() - this.lastPassEndedAt)); // never above MIN_GAP_MS
           if (gap > 0) await sleep(gap);
           this.queued = null;
           return this.current ?? this.start(source);
@@ -208,7 +216,7 @@ export class LiveAccessRevalidator implements OnModuleInit, OnModuleDestroy {
 
   private start(source: RevalidateSource): Promise<LiveAccessSummary> {
     const run = this.runPass(source).finally(() => {
-      this.lastPassEndedAt = Date.now();
+      this.lastPassEndedAt = monotonicNow();
       if (this.current === run) this.current = null;
     });
     this.current = run;
@@ -235,7 +243,7 @@ export class LiveAccessRevalidator implements OnModuleInit, OnModuleDestroy {
   }
 
   private async runPass(source: RevalidateSource): Promise<LiveAccessSummary> {
-    const t0 = Date.now();
+    const t0 = monotonicNow();
     const s: LiveAccessSummary = {
       checked: 0,
       closed: 0,
@@ -263,14 +271,14 @@ export class LiveAccessRevalidator implements OnModuleInit, OnModuleDestroy {
     }
     if (s.closed + s.left + s.disconnected > 0) {
       this.logger.log(
-        `LIVE_ACCESS_REVOKED source=${source} closed=${s.closed} left=${s.left} disconnected=${s.disconnected} unknownClosed=${s.unknownClosed} checked=${s.checked} unknown=${s.unknown} ms=${Date.now() - t0}`,
+        `LIVE_ACCESS_REVOKED source=${source} closed=${s.closed} left=${s.left} disconnected=${s.disconnected} unknownClosed=${s.unknownClosed} checked=${s.checked} unknown=${s.unknown} ms=${monotonicNow() - t0}`,
       );
     }
     return s;
   }
 
   private logFailed(detail: string): void {
-    const now = Date.now();
+    const now = monotonicNow();
     if (now - this.lastFailedLogAt < FAILED_LOG_THROTTLE_MS) return;
     this.lastFailedLogAt = now;
     this.logger.error(`LIVE_ACCESS_REVALIDATE_FAILED ${detail}`);
@@ -472,11 +480,11 @@ interface UnknownRun {
 const bumpUnknown = (run: UnknownRun | undefined): UnknownRun =>
   run
     ? { count: run.count + 1, since: run.since }
-    : { count: 1, since: Date.now() };
+    : { count: 1, since: monotonicNow() };
 
 /** Narrow only after BOTH bounds: enough passes, and enough time (see UNKNOWN_GRACE_MS). */
 const unknownExpired = (run: UnknownRun): boolean =>
-  run.count >= UNKNOWN_CAP && Date.now() - run.since >= UNKNOWN_GRACE_MS;
+  run.count >= UNKNOWN_CAP && monotonicNow() - run.since >= UNKNOWN_GRACE_MS;
 
 type UserRow = Awaited<ReturnType<UserRepo['findById']>>;
 

@@ -144,7 +144,9 @@ export function runCollabDrain(
   bounds: CollabDrainBounds,
   opts: { trigger: CollabDrainTrigger; budgetMs?: number; onBegin?: () => void; now?: () => number },
 ): Promise<CollabDrainResult> {
-  const now = opts.now ?? Date.now;
+  // wiki-v2 #736: the drain budget is on the MONOTONIC clock (an in-process deadline, never logged or stored): a
+  // wall-clock step back would run the drain past the ECS stopTimeout (a SIGKILL before it answers), forward cut it.
+  const now = opts.now ?? (() => performance.now());
   const budgetMs = opts.budgetMs ?? (opts.trigger === 'quiesce' ? QUIESCE_DRAIN_BUDGET_MS : SHUTDOWN_DRAIN_BUDGET_MS);
   const generation = bounds.drainGeneration;
   const done = bounds.beginDrain(hocuspocus.documents.size + hocuspocus.loadingDocuments.size, opts.trigger);

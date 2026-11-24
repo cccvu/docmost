@@ -140,11 +140,11 @@ function build(opts: {
   return { svc, authz, userRepo, pageRepo, lineageDb };
 }
 
-/** A controllable clock: the unknown cap is time-bounded. */
+/** A controllable clock: the unknown cap is time-bounded. wiki-v2 #736: the monotonic one (`performance.now`). */
 let clock = 1_000_000;
 beforeEach(() => {
   clock = 1_000_000;
-  jest.spyOn(Date, 'now').mockImplementation(() => clock);
+  jest.spyOn(performance, 'now').mockImplementation(() => clock);
 });
 afterEach(() => jest.restoreAllMocks());
 
@@ -343,6 +343,22 @@ describe('LiveAccessRevalidator — collab plane', () => {
     expect(c.close).not.toHaveBeenCalled();
     expect(room.leave).not.toHaveBeenCalled();
     expect(error).not.toHaveBeenCalled(); // and no alarm for a blip
+  });
+
+  it('wiki-v2 #736: the unknown grace is monotonic: wall-clock steps forward never narrow early', async () => {
+    const error = jest.spyOn(Logger.prototype, 'error').mockImplementation();
+    let wall = 0;
+    const realNow = Date.now.bind(Date);
+    jest.spyOn(Date, 'now').mockImplementation(() => realNow() + wall);
+    const c = conn(false);
+    const { svc } = build({ docs: [doc('p1', [c])], pdpFail: true });
+    for (let i = 0; i < UNKNOWN_CAP * 2; i++) {
+      await svc.request('sweep');
+      wall += UNKNOWN_GRACE_MS; // NTP steps the wall clock forward a whole grace between passes
+      clock += 1_000; // the monotonic clock: well under the grace in all
+    }
+    expect(c.close).not.toHaveBeenCalled(); // on the wall clock the forward steps would have spanned the grace
+    expect(error).not.toHaveBeenCalled();
   });
 
   it('a decided pass resets the unknown run (only CONSECUTIVE unknowns count)', async () => {
