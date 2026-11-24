@@ -239,7 +239,7 @@ describe('NarrowingSettleInterceptor', () => {
 
   it('keeps the whole request inside its budget: a slow handler leaves less (or no) wait for the settle', async () => {
     const t0 = 1_000_000;
-    const now = jest.spyOn(Date, 'now').mockReturnValue(t0);
+    const now = jest.spyOn(performance, 'now').mockReturnValue(t0);
     const settle = jest.fn(async () => ({ status: 'confirmed' }));
     const { icpt } = build({ settle });
     const { context } = ctx(PageRestrictionController, 'restrict');
@@ -253,6 +253,25 @@ describe('NarrowingSettleInterceptor', () => {
     await lastValueFrom(out2);
     expect(settle).toHaveBeenLastCalledWith('42.7', 0);
     expect(REQUEST_BUDGET_MS).toBeLessThan(8000); // under the platform's relay / service-client timeout
+  });
+
+  it('wiki-v2 #736: the budget is on the monotonic clock: a wall-clock step forward does not cut the settle wait to 0', async () => {
+    let step = 0;
+    const realNow = Date.now.bind(Date);
+    jest.spyOn(Date, 'now').mockImplementation(() => realNow() + step);
+    const settle = jest.fn(async () => ({ status: 'confirmed' }));
+    const { icpt } = build({ settle });
+    const { context, reply } = ctx(PageRestrictionController, 'restrict');
+    const out = icpt.intercept(context, {
+      handle: () => {
+        step = 3_600_000; // NTP steps the wall clock forward an hour while the handler runs
+        return of({});
+      },
+    });
+    await lastValueFrom(out);
+    // On the wall clock the whole budget would be gone: a 0 ms wait and, with a lagging PDP, a false `pending`.
+    expect((settle.mock.calls[0] as unknown[])[1]).toBeGreaterThan(0);
+    expect(reply.headers[AUTHZ_PROPAGATION_HEADER]).toBe('confirmed');
   });
 
   it('bounds the live-session re-check: a slow pass does not hold the response past REVALIDATE_WAIT_MS', async () => {
@@ -282,7 +301,7 @@ describe('NarrowingSettleInterceptor', () => {
 
   it('caps the live-session wait by what is left of the request budget', async () => {
     const t0 = 2_000_000;
-    const now = jest.spyOn(Date, 'now').mockReturnValue(t0);
+    const now = jest.spyOn(performance, 'now').mockReturnValue(t0);
     const signal = jest.fn(() => new Promise(() => undefined)); // never settles
     const settle = jest.fn(async () => {
       now.mockReturnValue(t0 + REQUEST_BUDGET_MS); // the settle used the whole budget
