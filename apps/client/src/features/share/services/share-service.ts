@@ -35,9 +35,13 @@ export async function updateShare(data: IUpdateShare): Promise<any> {
   return req.data;
 }
 
-export async function getShareForPage(pageId: string): Promise<IShareForPage> {
+// CCC #858: `null` for a page with no share. The server's envelope drops an undefined `data`, and TanStack
+// Query refuses `undefined` from a queryFn.
+export async function getShareForPage(
+  pageId: string,
+): Promise<IShareForPage | null> {
   const req = await api.post<any>("/shares/for-page", { pageId });
-  return req.data;
+  return req.data ?? null;
 }
 
 export async function getSharePageInfo(

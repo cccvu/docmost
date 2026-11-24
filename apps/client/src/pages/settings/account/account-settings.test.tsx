@@ -83,7 +83,7 @@ describe("AccountSettings", () => {
     expect(sessions.nextElementSibling).toBe(passkeys);
   });
 
-  it("native mode: also shows Email, Email and Sessions each after one divider", () => {
+  it("native mode: also shows Email; Email and Sessions each follow one divider", () => {
     nativeState.value = true;
     renderPage();
     expect(screen.getByTestId("avatar")).toBeTruthy();

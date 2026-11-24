@@ -83,6 +83,27 @@ done
 # psql helper against the bundled db
 psql() { "${COMPOSE[@]}" exec -T postgres psql -U docmost -d docmost -tAc "$1"; }
 
+# --- 1b. a fresh install has no workspace yet (wiki-v2 #858) ------------------------------------------
+# The SPA sends a fresh native install to /setup/register on exactly this answer: the api-client redirects on a
+# 404 whose message carries "Workspace not found" (client lib/api-client.ts, pinned by app-routes.test.tsx). The
+# stack was just wiped (`down -v` above), so this runs before any workspace exists. Retry only while migrations
+# settle (a 5xx, or 000 = no response), as the setup loop below does.
+log "fresh install: POST /api/workspace/public -> 404 'Workspace not found' before setup"
+public_code=""
+for i in $(seq 1 30); do
+  public_code="$(curl -s --max-redirs 0 -o "$TMP/public.json" -w '%{http_code}' -H 'content-type: application/json' \
+    -d '{}' "${BASE}/api/workspace/public" || true)"
+  case "$public_code" in
+    5??|000) sleep 2 ;;
+    *) break ;;
+  esac
+done
+if [ "$public_code" = "404" ] && grep -q 'Workspace not found' "$TMP/public.json"; then
+  pass "fresh install: /api/workspace/public -> 404 'Workspace not found' (the SPA's route to /setup/register)"
+else
+  bad "fresh install: /api/workspace/public -> HTTP $public_code (expected 404 'Workspace not found'): $(cat "$TMP/public.json" 2>/dev/null)"
+fi
+
 # --- 2. native credential auth: first-run setup (retry while migrations settle) --------------------
 log "first-run setup (creates workspace + owner Alice) — native setup route"
 setup_code=""

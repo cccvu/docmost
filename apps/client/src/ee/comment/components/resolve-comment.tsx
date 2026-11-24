@@ -52,6 +52,7 @@ function ResolveComment({
         variant="subtle"
         color={isResolved ? "green" : "gray"}
         size="sm"
+        aria-label={isResolved ? t("Re-Open comment") : t("Resolve comment")}
         loading={resolveCommentMutation.isPending}
         disabled={resolveCommentMutation.isPending}
       >

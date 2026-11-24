@@ -25,7 +25,9 @@ const WRITER_RULES = [
   { action: "manage", subject: "page" },
 ];
 
-const spaceState = vi.hoisted(() => ({ rules: [] as unknown[] }));
+const spaceState = vi.hoisted(() => ({
+  rules: [] as unknown[] | undefined,
+}));
 vi.mock("@/features/space/queries/space-query.ts", () => ({
   useGetSpaceBySlugQuery: () => ({
     data: {
@@ -145,5 +147,18 @@ describe("SpaceSidebar — space menu Export gating", () => {
     expect(screen.queryByRole("menuitem", { name: "Export space" })).toBeNull();
     expect(screen.queryByTestId("export-modal")).toBeNull();
     expect(screen.getByTestId("import-modal")).toBeTruthy();
+  });
+});
+
+describe("SpaceSidebar — space membership not loaded yet (#858 T2)", () => {
+  it("permissions undefined: no Import, Export or Trash, and neither modal mounted (fails closed)", () => {
+    spaceState.rules = undefined;
+    openSpaceMenu();
+
+    expect(screen.queryByRole("menuitem", { name: "Import pages" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Export space" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Trash" })).toBeNull();
+    expect(screen.queryByTestId("export-modal")).toBeNull();
+    expect(screen.queryByTestId("import-modal")).toBeNull();
   });
 });

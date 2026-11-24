@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 import {
   ActionIcon,
   Anchor,
@@ -23,6 +23,7 @@ import {
   useUpdateShareMutation,
 } from "@/features/share/queries/share-query";
 import useTrial from "@/ee/hooks/use-trial";
+import { sharePublishRefusal } from "@/features/share-lifecycle/share-publish-refusal";
 
 type PublishTabProps = {
   pageId: string;
@@ -54,43 +55,69 @@ export function PublishTab({ pageId, readOnly, isRestricted, workspaceSharingDis
     setIsPagePublic(!!share);
   }, [share, pageId]);
 
+  // CCC #858: the server's reason after a `share_not_permitted` refusal (the role may edit, not publish). For
+  // the rest of this modal session the publish controls stay disabled and say why (the unpublish stays open).
+  const [refusal, setRefusal] = useState<{ pageId: string; message: string }>();
+  const publishRefusal = refusal?.pageId === pageId ? refusal.message : null;
+  const refusalId = useId();
+  const noteRefusal = (err: unknown) => {
+    const message = sharePublishRefusal(err);
+    if (message) setRefusal({ pageId, message });
+  };
+
+  // CCC #858: optimistic, and rolled back when the server refuses (the mutation shows the server's message).
   const handleChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const value = event.currentTarget.checked;
+    setIsPagePublic(value);
 
-    if (value) {
-      createShareMutation.mutateAsync({
-        pageId: pageId,
-        includeSubPages: true,
-        searchIndexing: false,
-      });
-      setIsPagePublic(value);
-    } else {
-      if (share && share.id) {
-        deleteShareMutation.mutateAsync(share.id);
-        setIsPagePublic(value);
+    try {
+      if (value) {
+        await createShareMutation.mutateAsync({
+          pageId: pageId,
+          includeSubPages: true,
+          searchIndexing: false,
+        });
+      } else if (share && share.id) {
+        await deleteShareMutation.mutateAsync(share.id);
       }
+    } catch (err) {
+      setIsPagePublic(!value);
+      noteRefusal(err);
     }
   };
 
+  // CCC #858: awaited, so a refusal is handled; the switches follow `share`, so they revert on their own.
   const handleSubPagesChange = async (
     event: React.ChangeEvent<HTMLInputElement>,
   ) => {
     const value = event.currentTarget.checked;
-    updateShareMutation.mutateAsync({
-      shareId: share.id,
-      includeSubPages: value,
-    });
+    try {
+      await updateShareMutation.mutateAsync({
+        shareId: share.id,
+        includeSubPages: value,
+      });
+    } catch (err) {
+      noteRefusal(err);
+    }
   };
 
   const handleIndexSearchChange = async (
     event: React.ChangeEvent<HTMLInputElement>,
   ) => {
     const value = event.currentTarget.checked;
-    updateShareMutation.mutateAsync({
-      shareId: share.id,
-      searchIndexing: value,
-    });
+    try {
+      await updateShareMutation.mutateAsync({
+        shareId: share.id,
+        searchIndexing: value,
+      });
+    } catch (err) {
+      noteRefusal(err);
+    }
   };
+
+  const refusalProps = publishRefusal
+    ? { "aria-describedby": refusalId }
+    : {};
 
   const shareLink = useMemo(
     () => (
@@ -211,10 +238,18 @@ export function PublishTab({ pageId, readOnly, isRestricted, workspaceSharingDis
         <Switch
           onChange={handleChange}
           checked={isPagePublic}
-          disabled={readOnly}
+          disabled={readOnly || (!!publishRefusal && !isPagePublic)}
           size="xs"
+          aria-label={t("Share to web")}
+          {...refusalProps}
         />
       </Group>
+
+      {publishRefusal && (
+        <Text id={refusalId} size="xs" c="dimmed">
+          {publishRefusal}
+        </Text>
+      )}
 
       {pageIsShared && (
         <>
@@ -230,7 +265,9 @@ export function PublishTab({ pageId, readOnly, isRestricted, workspaceSharingDis
               onChange={handleSubPagesChange}
               checked={share.includeSubPages}
               size="xs"
-              disabled={readOnly}
+              disabled={readOnly || !!publishRefusal}
+              aria-label={t("Include sub-pages")}
+              {...refusalProps}
             />
           </Group>
           <Group justify="space-between" wrap="nowrap" gap="xl">
@@ -244,7 +281,9 @@ export function PublishTab({ pageId, readOnly, isRestricted, workspaceSharingDis
               onChange={handleIndexSearchChange}
               checked={share.searchIndexing}
               size="xs"
-              disabled={readOnly}
+              disabled={readOnly || !!publishRefusal}
+              aria-label={t("Search engine indexing")}
+              {...refusalProps}
             />
           </Group>
         </>

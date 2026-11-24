@@ -10,6 +10,19 @@
  * In dev (Vite serves index.html directly, so the server never injects `window.CONFIG`) it falls back to
  * `import.meta.env.VITE_NATIVE_AUTH_ENABLED`, defaulting to false — the integrated dev stack is remote.
  * The canonical standalone experience runs the built server, which injects the capability.
+ *
+ * What callers use it for (wiki-v2 #858). Beyond its first meaning (which sign-in, sign-out and session
+ * re-mint flow runs), `true`/`false` now also stands for four facts that today move together with the mode:
+ *   1. The platform owns the directory: members, groups, invites and space membership (and `users.role` is
+ *      inert in remote mode), so native admin UI is hidden there (App.tsx routes, top-menu, settings).
+ *   2. A platform exists: request access, the magic-link and passkey sign-in, the Admin Console, feedback,
+ *      the site announcement and share expiry (public-auth-buttons, public-footer, the features that call it).
+ *   3. The platform owns the remote profile: the Docmost email is a synthetic shadow address, never shown
+ *      or edited (account-settings, top-menu), and the name is re-asserted at every sign-in (account-name-form).
+ *   4. Docmost sends no mail in remote mode (notification-pref). This one is deploy config, not the mode:
+ *      it holds only because the remote task sets no MAIL_DRIVER.
+ * If any of these stops matching the mode, split the predicate and re-audit every caller
+ * (`grep -rn isNativeAuthEnabled apps/client/src`).
  */
 export function isNativeAuthEnabled(): boolean {
   const fromWindow =

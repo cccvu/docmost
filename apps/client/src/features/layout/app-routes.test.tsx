@@ -160,6 +160,8 @@ describe("App routes — the routes this cleanup keeps", () => {
     ["/settings/spaces", "Spaces"],
     ["/settings/sharing", "Shares"],
     ["/s/eng/trash", "SpaceTrash"],
+    // #858: a fresh native install reaches setup (the api-client sends a 404 "Workspace not found" here).
+    ["/setup/register", "SetupWorkspace"],
   ];
 
   it.each(KEPT)("remote and native: %s renders %s", async (path, page) => {
@@ -167,5 +169,17 @@ describe("App routes — the routes this cleanup keeps", () => {
     cleanup();
     nativeState.value = true;
     expect(await pageAt(path)).toBe(`page:${page}`);
+  });
+});
+
+// #858: one path, two pages. Remote signs in through the platform; native through Docmost's own form.
+describe("App routes — /login is mode-switched", () => {
+  it("remote mode: /login renders PasswordlessLogin", async () => {
+    expect(await pageAt("/login")).toBe("page:PasswordlessLogin");
+  });
+
+  it("native mode: /login renders NativeLogin", async () => {
+    nativeState.value = true;
+    expect(await pageAt("/login")).toBe("page:NativeLogin");
   });
 });

@@ -9,6 +9,7 @@ import { useState } from "react";
 import { TextInput, Button } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { useTranslation } from "react-i18next";
+import { isNativeAuthEnabled } from "@/features/auth-native/lib/auth-mode.ts";
 
 const formSchema = z.object({
   name: z.string().min(1).max(40),
@@ -27,6 +28,22 @@ export default function AccountNameForm() {
       name: user?.name,
     },
   });
+
+  // CCC #858: in remote mode the platform owns the display name and re-asserts it at every sign-in, so an
+  // edit here would be silently undone. Read-only (not disabled: it stays focusable and announced), with the
+  // reason as its description, and no form to submit.
+  if (!isNativeAuthEnabled()) {
+    return (
+      <TextInput
+        id="name"
+        label={t("Name")}
+        description={t("Your name is managed by your organization account")}
+        variant="filled"
+        value={user?.name ?? ""}
+        readOnly
+      />
+    );
+  }
 
   async function handleSubmit(data: Partial<IUser>) {
     setIsLoading(true);
