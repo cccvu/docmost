@@ -803,6 +803,11 @@ export class CollabUpdateGuard {
     return [...(this.docs.get(live)?.suspects.keys() ?? [])];
   }
 
+  /** #840: the users whose walks on `live` reached no verdict now (`DocGuard.unclear`; specs and diagnostics, #851). */
+  unclearOf(live: Y.Doc): string[] {
+    return [...(this.docs.get(live)?.unclear.keys() ?? [])];
+  }
+
   /** #827: the structure counts the guard holds for `live` (specs and diagnostics). */
   pageCounts(live: Y.Doc): { structs: number; clientIds: number; steps: number } | null {
     const doc = this.docs.get(live);

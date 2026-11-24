@@ -534,6 +534,66 @@ describe('#816 the meter fails closed', () => {
     // and outside the scope the same frame applies
     expect(() => Y.applyUpdate(copyOf(base), frame)).not.toThrow();
   });
+
+  /** #832: an append into an empty array of its own (no origins, no walk): 0 steps, so only the scope's state refuses it. */
+  const zeroStepAppend = (doc: Y.Doc): Uint8Array => {
+    const d = copyOf(doc);
+    d.clientID = 99;
+    const before = Y.encodeStateVector(d);
+    d.getArray('tail').push(['x']);
+    return Y.encodeStateAsUpdate(d, before);
+  };
+
+  it('#832: a failed scope stays failed: a later 0-step item in the same scope throws the meter error and never integrates', () => {
+    const { base, frame } = twoClientsShape(5);
+    const doc = copyOf(base);
+    const tail = zeroStepAppend(doc);
+    expect(unguardedSteps(doc, tail)).toBe(0); // precondition: nothing to walk, so no trip could refuse it
+    const boom = new Error('injected');
+    const scan = new ConflictScan(doc, true);
+    let second: unknown = null;
+    meter.metered(scan, () => {
+      const spy = jest.spyOn(Y, 'compareIDs').mockImplementation(() => {
+        throw boom;
+      });
+      try {
+        expect(() => Y.applyUpdate(doc, frame)).toThrow(ConflictScanMeterError);
+      } finally {
+        spy.mockRestore();
+      }
+      const items = scan.items;
+      try {
+        Y.applyUpdate(doc, tail);
+      } catch (err) {
+        second = err;
+      }
+      expect(scan.items).toBe(items);
+    });
+    expect(second).toBeInstanceOf(ConflictScanMeterError);
+    expect((second as ConflictScanMeterError).failure).toBe(boom);
+    expect(doc.getArray('tail').length).toBe(0);
+  });
+
+  it('#832: an enforcing scope that tripped stays tripped: a later 0-step item throws its exit and never integrates', () => {
+    const { base, frame } = twoClientsShape(300);
+    const doc = copyOf(base);
+    const tail = zeroStepAppend(doc);
+    const exit = { exit: 'tripped' };
+    const scan = new ConflictScan(doc, true, 1000, exit);
+    const thrown: unknown[] = [];
+    meter.metered(scan, () => {
+      for (const update of [frame, tail]) {
+        try {
+          Y.applyUpdate(doc, update);
+        } catch (err) {
+          thrown.push(err);
+        }
+      }
+    });
+    expect(scan.trip).toEqual({ steps: 1001 });
+    expect(thrown).toEqual([exit, exit]);
+    expect(doc.getArray('tail').length).toBe(0);
+  });
 });
 
 describe('#827 arm/disarm: a scan on one document across awaits (a load), and its own exit value', () => {

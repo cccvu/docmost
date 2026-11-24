@@ -2452,6 +2452,24 @@ describe('#816 client ids new to the page: a ceiling per frame and the (user, do
     expect(s.send(s.conn('editor'), ids(s, 6000, NEW_CLIENT_IDS_PER_FRAME))).toBe('applied');
   });
 
+  it('#832: report mode logs more than the ceiling client-ids and applies the frame', () => {
+    const s = setup({ seed: SEED, mode: 'report' });
+    expect(s.send(s.conn('attacker'), ids(s, 5000, NEW_CLIENT_IDS_PER_FRAME + 1))).toBe('applied');
+    const lines = s.logs.filter((l) => l.startsWith('COLLAB_UPDATE_REFUSED ')).map((l) => JSON.parse(l.slice(l.indexOf('{'))));
+    expect(lines).toEqual([expect.objectContaining({ rule: 'client-ids', mode: 'report', outcome: 'applied' })]);
+    expect(Y.getState(s.live.store, 5000 + NEW_CLIENT_IDS_PER_FRAME)).toBe(1);
+  });
+
+  it('#832: a block holding only a Skip names no new id: the ceiling plus a Skip-only block at another fresh id passes', () => {
+    const s = setup({ seed: SEED });
+    const { blocks } = blocksOf(ids(s, 6000, NEW_CLIENT_IDS_PER_FRAME));
+    const skipOnly = 9_999;
+    const frame = encodeStructs([...blocks, { client: skipOnly, clock: 0, structs: [new Y.Skip(Y.createID(skipOnly, 0), 1)] }]);
+    expect(new Set(Y.decodeUpdate(frame).structs.map((st) => st.id.client)).size).toBe(NEW_CLIENT_IDS_PER_FRAME + 1); // precondition
+    expect(s.send(s.conn('editor'), frame)).toBe('applied');
+    expect(Y.getState(s.live.store, skipOnly)).toBe(0); // a Skip integrates nothing
+  });
+
   it('they are charged to the per-(user, document) id budget: exhausted, the socket closes 1013; refilled, they pass', () => {
     let t = 1_000_000;
     const s = setup({ seed: SEED, now: () => t });
