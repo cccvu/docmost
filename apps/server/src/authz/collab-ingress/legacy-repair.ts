@@ -19,6 +19,10 @@
  *     spill over the repaired run), `format(run, { [key]: null })` ends that mark over the run, in the same transaction.
  *     Its only new structs are format items: a null, and the negation Yjs writes back, which is the earlier run's own
  *     value (checked to pass `checkFormat` before anything is written; otherwise that run is left alone).
+ * Both "left alone" branches (counted `skipped`) are defensive (#845): every attribute of today's server schema has a
+ * default, and a kept mark value fails no rule but the value rules (which would have made it repaired, not kept), so
+ * neither can trigger until the schema or the rules change. legacy-repair.spec.ts pins both with a synthetic schema
+ * and rule.
  * Text is never re-inserted and no attribute is set. That is load-bearing: the repair runs with `skipStoreHooks` (no
  * user is behind it, and the store reads `lastContext.user.id`), so it is persisted only by the next real store. Until
  * then every lifetime loads the same unrepaired row and repairs it again, with a new server client id: a repair that
