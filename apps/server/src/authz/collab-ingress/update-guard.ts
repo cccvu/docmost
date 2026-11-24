@@ -618,7 +618,8 @@ type DocBudget = { sync: Bucket; ids: Bucket; deadline: number; strikes: number[
 type UserBudget = { sync: Bucket; cpu: Bucket };
 /** #832: the budgets map's keys, in one place (the same strings as before the split, so nothing that reads one moves). */
 const userKey = (user: string): string => `${user}\u0001`;
-const docKey = (user: string, docName: string): string => `${user}\u0000${docName}`;
+/** Exported for the specs that read a (user, document) budget. */
+export const docKey = (user: string, docName: string): string => `${user}\u0000${docName}`;
 
 export class CollabUpdateGuard {
   private readonly docs = new WeakMap<Y.Doc, DocGuard>();
@@ -1168,7 +1169,9 @@ export class CollabUpdateGuard {
       const fromShadow = result.violation !== null && (violation === null || this.enforces(result.violation.rule, result.log, true));
       if (fromShadow) violation = result.violation;
       const log = fromShadow ? result.log : undefined;
-      // #832: a report-mode trip is always logged, also when the frame is answered for another rule (this frame's outcome).
+      // #832: a report-mode trip is logged on its own line when the frame is answered for another rule, with this frame's
+      // outcome: `blocked` when that rule refuses it (an `unresolved` retry included: it is not applied either), else
+      // `applied`. A trip whose shadow apply then ran past the deadline returned above (deadlineStrike logs that instead).
       if (result.trip && violation?.rule !== 'conflict-scan') {
         const outcome: RefusalOutcome = violation && this.enforces(violation.rule, log) ? 'blocked' : 'applied';
         this.refusalLine(frame, header, { rule: 'conflict-scan' }, result.trip, outcome);

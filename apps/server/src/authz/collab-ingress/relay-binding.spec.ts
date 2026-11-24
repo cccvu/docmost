@@ -9,6 +9,7 @@ import {
   AWARENESS_NEW_IDS_REFILL_MS,
   COLLAB_REFUSAL_CODE,
   CollabUpdateGuard,
+  docKey,
   UNRESOLVED_REASON,
   type CollabGuardOptions,
 } from './update-guard';
@@ -681,7 +682,7 @@ describe('the orderings through a real Hocuspocus 4.7.1 (its awareness meta, que
     const M_ID = 7007;
     const t = 1_000_000; // a fixed clock: the awareness-id budget never refills
     const s = await server(Y.encodeStateAsUpdate(prosemirrorJSONToYDoc(serverSchema(), SEED, 'default')), { now: () => t });
-    const idsLeft = (): number => (s.guard as any).userDocBudgets.get(`V\u0000${DOC_NAME}`).ids.tokens;
+    const idsLeft = (): number => (s.guard as any).userDocBudgets.get(docKey('V', DOC_NAME)).ids.tokens;
     const sealable = (): number[] => [...((s.guard as any).docs.get(s.live())?.sealable ?? [])];
     const vSock = await s.connect('V');
     const victim = new RemoteClient(s.live(), X);

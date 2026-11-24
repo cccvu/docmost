@@ -41,6 +41,7 @@ import {
   siblingsShape,
   twoClientsShape,
   unguardedSteps,
+  type RawStruct,
   type Shape,
   type StructBlock,
 } from './conflict-scan.testkit';
@@ -563,11 +564,13 @@ describe('#781 B4: a client id is bound to its user (forged clocks)', () => {
     };
     expect(move(vc, 1)).toBe('applied'); // announced and bound (awareness-only)
     const parse = jest.spyOn(JSON, 'parse');
+    // only the guard's parses of this awareness state count (any other JSON.parse in the process is not this spec's)
+    const stateParses = () => parse.mock.calls.filter(([text]) => typeof text === 'string' && text.includes('"cursor"')).length;
     try {
       expect(move(vc, 2)).toBe('applied'); // a cursor move: nothing to learn
-      expect(parse).not.toHaveBeenCalled();
+      expect(stateParses()).toBe(0);
       expect(move(s.conn('victim'), 3)).toBe('applied'); // the same user's new connection: its own evidence
-      expect(parse).toHaveBeenCalledTimes(1);
+      expect(stateParses()).toBe(1);
     } finally {
       parse.mockRestore();
     }
@@ -2184,6 +2187,27 @@ describe('#832 report mode: a conflict-scan trip never hides a rule refused in e
     const image = plusBadImage(shape.base, new Uint8Array([0, 0]));
     expect(c.send(c.conn('attacker'), image)).toBe('applied');
     expect(refusalLines(c)).toEqual([expect.objectContaining({ rule: 'string-attr', mode: 'report', outcome: 'applied' })]);
+  });
+
+  it('report, trip and a report-only pre-pass violation (too many new client ids): applied, and the trip line says applied', () => {
+    const shape = tripBase();
+    // the trip frame's 1100 siblings (client 3, as twoClientsShape) and one more sibling at each of 65 new ids, in one frame
+    const sibling = (): RawStruct => ({ origin: [1, shape.first + 4], right: [1, shape.first + 5], content: new Y.ContentString('x') });
+    const frame = rawUpdate([
+      { client: 3, clock: 0, structs: Array.from({ length: 1100 }, sibling) },
+      ...Array.from({ length: NEW_CLIENT_IDS_PER_FRAME + 1 }, (_, i) => ({ client: 5000 + i, clock: 0, structs: [sibling()] })),
+    ]);
+    expect(new Set(Y.decodeUpdate(frame).structs.map((st) => st.id.client)).size).toBe(NEW_CLIENT_IDS_PER_FRAME + 2); // precondition
+    expect(unguardedSteps(shape.base, frame)).toBeGreaterThan(CONFLICT_SCAN_STEPS_PER_FRAME);
+    const s = setup({ seed: shape.base, mode: 'report' });
+    expect(s.send(s.conn('attacker'), frame)).toBe('applied');
+    // an applied frame is never logged `blocked` (that outcome feeds the editing-blocked page)
+    expect(refusalLines(s)).toEqual([
+      expect.objectContaining({ rule: 'conflict-scan', mode: 'report', outcome: 'applied' }),
+      expect.objectContaining({ rule: 'client-ids', mode: 'report', outcome: 'applied' }),
+    ]);
+    expect(tripLine(s)!.steps as number).toBeGreaterThan(CONFLICT_SCAN_STEPS_PER_FRAME);
+    expect(Y.encodeStateVector(s.live)).toEqual(Y.encodeStateVector(unguarded(shape.base, frame)));
   });
 
   it.each([

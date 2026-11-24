@@ -971,6 +971,27 @@ describe("the awareness follows a regenerated client id (#845)", () => {
     for (const id of seen.slice(0, -1)) expect(peer.getStates().has(id)).toBe(false);
   });
 
+  it("a new id that collides with a peer's (known at a higher clock) is announced above that clock, so receivers apply it", () => {
+    const { doc, awareness, sent } = bound();
+    awareness.setLocalStateField("user", { name: "Ada" });
+    const peer = peerOf(awareness);
+    // Another client already holds the id Yjs will move this doc to, at clock 49, known to this awareness and the peer.
+    const taken = (awareness.clientID % 1_000_000) + 7;
+    const other = new Awareness(new Y.Doc());
+    awarenesses.push(other);
+    other.clientID = taken;
+    for (let i = 0; i < 50; i += 1) other.setLocalState({ n: i });
+    const othersFrame = encodeAwarenessUpdate(other, [taken]);
+    applyAwarenessUpdate(awareness, othersFrame, "remote");
+    applyAwarenessUpdate(peer, othersFrame, "remote");
+    expect(peer.meta.get(taken)!.clock).toBeGreaterThan(40); // precondition: far above this awareness's own clock
+    doc.clientID = taken; // the regenerated id (Yjs picks it at random; fixed here)
+    doc.transact(() => doc.getText("t").insert(0, "x"));
+    expect(awareness.clientID).toBe(taken);
+    for (const frame of sent) applyAwarenessUpdate(peer, frame, "remote");
+    expect(peer.getStates().get(taken)).toEqual({ user: { name: "Ada" } });
+  });
+
   it("with no local state (after a page hide), moves the id and its clock but sends nothing; the next state goes out at a clock receivers apply", () => {
     const { doc, awareness, sent } = bound();
     awareness.setLocalState(null);
