@@ -234,6 +234,44 @@ describe('OpSemaphore pause/resume (#716)', () => {
     held();
   });
 
+  // wiki-v2 #736: the wait and its pause credit are on the monotonic clock. `jest.setSystemTime` steps the fake
+  // Date only (an NTP/chrony step); the fake `performance.now()` and the timers carry on unmoved.
+  it('#736 a wall-clock step BACK during a pause neither stretches the wait nor withholds its credit', async () => {
+    const s = new OpSemaphore(1, 100, { pauseCreditMs: 50 });
+    const held = await s.acquire();
+    const w = settled(s.acquire());
+    jest.advanceTimersByTime(60);
+    s.pause();
+    jest.setSystemTime(Date.now() - 3_600_000); // the wall clock steps back an hour, mid-pause
+    jest.advanceTimersByTime(30);
+    s.resume(); // credited 30, exactly as with no step: deadline 130
+    jest.advanceTimersByTime(39);
+    await flush();
+    expect(w.done).toBe(false);
+    jest.advanceTimersByTime(1); // on the wall clock it would still have an hour to go
+    await flush();
+    expect(w).toEqual({ done: true, rejected: true });
+    held();
+  });
+
+  it('#736 a wall-clock step FORWARD during a pause neither cuts the wait nor inflates its credit', async () => {
+    const s = new OpSemaphore(1, 100, { pauseCreditMs: 50 });
+    const held = await s.acquire();
+    const w = settled(s.acquire());
+    jest.advanceTimersByTime(60);
+    s.pause();
+    jest.setSystemTime(Date.now() + 3_600_000); // the wall clock steps forward an hour, mid-pause
+    jest.advanceTimersByTime(30);
+    s.resume(); // credited 30, not the 50 cap: deadline 130 (on the wall clock: expired at once)
+    jest.advanceTimersByTime(39);
+    await flush();
+    expect(w.done).toBe(false);
+    jest.advanceTimersByTime(1);
+    await flush();
+    expect(w).toEqual({ done: true, rejected: true });
+    held();
+  });
+
   it('a grant during or after a pause still works, and pause/resume are idempotent', async () => {
     const s = new OpSemaphore(1, 100, { pauseCreditMs: 50 });
     const held = await s.acquire();
@@ -330,7 +368,7 @@ describe('OpSemaphore: an urgent waiter waits out at most one normal holder (#73
     };
     // Whether an aged large waiter is queued (white-box, for the anti-vacuity count only).
     const agedLargeQueued = () =>
-      (s as unknown as { waiters: Array<{ at: number }> }).waiters.some((w) => Date.now() - w.at >= 3_000);
+      (s as unknown as { waiters: Array<{ at: number }> }).waiters.some((w) => performance.now() - w.at >= 3_000); // #736: `at` is monotonic
     const small = async () => {
       // The small writer: every 5 s (A1_SMALL_EVERY_S), one at a time (its principal's own turn), joining right
       // after a large conversion started is the worst case and happens every round.
@@ -365,6 +403,31 @@ describe('OpSemaphore: an urgent waiter waits out at most one normal holder (#73
     // (each round is one 9 s large turn + at most one 0.3 s small one).
     const largeTotal = [...largeGrants.values()].reduce((a, b) => a + b, 0);
     expect(largeTotal).toBeGreaterThanOrEqual(Math.floor(END / (DEADLINE + RELOAD + SMALL_MS)));
+  });
+
+  it('#736 aging reads the monotonic clock: a wall-clock step forward ages no one, a step back delays no one', async () => {
+    const s = new OpSemaphore(1, 1e9, { agingMs: 3_000 });
+    // Forward: n1 has waited 0 ms; on the wall clock it would have waited an hour and gone ahead of u1.
+    let hold = await s.acquire(1e9, { urgent: true }); // an urgent holder: aging may pass u1 (#731)
+    let order: string[] = [];
+    let n1 = record(s, order, 'n1', false);
+    let u1 = record(s, order, 'u1', true);
+    jest.setSystemTime(Date.now() + 3_600_000);
+    hold();
+    (await u1)();
+    (await n1)();
+    expect(order).toEqual(['u1', 'n1']);
+    // Back: n1 has waited 3.5 s ≥ 3 s, so it is aged; on the wall clock it would have waited minus an hour.
+    hold = await s.acquire(1e9, { urgent: true });
+    order = [];
+    n1 = record(s, order, 'n1', false);
+    jest.advanceTimersByTime(3_500);
+    jest.setSystemTime(Date.now() - 3_600_000);
+    u1 = record(s, order, 'u1', true);
+    hold();
+    (await n1)();
+    (await u1)();
+    expect(order).toEqual(['n1', 'u1']);
   });
 
   it('a normal waiter never starves under a continuous urgent stream: it waits the smalls that waited out the last normal holder, then goes', async () => {
