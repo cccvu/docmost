@@ -34,6 +34,7 @@
  * `onApplied` (the guard's charge of live's own apply, #840 part 4) is called with the CPU ms from `beforeTransaction`
  * to `afterTransactionCleanup`, on the clocks the guard passed.
  */
+import { isTransactionOrigin } from '@hocuspocus/server';
 import * as Y from 'yjs';
 import { ExactReplicaLog } from './exact-replica';
 import { COLLAB_REPLICA_LOG_TOTAL_BYTES } from './limits';
@@ -105,11 +106,12 @@ export function encodingChanged(tr: Y.Transaction, before: PendingState | undefi
 const entries = new WeakMap<Y.Doc, Entry>();
 const EMPTY = Y.encodeStateAsUpdate(new Y.Doc());
 
-/** Hocuspocus's connection origin, or null (any other origin is server-local). */
+/** Hocuspocus's connection origin, or null (any other origin is server-local). Discriminated by Hocuspocus's own
+ *  `isTransactionOrigin`, as the guard's mirror does (#851). */
 function connectionOf(origin: unknown): object | null {
-  if (typeof origin !== 'object' || origin === null) return null;
-  const o = origin as { source?: unknown; connection?: unknown };
-  return o.source === 'connection' && typeof o.connection === 'object' && o.connection !== null ? o.connection : null;
+  if (!isTransactionOrigin(origin) || origin.source !== 'connection') return null;
+  const connection: unknown = origin.connection;
+  return typeof connection === 'object' && connection !== null ? connection : null;
 }
 
 /** Why a log past its caps stopped being trusted: the guard's next frame re-verifies (a stable reload re-arms it). */

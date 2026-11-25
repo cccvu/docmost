@@ -38,14 +38,9 @@
  * before this change stay in `pages.ydoc` and every IndexedDB copy as tombstones: removing them would mean
  * rewriting each doc's Yjs history, which a stale IndexedDB copy would then re-merge.
  *
- * LEGACY DUAL READ (one release): replicas before this change recorded the raw composite `userId NUL key`. The
- * check reads that form too (`ScopedWriteKey` carries it privately; nothing exported can build or record it),
- * so a retry first applied by an old replica still dedups after the roll. The reverse is NOT covered: an old
- * replica (rolling overlap or a rollback) reads only raw entries, so a keyed write that a new replica applied
- * and 504'd (outcome unknown; the platform's Redis claim is released on any error, so this ledger is the only
- * dedup) can apply twice if its same-key retry runs on the old-image owner within the window. MCP is not
- * exposed (a fresh key per call never dedups anyway); a `/v1` integrator reusing a stable `Idempotency-Key`,
- * or a retried attachment auto-embed, is. Remove the legacy read once rollback below this release is ruled out.
+ * Raw `userId NUL key` entries recorded before v0.12.4 (2026-11-11) are no longer read (#845: the one-release
+ * legacy dual read is gone; every rollback target below v0.12.4 also crosses #827). They age out at the next
+ * record and stay as tombstones.
  */
 import { createHash } from 'node:crypto';
 import * as Y from 'yjs';
@@ -82,20 +77,14 @@ const LEDGER_DOMAIN_H1 = 'ccc-write-idem/v1';
  * `entry` is the only form ever RECORDED: the `h1:` digest (see the file header for why never the id or key).
  * The NUL separators are unambiguous because a UUID user id cannot contain NUL, so distinct `(userId, key)`
  * pairs hash distinct inputs (the input is UTF-8, which is lossless: the golden vectors in write-idem.spec.ts
- * pin it with non-ASCII keys). The pre-digest raw composite is held privately and only ever READ, by
- * `isDuplicateWriteKey`, which accepts only a `ScopedWriteKey` (`.entry` would skip the legacy read and does
- * not type-check there).
+ * pin it with non-ASCII keys). `isDuplicateWriteKey` accepts only a `ScopedWriteKey` (a bare string, `.entry`
+ * included, does not type-check there), so every check is scoped to the acting user.
  */
 export class ScopedWriteKey {
-  readonly #legacyEntry: string;
-
   private constructor(
     /** The ledger entry this write records and checks: `h1:` + 43 base64url chars. */
     readonly entry: string,
-    legacyEntry: string,
-  ) {
-    this.#legacyEntry = legacyEntry;
-  }
+  ) {}
 
   static of(userId: string, key: string): ScopedWriteKey {
     const entry =
@@ -103,13 +92,12 @@ export class ScopedWriteKey {
       createHash('sha256')
         .update(`${LEDGER_DOMAIN_H1}\u0000${userId}\u0000${key}`, 'utf8')
         .digest('base64url');
-    // READ-ONLY legacy form (fork 137d3fc0, 2026-09-20, until this change). Never recorded: see the file header.
-    return new ScopedWriteKey(entry, `${userId}\u0000${key}`);
+    return new ScopedWriteKey(entry);
   }
 
-  /** PURE. Is this write recorded in `ledger`, in the current form or the legacy raw one? */
+  /** PURE. Is this write recorded in `ledger`? */
   isRecordedIn(ledger: Y.Map<unknown>): boolean {
-    return ledger.has(this.entry) || ledger.has(this.#legacyEntry);
+    return ledger.has(this.entry);
   }
 
   /** A log line or template literal gets the digest, never the user id or the key. */
@@ -129,8 +117,8 @@ export function scopedWriteKey(userId: string, key: string): ScopedWriteKey {
  * duplicate must leave the doc untouched so the closing store is a genuine no-op). Call inside the transaction,
  * BEFORE applying content; on `true` the caller returns a no-op outcome without mutating.
  *
- * Takes a `ScopedWriteKey` only (never a string, `.entry` included), so every check also reads the legacy raw
- * entry and is scoped to the acting user (S1). Specs that need a raw entry seed the map directly.
+ * Takes a `ScopedWriteKey` only (never a string, `.entry` included), so every check is scoped to the acting user
+ * (S1). Specs that need a raw entry seed the map directly.
  */
 export function isDuplicateWriteKey(doc: Y.Doc, key: ScopedWriteKey): boolean {
   return key.isRecordedIn(doc.getMap(WRITE_IDEM_MAP));

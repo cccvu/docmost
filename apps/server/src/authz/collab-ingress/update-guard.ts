@@ -149,7 +149,13 @@ import {
 } from '../page-write/compaction-registry';
 import { COLLAB_CONNECTIONS_PER_USER } from './limits';
 import { ClaimLedger, RelayClaims, verifyAttested, type Attested, type AttestResult, type ClaimOutcome, type DecodedFrame, type RecordOutcome } from './relay-claims';
-import { ConflictScan, installConflictScanMeter, type ConflictScanMeter } from './conflict-scan';
+import {
+  CONFLICT_SCAN_NEAR_CAP_STEPS,
+  CONFLICT_SCAN_STEPS_PER_FRAME,
+  ConflictScan,
+  installConflictScanMeter,
+  type ConflictScanMeter,
+} from './conflict-scan';
 import { COLLAB_PAGE_COMPACTING_REASON, epochStaleReason } from './collab-reasons';
 import { COLLAB_PAGE_COMPACTION_TOKEN, logCompactionRequested, type CompactionLogSink } from './compaction-log';
 import { isDeadlineExceeded, runWithDeadline, type DeadlineRunner } from './deadline';
@@ -238,8 +244,8 @@ export const pagesOn = (outcome: RefusalOutcome, rule: string): boolean => outco
 const REFUSED_TOKEN = 'COLLAB_UPDATE_REFUSED';
 export const SOCKET_REFUSAL_BUDGET = 3;
 /**
- * An honest connection announces one client id (y-protocols' Awareness keeps the id it was built with, even after Yjs
- * regenerates the doc's); this only bounds memory.
+ * An honest connection announces one client id, two when Yjs regenerates the doc's (#845: the editor then retires the
+ * old id and announces the new one, collab-access-controller.ts); this only bounds memory.
  */
 const AWARENESS_BINDS_PER_CONNECTION = 32;
 /** The ids one connection's own awareness announced that are remembered as its ownership evidence (memory bound only). */
@@ -463,6 +469,8 @@ type ShadowResult = {
    *  their R4/R6 checks (`verifyAttested`: refused `unproven-owner`, the relayer burned when `failed`). */
   relayed?: Set<number>;
   relayFailed?: Map<number, 'pending' | 'failed'>;
+  /** #832: report mode's meter tripped (its whole count). Logged on its own when the frame is answered for another rule. */
+  trip?: RefusalLog;
 };
 /** What `inspectTransaction` finds inside the transaction. `extra`: struct-array lengths, mid-transaction, of clients a
  *  delete reached that the pre-pass did not name (a keyed overwrite deletes the key's previous item). */
@@ -601,18 +609,24 @@ class DocGuard {
 export type WedgedStore = (live: GuardDocument, context: unknown) => void;
 
 type Bucket = { tokens: number; at: number };
-/** `cpu` (milliseconds, #816) is only used on the whole-user entry. `deadline` (#827): shadow-apply timeouts since this
- *  (user, document)'s last accepted frame (the strike rule). `strikes`/`heldUntil` (#840): when instabilities this user
- *  was a suspect of were found on the page, and until when their writer frames there wait (1013). Kept by page name, so
- *  a heal (a new document) does not forgive them. */
-type UserDocBudget = { sync: Bucket; ids: Bucket; cpu: Bucket; deadline: number; strikes: number[]; heldUntil: number };
+/** Per (user, document) (`docKey`): sync frames and new client ids (#790). `deadline` (#827): shadow-apply timeouts since
+ *  this (user, document)'s last accepted frame (the strike rule). `strikes`/`heldUntil` (#840): when instabilities this
+ *  user was a suspect of were found on the page, and until when their writer frames there wait (1013). Kept by page
+ *  name, so a heal (a new document) does not forgive them. */
+type DocBudget = { sync: Bucket; ids: Bucket; deadline: number; strikes: number[]; heldUntil: number };
+/** Per user, across documents (`userKey`): sync frames (#790) and collab CPU in milliseconds, as a debt (#816). */
+type UserBudget = { sync: Bucket; cpu: Bucket };
+/** #832: the budgets map's keys, in one place (the same strings as before the split, so nothing that reads one moves). */
+const userKey = (user: string): string => `${user}\u0001`;
+/** Exported for the specs that read a (user, document) budget. */
+export const docKey = (user: string, docName: string): string => `${user}\u0000${docName}`;
 
 export class CollabUpdateGuard {
   private readonly docs = new WeakMap<Y.Doc, DocGuard>();
   private readonly refusedConnections = new WeakMap<object, string>();
   private readonly socketRefusals = new WeakMap<object, number>();
   /** #790: per (user, document) budgets, least recently used first; and per connection, the ids it already paid for. */
-  private readonly userDocBudgets = new Map<string, UserDocBudget>();
+  private readonly userDocBudgets = new Map<string, DocBudget | UserBudget>();
   private readonly awarenessNewIds = new WeakMap<object, Set<number>>();
   /** #847: see `WedgedStore`; null until the extension is configured (specs set it directly). */
   private wedgedStore: WedgedStore | null = null;
@@ -723,7 +737,7 @@ export class CollabUpdateGuard {
     // A Step1 makes Hocuspocus encode the whole document (its Step2 answer); a reader's Step2 makes it snapshot it.
     if (header.subtype === STEP1 || (header.subtype === STEP2 && frame.connection.readOnly)) {
       const ok = this.takeBoth(
-        [this.budgetFor(frame, true).sync, USER_SYNC_BURST, USER_SYNC_REFILL_MS],
+        [this.userBudgetFor(frame).sync, USER_SYNC_BURST, USER_SYNC_REFILL_MS],
         [this.budgetFor(frame).sync, SYNC_BURST, SYNC_REFILL_MS],
       );
       if (!ok) this.tryLater(frame, 'user_sync_budget');
@@ -790,6 +804,11 @@ export class CollabUpdateGuard {
     return [...(this.docs.get(live)?.suspects.keys() ?? [])];
   }
 
+  /** #840: the users whose walks on `live` reached no verdict now (`DocGuard.unclear`; specs and diagnostics, #851). */
+  unclearOf(live: Y.Doc): string[] {
+    return [...(this.docs.get(live)?.unclear.keys() ?? [])];
+  }
+
   /** #827: the structure counts the guard holds for `live` (specs and diagnostics). */
   pageCounts(live: Y.Doc): { structs: number; clientIds: number; steps: number } | null {
     const doc = this.docs.get(live);
@@ -818,8 +837,9 @@ export class CollabUpdateGuard {
    * to the socket that caused it, so a reload loop pays for itself): logged `load_debt`. Report mode only logs.
    */
   admitLoad(user: string): boolean {
-    if (this.cpuBalance(user) >= 0) return true;
-    this.limitLog.log('load_debt', { userId: user });
+    const balance = this.cpuBalance(user);
+    if (balance >= 0) return true;
+    this.limitLog.log('load_debt', { userId: user, balanceMs: Math.round(balance) }); // #832: the debt's depth
     return this.mode === 'report';
   }
 
@@ -864,39 +884,59 @@ export class CollabUpdateGuard {
   }
 
   /** The (user, document) budget of this frame's connection, made most recently used; the least recent past the cap goes. */
-  private budgetFor(frame: GuardFrame, wholeUser = false): UserDocBudget {
-    return this.budgetOf(String(frame.context?.user?.id ?? ''), wholeUser ? null : (frame.document.name ?? ''));
+  private budgetFor(frame: GuardFrame): DocBudget {
+    return this.docBudget(String(frame.context?.user?.id ?? ''), frame.document.name ?? '');
   }
 
-  /** The budget of (`user`, `docName`), or the whole user's when `docName` is null. */
-  private budgetOf(user: string, docName: string | null): UserDocBudget {
-    const wholeUser = docName === null;
-    const key = wholeUser ? `${user}\u0001` : `${user}\u0000${docName}`;
+  /** The whole-user budget of this frame's connection, likewise. */
+  private userBudgetFor(frame: GuardFrame): UserBudget {
+    return this.userBudget(String(frame.context?.user?.id ?? ''));
+  }
+
+  /** The budget of (`user`, `docName`). */
+  private docBudget(user: string, docName: string): DocBudget {
+    return this.touchBudget(docKey(user, docName), (at) => ({
+      sync: { tokens: SYNC_BURST, at },
+      ids: { tokens: AWARENESS_NEW_IDS_BURST, at },
+      deadline: 0,
+      strikes: [],
+      heldUntil: 0,
+    }));
+  }
+
+  /** The whole user's budget. */
+  private userBudget(user: string): UserBudget {
+    return this.touchBudget(userKey(user), (at) => ({
+      sync: { tokens: USER_SYNC_BURST, at },
+      cpu: { tokens: USER_COLLAB_CPU_BURST_MS, at },
+    }));
+  }
+
+  /** The budget kept at `key` (made by `make` when none is), made most recently used; the least recent past the cap goes. */
+  private touchBudget<T extends DocBudget | UserBudget>(key: string, make: (at: number) => T): T {
     const at = this.now();
-    let budget = this.userDocBudgets.get(key);
+    let budget = this.userDocBudgets.get(key) as T | undefined; // a key's form says which (userKey, docKey)
     if (budget) this.userDocBudgets.delete(key);
-    else {
-      budget = {
-        sync: { tokens: wholeUser ? USER_SYNC_BURST : SYNC_BURST, at },
-        ids: { tokens: AWARENESS_NEW_IDS_BURST, at },
-        cpu: { tokens: USER_COLLAB_CPU_BURST_MS, at },
-        deadline: 0,
-        strikes: [],
-        heldUntil: 0,
-      };
-    }
+    else budget = make(at);
     this.userDocBudgets.set(key, budget);
     if (this.userDocBudgets.size > USER_DOC_BUDGETS_MAX) this.userDocBudgets.delete(this.userDocBudgets.keys().next().value!);
     return budget;
   }
 
+  /**
+   * #816: the whole user's collab CPU balance in ms when it is in debt (below 0), else null. Refills it and makes the
+   * entry most recently used (an entry in debt that dropped out of the map would be forgiven).
+   */
+  private inDebt(frame: GuardFrame): number | null {
+    const cpu = this.userBudgetFor(frame).cpu;
+    this.refill(cpu, USER_COLLAB_CPU_BURST_MS, CPU_MS_REFILL_EVERY_MS);
+    return cpu.tokens < 0 ? cpu.tokens : null;
+  }
+
   /** One token from each bucket, or none from either. */
   private takeBoth(...buckets: Array<[Bucket, number, number]>): boolean {
     const now = this.now();
-    for (const [bucket, burst, refillMs] of buckets) {
-      bucket.tokens = Math.min(burst, bucket.tokens + Math.max(0, now - bucket.at) / refillMs);
-      bucket.at = now;
-    }
+    for (const [bucket, burst, refillMs] of buckets) this.refill(bucket, burst, refillMs, now);
     if (buckets.some(([bucket]) => bucket.tokens < 1)) return false;
     for (const [bucket] of buckets) bucket.tokens -= 1;
     return true;
@@ -910,10 +950,15 @@ export class CollabUpdateGuard {
     return true;
   }
 
-  private refill(bucket: Bucket, burst: number, refillMs: number): void {
-    const now = this.now();
-    bucket.tokens = Math.min(burst, bucket.tokens + Math.max(0, now - bucket.at) / refillMs);
-    bucket.at = now;
+  /** `bucket`'s tokens refilled (one per `refillMs`, at most `burst`) up to `until`. Touches nothing. */
+  private refilled(bucket: Bucket, burst: number, refillMs: number, until: number = this.now()): number {
+    return Math.min(burst, bucket.tokens + Math.max(0, until - bucket.at) / refillMs);
+  }
+
+  /** Refill `bucket` up to `until`, and mark it refilled `at` (by default the same time). */
+  private refill(bucket: Bucket, burst: number, refillMs: number, until: number = this.now(), at: number = until): void {
+    bucket.tokens = this.refilled(bucket, burst, refillMs, until);
+    bucket.at = at;
   }
 
   /**
@@ -921,28 +966,27 @@ export class CollabUpdateGuard {
    * (wall clock) and not while the charged work ran: the event loop was that work's, so it earns nothing back.
    */
   private chargeCpu(user: string, ms: number, workStarted: number): void {
-    const bucket = this.budgetOf(user, null).cpu;
+    const bucket = this.userBudget(user).cpu;
     const now = this.now();
-    bucket.tokens = Math.min(USER_COLLAB_CPU_BURST_MS, bucket.tokens + Math.max(0, Math.min(now, workStarted) - bucket.at) / CPU_MS_REFILL_EVERY_MS);
-    bucket.at = Math.max(bucket.at, now);
+    this.refill(bucket, USER_COLLAB_CPU_BURST_MS, CPU_MS_REFILL_EVERY_MS, Math.min(now, workStarted), Math.max(bucket.at, now));
     bucket.tokens -= Math.max(0, ms);
   }
 
   /** A user's collab CPU balance now, in ms (specs and diagnostics): a full burst when none is kept. Touches nothing. */
   cpuBalance(user: string): number {
-    const bucket = this.userDocBudgets.get(`${user}\u0001`)?.cpu;
+    const bucket = (this.userDocBudgets.get(userKey(user)) as UserBudget | undefined)?.cpu;
     if (!bucket) return USER_COLLAB_CPU_BURST_MS;
-    return Math.min(USER_COLLAB_CPU_BURST_MS, bucket.tokens + Math.max(0, this.now() - bucket.at) / CPU_MS_REFILL_EVERY_MS);
+    return this.refilled(bucket, USER_COLLAB_CPU_BURST_MS, CPU_MS_REFILL_EVERY_MS);
   }
 
   /**
    * An exhausted (user, document) budget: close the SOCKET with 1013 first (so Hocuspocus's document CLOSE, sent next,
    * is dropped by the closing socket and the editor sees only a retryable socket close), then throw so this frame and
    * the ones queued behind it are not applied. Logged `COLLAB_SOCKET_LIMIT`, rate-limited. Report mode only logs, unless
-   * `always` (#847: a wedged live document, frozen in every mode).
+   * `always` (#847: a wedged live document, frozen in every mode). `fields`: numbers only (#832: `balanceMs`).
    */
-  private tryLater(frame: GuardFrame, limit: SocketLimit, always = false): void {
-    this.limitLog.log(limit, { userId: String(frame.context?.user?.id ?? '') });
+  private tryLater(frame: GuardFrame, limit: SocketLimit, always = false, fields: Record<string, number> = {}): void {
+    this.limitLog.log(limit, { userId: String(frame.context?.user?.id ?? ''), ...fields });
     if (this.mode === 'report' && !always) return;
     try {
       frame.connection.webSocket?.close(COLLAB_TRY_LATER_CODE, TRY_LATER_REASON);
@@ -1010,9 +1054,8 @@ export class CollabUpdateGuard {
    */
   private chargeReaderStep2(frame: GuardFrame, bytes: number): void {
     const userId = String(frame.context?.user?.id ?? '');
-    if (!this.take(this.budgetFor(frame, true).cpu, USER_COLLAB_CPU_BURST_MS, CPU_MS_REFILL_EVERY_MS, 0)) {
-      this.tryLater(frame, 'user_collab_cpu'); // throws unless report mode
-    }
+    const debt = this.inDebt(frame);
+    if (debt !== null) this.tryLater(frame, 'user_collab_cpu', false, { balanceMs: Math.round(debt) }); // throws unless report mode
     const known = this.docs.get(frame.document);
     const structs = known?.shadow ? known.structs : structCount(frame.document.store);
     this.chargeCpu(userId, readerStep2ChargeMs(bytes, structs), this.now());
@@ -1075,9 +1118,8 @@ export class CollabUpdateGuard {
     const doc = this.docFor(frame.document);
     const userId = String(frame.context?.user?.id ?? '');
     // 0. #816: a user in CPU debt waits, before any work; #840: so does one held for order strikes on this page.
-    if (!this.take(this.budgetFor(frame, true).cpu, USER_COLLAB_CPU_BURST_MS, CPU_MS_REFILL_EVERY_MS, 0)) {
-      this.tryLater(frame, 'user_collab_cpu'); // throws unless report mode
-    }
+    const debt = this.inDebt(frame);
+    if (debt !== null) this.tryLater(frame, 'user_collab_cpu', false, { balanceMs: Math.round(debt) }); // throws unless report mode
     if (this.budgetFor(frame).heldUntil > this.now()) this.tryLater(frame, 'order_strikes'); // throws unless report mode
     // From here every exit is charged (#816): the pre-pass, any rebuild and the shadow apply, once; live's own apply when
     // it runs (#840). A rebuild someone else's refusal made necessary is theirs; one the server caused is no one's (#827).
@@ -1127,6 +1169,13 @@ export class CollabUpdateGuard {
       const fromShadow = result.violation !== null && (violation === null || this.enforces(result.violation.rule, result.log, true));
       if (fromShadow) violation = result.violation;
       const log = fromShadow ? result.log : undefined;
+      // #832: a report-mode trip is logged on its own line when the frame is answered for another rule, with this frame's
+      // outcome: `blocked` when that rule refuses it (an `unresolved` retry included: it is not applied either), else
+      // `applied`. A trip whose shadow apply then ran past the deadline returned above (deadlineStrike logs that instead).
+      if (result.trip && violation?.rule !== 'conflict-scan') {
+        const outcome: RefusalOutcome = violation && this.enforces(violation.rule, log) ? 'blocked' : 'applied';
+        this.refusalLine(frame, header, { rule: 'conflict-scan' }, result.trip, outcome);
+      }
       if (!violation) for (const v of result.reportOnly) this.log('COLLAB_LEGACY_PENDING_INVALID', doc.live, { rule: v.rule });
       if (violation && this.enforces(violation.rule, log)) {
         // The shadow holds the refused frame; live never will. Rebuilt lazily by the next frame that needs it
@@ -1170,6 +1219,10 @@ export class CollabUpdateGuard {
         let clocks = 0;
         for (const client of result.relayed) clocks += relay.attested.get(client)!.to - relay.attested.get(client)!.from;
         this.log('COLLAB_RELAY_ATTESTED', doc.live, { userId, ids: result.relayed.size, clocks });
+      }
+      // #832: an accepted frame under the cap (no report-mode trip) that walked more than half of it (numbers only).
+      if (result.steps > CONFLICT_SCAN_NEAR_CAP_STEPS && result.trip === undefined) {
+        this.log('COLLAB_CONFLICT_SCAN_NEAR_CAP', doc.live, { steps: result.steps, cap: CONFLICT_SCAN_STEPS_PER_FRAME });
       }
       const raw = payload.slice();
       // A frame the shadow could not apply is not replayed into a rebuild (it would fail every rebuild from then on).
@@ -1493,6 +1546,8 @@ export class CollabUpdateGuard {
     for (const ids of [pre.clients, pre.reaches, pendingBefore.keys()]) for (const client of ids) tracked.set(client, lengthOf(store, client));
     const clientsBefore = store.clients.size;
     const scan = new ConflictScan(shadow, this.mode === 'enforce');
+    // #832: a report-mode trip (report mode's meter never throws), carried on every result.
+    const trip = (): { trip?: RefusalLog } => (!scan.enforce && scan.trip !== null ? { trip: { steps: scan.steps } } : {});
     const failed = (violation: Violation, log?: RefusalLog): ShadowResult => ({
       violation,
       binds: new Map(),
@@ -1508,6 +1563,7 @@ export class CollabUpdateGuard {
       suspect: false,
       unclear: false,
       changes: false,
+      ...trip(),
     });
     let out: Inspection | null = null;
     let applied: Y.Transaction | null = null;
@@ -1541,7 +1597,8 @@ export class CollabUpdateGuard {
         doc.shadow = null; // cut mid-transaction: never reused
         return { ...failed({ rule: 'apply-deadline' }), timedOut: true };
       }
-      if (scan.trip !== null) return failed({ rule: 'conflict-scan' }, { steps: scan.trip.steps });
+      // Only an enforcing scan throws at its trip (#832: after a report-mode trip, a throw is Yjs's own or the meter's).
+      if (scan.enforce && scan.trip !== null) return failed({ rule: 'conflict-scan' }, { steps: scan.trip.steps });
       if (scan.failure !== null) return failed({ rule: 'internal' }, { stage: 'conflict-scan' });
       // #847: Yjs threw on its own (M1's half-applied integrate, M2's wedged cleanup). A shadow whose cleanup is stuck
       // is Yjs's too, whatever the phase: a throw from the inspection unwinds through Yjs's cleanup, which can throw over it.
@@ -1573,8 +1630,12 @@ export class CollabUpdateGuard {
       relayFailed: found.relayFailed,
     };
     // Report mode: the meter counted past the cap and threw nothing; the frame is logged as it would have been refused.
-    if (scan.trip !== null) return { ...result, violation: { rule: 'conflict-scan' }, log: { steps: scan.steps } };
-    return result;
+    // #832: unless the inspection found a rule refused in every mode (`root`, `keyed-split`): that refusal stands (a
+    // relabel would let report mode apply it), and the trip is logged with it (`trip`).
+    if (scan.trip !== null && (found.violation === null || !this.enforces(found.violation.rule, found.log, true))) {
+      return { ...result, violation: { rule: 'conflict-scan' }, log: { steps: scan.steps }, ...trip() };
+    }
+    return { ...result, ...trip() };
   }
 
   /**
@@ -2017,7 +2078,7 @@ export class CollabUpdateGuard {
     for (const user of suspects) {
       if (doc.episode.struck.has(user)) continue; // struck once this episode; the line below still names them
       doc.episode.struck.add(user);
-      const budget = this.budgetOf(user, page);
+      const budget = this.docBudget(user, page);
       budget.strikes = budget.strikes.filter((at) => now - at < ORDER_STRIKE_WINDOW_MS);
       budget.strikes.push(now);
       if (budget.strikes.length >= ORDER_STRIKES_TO_HOLD) budget.heldUntil = now + ORDER_HOLD_MS;
@@ -2249,9 +2310,8 @@ export class CollabUpdateGuard {
       this.needsCompaction(doc, 'order_divergence', null, true);
       return this.tryLater(frame, 'order_divergence'); // throws unless report mode
     }
-    if (!this.take(this.budgetFor(frame, true).cpu, USER_COLLAB_CPU_BURST_MS, CPU_MS_REFILL_EVERY_MS, 0)) {
-      this.tryLater(frame, 'user_collab_cpu'); // throws unless report mode
-    }
+    const debt = this.inDebt(frame);
+    if (debt !== null) this.tryLater(frame, 'user_collab_cpu', false, { balanceMs: Math.round(debt) }); // throws unless report mode
     const workStarted = this.now();
     const started = this.cpuNow();
     let othersMs = 0;
@@ -2291,6 +2351,9 @@ export class CollabUpdateGuard {
       for (const { clientID, clock, state } of entries) {
         const owner = doc.bindings.get(clientID);
         if (owner !== undefined && owner !== userId) continue; // another user's (an echo or a removal: checkAwareness)
+        // #845: an id this connection already announced, bound to this user (every cursor move): nothing below would
+        // change, so its state is not parsed again.
+        if (owner === userId && doc.announced.get(frame.connection)?.has(clientID)) continue;
         // An echo (a provider's `timeout` removal of a peer, or a 3.x provider resending what it was relayed): the server
         // already holds this client's state at this clock (it relayed it), so the echo says nothing about who owns the
         // id: a writer's echo of a READER's state would otherwise bind the reader's id to the writer, refusing the reader
@@ -2339,19 +2402,7 @@ export class CollabUpdateGuard {
     const reason = extra?.stage === 'unproven-owner' ? UNRESOLVED_REASON : reasonFor(violation.rule);
     const enforced = this.enforces(violation.rule, extra);
     const outcome: RefusalOutcome = !enforced ? 'applied' : reason === UNRESOLVED_REASON ? 'retry' : 'blocked';
-    this.log(REFUSED_TOKEN, frame.document, {
-      rule: violation.rule,
-      ...(violation.node ? { node: violation.node } : {}),
-      ...(violation.mark ? { mark: violation.mark } : {}),
-      ...(violation.key ? { key: violation.key } : {}),
-      ...extra, // #816: `steps` for conflict-scan, `stage` for a meter failure; numbers and fixed words only
-      userId: frame.context?.user?.id,
-      msgType: header.type,
-      ...(header.subtype !== undefined ? { syncType: header.subtype } : {}),
-      bytes: frame.update.length,
-      mode: this.mode,
-      outcome,
-    });
+    this.refusalLine(frame, header, violation, extra, outcome);
     if (!enforced) return;
     this.refusedConnections.set(frame.connection, reason);
     const ws = frame.connection.webSocket;
@@ -2367,6 +2418,23 @@ export class CollabUpdateGuard {
       }
     }
     throw { code: COLLAB_REFUSAL_CODE, reason };
+  }
+
+  /** A refusal line (`COLLAB_UPDATE_REFUSED`), with this frame's `outcome`. */
+  private refusalLine(frame: GuardFrame, header: Header, violation: Violation, extra: RefusalLog | undefined, outcome: RefusalOutcome): void {
+    this.log(REFUSED_TOKEN, frame.document, {
+      rule: violation.rule,
+      ...(violation.node ? { node: violation.node } : {}),
+      ...(violation.mark ? { mark: violation.mark } : {}),
+      ...(violation.key ? { key: violation.key } : {}),
+      ...extra, // #816: `steps` for conflict-scan, `stage` for a meter failure; numbers and fixed words only
+      userId: frame.context?.user?.id,
+      msgType: header.type,
+      ...(header.subtype !== undefined ? { syncType: header.subtype } : {}),
+      bytes: frame.update.length,
+      mode: this.mode,
+      outcome,
+    });
   }
 
   /**
@@ -2386,14 +2454,23 @@ export class CollabUpdateGuard {
  * announced none (the rule before this evidence: a sender that sends no awareness still gets it, ADR 0036 §4). An honest
  * 4.7.1 provider sends its own awareness right after Auth and Step1, before its Step2 or any queued Update (with Docmost's
  * static token; pinned by the client's collab-provider-order.test.ts), so a sender that announced ids and writes another
- * never-seen one is relaying a peer's structs. Residual: a doc whose id Yjs regenerated (a remote write at its current
- * id) keeps announcing the old one, so its new id stays unbound (relay-binding.spec.ts); the guard refuses that remote
- * write at every bound id, so on an honest page it follows only an id collision. An editor of the page can still force
- * one across a reload (#845) where #793 restored nothing (a crash, or an id the seal did not cover): while the document
- * reloads it writes at the victim's id before the victim reconnects; the victim's Yjs then regenerates its id on the
- * relayed write, the new id stays unbound here, and the editor can forge at it (silently dropping the victim's later
- * edits) or claim it by awareness. After a clean unload the victim's id is restored awareness-only, so that write is
- * `unresolved` and nothing regenerates. Closing the rest needs the client to re-announce under its new id.
+ * never-seen one is relaying a peer's structs.
+ *
+ * #845, a regenerated id. Yjs gives a doc a new id on a remote write at its current one, and y-protocols' Awareness keeps
+ * the id it was built with. A client that does not re-announce writes at a never-seen id its connection did not
+ * announce: unbound here and forgeable (relay-binding.spec.ts pins it). Before the editor's fix, 4.7.1's provider then
+ * removed every awareness state but the doc's new id at its next socket close, the local one included: presence was
+ * lost for the rest of the mount, and the reconnect announced nothing, so the new id bound by its first struct again.
+ * The editor now retires the old id (null at its clock c + 1) and announces the new one at c + 2, before any struct at
+ * it (collab-access-controller.ts), so the new id binds at its announce, before its first struct, for one new awareness
+ * id (relay-binding.spec.ts, through a real Hocuspocus); a reconnect announces it after Step1. What remains: an
+ * announce dropped by the gateway's awareness rate limit, or answered 1013 by the awareness new-id budget, leaves the
+ * new id unbound until the next renewal (15 s) or reconnect; a stale or custom client still binds it by its first
+ * struct on a connection that announced nothing. The guard refuses a remote write at every bound
+ * id, so on an honest page a regeneration follows only an id collision, or an editor forcing one across a reload where
+ * #793 restored nothing (a crash, or an id the seal did not cover): it writes at the victim's id before the victim
+ * reconnects. After a clean unload the victim's id is restored awareness-only, so that write is `unresolved` and nothing
+ * regenerates.
  */
 const ownedBy =
   (announced: Set<number> | undefined) =>

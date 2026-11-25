@@ -89,7 +89,8 @@ const collabLive = async (userRepo: unknown, userSessionRepo: unknown, p: JwtPay
     return true;
   } catch (e) {
     if (e instanceof UnauthorizedException) return false;
-    // #810: a token naming no session is refused before any read, as an invalid token (the quiet `{ reason }` refusal)
+    // #810: a token naming no session is refused before any read, as an invalid token (the quiet `{ reason }` refusal);
+    // since #755 a session that is no longer live gets the same refusal (`sessionNotLive()`, logged with its cause)
     if (JSON.stringify(e) === JSON.stringify({ reason: COLLAB_INVALID_TOKEN_REASON })) return false;
     throw e;
   }

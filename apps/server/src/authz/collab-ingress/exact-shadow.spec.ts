@@ -809,6 +809,66 @@ describe('#840 strikes: padding past the walk cap does not buy a way out of blam
   });
 });
 
+/**
+ * #851: an honest editor's large paste spends its frame's blame walk budget (each pasted item walks past the rest of the
+ * paste to its rightOrigin), so its sender is `unclear`, and on a legacy unstable row (nobody to suspect) the unclear
+ * users stand in: the bounded false positive. One strike per episode, so the honest editor is never held.
+ */
+describe('#851 strikes: an honest large paste on a legacy unstable row', () => {
+  it('the paster is unclear and struck once for the row\'s instability, never held; a concurrent co-editor is not struck', () => {
+    const doc = new Y.Doc();
+    doc.clientID = 1;
+    const p = new Y.XmlElement('paragraph');
+    const tx = new Y.XmlText();
+    doc.transact(() => {
+      doc.getXmlFragment('default').insert(0, [p]);
+      p.insert(0, [tx]);
+      tx.insert(0, 'abcdef');
+    });
+    const first = (tx as any)._start.id.clock as number;
+    Y.applyUpdate(doc, rawUpdate([{ client: 2, clock: 0, structs: [{ origin: [1, first + 5], right: [1, first + 3], content: new Y.ContentString('X') }] }]));
+    expect(isReloadStable(doc).stable).toBe(false); // precondition: a legacy unstable row
+    const limitLogs: string[] = [];
+    const logs: string[] = [];
+    const guard = new CollabUpdateGuard({
+      mode: 'enforce',
+      logger: { warn: (m: string) => logs.push(m) },
+      limitLog: new SocketLimitLog({ warn: (m: string) => limitLogs.push(m) }),
+      schedule: () => ({ cancel: () => undefined }),
+    });
+    const s = harness({ bytes: Y.encodeStateAsUpdate(doc), attach: true, guard });
+    const typeFirst = (live: Y.Doc, c = 'x') => new RemoteClient(live).edit(live, (f) => ((f.get(0) as Y.XmlElement).get(0) as Y.XmlText).insert(0, c));
+    const coEditor = new RemoteClient(s.live); // it never sees the paste
+    const paste = () =>
+      new RemoteClient(s.live).edit(s.live, (f) => {
+        const ps = Array.from({ length: 400 }, (_, i) => {
+          const para = new Y.XmlElement('paragraph');
+          para.insert(0, [new Y.XmlText(`pasted ${i}`)]);
+          return para;
+        });
+        f.insert(1, ps);
+      });
+    expect(s.send(s.conn('paster'), paste())).toBe('applied');
+    expect(s.send(s.conn('co-editor'), coEditor.edit(s.live, (f) => f.insert(1, [new Y.XmlElement('paragraph')])))).toBe('applied');
+    expect({ suspects: s.guard.suspectsOf(s.live), unclear: s.guard.unclearOf(s.live) }).toEqual({ suspects: [], unclear: ['paster'] });
+    expect(s.join(s.conn('reader', true))).toBe(TRY_LATER);
+    const divergence = () => logs.filter((l) => l.startsWith('COLLAB_ORDER_DIVERGENCE ')).map((l) => JSON.parse(l.slice(l.indexOf('{'))));
+    expect(divergence()).toEqual([expect.objectContaining({ where: 'join', outcome: 'unstable', suspects: ['paster'] })]); // the stand-in
+    expect(s.send(s.conn('paster'), typeFirst(s.live))).toBe('applied'); // one strike: not held
+    // the page cannot heal yet: the paster pastes again (unclear again), joins find the page unstable in the same
+    // episode and name the paster, but strike it no second time (two would hold it)
+    for (let i = 0; i < 2; i++) {
+      expect(s.send(s.conn('paster'), paste())).toBe('applied');
+      expect(s.guard.unclearOf(s.live)).toEqual(['paster']);
+      expect(s.join(s.conn('reader', true))).toBe(TRY_LATER);
+    }
+    expect(divergence().map((l) => l.suspects)).toEqual([['paster'], ['paster'], ['paster']]);
+    expect(s.send(s.conn('paster'), typeFirst(s.live, 'y'))).toBe('applied');
+    expect(s.send(s.conn('co-editor'), typeFirst(s.live, 'z'))).toBe('applied');
+    expect(limitLogs.some((l) => l.includes('"limit":"order_strikes"'))).toBe(false);
+  });
+});
+
 describe('#840 strikes: a stable verdict ends the episode', () => {
   it('unstable, then stable again on the same document (the crafted run deleted), then unstable: a new episode, a second strike', () => {
     const limitLogs: string[] = [];

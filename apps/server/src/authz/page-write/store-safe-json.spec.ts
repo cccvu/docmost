@@ -119,14 +119,51 @@ describe('storeSafeJson (#773)', () => {
     expect(Object.getPrototypeOf(storeSafeJson(bare))).toBeNull();
   });
 
-  it('leaves JSON primitives, null and byte arrays untouched', () => {
+  it('leaves JSON primitives and null untouched', () => {
     for (const v of [0, 1.5, -1, true, false, null]) expect(storeSafeJson(v)).toBe(v);
+  });
+
+  // #784: a typed array (legacy ContentBinary/ContentAny bytes) becomes the index object JSON.stringify writes, so the
+  // projection deep-equals the jsonb row it is stored as and a reload does not rewrite the row.
+  it('turns a typed array into the plain object of its indices that JSON.stringify writes', () => {
     const bytes = new Uint8Array([0, 0xd8]);
-    expect(storeSafeJson(bytes)).toBe(bytes);
+    const out = storeSafeJson(bytes) as unknown;
+    expect(out).not.toBe(bytes);
+    expect(Object.getPrototypeOf(out)).toBe(Object.prototype);
+    expect(out).toStrictEqual({ '0': 0, '1': 0xd8 });
+    expect(JSON.stringify(out)).toBe(JSON.stringify(bytes));
+    expect(out).toStrictEqual(JSON.parse(JSON.stringify(bytes))); // what the jsonb row reads back
     const mixed = { n: 1, b: false, z: null, s: `\0`, bytes };
-    const out = storeSafeJson(mixed);
-    expect(out).toEqual({ n: 1, b: false, z: null, s: R, bytes });
-    expect(out.bytes).toBe(bytes);
+    expect(storeSafeJson(mixed)).toStrictEqual({ n: 1, b: false, z: null, s: R, bytes: { '0': 0, '1': 0xd8 } });
+    expect(storeSafeJson(new Float64Array([1.5, NaN]))).toStrictEqual({ '0': 1.5, '1': null });
+    expect(bytes).toEqual(new Uint8Array([0, 0xd8])); // the input is not written to
+  });
+
+  // #784: the store's COLLAB_STORE_NORMALIZED reads this. Never for a clean input, which comes back as itself.
+  it('calls onChanged exactly when the result is not the input itself', () => {
+    const calls = (v: unknown): number => {
+      let n = 0;
+      storeSafeJson(v, () => n++);
+      return n;
+    };
+    expect(calls({ type: 'doc', content: [{ type: 'text', text: EMOJI, marks: [{ type: 'bold', attrs: {} }] }] })).toBe(0);
+    expect(calls([1, 'x', null, { a: [true] }])).toBe(0);
+    expect(calls({ a: [`x\0`] })).toBe(1);
+    expect(calls({ [HIGH]: 1 })).toBe(1);
+    expect(calls({ d: new Date(0) })).toBe(1); // reshaped by toJSON, nothing replaced
+    expect(calls({ b: new Uint8Array([1]) })).toBe(1);
+    expect(calls({ u: undefined })).toBe(1);
+  });
+
+  // #784: an array index reaches project() as a number; toJSON must still get the string key, as in JSON.stringify.
+  it('passes toJSON an array element its index as a string', () => {
+    const seen: unknown[] = [];
+    const spy = { toJSON: (k: unknown) => (seen.push(k), 1) };
+    storeSafeJson([spy, { x: spy }]);
+    expect(seen).toEqual(['0', 'x']);
+    const native: unknown[] = [];
+    JSON.stringify([{ toJSON: (k: unknown) => (native.push(k), 1) }]);
+    expect(seen[0]).toBe(native[0]);
   });
 
   // The shape is attacker-controlled too (#773 security review): the walk writes what JSON.stringify writes.

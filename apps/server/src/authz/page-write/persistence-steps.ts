@@ -51,6 +51,8 @@ export interface StoreSnapshot {
   generation: number | undefined;
   json: any;
   state: Buffer;
+  /** #784: `json` is not `fromYdoc`'s own output: `storeSafeJson` replaced or reshaped something in it. */
+  normalized: boolean;
 }
 
 /**
@@ -68,9 +70,10 @@ export interface StoreSnapshot {
  */
 export function snapshotForStore(document: Y.Doc): StoreSnapshot {
   const generation = storeGenerationOf(document);
-  const json = storedProjection(document);
+  let normalized = false;
+  const json = storedProjection(document, () => (normalized = true));
   const state = Buffer.from(Y.encodeStateAsUpdate(document));
-  return { generation, json, state };
+  return { generation, json, state, normalized };
 }
 
 /**
@@ -96,7 +99,9 @@ export function snapshotHoldsRow(coveredRow: string | null, rowYdoc: Uint8Array 
 /**
  * The JSON a store writes as the page's `content`: `storeSafeJson(fromYdoc(document))` (#773). #827: compaction
  * rebuilds a page from exactly this, so its ADR 0019 digest (`stableHash` of it) is the one a conditional write names.
+ * `onNormalized` is called when `storeSafeJson` changed anything (#784; a clean page comes back as `fromYdoc`'s own
+ * object, so it is never called for one).
  */
-export function storedProjection(document: Y.Doc): any {
-  return storeSafeJson(TiptapTransformer.fromYdoc(document, 'default'));
+export function storedProjection(document: Y.Doc, onNormalized?: () => void): any {
+  return storeSafeJson(TiptapTransformer.fromYdoc(document, 'default'), onNormalized);
 }

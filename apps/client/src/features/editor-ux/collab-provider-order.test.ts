@@ -17,6 +17,7 @@ import {
 } from "@hocuspocus/provider";
 import { createCollabAccessController } from "./collab-access-controller";
 import {
+  installedProviderDependencyVersion,
   installedProviderVersion,
   readClientFrame,
   ScriptedSocket,
@@ -95,6 +96,64 @@ function wire(socket: ScriptedSocket): string[] {
   });
 }
 
+/** #845: one client frame with what the binding reads: each awareness entry, and the client ids of each struct. */
+type Frame =
+  | { kind: "Awareness"; entries: { id: number; clock: number; state: unknown }[] }
+  | { kind: "Step2" | "Update"; structClients: number[] }
+  | { kind: string };
+
+function frames(socket: ScriptedSocket): Frame[] {
+  return socket.sent.map((bytes) => {
+    const { type, decoder } = readClientFrame(bytes);
+    if (type === MessageType.Auth) return { kind: "Auth" };
+    if (type === MessageType.Sync) {
+      const sub = decoding.readVarUint(decoder);
+      if (sub !== STEP2 && sub !== UPDATE) return { kind: sub === STEP1 ? "Step1" : `Sync${sub}` };
+      const update = decoding.readVarUint8Array(decoder);
+      return {
+        kind: sub === STEP2 ? "Step2" : "Update",
+        structClients: Y.decodeUpdate(update).structs.map((s) => s.id.client),
+      };
+    }
+    if (type === MessageType.Awareness) {
+      const inner = decoding.createDecoder(decoding.readVarUint8Array(decoder));
+      const entries: { id: number; clock: number; state: unknown }[] = [];
+      const n = decoding.readVarUint(inner);
+      for (let i = 0; i < n; i++) {
+        const id = decoding.readVarUint(inner);
+        const clock = decoding.readVarUint(inner);
+        entries.push({ id, clock, state: JSON.parse(decoding.readVarString(inner)) });
+      }
+      return { kind: "Awareness", entries };
+    }
+    return { kind: `type${type}` };
+  });
+}
+
+/** Index of the first frame announcing `id` the way every receiver applies it: a state, at clock ≥ 1 (y-protocols drops clock 0 for an id it has never seen). */
+const announceOf = (fs: Frame[], id: number) =>
+  fs.findIndex(
+    (f) =>
+      f.kind === "Awareness" &&
+      "entries" in f &&
+      f.entries.some((e) => e.id === id && e.clock >= 1 && e.state !== null),
+  );
+/** Index of the first frame carrying a struct at `id`. */
+const firstStructAt = (fs: Frame[], id: number) =>
+  fs.findIndex((f) => "structClients" in f && f.structClients.includes(id));
+
+/**
+ * #845: make Yjs regenerate the client's id: the server delivers a struct written under the client's own id (a copy of
+ * the client's document with one more insert at its id), so the remote transaction changes the client's own state.
+ */
+function serverWritesAtClientId(socket: ScriptedSocket, ydoc: Y.Doc) {
+  const twin = new Y.Doc();
+  Y.applyUpdate(twin, Y.encodeStateAsUpdate(ydoc));
+  twin.clientID = ydoc.clientID; // set after the apply: applying under the same id would regenerate the twin's own
+  twin.getText("server").insert(0, "written under the client's id");
+  socket.receive(serverFrames.syncStep2(DOC, twin));
+}
+
 /** The server's side of a 4.7.1 open: Authenticated, then its Step1 (the client answers it with its Step2). */
 function serverOpens(socket: ScriptedSocket, serverDoc: Y.Doc) {
   socket.receive(serverFrames.authenticated(DOC));
@@ -135,6 +194,11 @@ afterEach(() => {
 describe("the provider and page-editor under test", () => {
   it("is @hocuspocus/provider 4.7.1", () => {
     expect(installedProviderVersion()).toBe("4.7.1");
+  });
+
+  it("runs y-protocols 1.0.6 and yjs 13.6.30 (#845: the client-id follow reads their Awareness and regeneration)", () => {
+    expect(installedProviderDependencyVersion("y-protocols")).toBe("1.0.6");
+    expect(installedProviderDependencyVersion("yjs")).toBe("13.6.30");
   });
 
   it("page-editor passes a string token (an async token function would put frames made during `await getToken()` before Auth)", () => {
@@ -201,5 +265,78 @@ describe("own awareness precedes every document update (ADR 0036 §4 binding evi
     const frames = wire(second);
     expect(frames.some((f) => f === "Update" || f === "Step2")).toBe(true);
     expectAnnouncedFirst(frames, ydoc.clientID);
+  });
+});
+
+// cccvu/wiki-v2 #845 — Yjs regenerates `doc.clientID` when a remote update writes at it, but y-protocols' Awareness keeps
+// the id it was built with. Without a follow the new id is never announced (the server binds it by its first struct, as
+// a relay: applied unbound and forgeable), the provider's onClose then removes the local state (it keeps only
+// `document.clientID`), and every reconnect sends no awareness at all.
+describe("a regenerated client id is announced before any struct at it (#845)", () => {
+  it("after the regeneration, no struct at the new id goes on the wire before Awareness(new id) at clock ≥ 1 with the state, even when an awareness `change` listener writes (the cursor plugin then ySync)", async () => {
+    const { ydoc, remote } = setup();
+    const awareness = remote.awareness!;
+    awareness.setLocalStateField("user", { name: "Ada" });
+    let armed = false;
+    awareness.on("change", (_change: unknown, origin: unknown) => {
+      if (armed && origin === "local") ydoc.getText("cursor").insert(0, "|");
+    });
+    const socket = last();
+    socket.open();
+    await flush();
+    serverOpens(socket, new Y.Doc());
+    await flush();
+    const before = ydoc.clientID;
+    const clock = awareness.meta.get(before)!.clock;
+    armed = true;
+    serverWritesAtClientId(socket, ydoc);
+    armed = false;
+    ydoc.getText("t").insert(0, "typed after the regeneration ");
+    await flush();
+    const after = ydoc.clientID;
+    expect(after).not.toBe(before); // anti-vacuity: Yjs did regenerate
+    const fs = frames(socket);
+    const firstZ = firstStructAt(fs, after);
+    expect(firstZ).toBeGreaterThanOrEqual(0); // anti-vacuity: structs at the new id were sent
+    const announce = announceOf(fs, after);
+    expect(announce).toBeGreaterThanOrEqual(0);
+    expect(announce).toBeLessThan(firstZ);
+    // The exact sequence the server's binding sees (the guard spec mirrors it): the old id removed at its next clock,
+    // then the new id with the state one clock later, back to back.
+    expect(fs.slice(announce - 1, announce + 1)).toEqual([
+      { kind: "Awareness", entries: [{ id: before, clock: clock + 1, state: null }] },
+      { kind: "Awareness", entries: [{ id: after, clock: clock + 2, state: { user: { name: "Ada" } } }] },
+    ]);
+  });
+
+  it("a reconnect after the regeneration announces the new id (today's provider onClose removed the local state, so it sent no awareness)", async () => {
+    vi.spyOn(Math, "random").mockReturnValue(0.9999);
+    const { ydoc, remote } = setup();
+    remote.awareness!.setLocalStateField("user", { name: "Ada" });
+    const first = last();
+    first.open();
+    await flush();
+    serverOpens(first, new Y.Doc());
+    await flush();
+    const before = ydoc.clientID;
+    serverWritesAtClientId(first, ydoc);
+    await flush();
+    expect(ydoc.clientID).not.toBe(before); // anti-vacuity
+    first.serverClose(1006);
+    await flush();
+    await vi.advanceTimersByTimeAsync(1_000);
+    const second = last();
+    expect(second).not.toBe(first);
+    second.open();
+    await flush();
+    serverOpens(second, new Y.Doc());
+    await flush();
+    const fs = frames(second);
+    expect(fs.slice(0, 2).map((f) => f.kind)).toEqual(["Auth", "Step1"]);
+    expect(fs[2]).toEqual({
+      kind: "Awareness",
+      entries: [{ id: ydoc.clientID, clock: expect.any(Number), state: { user: { name: "Ada" } } }],
+    });
+    expect((fs[2] as { entries: { clock: number }[] }).entries[0].clock).toBeGreaterThanOrEqual(1);
   });
 });

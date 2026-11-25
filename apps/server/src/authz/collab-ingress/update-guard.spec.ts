@@ -41,6 +41,7 @@ import {
   siblingsShape,
   twoClientsShape,
   unguardedSteps,
+  type RawStruct,
   type Shape,
   type StructBlock,
 } from './conflict-scan.testkit';
@@ -543,12 +544,37 @@ describe('#781 B4: a client id is bound to its user (forged clocks)', () => {
     expectRefused(s, s.conn('attacker'), forge(s, 1001, 'FORGED '), REFUSED('foreign-client'));
   });
 
-  // A regenerated client id is NOT bound this way once its connection announced its old id: relay-binding.spec.ts pins it.
+  // A regenerated client id is NOT bound this way once its connection announced its old id, unless the client announces
+  // the new one (#845): relay-binding.spec.ts pins both.
   it('bound by the first new struct when the connection announced nothing (a pagehide-nulled awareness)', () => {
     const { s, victim, vc } = victimSetup();
     expect(s.deliver(vc, awarenessFrame([{ clientID: 1001, state: null }]))).toBe('applied'); // null never binds
     expect(s.send(vc, victim.edit(s.live, () => textOf(find(victim.doc, 'paragraph')).insert(0, 'first ')))).toBe('applied');
     expectRefused(s, s.conn('attacker'), forge(s, 1001, 'FORGED '), REFUSED('foreign-client'));
+  });
+
+  it('#845: a state for an id this connection already announced is not parsed again; a new connection\'s is', () => {
+    const { s, vc } = victimSetup();
+    const meta = new Map<number, { clock: number }>();
+    (s.live as unknown as { awareness: unknown }).awareness = { meta };
+    const move = (c: Conn, clock: number) => {
+      const out = s.deliver(c, awarenessFrame([{ clientID: 1001, clock, state: { user: { name: 'V' }, cursor: clock } }]));
+      meta.set(1001, { clock }); // what Hocuspocus then applies
+      return out;
+    };
+    expect(move(vc, 1)).toBe('applied'); // announced and bound (awareness-only)
+    const parse = jest.spyOn(JSON, 'parse');
+    // only the guard's parses of this awareness state count (any other JSON.parse in the process is not this spec's)
+    const stateParses = () => parse.mock.calls.filter(([text]) => typeof text === 'string' && text.includes('"cursor"')).length;
+    try {
+      expect(move(vc, 2)).toBe('applied'); // a cursor move: nothing to learn
+      expect(stateParses()).toBe(0);
+      expect(move(s.conn('victim'), 3)).toBe('applied'); // the same user's new connection: its own evidence
+      expect(stateParses()).toBe(1);
+    } finally {
+      parse.mockRestore();
+    }
+    expectRefused(s, s.conn('attacker'), forge(s, 1001, 'FORGED '), UNRESOLVED_REASON); // still bound to the victim
   });
 
   it('accepted: awareness echoes, a reader claiming a writer\'s id, a remount resending a bound peer\'s cached structs', () => {
@@ -2044,13 +2070,43 @@ describe('#816 conflict scan: a frame whose integrate walks would stall the proc
     expect(JSON.parse(line.slice(line.indexOf('{')))).toMatchObject({ steps: CONFLICT_SCAN_STEPS_PER_FRAME + 1 });
   });
 
-  it('report mode counts and never refuses: the frame applies, logged with the whole count', () => {
+  it('report mode counts and never refuses: the frame applies, logged with the whole count (#832: the recovery pin)', () => {
     const shape = twoClientsShape(1100);
+    expect(unguardedSteps(shape.base, shape.frame)).toBeGreaterThan(CONFLICT_SCAN_STEPS_PER_FRAME); // it trips
     const s = setup({ seed: shape.base, mode: 'report' });
     expect(s.send(s.conn('attacker'), shape.frame)).toBe('applied');
-    const line = s.logs.find((l) => l.includes('"rule":"conflict-scan"'))!;
-    expect(JSON.parse(line.slice(line.indexOf('{')))).toMatchObject({ steps: unguardedSteps(shape.base, shape.frame), mode: 'report' });
+    const refusals = s.logs.filter((l) => l.startsWith('COLLAB_UPDATE_REFUSED '));
+    expect(refusals).toHaveLength(1);
+    expect(JSON.parse(refusals[0].slice(refusals[0].indexOf('{')))).toMatchObject({
+      rule: 'conflict-scan',
+      steps: unguardedSteps(shape.base, shape.frame),
+      mode: 'report',
+      outcome: 'applied',
+    });
     expect(Y.encodeStateVector(s.live)).toEqual(Y.encodeStateVector(unguarded(shape.base, shape.frame)));
+  });
+
+  it('#832: an accepted frame past half the cap is logged COLLAB_CONFLICT_SCAN_NEAR_CAP (numbers only); under it, nothing', () => {
+    const nearCap = (s: ReturnType<typeof setup>) => s.logs.filter((l) => l.startsWith('COLLAB_CONFLICT_SCAN_NEAR_CAP '));
+    const near = twoClientsShape(800); // 800·800 + 799 steps: past half the cap, under the cap
+    const steps = unguardedSteps(near.base, near.frame);
+    expect(steps).toBeGreaterThan(CONFLICT_SCAN_STEPS_PER_FRAME / 2);
+    expect(steps).toBeLessThanOrEqual(CONFLICT_SCAN_STEPS_PER_FRAME);
+    const s = setup({ seed: near.base });
+    expect(s.send(s.conn('editor'), near.frame)).toBe('applied');
+    expect(nearCap(s).map((l) => JSON.parse(l.slice(l.indexOf('{'))))).toEqual([
+      { steps, cap: CONFLICT_SCAN_STEPS_PER_FRAME, pageId: expect.any(String) },
+    ]);
+    const under = twoClientsShape(600);
+    expect(unguardedSteps(under.base, under.frame)).toBeLessThan(CONFLICT_SCAN_STEPS_PER_FRAME / 2);
+    const u = setup({ seed: under.base });
+    expect(u.send(u.conn('editor'), under.frame)).toBe('applied');
+    expect(nearCap(u)).toEqual([]);
+    // a report-mode trip is a refusal line of its own, never a near-cap one
+    const over = twoClientsShape(1100);
+    const r = setup({ seed: over.base, mode: 'report' });
+    expect(r.send(r.conn('editor'), over.frame)).toBe('applied');
+    expect(nearCap(r)).toEqual([]);
   });
 
   it('fails closed: a meter error (getItem throws in the replay) is refused internal, stage conflict-scan; the shadow rebuilds', () => {
@@ -2077,6 +2133,138 @@ describe('#816 conflict scan: a frame whose integrate walks would stall the proc
     expect(s.send(s.conn('editor'), overlap, SYNC.Step2)).toBe('applied'); // the same frame, honest, after the fault
     expect(s.guard.shadowOf(s.live)).not.toBe(shadow); // rebuilt from live, unmetered
     expect(textOf(find(s.live, 'paragraph')).toString()).toBe('abcdvictim text');
+  });
+});
+
+/**
+ * #832 (ADR 0036): report mode lets honest editing through while a content rule misfires, never a rule refused in every
+ * mode (ALWAYS_ENFORCED, or a throw inside Yjs). A report-mode conflict-scan trip used to relabel the frame's every-mode
+ * refusal `conflict-scan`, which report mode applies. Each row first proves the meter tripped (the unguarded walk, and
+ * the trip's own line), so none passes on a frame that never reached the cap.
+ */
+describe('#832 report mode: a conflict-scan trip never hides a rule refused in every mode', () => {
+  const K = 9; // a stored multi-value keyed item's client id (#847's G1 head)
+  /** The trip frame (twoClientsShape) on a base that also holds, on its paragraph, the keyed item K:0..2 holding three
+   *  values, and a value in a root that is not `default`. */
+  const tripBase = () => {
+    const shape = twoClientsShape(1100);
+    const p = shape.base.getXmlFragment('default').get(0) as Y.XmlElement;
+    const paragraph: [number, number] = [p._item!.id.client, p._item!.id.clock];
+    Y.applyUpdate(shape.base, rawUpdate([{ client: K, clock: 0, structs: [{ origin: null, right: null, parent: paragraph, sub: 'textAlign', content: new Y.ContentAny(['left', 'center', 'right']) }] }]));
+    const other = new Y.Doc();
+    other.clientID = 77;
+    other.getMap('evil').set('k', 'v');
+    Y.applyUpdate(shape.base, Y.encodeStateAsUpdate(other));
+    return shape;
+  };
+  /** The trip frame plus a delete that splits the stored keyed item (keyed-split) or a delete in `evil` (root). */
+  const plusDelete = (frame: Uint8Array, client: number, clock: number) => Y.mergeUpdates([frame, rawUpdate([], [{ client, ranges: [[clock, 1]] }])]);
+  /** The trip frame plus an image whose src is an object (a report-only rule of the shadow step). */
+  const plusBadImage = (base: Y.Doc, frame: Uint8Array) =>
+    Y.mergeUpdates([
+      frame,
+      new RemoteClient(base).edit(base, (f) => {
+        const img = new Y.XmlElement('image');
+        img.setAttribute('src', { evil: 1 } as never);
+        f.insert(1, [img]);
+      }),
+    ]);
+  const refusalLines = (s: ReturnType<typeof setup>) =>
+    s.logs.filter((l) => l.startsWith('COLLAB_UPDATE_REFUSED ')).map((l) => JSON.parse(l.slice(l.indexOf('{'))) as Record<string, unknown>);
+  const tripLine = (s: ReturnType<typeof setup>) => refusalLines(s).find((l) => l.rule === 'conflict-scan');
+
+  it('report, trip and a report-only shadow violation: applied, logged conflict-scan (recovery is kept)', () => {
+    const shape = tripBase();
+    const frame = plusBadImage(shape.base, shape.frame);
+    expect(unguardedSteps(shape.base, frame)).toBeGreaterThan(CONFLICT_SCAN_STEPS_PER_FRAME);
+    const s = setup({ seed: shape.base, mode: 'report' });
+    expect(s.send(s.conn('attacker'), frame)).toBe('applied');
+    expect(refusalLines(s)).toEqual([expect.objectContaining({ rule: 'conflict-scan', mode: 'report', outcome: 'applied' })]);
+    expect(tripLine(s)!.steps as number).toBeGreaterThan(CONFLICT_SCAN_STEPS_PER_FRAME);
+    expect(Y.encodeStateVector(s.live)).toEqual(Y.encodeStateVector(unguarded(shape.base, frame)));
+    // control: the image alone is a violation report mode logs and applies (enforce refuses it)
+    const c = setup({ seed: shape.base, mode: 'report' });
+    const image = plusBadImage(shape.base, new Uint8Array([0, 0]));
+    expect(c.send(c.conn('attacker'), image)).toBe('applied');
+    expect(refusalLines(c)).toEqual([expect.objectContaining({ rule: 'string-attr', mode: 'report', outcome: 'applied' })]);
+  });
+
+  it('report, trip and a report-only pre-pass violation (too many new client ids): applied, and the trip line says applied', () => {
+    const shape = tripBase();
+    // the trip frame's 1100 siblings (client 3, as twoClientsShape) and one more sibling at each of 65 new ids, in one frame
+    const sibling = (): RawStruct => ({ origin: [1, shape.first + 4], right: [1, shape.first + 5], content: new Y.ContentString('x') });
+    const frame = rawUpdate([
+      { client: 3, clock: 0, structs: Array.from({ length: 1100 }, sibling) },
+      ...Array.from({ length: NEW_CLIENT_IDS_PER_FRAME + 1 }, (_, i) => ({ client: 5000 + i, clock: 0, structs: [sibling()] })),
+    ]);
+    expect(new Set(Y.decodeUpdate(frame).structs.map((st) => st.id.client)).size).toBe(NEW_CLIENT_IDS_PER_FRAME + 2); // precondition
+    expect(unguardedSteps(shape.base, frame)).toBeGreaterThan(CONFLICT_SCAN_STEPS_PER_FRAME);
+    const s = setup({ seed: shape.base, mode: 'report' });
+    expect(s.send(s.conn('attacker'), frame)).toBe('applied');
+    // an applied frame is never logged `blocked` (that outcome feeds the editing-blocked page)
+    expect(refusalLines(s)).toEqual([
+      expect.objectContaining({ rule: 'conflict-scan', mode: 'report', outcome: 'applied' }),
+      expect.objectContaining({ rule: 'client-ids', mode: 'report', outcome: 'applied' }),
+    ]);
+    expect(tripLine(s)!.steps as number).toBeGreaterThan(CONFLICT_SCAN_STEPS_PER_FRAME);
+    expect(Y.encodeStateVector(s.live)).toEqual(Y.encodeStateVector(unguarded(shape.base, frame)));
+  });
+
+  it.each([
+    ['a delete that splits a stored keyed item', 'keyed-split', () => [K, 2] as const],
+    ['a delete in a root that is not default', 'root', (base: Y.Doc) => {
+      const id = ((base.getMap('evil') as any)._map.get('k') as Y.Item).id;
+      return [id.client, id.clock] as const;
+    }],
+  ])('report, trip and %s: refused %s (never applied), and the trip is still logged', (_name, rule, target) => {
+    const shape = tripBase();
+    const [client, clock] = target(shape.base);
+    const frame = plusDelete(shape.frame, client, clock);
+    expect(unguardedSteps(shape.base, frame)).toBeGreaterThan(CONFLICT_SCAN_STEPS_PER_FRAME);
+    const s = setup({ seed: shape.base, mode: 'report' });
+    expectRefused(s, s.conn('attacker'), frame, REFUSED(rule));
+    expect(refusalLines(s)).toEqual([
+      expect.objectContaining({ rule: 'conflict-scan', mode: 'report', outcome: 'blocked' }),
+      expect.objectContaining({ rule, mode: 'report', outcome: 'blocked' }),
+    ]);
+    expect(tripLine(s)!.steps as number).toBeGreaterThan(CONFLICT_SCAN_STEPS_PER_FRAME);
+    // control: the delete alone is refused the same way, in report mode too
+    const c = setup({ seed: shape.base, mode: 'report' });
+    expectRefused(c, c.conn('attacker'), rawUpdate([], [{ client, ranges: [[clock, 1]] }]), REFUSED(rule));
+  });
+
+  it('report, trip and then a throw inside Yjs\'s apply: refused internal, stage yjs (never relabelled conflict-scan)', () => {
+    const shape = tripBase();
+    expect(unguardedSteps(shape.base, shape.frame)).toBeGreaterThan(CONFLICT_SCAN_STEPS_PER_FRAME);
+    const s = setup({ seed: shape.base, mode: 'report' });
+    const real = Y.applyUpdate;
+    // Yjs throws once the frame integrated (in the shadow's apply, the inspect origin), after the meter tripped
+    const spy = jest.spyOn(Y, 'applyUpdate').mockImplementation((doc: Y.Doc, update: Uint8Array, origin?: unknown) => {
+      real(doc, update, origin);
+      if (typeof origin === 'symbol' && origin.description === 'ccc-collab-inspect') throw new Error('yjs threw');
+    });
+    try {
+      expectRefused(s, s.conn('attacker'), shape.frame, REFUSED('internal'));
+    } finally {
+      spy.mockRestore();
+    }
+    expect(refusalLines(s)).toEqual([
+      expect.objectContaining({ rule: 'conflict-scan', mode: 'report', outcome: 'blocked' }),
+      expect.objectContaining({ rule: 'internal', stage: 'yjs', mode: 'report', outcome: 'blocked' }),
+    ]);
+    expect(tripLine(s)!.steps as number).toBeGreaterThan(CONFLICT_SCAN_STEPS_PER_FRAME);
+  });
+
+  it.each([
+    ['trip only', (shape: Shape) => shape.frame],
+    ['trip and a keyed split', (shape: Shape) => plusDelete(shape.frame, K, 2)],
+  ])('enforce, %s: refused conflict-scan at the cap, as before', (_name, frameOf) => {
+    const shape = tripBase();
+    const frame = frameOf(shape);
+    expect(unguardedSteps(shape.base, frame)).toBeGreaterThan(CONFLICT_SCAN_STEPS_PER_FRAME);
+    const s = setup({ seed: shape.base });
+    expectRefused(s, s.conn('attacker'), frame, REFUSED('conflict-scan'));
+    expect(refusalLines(s)).toEqual([expect.objectContaining({ rule: 'conflict-scan', steps: CONFLICT_SCAN_STEPS_PER_FRAME + 1, mode: 'enforce', outcome: 'blocked' })]);
   });
 });
 
@@ -2288,6 +2476,24 @@ describe('#816 client ids new to the page: a ceiling per frame and the (user, do
     expect(s.send(s.conn('editor'), ids(s, 6000, NEW_CLIENT_IDS_PER_FRAME))).toBe('applied');
   });
 
+  it('#832: report mode logs more than the ceiling client-ids and applies the frame', () => {
+    const s = setup({ seed: SEED, mode: 'report' });
+    expect(s.send(s.conn('attacker'), ids(s, 5000, NEW_CLIENT_IDS_PER_FRAME + 1))).toBe('applied');
+    const lines = s.logs.filter((l) => l.startsWith('COLLAB_UPDATE_REFUSED ')).map((l) => JSON.parse(l.slice(l.indexOf('{'))));
+    expect(lines).toEqual([expect.objectContaining({ rule: 'client-ids', mode: 'report', outcome: 'applied' })]);
+    expect(Y.getState(s.live.store, 5000 + NEW_CLIENT_IDS_PER_FRAME)).toBe(1);
+  });
+
+  it('#832: a block holding only a Skip names no new id: the ceiling plus a Skip-only block at another fresh id passes', () => {
+    const s = setup({ seed: SEED });
+    const { blocks } = blocksOf(ids(s, 6000, NEW_CLIENT_IDS_PER_FRAME));
+    const skipOnly = 9_999;
+    const frame = encodeStructs([...blocks, { client: skipOnly, clock: 0, structs: [new Y.Skip(Y.createID(skipOnly, 0), 1)] }]);
+    expect(new Set(Y.decodeUpdate(frame).structs.map((st) => st.id.client)).size).toBe(NEW_CLIENT_IDS_PER_FRAME + 1); // precondition
+    expect(s.send(s.conn('editor'), frame)).toBe('applied');
+    expect(Y.getState(s.live.store, skipOnly)).toBe(0); // a Skip integrates nothing
+  });
+
   it('they are charged to the per-(user, document) id budget: exhausted, the socket closes 1013; refilled, they pass', () => {
     let t = 1_000_000;
     const s = setup({ seed: SEED, now: () => t });
@@ -2372,7 +2578,8 @@ describe('#816 the per-user collab CPU budget (a debt)', () => {
     expect(s.guard.cpuBalance('a')).toBe(USER_COLLAB_CPU_BURST_MS - 3_000);
     cpu.apply = 1;
     expect(s.send(s.conn('a'), edit())).toBe(TRY_LATER);
-    expect(s.limitLogs.some((l) => l.includes('"limit":"user_collab_cpu"'))).toBe(true);
+    const debt = s.limitLogs.find((l) => l.includes('"limit":"user_collab_cpu"'))!;
+    expect(JSON.parse(debt.slice(debt.indexOf('{')))).toEqual({ limit: 'user_collab_cpu', userId: 'a', balanceMs: -1_000 }); // #832: its depth
     expect(s.send(s.conn('b'), edit())).toBe('applied'); // per user
     const refill = (1_000 / USER_COLLAB_CPU_REFILL_MS_PER_SECOND) * 1_000; // wall ms that pay back 1000 ms of debt
     advance(refill - 1_000);
@@ -2450,5 +2657,15 @@ describe('#816 the per-user collab CPU budget (a debt)', () => {
     cpu.apply = 1_500;
     for (let i = 0; i < 4; i++) expect(s.send(s.conn('a'), edit())).toBe('applied');
     expect(s.limitLogs.some((l) => l.includes('"limit":"user_collab_cpu"'))).toBe(true);
+  });
+
+  it('#832: a socket load refused for CPU debt is logged load_debt with the debt\'s depth (balanceMs)', () => {
+    const t = 1_000_000;
+    const s = setup({ seed: SEED, now: () => t });
+    expect(s.guard.admitLoad('a')).toBe(true);
+    expect(s.limitLogs).toEqual([]);
+    s.guard.chargeLoad('a', USER_COLLAB_CPU_BURST_MS + 750, t);
+    expect(s.guard.admitLoad('a')).toBe(false);
+    expect(s.limitLogs.map((l) => JSON.parse(l.slice(l.indexOf('{'))))).toEqual([{ limit: 'load_debt', userId: 'a', balanceMs: -750 }]);
   });
 });

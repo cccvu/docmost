@@ -18,8 +18,8 @@
  *     runs Yjs left split are joined, #827's `textRunsDigest`, and it reloads strict-equal to itself), with `row_sha` =
  *     sha256 of the raw bytes, or no image when it cannot be built.
  *     After the commit, compaction is requested: unstable (`order_divergence`) drains now when one can start; unknown
- *     (`load_steps`, so #827's build-failure memo still holds) waits for the next unload (one slow reload is no
- *     evidence; a joiner still meets the guard's join check).
+ *     (`reload_failed`, #851: not an order heal, so #827's build-failure memo still holds) waits for the next unload
+ *     (one slow reload is no evidence; a joiner still meets the guard's join check).
  *   - Load (`loadStableYdoc`, the only loader of `pages.ydoc`; heal-image.fitness.spec.ts pins it).
  *     (a) a heal row naming the row's bytes: once compaction is armed, one transaction compare-and-swaps the image in
  *         and deletes the heal row (compaction's own swap, which deletes it), then the image is served; before that,
@@ -30,7 +30,8 @@
  *         ydoc without one, and it served the reload order): the stale row is dropped and the row is (d).
  *     (d) no heal row: served as before; an unstable (legacy, pre-#840) row requests compaction from the loaded tree,
  *         which is the order users already see today, and from then on the only one. A reload that ran out of bounds
- *         (`reload_failed`) is no evidence: logged as such and compacted at unload under the memo (`load_steps`).
+ *         (`reload_failed`) is no evidence: logged as such and compacted at unload under the memo (reason
+ *         `reload_failed`, #851).
  *   Every branch hands the exact bytes it applied to the guard's replica log (`attachReplicaLog`), and ends with #793's
  *   claim of the page's binding seal (binding-seal.ts `claimAtLoad`: restored only on (c)/(d)). The load's
  *   `COLLAB_ORDER_DIVERGENCE` lines are rate-limited per page and outcome (order-divergence-log.ts).
@@ -42,18 +43,20 @@
  *
  * Reloads run under the #816 meter with a deadline innermost (the load's budget). Images are built under
  * COMPACTION_DEADLINE_MS from documents they made (the live tree is read with the snapshot, outside any deadline).
- * Logs: `COLLAB_ORDER_DIVERGENCE` (order-divergence-log.ts), and `COLLAB_COMPACTION_FAILED` when an image cannot be
- * built.
+ * Logs: `COLLAB_ORDER_DIVERGENCE` (order-divergence-log.ts), `COLLAB_COMPACTION_FAILED` when an image cannot be
+ * built, and `COLLAB_STORE_NORMALIZED` (#784) when a store's snapshot is not `fromYdoc`'s own output (below).
  */
 import { createHash } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
 import * as Y from 'yjs';
 import { sql } from 'kysely';
-import type { KyselyDB } from '@docmost/db/types/kysely.types';
+import { Logger } from '@nestjs/common';
+import type { KyselyDB, KyselyTransaction } from '@docmost/db/types/kysely.types';
 import { COLLAB_PAGE_COMPACTING_REASON, pageCompactingRefusal } from '../collab-ingress/collab-reasons';
 import { logCompactionFailed, logCompactionRequested } from '../collab-ingress/compaction-log';
 import { ConflictScan, installConflictScanMeter, type ConflictScanMeter } from '../collab-ingress/conflict-scan';
 import { runWithDeadline } from '../collab-ingress/deadline';
+import { RateLimitedWarn } from '../collab-ingress/socket-limit-log';
 import { COMPACTION_DEADLINE_MS } from '../collab-ingress/doc-bounds';
 import { attachReplicaLog } from '../collab-ingress/exact-replica-registry';
 import { claimAtLoad, claimSealRow, commitSealRow, type BindingSealStore } from './binding-seal';
@@ -92,7 +95,7 @@ const meter = (): ConflictScanMeter => (meterInstance ??= installConflictScanMet
  * when they are, else the first difference's kind, or `reload_failed` when the reload threw (a trip of the walk budget
  * or the deadline, a malformed state). Only the reload runs under the meter and the deadline; live is read outside.
  */
-const RELOAD_FAILED = 'reload_failed';
+const RELOAD_FAILED = 'reload_failed' satisfies CompactionReason;
 
 function reloadDiff(live: Y.Doc, encoded: Uint8Array, bounds: LoadBounds): string | null {
   const reload = new Y.Doc({ gc: live.gc, gcFilter: live.gcFilter });
@@ -235,6 +238,7 @@ export interface PreparedStore {
 export async function prepareStore(document: Y.Doc, pageId: string): Promise<PreparedStore> {
   const coveredRow = coveredRowAtSnapshot(document);
   const snapshot = snapshotForStore(document);
+  noteStoreNormalized(document, pageId, snapshot);
   const order = checkStoreOrder(document, snapshot);
   if (order.stable) return { snapshot, order, coveredRow, underLock: false };
   await yieldToEventLoop();
@@ -255,10 +259,55 @@ export async function storeSnapshotUnderLock(
 ): Promise<PreparedStore> {
   if (snapshotHoldsRow(prepared.coveredRow, rowYdoc)) return prepared;
   const snapshot = snapshotForStore(document);
+  noteStoreNormalized(document, pageId, snapshot);
   const order = checkStoreOrder(document, snapshot);
   if (order.stable) return { snapshot, order, coveredRow: null, underLock: true };
   await yieldToEventLoop();
   return { snapshot, order: withHealImage(pageId, order), coveredRow: null, underLock: true };
+}
+
+// --- the store's normalization line (#784)
+
+export const COLLAB_STORE_NORMALIZED_TOKEN = 'COLLAB_STORE_NORMALIZED';
+/** Lines a minute across all pages; the rest are counted into one `log_suppressed` line when the window ends. */
+export const STORE_NORMALIZED_LOGS_PER_MINUTE = 30;
+/** Where the line goes (the specs spy on it). */
+export const storeNormalizedLogSink: { warn(line: string): void } = {
+  warn: (line) => storeNormalizedLogger.warn(line),
+};
+const storeNormalizedLogger = new Logger('CollabStoreNormalized');
+let storeNormalizedLines = newStoreNormalizedLines();
+function newStoreNormalizedLines(): RateLimitedWarn<typeof COLLAB_STORE_NORMALIZED_TOKEN> {
+  return new RateLimitedWarn({
+    logger: { warn: (line) => storeNormalizedLogSink.warn(line) },
+    perKey: STORE_NORMALIZED_LOGS_PER_MINUTE,
+    summary: (token, count) => `${token} ${JSON.stringify({ reason: 'log_suppressed', count })}`,
+  });
+}
+/** The documents already logged: one line per document lifetime, not one per store of a page that stays poisoned. */
+let storeNormalizedDocs = new WeakSet<Y.Doc>();
+
+/** The specs: a fresh rate-limit window, and no document logged yet. */
+export function resetStoreNormalizedLogForTests(): void {
+  storeNormalizedLines = newStoreNormalizedLines();
+  storeNormalizedDocs = new WeakSet<Y.Doc>();
+}
+
+/**
+ * `COLLAB_STORE_NORMALIZED {"pageId"}` (warn) when the store's snapshot is not `fromYdoc`'s own output: `storeSafeJson`
+ * wrote U+FFFD for a lone surrogate or NUL that Postgres refuses, or reshaped a value `JSON.stringify` writes otherwise
+ * (#773). The page stores and nothing is lost; before #773 the same page wedged its store (`COLLAB_STORE_FAILED`). The
+ * collab ingress does not refuse these strings, so a burst across pages points at a crafted client. At most once per
+ * document lifetime and STORE_NORMALIZED_LOGS_PER_MINUTE a minute; the page id only, never content. Never throws.
+ */
+function noteStoreNormalized(document: Y.Doc, pageId: string, snapshot: StoreSnapshot): void {
+  if (!snapshot.normalized || storeNormalizedDocs.has(document)) return;
+  storeNormalizedDocs.add(document);
+  try {
+    storeNormalizedLines.warn(COLLAB_STORE_NORMALIZED_TOKEN, () => `${COLLAB_STORE_NORMALIZED_TOKEN} ${JSON.stringify({ pageId })}`);
+  } catch {
+    // a log line is never a reason to fail the store
+  }
 }
 
 /** What the store did about order (flat, see StoreOrder). */
@@ -283,7 +332,7 @@ export interface OrderStoreOutcome {
  */
 export async function persistOrderState(
   db: KyselyDB | HealImageStore,
-  trx: unknown,
+  trx: KyselyTransaction,
   pageId: string,
   snapshot: StoreSnapshot,
   order: StoreOrder,
@@ -310,8 +359,8 @@ export async function persistOrderState(
  * After the store committed: an unstable one requests compaction from live (`order_divergence`), drains the page now
  * when a compaction can start (its sockets close 1013, so it unloads and compacts; the heal row covers a crash until
  * then), and logs. An unknown order (`reload_failed`: one slow reload, a GC pause on an honest page) never drains and
- * is never an order heal (`load_steps`, so a failed build's memo still holds): it is compacted at its next unload, and
- * a joiner is still checked by the guard's own join check. #827: like every drain,
+ * is never an order heal (requested as `reload_failed`, #851, so a failed build's memo still holds): it is compacted at
+ * its next unload, and a joiner is still checked by the guard's own join check. #827: like every drain,
  * only when the page heals after it: the unload can compact it (`unloadCanCompact`, which a failed build never stops for
  * an order heal), or the store wrote an image the next load adopts. A page with neither (bytes that leave structs
  * pending, no image) keeps its writers; its joiners wait on the guard's join check. Never throws.
@@ -319,9 +368,9 @@ export async function persistOrderState(
 export function afterOrderStore(document: Y.Doc, pageId: string, outcome: OrderStoreOutcome | null | undefined): void {
   try {
     if (!outcome?.unstable) return;
-    // An unknown order is no evidence of instability: requested as the guard requests a reload that ran out of bounds
-    // (`load_steps`), so #827's build-failure memo still holds for it. Only `order_divergence` lifts that memo.
-    const reason: CompactionReason = outcome.reloadFailed ? 'load_steps' : 'order_divergence';
+    // An unknown order is no evidence of instability: requested as `reload_failed` (#851), which like the guard's
+    // `load_steps` is no order heal, so #827's build-failure memo still holds for it. Only `order_divergence` lifts it.
+    const reason: CompactionReason = outcome.reloadFailed ? RELOAD_FAILED : 'order_divergence';
     const heals = outcome.imaged || unloadCanCompact(document, pageId, reason);
     const request: CompactionRequest = { reason, userId: null, drain: !outcome.reloadFailed && canStartCompaction(pageId) && heals };
     if (requestCompaction(document, request)) logCompactionRequested(pageId, request, { structs: outcome.structs });
@@ -434,9 +483,9 @@ export async function loadStableYdoc(
     }
     if (why === RELOAD_FAILED) {
       // The reload ran out of bounds: no evidence either way (a GC pause on an honest page). Compacted at its unload as
-      // any page whose reload trips is (`load_steps`, under #827's build-failure memo); a joiner is still checked by the
-      // guard's own join check.
-      const request: CompactionRequest = { reason: 'load_steps', userId: null, drain: false };
+      // any page whose reload trips is (`reload_failed`, #851: under #827's build-failure memo); a joiner is still
+      // checked by the guard's own join check.
+      const request: CompactionRequest = { reason: RELOAD_FAILED, userId: null, drain: false };
       if (requestCompaction(document, request)) logCompactionRequested(pageId, request, { structs });
       log(RELOAD_FAILED, false, structs);
     } else if (why !== null) {
@@ -590,10 +639,10 @@ export interface HealImageStore extends BindingSealStore {
   /** Delete the heal row iff it still names `rowSha` and the row's ydoc no longer has that digest. */
   dropStale(pageId: string, rowSha: string): Promise<void>;
   /** In the store's transaction: delete the page's heal row; when there was one and `ydoc` is given, write `ydoc` alone. True: written. */
-  clear(trx: unknown, pageId: string, ydoc: Uint8Array | null): Promise<boolean>;
+  clear(trx: KyselyTransaction, pageId: string, ydoc: Uint8Array | null): Promise<boolean>;
   /** In the store's transaction: write `ydoc` alone when given (no `updated_at`, no `content`), and upsert the heal row. */
   put(
-    trx: unknown,
+    trx: KyselyTransaction,
     pageId: string,
     heal: { image: Uint8Array | null; rowSha: string; epoch: number; contentDigest: string | null },
     ydoc: Uint8Array | null,
@@ -643,22 +692,20 @@ export function kyselyHealImageStore(db: KyselyDB): HealImageStore {
     },
     async clear(trx, pageId, ydoc) {
       await ensureHealImageTable(db);
-      const t = trx as KyselyDB;
-      const { rows } = await sql`delete from ccc_page_heal_image where page_id = ${pageId} returning page_id`.execute(t);
+      const { rows } = await sql`delete from ccc_page_heal_image where page_id = ${pageId} returning page_id`.execute(trx);
       if (rows.length === 0 || !ydoc) return false;
-      await sql`update pages set ydoc = ${Buffer.from(ydoc)} where id = ${pageId}`.execute(t);
+      await sql`update pages set ydoc = ${Buffer.from(ydoc)} where id = ${pageId}`.execute(trx);
       return true;
     },
     async put(trx, pageId, heal, ydoc) {
       await ensureHealImageTable(db);
-      const t = trx as KyselyDB;
-      if (ydoc) await sql`update pages set ydoc = ${Buffer.from(ydoc)} where id = ${pageId}`.execute(t);
+      if (ydoc) await sql`update pages set ydoc = ${Buffer.from(ydoc)} where id = ${pageId}`.execute(trx);
       await sql`
         insert into ccc_page_heal_image (page_id, image, row_sha, epoch, content_digest)
         values (${pageId}, ${heal.image ? Buffer.from(heal.image) : null}, ${heal.rowSha}, ${heal.epoch}, ${heal.contentDigest})
         on conflict (page_id) do update
           set image = excluded.image, row_sha = excluded.row_sha, epoch = excluded.epoch,
-              content_digest = excluded.content_digest, created_at = now()`.execute(t);
+              content_digest = excluded.content_digest, created_at = now()`.execute(trx);
     },
     claimSeal: (pageId, lifetimeId) => claimSealRow(db, pageId, lifetimeId),
     commitSeal: (pageId, lifetimeId, claimed, seal) => commitSealRow(db, pageId, lifetimeId, claimed, seal),

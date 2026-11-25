@@ -35,6 +35,9 @@ import { collabRefusalCause, type CollabRefusalCause } from "./collab-refusal-ca
  *   - `passive` (Read mode, or no edit permission: the editor was never editable under the cursor): role="status" and
  *     no focus move, the same text. Switching to Edit makes it an alert and focuses it once; switching back never
  *     moves focus.
+ *   - #845: `canEdit` false (no edit permission: a reader) titles a paused notice "Live updates are paused on this
+ *     page": a reader never edits, so "Editing is paused" named the wrong loss. The body already says other people's
+ *     edits no longer appear here.
  *   - `showsLocalCopy` false (the page still shows the server's saved version: the refusal came before the first sync,
  *     so this browser's copy was never rendered): the Discard confirm cannot ask the user to copy what they need from
  *     the page, so it says unsent changes are not shown and cannot be recovered after discarding.
@@ -52,6 +55,8 @@ export interface CollabRefusalNoticeProps {
   cause?: CollabRefusalCause;
   /** Read mode or no edit permission: an advisory status that does not take focus. */
   passive?: boolean;
+  /** #845: the user may edit this page (false: a reader, whose paused title names live updates). */
+  canEdit?: boolean;
   /** The page shows this browser's own copy (false: still the server's saved version). */
   showsLocalCopy?: boolean;
 }
@@ -62,6 +67,7 @@ export function CollabRefusalNotice({
   kind = "generic",
   cause = "other",
   passive = false,
+  canEdit = true,
   showsLocalCopy = true,
 }: CollabRefusalNoticeProps) {
   const { t } = useTranslation();
@@ -110,12 +116,14 @@ export function CollabRefusalNotice({
         title={
           notSaved
             ? t("A change from this browser was not saved")
-            : t("Editing is paused on this page")
+            : canEdit
+              ? t("Editing is paused on this page")
+              : t("Live updates are paused on this page")
         }
         mb="md"
       >
         <Stack gap="sm">
-          <Text size="sm">{refusalText(kind, cause, t)}</Text>
+          <Text size="sm">{refusalText(kind, cause, canEdit, t)}</Text>
           <Group gap="sm">
             {!discardFirst && (
               <Button size="xs" onClick={() => reload()}>
@@ -186,6 +194,7 @@ export function CollabRefusalNotice({
 function refusalText(
   kind: CollabRefusalKind,
   cause: CollabRefusalCause,
+  canEdit: boolean,
   t: (key: string) => string,
 ) {
   switch (kind) {
@@ -212,10 +221,21 @@ function refusalText(
         "The server did not accept a change from this browser, so editing is paused and other people's edits no longer appear here. Reload the page to continue. If that does not help, discard this browser's copy of the page.",
       );
     case "copy":
+      // #845: a reader never edits, so its body names only the lost live updates (as its title does).
+      if (!canEdit) {
+        return t(
+          "This browser's stored copy of the page does not match the server, so other people's edits no longer appear here. Reload the page to continue. If that does not help, discard this browser's copy of the page.",
+        );
+      }
       return t(
         "This browser's stored copy of the page does not match the server, so editing is paused and other people's edits no longer appear here. Reload the page to continue. If that does not help, discard this browser's copy of the page.",
       );
     default:
+      if (!canEdit) {
+        return t(
+          "The server stopped syncing this page with this browser, so other people's edits no longer appear here. Reload the page to continue. If that does not help, discard this browser's copy of the page.",
+        );
+      }
       return t(
         "The server stopped syncing this page with this browser, so editing is paused and other people's edits no longer appear here. Reload the page to continue. If that does not help, discard this browser's copy of the page.",
       );
@@ -234,6 +254,7 @@ export function CollabPageNotices({
   epoch,
   clearLocalCopy,
   passive = false,
+  canEdit = true,
   showsLocalCopy = true,
 }: {
   access: CollabAccessState;
@@ -241,6 +262,8 @@ export function CollabPageNotices({
   clearLocalCopy: () => Promise<void>;
   /** Read mode or no edit permission (`CollabRefusalNotice`). */
   passive?: boolean;
+  /** #845: the user may edit this page (`CollabRefusalNotice`). */
+  canEdit?: boolean;
   /** The page shows this browser's own copy (`CollabRefusalNotice`). */
   showsLocalCopy?: boolean;
 }) {
@@ -252,6 +275,7 @@ export function CollabPageNotices({
           kind={access.refusalKind}
           cause={collabRefusalCause(access.refusedRule)}
           passive={passive}
+          canEdit={canEdit}
           showsLocalCopy={showsLocalCopy}
           clearLocalCopy={clearLocalCopy}
         />
@@ -262,6 +286,7 @@ export function CollabPageNotices({
       <CollabRefusalNotice
         kind="compacted"
         passive={passive}
+        canEdit={canEdit}
         showsLocalCopy={showsLocalCopy}
         clearLocalCopy={clearLocalCopy}
         reload={epoch.openCurrentVersion}

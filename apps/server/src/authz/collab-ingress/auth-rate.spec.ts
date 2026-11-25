@@ -195,14 +195,22 @@ describe('#810 the session is charged before any read, the user only once the se
     h.live.add('live-B');
     for (let i = 0; i < COLLAB_AUTH_BURST + 10; i++) {
       const r = await h.auth('revoked-A');
-      // the first 64 reach the liveness read and are refused there; the rest are over the session's rate
-      expect(r).toEqual(i < COLLAB_AUTH_BURST ? expect.any(UnauthorizedException) : { reason: COLLAB_AUTH_RATE_REASON });
+      // the first 64 reach the liveness read and are refused there (#755: the quiet session_not_live refusal); the rest
+      // are over the session's rate
+      expect(r).toEqual({ reason: i < COLLAB_AUTH_BURST ? COLLAB_INVALID_TOKEN_REASON : COLLAB_AUTH_RATE_REASON });
     }
     expect(h.bounds.authRate.size).toBe(0); // the revoked session never touched the user's bucket
     const before = h.pageRepo.findById.mock.calls.length;
     expect(await h.auth('live-B')).toBeInstanceOf(NotFoundException); // past both rates and the liveness check
     expect(h.pageRepo.findById.mock.calls.length).toBe(before + 1);
-    expect(h.warn.mock.calls.map((c) => c[0])).toEqual(Array(10).fill(`COLLAB_SOCKET_LIMIT {"limit":"auth_session_rate","userId":"${USER}"}`));
+    const lines = h.warn.mock.calls.map((c) => c[0] as string);
+    // #755: the liveness refusals log `auth_refused` with their cause (rate-limited, so fewer lines than refusals)
+    const refused = lines.filter((l) => l.includes('"auth_refused"'));
+    expect(refused.length).toBeGreaterThan(0);
+    expect(new Set(refused)).toEqual(new Set([`COLLAB_SOCKET_LIMIT {"limit":"auth_refused","status":401,"cause":"session_not_live"}`]));
+    expect(lines.filter((l) => !l.includes('"auth_refused"'))).toEqual(
+      Array(10).fill(`COLLAB_SOCKET_LIMIT {"limit":"auth_session_rate","userId":"${USER}"}`),
+    );
   });
 
   it('two live sessions of one user together are refused at the 65th authentication, after the liveness read', async () => {

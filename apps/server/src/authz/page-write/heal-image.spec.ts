@@ -14,7 +14,7 @@ import { isPageCompactingRefusal, resetLoadTripsForTests } from './compaction';
 import { compactionRequest, LINEAGE_ROOT, lineageEpoch, noteBuildFailed, orderHealRequested, resetBuildFailuresForTests, setCompactionClockForTests } from './compaction-registry';
 import { liveContentDigest } from './doc-version';
 import { afterOrderStore, checkStoreOrder, loadStableYdoc, persistOrderState, prepareStore, resetContentHealRefusalsForTests, storeSnapshotUnderLock, type HealImageStore } from './heal-image';
-import { memoryHealStore } from './heal-image.testkit';
+import { memoryHealStore, NO_TRX } from './heal-image.testkit';
 import { sealLifetimeOf } from './binding-seal';
 import { snapshotForStore } from './persistence-steps';
 import { storeSafeJson } from './store-safe-json';
@@ -131,19 +131,19 @@ describe('persistOrderState (#840): in the store\'s transaction', () => {
     const calm = loaded(Y.encodeStateAsUpdate(basePage('x').doc));
     calm.getXmlFragment('default');
     const s0 = snapshotForStore(calm);
-    await expect(persistOrderState(store, {}, PAGE, s0, checkStoreOrder(calm, s0), false)).resolves.toMatchObject({ unstable: false });
+    await expect(persistOrderState(store, NO_TRX, PAGE, s0, checkStoreOrder(calm, s0), false)).resolves.toMatchObject({ unstable: false });
     expect(store.heals.has(PAGE)).toBe(false);
     expect(row.ydoc).toBeNull(); // content changed: the store's own write carries the bytes
     // Content unchanged: the bytes the heal row named are replaced here, or they stay and are served unhealed.
     store.heals.set(PAGE, { image: null, rowSha: 'old', epoch: 3 });
-    await expect(persistOrderState(store, {}, PAGE, s0, checkStoreOrder(calm, s0), true)).resolves.toMatchObject({ unstable: false, ydocWritten: true });
+    await expect(persistOrderState(store, NO_TRX, PAGE, s0, checkStoreOrder(calm, s0), true)).resolves.toMatchObject({ unstable: false, ydocWritten: true });
     expect(Buffer.from(row.ydoc!)).toEqual(s0.state);
     row.ydoc = null; // …and with no heal row, an unchanged stable store writes nothing (as before #840)
-    await expect(persistOrderState(store, {}, PAGE, s0, checkStoreOrder(calm, s0), true)).resolves.toMatchObject({ ydocWritten: false });
+    await expect(persistOrderState(store, NO_TRX, PAGE, s0, checkStoreOrder(calm, s0), true)).resolves.toMatchObject({ ydocWritten: false });
     expect(row.ydoc).toBeNull();
 
     const { snapshot, order } = await prepareStore(live, PAGE);
-    const out = await persistOrderState(store, {}, PAGE, snapshot, order, true);
+    const out = await persistOrderState(store, NO_TRX, PAGE, snapshot, order, true);
     expect(out).toMatchObject({ unstable: true, reloadFailed: false, imaged: true, ydocWritten: true });
     expect(Buffer.from(row.ydoc!)).toEqual(snapshot.state);
     const heal = store.heals.get(PAGE)!;
@@ -159,7 +159,7 @@ describe('persistOrderState (#840): in the store\'s transaction', () => {
     live.getMap(LINEAGE_ROOT).set('epoch', 'not a number');
     const store = memoryHealStore();
     const { snapshot, order } = await prepareStore(live, PAGE);
-    const out = await persistOrderState(store, {}, PAGE, snapshot, order, false);
+    const out = await persistOrderState(store, NO_TRX, PAGE, snapshot, order, false);
     expect(out).toMatchObject({ unstable: true, imaged: false, ydocWritten: false });
     expect(store.heals.get(PAGE)).toEqual({ image: null, rowSha: sha(snapshot.state), epoch: -1, contentDigest: liveContentDigest(live) });
   });
@@ -173,7 +173,7 @@ describe('buildHealImage (#840): never an image that reloads into another order'
     try {
       const store = memoryHealStore();
       const { snapshot, order } = await prepareStore(live, PAGE);
-      const out = await persistOrderState(store, {}, PAGE, snapshot, order, false);
+      const out = await persistOrderState(store, NO_TRX, PAGE, snapshot, order, false);
       expect(spy).toHaveBeenCalledTimes(1);
       expect(out).toMatchObject({ unstable: true, imaged: false });
       expect(store.heals.get(PAGE)).toMatchObject({ image: null, epoch: 1 });
@@ -246,7 +246,7 @@ describe('loadStableYdoc (#840): the branches the crash matrix does not reach', 
     const row = { ydoc: null as Uint8Array | null };
     const store = memoryHealStore(row);
     const { snapshot, order } = await prepareStore(live, PAGE);
-    await persistOrderState(store, {}, PAGE, snapshot, order, true);
+    await persistOrderState(store, NO_TRX, PAGE, snapshot, order, true);
     return { live, row, store, raw: snapshot.state };
   }
 
@@ -335,7 +335,7 @@ describe('a reload that throws at the store is no evidence of instability (#840 
     expect(prepared.order.image).not.toBeNull(); // fail closed for a crash: an unknown order stays recoverable
     const row = { ydoc: null as Uint8Array | null };
     const store = memoryHealStore(row);
-    const out = await persistOrderState(store, {}, PAGE, prepared.snapshot, prepared.order, true);
+    const out = await persistOrderState(store, NO_TRX, PAGE, prepared.snapshot, prepared.order, true);
     expect(out).toMatchObject({ unstable: true, reloadFailed: true, imaged: true });
     expect(store.heals.get(PAGE)).toMatchObject({ rowSha: sha(prepared.snapshot.state), epoch: 1 });
 
@@ -345,8 +345,8 @@ describe('a reload that throws at the store is no evidence of instability (#840 
       const closes: Array<[number, string]> = [];
       const live = Object.assign(calm, { getConnections: () => [{ webSocket: { close: (code: number, reason: string) => closes.push([code, reason]) } }] });
       afterOrderStore(live, PAGE, out);
-      // requested as any reload past its bounds is (#827's memo still holds), never as an order heal
-      expect(compactionRequest(live)).toEqual({ reason: 'load_steps', userId: null, drain: false });
+      // requested as `reload_failed` (#851; #827's memo still holds), never as an order heal
+      expect(compactionRequest(live)).toEqual({ reason: 'reload_failed', userId: null, drain: false });
       expect(orderHealRequested(live)).toBe(false);
       expect(closes).toEqual([]); // never a page-wide drain for one slow reload
       expect(outcomes(warn)).toEqual(['reload_failed']);
@@ -386,7 +386,7 @@ describe('a reload that throws at the store is no evidence of instability (#840 
       const doc = new Y.Doc();
       await loadStableYdoc(doc, PAGE, stable, memoryHealStore({ ydoc: stable }));
       expect(calls).toBe(2);
-      expect(compactionRequest(doc)).toEqual({ reason: 'load_steps', userId: null, drain: false });
+      expect(compactionRequest(doc)).toEqual({ reason: 'reload_failed', userId: null, drain: false }); // #851
       expect(orderHealRequested(doc)).toBe(false);
       expect(outcomes(warn)).toEqual(['reload_failed']);
       expect(logRebuilds(doc)).toBe(true); // served as loaded
@@ -452,7 +452,7 @@ describe('loadStableYdoc (#840 review items 1 and 2)', () => {
     const row = { ydoc: null as Uint8Array | null, content: undefined as unknown };
     const store = memoryHealStore(row);
     const prepared = await prepareStore(live, PAGE);
-    await persistOrderState(store, {}, PAGE, prepared.snapshot, { ...prepared.order, image: null }, true);
+    await persistOrderState(store, NO_TRX, PAGE, prepared.snapshot, { ...prepared.order, image: null }, true);
     row.content = JSON.parse(JSON.stringify(prepared.snapshot.json)); // jsonb
     expect(store.heals.get(PAGE)).toMatchObject({ image: null, epoch: 1 });
     return { live, row, store, raw: prepared.snapshot.state };
@@ -595,7 +595,7 @@ describe('#840 heals after the #827 merge: split text runs and the write-idem le
     const store = memoryHealStore(row);
     const { snapshot, order } = await prepareStore(live, PAGE);
     expect(order.image).not.toBeNull(); // with the exact digest: null (CompactionDigestMismatchError)
-    const out = await persistOrderState(store, {}, PAGE, snapshot, order, true);
+    const out = await persistOrderState(store, NO_TRX, PAGE, snapshot, order, true);
     expect(out).toMatchObject({ unstable: true, imaged: true });
     const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
     const doc = new Y.Doc();
@@ -616,7 +616,7 @@ describe('#840 heals after the #827 merge: split text runs and the write-idem le
     const row = { ydoc: null as Uint8Array | null, content: undefined as unknown };
     const store = memoryHealStore(row);
     const prepared = await prepareStore(live, PAGE);
-    await persistOrderState(store, {}, PAGE, prepared.snapshot, { ...prepared.order, image: null }, true);
+    await persistOrderState(store, NO_TRX, PAGE, prepared.snapshot, { ...prepared.order, image: null }, true);
     row.content = JSON.parse(JSON.stringify(prepared.snapshot.json)); // jsonb
     expect(store.heals.get(PAGE)).toMatchObject({ image: null, epoch: 1 });
     const warn = jest.spyOn(Logger.prototype, 'warn').mockImplementation(() => undefined);
@@ -642,7 +642,7 @@ describe('#840 heals after the #827 merge: split text runs and the write-idem le
     const row = { ydoc: null as Uint8Array | null, content: undefined as unknown };
     const store = memoryHealStore(row);
     const prepared = await prepareStore(live, PAGE);
-    await persistOrderState(store, {}, PAGE, prepared.snapshot, { ...prepared.order, image: null }, true);
+    await persistOrderState(store, NO_TRX, PAGE, prepared.snapshot, { ...prepared.order, image: null }, true);
     // the same ProseMirror document with the run joined: textRunsDigest-equal, but not the bytes live's store wrote
     const joined = JSON.parse(JSON.stringify(prepared.snapshot.json));
     const para = joined.content[0];

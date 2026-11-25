@@ -791,7 +791,7 @@ describe("page-editor wiring", () => {
 
   it("the notices are told the access state, the epoch and how to clear the local copy", () => {
     expect(source).toMatch(
-      /<CollabPageNotices[^>]*\s+access=\{collabAccess\}\s+epoch=\{collabEpoch\}\s+passive=\{[^}]*\}\s+showsLocalCopy=\{!showStatic\}\s+clearLocalCopy=\{\(\) => clearLocalCollabCopy\(providersRef\.current\?\.local\)\}/,
+      /<CollabPageNotices[^>]*\s+access=\{collabAccess\}\s+epoch=\{collabEpoch\}\s+passive=\{[^}]*\}\s+canEdit=\{editable\}\s+showsLocalCopy=\{!showStatic\}\s+clearLocalCopy=\{\(\) => clearLocalCollabCopy\(providersRef\.current\?\.local\)\}/,
     );
     expect(source).not.toMatch(/collabAccess\.refused &&/); // the notice decides what shows (a clean epoch switch shows none)
   });
@@ -813,10 +813,10 @@ describe("page-editor wiring", () => {
   });
 
   // The ledger-echo incident: the notice's copy, its role and its Discard wording follow the refusal and the view.
-  it("the refusal notice gets the rule's cause, passive outside Edit mode, and whether this browser's copy is shown", () => {
+  it("the refusal notice gets the rule's cause, passive outside Edit mode, whether the user can edit (#845), and whether this browser's copy is shown", () => {
     // the cause comes from `refusedRule` inside CollabPageNotices (collab-refusal-notice.test.tsx pins it)
     expect(source).toMatch(
-      /<CollabPageNotices[^\n]*\n\s*access=\{collabAccess\}\s*epoch=\{collabEpoch\}\s*passive=\{!\(editable && currentPageEditMode === PageEditMode\.Edit\)\}\s*showsLocalCopy=\{!showStatic\}/,
+      /<CollabPageNotices[^\n]*\n\s*access=\{collabAccess\}\s*epoch=\{collabEpoch\}\s*passive=\{!\(editable && currentPageEditMode === PageEditMode\.Edit\)\}\s*canEdit=\{editable\}\s*showsLocalCopy=\{!showStatic\}/,
     );
   });
 
