@@ -48,6 +48,12 @@ import * as Y from 'yjs';
  * refuse that keystroke 4422 and detach an honest editor; the frame's total is what costs the process.
  */
 export const CONFLICT_SCAN_STEPS_PER_FRAME = 1_000_000;
+/**
+ * #832: an accepted frame that walked more than this (half the cap, about 2.8 times the largest honest walk measured)
+ * is logged `COLLAB_CONFLICT_SCAN_NEAR_CAP` (its steps and the cap, numbers only), a lead-time signal that honest
+ * walks are nearing the cap. No alarm: a frame past the cap is refused, and that refusal pages.
+ */
+export const CONFLICT_SCAN_NEAR_CAP_STEPS = CONFLICT_SCAN_STEPS_PER_FRAME / 2;
 
 type YModule = typeof Y;
 type Trip = { steps: number };

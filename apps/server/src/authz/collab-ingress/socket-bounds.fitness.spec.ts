@@ -196,6 +196,7 @@ describe('#810 fitness: one CollabSocketBounds per process', () => {
     expect(extension).toMatch(/this\.collabSocketBounds\.chargeSession\(userId, jwtPayload\.sessionId\);\s*this\.collabSocketBounds\.admitUser\(userId\);/);
     expect(extension).toMatch(/this\.collabSocketBounds\.chargeUser\(userId\);/);
     expect(extension).toMatch(/throw this\.collabSocketBounds\.invalidToken\(error\);/);
+    expect(extension).toMatch(/\) \{\s*throw this\.collabSocketBounds\.sessionNotLive\(\);\s*\}/); // #755: the liveness refusal
     expect(gateway).toMatch(/this\.collabSocketBounds\.quietAuthRefusals\(this\.authenticationExtension\),/);
     expect(gateway).not.toMatch(/^\s*this\.authenticationExtension,\s*$/m); // never the bare extension (#810 L1)
     // a value import: `import type` would drop the constructor's design:paramtypes, and Nest could not inject it

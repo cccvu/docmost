@@ -190,17 +190,33 @@ export function applyClientSync(
 
 /** The installed @hocuspocus/provider version (the tests pin 4.7.1 so a stale install cannot pass them). */
 export function installedProviderVersion(): string {
+  return installedVersion("@hocuspocus/provider", "@hocuspocus/provider", import.meta.url);
+}
+
+/**
+ * #845: the installed y-protocols and yjs versions, as the provider resolves them (the copies its Awareness and its
+ * document come from). The client-id follow in collab-access-controller.ts relies on y-protocols 1.0.6's Awareness
+ * (a writable `clientID`, `meta` clocks, a clock-0 state for an unseen id being dropped) and on yjs 13.6.30
+ * regenerating `doc.clientID` before `afterTransactionCleanup`; a bump re-reads both before changing the pin.
+ */
+export function installedProviderDependencyVersion(pkg: "y-protocols" | "yjs"): string {
   const require = createRequire(import.meta.url);
-  const entry = require.resolve("@hocuspocus/provider");
-  let dir = dirname(entry);
+  const provider = require.resolve("@hocuspocus/provider");
+  return installedVersion(pkg, pkg === "yjs" ? "yjs" : "y-protocols/awareness", provider);
+}
+
+/** The version of `pkg`, found by resolving `entry` from `from` and walking up to `pkg`'s package.json. */
+function installedVersion(pkg: string, entry: string, from: string): string {
+  const require = createRequire(from);
+  let dir = dirname(require.resolve(entry));
   for (let i = 0; i < 4; i += 1) {
     try {
-      const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
-      if (pkg.name === "@hocuspocus/provider") return pkg.version;
+      const json = JSON.parse(readFileSync(join(dir, "package.json"), "utf8"));
+      if (json.name === pkg) return json.version;
     } catch {
       // not here: walk up
     }
     dir = dirname(dir);
   }
-  throw new Error("could not find @hocuspocus/provider's package.json");
+  throw new Error(`could not find ${pkg}'s package.json`);
 }

@@ -84,6 +84,19 @@ describe('JwtStrategy.validate: access tokens are session-bound (#133)', () => {
     ).rejects.toBeInstanceOf(UnauthorizedException);
   });
 
+  // wiki-v2 #755: a collab token carries the same session id (#537), so only its type keeps it off /api. The socket.io
+  // upgrade gate refuses it by type before any read (realtime-socket-bounds.spec.ts, 'a wrong token type (collab)').
+  it('rejects a collab-type token with 401 even when its session is live, before any session read', async () => {
+    const { strategy, userSessionRepo, sessionActivityService } = build(liveSession);
+    const req = { raw: {} } as any;
+    await expect(
+      strategy.validate(req, payload({ type: 'collab' } as unknown as Partial<JwtPayload>)),
+    ).rejects.toBeInstanceOf(UnauthorizedException);
+    expect(userSessionRepo.findActiveById).not.toHaveBeenCalled();
+    expect(sessionActivityService.trackActivity).not.toHaveBeenCalled();
+    expect(req.raw.sessionId).toBeUndefined();
+  });
+
   it.each([
     ['a different user', { ...liveSession, userId: 'someone-else' }],
     ['a different workspace', { ...liveSession, workspaceId: 'other-ws' }],

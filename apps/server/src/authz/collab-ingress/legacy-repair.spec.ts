@@ -6,6 +6,7 @@ import { EditorState } from '@tiptap/pm/state';
 import { fixTables, TableMap } from '@tiptap/pm/tables';
 import { initProseMirrorDoc, prosemirrorJSONToYDoc, updateYFragment } from '@tiptap/y-tiptap';
 import { docGeneration } from '../page-write/doc-version';
+import * as prelimContent from '../page-write/prelim-content';
 import { serverSchema } from '../page-write/prelim-content';
 import {
   ALL_NODES_DOC,
@@ -22,6 +23,7 @@ import {
   syncFrame,
 } from './collab-ingress.testkit';
 import { CollabUpdateGuardExtension } from './collab-update-guard.extension';
+import * as contentRules from './content-rules';
 import { checkAttribute, checkElement, checkFormat, INT_ATTRS, STRING_ATTRS } from './content-rules';
 import { planLegacyRepair, repairLegacyValues, REPAIR_ORIGIN, type LegacyRepair } from './legacy-repair';
 import { SocketLimitLog } from './socket-limit-log';
@@ -419,6 +421,47 @@ describe('#781 legacy repair: an abutting mark run never spills over the repaire
       { insert: 'b1b2' },
       { insert: 'cc', attributes: { link: { href: 'y' } } },
     ]);
+  });
+});
+
+// #845: the two `skipped` branches cannot trigger with today's schema and rules (legacy-repair.ts header), so they are
+// pinned here with a synthetic schema and a synthetic rule. Each would otherwise delete what it must leave alone.
+describe('#845 legacy repair: the defensive skipped branches leave the value alone', () => {
+  afterEach(() => jest.restoreAllMocks());
+
+  it('an attribute the schema declares required (no default) is skipped, never removed', () => {
+    const doc = lifetime(stored((f) => f.insert(0, [el('paragraph', { textAlign: 10n }, runs(['x']))])), false);
+    const p = find(doc, 'paragraph');
+    expect(checkAttribute('paragraph', 'textAlign', [10n], { yjs: true })).toMatchObject({ rule: 'value-kind' }); // non-vacuity
+    // Synthetic: paragraph's textAlign has no default (planLegacyRepair reads only `nodes[name].spec.attrs`).
+    const synthetic = { nodes: { paragraph: { spec: { attrs: { textAlign: {} } } } } };
+    jest.spyOn(prelimContent, 'serverSchema').mockReturnValue(synthetic as never);
+    const updates = updatesOf(doc, () =>
+      expect(repairLegacyValues(doc)).toEqual({ attrs: 0, marks: 0, spills: 0, skipped: 1, rules: {} }),
+    );
+    expect(updates).toEqual([]);
+    expect(p.getAttribute('textAlign')).toBe(10n);
+  });
+
+  it('a refused mark run whose earlier value would fail checkFormat when written back is skipped, with no transaction', () => {
+    const real = contentRules.checkFormat;
+    const doc = lifetime(
+      stored((f) => f.insert(0, [para(formatted('aabbcc', [0, 4, { link: { href: 'x' } }], [2, 2, { link: { href: 123 } }]))])),
+      false,
+    );
+    const before = runsOf(textOf(find(doc, 'paragraph')));
+    expect(planLegacyRepair(doc).report).toMatchObject({ marks: 1, spills: 1, skipped: 0 }); // non-vacuity: a spill run
+    // Synthetic: the earlier `link x` value fails a non-value rule (kept by the walk, refused when written back).
+    jest
+      .spyOn(contentRules, 'checkFormat')
+      .mockImplementation((key, value) =>
+        key === 'link' && (value as { href?: unknown })?.href === 'x' ? { rule: 'schema', mark: 'link' } : real(key, value),
+      );
+    const updates = updatesOf(doc, () =>
+      expect(repairLegacyValues(doc)).toEqual({ attrs: 0, marks: 0, spills: 0, skipped: 1, rules: {} }),
+    );
+    expect(updates).toEqual([]);
+    expect(runsOf(textOf(find(doc, 'paragraph')))).toEqual(before);
   });
 });
 

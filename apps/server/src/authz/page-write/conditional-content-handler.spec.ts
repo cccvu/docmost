@@ -510,18 +510,18 @@ describe('CollaborationHandler.conditionalUpdatePageContent — idempotency (#42
     }
   });
 
-  // One-release dual read: a retry whose first apply ran on a pre-fix replica (raw `${userId}\0${key}` entry)
-  // must still dedup after the roll, and still only for that user (S1).
-  it('a retry recorded raw by a pre-fix replica still dedups; another user\'s raw entry does not', async () => {
+  // #845: the one-release dual read is removed. A raw `${userId}\0${key}` entry a pre-v0.12.4 replica recorded is
+  // only an aging tombstone: it no longer dedups (every rollback target below v0.12.4 also crosses #827).
+  it('a retry recorded raw by a pre-v0.12.4 replica no longer dedups (the dual read is removed)', async () => {
     const { handler, ledger, opsLog } = build();
     ledger.set('user-1\u0000K1', Date.now());
-    await expect(handler(DOC, payload('K1'))).resolves.toEqual({ applied: false, reason: 'duplicate' });
-    expect(opsLog[0]).not.toContain('insert');
-    // Control: user-2's raw entry with the same key does not suppress user-1's write.
+    await expect(handler(DOC, payload('K1'))).resolves.toEqual({ applied: true });
+    expect(opsLog[0]).toContain('insert');
+    // Control: the h1 entry of the same (user, key) does dedup.
     const other = build();
-    other.ledger.set('user-2\u0000K1', Date.now());
-    await expect(other.handler(DOC, payload('K1'))).resolves.toEqual({ applied: true });
-    expect(other.opsLog[0]).toContain('insert');
+    other.ledger.set(scopedWriteKey('user-1', 'K1').entry, Date.now());
+    await expect(other.handler(DOC, payload('K1'))).resolves.toEqual({ applied: false, reason: 'duplicate' });
+    expect(other.opsLog[0]).not.toContain('insert');
   });
 });
 
@@ -950,19 +950,19 @@ describe('CollaborationHandler.conditionalUpdatePageContent — #716', () => {
     });
 
     // The resident pre-check is its own call site of the dedup (it only exists under refuseOverCap with a resident
-    // doc, and opens no connection); it reads the pre-fix raw entry too, so the retry is duplicate, not too_large.
-    it('resident: a retry recorded raw by a pre-fix replica answers duplicate (the dual read at the pre-check)', async () => {
+    // doc, and opens no connection). #845: it reads the h1 entry only; a pre-v0.12.4 raw entry is no retry.
+    it('resident: the pre-check dedups an h1 entry and ignores a raw one (the dual read is removed)', async () => {
       const { handler, hocuspocus, ledger } = build();
-      ledger.set(`${USER.id}\u0000K`, Date.now());
+      ledger.set(scopedWriteKey(USER.id, 'K').entry, Date.now());
       await expect(handler(DOC, req({ idempotencyKey: 'K', refuseOverCap: true }))).resolves.toEqual({
         applied: false,
         reason: 'duplicate',
       });
       expect(hocuspocus.openDirectConnection).not.toHaveBeenCalled(); // decided at the resident pre-check
-      // Control: another user's raw entry is not this user's retry.
-      const other = build();
-      other.ledger.set('user-2\u0000K', Date.now());
-      await expect(other.handler(DOC, req({ idempotencyKey: 'K', refuseOverCap: true }))).resolves.toEqual({
+      // A raw entry of the same (user, key) is not read: the write meets the cap.
+      const raw = build();
+      raw.ledger.set(`${USER.id}\u0000K`, Date.now());
+      await expect(raw.handler(DOC, req({ idempotencyKey: 'K', refuseOverCap: true }))).resolves.toEqual({
         applied: false,
         reason: 'too_large',
       });

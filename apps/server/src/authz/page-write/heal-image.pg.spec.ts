@@ -18,6 +18,7 @@ import { compactionStoreOf, isPageCompactingRefusal, resetLoadTripsForTests } fr
 import { awaitCompaction, compactionRequest, lineageEpoch, setCompactionClockForTests } from './compaction-registry';
 import { liveContentDigest } from './doc-version';
 import { healStoreOf } from './heal-image';
+import { installHealImageTable } from './heal-image.installer';
 import { resetLoadDivergenceLogForTests } from './order-divergence-log';
 import { tiptapExtensions } from '../../collaboration/collaboration.util';
 import { recordWriteKey, scopedWriteKey } from './write-idem';
@@ -565,7 +566,7 @@ d('heal image crash matrix on real Postgres (#840)', () => {
     const h = await heal();
     expect(h).toMatchObject({ rowSha: sha(r.ydoc), epoch: 1 }); // fail closed for a crash: the unknown order is recoverable
     expect(h!.image).not.toBeNull();
-    expect(compactionRequest(doc)).toMatchObject({ reason: 'load_steps', drain: false }); // never a page-wide drain, never an order heal (#827's memo holds)
+    expect(compactionRequest(doc)).toMatchObject({ reason: 'reload_failed', drain: false }); // never a page-wide drain, never an order heal (#827's memo holds)
     expect(divergence()).toEqual([expect.objectContaining({ where: 'store', outcome: 'reload_failed' })]);
     expect(lines.filter((l) => l.startsWith('COLLAB_ORDER_DIVERGENCE ') && l.includes('ERROR'))).toEqual([]);
 
@@ -682,5 +683,31 @@ d('heal image crash matrix on real Postgres (#840)', () => {
     expect(lineageEpoch(compacted)).toBe(1);
     expect(isReloadStable(compacted).stable).toBe(true);
     expect(json(compacted)).toEqual(served); // consistent everywhere from then on
+  });
+  // #851: a table an earlier, unreleased #840 build made has no content_digest. The install looks the column up in
+  // information_schema and adds it (an ALTER only when missing); an existing row survives with a NULL digest. The case
+  // leaves the table in its canonical shape (the column back, last, nullable), so it does not depend on running last.
+  it('the install adds content_digest to an earlier-build table, keeps its rows, and a second run changes nothing', async () => {
+    const columns = async () =>
+      (await pg<{ name: string; type: string; nullable: string }[]>`
+        select column_name as name, data_type as type, is_nullable as nullable from information_schema.columns
+         where table_schema = current_schema() and table_name = 'ccc_page_heal_image' order by ordinal_position`).map(
+        (c) => `${c.name}:${c.type}:${c.nullable}`,
+      );
+    const canonical = await columns();
+    expect(canonical[canonical.length - 1]).toBe('content_digest:text:YES');
+    await pg`alter table ccc_page_heal_image drop column content_digest`; // the earlier build's shape
+    expect(await columns()).toEqual(canonical.slice(0, -1));
+    await insert({ type: 'doc', content: [] }, null);
+    await pg`insert into ccc_page_heal_image (page_id, image, row_sha, epoch) values (${pageId}, ${Buffer.from([1, 2])}, 'sha', 3)`;
+
+    await installHealImageTable(db as never);
+    expect(await columns()).toEqual(canonical);
+    const kept = async () => (await pg`select image, row_sha, epoch, content_digest from ccc_page_heal_image where page_id = ${pageId}`)[0];
+    expect(await kept()).toEqual({ image: Buffer.from([1, 2]), row_sha: 'sha', epoch: 3, content_digest: null });
+
+    await installHealImageTable(db as never); // idempotent: the column is there, so no ALTER
+    expect(await columns()).toEqual(canonical);
+    expect(await kept()).toEqual({ image: Buffer.from([1, 2]), row_sha: 'sha', epoch: 3, content_digest: null });
   });
 });

@@ -11,6 +11,7 @@ import {
   DOC_NAME,
   processCpuMs,
   renderLikeABrowser,
+  runnerSlowdown,
   step1Frame,
   SYNC,
   syncFrame,
@@ -264,6 +265,7 @@ function runSeed(seed: number) {
 describe('#816 honest concurrency never meets the CPU bounds', () => {
   it(`${SEEDS} seeded sessions of 2–5 concurrent editors: every frame accepted, every peer converges`, () => {
     let lowest = Infinity;
+    let unclear = 0;
     for (let seed = 1; seed <= SEEDS; seed++) {
       const h = runSeed(seed);
       seen.frames += h.results.frames;
@@ -275,12 +277,18 @@ describe('#816 honest concurrency never meets the CPU bounds', () => {
       expect(renderLikeABrowser(h.live)).toMatchObject({ deleted: false, threw: false });
       // #840: the replay log stayed exact and trusted through the session, and no honest editor became a suspect
       expect({ seed, distrust: replicaLogDistrust(h.live), suspects: h.guard.suspectsOf(h.live) }).toEqual({ seed, distrust: null, suspects: [] });
+      // #851: honest editors DO end up `unclear` (a paste's items walk past the rest of the paste to their rightOrigin, so
+      // a frame of a few hundred items spends the blame walk budget): they stand in only for an instability with no
+      // suspect, at most once per episode (exact-shadow.spec.ts pins that bound). Counted for the tally, not asserted.
+      unclear += h.guard.unclearOf(h.live).length;
       expect(strictOrderDiff(replicaLogOf(h.live)!.rebuild({ gc: h.live.gc }), h.live)).toBeNull();
     }
     // anti-vacuity: the corpus really sent frames of every kind it claims
-    if (process.env.CONFLICT_SCAN_TALLY) console.log(JSON.stringify({ ...seen, lowest }));
-    // the CPU budget: no honest session came near the debt (a wide margin, so a slow CI runner stays far from it)
-    expect(lowest).toBeGreaterThan(USER_COLLAB_CPU_BURST_MS / 2);
+    if (process.env.CONFLICT_SCAN_TALLY) console.log(JSON.stringify({ ...seen, lowest, slowdown: runnerSlowdown(), unclear }));
+    // the CPU budget: no honest session came near the debt. The spend is real CPU time, scaled to a production-class core
+    // (#832: runnerSlowdown, 1 on a runner at least as fast as Graviton2), so a slower runner does not fail it.
+    expect(lowest).toBeLessThan(USER_COLLAB_CPU_BURST_MS); // anti-vacuity: the corpus was charged
+    expect((USER_COLLAB_CPU_BURST_MS - lowest) / runnerSlowdown()).toBeLessThan(USER_COLLAB_CPU_BURST_MS / 2);
     expect(seen.frames).toBeGreaterThan(SEEDS * 200);
     for (const n of Object.values(seen)) expect(n).toBeGreaterThan(0);
   });
@@ -325,10 +333,15 @@ describe('#816 honest concurrency never meets the CPU bounds', () => {
     h.connect(c);
     expect(Y.decodeStateVector(Y.encodeStateVector(c.doc)).size - Y.decodeStateVector(Y.encodeStateVector(seedDoc)).size).toBeGreaterThan(4);
     expect(h.results.refused).toEqual([]);
-    if (process.env.CONFLICT_SCAN_TALLY) console.log(JSON.stringify({ worstLowest: h.results.lowestBalance }));
+    expect(h.guard.suspectsOf(h.live)).toEqual([]);
+    if (process.env.CONFLICT_SCAN_TALLY) {
+      console.log(JSON.stringify({ worstLowest: h.results.lowestBalance, slowdown: runnerSlowdown(), unclear: h.guard.unclearOf(h.live) }));
+    }
     // a 2000-paragraph paste, then a 176k-step Step2: never in debt. Real CPU clock: measured ~1,590 of 2,000 ms left on
-    // the dev box (~4.7x headroom); a runner that much slower would fail here, which is the signal to re-measure.
-    expect(h.results.lowestBalance).toBeGreaterThan(0);
+    // the dev box (~4.7x headroom), the spend scaled to a production-class core (#832: runnerSlowdown), so a slower
+    // runner does not fail it, and a costlier honest path on production-class CPU still does.
+    expect(h.results.lowestBalance).toBeLessThan(USER_COLLAB_CPU_BURST_MS); // anti-vacuity: it was charged
+    expect((USER_COLLAB_CPU_BURST_MS - h.results.lowestBalance) / runnerSlowdown()).toBeLessThan(USER_COLLAB_CPU_BURST_MS);
     expect(contentOf(h.live)).toEqual(contentOf(c.doc));
   });
 

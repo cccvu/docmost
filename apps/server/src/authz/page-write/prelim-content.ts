@@ -15,7 +15,7 @@
  * Pinned by prelim-content.parity.spec.ts against `toYdoc` itself: byte-identical updates, the same tree, the same
  * `fromYdoc` JSON and digest. A y-prosemirror bump must re-run it.
  *
- * Two deliberate differences from a build in another document, both so the LIVE document holds exactly what a document
+ * Three deliberate differences from a build in another document, all so the LIVE document holds exactly what a document
  * decoded from its own encoding would hold (the same `fromYdoc` JSON, deep-equal and `stableHash`-equal, before and
  * after a reload — the ADR 0019 digest and the store's deep-equal no-op read it):
  *   - every attribute and format value is a fresh plain copy, as Yjs's decoder hands values back. ProseMirror shares one
@@ -24,10 +24,13 @@
  *     schema has none, pinned by the parity spec, so this throw is unreachable until the schema changes.
  *   - every string (text, attribute and format values, object keys) is made well-formed: a lone UTF-16 surrogate (half
  *     an emoji) becomes U+FFFD. Yjs's encoder (`TextEncoder`) does that to text and attribute values, so a decoded
- *     document never holds one; a raw insert would, and Postgres jsonb refuses its `fromYdoc` JSON on every store from
- *     then on (#731 review). A FORMAT value is written as escaped JSON, so `toYdoc`'s round trip KEEPS a lone surrogate
- *     there and poisons the page the same way; this build normalizes it too, the one place it differs from `toYdoc` in
- *     content. Pinned by the parity spec's lone-surrogate case.
+ *     document never holds one; this keeps live equal to its own reload. It is not what makes the page storable: the
+ *     collab store (`storeSafeJson`, #773) is the storage boundary, for lone surrogates and NUL alike (#784). A FORMAT
+ *     value is written as escaped JSON, so `toYdoc`'s round trip (and a reload) KEEPS a lone surrogate there; this
+ *     build normalizes it anyway, so a /v1 write never plants one in the Yjs state every client receives. That is the
+ *     one place it differs from `toYdoc` in content, pinned by the parity spec's lone-surrogate case. NUL is left as
+ *     is: Yjs keeps it through encode and decode, so replacing it here would break the byte parity with `toYdoc`, and
+ *     the store maps it.
  */
 import * as Y from 'yjs';
 import { getSchema } from '@tiptap/core';
@@ -43,7 +46,10 @@ export function serverSchema(): Schema {
   return schema;
 }
 
-/** A string as Yjs's decoder returns it: a lone surrogate is U+FFFD (Node ≥ 20; the target lib predates the type). */
+/**
+ * A string as Yjs's decoder returns it: a lone surrogate is U+FFFD, NUL is kept (Node ≥ 20; the target lib predates
+ * the type). Live equality with a reload, not storability: the store maps what Postgres refuses (#773, #784).
+ */
 const wellFormed = (s: string): string => (s as string & { toWellFormed(): string }).toWellFormed();
 
 /**

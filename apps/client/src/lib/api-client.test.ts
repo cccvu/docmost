@@ -36,6 +36,7 @@ vi.mock("@/lib/config.ts", () => ({ isCloud: () => false }));
 
 import { AxiosError } from "axios";
 import api from "@/lib/api-client";
+import { shouldRetryCollabToken } from "@/features/auth/queries/auth-query";
 
 const RESP_URL = "https://wiki.example/api/pages/info";
 const originalAdapter = api.defaults.adapter;
@@ -148,6 +149,176 @@ describe("api-client 401 self-heal (#310)", () => {
 
     expect(openDocmostSession).not.toHaveBeenCalled();
     expect(window.location.href).toBe(""); // public experience renders; no /login bounce
+  });
+});
+
+/**
+ * wiki-v2 #755: a 401 from POST /api/auth/collab-token returned `undefined` before the #310 re-mint, so getCollabToken
+ * threw a TypeError with no `response`, the token query retried it as a network error for ~30 s, and an editor whose
+ * wiki session ended behind a live platform session stayed lost until a reload. Now it takes the one re-mint and,
+ * when a 401 remains, rejects with that AxiosError (terminal for the token query); it never redirects to /login.
+ * Driven through the real interceptor with a real AxiosError on the collab-token responseURL.
+ */
+describe("api-client collab-token 401 (#755)", () => {
+  const COLLAB_URL = "https://wiki.example/api/auth/collab-token";
+  const BODY = { data: { token: "collab.jwt" } };
+  function collab401(config: any): never {
+    throw new AxiosError(
+      "Request failed with status code 401",
+      "ERR_BAD_REQUEST",
+      config,
+      { responseURL: COLLAB_URL },
+      { status: 401, statusText: "Unauthorized", data: {}, headers: {}, config },
+    );
+  }
+  function collabOk(config: any) {
+    return {
+      data: BODY,
+      status: 200,
+      statusText: "OK",
+      headers: {},
+      config,
+      request: { responseURL: COLLAB_URL },
+    };
+  }
+  /** The adapter answers 401 `failures` times, then 200; it counts the calls. */
+  function collabAdapter(failures: number) {
+    const seen = { calls: 0 };
+    setAdapter(async (config) => {
+      seen.calls += 1;
+      return seen.calls <= failures ? collab401(config) : collabOk(config);
+    });
+    return seen;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    isNativeAuthEnabled.mockReturnValue(false);
+    isPublicRoutePath.mockReturnValue(false);
+    Object.defineProperty(window, "location", {
+      value: { pathname: "/s/eng/p/abc", href: "" },
+      writable: true,
+      configurable: true,
+    });
+  });
+  afterEach(() => {
+    api.defaults.adapter = originalAdapter;
+  });
+
+  it("(a) remote mode: a 401 re-mints once and the retried request returns the token (no redirect)", async () => {
+    const seen = collabAdapter(1);
+
+    const result = await api.post("/auth/collab-token");
+
+    expect(result).toEqual(BODY);
+    expect(openDocmostSession).toHaveBeenCalledTimes(1);
+    expect(seen.calls).toBe(2);
+    expect(window.location.href).toBe("");
+  });
+
+  it("(b) remote mode: a 401 that remains after the re-mint rejects with that AxiosError (no second mint, no redirect)", async () => {
+    const seen = collabAdapter(Infinity);
+
+    const error = await api.post("/auth/collab-token").then(
+      (value) => ({ resolved: value }),
+      (e) => e,
+    );
+
+    expect(error).toBeInstanceOf(AxiosError);
+    expect(error.response.status).toBe(401);
+    expect(openDocmostSession).toHaveBeenCalledTimes(1);
+    expect(seen.calls).toBe(2);
+    expect(window.location.href).toBe("");
+  });
+
+  it("(c) remote mode: a failed re-mint rejects with the original 401 (one call, no redirect)", async () => {
+    openDocmostSession.mockRejectedValueOnce(new Error("re-mint failed"));
+    const seen = collabAdapter(Infinity);
+
+    const error = await api.post("/auth/collab-token").then(
+      (value) => ({ resolved: value }),
+      (e) => e,
+    );
+
+    expect(error).toBeInstanceOf(AxiosError);
+    expect(error.response.status).toBe(401);
+    expect(openDocmostSession).toHaveBeenCalledTimes(1);
+    expect(seen.calls).toBe(1);
+    expect(window.location.href).toBe("");
+  });
+
+  it("(d) native mode: no re-mint, rejects with the 401, no redirect", async () => {
+    isNativeAuthEnabled.mockReturnValue(true);
+    const seen = collabAdapter(Infinity);
+
+    const error = await api.post("/auth/collab-token").then(
+      (value) => ({ resolved: value }),
+      (e) => e,
+    );
+
+    expect(error).toBeInstanceOf(AxiosError);
+    expect(error.response.status).toBe(401);
+    expect(openDocmostSession).not.toHaveBeenCalled();
+    expect(seen.calls).toBe(1);
+    expect(window.location.href).toBe("");
+  });
+
+  it("(e) the rejected 401 is terminal for the token query (never retried like a network error)", async () => {
+    collabAdapter(Infinity);
+
+    const error = await api.post("/auth/collab-token").catch((e) => e);
+
+    expect(error).toBeInstanceOf(AxiosError);
+    expect(shouldRetryCollabToken(0, error)).toBe(false);
+  });
+
+  /** A re-mint (`POST /bff/docmost/session`) failure as the platform client raises it. */
+  function remintError(status: number | null): AxiosError {
+    const config: any = { url: "/bff/docmost/session", headers: {} };
+    return new AxiosError(
+      status == null ? "Network Error" : `Request failed with status code ${status}`,
+      status == null ? "ERR_NETWORK" : "ERR_BAD_RESPONSE",
+      config,
+      {},
+      status == null
+        ? undefined
+        : { status, statusText: "", data: {}, headers: {}, config },
+    );
+  }
+
+  it.each([
+    ["a 503", 503],
+    ["a 429", 429],
+    ["no response (network error)", null],
+  ])(
+    "(f) remote mode: a re-mint that failed transiently with %s rejects with the re-mint's error, which the token query retries",
+    async (_label, status) => {
+      const minted = remintError(status);
+      openDocmostSession.mockRejectedValueOnce(minted);
+      const seen = collabAdapter(Infinity);
+
+      const error = await api.post("/auth/collab-token").catch((e) => e);
+
+      expect(error).toBe(minted);
+      expect(shouldRetryCollabToken(0, error)).toBe(true);
+      expect(openDocmostSession).toHaveBeenCalledTimes(1);
+      expect(seen.calls).toBe(1);
+      expect(window.location.href).toBe("");
+    },
+  );
+
+  it("(g) remote mode: a re-mint refused with 401 (the platform session is gone) rejects with the original, terminal 401", async () => {
+    openDocmostSession.mockRejectedValueOnce(remintError(401));
+    const seen = collabAdapter(Infinity);
+
+    const error = await api.post("/auth/collab-token").catch((e) => e);
+
+    expect(error).toBeInstanceOf(AxiosError);
+    expect(error.config.url).toBe("/auth/collab-token");
+    expect(error.response.status).toBe(401);
+    expect(shouldRetryCollabToken(0, error)).toBe(false);
+    expect(seen.calls).toBe(1);
+    expect(window.location.href).toBe("");
   });
 });
 

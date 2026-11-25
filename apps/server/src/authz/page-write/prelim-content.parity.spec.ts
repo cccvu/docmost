@@ -390,8 +390,8 @@ describe('#731 a content write built as preliminary Yjs types equals the toYdoc 
     });
     expect(allWellFormed(fromYdoc(decoded(referenceUpdate(linked('https://e.com/\ud83d')).update)))).toBe(false); // the old poison
     expect(allWellFormed(liveJson(linked('https://e.com/\ud83d')))).toBe(true);
-    expect(liveJson(linked('https://e.com/\ud83d'))).toEqual(fromYdoc(decoded(referenceUpdate(linked('https://e.com/�')).update)));
-    expect(parityFailures(linked('https://e.com/�'))).toEqual([]);
+    expect(liveJson(linked('https://e.com/\ud83d'))).toEqual(fromYdoc(decoded(referenceUpdate(linked('https://e.com/\uFFFD')).update)));
+    expect(parityFailures(linked('https://e.com/\uFFFD'))).toEqual([]);
   });
 
   it('replace, append and prepend all build through it (one definition of the content a write inserts)', () => {

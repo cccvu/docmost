@@ -12,6 +12,7 @@ import { UserSessionRepo } from '@docmost/db/repos/session/user-session.repo';
 import { TokenService } from '../../core/auth/services/token.service';
 import { SessionService } from '../../core/session/session.service';
 import { AuthenticationExtension } from '../../collaboration/extensions/authentication.extension';
+import { COLLAB_INVALID_TOKEN_REASON } from '../collab-ingress/auth-refusal';
 import { CollabSocketBounds } from '../collab-ingress/socket-bounds';
 import {
   PG_URL,
@@ -140,7 +141,8 @@ d('the collab connect re-checks the collab token session on real Postgres (#537)
 
     await sessions.revokeSession(first.sessionId, bob.id, WS);
 
-    await expect(connect(first.collab)).rejects.toBeInstanceOf(UnauthorizedException);
+    // #755: a session no longer live is the quiet `{ reason }` refusal (logged `auth_refused` `session_not_live`)
+    await expect(connect(first.collab)).rejects.toEqual({ reason: COLLAB_INVALID_TOKEN_REASON });
     await expect(connect(second.collab)).resolves.toEqual({ user: expect.objectContaining({ id: bob.id }) });
   });
 
@@ -148,7 +150,7 @@ d('the collab connect re-checks the collab token session on real Postgres (#537)
     const carol = await newUser('carol@pg537');
     const { sessionId, collab } = await signIn(carol);
     await pg`update user_sessions set expires_at = now() - interval '1 minute' where id = ${sessionId}`;
-    await expect(connect(collab)).rejects.toBeInstanceOf(UnauthorizedException);
+    await expect(connect(collab)).rejects.toEqual({ reason: COLLAB_INVALID_TOKEN_REASON });
   });
 
   it('a deactivated user is refused even with a live session', async () => {

@@ -454,6 +454,7 @@ export default function PageEditor({
         access={collabAccess}
         epoch={collabEpoch}
         passive={!(editable && currentPageEditMode === PageEditMode.Edit)}
+        canEdit={editable}
         showsLocalCopy={!showStatic}
         clearLocalCopy={() => clearLocalCollabCopy(providersRef.current?.local)}
       />

@@ -45,6 +45,7 @@ import {
   COLLAB_TOKEN_WITHOUT_SESSION,
   invalidCollabTokenRefusal,
   quietCollabAuthRefusals,
+  sessionNotLiveRefusal,
   type CollabAuthenticator,
   type CollabAuthRefusal,
 } from './auth-refusal';
@@ -234,6 +235,14 @@ export class CollabSocketBounds implements OnModuleInit, OnModuleDestroy {
   chargeSession(userId: string, sessionId: string | undefined): void {
     if (!sessionId) throw this.invalidToken(COLLAB_TOKEN_WITHOUT_SESSION);
     chargeCollabSessionAuth(userId, sessionId, this.sessionAuthRate);
+  }
+
+  /**
+   * In `onAuthenticate` when the token's session is not live (seam §213, #755): the refusal to throw, logged
+   * `auth_refused` with `cause: "session_not_live"` (auth-refusal.ts).
+   */
+  sessionNotLive(): CollabAuthRefusal {
+    return sessionNotLiveRefusal(this.limitLog);
   }
 
   /** In `onAuthenticate` once the session is live (seam §213): the per-user auth rate; throws `{ reason }` when spent. */

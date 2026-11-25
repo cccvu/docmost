@@ -48,6 +48,16 @@ import { watchCollabCopyHealth } from "./collab-copy-health";
  *
  * #847: it also watches the local copy's Y.Doc (`collab-copy-health.ts`): a copy that wedged or failed its replay is
  * refused (`local-copy-broken`), so it stops sending and persisting and the notice offers Reload and Discard.
+ *
+ * #845: it keeps the provider's awareness on the document's client id. Yjs (13.6.30) gives the document a new random
+ * `clientID` when a remote update writes at its current one, inside that transaction's cleanup; y-protocols' (1.0.6)
+ * Awareness keeps the id it was built with, so the new id was never announced (the server bound it by its first struct,
+ * applied unbound as a relay), the provider's onClose removed the local state (it keeps only `document.clientID`), and
+ * no reconnect sent any awareness. On `afterTransactionCleanup` (after the regeneration, before that transaction's
+ * `update`, so a document write made by an awareness `change` listener is deferred behind the frames below) and once at
+ * bind, when the ids differ: the old id is removed with a null state at its next clock (frame 1), then the awareness
+ * takes the new id with the old id's clock, so its state goes out at that clock + 1 (frame 2): never 0, which every
+ * receiver drops for an id it has never seen. With no local state (after a page hide) it only moves the id and clock.
  */
 
 /** The slice of `HocuspocusProviderWebsocket` the controller drives. */
@@ -62,6 +72,24 @@ export interface CollabControllerProvider {
   detach(): void;
   on(event: string, fn: (...args: any[]) => void): unknown;
   off(event: string, fn: (...args: any[]) => void): unknown;
+  /** #845: the document and awareness whose client ids are kept equal (no-op when either is missing). */
+  document?: CollabControllerDoc;
+  awareness?: CollabControllerAwareness | null;
+}
+
+/** #845: the slice of the Y.Doc the client-id follow reads. */
+export interface CollabControllerDoc {
+  clientID: number;
+  on(event: "afterTransactionCleanup", fn: () => void): void;
+  off(event: "afterTransactionCleanup", fn: () => void): void;
+}
+
+/** #845: the slice of y-protocols' Awareness the client-id follow drives. */
+export interface CollabControllerAwareness {
+  clientID: number;
+  meta: Map<number, { clock: number; lastUpdated: number }>;
+  getLocalState(): Record<string, unknown> | null;
+  setLocalState(state: Record<string, unknown> | null): void;
 }
 
 export interface CollabAccessControllerOptions {
@@ -200,6 +228,21 @@ export function createCollabAccessController(
   const onSynced = ({ state: synced }: { state?: boolean } = {}) => {
     if (synced) handle({ kind: "synced" });
   };
+  // #845: put the awareness on the document's (regenerated) client id; see the header for the two frames it sends.
+  const followClientId = () => {
+    const doc = provider?.document;
+    const awareness = provider?.awareness;
+    if (!doc || !awareness || doc.clientID === awareness.clientID) return;
+    const state = awareness.getLocalState();
+    if (state !== null) awareness.setLocalState(null); // frame 1: the old id, null, at its next clock
+    const old = awareness.meta.get(awareness.clientID);
+    awareness.clientID = doc.clientID;
+    awareness.meta.set(doc.clientID, {
+      clock: Math.max(old?.clock ?? 0, awareness.meta.get(doc.clientID)?.clock ?? 0),
+      lastUpdated: Date.now(), // y-protocols' clock: lib0 `time.getUnixTime`, which is Date.now (ms)
+    });
+    if (state !== null) awareness.setLocalState(state); // frame 2: the new id, the state, at that clock + 1
+  };
   // The network is back: skip the provider's remaining backoff, only for a socket the provider itself is retrying.
   const onOnline = () => {
     if (
@@ -232,6 +275,8 @@ export function createCollabAccessController(
         );
       }
       network?.addEventListener("online", onOnline);
+      next.document?.on("afterTransactionCleanup", followClientId);
+      followClientId();
     },
     handle,
     isCopyDirty() {
@@ -248,6 +293,7 @@ export function createCollabAccessController(
         provider.off("close", onClose);
         provider.off("unsyncedChanges", onUnsyncedChanges);
         provider.off("synced", onSynced);
+        provider.document?.off("afterTransactionCleanup", followClientId);
       }
       copy?.destroy();
       unwatchCopy?.();

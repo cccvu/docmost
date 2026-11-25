@@ -44,6 +44,10 @@ export const COMPACTION_REASONS = [
   'rebuild_deadline',
   // #840: the live order and its reload differ (order-parity.ts); compaction from live makes the page reload-stable.
   'order_divergence',
+  // #851: a store's or a load's reload check ran out of bounds (heal-image.ts): no evidence either way. Like
+  // `load_steps` it is not an order heal, so #827's build-failure memo holds; unlike it, it is not a guard cap measure
+  // (never in live-structure.ts's ORDER_REASONS).
+  'reload_failed',
 ] as const;
 export type CompactionReason = (typeof COMPACTION_REASONS)[number];
 

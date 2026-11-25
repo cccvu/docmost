@@ -275,7 +275,7 @@ describe("CollabPageNotices (#827)", () => {
   function show(
     access: Partial<CollabAccessState>,
     compactedTo: number | null = null,
-    view: { passive?: boolean; showsLocalCopy?: boolean } = {},
+    view: { passive?: boolean; canEdit?: boolean; showsLocalCopy?: boolean } = {},
   ) {
     const openCurrentVersion = vi.fn();
     const clearLocalCopy = vi.fn(async () => {});
@@ -313,6 +313,14 @@ describe("CollabPageNotices (#827)", () => {
     show({ refused: true, refusalKind: "generic", refusedRule: "schema" }, null, { passive: true });
     expect(screen.queryByRole("alert")).toBeNull();
     expect(screen.getByRole("status").textContent).toContain("A change from this browser was not saved");
+  });
+
+  it("#845: canEdit reaches the notice: a reader's paused notice names live updates", () => {
+    show({ refused: true, refusalKind: "generic", refusedRule: "root" }, null, { passive: true, canEdit: false });
+    expect(screen.getByRole("status").textContent).toContain("Live updates are paused on this page");
+    cleanup();
+    show({ refused: true, refusalKind: "generic", refusedRule: "root" }, null, { passive: true });
+    expect(screen.getByRole("status").textContent).toContain("Editing is paused on this page"); // default: a writer
   });
 
   // #847: this browser's own copy broke (collab-copy-health.ts): the stored-copy notice, with both recoveries
@@ -496,6 +504,33 @@ describe("CollabRefusalNotice in Read mode or without edit permission (passive)"
     expect(screen.getByRole("status")).toBeTruthy();
     expect(document.activeElement).toBe(outside);
     outside.remove();
+  });
+});
+
+// #845: a reader never edits, so a paused notice tells them what they lost: other people's live edits.
+describe("CollabRefusalNotice for a user without edit permission (canEdit)", () => {
+  it.each(["other", "copy"] as const)("a %s pause is titled 'Live updates are paused on this page', never 'Editing is paused'", (cause) => {
+    setup(undefined, false, { cause, passive: true, canEdit: false });
+    const status = screen.getByRole("status");
+    expect(status.textContent).toContain("Live updates are paused on this page");
+    // Title and body: a reader's notice never says editing is paused (any case).
+    expect(status.textContent!.toLowerCase()).not.toContain("editing is paused");
+    expect(status.textContent).toContain("other people's edits no longer appear here");
+    expect(screen.getByRole("button", { name: "Reload" })).toBeTruthy();
+  });
+
+  it("a writer (canEdit, the default) in Read mode keeps 'Editing is paused on this page'", () => {
+    setup(undefined, false, { cause: "other", passive: true, canEdit: true });
+    expect(screen.getByRole("status").textContent).toContain("Editing is paused on this page");
+    expect(screen.getByRole("status").textContent).toContain("so editing is paused and other people's edits");
+    cleanup();
+    setup(undefined, false, { cause: "other", passive: true });
+    expect(screen.getByRole("status").textContent).toContain("Editing is paused on this page");
+  });
+
+  it("a change that was not saved keeps its title for a reader too (it is about this browser's copy)", () => {
+    setup(undefined, false, { cause: "change", passive: true, canEdit: false });
+    expect(screen.getByRole("status").textContent).toContain("A change from this browser was not saved");
   });
 });
 
