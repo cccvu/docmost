@@ -38,13 +38,26 @@ const held = new Map<string, PassThrough>();
 const release = (key: string) => held.get(key)?.end();
 /** Callers waiting in `heldSource` for a key's storage object to be opened. */
 const opening = new Map<string, (s: PassThrough) => void>();
+/** wiki-v2 #736: how long `heldSource` waits for the open; under jest's 5 s test timeout, so the cause is reported. */
+const HELD_SOURCE_OPEN_MS = 3_000;
 /**
  * #734: resolves with `key`'s held source once the export has opened it. The archive opens it lazily, when JSZip
  * pulls the entry, which can come after the response head; a fixed sleep stood in for that and flaked under load.
+ * wiki-v2 #736: an object that is never opened fails naming its key, not as a generic jest timeout.
  */
 const heldSource = (key: string): Promise<PassThrough> => {
   const s = held.get(key);
-  return s ? Promise.resolve(s) : new Promise((resolve) => opening.set(key, resolve));
+  if (s) return Promise.resolve(s);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      opening.delete(key);
+      reject(new Error(`storage object ${key} was never opened (waited ${HELD_SOURCE_OPEN_MS} ms)`));
+    }, HELD_SOURCE_OPEN_MS);
+    opening.set(key, (source) => {
+      clearTimeout(timer);
+      resolve(source);
+    });
+  });
 };
 
 function storageFor(body: ExportBody) {
@@ -268,7 +281,7 @@ describe('export admission on a real server (#699)', () => {
   it('a client that goes away releases its slot and the open storage object', async () => {
     const a = await post('/spaces/export', { key: 'p3', scenario: 'hold' }, 'user-3');
     expect(a.status).toBe(200);
-    const source = await heldSource('p3'); // the storage object is open (never opened: the test times out)
+    const source = await heldSource('p3'); // the storage object is open (never opened: fails naming 'p3')
     expect(source.destroyed).toBe(false);
     a.req.destroy(); // the browser tab closes
     await admittedWithin('user-3');

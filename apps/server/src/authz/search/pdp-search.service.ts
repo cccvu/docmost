@@ -22,6 +22,14 @@ import { asEngineBusy, engineBusy } from '../../service-bridge/resource-version'
 import type { AuthzSubject } from '../http-authz.client';
 import { OpSemaphore, OpSemaphoreTimeout } from '../page-write/op-semaphore';
 
+/**
+ * wiki-v2 #736: every search deadline and wait is on the MONOTONIC clock (`performance.now()`), never the wall clock:
+ * an NTP/chrony step back would stretch a search's waits and statements past its budget, a step forward shed it. They
+ * are in-process instants only (never logged, stored or compared with a timestamp). The global `performance` is read,
+ * so jest's fake timers drive it like the timers.
+ */
+const monotonicNow = (): number => performance.now();
+
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const tsquery = require('pg-tsquery')();
 
@@ -121,7 +129,7 @@ export interface SearchPdpClient {
 
 /** The bounds that keep search from taking the engine down (#696). */
 export interface SearchLimits {
-  /** One wall-clock deadline per search, from entry — under the platform's 8 s relay timeout. */
+  /** One deadline per search, from entry (monotonic, #736) — under the platform's 8 s relay timeout. */
   deadlineMs: number;
   /** Per statement: `statement_timeout = min(this, what is left of the deadline)`. */
   statementTimeoutMs: number;
@@ -360,10 +368,10 @@ export class PdpSearchService extends SearchService {
     // passed on here).
     if (!searchParams.shareId) return { items: [] };
 
-    const deadline = Date.now() + this.limits.deadlineMs;
+    const deadline = monotonicNow() + this.limits.deadlineMs;
     let release: () => void;
     try {
-      release = await this.shareLane.acquire(Math.max(0, Math.min(this.limits.slotWaitMs, deadline - Date.now())));
+      release = await this.shareLane.acquire(Math.max(0, Math.min(this.limits.slotWaitMs, deadline - monotonicNow())));
     } catch (err) {
       if (err instanceof OpSemaphoreTimeout) throw this.shed(new SearchShed('share_lane', 'admit'), 'share', 'anonymous');
       throw err;
@@ -894,7 +902,7 @@ export class PdpSearchService extends SearchService {
    * would keep running a window's checks anyway, and freeing the slot early is exactly what would let them escape.
    */
   private async inPdpLane<T>(deadline: number, stage: string, call: () => Promise<T>): Promise<T> {
-    const left = deadline - Date.now();
+    const left = this.msLeft(deadline);
     if (left < this.limits.pdpMinMs) throw new SearchShed('deadline', stage);
     let release: () => void;
     try {
@@ -927,9 +935,9 @@ export class PdpSearchService extends SearchService {
     userId: string,
     fn: (deadline: number) => Promise<T>,
   ): Promise<T> {
-    const deadline = Date.now() + this.limits.deadlineMs;
+    const deadline = monotonicNow() + this.limits.deadlineMs;
     const turnWaitMs = kind === 'search' ? Math.max(this.limits.searchTurnWaitMs, this.limits.slotWaitMs) : this.limits.slotWaitMs;
-    const turnBy = Math.min(Date.now() + turnWaitMs, deadline);
+    const turnBy = Math.min(monotonicNow() + turnWaitMs, deadline);
     const key = `${kind}:user:${userId}`;
     let entry = this.inFlight.get(key);
     if (!entry) {
@@ -940,7 +948,8 @@ export class PdpSearchService extends SearchService {
     try {
       let releasePlace: () => void;
       try {
-        releasePlace = await entry.places.acquire(Math.max(0, turnBy - Date.now()));
+        // Never more than its own wait, whatever the clock did (#736).
+        releasePlace = await entry.places.acquire(Math.max(0, Math.min(turnWaitMs, turnBy - monotonicNow())));
       } catch (err) {
         if (err instanceof OpSemaphoreTimeout) throw new SearchShed('principal', kind);
         throw err;
@@ -948,8 +957,8 @@ export class PdpSearchService extends SearchService {
       try {
         let release: () => void;
         try {
-          const slotBy = Math.min(Date.now() + this.limits.slotWaitMs, deadline);
-          release = await this.slots.acquire(Math.max(0, slotBy - Date.now()));
+          const slotBy = Math.min(monotonicNow() + this.limits.slotWaitMs, deadline);
+          release = await this.slots.acquire(Math.max(0, Math.min(this.limits.slotWaitMs, slotBy - monotonicNow())));
         } catch (err) {
           if (err instanceof OpSemaphoreTimeout) throw new SearchShed('slots', kind);
           throw err;
@@ -1010,17 +1019,22 @@ export class PdpSearchService extends SearchService {
    */
   private txStatement<T>(deadline: number, stage: string, run: (trx: KyselyTransaction) => Promise<T>): Promise<T> {
     return executeTx(this.database, async (trx) => {
-      const ms = Math.min(this.limits.statementTimeoutMs, deadline - Date.now());
+      const ms = Math.min(this.limits.statementTimeoutMs, this.msLeft(deadline));
       if (ms < this.limits.minStatementMs) throw new SearchShed('deadline', stage);
       await sql`SET LOCAL statement_timeout = ${sql.lit(Math.floor(ms))}`.execute(trx);
       return run(trx);
     });
   }
 
+  /** Ms left of a search's deadline: never more than one whole deadline, so a wrong clock can only shorten it (#736). */
+  private msLeft(deadline: number): number {
+    return Math.min(this.limits.deadlineMs, deadline - monotonicNow());
+  }
+
   /** `p`, unless the deadline passes first (then a shed; `p` settles unobserved). */
   private within<T>(deadline: number, stage: string, p: Promise<T>): Promise<T> {
     p.catch(() => undefined); // an abandoned step never becomes an unhandled rejection
-    const left = deadline - Date.now();
+    const left = this.msLeft(deadline);
     if (left <= 0) return Promise.reject(new SearchShed('deadline', stage));
     let timer: ReturnType<typeof setTimeout> | undefined;
     const expiry = new Promise<never>((_, reject) => {

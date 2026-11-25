@@ -72,7 +72,11 @@ export interface ExportConversionScope {
   userId: string | null | undefined;
   /** A zip (many pages, one batch turn), or one page (interactive). */
   zip: boolean;
-  /** When the export began (ms epoch): the build deadline runs from here. Absent: from this call. */
+  /**
+   * When the export began, on the MONOTONIC clock (`performance.now()`, wiki-v2 #736; the seam takes it so): the build
+   * deadline runs from here. Absent: from this call. A value ahead of now (a wall-clock epoch, i.e. a mixed clock) is
+   * taken as now: the deadline is then this call's own build window, never one lifted far into the future.
+   */
   startedAt?: number;
 }
 
@@ -96,10 +100,11 @@ export async function withExportConversion<T>(
     logger.error(`EXPORT_CONVERSION_NO_ACTOR export=${scope.label}: refused (500)`);
     throw new InternalServerErrorException('The export names no user.');
   }
-  const now = options.now ?? Date.now;
+  // wiki-v2 #736: the monotonic clock: a wall-clock step back would extend the build past its deadline, forward cut it.
+  const now = options.now ?? (() => performance.now());
   const limits = exportLimits();
   const buildMs = options.buildMs ?? (scope.zip ? limits.buildMs : limits.singlePageBuildMs);
-  const startedAt = scope.startedAt ?? now();
+  const startedAt = Math.min(scope.startedAt ?? Infinity, now());
   const turnKey = userConversionKey(scope.userId);
   const budgetKey = `${turnKey}:export`;
   const queue: ConversionQueue = scope.zip

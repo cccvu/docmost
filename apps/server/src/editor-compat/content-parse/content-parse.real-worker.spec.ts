@@ -116,6 +116,14 @@ describe('#626 the real worker enforces the bounds', () => {
     ['HTML nested 30,000 deep', '<div>'.repeat(30_000) + 'x', 'html'],
     ['Markdown quotes nested 5,000 deep', '> '.repeat(5_000) + 'x', 'markdown'],
   ] as const)('%s → 422 at once (it used to be a 500 from a stack overflow)', async (_name, content, format) => {
+    // wiki-v2 #757: the bound below measures the stack-overflow refusal, so the shared worker must already be loaded.
+    // It is not always: under a `-t` filter this is the run's first conversion, and a previous conversion that lost
+    // the worker leaves a replacement to load (the overflow itself is normally caught in the worker and answered
+    // `depth`). Starting a worker compiles the parsers through ts-node (~1 s on a dev laptop, longer on a loaded
+    // runner). The pool hands the next conversion the replacement's start (`ready()`), and holds the slot until a
+    // killed conversion's replacement is ready, so a conversion that succeeds here leaves a loaded worker. Its own wait
+    // is the startup bound, so a slow load cannot turn the warm-up into a 503 (`background` is never charged).
+    await parseUntrustedContent('<p>x</p>', 'html', { principal: 'background', waitMs: STARTUP_MS });
     const started = Date.now();
     await expect(parseUntrustedContent(content, format)).rejects.toBeInstanceOf(ContentTooComplexException);
     // A stack overflow, not the deadline: the worker's stack matches the main thread's.

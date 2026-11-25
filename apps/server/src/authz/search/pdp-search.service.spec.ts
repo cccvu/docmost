@@ -1126,3 +1126,48 @@ describe('search DTO @MaxLength (sweep F6)', () => {
     expect(hasMaxLength(await validate(over))).toBe(true);
   });
 });
+
+describe('PdpSearchService — wiki-v2 #736 the deadline is on the monotonic clock', () => {
+  /** Steps `Date.now` (an NTP/chrony step) from inside the PDP gate, i.e. mid-search, after the deadline was taken. */
+  const stepWallClockInGate = (pdp: { tryFilterResources: jest.Mock }, stepMs: number) => {
+    let step = 0;
+    const realNow = Date.now.bind(Date);
+    const spy = jest.spyOn(Date, 'now').mockImplementation(() => realNow() + step);
+    pdp.tryFilterResources.mockImplementation(async (_s: unknown, _p: string, _t: string, list: string[]) => {
+      step = stepMs;
+      return list;
+    });
+    return spy;
+  };
+
+  it('a wall-clock step forward mid-search sheds nothing (on the wall clock the deadline would be an hour gone)', async () => {
+    const { service, pdp } = build({ pageCandidates: mkRows(ids(3)), denied: new Set() });
+    const spy = stepWallClockInGate(pdp, 3_600_000);
+    try {
+      const { items } = await service.searchPage({ query: 'foo' } as any, { userId: USER, workspaceId: WS });
+      expect(items.map((i: any) => i.id)).toEqual(ids(3));
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('a wall-clock step back mid-search does not extend it: a slow hydrate is still shed at the deadline', async () => {
+    const { service, pdp, hydrateQueries } = build({
+      pageCandidates: mkRows(ids(3)),
+      denied: new Set(),
+      limits: { deadlineMs: 150, pdpMinMs: 0 },
+      delayMs: (q) => (/"id" in \(/.test(q.sql) ? 1500 : 0),
+    });
+    const spy = stepWallClockInGate(pdp, -3_600_000);
+    const warn = jest.spyOn((service as any).logger, 'warn').mockImplementation();
+    try {
+      const t0 = performance.now();
+      await expectEngineBusy(service.searchPage({ query: 'foo' } as any, { userId: USER, workspaceId: WS }));
+      expect(performance.now() - t0).toBeLessThan(1000); // shed at the deadline, not after the 1.5 s hydrate
+      expect(hydrateQueries()).toHaveLength(1);
+    } finally {
+      spy.mockRestore();
+      warn.mockRestore();
+    }
+  });
+});

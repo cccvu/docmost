@@ -165,6 +165,25 @@ describe('#790 CollabPreAuthSlots', () => {
     expect(s.terminated).toBe(1);
   });
 
+  // wiki-v2 #736: the deadline after Auth counts from the upgrade on the monotonic clock. `jest.setSystemTime` steps
+  // only the fake Date (an NTP/chrony step); the fake `performance.now()` and the timers carry on unmoved.
+  it.each([
+    ['back', -3_600_000], // on the wall clock: an hour more before the cut
+    ['forward', 3_600_000], // on the wall clock: cut at once on the Auth
+  ])('#736 a wall-clock step %s between upgrade and Auth leaves the deadline where it was', (_dir, stepMs) => {
+    jest.useFakeTimers();
+    const slots = new CollabPreAuthSlots({ cap: 4, deadlineMs: 5_000, firstAuthMs: 2_000, limitLog: quietLog() });
+    const s = new Sock();
+    slots.hold(s);
+    jest.advanceTimersByTime(1_000);
+    jest.setSystemTime(Date.now() + stepMs);
+    slots.authArrived(s);
+    jest.advanceTimersByTime(3_999);
+    expect(s.terminated).toBe(0);
+    jest.advanceTimersByTime(1); // 5 s after the upgrade
+    expect(s.terminated).toBe(1);
+  });
+
   it('answers the upgrade 503 with Retry-After at the cap, synchronously', () => {
     const slots = new CollabPreAuthSlots({ cap: 1, deadlineMs: 60_000, limitLog: quietLog() });
     const done = jest.fn();

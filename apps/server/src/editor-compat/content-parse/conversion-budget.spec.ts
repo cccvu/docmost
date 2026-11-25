@@ -4,6 +4,7 @@
  *
  * Run in CI via the `docmost-authz` job's jest glob (`… src/editor-compat …`).
  */
+import { performance } from 'node:perf_hooks';
 import {
   type BatchBudgetTurn,
   ConversionBudget,
@@ -75,7 +76,7 @@ describe('ConversionBudget (#642, extracted #716)', () => {
     const { budget, clock } = make();
     for (let i = 0; i < 5; i++) budget.charge(`user:${i}`, 10);
     expect(budget.size).toBe(5);
-    clock.t += 1_000; // all refilled, but the sweep last ran (lastPrune=0) long ago: due now
+    clock.t += 1_000; // all refilled, and the sweep has never run: due now
     budget.prune();
     expect(budget.size).toBe(0);
     budget.charge('user:x', 10);
@@ -83,6 +84,15 @@ describe('ConversionBudget (#642, extracted #716)', () => {
     budget.prune(); // within a minute of the last sweep: skipped
     expect(budget.size).toBe(1);
     clock.t += 60_000;
+    budget.prune();
+    expect(budget.size).toBe(0);
+  });
+
+  it('wiki-v2 #736: the first sweep is due whatever the clock origin (the monotonic clock starts near 0)', () => {
+    const { budget, clock } = make();
+    clock.t = 0;
+    budget.charge('user:A', 10);
+    clock.t = 1_000; // refilled; on a clock starting at 0, a `lastPrune = 0` sweep would wait a minute
     budget.prune();
     expect(budget.size).toBe(0);
   });
@@ -172,16 +182,22 @@ describe('ConversionBudget (#642, extracted #716)', () => {
     expect((err as ConversionBudgetExhaustedException).retryAfterSeconds).toBe(1);
   });
 
-  it('the default clock reads Date.now at call time (a spy on it steers an un-injected budget)', () => {
+  it('wiki-v2 #736: the default clock is the monotonic performance.now, read at call time; a wall-clock step never moves it', () => {
     const budget = new ConversionBudget({ ...LIMITS, budgetRefillMsPerMinute: 60_000 });
-    let now = 5_000_000;
-    const spy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    let mono = 5_000_000;
+    let wall = 9_000_000;
+    const perf = jest.spyOn(performance, 'now').mockImplementation(() => mono);
+    const date = jest.spyOn(Date, 'now').mockImplementation(() => wall);
     try {
       budget.charge('user:A', 500);
-      now += 200;
+      wall += 60_000; // a forward step: refilled in full on a wall clock
+      expect(budget.left('user:A')).toBe(500);
+      wall -= 3_600_000; // a backward step: no refill for an hour on a wall clock
+      mono += 200;
       expect(budget.left('user:A')).toBe(700);
     } finally {
-      spy.mockRestore();
+      perf.mockRestore();
+      date.mockRestore();
     }
   });
 });

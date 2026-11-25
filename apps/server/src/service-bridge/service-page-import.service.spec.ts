@@ -138,7 +138,7 @@ describe('validate-content — budgets and codes', () => {
 
   it('the time budget stops at the first overrun too (checked before each item) — as parse_budget_exceeded, never too_large', async () => {
     let clock = 0;
-    const now = jest.spyOn(Date, 'now').mockImplementation(() => clock);
+    const now = jest.spyOn(performance, 'now').mockImplementation(() => clock); // wiki-v2 #736: the monotonic clock
     try {
       const t = make(async () => {
         clock += 3000; // each parse "takes" 3s
@@ -155,6 +155,25 @@ describe('validate-content — budgets and codes', () => {
       expect(t.parsed).toEqual(['a', 'b']);
     } finally {
       now.mockRestore();
+    }
+  });
+
+  it('wiki-v2 #736: a wall-clock step forward does not shed the later items (the budget is monotonic)', async () => {
+    let step = 0;
+    const realNow = Date.now.bind(Date);
+    const wall = jest.spyOn(Date, 'now').mockImplementation(() => realNow() + step);
+    try {
+      const t = make(async () => {
+        step += 3_600_000; // NTP steps the wall clock forward an hour during each parse
+      });
+      const res = await t.svc.validateContent({ items: ['a', 'b', 'c'].map((content) => ({ format: 'markdown' as const, content })) });
+      expect(res.results).toEqual([
+        { idx: 0, ok: true },
+        { idx: 1, ok: true },
+        { idx: 2, ok: true },
+      ]);
+    } finally {
+      wall.mockRestore();
     }
   });
 
@@ -196,7 +215,7 @@ describe('validate-content — budgets and codes', () => {
 
   it('the byte budget still wins when both are spent at the same item (too_large: the request itself is too big)', async () => {
     let clock = 0;
-    const now = jest.spyOn(Date, 'now').mockImplementation(() => clock);
+    const now = jest.spyOn(performance, 'now').mockImplementation(() => clock); // wiki-v2 #736: the monotonic clock
     try {
       const half = 'x'.repeat(PAGE_IMPORT_ITEM_MAX_BYTES);
       const t = make(async () => {
@@ -220,7 +239,7 @@ describe('validate-content — budgets and codes', () => {
   it('a time-budget stop is per call: the same items, re-sent to an idle engine, are all checked', async () => {
     let clock = 0;
     let cost = 3000;
-    const now = jest.spyOn(Date, 'now').mockImplementation(() => clock);
+    const now = jest.spyOn(performance, 'now').mockImplementation(() => clock); // wiki-v2 #736: the monotonic clock
     try {
       const t = make(async () => {
         clock += cost;

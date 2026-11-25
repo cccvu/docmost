@@ -127,7 +127,8 @@ export class ExportStreamRegistry {
     readonly label: string,
     private readonly limits: Pick<ExportLimits, 'attachmentBytes' | 'maxDurationMs'> & Partial<Pick<ExportLimits, 'storageTimeoutMs'>>,
     private readonly logger: Pick<Logger, 'warn' | 'error'> = new Logger('Export'),
-    private readonly now: () => number = Date.now,
+    /** wiki-v2 #736: the monotonic clock, so a wall-clock step can neither end the export early nor extend its cap. */
+    private readonly now: () => number = () => performance.now(),
   ) {
     this.startedAt = now();
   }

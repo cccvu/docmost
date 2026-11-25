@@ -132,7 +132,9 @@ export class ServicePageImportService {
   }
 
   private async validateAll(dto: ValidateContentDto): Promise<ValidateContentResult> {
-    const started = Date.now();
+    // wiki-v2 #736: the parse budget is on the MONOTONIC clock: a wall-clock step forward would shed the call's later
+    // items as parse_budget_exceeded at once, a step back let it parse past its budget.
+    const started = performance.now();
     let parsedBytes = 0;
     /** Set at the first overrun: the code that item and every later one answer, unparsed. */
     let stopped: 'too_large' | 'parse_budget_exceeded' | null = null;
@@ -154,7 +156,7 @@ export class ServicePageImportService {
       }
       if (parsedBytes + bytes > PAGE_IMPORT_TOTAL_MAX_BYTES) {
         stopped = 'too_large';
-      } else if (Date.now() - started > this.parseBudgetMs) {
+      } else if (performance.now() - started > this.parseBudgetMs) {
         stopped = 'parse_budget_exceeded';
       }
       if (stopped) {

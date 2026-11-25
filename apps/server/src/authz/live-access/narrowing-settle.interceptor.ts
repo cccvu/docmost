@@ -83,7 +83,9 @@ export class NarrowingSettleInterceptor implements NestInterceptor {
     }
     const route = `${context.getClass().name}.${context.getHandler().name}`;
     if (!NARROWING_ROUTES.has(route)) return next.handle();
-    const startedAt = Date.now();
+    // wiki-v2 #736: the request budget is on the monotonic clock (an in-process instant, never logged or stored): a
+    // wall-clock step would otherwise stretch the settle wait past the budget, or cut it into a false `pending`.
+    const startedAt = performance.now();
     const reply = context.switchToHttp().getResponse<FastifyReply>();
     // null = unknown (the read failed): then settle anyway, never skip on a guess.
     const before = maxCommittedPosition(this.db).catch(() => null);
@@ -108,7 +110,8 @@ export class NarrowingSettleInterceptor implements NestInterceptor {
     startedAt: number,
     fenceBefore: string | null,
   ): Promise<'confirmed' | 'pending' | null> {
-    const left = () => REQUEST_BUDGET_MS - (Date.now() - startedAt);
+    // Never more than the whole budget, whatever the clock did (#736).
+    const left = () => REQUEST_BUDGET_MS - Math.max(0, performance.now() - startedAt);
     let position = '?';
     try {
       position = await maxCommittedPosition(this.db);

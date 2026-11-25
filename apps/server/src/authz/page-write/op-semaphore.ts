@@ -6,7 +6,13 @@
  * `this.db`, the PDP's lineage read), so their concurrency is capped per process to keep them from exhausting the
  * pool that serves every other request. A caller that cannot get a slot within `waitMs` is refused
  * (`OpSemaphoreTimeout`) rather than queued without bound; the controller answers that with a retryable 503.
+ *
+ * wiki-v2 #736: every instant here (a waiter's deadline, when it joined, a pause, aging) is on the MONOTONIC clock
+ * (`performance.now()`), never the wall clock: an NTP/chrony step would otherwise stretch or cut a wait across a
+ * pause, or reorder aging. None of these values leaves this class; callers pass durations (`waitMs`), never instants.
+ * The global `performance` is read (not node:perf_hooks'), so jest's fake timers drive it like the timers themselves.
  */
+const monotonicNow = (): number => performance.now();
 export class OpSemaphoreTimeout extends Error {
   constructor() {
     super('no conditional-operation slot became free in time');
@@ -18,7 +24,7 @@ export class OpSemaphoreTimeout extends Error {
 interface Waiter {
   grant: () => void;
   at: number;
-  /** #716: when its wait runs out (wall clock), the time it joined, and the pause time already credited to it. */
+  /** #716: when its wait runs out, the time it joined (monotonic, #736), and the pause time already credited to it. */
   deadline: number;
   joined: number;
   credited: number;
@@ -45,7 +51,7 @@ export interface OpSemaphoreOptions {
    * urgent waiters that join after it have waited behind urgent holders only, and aging passes them.
    */
   agingMs?: number;
-  /** The clock aging reads (tests). */
+  /** The clock aging reads (tests). Default: the monotonic clock (wiki-v2 #736). */
   now?: () => number;
   /**
    * #716: the most wait time `pause()` may give back to one waiter in total (default: none — a pause then only
@@ -60,7 +66,7 @@ export class OpSemaphore {
   /** #716: waiters that asked for priority (`acquire(…, { urgent: true })`). Empty unless a caller uses it. */
   private readonly urgent: Waiter[] = [];
   private readonly now: () => number;
-  /** #716: when the current pause began (wall clock), or null while not paused. */
+  /** #716: when the current pause began (monotonic, #736), or null while not paused. */
   private pausedAt: number | null = null;
 
   constructor(
@@ -69,7 +75,7 @@ export class OpSemaphore {
     private readonly options: OpSemaphoreOptions = {},
   ) {
     if (!Number.isInteger(max) || max < 1) throw new Error('OpSemaphore: max must be a positive integer');
-    this.now = options.now ?? (() => Date.now());
+    this.now = options.now ?? monotonicNow;
   }
 
   /** Slots currently held (for tests and diagnostics). */
@@ -90,7 +96,7 @@ export class OpSemaphore {
     }
     const queue = urgent ? this.urgent : this.waiters;
     return new Promise((resolve, reject) => {
-      const joined = Date.now();
+      const joined = monotonicNow();
       const waiter: Waiter = {
         grant: () => {
           clearTimeout(waiter.timer);
@@ -123,14 +129,14 @@ export class OpSemaphore {
    */
   pause(): void {
     if (this.pausedAt !== null) return;
-    this.pausedAt = Date.now();
+    this.pausedAt = monotonicNow();
     for (const w of [...this.urgent, ...this.waiters]) clearTimeout(w.timer);
   }
 
   /** #716: restart the waiters' clocks, each extended by the pause it sat through (capped, see `pause()`). */
   resume(): void {
     if (this.pausedAt === null) return;
-    const now = Date.now();
+    const now = monotonicNow();
     const pausedAt = this.pausedAt;
     this.pausedAt = null;
     const cap = this.options.pauseCreditMs ?? 0;
@@ -145,7 +151,7 @@ export class OpSemaphore {
   /** Start (or restart) a waiter's expiry timer for what is left of its wait; expire it now if nothing is. */
   private arm(w: Waiter): void {
     clearTimeout(w.timer);
-    const ms = w.deadline - Date.now();
+    const ms = w.deadline - monotonicNow();
     if (ms <= 0) {
       w.expire();
       return;

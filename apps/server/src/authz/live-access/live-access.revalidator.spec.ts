@@ -140,11 +140,11 @@ function build(opts: {
   return { svc, authz, userRepo, pageRepo, lineageDb };
 }
 
-/** A controllable clock: the unknown cap is time-bounded. */
+/** A controllable clock: the unknown cap is time-bounded. wiki-v2 #736: the monotonic one (`performance.now`). */
 let clock = 1_000_000;
 beforeEach(() => {
   clock = 1_000_000;
-  jest.spyOn(Date, 'now').mockImplementation(() => clock);
+  jest.spyOn(performance, 'now').mockImplementation(() => clock);
 });
 afterEach(() => jest.restoreAllMocks());
 
@@ -327,6 +327,25 @@ describe('LiveAccessRevalidator — collab plane', () => {
     );
   });
 
+  it('wiki-v2 #736 review: the first failure is logged inside the process\'s first minute (the monotonic clock starts near 0)', async () => {
+    clock = 5_000; // performance.now() a few seconds after boot: under FAILED_LOG_THROTTLE_MS
+    const error = jest.spyOn(Logger.prototype, 'error').mockImplementation();
+    const { svc } = build({ docs: [] });
+    (svc as any).collab = {
+      getResidentDocuments: () => {
+        throw new Error('collab down');
+      },
+    };
+    await expect(svc.request('sweep')).rejects.toThrow('collab down');
+    expect(error).toHaveBeenCalledTimes(1);
+    expect(error).toHaveBeenCalledWith(
+      expect.stringContaining('LIVE_ACCESS_REVALIDATE_FAILED'),
+    );
+    clock += 1_000; // still throttled: a second failure inside the window is not logged again
+    await expect(svc.request('sweep')).rejects.toThrow('collab down');
+    expect(error).toHaveBeenCalledTimes(1);
+  });
+
   it('a burst of fast-path passes during a PDP blip never narrows before UNKNOWN_GRACE_MS (#501 review)', async () => {
     const error = jest.spyOn(Logger.prototype, 'error').mockImplementation();
     const c = conn(false);
@@ -343,6 +362,22 @@ describe('LiveAccessRevalidator — collab plane', () => {
     expect(c.close).not.toHaveBeenCalled();
     expect(room.leave).not.toHaveBeenCalled();
     expect(error).not.toHaveBeenCalled(); // and no alarm for a blip
+  });
+
+  it('wiki-v2 #736: the unknown grace is monotonic: wall-clock steps forward never narrow early', async () => {
+    const error = jest.spyOn(Logger.prototype, 'error').mockImplementation();
+    let wall = 0;
+    const realNow = Date.now.bind(Date);
+    jest.spyOn(Date, 'now').mockImplementation(() => realNow() + wall);
+    const c = conn(false);
+    const { svc } = build({ docs: [doc('p1', [c])], pdpFail: true });
+    for (let i = 0; i < UNKNOWN_CAP * 2; i++) {
+      await svc.request('sweep');
+      wall += UNKNOWN_GRACE_MS; // NTP steps the wall clock forward a whole grace between passes
+      clock += 1_000; // the monotonic clock: well under the grace in all
+    }
+    expect(c.close).not.toHaveBeenCalled(); // on the wall clock the forward steps would have spanned the grace
+    expect(error).not.toHaveBeenCalled();
   });
 
   it('a decided pass resets the unknown run (only CONSECUTIVE unknowns count)', async () => {

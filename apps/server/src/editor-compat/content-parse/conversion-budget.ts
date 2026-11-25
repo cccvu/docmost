@@ -65,6 +65,7 @@ export function isBudgetExempt(key: string): boolean {
 const BUDGET_PRUNE_EVERY_MS = 60_000;
 
 export interface ConversionBudgetClock {
+  /** Milliseconds on a monotonic clock. Default: `performance.now()` (wiki-v2 #736), never the wall clock. */
   now?: () => number;
   /** How a batch waits for its refill (tests advance a fake clock instead). */
   sleep?: (ms: number) => Promise<void>;
@@ -85,7 +86,8 @@ export class ConversionBudget {
   private readonly logger = new Logger('ContentParse');
   /** Buckets of the keys that are below capacity. A missing key is full. */
   private readonly buckets = new Map<string, { tokens: number; at: number }>();
-  private lastPrune = 0;
+  /** Never swept yet: the first `prune` is due whatever the clock's origin (the monotonic one starts near 0). */
+  private lastPrune = Number.NEGATIVE_INFINITY;
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
 
@@ -93,8 +95,10 @@ export class ConversionBudget {
     private readonly limits: Readonly<ConversionBudgetLimits>,
     clock: ConversionBudgetClock = {},
   ) {
-    // Read through at call time (not `Date.now` captured), so a spy on Date.now still steers the default clock.
-    this.now = clock.now ?? (() => Date.now());
+    // wiki-v2 #736: the monotonic clock, like the conversion deadline and charges (#734). The wall clock can step
+    // (NTP/chrony makestep): backward, it would hold a refill back by the step; forward, it would refill a spent bucket
+    // at once. Read through at call time, so a spy on `performance.now` steers it; tests usually inject `now`.
+    this.now = clock.now ?? (() => performance.now());
     this.sleep = clock.sleep ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   }
 

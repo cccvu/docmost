@@ -305,17 +305,20 @@ export class AuthzChangeFeedService implements OnModuleInit, OnModuleDestroy {
     waitMs: number,
     seq0: number,
   ): Promise<{ row: OutboxRow; xactId: string; id: string }[]> {
-    const deadline = Date.now() + waitMs;
+    // wiki-v2 #736: the long-poll deadline is on the MONOTONIC clock (an in-process instant, never logged or stored): a
+    // wall-clock step back would otherwise hold the relay's poll for the step, a step forward cut it short. The global
+    // `performance` is read, so jest's fake timers drive it. `remaining` never exceeds the whole wait.
+    const deadline = performance.now() + waitMs;
     let seq = seq0;
     for (;;) {
       const withheld = await this.hasRowsAfter(cursor);
-      const remaining = deadline - Date.now();
+      const remaining = Math.min(waitMs, deadline - performance.now());
       if (remaining > 0 && this.wakeSeq === seq && !this.closingFlag) {
         await this.waitForWake(withheld ? Math.min(WITHHELD_POLL_MS, remaining) : remaining);
       }
       seq = this.wakeSeq;
       const raw = await this.readRawAfter(cursor, limit);
-      if (raw.length > 0 || !withheld || Date.now() >= deadline || this.closingFlag) return raw;
+      if (raw.length > 0 || !withheld || performance.now() >= deadline || this.closingFlag) return raw;
     }
   }
 

@@ -233,6 +233,26 @@ describe('AuthzChangeFeedService long-poll wakeups (#501)', () => {
     expect(res.events).toEqual([]);
     expect(probes).toHaveLength(1); // one probe, then one park until the deadline
   });
+
+  it('wiki-v2 #736: the wait is on the monotonic clock: a wall-clock step back never holds the poll past its wait', async () => {
+    const state: { rows: unknown[]; withheld: boolean; onFirstRead?: () => void } = { rows: [], withheld: false };
+    const svc = harness(state);
+    const realNow = Date.now.bind(Date);
+    let calls = 0;
+    // NTP steps the wall clock back an hour right after the deadline is taken (every later read sees the step).
+    const spy = jest.spyOn(Date, 'now').mockImplementation(() => realNow() - (calls++ > 0 ? 3_600_000 : 0));
+    try {
+      const t0 = performance.now();
+      const res = await Promise.race([
+        svc.getChanges('49.0', 300, 500),
+        new Promise<'held'>((r) => setTimeout(() => r('held'), 3_000).unref?.()),
+      ]);
+      expect(res).not.toBe('held'); // on the wall clock: parked for the hour the step added
+      expect(performance.now() - t0).toBeLessThan(2_000);
+    } finally {
+      spy.mockRestore();
+    }
+  });
 });
 
 describe('AuthzChangeFeedService shutdown (#810)', () => {

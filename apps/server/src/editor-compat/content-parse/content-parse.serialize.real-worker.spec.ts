@@ -16,7 +16,22 @@ import { serializeForExport } from './content-parse.worker';
 const STARTUP_MS = 90_000; // ts-node compiles the collaboration graph when a worker starts
 jest.setTimeout(180_000);
 
-const pool = new ContentParsePool({ ...CONTENT_PARSE_LIMITS, startupMs: STARTUP_MS }, spawnContentParseWorker);
+/**
+ * wiki-v2 #757: this spec asserts the output (byte-identical to the in-process path) and the main thread's lag, never
+ * the production 7 s deadline: on an overloaded CI runner the ~1.75 MiB Markdown serialization ran past it and was
+ * killed (422), failing a test about something else. So its pools get a generous deadline, and a budget that a slow
+ * runner's long conversions cannot spend (its key would be refused 429 for the same reason). The timings are still
+ * printed. The production deadline has its own specs (content-parse.service.spec.ts, content-parse.real-worker.spec.ts).
+ */
+const SPEC_LIMITS = {
+  ...CONTENT_PARSE_LIMITS,
+  startupMs: STARTUP_MS,
+  deadlineMs: 60_000,
+  budgetCapacityMs: 1e12,
+  budgetRefillMsPerMinute: 1e12,
+};
+
+const pool = new ContentParsePool(SPEC_LIMITS, spawnContentParseWorker);
 afterAll(() => pool.close());
 const queue = { principal: 'user:serialize-spec', budgetKey: 'user:serialize-spec:export' };
 
@@ -97,7 +112,7 @@ describe('serialize in the real worker (#716)', () => {
     expect(starsMd.length).toBeGreaterThan(starsHtml.length);
     expect(serializeForExport(stars, 'html', starsHtml.length)).toBe(starsHtml);
     expect(serializeForExport(stars, 'markdown', starsHtml.length)).toBeNull();
-    const small = new ContentParsePool({ ...CONTENT_PARSE_LIMITS, startupMs: STARTUP_MS, maxChars: 100 }, spawnContentParseWorker);
+    const small = new ContentParsePool({ ...SPEC_LIMITS, maxChars: 100 }, spawnContentParseWorker);
     try {
       await expect(small.serialize(doc, 'html', queue)).rejects.toBeInstanceOf(ContentTooComplexException);
     } finally {

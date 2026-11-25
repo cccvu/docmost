@@ -88,6 +88,7 @@ type Held = {
   bytes: number;
   /** What it adds to the process total: `bytes` plus the per-read overhead for every read. */
   charged: number;
+  /** When it opened, on the monotonic clock (#736): an in-process instant, never logged. */
   openedAt: number;
   phase: Phase;
   /** The client address key it counts against, when the share was active at its upgrade. */
@@ -224,7 +225,7 @@ export class CollabPreAuthSlots {
       detach: () => transport?.off('data', onData),
       bytes: 0,
       charged: 0,
-      openedAt: Date.now(),
+      openedAt: performance.now(), // wiki-v2 #736: monotonic (the global, so fake timers drive it)
       phase: 'awaiting_auth',
       key,
     };
@@ -283,7 +284,9 @@ export class CollabPreAuthSlots {
     if (!entry || entry.phase !== 'awaiting_auth') return;
     entry.phase = 'authenticating';
     clearTimeout(entry.timer);
-    entry.timer = this.deadline(entry.socket, Math.max(0, this.deadlineMs - (Date.now() - entry.openedAt)), 'preauth_deadline', this.deadlineMs);
+    // wiki-v2 #736: what is left of the deadline on the monotonic clock, never more than the whole deadline.
+    const elapsed = Math.max(0, performance.now() - entry.openedAt);
+    entry.timer = this.deadline(entry.socket, Math.max(0, this.deadlineMs - elapsed), 'preauth_deadline', this.deadlineMs);
   }
 
   /**

@@ -281,6 +281,29 @@ describe('LazyAttachmentStream + ExportStreamRegistry over real JSZip (#699)', (
     expect(() => reg2.attach(generate(zip2))).toThrow(ExportStorageException);
   });
 
+  it('wiki-v2 #736: the cap runs on the monotonic clock: a wall-clock step forward does not end the export at once', async () => {
+    let step = 0;
+    const realNow = Date.now.bind(Date);
+    const spy = jest.spyOn(Date, 'now').mockImplementation(() => realNow() + step);
+    try {
+      const reg = new ExportStreamRegistry('page:p1', LIMITS, logger()); // the default clock
+      step = 3_600_000; // NTP steps the wall clock forward an hour while the pages are built
+      const zip = new JSZip();
+      zip.file('a.md', 'a');
+      const timers = jest.spyOn(global, 'setTimeout');
+      const out = reg.attach(generate(zip));
+      // attach() arms the wall_cap timer synchronously: it must get (about) the whole cap. On the wall clock it
+      // got 0 ms (the step consumed it), which a fast one-file archive can still outrun, so assert the delay itself.
+      const armed = timers.mock.calls[timers.mock.calls.length - 1]?.[1];
+      timers.mockRestore();
+      expect(armed).toBeGreaterThan(LIMITS.maxDurationMs - 1_000);
+      expect((await collect(out)).length).toBeGreaterThan(0);
+      expect(reg.failed).toBeNull();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it('a completed archive clears the wall-clock timer and leaves nothing open', async () => {
     const { state, open } = storage(() => synthetic(MiB));
     const reg = new ExportStreamRegistry('page:p1', LIMITS, logger());
