@@ -14,7 +14,6 @@
  *     2 × capacity + `batchOverdraftMs` + the refill over its run.
  *   - keys with no human behind them (`background`, `batch:<id>`) are exempt.
  */
-import { performance } from 'node:perf_hooks';
 import { HttpException, HttpStatus, Logger } from '@nestjs/common';
 
 export interface ConversionBudgetLimits {

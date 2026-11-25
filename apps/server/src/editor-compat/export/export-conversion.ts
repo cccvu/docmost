@@ -75,7 +75,7 @@ export interface ExportConversionScope {
   /**
    * When the export began, on the MONOTONIC clock (`performance.now()`, wiki-v2 #736; the seam takes it so): the build
    * deadline runs from here. Absent: from this call. A value ahead of now (a wall-clock epoch, i.e. a mixed clock) is
-   * taken as now, so a wrong clock can only shorten the window to this call's, never lift the deadline.
+   * taken as now: the deadline is then this call's own build window, never one lifted far into the future.
    */
   startedAt?: number;
 }

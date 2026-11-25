@@ -149,11 +149,14 @@ export class LiveAccessRevalidator implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(LiveAccessRevalidator.name);
   private current: Promise<LiveAccessSummary> | null = null;
   private queued: Promise<LiveAccessSummary> | null = null;
-  private lastPassEndedAt = 0;
+  /** -Infinity, never 0: the monotonic clock starts near 0 at process start (wiki-v2 #736 review). */
+  private lastPassEndedAt = Number.NEGATIVE_INFINITY;
   private sweepTimer: ReturnType<typeof setTimeout> | null = null;
   private trailingTimer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
-  private lastFailedLogAt = 0;
+  /** -Infinity, never 0: `performance.now()` starts near 0, so a 0 here silenced every LIVE_ACCESS_REVALIDATE_FAILED
+   *  (an alarmed token) in a process's first FAILED_LOG_THROTTLE_MS (wiki-v2 #736 review). */
+  private lastFailedLogAt = Number.NEGATIVE_INFINITY;
   /** Consecutive unknown decisions (and when the run began), per collab connection / per socket+room. Weak: a
    *  closed connection frees it. */
   private readonly unknownCollab = new WeakMap<object, UnknownRun>();
@@ -271,7 +274,7 @@ export class LiveAccessRevalidator implements OnModuleInit, OnModuleDestroy {
     }
     if (s.closed + s.left + s.disconnected > 0) {
       this.logger.log(
-        `LIVE_ACCESS_REVOKED source=${source} closed=${s.closed} left=${s.left} disconnected=${s.disconnected} unknownClosed=${s.unknownClosed} checked=${s.checked} unknown=${s.unknown} ms=${monotonicNow() - t0}`,
+        `LIVE_ACCESS_REVOKED source=${source} closed=${s.closed} left=${s.left} disconnected=${s.disconnected} unknownClosed=${s.unknownClosed} checked=${s.checked} unknown=${s.unknown} ms=${Math.round(monotonicNow() - t0)}`,
       );
     }
     return s;
